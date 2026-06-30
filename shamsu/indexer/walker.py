@@ -122,7 +122,13 @@ class FileWalker:
         conn = init_db(self.db_path)
         entries: list[IndexEntry] = []
         try:
-            for path in self.discover():
+            discovered = self.discover()
+            seen_paths = {
+                path.relative_to(self.workspace_root).as_posix()
+                for path in discovered
+            }
+            self._remove_stale_files(conn, seen_paths)
+            for path in discovered:
                 stat = path.stat()
                 relative_path = path.relative_to(self.workspace_root).as_posix()
                 file_hash = sha256_file(path)
@@ -162,6 +168,16 @@ class FileWalker:
         finally:
             conn.close()
         return entries
+
+    @staticmethod
+    def _remove_stale_files(conn, seen_paths: set[str]) -> None:
+        rows = conn.execute("SELECT id, path FROM files").fetchall()
+        for file_id, file_path in rows:
+            if file_path in seen_paths:
+                continue
+            conn.execute("DELETE FROM symbols WHERE file_id = ?", (file_id,))
+            conn.execute("DELETE FROM snippets WHERE file_id = ?", (file_id,))
+            conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
 
     @staticmethod
     def _replace_file_index(conn, file_id: int, path: Path, language: str) -> None:

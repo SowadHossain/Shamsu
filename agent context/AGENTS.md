@@ -9,9 +9,10 @@ This file is the quick-start context for agents working in this repository.
 - Current branch: `main`
 - Current state: Day-1 scaffold unpacked, installed, and extended with the first dev-plan slice.
 - Existing source documents:
-  - `REQUIREMENTS.md`: full product requirements for SHAMSU.
-  - `SHAMSU_week2_milestone_v2.md`: v0.2.0 implementation milestone focused on PRD-to-Django project generation.
-  - `SHAMSU_10day_dev_plan.md`: current 10-day build plan based on the scaffold zip.
+  - `agent context/REQUIREMENTS.md`: full product requirements for SHAMSU.
+  - `agent context/SHAMSU_week2_milestone_v2.md`: v0.2.0 implementation milestone focused on PRD-to-Django project generation.
+  - `agent context/SHAMSU_10day_dev_plan.md`: current 10-day build plan based on the scaffold zip.
+  - `agent context/PROGRESS.md`: live completed-feature and next-task tracker.
 
 ## Product Identity
 
@@ -148,7 +149,8 @@ The system is safety-first by design:
 
 ## Practical Next Implementation Path
 
-The scaffold package now exists. The next step is to continue the day-by-day plan from `SHAMSU_10day_dev_plan.md`.
+The scaffold package now exists. The next step is to continue the day-by-day plan from `agent context/SHAMSU_10day_dev_plan.md`.
+Update `agent context/PROGRESS.md` at the end of each feature slice.
 
 Completed first slice:
 
@@ -158,19 +160,22 @@ Completed first slice:
 - `indexer/walker.py` indexes project files into SQLite using streamed sha256 hashing.
 - `indexer/parser.py` extracts Python imports, classes, functions, methods, docstrings, signatures, and line ranges.
 - The file walker now writes symbols and searchable line-window snippets.
+- The file walker removes stale index rows after file moves/deletes.
 - `core/coordinator.py` routes requests and falls back to QA preview if Ollama is unavailable.
 - `agents/qa_workflow.py` wires `SearchAgentStub` to `ContextBuilder`.
 - `prd/parser.py` parses Markdown PRDs into `ParsedPRD`.
 - `prd/extractor.py` extracts `EntitySpec` values from PRD entity sections.
+- `prd/project.py` assembles `ProjectSpec` values.
+- `templates/django/constants.py` and `templates/django/renderer.py` provide deterministic fixed Django generation.
 - `safety/approval.py` displays Rich approval panels.
-- `cli/repl.py` supports `index`, `parse-prd <file.md>`, and QA context preview.
+- `cli/repl.py` supports `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file.md>`, and QA context preview.
 
 Recommended next slice:
 
-1. `templates/django/`: add fixed Django template constants.
-2. Assemble `ProjectSpec` from parsed PRDs and extracted entities.
-3. Add deterministic Django settings/base template rendering.
-4. Add CLI commands for status and real indexed search.
+1. Add command runner with safety gates.
+2. Add patch validation and Rich preview.
+3. Add deterministic Django project writer behind approval.
+4. Add `ProjectSpec` JSON preview command for PRDs.
 5. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
 
 ## Suggested Initial File Layout
@@ -224,7 +229,7 @@ Current repository inspection:
 ```powershell
 git status --short --branch
 git log --oneline -5
-rg -n "^(#|##|###) " REQUIREMENTS.md SHAMSU_week2_milestone_v2.md
+rg -n "^(#|##|###) " "agent context"
 python -m pytest tests/ -v
 python -m ruff check shamsu tests
 python -m shamsu.indexer.walker
@@ -240,7 +245,7 @@ exit
 '@ | python -m shamsu.cli.repl
 
 @'
-parse-prd SHAMSU_10day_dev_plan.md
+parse-prd "agent context/SHAMSU_10day_dev_plan.md"
 exit
 '@ | python -m shamsu.cli.repl
 ```

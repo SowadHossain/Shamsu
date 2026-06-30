@@ -33,18 +33,24 @@ Included and working:
 - Recursive project file walker
 - Python AST symbol parser
 - Searchable snippet indexing through SQLite FTS5
+- Stale index cleanup after file moves/deletes
 - Markdown PRD parser
 - Rule-based PRD entity extractor
+- `ProjectSpec` assembly from PRDs
+- Fixed Django template constants and renderer
 - Rich approval prompt
 - Thin coordinator and QA context preview workflow
+- CLI status/search/symbol lookup commands
 - Baseline tests and CI configuration
 
-The repo also includes product and milestone docs:
+The repo also includes product, milestone, and agent-memory docs under
+`agent context/`:
 
-- `REQUIREMENTS.md`
-- `SHAMSU_10day_dev_plan.md`
-- `SHAMSU_week2_milestone_v2.md`
-- `AGENTS.md`
+- `agent context/REQUIREMENTS.md`
+- `agent context/SHAMSU_10day_dev_plan.md`
+- `agent context/SHAMSU_week2_milestone_v2.md`
+- `agent context/AGENTS.md`
+- `agent context/PROGRESS.md`
 
 ## Install
 
@@ -71,7 +77,7 @@ python -m ruff check shamsu tests
 Expected current result:
 
 ```text
-32 passed
+36 passed
 All checks passed!
 ```
 
@@ -91,6 +97,9 @@ Available Day-1 commands:
 
 ```text
 index
+status
+search <query>
+symbols <name>
 parse-prd <file.md>
 help
 exit
@@ -114,7 +123,7 @@ Parse a Markdown PRD-like document:
 
 ```powershell
 @'
-parse-prd SHAMSU_10day_dev_plan.md
+parse-prd "agent context/SHAMSU_10day_dev_plan.md"
 exit
 '@ | python -m shamsu.cli.repl
 ```
@@ -144,11 +153,13 @@ shamsu/
   templates/       Future Django/frontend templates
   tools/           Future command and git tools
 tests/
+agent context/     Planning docs, agent context, and progress tracker
 ```
 
 ## Development Plan
 
-The active plan is `SHAMSU_10day_dev_plan.md`.
+The active plan is `agent context/SHAMSU_10day_dev_plan.md`.
+The live implementation ledger is `agent context/PROGRESS.md`.
 
 Completed Day-1 work:
 
@@ -170,13 +181,18 @@ Completed next slice:
   real repository content through FTS5.
 - Added `prd/extractor.py` to turn `## Entities` sections into `EntitySpec`
   objects.
+- Added stale index cleanup when files are moved or deleted.
+- Added fixed Django template constants and a deterministic renderer.
+- Added `ProjectSpec` assembly from parsed PRDs and extracted entities.
+- Added CLI `status`, `search <query>`, and `symbols <name>`.
+- CLI QA preview now uses real indexed search when an index exists.
 
 Recommended next slice:
 
-1. Add fixed Django template constants under `shamsu/templates/django/`.
-2. Add `ProjectSpec` assembly from parsed PRDs and extracted entities.
-3. Add a deterministic Django settings/base template renderer.
-4. Add CLI commands for status and real indexed search.
+1. Add command runner with safety gates.
+2. Add patch validation and Rich preview.
+3. Add deterministic Django project writer behind approval.
+4. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Safety Principles
 
@@ -198,3 +214,5 @@ SHAMSU is safety-first:
 - Keep memory use low; avoid loading full projects into memory.
 - Add tests with each feature slice.
 - Run `pytest` and `ruff` before handing off.
+- Update `agent context/PROGRESS.md` whenever a feature slice is completed or
+  the next task changes.
