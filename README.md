@@ -2,98 +2,146 @@
 
 Local-first autonomous coding agent for low-resource machines.
 
-SHAMSU is designed to work like a lightweight coding teammate that can inspect,
-index, understand, edit, audit, fix, test, document, and eventually generate
-software projects from PRDs without relying on expensive cloud AI APIs.
+SHAMSU is being built as a lightweight coding teammate that can inspect,
+index, search, explain, parse PRDs, and eventually edit, fix, test, document,
+and generate software projects without depending on expensive cloud AI APIs.
 
-The core idea is simple:
+The core rule:
 
-> Use tools to find the right context, then use a small local model to reason
-> over that context.
+> Use deterministic tools to find the right context, then use a small local
+> model to reason over that context.
 
-SHAMSU should not throw an entire codebase into an LLM prompt. It should use
-deterministic indexing, search, parsing, retrieval, validation, patching, and
-safety checks first, then call local models only where language reasoning or
-generation is useful.
+SHAMSU should not dump a whole codebase into an LLM prompt. It indexes and
+retrieves relevant files first, then builds a compact context pack.
 
-## Current Status
+## Current Capability
 
-This repository now contains the Day-1 scaffold from the development plan plus
-the first working implementation slice.
+Working now:
 
-Included and working:
-
-- Python package scaffold in `shamsu/`
-- CLI entrypoint: `shamsu`
-- SQLite storage schema with FTS5 tables
-- Search agent stub and initial FTS5 search implementation
-- Context builder with snippet packing and middle truncation
-- LLM manager with routing JSON parsing and repair fallback
-- Workspace sandbox and command risk classification
-- Recursive project file walker
-- Python AST symbol parser
-- Searchable snippet indexing through SQLite FTS5
-- Stale index cleanup after file moves/deletes
-- Markdown PRD parser
-- Rule-based PRD entity extractor
+- CLI REPL through `shamsu`
+- Workspace-scoped indexing into `.shamsu/index.db`
+- SQLite FTS5 snippet search
+- Python symbol extraction with `ast`
+- Stale index cleanup when files move or disappear
+- Markdown PRD parsing
+- Rule-based PRD entity extraction
 - `ProjectSpec` assembly from PRDs
 - Fixed Django template constants and renderer
-- Rich approval prompt
-- Thin coordinator and QA context preview workflow
-- CLI status/search/symbol lookup commands
-- Baseline tests and CI configuration
+- QA context preview using real indexed search when an index exists
+- Workspace path sandbox for file inputs such as `parse-prd`
+- Command risk classifier and secret redaction helpers
+- Internal command runner with workspace checks, blocked-command rejection,
+  approval gates, timeouts, captured output, and redaction
+- Agent progress tracking in `agent context/PROGRESS.md`
 
-The repo also includes product, milestone, and agent-memory docs under
-`agent context/`:
+Planned next:
 
-- `agent context/REQUIREMENTS.md`
-- `agent context/SHAMSU_10day_dev_plan.md`
-- `agent context/SHAMSU_week2_milestone_v2.md`
-- `agent context/AGENTS.md`
-- `agent context/PROGRESS.md`
+- Patch validation and Rich diff preview
+- Writing generated Django files behind approval
+- Full PRD-to-Django project generation
+- Local Ollama-backed specialist responses beyond preview mode
 
-## Install
+## Requirements
 
-Use Python 3.11 or newer.
+- Python 3.11 or newer
+- PowerShell on Windows, or Bash on Linux/macOS
+- Optional: Ollama for local model calls
 
-```powershell
-python -m pip install -e ".[dev]"
-```
+The current CLI works without Ollama. If Ollama is not running, SHAMSU falls
+back to a safe QA preview instead of crashing.
 
-## Verify
+## Safe Install
 
-Run the test suite:
+The recommended install uses a repo-local virtual environment:
 
-```powershell
-python -m pytest tests/ -v
-```
+- Creates `.venv/` inside this repository
+- Installs SHAMSU into that `.venv`
+- Does not install packages into global Python
+- Does not edit PATH, shell profiles, registry, or system files
 
-Run lint:
+This is dependency isolation plus SHAMSU's workspace sandbox. It is not a full
+Docker or OS-level sandbox.
 
-```powershell
-python -m ruff check shamsu tests
-```
+### Windows PowerShell
 
-Expected current result:
-
-```text
-36 passed
-All checks passed!
-```
-
-## Run The CLI
+From the SHAMSU repo root:
 
 ```powershell
-python -m shamsu.cli.repl
+.\scripts\install.ps1
 ```
 
-or, after editable install:
+If PowerShell blocks script execution on your machine, run:
 
 ```powershell
-shamsu
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Available Day-1 commands:
+### Linux/macOS Bash
+
+From the SHAMSU repo root:
+
+```bash
+bash scripts/install.sh
+```
+
+If your Python command is not `python3`, choose one explicitly:
+
+```bash
+PYTHON=python3.11 bash scripts/install.sh
+```
+
+## Run SHAMSU Safely
+
+SHAMSU treats the selected workspace as the project boundary. Indexes and
+local state are written under that workspace's `.shamsu/` folder.
+
+### Run From The Current Folder
+
+Go to the project folder you want SHAMSU to inspect, then run the repo script.
+
+Windows:
+
+```powershell
+cd F:\Work\some-project
+& "F:\Work\PROJECTS\shamsu\Shamsu\scripts\run-shamsu.ps1"
+```
+
+Linux/macOS:
+
+```bash
+cd /path/to/some-project
+/path/to/Shamsu/scripts/run-shamsu.sh
+```
+
+### Run With An Explicit Workspace
+
+Windows:
+
+```powershell
+& .\scripts\run-shamsu.ps1 -Workspace "F:\Work\some-project"
+```
+
+Direct Python:
+
+```powershell
+.\.venv\Scripts\python.exe -m shamsu.cli.repl --workspace "F:\Work\some-project"
+```
+
+Bash:
+
+```bash
+SHAMSU_WORKSPACE=/path/to/some-project scripts/run-shamsu.sh
+```
+
+## CLI Commands
+
+Start the REPL:
+
+```powershell
+.\scripts\run-shamsu.ps1
+```
+
+Inside the REPL:
 
 ```text
 index
@@ -105,114 +153,232 @@ help
 exit
 ```
 
-Any other text is treated as a natural-language request. For now, the
-coordinator routes it and builds a QA context preview. If Ollama is not running,
-the coordinator falls back safely to QA mode instead of crashing.
+### `index`
 
-Example smoke test:
+Indexes the selected workspace.
+
+```text
+shamsu> index
+```
+
+Creates or updates:
+
+```text
+.shamsu/index.db
+```
+
+The index includes file metadata, Python symbols, and searchable text snippets.
+
+### `status`
+
+Shows index counts.
+
+```text
+shamsu> status
+Files: 53
+Symbols: 313
+Snippets: 181
+```
+
+### `search <query>`
+
+Searches indexed snippets with SQLite FTS5.
+
+```text
+shamsu> search authentication flow
+```
+
+### `symbols <name>`
+
+Looks up indexed symbols.
+
+```text
+shamsu> symbols build_project_spec
+```
+
+### `parse-prd <file.md>`
+
+Parses a Markdown PRD inside the workspace.
+
+```text
+shamsu> parse-prd "agent context/SHAMSU_10day_dev_plan.md"
+```
+
+Paths outside the workspace are rejected.
+
+### Natural-Language Request
+
+Any other text builds a routed QA context preview:
+
+```text
+shamsu> how does project spec work?
+```
+
+If an index exists, SHAMSU uses real indexed search to assemble the preview. If
+Ollama is unavailable, the routing step falls back to safe QA mode.
+
+## Smoke Test
+
+From the SHAMSU repo root after install:
 
 ```powershell
 @'
 index
-how does login work?
-exit
-'@ | python -m shamsu.cli.repl
-```
-
-Parse a Markdown PRD-like document:
-
-```powershell
-@'
+status
+search EntitySpec
+symbols build_project_spec
 parse-prd "agent context/SHAMSU_10day_dev_plan.md"
 exit
-'@ | python -m shamsu.cli.repl
+'@ | .\.venv\Scripts\python.exe -m shamsu.cli.repl --workspace .
 ```
 
-Run the file walker directly:
+## Verify Development Setup
+
+Run tests:
 
 ```powershell
-python -m shamsu.indexer.walker
+.\.venv\Scripts\python.exe -m pytest tests/ -q
 ```
+
+Run lint:
+
+```powershell
+.\.venv\Scripts\python.exe -m ruff check shamsu tests
+```
+
+Expected current result:
+
+```text
+51 passed
+All checks passed!
+```
+
+On Bash:
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+.venv/bin/python -m ruff check shamsu tests
+```
+
+## Safety Model
+
+SHAMSU currently has two safety layers.
+
+Dependency isolation:
+
+- Install scripts use only `.venv/`.
+- No global `pip install`.
+- No PATH or shell profile edits.
+
+Workspace sandbox:
+
+- The CLI resolves one workspace at startup.
+- `parse-prd` validates file paths with `Sandbox.validate()`.
+- Paths outside the workspace are rejected.
+- Index data stays inside `<workspace>/.shamsu/`.
+
+Internal command execution:
+
+- `CommandRunner` validates the requested working directory inside the
+  workspace before running anything.
+- Blocked commands are rejected without approval or execution.
+- Medium-risk and unknown commands require approval.
+- Captured command output is redacted before it is returned.
+- This runner is available internally for future workflows such as tests and
+  patch validation. It is not exposed as a general REPL command yet.
+
+Important limitation:
+
+- This is not a full OS sandbox.
+- This is not Docker isolation.
+- Future file writes, patching, and user-facing command execution still need
+  approval gates before they become public workflows.
+
+## Troubleshooting
+
+### Python Not Found
+
+Check your Python version:
+
+```powershell
+python --version
+```
+
+Use Python 3.11 or newer. On Bash, try:
+
+```bash
+python3 --version
+```
+
+### PowerShell Blocks Scripts
+
+Use a one-time bypass for this command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+This does not permanently change your execution policy.
+
+### Reinstall Dependencies
+
+Remove the local venv and reinstall.
+
+Windows:
+
+```powershell
+Remove-Item -Recurse -Force .\.venv
+.\scripts\install.ps1
+```
+
+Bash:
+
+```bash
+rm -rf .venv
+bash scripts/install.sh
+```
+
+### Rebuild The Index
+
+Inside the REPL:
+
+```text
+shamsu> index
+```
+
+Or delete the workspace index and re-run `index`:
+
+```powershell
+Remove-Item .\.shamsu\index.db*
+```
+
+Only do this inside the workspace you intend to re-index.
 
 ## Project Layout
 
 ```text
-shamsu/
-  agents/          Workflow agents, currently QA preview
-  cli/             REPL entrypoint
-  context/         Context packing and token budget helpers
-  core/            Coordinator
-  indexer/         File walking and future symbol parsing
-  llm/             Ollama-backed LLM manager
-  patch/           Future patch engine
-  prd/             PRD parsing and future extraction
-  retriever/       Search agents
-  safety/          Sandbox, command risk, approvals
-  skills/          Future reusable skills
-  storage/         SQLite schema
-  templates/       Future Django/frontend templates
-  tools/           Future command and git tools
-tests/
+shamsu/            Python package
+scripts/           Install and run wrappers
+tests/             Test suite
 agent context/     Planning docs, agent context, and progress tracker
+.shamsu/           Local SHAMSU state for this repo workspace
 ```
 
-## Development Plan
+Key agent docs:
 
-The active plan is `agent context/SHAMSU_10day_dev_plan.md`.
-The live implementation ledger is `agent context/PROGRESS.md`.
+- `agent context/AGENTS.md`
+- `agent context/PROGRESS.md`
+- `agent context/REQUIREMENTS.md`
+- `agent context/SHAMSU_10day_dev_plan.md`
+- `agent context/SHAMSU_week2_milestone_v2.md`
 
-Completed Day-1 work:
-
-- Unpacked scaffold and verified baseline tests.
-- Added `indexer/walker.py`.
-- Added `core/coordinator.py`.
-- Added `agents/qa_workflow.py`.
-- Added `prd/parser.py`.
-- Added `safety/approval.py`.
-- Updated `cli/repl.py` to exercise the working slices.
-
-Completed next slice:
-
-- Added `indexer/parser.py` using Python `ast` to extract functions, classes,
-  methods, imports, docstrings, signatures, and line ranges.
-- Updated the walker to write extracted symbols into the existing `symbols`
-  table.
-- Updated indexing to write line-window snippets so `SearchAgent` can search
-  real repository content through FTS5.
-- Added `prd/extractor.py` to turn `## Entities` sections into `EntitySpec`
-  objects.
-- Added stale index cleanup when files are moved or deleted.
-- Added fixed Django template constants and a deterministic renderer.
-- Added `ProjectSpec` assembly from parsed PRDs and extracted entities.
-- Added CLI `status`, `search <query>`, and `symbols <name>`.
-- CLI QA preview now uses real indexed search when an index exists.
-
-Recommended next slice:
-
-1. Add command runner with safety gates.
-2. Add patch validation and Rich preview.
-3. Add deterministic Django project writer behind approval.
-4. Add `ProjectSpec` JSON preview command for PRDs.
-
-## Safety Principles
-
-SHAMSU is safety-first:
-
-- Treat the active workspace as the boundary.
-- Block path traversal.
-- Block dangerous commands.
-- Require approval for risky commands and writes.
-- Prefer patch previews before edits.
-- Redact secrets in logs and outputs.
-- Do not send private code to external services.
-
-## Notes For Contributors
+## Contributor Notes
 
 - Keep `shamsu/types.py` and `shamsu/interfaces.py` stable unless the team
   explicitly agrees to change the shared contract.
 - Prefer deterministic tooling before LLM calls.
 - Keep memory use low; avoid loading full projects into memory.
 - Add tests with each feature slice.
-- Run `pytest` and `ruff` before handing off.
+- Run tests and lint before handoff.
 - Update `agent context/PROGRESS.md` whenever a feature slice is completed or
   the next task changes.

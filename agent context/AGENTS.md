@@ -168,15 +168,18 @@ Completed first slice:
 - `prd/project.py` assembles `ProjectSpec` values.
 - `templates/django/constants.py` and `templates/django/renderer.py` provide deterministic fixed Django generation.
 - `safety/approval.py` displays Rich approval panels.
-- `cli/repl.py` supports `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file.md>`, and QA context preview.
+- `cli/repl.py` supports `--workspace <path>`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file.md>`, and QA context preview.
+- `scripts/install.ps1` and `scripts/install.sh` install into repo-local `.venv`.
+- `scripts/run-shamsu.ps1` and `scripts/run-shamsu.sh` run SHAMSU from that `.venv` while preserving the caller workspace.
+- `parse-prd` file inputs are validated through `Sandbox.validate()`.
+- `tools/executor.py` provides an internal `CommandRunner` with workspace-bound `cwd` validation, blocked-command rejection, approval gates, timeout handling, output capture, and redaction.
 
 Recommended next slice:
 
-1. Add command runner with safety gates.
-2. Add patch validation and Rich preview.
-3. Add deterministic Django project writer behind approval.
-4. Add `ProjectSpec` JSON preview command for PRDs.
-5. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
+1. Add patch validation and Rich preview.
+2. Add deterministic Django project writer behind approval.
+3. Add `ProjectSpec` JSON preview command for PRDs.
+4. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
 
 ## Suggested Initial File Layout
 
@@ -233,6 +236,8 @@ rg -n "^(#|##|###) " "agent context"
 python -m pytest tests/ -v
 python -m ruff check shamsu tests
 python -m shamsu.indexer.walker
+.\scripts\install.ps1
+.\scripts\run-shamsu.ps1
 ```
 
 REPL smoke checks:

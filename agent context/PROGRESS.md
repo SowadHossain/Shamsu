@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete.
-- Tests: `36 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, and internal command runner complete.
+- Tests: `51 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-06-30
-- Current next focus: command runner with safety gates, then patch validation/preview.
+- Current next focus: patch validation and Rich preview.
 
 ## Completed Features
 
@@ -40,30 +40,29 @@ blocker.
 - [x] Updated REPL with `index`, `parse-prd <file.md>`, and QA preview.
 - [x] Added REPL `status`, `search <query>`, and `symbols <name>` commands.
 - [x] REPL QA preview uses real indexed search when `.shamsu/index.db` exists.
-- [x] Added README.
+- [x] Added detailed README with install, run, safety, usage, and troubleshooting sections.
+- [x] Added PowerShell install/run scripts using repo-local `.venv`.
+- [x] Added Bash install/run scripts using repo-local `.venv`.
+- [x] Added CLI `--workspace <path>` support.
+- [x] Added workspace sandbox validation for `parse-prd`.
 - [x] Moved planning and agent-memory docs into `agent context/`.
+- [x] Added internal `CommandRunner` with workspace validation, blocked-command rejection, approval gates, timeouts, captured output, and redaction.
+- [x] Added `CommandRunner.run_tests()` pytest summary parsing.
 
 ## In Progress
 
-- [ ] Command runner with safety gates.
 - [ ] Patch validation and preview.
 
 ## Next Queue
 
-1. Add command runner with safety gates:
-   - classify commands with `classify_command()`
-   - block `CommandRisk.BLOCKED`
-   - require approval for `CommandRisk.MEDIUM`
-   - run `CommandRisk.SAFE`
-   - capture stdout/stderr
-2. Add patch validation and preview:
+1. Add patch validation and preview:
    - validate unified diff headers
    - reject malformed hunks
    - show Rich diff preview
    - prepare rollback strategy
-3. Add real indexed QA workflow as the default after `index`.
-4. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-5. Add `ProjectSpec` JSON preview command for PRDs.
+2. Add real indexed QA workflow as the default after `index`.
+3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+4. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 
@@ -75,9 +74,9 @@ blocker.
 ## Verification Commands
 
 ```powershell
-python -m pytest tests/ -q
-python -m ruff check shamsu tests
-python -m shamsu.indexer.walker
+.\.venv\Scripts\python.exe -m pytest tests/ -q
+.\.venv\Scripts\python.exe -m ruff check shamsu tests
+.\scripts\run-shamsu.ps1
 ```
 
 ## Update Rule For Agents
