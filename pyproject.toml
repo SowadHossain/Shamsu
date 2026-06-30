@@ -1,0 +1,58 @@
+[project]
+name = "shamsu"
+version = "0.3.0"
+description = "Local AI coding agent — PRD to full Django web project, offline, sub-8GB RAM"
+requires-python = ">=3.11"
+dependencies = [
+    # CLI + output
+    "prompt_toolkit>=3.0",
+    "rich>=13.7",
+
+    # LLM client
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "instructor>=1.3",
+    "json-repair>=0.25",
+
+    # Retrieval — zero/near-zero RAM cost (see ENGINEERING_HARNESS.md)
+    "rank_bm25>=0.2",
+    # SQLite FTS5 is stdlib — no extra dependency
+
+    # Code parsing
+    "tree-sitter>=0.23",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-html",
+
+    # PRD parsing
+    "mistletoe>=1.3",
+    "pdfplumber>=0.10",
+
+    # Caching
+    "diskcache>=5.6",
+
+    # System
+    "psutil>=5.9",
+    "watchdog>=4.0",
+
+    # Keyword extraction (near-zero RAM, no model)
+    "yake>=0.4.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+shamsu = "shamsu.cli.repl:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

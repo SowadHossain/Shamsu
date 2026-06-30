@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.shamsu/index.db
+.shamsu/index.db-wal
+.shamsu/index.db-shm
+.shamsu/logs/*.jsonl
+.shamsu/tasks/*.json
+.shamsu/context/*.json
+*.sqlite3
+db.sqlite3
+.env
