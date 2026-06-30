@@ -10,6 +10,7 @@ import fnmatch
 import hashlib
 from pathlib import Path
 
+from shamsu.indexer.parser import build_line_windows, parse_python_symbols, read_text_file
 from shamsu.storage.schema import init_db
 from shamsu.types import IndexEntry
 
@@ -142,6 +143,7 @@ class FileWalker:
                     "SELECT id FROM files WHERE path = ?",
                     (relative_path,),
                 ).fetchone()[0]
+                self._replace_file_index(conn, file_id, path, language)
                 symbol_count = conn.execute(
                     "SELECT COUNT(*) FROM symbols WHERE file_id = ?",
                     (file_id,),
@@ -160,6 +162,51 @@ class FileWalker:
         finally:
             conn.close()
         return entries
+
+    @staticmethod
+    def _replace_file_index(conn, file_id: int, path: Path, language: str) -> None:
+        conn.execute("DELETE FROM symbols WHERE file_id = ?", (file_id,))
+        conn.execute("DELETE FROM snippets WHERE file_id = ?", (file_id,))
+
+        source = read_text_file(path)
+        if source is None:
+            return
+
+        for snippet in build_line_windows(source):
+            conn.execute(
+                """
+                INSERT INTO snippets (file_id, content, line_start, line_end, chunk_index)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    snippet.content,
+                    snippet.line_start,
+                    snippet.line_end,
+                    snippet.chunk_index,
+                ),
+            )
+
+        if language != "python":
+            return
+
+        for symbol in parse_python_symbols(source):
+            conn.execute(
+                """
+                INSERT INTO symbols
+                    (file_id, name, kind, line_start, line_end, signature, docstring)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    file_id,
+                    symbol.name,
+                    symbol.kind,
+                    symbol.line_start,
+                    symbol.line_end,
+                    symbol.signature,
+                    symbol.docstring,
+                ),
+            )
 
 
 if __name__ == "__main__":

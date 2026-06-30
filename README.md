@@ -31,7 +31,10 @@ Included and working:
 - LLM manager with routing JSON parsing and repair fallback
 - Workspace sandbox and command risk classification
 - Recursive project file walker
+- Python AST symbol parser
+- Searchable snippet indexing through SQLite FTS5
 - Markdown PRD parser
+- Rule-based PRD entity extractor
 - Rich approval prompt
 - Thin coordinator and QA context preview workflow
 - Baseline tests and CI configuration
@@ -68,7 +71,7 @@ python -m ruff check shamsu tests
 Expected current result:
 
 ```text
-29 passed
+32 passed
 All checks passed!
 ```
 
@@ -157,16 +160,23 @@ Completed Day-1 work:
 - Added `safety/approval.py`.
 - Updated `cli/repl.py` to exercise the working slices.
 
+Completed next slice:
+
+- Added `indexer/parser.py` using Python `ast` to extract functions, classes,
+  methods, imports, docstrings, signatures, and line ranges.
+- Updated the walker to write extracted symbols into the existing `symbols`
+  table.
+- Updated indexing to write line-window snippets so `SearchAgent` can search
+  real repository content through FTS5.
+- Added `prd/extractor.py` to turn `## Entities` sections into `EntitySpec`
+  objects.
+
 Recommended next slice:
 
-1. Add `indexer/parser.py` using Python `ast` to extract functions, classes,
-   imports, docstrings, signatures, and line ranges.
-2. Write extracted symbols into the existing `symbols` table.
-3. Add snippets during indexing so the real `SearchAgent` can search repo
-   content instead of relying on `SearchAgentStub`.
-4. Add `prd/extractor.py` to turn `## Entities` sections into `EntitySpec`
-   objects.
-5. Add fixed Django template constants under `shamsu/templates/django/`.
+1. Add fixed Django template constants under `shamsu/templates/django/`.
+2. Add `ProjectSpec` assembly from parsed PRDs and extracted entities.
+3. Add a deterministic Django settings/base template renderer.
+4. Add CLI commands for status and real indexed search.
 
 ## Safety Principles
 
@@ -188,4 +198,3 @@ SHAMSU is safety-first:
 - Keep memory use low; avoid loading full projects into memory.
 - Add tests with each feature slice.
 - Run `pytest` and `ruff` before handing off.
-

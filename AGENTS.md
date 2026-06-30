@@ -156,20 +156,22 @@ Completed first slice:
 - `pyproject.toml`, package files, `.github` CI config, and baseline tests are present.
 - Baseline scaffold tests pass.
 - `indexer/walker.py` indexes project files into SQLite using streamed sha256 hashing.
+- `indexer/parser.py` extracts Python imports, classes, functions, methods, docstrings, signatures, and line ranges.
+- The file walker now writes symbols and searchable line-window snippets.
 - `core/coordinator.py` routes requests and falls back to QA preview if Ollama is unavailable.
 - `agents/qa_workflow.py` wires `SearchAgentStub` to `ContextBuilder`.
 - `prd/parser.py` parses Markdown PRDs into `ParsedPRD`.
+- `prd/extractor.py` extracts `EntitySpec` values from PRD entity sections.
 - `safety/approval.py` displays Rich approval panels.
 - `cli/repl.py` supports `index`, `parse-prd <file.md>`, and QA context preview.
 
 Recommended next slice:
 
-1. `indexer/parser.py`: extract Python functions, classes, imports, docstrings, signatures, and line ranges with `ast`.
-2. Write extracted symbols into the existing `symbols` table.
-3. Add snippets for indexed files so the real `SearchAgent` can search repo content instead of the stub.
-4. `prd/extractor.py`: extract `EntitySpec` values from `## Entities` sections.
-5. `templates/django/`: add fixed Django template constants.
-6. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
+1. `templates/django/`: add fixed Django template constants.
+2. Assemble `ProjectSpec` from parsed PRDs and extracted entities.
+3. Add deterministic Django settings/base template rendering.
+4. Add CLI commands for status and real indexed search.
+5. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
 
 ## Suggested Initial File Layout
 
