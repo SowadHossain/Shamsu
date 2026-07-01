@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, and internal command runner complete.
-- Tests: `51 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, and patch validation/preview complete.
+- Tests: `60 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
-- Last verified: 2026-06-30
-- Current next focus: patch validation and Rich preview.
+- Last verified: 2026-07-01
+- Current next focus: patch application and rollback behind approval.
 
 ## Completed Features
 
@@ -48,18 +48,21 @@ blocker.
 - [x] Moved planning and agent-memory docs into `agent context/`.
 - [x] Added internal `CommandRunner` with workspace validation, blocked-command rejection, approval gates, timeouts, captured output, and redaction.
 - [x] Added `CommandRunner.run_tests()` pytest summary parsing.
+- [x] Added internal `PatchEngine` validation for unified diff headers, hunks, line counts, and workspace-safe paths.
+- [x] Added Rich patch preview with changed-file summary and colorized diff body.
+- [x] Kept patch `apply()` and `rollback()` as non-mutating stubs until the approval-backed apply slice.
 
 ## In Progress
 
-- [ ] Patch validation and preview.
+- [ ] Patch application and rollback behind approval.
 
 ## Next Queue
 
-1. Add patch validation and preview:
-   - validate unified diff headers
-   - reject malformed hunks
-   - show Rich diff preview
-   - prepare rollback strategy
+1. Add patch application and rollback behind approval:
+   - validate and preview before apply
+   - ask approval with patch summary
+   - create `.bak` backups before writes
+   - restore backups on apply failure
 2. Add real indexed QA workflow as the default after `index`.
 3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
 4. Add `ProjectSpec` JSON preview command for PRDs.

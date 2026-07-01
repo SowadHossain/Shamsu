@@ -173,10 +173,12 @@ Completed first slice:
 - `scripts/run-shamsu.ps1` and `scripts/run-shamsu.sh` run SHAMSU from that `.venv` while preserving the caller workspace.
 - `parse-prd` file inputs are validated through `Sandbox.validate()`.
 - `tools/executor.py` provides an internal `CommandRunner` with workspace-bound `cwd` validation, blocked-command rejection, approval gates, timeout handling, output capture, and redaction.
+- `patch/engine.py` validates unified diffs, checks hunk structure and counts, and rejects unsafe patch paths.
+- `patch/preview.py` renders Rich patch summaries and colorized diff previews.
 
 Recommended next slice:
 
-1. Add patch validation and Rich preview.
+1. Add patch application and rollback behind approval.
 2. Add deterministic Django project writer behind approval.
 3. Add `ProjectSpec` JSON preview command for PRDs.
 4. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.

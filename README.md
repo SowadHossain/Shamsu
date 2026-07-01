@@ -32,11 +32,12 @@ Working now:
 - Command risk classifier and secret redaction helpers
 - Internal command runner with workspace checks, blocked-command rejection,
   approval gates, timeouts, captured output, and redaction
+- Internal patch validation and Rich diff preview for unified diffs
 - Agent progress tracking in `agent context/PROGRESS.md`
 
 Planned next:
 
-- Patch validation and Rich diff preview
+- Patch application and rollback behind approval
 - Writing generated Django files behind approval
 - Full PRD-to-Django project generation
 - Local Ollama-backed specialist responses beyond preview mode
@@ -249,7 +250,7 @@ Run lint:
 Expected current result:
 
 ```text
-51 passed
+60 passed
 All checks passed!
 ```
 
@@ -287,12 +288,20 @@ Internal command execution:
 - This runner is available internally for future workflows such as tests and
   patch validation. It is not exposed as a general REPL command yet.
 
+Internal patch review:
+
+- `PatchEngine` validates unified diff structure before any apply workflow can
+  use it.
+- Patch paths are normalized and checked against the workspace sandbox.
+- `patch.preview` renders a Rich diff summary and colorized diff body.
+- Patch application and rollback are intentionally not enabled yet.
+
 Important limitation:
 
 - This is not a full OS sandbox.
 - This is not Docker isolation.
-- Future file writes, patching, and user-facing command execution still need
-  approval gates before they become public workflows.
+- Future file writes, patch application, rollback, and user-facing command
+  execution still need approval gates before they become public workflows.
 
 ## Troubleshooting
 
