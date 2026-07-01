@@ -6,8 +6,8 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, real indexed QA fallback, and audit workflow complete.
-- Tests: `67 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, real indexed QA fallback, audit workflow, and documentation proposal workflow complete.
+- Tests: `71 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-01
 - Current next focus: Dev A patch application/rollback, then Dev B code edit workflow and bug fix workflow.
@@ -58,12 +58,14 @@ blocker.
 - [x] Added real indexed QA as the default REPL behavior when `.shamsu/index.db` exists.
 - [x] Added explicit no-index fallback message instead of silently showing stub context.
 - [x] Added read-only audit workflow that uses indexed search, packs reviewer context, and parses structured findings.
+- [x] Added documentation proposal workflow that uses indexed context, calls `doc_agent`, and generates README unified diffs for review.
 
 ## In Progress
 
 - [ ] Patch application and rollback behind approval.
 - [ ] Code edit workflow end to end.
 - [ ] Bug fix workflow.
+- [ ] Documentation workflow patch application once patch apply lands.
 
 ## Next Queue
 
@@ -75,7 +77,7 @@ blocker.
 2. Add code edit workflow end to end once patch apply lands.
 3. Add bug fix workflow using indexed context and patch apply once patch apply lands.
 4. Add test generation workflow.
-5. Add documentation generation workflow.
+5. Wire documentation proposals into approval-backed patch apply once patch apply lands.
 6. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
 7. Add `ProjectSpec` JSON preview command for PRDs.
 

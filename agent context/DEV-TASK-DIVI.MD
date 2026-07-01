@@ -68,6 +68,9 @@ Do not create new GitHub issues for them unless a bug/regression is found.
 - [x] Issue 7 implementation is complete locally on `dev-b`: audit workflow uses
   indexed search, reviewer context, and structured findings without applying
   changes.
+- [x] Issue 9 proposal layer is complete locally on `dev-b`: documentation
+  workflow uses indexed context, calls `doc_agent`, and produces README diffs.
+  Approval-backed application still depends on Issue 1.
 
 The issue list below starts from remaining work only.
 
@@ -329,6 +332,9 @@ into `develop` merges.
   - Tests mock the LLM and command runner.
 
 ### Issue 9: Documentation Generation Workflow
+
+Status: proposal layer implemented locally on `dev-b`; approval-backed apply
+remains blocked by Issue 1.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:docs`, `area:llm`, `type:feature`,
