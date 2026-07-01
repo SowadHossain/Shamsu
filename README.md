@@ -16,6 +16,7 @@ retrieves relevant files first, then builds a compact context pack.
 
 ## Current Capability
 
+
 Working now:
 
 - CLI REPL through `shamsu`
