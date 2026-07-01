@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, and patch validation/preview complete.
-- Tests: `60 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, and patch apply/rollback complete.
+- Tests: `67 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-01
-- Current next focus: patch application and rollback behind approval.
+- Current next focus: re-index changed files after patch apply, then Dev B code edit workflow.
 
 ## Completed Features
 
@@ -50,7 +50,8 @@ blocker.
 - [x] Added `CommandRunner.run_tests()` pytest summary parsing.
 - [x] Added internal `PatchEngine` validation for unified diff headers, hunks, line counts, and workspace-safe paths.
 - [x] Added Rich patch preview with changed-file summary and colorized diff body.
-- [x] Kept patch `apply()` and `rollback()` as non-mutating stubs until the approval-backed apply slice.
+- [x] Added approval-backed patch `apply()` with validation, Rich preview, `.bak` backups, workspace safety, file create/delete support, and failure rollback.
+- [x] Added patch `rollback()` that restores `.bak` backups.
 - [x] Added `agent context/DEV-TASK-DIVI.MD` with remaining project work split into GitHub-issue-ready Dev A/B/C tasks.
 - [x] Added branch hierarchy and PR rules to `agent context/DEV-TASK-DIVI.MD`.
 - [x] Created GitHub core branches: `develop`, `dev-a`, `dev-b`, and `dev-c`.
@@ -58,18 +59,16 @@ blocker.
 
 ## In Progress
 
-- [ ] Patch application and rollback behind approval.
+- [ ] Re-index changed files after patch apply.
+- [ ] Code edit workflow end to end.
 
 ## Next Queue
 
-1. Add patch application and rollback behind approval:
-   - validate and preview before apply
-   - ask approval with patch summary
-   - create `.bak` backups before writes
-   - restore backups on apply failure
-2. Add real indexed QA workflow as the default after `index`.
-3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-4. Add `ProjectSpec` JSON preview command for PRDs.
+1. Re-index changed files after patch apply.
+2. Add code edit workflow end to end using patch apply.
+3. Add real indexed QA workflow as the default after `index`.
+4. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+5. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 

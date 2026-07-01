@@ -61,8 +61,9 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   and workspace-safe paths.
 - [x] Rich patch preview exists with changed-file summary and colorized diff
   body.
-- [x] Patch `apply()` and `rollback()` are intentionally non-mutating stubs until
-  Issue 1.
+- [x] Issue 1 implementation is complete locally on `dev-a`: approval-backed
+  patch apply, `.bak` backups, rollback, create/delete handling, and failure
+  restore.
 
 The issue list below starts from remaining work only.
 
@@ -186,6 +187,9 @@ ask for approval, apply it inside the workspace, roll back on failure, and
 re-index changed files.
 
 ### Issue 1: Patch Apply And Rollback Behind Approval
+
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:patch`, `area:safety`, `type:feature`,
