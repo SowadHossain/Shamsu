@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 1 merged to `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, and test generation workflow complete locally on `dev-b`.
-- Tests: `101 passed`
+- Status: Milestone 1 merged to `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, and CLI workflow routing complete locally on `dev-b`.
+- Tests: `105 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: open/merge Milestone 2 Dev B PR into `develop`, then coordinate CLI workflow routing with Dev C.
+- Current next focus: open/merge Milestone 2 workflow + CLI routing PR into `develop`, then start PRD-to-project planning and Django generation.
 
 ## Completed Features
 
@@ -67,17 +67,18 @@ blocker.
 - [x] Added bug fix workflow that parses traceback locations, gathers indexed context, calls the `bugfix` specialist, validates unified diffs, applies via `PatchEngine`, and reports changed files.
 - [x] Added test generation workflow that gathers indexed context, calls the `test_gen` specialist, validates pytest-oriented unified diffs, applies via `PatchEngine`, and can run tests through `CommandRunner`.
 - [x] Extended documentation workflow so README diffs can apply through approval-backed `PatchEngine` while preserving proposal-only behavior.
+- [x] Added Claude-like CLI routing with prompt-toolkit input, natural-language intent dispatch, keyword fallback when Ollama routing is unavailable, and explicit workflow commands for edit/fix/test-gen/audit/docs.
+- [x] Added LLM model aliases for `bugfix` and `test_gen` specialists so workflow names map to the intended local models.
 
 ## In Progress
 
-- [ ] CLI workflow routing for Milestone 2 workflows.
+- [ ] Review and merge Milestone 2 PR into `develop`.
 
 ## Next Queue
 
 1. Open/review Dev B Milestone 2 PR into `develop`.
-2. Coordinate Dev C CLI workflow routing for QA, code edit, bug fix, audit, test generation, and docs.
-3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-4. Add `ProjectSpec` JSON preview command for PRDs.
+2. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+3. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 

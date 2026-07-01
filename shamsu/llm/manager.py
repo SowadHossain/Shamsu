@@ -32,8 +32,10 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODELS = {
     "router": "phi3:mini-4k-instruct",
     "coder": "qwen2.5-coder:7b-instruct-q4_K_M",
+    "bugfix": "deepseek-coder:6.7b-instruct-q4_K_M",
     "bugfixer": "deepseek-coder:6.7b-instruct-q4_K_M",
     "reviewer": "mistral:7b-instruct-q4_K_M",
+    "test_gen": "qwen2.5-coder:7b-instruct-q4_K_M",
     "test_agent": "qwen2.5-coder:7b-instruct-q4_K_M",
     "planner": None,      # null = reuse router model, no swap
     "doc_agent": None,
@@ -43,7 +45,8 @@ OLLAMA_MODELS = {
 # Temperature per specialist — see ENGINEERING_HARNESS.md §1.
 SPECIALIST_TEMPS = {
     "router": 0.0, "planner": 0.1, "coder": 0.1,
-    "bugfixer": 0.1, "reviewer": 0.2, "test_agent": 0.1,
+    "bugfix": 0.1, "bugfixer": 0.1, "reviewer": 0.2,
+    "test_gen": 0.1, "test_agent": 0.1,
     "doc_agent": 0.4, "summarizer": 0.3, "qa": 0.2,
 }
 

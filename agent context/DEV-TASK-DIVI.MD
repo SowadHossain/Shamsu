@@ -12,8 +12,8 @@ Current baseline:
 - Indexing, Python symbols, FTS search, PRD parsing, `ProjectSpec`, fixed Django
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
-- Current verified state: `101 passed`, `ruff check shamsu tests` clean.
-- Next implementation focus: CLI workflow routing, then PRD-to-project planning and Django generation.
+- Current verified state: `105 passed`, `ruff check shamsu tests` clean.
+- Next implementation focus: PRD-to-project planning and Django generation.
 
 ## Already Done - Do Not Create Issues
 
@@ -89,6 +89,10 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   workflow gathers indexed context, calls `test_gen`, validates pytest-oriented
   unified diffs, applies through `PatchEngine`, and can run tests through
   `CommandRunner`.
+- [x] Issue 10 implementation is complete locally on `dev-b`: CLI workflow
+  routing gives SHAMSU a Claude-like prompt loop with prompt-toolkit input,
+  natural-language routing, keyword fallback, and explicit commands for edit,
+  fix, test-gen, audit, and docs.
 
 The issue list below starts from remaining work only.
 
@@ -385,6 +389,9 @@ into `develop` merges.
   - Tests cover mocked doc output.
 
 ### Issue 10: CLI Workflow Routing
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:cli`, `area:llm`, `type:feature`,
