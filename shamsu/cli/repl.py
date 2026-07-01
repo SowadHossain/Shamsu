@@ -14,6 +14,7 @@ from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.panel import Panel
@@ -415,18 +416,21 @@ def _strip_forced_prefix(user_input: str, command: str) -> str:
     return user_input
 
 
-def _make_prompt_session(workspace: Path) -> PromptSession:
+def _make_prompt_session(workspace: Path) -> PromptSession | None:
     style = Style.from_dict(
         {
             "prompt": "ansigreen bold",
             "workspace": "ansiblue",
         }
     )
-    return PromptSession(
-        history=InMemoryHistory(),
-        style=style,
-        bottom_toolbar=f"Workspace: {workspace} | help | index | exit",
-    )
+    try:
+        return PromptSession(
+            history=InMemoryHistory(),
+            style=style,
+            bottom_toolbar=f"Workspace: {workspace} | help | index | exit",
+        )
+    except NoConsoleScreenBufferError:
+        return None
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -445,7 +449,10 @@ def main(argv: list[str] | None = None) -> None:
 
     while True:
         try:
-            user_input = session.prompt([("class:prompt", "shamsu> ")]).strip()
+            if session is None:
+                user_input = input("shamsu> ").strip()
+            else:
+                user_input = session.prompt([("class:prompt", "shamsu> ")]).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
             sys.exit(0)
