@@ -14,7 +14,6 @@ from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
-from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.panel import Panel
@@ -33,6 +32,11 @@ from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.types import RoutingDecision, SearchResult
+
+if sys.platform == "win32":
+    from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
+else:
+    NoConsoleScreenBufferError = RuntimeError
 
 
 class EmptySearchAgent:
