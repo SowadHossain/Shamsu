@@ -69,7 +69,7 @@ def _print_help(console: Console) -> None:
                     "help                   Show commands",
                     "exit                   Quit",
                     "",
-                    "Any other text builds a QA context preview.",
+                    "Any other text runs indexed QA when Ollama is available.",
                 ]
             ),
             title="SHAMSU Commands",
@@ -197,6 +197,13 @@ async def _handle_request(user_input: str, workspace: Path, console: Console) ->
             indent=2,
         )
     )
+    if result.answer:
+        title = "Answer"
+        if result.model_used:
+            title = f"Answer ({result.model_used})"
+        console.print(Panel(result.answer, title=title))
+    elif result.fallback_reason:
+        console.print(f"[yellow]{result.fallback_reason}[/yellow]")
     if result.preview:
         console.print(Panel(result.preview, title="Context Preview"))
 

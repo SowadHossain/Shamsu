@@ -6,8 +6,8 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, real indexed QA fallback, audit workflow, and documentation proposal workflow complete.
-- Tests: `71 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, real indexed QA fallback, live QA integration, audit workflow, and documentation proposal workflow complete.
+- Tests: `72 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-01
 - Current next focus: Dev A patch application/rollback, then Dev B code edit workflow and bug fix workflow.
@@ -57,6 +57,7 @@ blocker.
 - [x] Enabled branch protection for `main` and `develop`.
 - [x] Added real indexed QA as the default REPL behavior when `.shamsu/index.db` exists.
 - [x] Added explicit no-index fallback message instead of silently showing stub context.
+- [x] Added live QA integration through `LLMManager.run_specialist("qa", ...)` with safe preview fallback when Ollama is unavailable.
 - [x] Added read-only audit workflow that uses indexed search, packs reviewer context, and parses structured findings.
 - [x] Added documentation proposal workflow that uses indexed context, calls `doc_agent`, and generates README unified diffs for review.
 

@@ -65,6 +65,9 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   Issue 1.
 - [x] Issue 5 implementation is complete locally on `dev-b`: real indexed QA is
   used when `.shamsu/index.db` exists, with a clear no-index fallback.
+- [x] Live QA integration is complete locally on `dev-b`: SHAMSU attempts the
+  local `qa` specialist through Ollama and falls back to the indexed context
+  preview if Ollama is unavailable.
 - [x] Issue 7 implementation is complete locally on `dev-b`: audit workflow uses
   indexed search, reviewer context, and structured findings without applying
   changes.
