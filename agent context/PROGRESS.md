@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, and patch validation/preview complete.
-- Tests: `60 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, and real indexed QA fallback complete.
+- Tests: `64 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-01
-- Current next focus: patch application and rollback behind approval.
+- Current next focus: Dev A patch application/rollback, then Dev B code edit workflow and bug fix workflow.
 
 ## Completed Features
 
@@ -55,10 +55,13 @@ blocker.
 - [x] Added branch hierarchy and PR rules to `agent context/DEV-TASK-DIVI.MD`.
 - [x] Created GitHub core branches: `develop`, `dev-a`, `dev-b`, and `dev-c`.
 - [x] Enabled branch protection for `main` and `develop`.
+- [x] Added real indexed QA as the default REPL behavior when `.shamsu/index.db` exists.
+- [x] Added explicit no-index fallback message instead of silently showing stub context.
 
 ## In Progress
 
 - [ ] Patch application and rollback behind approval.
+- [ ] Code edit workflow end to end.
 
 ## Next Queue
 
@@ -67,9 +70,10 @@ blocker.
    - ask approval with patch summary
    - create `.bak` backups before writes
    - restore backups on apply failure
-2. Add real indexed QA workflow as the default after `index`.
-3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-4. Add `ProjectSpec` JSON preview command for PRDs.
+2. Add code edit workflow end to end once patch apply lands.
+3. Add bug fix workflow using indexed context and patch apply.
+4. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+5. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 

@@ -21,6 +21,18 @@ from shamsu.indexer.walker import FileWalker
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.types import SearchResult
+
+
+class EmptySearchAgent:
+    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+        return []
+
+    def symbol_lookup(self, name: str) -> list[SearchResult]:
+        return []
+
+    def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+        return []
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -71,6 +83,12 @@ def _index_db_path(workspace: Path) -> Path:
 
 def _has_index(workspace: Path) -> bool:
     return _index_db_path(workspace).exists()
+
+
+def _build_workspace_qa_workflow(workspace: Path) -> tuple[QAWorkflow, bool]:
+    if _has_index(workspace):
+        return QAWorkflow(search=SearchAgent(_index_db_path(workspace))), True
+    return QAWorkflow(search=EmptySearchAgent()), False
 
 
 def _handle_index(workspace: Path, console: Console) -> None:
@@ -162,9 +180,11 @@ def _handle_symbols(user_input: str, workspace: Path, console: Console) -> None:
 
 
 async def _handle_request(user_input: str, workspace: Path, console: Console) -> None:
-    qa_workflow = None
-    if _has_index(workspace):
-        qa_workflow = QAWorkflow(search=SearchAgent(_index_db_path(workspace)))
+    qa_workflow, uses_real_index = _build_workspace_qa_workflow(workspace)
+    if not uses_real_index:
+        console.print(
+            "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
+        )
     result = await Coordinator(qa_workflow=qa_workflow).handle(user_input)
     console.print(
         json.dumps(

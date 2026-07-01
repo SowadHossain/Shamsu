@@ -63,6 +63,8 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   body.
 - [x] Patch `apply()` and `rollback()` are intentionally non-mutating stubs until
   Issue 1.
+- [x] Issue 5 implementation is complete locally on `dev-b`: real indexed QA is
+  used when `.shamsu/index.db` exists, with a clear no-index fallback.
 
 The issue list below starts from remaining work only.
 
@@ -256,6 +258,9 @@ Goal: SHAMSU can answer questions, edit code, fix bugs, audit projects, generate
 tests, and generate docs against an indexed workspace.
 
 ### Issue 5: Real Indexed QA As Default
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:index`, `type:feature`,
