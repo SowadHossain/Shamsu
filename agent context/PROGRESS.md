@@ -52,6 +52,9 @@ blocker.
 - [x] Added Rich patch preview with changed-file summary and colorized diff body.
 - [x] Kept patch `apply()` and `rollback()` as non-mutating stubs until the approval-backed apply slice.
 - [x] Added `agent context/DEV-TASK-DIVI.MD` with remaining project work split into GitHub-issue-ready Dev A/B/C tasks.
+- [x] Added branch hierarchy and PR rules to `agent context/DEV-TASK-DIVI.MD`.
+- [x] Created GitHub core branches: `develop`, `dev-a`, `dev-b`, and `dev-c`.
+- [x] Enabled branch protection for `main` and `develop`.
 
 ## In Progress
 
@@ -73,6 +76,8 @@ blocker.
 - Keep `shamsu/types.py` and `shamsu/interfaces.py` stable unless the team explicitly agrees to change the contract.
 - The root README is for humans; `agent context/AGENTS.md` and this file are for future agent handoff.
 - `agent context/DEV-TASK-DIVI.MD` is the issue/PR planning board for the remaining MVP work.
+- Feature work should branch from `develop` and merge back through PRs. `main`
+  is protected for stable milestone merges only.
 - `SHAMSU_day1_scaffold.zip` remains at the repo root as the original scaffold artifact.
 - Some copied planning docs contain mojibake. Avoid broad formatting churn unless asked.
 

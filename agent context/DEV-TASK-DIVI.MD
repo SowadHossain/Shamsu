@@ -98,6 +98,9 @@ Dev C owns product generation, CLI, and safety:
 - Use branch names exactly as listed unless the issue scope changes.
 - Every PR should include `Closes #ISSUE_NUMBER`.
 - Keep PRs small enough to review in one sitting.
+- Do not push feature work directly to `main`.
+- Merge normal work into `develop` first, then merge stable milestone batches
+  from `develop` into `main`.
 - Do not change `shamsu/types.py` or `shamsu/interfaces.py` unless the issue
   explicitly says "contract change" and all devs agree.
 - Every PR must update `agent context/PROGRESS.md` when it changes completed
@@ -125,6 +128,56 @@ GitHub assignee map:
   20, 21, 22, 25, 29, 30, 31, 32, 37.
 - Dev C / Dev 3 / `abidjan00`: Issues 10, 11, 12, 13, 15, 16, 19, 24, 26,
   28, 33, 34, 38, 39.
+
+## Branch Hierarchy
+
+Protected/shared branches:
+
+- `main`: stable branch only. No direct feature pushes. Merge into this only
+  after a milestone is green on `develop`.
+- `develop`: integration branch for active team work. Feature PRs target this
+  branch first.
+- `dev-a`, `dev-b`, `dev-c`: optional owner staging branches for each dev when
+  they want to group multiple feature branches before opening a PR to `develop`.
+
+Normal working branches:
+
+- `feature/dev-a/<issue-slug>` for Dev A feature issues.
+- `feature/dev-b/<issue-slug>` for Dev B feature issues.
+- `feature/dev-c/<issue-slug>` for Dev C feature issues.
+- `fix/dev-a/<issue-slug>`, `fix/dev-b/<issue-slug>`,
+  `fix/dev-c/<issue-slug>` for bugfix branches.
+- `release/<version>` for final stabilization before tagging.
+
+Required PR flow:
+
+```text
+feature/dev-x/<issue-slug> -> develop
+develop -> main
+```
+
+Optional owner staging flow:
+
+```text
+feature/dev-x/<issue-slug> -> dev-x -> develop
+```
+
+Recommended branch protection:
+
+- `main`: require PR, require at least 1 approval, require tests/lint, require
+  up-to-date branch, block force pushes, block direct pushes.
+- `develop`: require PR, require tests/lint, require at least 1 approval when
+  practical, block force pushes.
+
+Examples:
+
+```powershell
+git checkout develop
+git pull
+git checkout -b feature/dev-b/real-indexed-qa
+
+git push -u origin feature/dev-b/real-indexed-qa
+```
 
 ## Milestone 1: Safe Edit Loop
 
