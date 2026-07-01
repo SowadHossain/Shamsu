@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 1 complete locally; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, and documentation proposal workflow complete.
-- Tests: `91 passed`
+- Status: Milestone 1 merged to `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, and test generation workflow complete locally on `dev-b`.
+- Tests: `101 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
-- Last verified: 2026-07-01
-- Current next focus: merge Milestone 1 PRs, then bug fix workflow and test generation workflow.
+- Last verified: 2026-07-02
+- Current next focus: open/merge Milestone 2 Dev B PR into `develop`, then coordinate CLI workflow routing with Dev C.
 
 ## Completed Features
 
@@ -64,21 +64,20 @@ blocker.
 - [x] Added live QA integration through `LLMManager.run_specialist("qa", ...)` with safe preview fallback when Ollama is unavailable.
 - [x] Added read-only audit workflow that uses indexed search, packs reviewer context, and parses structured findings.
 - [x] Added documentation proposal workflow that uses indexed context, calls `doc_agent`, and generates README unified diffs for review.
+- [x] Added bug fix workflow that parses traceback locations, gathers indexed context, calls the `bugfix` specialist, validates unified diffs, applies via `PatchEngine`, and reports changed files.
+- [x] Added test generation workflow that gathers indexed context, calls the `test_gen` specialist, validates pytest-oriented unified diffs, applies via `PatchEngine`, and can run tests through `CommandRunner`.
+- [x] Extended documentation workflow so README diffs can apply through approval-backed `PatchEngine` while preserving proposal-only behavior.
 
 ## In Progress
 
-- [ ] Bug fix workflow.
-- [ ] Test generation workflow.
-- [ ] Documentation workflow patch application.
+- [ ] CLI workflow routing for Milestone 2 workflows.
 
 ## Next Queue
 
-1. Merge/review Milestone 1 PRs into `develop`.
-2. Add bug fix workflow using indexed context and patch apply.
-3. Add test generation workflow.
-4. Wire documentation proposals into approval-backed patch apply.
-5. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-6. Add `ProjectSpec` JSON preview command for PRDs.
+1. Open/review Dev B Milestone 2 PR into `develop`.
+2. Coordinate Dev C CLI workflow routing for QA, code edit, bug fix, audit, test generation, and docs.
+3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+4. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 

@@ -8,12 +8,13 @@ README-style Markdown, and can produce a unified diff for review.
 from __future__ import annotations
 
 import difflib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from shamsu.context.builder import ContextBuilder
-from shamsu.interfaces import IContextBuilder, ILLMManager, ISearchAgent
+from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.manager import LLMManager
+from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.types import ContextPack, SearchResult
 
 DOC_SYSTEM_INSTRUCTIONS = """Generate concise, accurate project documentation from
@@ -30,16 +31,28 @@ class DocumentationProposal:
     raw_response: str
 
 
+@dataclass(frozen=True)
+class DocumentationApplyResult:
+    proposal: DocumentationProposal
+    changed_files: list[str] = field(default_factory=list)
+    applied: bool = False
+    error: str = ""
+
+
 class DocumentationWorkflow:
     def __init__(
         self,
         search: ISearchAgent,
         llm: ILLMManager | None = None,
         context_builder: IContextBuilder | None = None,
+        workspace_root: Path | None = None,
+        patch_engine: IPatchEngine | None = None,
     ) -> None:
         self.search = search
         self.llm = llm or LLMManager()
         self.context_builder = context_builder or ContextBuilder()
+        self.workspace_root = Path(workspace_root).resolve() if workspace_root else None
+        self.patch_engine = patch_engine
 
     async def propose_readme_update(
         self,
@@ -65,6 +78,60 @@ class DocumentationWorkflow:
             markdown=markdown,
             diff_text=diff_text,
             raw_response=response.raw,
+        )
+
+    async def apply_readme_update(
+        self,
+        workspace_root: Path | None = None,
+        request: str = "Generate README documentation for this project.",
+        target_path: str = "README.md",
+    ) -> DocumentationApplyResult:
+        root = Path(workspace_root).resolve() if workspace_root else self.workspace_root
+        if root is None:
+            empty_pack = self.context_builder.pack(
+                results=[],
+                request=request,
+                task_id="doc-generation",
+                step_id=1,
+                specialist="doc_agent",
+            )
+            return DocumentationApplyResult(
+                proposal=DocumentationProposal(
+                    request=request,
+                    pack=empty_pack,
+                    markdown="",
+                    diff_text="",
+                    raw_response="",
+                ),
+                error="Workspace root is required to apply documentation updates.",
+            )
+
+        existing_readme = load_existing_readme(root, target_path)
+        proposal = await self.propose_readme_update(
+            existing_readme=existing_readme,
+            request=request,
+            target_path=target_path,
+        )
+        engine = self.patch_engine or PatchEngine(root)
+        ok, error = engine.validate_diff(proposal.diff_text)
+        if not ok:
+            return DocumentationApplyResult(
+                proposal=proposal,
+                error=f"Invalid diff: {error}",
+            )
+
+        changed_files = [patch.display_path for patch in parse_unified_diff(proposal.diff_text)]
+        applied = engine.apply(proposal.diff_text, root)
+        if not applied:
+            return DocumentationApplyResult(
+                proposal=proposal,
+                changed_files=changed_files,
+                error="Patch was not applied.",
+            )
+        return DocumentationApplyResult(
+            proposal=proposal,
+            changed_files=changed_files,
+            applied=True,
         )
 
     def _search_for_documentation_context(self, request: str) -> list[SearchResult]:
