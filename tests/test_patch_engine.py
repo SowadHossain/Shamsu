@@ -4,8 +4,10 @@ from io import StringIO
 
 from rich.console import Console
 
+from shamsu.indexer.walker import FileWalker
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.patch.preview import print_diff_preview
+from shamsu.retriever.search import SearchAgent
 from shamsu.safety.sandbox import Sandbox
 
 
@@ -250,3 +252,59 @@ def test_apply_rejects_outside_workspace_path(tmp_path):
     engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
 
     assert engine.apply(diff, tmp_path) is False
+
+
+def test_apply_reindexes_modified_python_file(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("def old_name():\n    return 1\n", encoding="utf-8")
+    FileWalker(tmp_path).index()
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+-def old_name():
++def new_name():
+     return 1
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+
+    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
+    assert search.symbol_lookup("new_name")
+    assert search.symbol_lookup("old_name") == []
+    assert search.search("new_name")
+
+
+def test_apply_indexes_created_python_file(tmp_path):
+    FileWalker(tmp_path).index()
+    diff = """--- /dev/null
++++ b/new_module.py
+@@ -0,0 +1,2 @@
++def generated_symbol():
++    return True
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+
+    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
+    assert search.symbol_lookup("generated_symbol")
+
+
+def test_apply_removes_deleted_file_from_index(tmp_path):
+    target = tmp_path / "dead.py"
+    target.write_text("def removed_symbol():\n    return False\n", encoding="utf-8")
+    FileWalker(tmp_path).index()
+    diff = """--- a/dead.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def removed_symbol():
+-    return False
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+
+    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
+    assert search.symbol_lookup("removed_symbol") == []
+    assert search.search("removed_symbol") == []

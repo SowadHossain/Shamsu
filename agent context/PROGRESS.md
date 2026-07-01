@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, and patch apply/rollback complete.
-- Tests: `67 passed`
+- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, and read-only git tooling complete.
+- Tests: `76 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-01
-- Current next focus: re-index changed files after patch apply, then Dev B code edit workflow.
+- Current next focus: Dev B code edit workflow.
 
 ## Completed Features
 
@@ -52,6 +52,8 @@ blocker.
 - [x] Added Rich patch preview with changed-file summary and colorized diff body.
 - [x] Added approval-backed patch `apply()` with validation, Rich preview, `.bak` backups, workspace safety, file create/delete support, and failure rollback.
 - [x] Added patch `rollback()` that restores `.bak` backups.
+- [x] Added automatic full index refresh after successful patch apply so modified, created, and deleted files are reflected in `.shamsu/index.db`.
+- [x] Added read-only git helper for `git status --short`, `git diff`, and dirty-worktree warnings.
 - [x] Added `agent context/DEV-TASK-DIVI.MD` with remaining project work split into GitHub-issue-ready Dev A/B/C tasks.
 - [x] Added branch hierarchy and PR rules to `agent context/DEV-TASK-DIVI.MD`.
 - [x] Created GitHub core branches: `develop`, `dev-a`, `dev-b`, and `dev-c`.
@@ -59,16 +61,14 @@ blocker.
 
 ## In Progress
 
-- [ ] Re-index changed files after patch apply.
 - [ ] Code edit workflow end to end.
 
 ## Next Queue
 
-1. Re-index changed files after patch apply.
-2. Add code edit workflow end to end using patch apply.
-3. Add real indexed QA workflow as the default after `index`.
-4. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-5. Add `ProjectSpec` JSON preview command for PRDs.
+1. Add code edit workflow end to end using patch apply.
+2. Add real indexed QA workflow as the default after `index`.
+3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+4. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 

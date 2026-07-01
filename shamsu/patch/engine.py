@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from shamsu.indexer.walker import FileWalker
 from shamsu.interfaces import IPatchEngine
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox, SecurityError
@@ -131,6 +132,7 @@ class PatchEngine(IPatchEngine):
                 if created.exists():
                     created.unlink()
             return False
+        FileWalker(self.workspace_root).index()
         return True
 
     def rollback(self, file_path: Path) -> bool:

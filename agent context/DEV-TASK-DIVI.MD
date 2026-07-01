@@ -64,6 +64,10 @@ Do not create new GitHub issues for them unless a bug/regression is found.
 - [x] Issue 1 implementation is complete locally on `dev-a`: approval-backed
   patch apply, `.bak` backups, rollback, create/delete handling, and failure
   restore.
+- [x] Issue 2 implementation is complete locally on `dev-a`: successful patch
+  apply refreshes the workspace index and keeps `.bak` files out of the index.
+- [x] Issue 3 implementation is complete locally on `dev-a`: read-only git
+  status/diff helper reports dirty worktrees without git write commands.
 
 The issue list below starts from remaining work only.
 
@@ -212,6 +216,9 @@ into `develop` merges.
 
 ### Issue 2: Re-Index Changed Files After Patch Apply
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:index`, `area:patch`, `type:feature`,
   `priority:p1`
@@ -225,6 +232,9 @@ into `develop` merges.
   - Tests prove search results reflect the post-patch state.
 
 ### Issue 3: Git Status And Diff Read-Only Tooling
+
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:patch`, `area:safety`, `type:feature`,
