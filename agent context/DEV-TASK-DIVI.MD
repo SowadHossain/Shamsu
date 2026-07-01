@@ -61,8 +61,27 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   and workspace-safe paths.
 - [x] Rich patch preview exists with changed-file summary and colorized diff
   body.
-- [x] Patch `apply()` and `rollback()` are intentionally non-mutating stubs until
-  Issue 1.
+- [x] Issue 1 implementation is complete locally on `dev-a`: approval-backed
+  patch apply, `.bak` backups, rollback, create/delete handling, and failure
+  restore.
+- [x] Issue 2 implementation is complete locally on `dev-a`: successful patch
+  apply refreshes the workspace index and keeps `.bak` files out of the index.
+- [x] Issue 3 implementation is complete locally on `dev-a`: read-only git
+  status/diff helper reports dirty worktrees without git write commands.
+- [x] Issue 5 implementation is complete locally on `dev-b`: real indexed QA is
+  used when `.shamsu/index.db` exists, with a clear no-index fallback.
+- [x] Live QA integration is complete locally on `dev-b`: SHAMSU attempts the
+  local `qa` specialist through Ollama and falls back to the indexed context
+  preview if Ollama is unavailable.
+- [x] Issue 7 implementation is complete locally on `dev-b`: audit workflow uses
+  indexed search, reviewer context, and structured findings without applying
+  changes.
+- [x] Issue 9 proposal layer is complete locally on `dev-b`: documentation
+  workflow uses indexed context, calls `doc_agent`, and produces README diffs.
+  Approval-backed application still depends on Issue 1.
+- [x] Issue 4 implementation is complete locally on `dev-b`: code edit workflow
+  searches indexed context, calls `coder`, validates diff output, applies via
+  `PatchEngine`, and reports changed files.
 
 The issue list below starts from remaining work only.
 
@@ -187,6 +206,9 @@ re-index changed files.
 
 ### Issue 1: Patch Apply And Rollback Behind Approval
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:patch`, `area:safety`, `type:feature`,
   `priority:p0`
@@ -208,6 +230,9 @@ re-index changed files.
 
 ### Issue 2: Re-Index Changed Files After Patch Apply
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:index`, `area:patch`, `type:feature`,
   `priority:p1`
@@ -222,6 +247,9 @@ re-index changed files.
 
 ### Issue 3: Git Status And Diff Read-Only Tooling
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:patch`, `area:safety`, `type:feature`,
   `priority:p1`
@@ -235,6 +263,9 @@ re-index changed files.
   - Tests cover clean repo, dirty file, and non-git workspace behavior.
 
 ### Issue 4: Code Edit Workflow End To End
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:patch`, `type:feature`,
@@ -256,6 +287,9 @@ Goal: SHAMSU can answer questions, edit code, fix bugs, audit projects, generate
 tests, and generate docs against an indexed workspace.
 
 ### Issue 5: Real Indexed QA As Default
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:index`, `type:feature`,
@@ -288,6 +322,9 @@ tests, and generate docs against an indexed workspace.
 
 ### Issue 7: Audit Workflow
 
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:safety`, `type:feature`,
   `priority:p1`
@@ -318,6 +355,9 @@ tests, and generate docs against an indexed workspace.
   - Tests mock the LLM and command runner.
 
 ### Issue 9: Documentation Generation Workflow
+
+Status: proposal layer implemented locally on `dev-b`; approval-backed apply
+remains blocked by Issue 1.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:docs`, `area:llm`, `type:feature`,

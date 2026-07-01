@@ -4,8 +4,10 @@ from io import StringIO
 
 from rich.console import Console
 
+from shamsu.indexer.walker import FileWalker
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.patch.preview import print_diff_preview
+from shamsu.retriever.search import SearchAgent
 from shamsu.safety.sandbox import Sandbox
 
 
@@ -130,11 +132,179 @@ def test_rich_preview_includes_file_names_and_changed_lines(tmp_path):
     assert '-    done = False' in rendered
 
 
-def test_apply_and_rollback_do_not_mutate_files_in_this_slice(tmp_path):
+def test_apply_denies_without_mutating_when_approval_rejects(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
-    engine = PatchEngine(tmp_path)
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: False)
 
-    assert engine.apply(VALID_DIFF, tmp_path) is False
-    assert engine.rollback(target) is False
+    assert engine.apply(diff, tmp_path) is False
     assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert not (tmp_path / "app.py.bak").exists()
+
+
+def test_apply_modifies_file_and_creates_backup_after_approval(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert (tmp_path / "app.py.bak").read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_rollback_restores_backup(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    backup = tmp_path / "app.py.bak"
+    backup.write_text("value = 0\n", encoding="utf-8")
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.rollback(target) is True
+    assert target.read_text(encoding="utf-8") == "value = 0\n"
+    assert not backup.exists()
+
+
+def test_apply_invalid_diff_returns_false(tmp_path):
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply("not a diff", tmp_path) is False
+
+
+def test_apply_restores_backup_on_context_mismatch(tmp_path):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("value = 1\n", encoding="utf-8")
+    second.write_text("actual = 1\n", encoding="utf-8")
+    diff = """--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+--- a/second.py
++++ b/second.py
+@@ -1 +1 @@
+-expected = 1
++expected = 2
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is False
+    assert first.read_text(encoding="utf-8") == "value = 1\n"
+    assert second.read_text(encoding="utf-8") == "actual = 1\n"
+
+
+def test_apply_creates_new_file_inside_workspace(tmp_path):
+    diff = """--- /dev/null
++++ b/pkg/new_file.py
+@@ -0,0 +1,2 @@
++def created():
++    return True
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert (tmp_path / "pkg" / "new_file.py").read_text(encoding="utf-8") == (
+        "def created():\n    return True\n"
+    )
+
+
+def test_apply_deletes_file_with_backup_after_approval(tmp_path):
+    target = tmp_path / "old.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    diff = """--- a/old.py
++++ /dev/null
+@@ -1 +0,0 @@
+-value = 1
+"""
+    requests = []
+
+    def approve(request):
+        requests.append(request)
+        return True
+
+    engine = PatchEngine(tmp_path, approval_func=approve)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert not target.exists()
+    assert (tmp_path / "old.py.bak").read_text(encoding="utf-8") == "value = 1\n"
+    assert requests[0].action_type == "file_delete"
+
+
+def test_apply_rejects_outside_workspace_path(tmp_path):
+    diff = """--- a/../outside.py
++++ b/../outside.py
+@@ -1 +1 @@
+-old
++new
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is False
+
+
+def test_apply_reindexes_modified_python_file(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("def old_name():\n    return 1\n", encoding="utf-8")
+    FileWalker(tmp_path).index()
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+-def old_name():
++def new_name():
+     return 1
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+
+    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
+    assert search.symbol_lookup("new_name")
+    assert search.symbol_lookup("old_name") == []
+    assert search.search("new_name")
+
+
+def test_apply_indexes_created_python_file(tmp_path):
+    FileWalker(tmp_path).index()
+    diff = """--- /dev/null
++++ b/new_module.py
+@@ -0,0 +1,2 @@
++def generated_symbol():
++    return True
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+
+    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
+    assert search.symbol_lookup("generated_symbol")
+
+
+def test_apply_removes_deleted_file_from_index(tmp_path):
+    target = tmp_path / "dead.py"
+    target.write_text("def removed_symbol():\n    return False\n", encoding="utf-8")
+    FileWalker(tmp_path).index()
+    diff = """--- a/dead.py
++++ /dev/null
+@@ -1,2 +0,0 @@
+-def removed_symbol():
+-    return False
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+
+    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
+    assert search.symbol_lookup("removed_symbol") == []
+    assert search.search("removed_symbol") == []

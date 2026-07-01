@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, and patch validation/preview complete.
-- Tests: `60 passed`
+- Status: Milestone 1 complete locally; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, and documentation proposal workflow complete.
+- Tests: `91 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-01
-- Current next focus: patch application and rollback behind approval.
+- Current next focus: merge Milestone 1 PRs, then bug fix workflow and test generation workflow.
 
 ## Completed Features
 
@@ -50,26 +50,35 @@ blocker.
 - [x] Added `CommandRunner.run_tests()` pytest summary parsing.
 - [x] Added internal `PatchEngine` validation for unified diff headers, hunks, line counts, and workspace-safe paths.
 - [x] Added Rich patch preview with changed-file summary and colorized diff body.
-- [x] Kept patch `apply()` and `rollback()` as non-mutating stubs until the approval-backed apply slice.
+- [x] Added approval-backed patch `apply()` with validation, Rich preview, `.bak` backups, workspace safety, file create/delete support, and failure rollback.
+- [x] Added patch `rollback()` that restores `.bak` backups.
+- [x] Added automatic full index refresh after successful patch apply so modified, created, and deleted files are reflected in `.shamsu/index.db`.
+- [x] Added read-only git helper for `git status --short`, `git diff`, and dirty-worktree warnings.
+- [x] Added code edit workflow that searches indexed context, calls the `coder` specialist, validates unified diffs, applies via `PatchEngine`, and reports changed files.
 - [x] Added `agent context/DEV-TASK-DIVI.MD` with remaining project work split into GitHub-issue-ready Dev A/B/C tasks.
 - [x] Added branch hierarchy and PR rules to `agent context/DEV-TASK-DIVI.MD`.
 - [x] Created GitHub core branches: `develop`, `dev-a`, `dev-b`, and `dev-c`.
 - [x] Enabled branch protection for `main` and `develop`.
+- [x] Added real indexed QA as the default REPL behavior when `.shamsu/index.db` exists.
+- [x] Added explicit no-index fallback message instead of silently showing stub context.
+- [x] Added live QA integration through `LLMManager.run_specialist("qa", ...)` with safe preview fallback when Ollama is unavailable.
+- [x] Added read-only audit workflow that uses indexed search, packs reviewer context, and parses structured findings.
+- [x] Added documentation proposal workflow that uses indexed context, calls `doc_agent`, and generates README unified diffs for review.
 
 ## In Progress
 
-- [ ] Patch application and rollback behind approval.
+- [ ] Bug fix workflow.
+- [ ] Test generation workflow.
+- [ ] Documentation workflow patch application.
 
 ## Next Queue
 
-1. Add patch application and rollback behind approval:
-   - validate and preview before apply
-   - ask approval with patch summary
-   - create `.bak` backups before writes
-   - restore backups on apply failure
-2. Add real indexed QA workflow as the default after `index`.
-3. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-4. Add `ProjectSpec` JSON preview command for PRDs.
+1. Merge/review Milestone 1 PRs into `develop`.
+2. Add bug fix workflow using indexed context and patch apply.
+3. Add test generation workflow.
+4. Wire documentation proposals into approval-backed patch apply.
+5. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
+6. Add `ProjectSpec` JSON preview command for PRDs.
 
 ## Known Notes
 
