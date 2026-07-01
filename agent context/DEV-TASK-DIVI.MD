@@ -65,6 +65,9 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   Issue 1.
 - [x] Issue 5 implementation is complete locally on `dev-b`: real indexed QA is
   used when `.shamsu/index.db` exists, with a clear no-index fallback.
+- [x] Issue 7 implementation is complete locally on `dev-b`: audit workflow uses
+  indexed search, reviewer context, and structured findings without applying
+  changes.
 
 The issue list below starts from remaining work only.
 
@@ -292,6 +295,9 @@ into `develop` merges.
   - Tests cover traceback parsing and mocked bugfix diff flow.
 
 ### Issue 7: Audit Workflow
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:safety`, `type:feature`,
