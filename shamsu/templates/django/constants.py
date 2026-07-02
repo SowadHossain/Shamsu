@@ -223,6 +223,83 @@ REGISTER_HTML_TEMPLATE = """{% extends "base.html" %}
 {% endblock %}
 """
 
+RESOURCE_LIST_HTML_TEMPLATE = """{% extends "base.html" %}
+{% load crispy_forms_tags %}
+
+{% block title %}{{ resource_label_plural }}{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6">
+  <div>
+    <h1 class="text-3xl font-bold">{{ resource_label_plural }}</h1>
+    <p class="text-base-content/70">Manage {{ resource_label_plural_lower }}.</p>
+  </div>
+  <button class="btn btn-primary" onclick="{{ modal_id }}.showModal()">
+    Add {{ resource_label }}
+  </button>
+</div>
+
+<dialog id="{{ modal_id }}" class="modal">
+  <div class="modal-box">
+    <form method="dialog">
+      <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">x</button>
+    </form>
+    <h2 class="font-bold text-lg mb-4">Add {{ resource_label }}</h2>
+    <form
+      method="post"
+      hx-post="{% url '{{ resource_url_name }}' %}"
+      hx-target="#{{ table_body_id }}"
+      hx-swap="beforeend"
+    >
+      {% csrf_token %}
+      {{ form|crispy }}
+      <div class="modal-action">
+        <button type="submit" class="btn btn-primary">Save</button>
+      </div>
+    </form>
+  </div>
+</dialog>
+
+<div class="overflow-x-auto bg-base-100 rounded-box shadow">
+  <table class="table table-zebra">
+    <thead>
+      <tr>
+{{ table_headers }}
+        <th class="text-right">Actions</th>
+      </tr>
+    </thead>
+    <tbody id="{{ table_body_id }}">
+      {% for object in objects %}
+        {% include "{{ partial_template_path }}" with object=object %}
+      {% empty %}
+        <tr>
+          <td colspan="{{ table_colspan }}" class="text-center opacity-70 py-8">
+            No {{ resource_label_plural_lower }} yet.
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+"""
+
+RESOURCE_ITEM_HTML_TEMPLATE = """<tr id="{{ row_id_prefix }}-{{ object.id }}">
+{{ table_cells }}
+  <td class="text-right">
+    <button
+      class="btn btn-error btn-sm"
+      hx-delete="{% url '{{ resource_delete_url_name }}' object.id %}"
+      hx-target="#{{ row_id_prefix }}-{{ object.id }}"
+      hx-swap="outerHTML"
+      hx-confirm="Delete this {{ resource_label_lower }}?"
+    >
+      Delete
+    </button>
+  </td>
+</tr>
+"""
+
 REQUIREMENTS_TEMPLATE = """Django==5.0.6
 djangorestframework==3.15.2
 djangorestframework-simplejwt==5.3.1
