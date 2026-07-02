@@ -60,7 +60,8 @@ def _extract_endpoints(parsed: ParsedPRD) -> list[EndpointSpec]:
             method = match.group(1).upper()
             path = match.group(2)
             resource = _resource_from_path(path)
-            endpoints.append(EndpointSpec(method, path, resource))
+            auth_required = "public" not in line.lower() and "no auth" not in line.lower()
+            endpoints.append(EndpointSpec(method, path, resource, auth_required=auth_required))
     return endpoints
 
 
@@ -73,13 +74,32 @@ def _extract_or_infer_pages(parsed: ParsedPRD, entities) -> list[PageSpec]:
     for entity in entities:
         if entity.name.lower() == "user":
             continue
+        fields = [field.name for field in entity.fields]
         inferred.append(
             PageSpec(
                 name=f"{entity.name} List",
                 page_type="list",
                 purpose=f"List and manage {entity.name} records",
                 resource=entity.name,
-                fields_shown=[field.name for field in entity.fields],
+                fields_shown=fields,
+            )
+        )
+        inferred.append(
+            PageSpec(
+                name=f"{entity.name} Detail",
+                page_type="detail",
+                purpose=f"Show one {entity.name} record",
+                resource=entity.name,
+                fields_shown=fields,
+            )
+        )
+        inferred.append(
+            PageSpec(
+                name=f"{entity.name} Form",
+                page_type="form",
+                purpose=f"Create and edit {entity.name} records",
+                resource=entity.name,
+                fields_shown=fields,
             )
         )
     return inferred
@@ -109,15 +129,84 @@ def _extract_pages(parsed: ParsedPRD) -> list[PageSpec]:
 def _fixed_generation_order(project_name: str, app_name: str) -> list[DjangoFileSpec]:
     return [
         DjangoFileSpec("manage.py", "fixed_template", None),
+        DjangoFileSpec(f"{project_name}/__init__.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/settings.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/urls.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/wsgi.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/asgi.py", "fixed_template", None),
+        DjangoFileSpec(f"{app_name}/__init__.py", "fixed_template", None),
+        DjangoFileSpec(f"{app_name}/apps.py", "fixed_template", None),
+        DjangoFileSpec(f"{app_name}/models.py", "model_generator", "coder"),
+        DjangoFileSpec(
+            f"{app_name}/serializers.py",
+            "serializer_generator",
+            "coder",
+            depends_on=[f"{app_name}/models.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/forms.py",
+            "form_generator",
+            "coder",
+            depends_on=[f"{app_name}/models.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/views.py",
+            "view_generator",
+            "coder",
+            depends_on=[
+                f"{app_name}/models.py",
+                f"{app_name}/serializers.py",
+                f"{app_name}/forms.py",
+            ],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/urls.py",
+            "url_generator",
+            "coder",
+            depends_on=[f"{app_name}/views.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/admin.py",
+            "admin_generator",
+            "coder",
+            depends_on=[f"{app_name}/models.py"],
+        ),
         DjangoFileSpec(f"{app_name}/templates/base.html", "fixed_template", None),
         DjangoFileSpec(f"{app_name}/templates/login.html", "fixed_template", None),
         DjangoFileSpec(f"{app_name}/templates/register.html", "fixed_template", None),
+        DjangoFileSpec(
+            f"{app_name}/templates/dashboard.html",
+            "frontend_generator",
+            "coder",
+            depends_on=[f"{app_name}/views.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/templates/resource_list.html",
+            "frontend_generator",
+            "coder",
+            depends_on=[f"{app_name}/views.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/templates/resource_detail.html",
+            "frontend_generator",
+            "coder",
+            depends_on=[f"{app_name}/views.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/templates/resource_form.html",
+            "frontend_generator",
+            "coder",
+            depends_on=[f"{app_name}/views.py", f"{app_name}/forms.py"],
+        ),
+        DjangoFileSpec(
+            f"{app_name}/tests.py",
+            "test_generator",
+            "test_gen",
+            depends_on=[f"{app_name}/models.py", f"{app_name}/views.py"],
+        ),
         DjangoFileSpec("requirements.txt", "fixed_template", None),
         DjangoFileSpec(".env.example", "fixed_template", None),
+        DjangoFileSpec("README.md", "doc_generator", "doc_agent"),
     ]
 
 
