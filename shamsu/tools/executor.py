@@ -12,6 +12,7 @@ from shamsu.interfaces import ICommandRunner
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest, CommandRisk, TestRunResult
 
 BLOCKED_EXIT_CODE = 126
@@ -26,20 +27,43 @@ class CommandRunner(ICommandRunner):
         workspace_root: Path,
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         timeout_seconds: int = 120,
+        session_logger: SessionLogger | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
         self.timeout_seconds = timeout_seconds
+        self.session_logger = session_logger
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
+        if self.session_logger:
+            self.session_logger.log(
+                "command.started",
+                {"command": command, "cwd": str(cwd)},
+                f"Command started: {command}",
+                workflow_id="command",
+            )
         try:
             validated_cwd = self._validate_cwd(cwd)
         except (SecurityError, ValueError) as exc:
+            if self.session_logger:
+                self.session_logger.log(
+                    "command.failed",
+                    {"command": command, "error": str(exc)},
+                    "Command rejected before execution",
+                    workflow_id="command",
+                )
             return WORKSPACE_EXIT_CODE, "", str(exc)
 
         risk = classify_command(command)
         if risk == CommandRisk.BLOCKED:
+            if self.session_logger:
+                self.session_logger.log(
+                    "command.blocked",
+                    {"command": command, "risk": risk.value},
+                    f"Blocked command: {command}",
+                    workflow_id="command",
+                )
             return BLOCKED_EXIT_CODE, "", f"Blocked command: {command}"
 
         if risk == CommandRisk.MEDIUM:
@@ -52,6 +76,13 @@ class CommandRunner(ICommandRunner):
                 reason="Command is medium risk or unknown.",
             )
             if not self.approval_func(request):
+                if self.session_logger:
+                    self.session_logger.log(
+                        "command.denied",
+                        {"command": command, "cwd": str(validated_cwd)},
+                        f"Command denied: {command}",
+                        workflow_id="command",
+                    )
                 return DENIED_EXIT_CODE, "", f"Command denied by user: {command}"
 
         try:
@@ -69,13 +100,33 @@ class CommandRunner(ICommandRunner):
             message = f"Command timed out after {self.timeout_seconds} seconds: {command}"
             if stderr:
                 message = f"{message}\n{stderr}"
+            if self.session_logger:
+                self.session_logger.log(
+                    "command.failed",
+                    {"command": command, "stdout": stdout, "stderr": message, "exit_code": TIMEOUT_EXIT_CODE},
+                    f"Command timed out: {command}",
+                    workflow_id="command",
+                )
             return TIMEOUT_EXIT_CODE, stdout, message
 
-        return (
+        result = (
             completed.returncode,
             redact(completed.stdout or ""),
             redact(completed.stderr or ""),
         )
+        if self.session_logger:
+            self.session_logger.log(
+                "command.finished",
+                {
+                    "command": command,
+                    "exit_code": result[0],
+                    "stdout": result[1],
+                    "stderr": result[2],
+                },
+                f"Command finished with exit {result[0]}: {command}",
+                workflow_id="command",
+            )
+        return result
 
     def run_tests(self, cwd: Path) -> TestRunResult:
         exit_code, stdout, stderr = self.run("python -m pytest tests/ -q", cwd)

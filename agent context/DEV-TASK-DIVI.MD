@@ -1,6 +1,6 @@
 # SHAMSU Dev Task Division
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 This file is the issue-ready build plan for the rest of SHAMSU. Use it to create
 GitHub issues, assign work, open branches, and track PRs.
@@ -12,8 +12,8 @@ Current baseline:
 - Indexing, Python symbols, FTS search, PRD parsing, `ProjectSpec`, fixed Django
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
-- Current verified state: `116 passed`, `ruff check shamsu tests` clean.
-- Next implementation focus: PRD-to-project planning and Django generation.
+- Current verified state: `152 passed`, `ruff check shamsu tests` clean.
+- Next implementation focus: Milestone 5 frontend, migrations, tests, and error loop.
 
 ## Already Done - Do Not Create Issues
 
@@ -97,6 +97,15 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   flags support Ollama/model setup, runtime checks remain local-only, REPL has
   `models status|pull|repair`, and SHAMSU scripts avoid profile/PATH/registry
   edits.
+- [x] Claude-like session logging and resume is complete locally: sessions live
+  under workspace `.shamsu/sessions/`, default startup resumes the latest active
+  session, `--session` and `--new-session` are supported, REPL session commands
+  can list/show/resume/rename/close/export sessions, and `log tail` shows recent
+  redacted events.
+- [x] Structured event tracing is complete locally for prompts, routing,
+  context packs, local LLM calls, approvals, patches, commands, PRD parsing,
+  project planning, and Django generation. New workflows should keep passing an
+  optional `SessionLogger` through dependency injection.
 
 The issue list below starts from remaining work only.
 
@@ -764,6 +773,9 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 33: CLI Status, Log, And Progress Views
 
+Status: core session/log commands implemented locally; future full-pipeline
+progress views can extend this instead of creating a second log system.
+
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:cli`, `area:safety`, `type:feature`,
   `priority:p1`
@@ -778,6 +790,10 @@ projects from multiple PRDs, with clear progress and safety logs.
   - Tests cover output formatting and missing log file behavior.
 
 ### Issue 34: Structured Audit Trail
+
+Status: core structured session event trail implemented locally; future command
+and full-pipeline work should add event types to `SessionLogger` rather than
+creating parallel audit files.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:safety`, `type:feature`, `priority:p1`

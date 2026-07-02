@@ -20,6 +20,7 @@ to decide what's resident.
 from __future__ import annotations
 
 import json
+import time
 from urllib.parse import urlparse
 
 import httpx
@@ -27,6 +28,7 @@ from json_repair import repair_json
 
 from shamsu.interfaces import ILLMManager
 from shamsu.runtime.models import SPECIALIST_MODELS
+from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
 
 OLLAMA_BASE_URL = "http://localhost:11434"
@@ -82,10 +84,11 @@ ROUTING_JSON_SCHEMA = {
 
 
 class LLMManager(ILLMManager):
-    def __init__(self, base_url: str = OLLAMA_BASE_URL):
+    def __init__(self, base_url: str = OLLAMA_BASE_URL, session_logger: SessionLogger | None = None):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
         self.router_model = OLLAMA_MODELS["router"]
+        self.session_logger = session_logger
 
     async def _generate(
         self, model: str, system: str, prompt: str,
@@ -119,13 +122,22 @@ class LLMManager(ILLMManager):
         §8). temperature=0, schema-constrained — this is the harness's
         primary defense against malformed routing JSON, not a try/except.
         """
+        started = time.perf_counter()
         user_msg = f"USER PROMPT: {prompt}\n\nPROJECT: {project_summary}"
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.request",
+                {"specialist": "router", "model": self.router_model, "endpoint": self.base_url},
+                "Routing request sent to local model",
+                workflow_id="router",
+            )
         raw = await self._generate(
             self.router_model, ROUTER_SYSTEM_PROMPT, user_msg,
             temperature=0.0, json_schema=ROUTING_JSON_SCHEMA, keep_alive="-1",
         )
         decision = self._parse_routing(raw)
         if decision is not None:
+            self._log_route_decision(decision, started, retry_count=0)
             return decision
 
         # One retry with explicit correction, per harness §4 retry phrasing.
@@ -140,9 +152,17 @@ class LLMManager(ILLMManager):
         )
         decision = self._parse_routing(raw2)
         if decision is not None:
+            self._log_route_decision(decision, started, retry_count=1)
             return decision
 
         # Safe fallback — never crash the conversation on a routing failure.
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.error",
+                {"specialist": "router", "model": self.router_model, "retry_count": 1},
+                "Router output could not be parsed; falling back to QA",
+                workflow_id="router",
+            )
         return RoutingDecision(
             intent="qa", complexity="single",
             steps=[{"id": 1, "specialist": "qa", "task": prompt}],
@@ -176,8 +196,66 @@ class LLMManager(ILLMManager):
         model_name = OLLAMA_MODELS.get(specialist) or self.router_model
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
         prompt = self._format_pack(pack)
-        raw = await self._generate(model_name, "", prompt, temperature=temp)
+        started = time.perf_counter()
+        if self.session_logger:
+            self.session_logger.log_context_pack(pack, workflow_id=pack.task_id)
+            self.session_logger.log(
+                "llm.request",
+                {
+                    "specialist": specialist,
+                    "model": model_name,
+                    "endpoint": self.base_url,
+                    "prompt_token_estimate": pack.token_estimate,
+                },
+                f"Specialist request sent to {specialist}",
+                workflow_id=pack.task_id,
+            )
+        try:
+            raw = await self._generate(model_name, "", prompt, temperature=temp)
+        except Exception as exc:
+            if self.session_logger:
+                self.session_logger.log(
+                    "llm.error",
+                    {"specialist": specialist, "model": model_name, "error": str(exc)},
+                    f"Specialist {specialist} failed",
+                    workflow_id=pack.task_id,
+                )
+            raise
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.response",
+                {
+                    "specialist": specialist,
+                    "model": model_name,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "response_chars": len(raw),
+                    "retry_count": 0,
+                },
+                f"Specialist {specialist} returned a response",
+                workflow_id=pack.task_id,
+            )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
+
+    def _log_route_decision(
+        self,
+        decision: RoutingDecision,
+        started: float,
+        retry_count: int,
+    ) -> None:
+        if not self.session_logger:
+            return
+        self.session_logger.log(
+            "router.decision",
+            {
+                "intent": decision.intent,
+                "complexity": decision.complexity,
+                "confidence": decision.confidence,
+                "retry_count": retry_count,
+                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            },
+            f"Routed prompt as {decision.intent}",
+            workflow_id="router",
+        )
 
     @staticmethod
     def _format_pack(pack: ContextPack) -> str:

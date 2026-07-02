@@ -13,6 +13,7 @@ from shamsu.indexer.walker import FileWalker
 from shamsu.interfaces import IPatchEngine
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
 
 HUNK_HEADER_RE = re.compile(
@@ -87,10 +88,12 @@ class PatchEngine(IPatchEngine):
         self,
         workspace_root: Path | None = None,
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+        session_logger: SessionLogger | None = None,
     ) -> None:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
+        self.session_logger = session_logger
 
     def validate_diff(self, diff_text: str) -> tuple[bool, str | None]:
         try:
@@ -105,6 +108,7 @@ class PatchEngine(IPatchEngine):
         try:
             patches = parse_file_patches(diff_text, self.sandbox)
         except DiffValidationError:
+            self._log("patch.failed", {"error": "Diff validation failed"}, "Patch validation failed")
             return False
 
         from shamsu.patch.preview import print_diff_preview
@@ -118,8 +122,13 @@ class PatchEngine(IPatchEngine):
             working_dir=str(self.workspace_root),
             reason="Patch application modifies files inside the selected workspace.",
         )
+        self._log("patch.preview", {"files": [patch.display_path for patch in patches]}, request.description)
+        self._log("approval.request", {"request": request}, request.description)
         if not self.approval_func(request):
+            self._log("approval.result", {"approved": False}, "Patch approval denied")
+            self._log("patch.denied", {"files": [patch.display_path for patch in patches]}, "Patch denied")
             return False
+        self._log("approval.result", {"approved": True}, "Patch approval granted")
 
         backups: dict[Path, Path] = {}
         created_files: list[Path] = []
@@ -131,8 +140,10 @@ class PatchEngine(IPatchEngine):
             for created in created_files:
                 if created.exists():
                     created.unlink()
+            self._log("patch.failed", {"files": [patch.display_path for patch in patches]}, "Patch failed")
             return False
         FileWalker(self.workspace_root).index()
+        self._log("patch.applied", {"files": [patch.display_path for patch in patches]}, "Patch applied")
         return True
 
     def rollback(self, file_path: Path) -> bool:
@@ -146,6 +157,10 @@ class PatchEngine(IPatchEngine):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(backup), str(target))
         return True
+
+    def _log(self, event_type: str, payload: dict, summary: str) -> None:
+        if self.session_logger:
+            self.session_logger.log(event_type, payload, summary, workflow_id="patch")
 
     def _apply_file_patch(
         self,
