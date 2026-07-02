@@ -482,7 +482,10 @@ and PR split/merge.
 
 Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
 
-### Issue 15: Approval-Backed Django Project Writer
+Status: Implemented locally on top of `develop`; pending full-suite verification
+and PR split/merge.
+
+### Issue 15: Approval-Backed Django Project Writer [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:django`, `area:safety`, `type:feature`,
@@ -497,7 +500,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Records written files for resume/logging.
   - Tests cover new project, existing file, denied approval, path escape.
 
-### Issue 16: Fixed Django Template Completion
+### Issue 16: Fixed Django Template Completion [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:django`, `type:feature`, `priority:p0`
@@ -512,7 +515,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Templates do not require Node or a build step.
   - Tests assert key imports/settings/HTML tags are present.
 
-### Issue 17: Django Models Generator
+### Issue 17: Django Models Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:llm`, `type:feature`,
@@ -527,7 +530,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Correctly maps extracted fields and relationships.
   - Tests cover Todo, Expense, Blog model specs.
 
-### Issue 18: Django Serializers Generator
+### Issue 18: Django Serializers Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:llm`, `type:feature`,
@@ -541,7 +544,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates serializer fields against model fields.
   - Tests cover field matching and invalid field rejection.
 
-### Issue 19: Django Forms Generator
+### Issue 19: Django Forms Generator [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:django`, `area:llm`, `type:feature`,
@@ -555,7 +558,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates fields against generated models.
   - Tests cover normal fields and relationship fields.
 
-### Issue 20: Django Views Generator
+### Issue 20: Django Views Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:llm`, `type:feature`,
@@ -570,7 +573,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates imports and referenced classes.
   - Tests cover public vs private page behavior at code level.
 
-### Issue 21: Django URLs Generator
+### Issue 21: Django URLs Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `type:feature`, `priority:p0`
@@ -584,7 +587,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates all referenced views exist.
   - Tests cover URL name extraction for templates.
 
-### Issue 22: Django Admin Generator
+### Issue 22: Django Admin Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `type:feature`, `priority:p1`
@@ -597,7 +600,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates output with `ast.parse()`.
   - Tests cover multiple model registration.
 
-### Issue 23: Backend Consistency Checker
+### Issue 23: Backend Consistency Checker [done]
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:django`, `area:tests`, `type:feature`,

@@ -53,10 +53,13 @@ def test_render_fixed_django_files_are_deterministic_and_python_valid(tmp_path):
 
     expected_paths = {
         "manage.py",
+        "todo_app/__init__.py",
         "todo_app/settings.py",
         "todo_app/urls.py",
         "todo_app/wsgi.py",
         "todo_app/asgi.py",
+        "app/__init__.py",
+        "app/apps.py",
         "app/templates/base.html",
         "app/templates/login.html",
         "app/templates/register.html",

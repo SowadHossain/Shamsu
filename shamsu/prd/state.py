@@ -127,6 +127,14 @@ def mark_step_failed(state: GenerationState, step_id: int, error: str) -> Genera
     return state
 
 
+def mark_step_skipped(state: GenerationState, step_id: int, reason: str) -> GenerationState:
+    step = _find_step(state, step_id)
+    step.status = TaskStepStatus.SKIPPED
+    step.error = reason
+    state.updated_at = _now()
+    return state
+
+
 def _find_step(state: GenerationState, step_id: int) -> GenerationStepState:
     for step in state.generation_order:
         if step.id == step_id:

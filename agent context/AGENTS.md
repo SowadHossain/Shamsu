@@ -169,8 +169,11 @@ Completed first slice:
 - `prd/project.py` assembles `ProjectSpec` values with inferred endpoints, pages, theme, and generation order.
 - `prd/state.py` stores accepted generation-plan resume state under workspace `.shamsu/`.
 - `templates/django/constants.py` and `templates/django/renderer.py` provide deterministic fixed Django generation.
+- `templates/django/generators.py` deterministically generates backend `models.py`, `serializers.py`, `forms.py`, `views.py`, app `urls.py`, and `admin.py`.
+- `templates/django/writer.py` writes generated Django files inside the workspace behind approval and updates generation resume state.
+- `templates/django/checker.py` statically checks backend model/serializer/form/view/url/admin references.
 - `safety/approval.py` displays Rich approval panels.
-- `cli/repl.py` supports `--workspace <path>`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file>`, `plan-prd <file>`, and QA context preview.
+- `cli/repl.py` supports `--workspace <path>`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file>`, `plan-prd <file>`, `generate-django <file>`, and QA context preview.
 - `scripts/install.ps1` and `scripts/install.sh` install into repo-local `.venv`.
 - `scripts/run-shamsu.ps1` and `scripts/run-shamsu.sh` run SHAMSU from that `.venv` while preserving the caller workspace.
 - `parse-prd` and `plan-prd` file inputs are validated through `Sandbox.validate()`.
@@ -180,9 +183,9 @@ Completed first slice:
 
 Recommended next slice:
 
-1. Add deterministic Django project writer behind approval.
-2. Wire approved `generation-state.json` into the M4 file-writing pipeline.
-3. Add Django backend generators for models, serializers, views, URLs, forms, and admin.
+1. Add frontend page generation for dashboard/list/detail/form templates.
+2. Add migration/dependency/test runner flow for generated Django projects.
+3. Add generated-project feedback loop that uses test/check failures to produce fixes.
 4. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
 
 ## Suggested Initial File Layout
