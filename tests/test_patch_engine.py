@@ -148,6 +148,37 @@ def test_apply_denies_without_mutating_when_approval_rejects(tmp_path):
     assert not (tmp_path / "app.py.bak").exists()
 
 
+def test_apply_shows_preview_before_file_edit_approval(monkeypatch, tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+    events: list[str] = []
+    requests = []
+
+    def preview(diff_text, console=None, sandbox=None):
+        assert diff_text == diff
+        events.append("preview")
+
+    def approve(request):
+        events.append("approval")
+        requests.append(request)
+        return True
+
+    monkeypatch.setattr("shamsu.patch.preview.print_diff_preview", preview)
+    engine = PatchEngine(tmp_path, approval_func=approve)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert events == ["preview", "approval"]
+    assert requests[0].action_type == "file_edit"
+    assert requests[0].preview == diff
+
+
 def test_apply_modifies_file_and_creates_backup_after_approval(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
