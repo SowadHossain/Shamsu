@@ -647,6 +647,9 @@ self-correct common generated-code mistakes.
 
 ### Issue 25: Dashboard Generator
 
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:frontend`, `area:llm`,
   `type:feature`, `priority:p1`
@@ -708,6 +711,9 @@ self-correct common generated-code mistakes.
 
 ### Issue 29: Django Test Runner
 
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:tests`, `area:django`, `type:feature`,
   `priority:p0`
@@ -723,6 +729,9 @@ self-correct common generated-code mistakes.
 
 ### Issue 30: Error Feedback Loop
 
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:tests`, `area:patch`,
   `type:feature`, `priority:p0`
@@ -737,6 +746,9 @@ self-correct common generated-code mistakes.
   - Tests mock two failing iterations followed by success.
 
 ### Issue 31: Django Test File Generator
+
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:tests`, `area:django`, `area:llm`,
