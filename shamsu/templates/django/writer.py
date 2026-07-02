@@ -20,6 +20,7 @@ from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 from shamsu.templates.django.checker import BackendConsistencyChecker, ConsistencyDiagnostic
 from shamsu.templates.django.docs import render_generated_project_readme
+from shamsu.templates.django.frontend_checker import FrontendConsistencyChecker
 from shamsu.templates.django.frontend import render_django_test_files, render_frontend_django_files
 from shamsu.templates.django.generators import render_backend_django_files
 from shamsu.templates.django.renderer import render_fixed_django_files
@@ -108,7 +109,10 @@ class DjangoProjectWriter:
 
     def check_project(self, project: ProjectSpec, target_dir: Path | None = None) -> list[ConsistencyDiagnostic]:
         root = self.sandbox.validate(target_dir or ".")
-        return BackendConsistencyChecker(root).check(project)
+        return [
+            *BackendConsistencyChecker(root).check(project),
+            *FrontendConsistencyChecker(root).check(project),
+        ]
 
     def _load_or_create_state(self, project: ProjectSpec, prd_path: Path) -> GenerationState:
         path = state_path(self.workspace_root)

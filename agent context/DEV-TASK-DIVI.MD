@@ -12,8 +12,9 @@ Current baseline:
 - Indexing, Python symbols, FTS search, PRD parsing, `ProjectSpec`, fixed Django
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
-- Current verified state: `152 passed`, `ruff check shamsu tests` clean.
-- Next implementation focus: Milestone 5 frontend, migrations, tests, and error loop.
+- Current verified state: `183 passed`, `ruff check shamsu tests scripts` clean.
+- Next implementation focus: remaining Milestone 6 status/log/progress, release docs,
+  final safety audit, and release cut.
 
 ## Already Done - Do Not Create Issues
 
@@ -106,6 +107,12 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   context packs, local LLM calls, approvals, patches, commands, PRD parsing,
   project planning, and Django generation. New workflows should keep passing an
   optional `SessionLogger` through dependency injection.
+- [x] Issue 27 implementation is complete locally on
+  `feature/dev-a/frontend-consistency-checker`: generated Django templates are
+  checked for missing URL names, invalid model field references, missing HTMX
+  targets, and raw generated form controls.
+- [x] Dirty-worktree edit warnings are complete locally before edit/fix/test-gen/docs
+  workflows; this safely salvages the useful part of stale PR #53.
 
 The issue list below starts from remaining work only.
 
@@ -679,6 +686,9 @@ GitHub issue open until the PR into `develop` merges.
 
 ### Issue 27: Frontend Consistency Checker
 
+Status: implemented locally on `feature/dev-a/frontend-consistency-checker`;
+keep GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:django`, `area:frontend`, `area:tests`,
   `type:feature`, `priority:p1`
@@ -788,8 +798,9 @@ GitHub issue open until the PR into `develop` merges.
 
 ### Issue 33: CLI Status, Log, And Progress Views
 
-Status: core session/log commands implemented locally; future full-pipeline
-progress views can extend this instead of creating a second log system.
+Status: core session/log commands implemented locally; PR #54 attempted related
+work but is stale/conflicting and failing CI. Rebuild any useful changes from
+fresh `develop`.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:cli`, `area:safety`, `type:feature`,
@@ -808,7 +819,7 @@ progress views can extend this instead of creating a second log system.
 
 Status: core structured session event trail implemented locally; future command
 and full-pipeline work should add event types to `SessionLogger` rather than
-creating parallel audit files.
+creating parallel audit files. PR #54 is not safe to merge directly.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:safety`, `type:feature`, `priority:p1`
@@ -874,6 +885,9 @@ GitHub issue open until the PR into `develop` merges.
 
 ### Issue 38: Release Docs And Demo Script
 
+Status: PR #54 attempted related work but is stale/conflicting and failing CI.
+Reapply useful docs onto a fresh branch from `develop`.
+
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:docs`, `type:hardening`, `priority:p1`
 - Branch: `feature/dev-c/release-docs-demo`
@@ -886,6 +900,9 @@ GitHub issue open until the PR into `develop` merges.
   - Known limitations are explicit.
 
 ### Issue 39: Final Safety Audit
+
+Status: PR #54 attempted related work but is stale/conflicting and failing CI.
+Reapply useful audit coverage onto a fresh branch from `develop`.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:safety`, `type:hardening`, `priority:p0`

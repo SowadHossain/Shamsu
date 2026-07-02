@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, and workspace-local session logging/resume complete.
-- Tests: `175 passed`
+- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, and dirty-worktree edit warnings complete.
+- Tests: `183 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: finish Milestone 5 from fresh branches based on `develop`.
+- Current next focus: finish remaining Milestone 6 Dev C status/log/progress, release docs, final safety audit, then release cut.
 
 ## Completed Features
 
@@ -101,6 +101,8 @@ blocker.
 - [x] Added Todo, Expense Tracker, and Blog PRD fixtures for M6 end-to-end generation coverage.
 - [x] Added generated project README and `SHAMSU_SUMMARY.md` output with install, migrate, test, run, generated files, command results, and warnings.
 - [x] Added MVP benchmark script and `BENCHMARK.md` recording representative PRD generation runtime and peak RSS against the 7 GB target.
+- [x] Added frontend consistency checker for generated Django templates covering missing URL names, invalid model field references, missing HTMX targets, and raw generated form controls.
+- [x] Added dirty-worktree warning before edit/fix/test-generation/docs workflows.
 
 ## In Progress
 
@@ -108,9 +110,9 @@ blocker.
 
 ## Next Queue
 
-1. Open PR for issues #35, #36, and #37 from `feature/dev-b-dev-a/m6-fixtures-bench-docs` into `develop`.
-2. Finish Issue #33/#34 status/log/progress and audit trail polish.
-3. Finish Issue #38/#39 release docs and final safety audit, then complete Issue #40 release cut.
+1. Open PR for Issue #27 from `feature/dev-a/frontend-consistency-checker` into `develop`.
+2. Rebuild or replace stale/conflicting PR #54 from fresh `develop` for Issues #33/#34/#38/#39.
+3. Finish Issue #40 release cut after all Issues #1-#39 are merged and verified.
 
 ## Known Notes
 
@@ -121,6 +123,8 @@ blocker.
   merge checklist and verification path.
 - Feature work should branch from `develop` and merge back through PRs. `main`
   is protected for stable milestone merges only.
+- PR #53 (`dev-a`) was reviewed on 2026-07-02 and is conflicting/stale; the safe dirty-worktree warning behavior was salvaged onto `feature/dev-a/frontend-consistency-checker`.
+- PR #54 (`dev-c`) was reviewed on 2026-07-02 and is conflicting with failing CI; do not merge it directly. Reapply useful Dev C work onto fresh branches from `develop`.
 - `SHAMSU_day1_scaffold.zip` remains at the repo root as the original scaffold artifact.
 - Some copied planning docs contain mojibake. Avoid broad formatting churn unless asked.
 

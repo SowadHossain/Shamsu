@@ -45,6 +45,7 @@ from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
+from shamsu.tools.git import GitTool
 from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
 
 if sys.platform == "win32":
@@ -912,6 +913,7 @@ async def _run_code_edit(
     llm: LLMManager,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    _warn_if_dirty_before_edit(workspace, console)
     kwargs = {}
     if session_logger:
         kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
@@ -929,6 +931,7 @@ async def _run_bug_fix(
     llm: LLMManager,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    _warn_if_dirty_before_edit(workspace, console)
     kwargs = {}
     if session_logger:
         kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
@@ -973,6 +976,7 @@ async def _run_test_generation(
     llm: LLMManager,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    _warn_if_dirty_before_edit(workspace, console)
     kwargs = {}
     if session_logger:
         kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
@@ -991,6 +995,7 @@ async def _run_docs(
     llm: LLMManager,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    _warn_if_dirty_before_edit(workspace, console)
     result = await DocumentationWorkflow(
         search=search,
         llm=llm,
@@ -1002,6 +1007,12 @@ async def _run_docs(
         ),
     ).apply_readme_update(request=_strip_forced_prefix(user_input, "docs"))
     _print_patch_result("Documentation", result.applied, result.changed_files, result.error, console)
+
+
+def _warn_if_dirty_before_edit(workspace: Path, console: Console) -> None:
+    warning = GitTool(workspace).warn_if_dirty()
+    if warning:
+        console.print(f"[yellow]{warning}[/yellow]")
 
 
 async def _handle_django_fix_tests(
