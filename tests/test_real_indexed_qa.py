@@ -10,6 +10,7 @@ from shamsu.cli.repl import _build_workspace_qa_workflow, _handle_request
 from shamsu.indexer.walker import FileWalker
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.web import WebTool
+from shamsu.tools.web import SearchHit, WebSearchResult
 from shamsu.types import LLMResponse
 
 
@@ -144,6 +145,91 @@ def test_repl_workspace_location_question_reports_workspace(tmp_path):
     assert "Current Workspace" in rendered
     assert str(tmp_path) in rendered
     assert "I don’t have a current working directory" not in rendered
+
+
+def test_repl_weather_question_uses_web_tool(monkeypatch, tmp_path):
+    console, output = _console_output()
+
+    class FakeWebTool:
+        def search(self, query: str, reason: str = "", top_k: int = 5):
+            assert "weather" in query.lower()
+            return WebSearchResult(
+                approved=True,
+                query=query,
+                hits=[SearchHit(title="Weather", url="https://example.com/weather", snippet="Sunny 31C")],
+            )
+
+        def fetch(self, url: str, reason: str = ""):
+            return type(
+                "Fetch",
+                (),
+                {
+                    "approved": True,
+                    "url": url,
+                    "title": "Weather",
+                    "text": "Today will be sunny and 31C.",
+                    "error": "",
+                },
+            )()
+
+    class FakeLLM:
+        def __init__(self, session_logger=None):
+            self.session_logger = session_logger
+
+        async def run_specialist(self, specialist, pack):
+            assert pack.task_id == "web-qa"
+            return LLMResponse(raw="It will be sunny and 31C.", model_used="fake-gemma")
+
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    asyncio.run(
+        _handle_request(
+            "whats the weather today?",
+            tmp_path,
+            console,
+            FakeWebTool(),
+            BrowserTool(tmp_path, approval_func=lambda _request: False),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Web Answer" in rendered
+    assert "sunny and 31C" in rendered
+
+
+def test_repl_followup_web_request_uses_previous_prompt(monkeypatch, tmp_path):
+    console, output = _console_output()
+    seen = []
+
+    class FakeWebTool:
+        def search(self, query: str, reason: str = "", top_k: int = 5):
+            seen.append(query)
+            return WebSearchResult(approved=False, query=query, error="Web search denied by user.")
+
+        def fetch(self, url: str, reason: str = ""):  # pragma: no cover - not reached here
+            raise AssertionError("fetch should not be called")
+
+    class FakeLLM:
+        def __init__(self, session_logger=None):
+            self.session_logger = session_logger
+
+        async def run_specialist(self, specialist, pack):
+            return LLMResponse(raw="General fallback", model_used="fake-gemma")
+
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    asyncio.run(
+        _handle_request(
+            "check on the web",
+            tmp_path,
+            console,
+            FakeWebTool(),
+            BrowserTool(tmp_path, approval_func=lambda _request: False),
+            previous_user_prompt="whats the weather today?",
+        )
+    )
+
+    assert seen == ["whats the weather today? Please check on the web for this."]
 
 
 def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):

@@ -130,6 +130,7 @@ def test_slash_command_completer_suggests_web_and_browser_commands():
 
 def test_web_needed_prompt_detects_external_docs_requests():
     assert repl._looks_like_web_needed_prompt("look up the latest Django auth docs")
+    assert repl._looks_like_web_needed_prompt("whats the weather today?")
     assert not repl._looks_like_web_needed_prompt("how does auth work in this repo?")
 
 
@@ -137,6 +138,12 @@ def test_browser_needed_prompt_detects_local_preview_requests():
     assert repl._looks_like_browser_needed_prompt("check the app and verify the dashboard")
     assert repl._looks_like_browser_needed_prompt("open http://127.0.0.1:8000 and inspect the rendered ui")
     assert not repl._looks_like_browser_needed_prompt("summarize https://docs.djangoproject.com/en/5.1/")
+
+
+def test_expand_followup_prompt_uses_previous_turn_for_web_followup():
+    expanded = repl._expand_followup_prompt("check on the web", "whats the weather today?")
+
+    assert expanded == "whats the weather today? Please check on the web for this."
 
 
 def test_code_edit_handler_prints_applied_result(monkeypatch, tmp_path):

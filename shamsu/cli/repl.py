@@ -948,41 +948,43 @@ async def _handle_request(
     console: Console,
     web_tool: WebTool,
     browser_tool: BrowserTool,
+    previous_user_prompt: str = "",
     session_logger: SessionLogger | None = None,
 ) -> None:
+    effective_input = _expand_followup_prompt(user_input, previous_user_prompt)
     if _is_casual_prompt(user_input):
         _print_ready_message(workspace, console)
         return
-    if _looks_like_workspace_location_prompt(user_input):
+    if _looks_like_workspace_location_prompt(effective_input):
         _print_workspace_location(workspace, console)
         return
-    if _looks_like_workspace_files_prompt(user_input):
+    if _looks_like_workspace_files_prompt(effective_input):
         _print_workspace_files(workspace, console)
         return
-    if _looks_like_workspace_prd_request(user_input):
+    if _looks_like_workspace_prd_request(effective_input):
         _handle_workspace_prd_request(workspace, console)
         return
-    if _looks_like_browser_needed_prompt(user_input):
-        await _run_browser_assist(user_input, console, llm=LLMManager(session_logger=session_logger), browser_tool=browser_tool)
+    if _looks_like_browser_needed_prompt(effective_input):
+        await _run_browser_assist(effective_input, console, llm=LLMManager(session_logger=session_logger), browser_tool=browser_tool)
         return
-    if _looks_like_web_needed_prompt(user_input):
-        await _run_web_assist(user_input, console, llm=LLMManager(session_logger=session_logger), web_tool=web_tool)
+    if _looks_like_web_needed_prompt(effective_input):
+        await _run_web_assist(effective_input, console, llm=LLMManager(session_logger=session_logger), web_tool=web_tool)
         return
-    if _looks_like_django_generation_request(user_input):
-        generate_command = f"generate-django {_extract_prd_path_from_prompt(user_input)}"
+    if _looks_like_django_generation_request(effective_input):
+        generate_command = f"generate-django {_extract_prd_path_from_prompt(effective_input)}"
         _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
         return
-    if _looks_like_prd_plan_request(user_input):
-        plan_command = f"plan-prd {_extract_prd_path_from_prompt(user_input)}"
+    if _looks_like_prd_plan_request(effective_input):
+        plan_command = f"plan-prd {_extract_prd_path_from_prompt(effective_input)}"
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
     search, uses_real_index = _build_search_agent(workspace)
     llm = LLMManager(session_logger=session_logger)
     if not uses_real_index:
-        decision = _keyword_decision(user_input)
+        decision = _keyword_decision(effective_input)
         if decision.intent in {"qa", "explain"}:
-            if _is_general_chat_prompt(user_input):
-                await _run_general_chat(user_input, console, llm)
+            if _is_general_chat_prompt(effective_input):
+                await _run_general_chat(effective_input, console, llm)
             else:
                 console.print(
                     "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
@@ -995,29 +997,29 @@ async def _handle_request(
         console.print(
             "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
         )
-    decision = await _route_prompt(user_input, llm)
+    decision = await _route_prompt(effective_input, llm)
     _print_decision(decision, console)
 
     try:
         _log_event(
             session_logger,
             "workflow.started",
-            {"intent": decision.intent, "prompt": user_input},
+            {"intent": decision.intent, "prompt": user_input, "effective_prompt": effective_input},
             f"Workflow started: {decision.intent}",
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
-            await _run_qa(user_input, workspace, console, llm)
+            await _run_qa(effective_input, workspace, console, llm)
         elif decision.intent == "code_edit":
-            await _run_code_edit(user_input, workspace, search, console, llm, session_logger)
+            await _run_code_edit(effective_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
-            await _run_bug_fix(user_input, workspace, search, console, llm, session_logger)
+            await _run_bug_fix(effective_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
-            await _run_audit(user_input, search, console, llm)
+            await _run_audit(effective_input, search, console, llm)
         elif decision.intent == "test_gen":
-            await _run_test_generation(user_input, workspace, search, console, llm, session_logger)
+            await _run_test_generation(effective_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "doc_gen":
-            await _run_docs(user_input, workspace, search, console, llm, session_logger)
+            await _run_docs(effective_input, workspace, search, console, llm, session_logger)
         else:
             console.print("[yellow]Project generation is not wired into this CLI yet.[/yellow]")
         _log_event(
@@ -1192,7 +1194,9 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     extracted_url = _extract_url_from_prompt(user_input)
     if extracted_url and not _is_local_url(extracted_url):
         return True
-    if any(phrase in text for phrase in ("search the web", "look up", "find docs", "documentation for", "official docs", "latest ", "current ")):
+    if any(phrase in text for phrase in ("search the web", "look up", "find docs", "documentation for", "official docs", "latest ", "current ", "check on the web")):
+        return True
+    if any(word in text for word in ("weather", "forecast", "temperature", "rain today", "news today", "stock price", "exchange rate")):
         return True
     if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
         return True
@@ -1237,6 +1241,29 @@ def _is_local_url(url: str) -> bool:
         return False
     hostname = urlparse(url).hostname or ""
     return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _expand_followup_prompt(user_input: str, previous_user_prompt: str) -> str:
+    if not previous_user_prompt:
+        return user_input
+    text = user_input.strip().lower()
+    if text in {
+        "check on the web",
+        "look it up",
+        "search the web",
+        "use the web",
+        "check online",
+        "search online",
+    }:
+        return f"{previous_user_prompt.strip()} Please check on the web for this."
+    if text in {
+        "open it",
+        "check it in the browser",
+        "open it in the browser",
+        "use the browser",
+    }:
+        return f"{previous_user_prompt.strip()} Please inspect it in the browser."
+    return user_input
 
 
 def _print_decision(decision: RoutingDecision, console: Console) -> None:
@@ -1866,6 +1893,7 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input in {"exit", "quit"}:
             print("Goodbye.")
             break
+        previous_user_prompt = session_logger.metadata.last_user_prompt
         session_logger.log(
             "user.prompt",
             {"prompt": user_input},
@@ -1937,7 +1965,17 @@ def main(argv: list[str] | None = None) -> None:
             continue
 
         with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-            asyncio.run(_handle_request(user_input, workspace, console, web_tool, browser_tool, session_logger))
+            asyncio.run(
+                _handle_request(
+                    user_input,
+                    workspace,
+                    console,
+                    web_tool,
+                    browser_tool,
+                    previous_user_prompt=previous_user_prompt,
+                    session_logger=session_logger,
+                )
+            )
 
     browser_tool.close()
 
