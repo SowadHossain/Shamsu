@@ -63,6 +63,7 @@ The recommended install uses a repo-local virtual environment:
 
 - Creates `.venv/` inside this repository
 - Installs SHAMSU into that `.venv`
+- Installs a user-local `shamsu` launcher
 - Does not install packages into global Python
 - Does not edit PATH, shell profiles, registry, or system files
 
@@ -103,6 +104,8 @@ Installer flags:
 -Yes / --yes                         approve runtime bootstrap prompts
 -SkipOllamaInstall / --skip-ollama-install
 -SkipModels / --skip-models
+-SkipCommandInstall / --skip-command-install
+-BinDir <path> / --bin-dir <path>
 -ModelsPath <path> / --models-path <path>
 ```
 
@@ -111,24 +114,7 @@ does not edit your PowerShell profile, PATH, registry, shell startup files, or
 global Python. If Ollama's official installer makes normal app/service entries,
 that is Ollama's installer behavior, not extra SHAMSU configuration.
 
-## Install As A User Command
-
-After the normal install, you can create a tiny user-local launcher so `shamsu`
-can be called from any project directory.
-
-Windows:
-
-```powershell
-.\scripts\install-command.ps1
-```
-
-Linux/macOS:
-
-```bash
-bash scripts/install-command.sh
-```
-
-The command installer writes only launcher files:
+The installer also writes user-local launcher files:
 
 - Windows default: `$HOME\.shamsu\bin\shamsu.ps1` and `shamsu.cmd`
 - Linux/macOS default: `$HOME/.local/bin/shamsu`
