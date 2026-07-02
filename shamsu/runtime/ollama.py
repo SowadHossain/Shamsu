@@ -107,13 +107,7 @@ def wait_until_running(
 
 
 def list_installed_models(ollama_path: Path) -> list[str]:
-    completed = subprocess.run(
-        [str(ollama_path), "list"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
+    completed = _run_ollama_command(ollama_path, "list", timeout=30)
     if completed.returncode != 0:
         return []
     return parse_ollama_list(completed.stdout)
@@ -130,13 +124,7 @@ def parse_ollama_list(output: str) -> list[str]:
 
 
 def pull_model(ollama_path: Path, model_name: str) -> tuple[int, str, str]:
-    completed = subprocess.run(
-        [str(ollama_path), "pull", model_name],
-        capture_output=True,
-        text=True,
-        timeout=3600,
-        check=False,
-    )
+    completed = _run_ollama_command(ollama_path, "pull", model_name, timeout=3600)
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
 
@@ -249,6 +237,25 @@ def _creationflags() -> int:
     if sys.platform != "win32":
         return 0
     return subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
+
+
+def _run_ollama_command(
+    ollama_path: Path,
+    *args: str,
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    return subprocess.run(
+        [str(ollama_path), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
+        env=env,
+    )
 
 
 if __name__ == "__main__":

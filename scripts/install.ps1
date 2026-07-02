@@ -8,6 +8,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+$env:PYTHONUTF8 = "1"
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $VenvDir = Join-Path $RepoRoot ".venv"

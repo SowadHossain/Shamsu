@@ -10,6 +10,7 @@ param(
 begin {
     $ErrorActionPreference = "Stop"
     Set-StrictMode -Version Latest
+    $env:PYTHONUTF8 = "1"
 
     $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
     $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"

@@ -42,3 +42,15 @@ def test_install_scripts_expose_safe_runtime_flags():
     assert "--skip-ollama-install" in sh
     assert "--skip-models" in sh
     assert "--models-path" in sh
+
+
+def test_windows_runtime_scripts_force_python_utf8_for_ollama_output():
+    install_ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    run_ps1 = (REPO_ROOT / "scripts" / "run-shamsu.ps1").read_text(encoding="utf-8")
+    install_sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+    run_sh = (REPO_ROOT / "scripts" / "run-shamsu.sh").read_text(encoding="utf-8")
+
+    assert '$env:PYTHONUTF8 = "1"' in install_ps1
+    assert '$env:PYTHONUTF8 = "1"' in run_ps1
+    assert 'export PYTHONUTF8="${PYTHONUTF8:-1}"' in install_sh
+    assert 'export PYTHONUTF8="${PYTHONUTF8:-1}"' in run_sh
