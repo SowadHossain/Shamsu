@@ -32,6 +32,7 @@ from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.retriever.search import SearchAgent
 from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner
 from shamsu.types import RoutingDecision, SearchResult
 
 if sys.platform == "win32":
@@ -94,6 +95,7 @@ def _print_help(console: Console) -> None:
                     "  models status            Show local Ollama/model status",
                     "  models pull              Pull missing local models",
                     "  models repair            Start Ollama and pull missing models",
+                    "  django setup [dir]       Install requirements and run migrations",
                     "  edit <request>           Force code-edit workflow",
                     "  fix <bug/traceback>      Force bug-fix workflow",
                     "  test-gen <request>       Force test-generation workflow",
@@ -226,7 +228,9 @@ def _handle_models(user_input: str, console: Console) -> None:
     if command == "pull":
         status = collect_status()
         if not status.ollama_found:
-            console.print("[red]Ollama was not found. Run `models repair` after installing Ollama.[/red]")
+            console.print(
+                "[red]Ollama was not found. Run `models repair` after installing Ollama.[/red]"
+            )
             return
         if not status.server_running:
             console.print("[yellow]Ollama is not running. Run `models repair`.[/yellow]")
@@ -246,6 +250,35 @@ def _handle_models(user_input: str, console: Console) -> None:
         _print_runtime_status(console, status=status)
         return
     console.print("[red]Usage: models status|pull|repair[/red]")
+
+
+def _handle_django(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=2)
+    command = parts[1].strip().lower() if len(parts) > 1 else ""
+    if command != "setup":
+        console.print("[red]Usage: django setup [project-dir][/red]")
+        return
+    project_dir = parts[2].strip() if len(parts) > 2 else "."
+    result = DjangoSetupRunner(workspace).run(project_dir)
+    _print_django_setup_result(result, console)
+
+
+def _print_django_setup_result(result: DjangoSetupResult, console: Console) -> None:
+    table = Table(title="Django Setup")
+    table.add_column("Step")
+    table.add_column("Command")
+    table.add_column("Exit")
+    for command in result.commands:
+        style = "green" if command.ok else "red"
+        table.add_row(command.step, command.command, f"[{style}]{command.exit_code}[/{style}]")
+    if not result.commands and result.failures:
+        failure = result.failures[0]
+        table.add_row(failure.step, failure.command or "validate project", "[red]1[/red]")
+    console.print(table)
+    if result.ok:
+        console.print("[green]Django dependencies installed and migrations completed.[/green]")
+        return
+    console.print(Panel(result.bugfix_context, title="Setup Failure", border_style="red"))
 
 
 def _print_runtime_status(console: Console, status=None) -> None:
@@ -433,7 +466,13 @@ async def _run_test_generation(
     result = await TestGenerationWorkflow(workspace, search=search, llm=llm).run(
         _strip_forced_prefix(user_input, "test-gen")
     )
-    _print_patch_result("Test Generation", result.applied, result.changed_files, result.error, console)
+    _print_patch_result(
+        "Test Generation",
+        result.applied,
+        result.changed_files,
+        result.error,
+        console,
+    )
 
 
 async def _run_docs(
@@ -448,7 +487,13 @@ async def _run_docs(
         llm=llm,
         workspace_root=workspace,
     ).apply_readme_update(request=_strip_forced_prefix(user_input, "docs"))
-    _print_patch_result("Documentation", result.applied, result.changed_files, result.error, console)
+    _print_patch_result(
+        "Documentation",
+        result.applied,
+        result.changed_files,
+        result.error,
+        console,
+    )
 
 
 def _print_patch_result(
@@ -462,7 +507,9 @@ def _print_patch_result(
         files = "\n".join(f"- {path}" for path in changed_files) or "No files reported."
         console.print(Panel(files, title=f"{title} Applied", border_style="green"))
         return
-    console.print(Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow"))
+    console.print(
+        Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow")
+    )
 
 
 def _looks_like_runtime_error(message: str) -> bool:
@@ -547,6 +594,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower().startswith("models"):
             _handle_models(user_input, console)
+            continue
+        if user_input.lower().startswith("django"):
+            _handle_django(user_input, workspace, console)
             continue
 
         asyncio.run(_handle_request(user_input, workspace, console))
