@@ -6,6 +6,7 @@ YES=0
 SKIP_OLLAMA_INSTALL=0
 SKIP_MODELS=0
 MODELS_PATH=""
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
