@@ -824,6 +824,9 @@ creating parallel audit files.
 
 ### Issue 35: End-To-End PRD Fixtures
 
+Status: implemented locally on `feature/dev-b-dev-a/m6-fixtures-bench-docs`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:tests`, `area:django`, `type:integration`,
   `priority:p0`
@@ -838,6 +841,9 @@ creating parallel audit files.
 
 ### Issue 36: RAM And Performance Benchmarking
 
+Status: implemented locally on `feature/dev-b-dev-a/m6-fixtures-bench-docs`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:tests`, `type:hardening`, `priority:p1`
 - Branch: `feature/dev-a/ram-performance-benchmark`
@@ -850,6 +856,9 @@ creating parallel audit files.
   - Writes results to `BENCHMARK.md`.
 
 ### Issue 37: Generated Project README And Summary Report
+
+Status: implemented locally on `feature/dev-b-dev-a/m6-fixtures-bench-docs`; keep
+GitHub issue open until the PR into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:docs`, `area:django`, `area:llm`,
@@ -893,6 +902,8 @@ creating parallel audit files.
   - Tests cover all safety gates.
 
 ### Issue 40: MVP Release Cut
+
+Status: blocked until issues #33, #34, #38, and #39 are complete and merged.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `type:hardening`, `priority:p0`

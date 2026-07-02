@@ -7,7 +7,7 @@ blocker.
 ## Current State
 
 - Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, and workspace-local session logging/resume complete.
-- Tests: `171 passed`
+- Tests: `175 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
 - Current next focus: finish Milestone 5 from fresh branches based on `develop`.
@@ -98,16 +98,19 @@ blocker.
 - [x] Added REPL `django fix-tests [project-dir]` command for the generated-project test/fix loop.
 - [x] Added M6 full PRD-to-Django pipeline orchestrator that parses a PRD, builds a project plan, writes generated files, runs setup, runs Django tests, and invokes the error feedback loop when tests fail.
 - [x] Added REPL `generate-prd <file> --output <dir>` command for the full pipeline.
+- [x] Added Todo, Expense Tracker, and Blog PRD fixtures for M6 end-to-end generation coverage.
+- [x] Added generated project README and `SHAMSU_SUMMARY.md` output with install, migrate, test, run, generated files, command results, and warnings.
+- [x] Added MVP benchmark script and `BENCHMARK.md` recording representative PRD generation runtime and peak RSS against the 7 GB target.
 
 ## In Progress
 
-- [ ] Milestone 6 status/log/progress views, generated project docs, fixtures, benchmarks, safety audit, and release cut.
+- [ ] Milestone 6 status/log/progress views, safety audit, release docs, and final release cut.
 
 ## Next Queue
 
-1. Open PR for Issue #32 from `feature/dev-b/full-django-pipeline` into `develop`.
+1. Open PR for issues #35, #36, and #37 from `feature/dev-b-dev-a/m6-fixtures-bench-docs` into `develop`.
 2. Finish Issue #33/#34 status/log/progress and audit trail polish.
-3. Add M6 E2E fixtures, generated docs, benchmarks, safety audit, and release docs.
+3. Finish Issue #38/#39 release docs and final safety audit, then complete Issue #40 release cut.
 
 ## Known Notes
 

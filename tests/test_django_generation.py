@@ -82,8 +82,10 @@ def test_project_writer_writes_inside_workspace_and_records_state(tmp_path):
     assert approvals
     assert (tmp_path / "manage.py").exists()
     assert (tmp_path / "app" / "models.py").exists()
+    assert (tmp_path / "README.md").exists()
     assert "manage.py" in state.completed_files
-    assert any(step.status == TaskStepStatus.SKIPPED for step in state.generation_order)
+    assert "README.md" in state.completed_files
+    assert not any(step.status == TaskStepStatus.SKIPPED for step in state.generation_order)
 
 
 def test_project_writer_rejects_path_escape(tmp_path):
