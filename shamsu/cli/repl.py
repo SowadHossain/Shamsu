@@ -31,6 +31,7 @@ from shamsu.llm.manager import LLMManager
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.retriever.search import SearchAgent
 from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
+from shamsu.safety.commands import redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner
 from shamsu.types import RoutingDecision, SearchResult
@@ -88,7 +89,8 @@ def _print_help(console: Console) -> None:
                     "",
                     "Commands:",
                     "  index                    Index the current workspace",
-                    "  status                   Show index counts",
+                    "  status                   Show workspace, index, model, and task status",
+                    "  log [n]                  Tail structured logs from .shamsu/",
                     "  search <query>           Search indexed snippets",
                     "  symbols <name>           Look up indexed symbols",
                     "  parse-prd <file.md>      Parse a Markdown PRD into sections",
@@ -114,6 +116,10 @@ def _print_help(console: Console) -> None:
 
 def _index_db_path(workspace: Path) -> Path:
     return workspace / ".shamsu" / "index.db"
+
+
+def _log_path(workspace: Path) -> Path:
+    return workspace / ".shamsu" / "shamsu.log"
 
 
 def _has_index(workspace: Path) -> bool:
@@ -164,10 +170,27 @@ def _resolve_workspace_file(path_text: str, workspace: Path) -> Path:
 
 
 def _handle_status(workspace: Path, console: Console) -> None:
+    files, symbols, snippets = _index_counts(workspace)
+    runtime_status = collect_status()
+    table = Table(title="SHAMSU Status")
+    table.add_column("Item")
+    table.add_column("Value")
+    table.add_row("Workspace", str(workspace))
+    table.add_row("Index", "ready" if _has_index(workspace) else "missing")
+    table.add_row("Files", str(files))
+    table.add_row("Symbols", str(symbols))
+    table.add_row("Snippets", str(snippets))
+    table.add_row("Task status", "idle")
+    table.add_row("Current model", LLMManager().router_model)
+    table.add_row("Runtime", status_text(runtime_status))
+    table.add_row("Pending approvals", "none")
+    console.print(table)
+
+
+def _index_counts(workspace: Path) -> tuple[int, int, int]:
     db_path = _index_db_path(workspace)
     if not db_path.exists():
-        console.print("[yellow]No index found. Run `index` first.[/yellow]")
-        return
+        return 0, 0, 0
 
     conn = sqlite3.connect(db_path)
     try:
@@ -176,9 +199,35 @@ def _handle_status(workspace: Path, console: Console) -> None:
         snippets = conn.execute("SELECT COUNT(*) FROM snippets").fetchone()[0]
     finally:
         conn.close()
-    console.print(f"Files: {files}")
-    console.print(f"Symbols: {symbols}")
-    console.print(f"Snippets: {snippets}")
+    return files, symbols, snippets
+
+
+def _handle_log(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=1)
+    line_count = 20
+    if len(parts) > 1:
+        try:
+            line_count = max(1, int(parts[1].strip()))
+        except ValueError:
+            console.print("[red]Usage: log [line-count][/red]")
+            return
+
+    log_path = _log_path(workspace)
+    if not log_path.exists():
+        console.print("[yellow]No log file found at .shamsu/shamsu.log[/yellow]")
+        return
+    if not log_path.is_file():
+        console.print("[red].shamsu/shamsu.log is not a file[/red]")
+        return
+
+    lines = _tail_lines(log_path, line_count)
+    console.print(Panel(redact("".join(lines)).rstrip(), title="SHAMSU Log"))
+
+
+def _tail_lines(path: Path, line_count: int) -> list[str]:
+    return path.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True)[
+        -line_count:
+    ]
 
 
 def _handle_search(user_input: str, workspace: Path, console: Console) -> None:
@@ -582,6 +631,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower() == "status":
             _handle_status(workspace, console)
+            continue
+        if user_input.lower() == "log" or user_input.lower().startswith("log "):
+            _handle_log(user_input, workspace, console)
             continue
         if user_input.lower().startswith("search "):
             _handle_search(user_input, workspace, console)
