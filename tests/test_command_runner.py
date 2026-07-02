@@ -53,6 +53,24 @@ def test_medium_risk_command_asks_approval_and_denies_cleanly(tmp_path: Path):
     assert requests[0].risk_level == "medium"
 
 
+def test_pip_install_requirements_requires_approval(tmp_path: Path):
+    requests: list[ApprovalRequest] = []
+
+    def deny(request: ApprovalRequest) -> bool:
+        requests.append(request)
+        return False
+
+    runner = CommandRunner(tmp_path, approval_func=deny)
+
+    code, stdout, stderr = runner.run("pip install -r requirements.txt", tmp_path)
+
+    assert code == DENIED_EXIT_CODE
+    assert stdout == ""
+    assert "denied" in stderr
+    assert requests[0].action_type == "run_command"
+    assert requests[0].preview == "pip install -r requirements.txt"
+
+
 def test_medium_risk_command_runs_when_approved(tmp_path: Path):
     requests: list[ApprovalRequest] = []
 

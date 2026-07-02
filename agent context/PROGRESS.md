@@ -7,10 +7,10 @@ blocker.
 ## Current State
 
 - Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, and workspace-local session logging/resume complete.
-- Tests: `152 passed`
+- Tests: `158 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: open/merge the M4 plus session logging PR work, then start Milestone 5 frontend/migrations/tests.
+- Current next focus: finish Milestone 5 from fresh branches based on `develop`.
 
 ## Completed Features
 
@@ -87,16 +87,20 @@ blocker.
 - [x] Added default session resume behavior, `--session`, `--new-session`, and REPL `sessions list/current/show/resume/rename/close/export` commands.
 - [x] Added redacted session event logging for prompts, routing, context packs, local LLM calls, approvals, patches, commands, PRD parsing, project planning, and Django generation.
 - [x] Added `log tail` and redacted session ZIP exports with `session.json`, `events.jsonl`, and Markdown summary.
+- [x] Merged M4 deterministic Django backend generation into `develop` and closed issues #15-#23.
+- [x] Merged session logging/resume PR #48 into `develop`.
+- [x] Added Milestone 5 Django setup runner for generated projects: validates project cwd inside the workspace, installs generated requirements, runs `makemigrations`/`migrate` through `CommandRunner`, redacts output, and returns structured bug-fix context on failure.
+- [x] Added REPL `django setup [project-dir]` command with Rich setup results and session-aware command logging.
 
 ## In Progress
 
-- [ ] M4/session logging PR preparation.
+- [ ] Milestone 5 frontend generators, Django test runner, frontend checker, and error feedback loop.
 
 ## Next Queue
 
-1. Open/merge M4 PRs for issues #15-#23.
-2. Sync `dev-a`, `dev-b`, and `dev-c` after M4 merges.
-3. Start Milestone 5 frontend, migrations, tests, and error feedback loop.
+1. Open PR for Issue #28 from `feature/dev-c/m5-setup-runner-safe` into `develop`.
+2. Implement M5 frontend theme/dashboard/resource templates and checker.
+3. Implement Django test runner, generated test files, and error feedback loop.
 
 ## Known Notes
 
