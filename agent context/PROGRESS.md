@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 1 merged to `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, and CLI workflow routing complete locally on `dev-b`.
-- Tests: `105 passed`
+- Status: Milestone 1 merged to `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, and native local Ollama runtime bootstrap complete locally on `dev-b`.
+- Tests: `116 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: open/merge Milestone 2 workflow + CLI routing PR into `develop`, then start PRD-to-project planning and Django generation.
+- Current next focus: open/merge Milestone 2 workflow + native runtime PR into `develop`, then start PRD-to-project planning and Django generation.
 
 ## Completed Features
 
@@ -69,6 +69,8 @@ blocker.
 - [x] Extended documentation workflow so README diffs can apply through approval-backed `PatchEngine` while preserving proposal-only behavior.
 - [x] Added Claude-like CLI routing with prompt-toolkit input, natural-language intent dispatch, keyword fallback when Ollama routing is unavailable, and explicit workflow commands for edit/fix/test-gen/audit/docs.
 - [x] Added LLM model aliases for `bugfix` and `test_gen` specialists so workflow names map to the intended local models.
+- [x] Added native local runtime management for Ollama detection, local-only status, model checks/pulls, runtime config, and REPL `models status|pull|repair` commands.
+- [x] Extended install scripts with safe runtime bootstrap flags while avoiding PowerShell profile, PATH, registry, shell startup files, and global Python edits.
 
 ## In Progress
 

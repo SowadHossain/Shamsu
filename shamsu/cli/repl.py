@@ -30,6 +30,7 @@ from shamsu.indexer.walker import FileWalker
 from shamsu.llm.manager import LLMManager
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.retriever.search import SearchAgent
+from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.types import RoutingDecision, SearchResult
 
@@ -90,6 +91,9 @@ def _print_help(console: Console) -> None:
                     "  search <query>           Search indexed snippets",
                     "  symbols <name>           Look up indexed symbols",
                     "  parse-prd <file.md>      Parse a Markdown PRD into sections",
+                    "  models status            Show local Ollama/model status",
+                    "  models pull              Pull missing local models",
+                    "  models repair            Start Ollama and pull missing models",
                     "  edit <request>           Force code-edit workflow",
                     "  fix <bug/traceback>      Force bug-fix workflow",
                     "  test-gen <request>       Force test-generation workflow",
@@ -213,6 +217,51 @@ def _handle_symbols(user_input: str, workspace: Path, console: Console) -> None:
         console.print(f"{symbol}: {result.file_path}:{result.line_start}-{result.line_end}")
 
 
+def _handle_models(user_input: str, console: Console) -> None:
+    parts = user_input.split(maxsplit=1)
+    command = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if command == "status":
+        _print_runtime_status(console)
+        return
+    if command == "pull":
+        status = collect_status()
+        if not status.ollama_found:
+            console.print("[red]Ollama was not found. Run `models repair` after installing Ollama.[/red]")
+            return
+        if not status.server_running:
+            console.print("[yellow]Ollama is not running. Run `models repair`.[/yellow]")
+            return
+        if not status.missing_models:
+            console.print("[green]All required local models are installed.[/green]")
+            return
+        console.print(f"Pulling missing models: {', '.join(status.missing_models)}")
+        results = pull_missing_models(Path(status.ollama_path), status.missing_models)
+        for model, exit_code in results.items():
+            style = "green" if exit_code == 0 else "red"
+            console.print(f"[{style}]{model}: exit {exit_code}[/{style}]")
+        _print_runtime_status(console)
+        return
+    if command == "repair":
+        status = repair_runtime(pull_models=True)
+        _print_runtime_status(console, status=status)
+        return
+    console.print("[red]Usage: models status|pull|repair[/red]")
+
+
+def _print_runtime_status(console: Console, status=None) -> None:
+    status = status or collect_status()
+    table = Table(title="Local Runtime")
+    table.add_column("Item")
+    table.add_column("Value")
+    table.add_row("Inference", "local-only Ollama")
+    table.add_row("Endpoint", status.base_url)
+    table.add_row("Ollama", status.ollama_path or "not found")
+    table.add_row("Server", "running" if status.server_running else "not running")
+    table.add_row("Missing models", ", ".join(status.missing_models) or "none")
+    table.add_row("Status", status_text(status))
+    console.print(table)
+
+
 async def _handle_request(user_input: str, workspace: Path, console: Console) -> None:
     search, uses_real_index = _build_search_agent(workspace)
     if not uses_real_index:
@@ -239,7 +288,10 @@ async def _handle_request(user_input: str, workspace: Path, console: Console) ->
         else:
             console.print("[yellow]Project generation is not wired into this CLI yet.[/yellow]")
     except Exception as exc:
-        console.print(Panel(str(exc), title="Workflow Unavailable", border_style="red"))
+        message = str(exc)
+        if _looks_like_runtime_error(message):
+            message = f"{message}\n\nRun `models status` or `models repair`."
+        console.print(Panel(message, title="Workflow Unavailable", border_style="red"))
 
 
 async def _route_prompt(user_input: str, llm: LLMManager) -> RoutingDecision:
@@ -413,6 +465,14 @@ def _print_patch_result(
     console.print(Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow"))
 
 
+def _looks_like_runtime_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        marker in lowered
+        for marker in ("connect", "connection", "localhost:11434", "ollama", "model")
+    )
+
+
 def _strip_forced_prefix(user_input: str, command: str) -> str:
     prefix = f"{command} "
     if user_input.lower().startswith(prefix):
@@ -448,6 +508,7 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     console.print(f"[dim]Workspace: {workspace}[/dim]")
+    console.print(f"[dim]{status_text(collect_status())}[/dim]")
     console.print("[dim]Type a prompt, or `help` for commands.[/dim]\n")
     session = _make_prompt_session(workspace)
 
@@ -483,6 +544,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower().startswith("parse-prd "):
             _handle_parse_prd(user_input, workspace, console)
+            continue
+        if user_input.lower().startswith("models"):
+            _handle_models(user_input, console)
             continue
 
         asyncio.run(_handle_request(user_input, workspace, console))

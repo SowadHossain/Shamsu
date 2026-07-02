@@ -12,7 +12,7 @@ Current baseline:
 - Indexing, Python symbols, FTS search, PRD parsing, `ProjectSpec`, fixed Django
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
-- Current verified state: `105 passed`, `ruff check shamsu tests` clean.
+- Current verified state: `116 passed`, `ruff check shamsu tests` clean.
 - Next implementation focus: PRD-to-project planning and Django generation.
 
 ## Already Done - Do Not Create Issues
@@ -93,6 +93,10 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   routing gives SHAMSU a Claude-like prompt loop with prompt-toolkit input,
   natural-language routing, keyword fallback, and explicit commands for edit,
   fix, test-gen, audit, and docs.
+- [x] Native local runtime bootstrap is complete locally on `dev-b`: installer
+  flags support Ollama/model setup, runtime checks remain local-only, REPL has
+  `models status|pull|repair`, and SHAMSU scripts avoid profile/PATH/registry
+  edits.
 
 The issue list below starts from remaining work only.
 

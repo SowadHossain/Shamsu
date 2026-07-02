@@ -30,4 +30,5 @@ elif [[ "${USES_WINDOWS_PYTHON}" -eq 1 && "${WORKSPACE}" =~ ^/([A-Za-z])/(.*)$ ]
   WORKSPACE="${DRIVE}:\\${REST}"
 fi
 
+"${VENV_PYTHON}" -m shamsu.runtime.ollama status
 "${VENV_PYTHON}" -m shamsu.cli.repl --workspace "${WORKSPACE}" "$@"
