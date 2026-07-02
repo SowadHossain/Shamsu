@@ -3,10 +3,12 @@ from __future__ import annotations
 import pytest
 
 from shamsu.agents.doc_workflow import (
+    DocumentationApplyResult,
     DocumentationWorkflow,
     build_readme_diff,
     load_existing_readme,
 )
+from shamsu.patch.engine import PatchEngine
 from shamsu.types import ContextPack, LLMResponse, SearchResult
 
 
@@ -91,3 +93,40 @@ def test_load_existing_readme_reads_file(tmp_path):
     readme.write_text("# Project\n", encoding="utf-8")
 
     assert load_existing_readme(tmp_path) == "# Project\n"
+
+
+@pytest.mark.asyncio
+async def test_documentation_workflow_applies_readme_diff_through_patch_engine(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("# Old\n", encoding="utf-8")
+
+    result = await DocumentationWorkflow(
+        search=FakeSearch(),
+        llm=FakeLLM(),
+        workspace_root=tmp_path,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).apply_readme_update(request="document the CLI")
+
+    assert isinstance(result, DocumentationApplyResult)
+    assert result.applied is True
+    assert result.error == ""
+    assert result.changed_files == ["README.md"]
+    assert readme.read_text(encoding="utf-8").startswith("# SHAMSU")
+
+
+@pytest.mark.asyncio
+async def test_documentation_workflow_reports_denied_apply(tmp_path):
+    readme = tmp_path / "README.md"
+    readme.write_text("# Old\n", encoding="utf-8")
+
+    result = await DocumentationWorkflow(
+        search=FakeSearch(),
+        llm=FakeLLM(),
+        workspace_root=tmp_path,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: False),
+    ).apply_readme_update(request="document the CLI")
+
+    assert result.applied is False
+    assert result.error == "Patch was not applied."
+    assert result.changed_files == ["README.md"]
+    assert readme.read_text(encoding="utf-8") == "# Old\n"

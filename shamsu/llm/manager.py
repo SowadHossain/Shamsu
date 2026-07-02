@@ -20,30 +20,26 @@ to decide what's resident.
 from __future__ import annotations
 
 import json
+from urllib.parse import urlparse
+
 import httpx
 from json_repair import repair_json
 
 from shamsu.interfaces import ILLMManager
+from shamsu.runtime.models import SPECIALIST_MODELS
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
 
 OLLAMA_BASE_URL = "http://localhost:11434"
+LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # Model assignment — see SHAMSU_model_architecture.md for full rationale.
-OLLAMA_MODELS = {
-    "router": "phi3:mini-4k-instruct",
-    "coder": "qwen2.5-coder:7b-instruct-q4_K_M",
-    "bugfixer": "deepseek-coder:6.7b-instruct-q4_K_M",
-    "reviewer": "mistral:7b-instruct-q4_K_M",
-    "test_agent": "qwen2.5-coder:7b-instruct-q4_K_M",
-    "planner": None,      # null = reuse router model, no swap
-    "doc_agent": None,
-    "summarizer": None,
-}
+OLLAMA_MODELS = SPECIALIST_MODELS
 
 # Temperature per specialist — see ENGINEERING_HARNESS.md §1.
 SPECIALIST_TEMPS = {
     "router": 0.0, "planner": 0.1, "coder": 0.1,
-    "bugfixer": 0.1, "reviewer": 0.2, "test_agent": 0.1,
+    "bugfix": 0.1, "bugfixer": 0.1, "reviewer": 0.2,
+    "test_gen": 0.1, "test_agent": 0.1,
     "doc_agent": 0.4, "summarizer": 0.3, "qa": 0.2,
 }
 
@@ -87,6 +83,7 @@ ROUTING_JSON_SCHEMA = {
 
 class LLMManager(ILLMManager):
     def __init__(self, base_url: str = OLLAMA_BASE_URL):
+        _validate_local_llm_url(base_url)
         self.base_url = base_url
         self.router_model = OLLAMA_MODELS["router"]
 
@@ -203,3 +200,14 @@ class LLMManager(ILLMManager):
 ## Task (read this carefully)
 {pack.user_request}
 """
+
+
+def _validate_local_llm_url(base_url: str) -> None:
+    parsed = urlparse(base_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"Invalid Ollama URL: {base_url}")
+    if parsed.hostname not in LOCAL_LLM_HOSTS:
+        raise ValueError(
+            "SHAMSU only supports local Ollama endpoints. "
+            f"Refusing non-local LLM URL: {base_url}"
+        )

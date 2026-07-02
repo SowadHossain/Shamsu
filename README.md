@@ -46,10 +46,10 @@ Planned next:
 
 - Python 3.11 or newer
 - PowerShell on Windows, or Bash on Linux/macOS
-- Optional: Ollama for local model calls
+- Ollama for local model calls. The installer can bootstrap it for you.
 
-The current CLI works without Ollama. If Ollama is not running, SHAMSU falls
-back to a safe QA preview instead of crashing.
+Runtime inference is local-only through Ollama on `localhost:11434`. SHAMSU does
+not configure cloud AI APIs.
 
 ## Safe Install
 
@@ -68,7 +68,7 @@ Docker or OS-level sandbox.
 From the SHAMSU repo root:
 
 ```powershell
-.\scripts\install.ps1
+.\scripts\install.ps1 -Yes
 ```
 
 If PowerShell blocks script execution on your machine, run:
@@ -82,7 +82,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 From the SHAMSU repo root:
 
 ```bash
-bash scripts/install.sh
+bash scripts/install.sh --yes
 ```
 
 If your Python command is not `python3`, choose one explicitly:
@@ -90,6 +90,20 @@ If your Python command is not `python3`, choose one explicitly:
 ```bash
 PYTHON=python3.11 bash scripts/install.sh
 ```
+
+Installer flags:
+
+```text
+-Yes / --yes                         approve runtime bootstrap prompts
+-SkipOllamaInstall / --skip-ollama-install
+-SkipModels / --skip-models
+-ModelsPath <path> / --models-path <path>
+```
+
+The installer may download Ollama and model weights when approved. SHAMSU itself
+does not edit your PowerShell profile, PATH, registry, shell startup files, or
+global Python. If Ollama's official installer makes normal app/service entries,
+that is Ollama's installer behavior, not extra SHAMSU configuration.
 
 ## Run SHAMSU Safely
 
@@ -150,6 +164,9 @@ status
 search <query>
 symbols <name>
 parse-prd <file.md>
+models status
+models pull
+models repair
 help
 exit
 ```
@@ -218,6 +235,19 @@ shamsu> how does project spec work?
 If an index exists, SHAMSU uses real indexed search to assemble the preview. If
 Ollama is unavailable, the routing step falls back to safe QA mode.
 
+### `models status|pull|repair`
+
+Checks and repairs the local AI runtime.
+
+```text
+shamsu> models status
+shamsu> models pull
+shamsu> models repair
+```
+
+`models repair` starts local Ollama when possible and pulls missing required
+models. It does not install Ollama; use the installer for first-time bootstrap.
+
 ## Smoke Test
 
 From the SHAMSU repo root after install:
@@ -250,7 +280,7 @@ Run lint:
 Expected current result:
 
 ```text
-60 passed
+105 passed
 All checks passed!
 ```
 
@@ -277,6 +307,14 @@ Workspace sandbox:
 - `parse-prd` validates file paths with `Sandbox.validate()`.
 - Paths outside the workspace are rejected.
 - Index data stays inside `<workspace>/.shamsu/`.
+
+Local AI runtime:
+
+- SHAMSU only allows LLM calls to `localhost`, `127.0.0.1`, or `::1`.
+- Runtime status is stored in repo-local `.shamsu/runtime.json`.
+- Required model checks use Ollama's local CLI and local HTTP API.
+- Setup-time downloads require installer approval or `-Yes`/`--yes`.
+- Runtime inference does not call cloud AI endpoints.
 
 Internal command execution:
 

@@ -12,8 +12,8 @@ Current baseline:
 - Indexing, Python symbols, FTS search, PRD parsing, `ProjectSpec`, fixed Django
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
-- Current verified state: `60 passed`, `ruff check shamsu tests` clean.
-- Next implementation focus: patch application and rollback behind approval.
+- Current verified state: `116 passed`, `ruff check shamsu tests` clean.
+- Next implementation focus: PRD-to-project planning and Django generation.
 
 ## Already Done - Do Not Create Issues
 
@@ -78,10 +78,25 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   changes.
 - [x] Issue 9 proposal layer is complete locally on `dev-b`: documentation
   workflow uses indexed context, calls `doc_agent`, and produces README diffs.
-  Approval-backed application still depends on Issue 1.
+  Approval-backed application is also complete locally on `dev-b`.
 - [x] Issue 4 implementation is complete locally on `dev-b`: code edit workflow
   searches indexed context, calls `coder`, validates diff output, applies via
   `PatchEngine`, and reports changed files.
+- [x] Issue 6 implementation is complete locally on `dev-b`: bug fix workflow
+  parses traceback locations, gathers indexed context, calls `bugfix`, validates
+  unified diffs, applies through `PatchEngine`, and reports changed files.
+- [x] Issue 8 implementation is complete locally on `dev-b`: test generation
+  workflow gathers indexed context, calls `test_gen`, validates pytest-oriented
+  unified diffs, applies through `PatchEngine`, and can run tests through
+  `CommandRunner`.
+- [x] Issue 10 implementation is complete locally on `dev-b`: CLI workflow
+  routing gives SHAMSU a Claude-like prompt loop with prompt-toolkit input,
+  natural-language routing, keyword fallback, and explicit commands for edit,
+  fix, test-gen, audit, and docs.
+- [x] Native local runtime bootstrap is complete locally on `dev-b`: installer
+  flags support Ollama/model setup, runtime checks remain local-only, REPL has
+  `models status|pull|repair`, and SHAMSU scripts avoid profile/PATH/registry
+  edits.
 
 The issue list below starts from remaining work only.
 
@@ -306,6 +321,9 @@ into `develop` merges.
 
 ### Issue 6: Bug Fix Workflow
 
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:patch`, `type:feature`,
   `priority:p0`
@@ -340,6 +358,9 @@ into `develop` merges.
 
 ### Issue 8: Test Generation Workflow
 
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:tests`, `area:llm`, `type:feature`,
   `priority:p1`
@@ -356,8 +377,8 @@ into `develop` merges.
 
 ### Issue 9: Documentation Generation Workflow
 
-Status: proposal layer implemented locally on `dev-b`; approval-backed apply
-remains blocked by Issue 1.
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:docs`, `area:llm`, `type:feature`,
@@ -372,6 +393,9 @@ remains blocked by Issue 1.
   - Tests cover mocked doc output.
 
 ### Issue 10: CLI Workflow Routing
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:cli`, `area:llm`, `type:feature`,
