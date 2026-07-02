@@ -37,7 +37,10 @@ from shamsu.retriever.search import SearchAgent
 from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.patch.engine import PatchEngine
+from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
+from shamsu.tools.executor import CommandRunner
 from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
 
 if sys.platform == "win32":
@@ -66,6 +69,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--workspace",
         default=None,
         help="Workspace directory to treat as the sandbox boundary. Defaults to cwd.",
+    )
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Resume a session by id or title prefix.",
+    )
+    parser.add_argument(
+        "--new-session",
+        nargs="?",
+        const="SHAMSU Session",
+        default=None,
+        help="Create a new session with an optional title.",
     )
     return parser.parse_args(argv)
 
@@ -102,6 +117,14 @@ def _print_help(console: Console) -> None:
                     "  models status            Show local Ollama/model status",
                     "  models pull              Pull missing local models",
                     "  models repair            Start Ollama and pull missing models",
+                    "  sessions list            List workspace sessions",
+                    "  sessions current         Show current session",
+                    "  sessions show <id>       Show session metadata",
+                    "  sessions resume <id>     Resume another session",
+                    "  sessions rename <id> <title>",
+                    "  sessions close [id]      Close a session",
+                    "  sessions export <id>     Export redacted session bundle",
+                    "  log tail                 Show recent session events",
                     "  edit <request>           Force code-edit workflow",
                     "  fix <bug/traceback>      Force bug-fix workflow",
                     "  test-gen <request>       Force test-generation workflow",
@@ -174,6 +197,7 @@ def _handle_plan_prd(
     workspace: Path,
     console: Console,
     approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+    session_logger: SessionLogger | None = None,
 ) -> None:
     _, _, path_text = user_input.partition(" ")
     cleaned_path = path_text.strip().strip('"').strip("'")
@@ -194,7 +218,28 @@ def _handle_plan_prd(
         console.print(f"[red]{exc}[/red]")
         return
 
+    _log_event(
+        session_logger,
+        "prd.parsed",
+        {"path": str(file_path), "title": parsed.title, "sections": list(parsed.sections)},
+        f"Parsed PRD {file_path.name}",
+        workflow_id="plan-prd",
+    )
     spec = build_project_spec(parsed)
+    _log_event(
+        session_logger,
+        "project.planned",
+        {
+            "project": spec.project_name,
+            "app": spec.app_name,
+            "entities": [entity.name for entity in spec.entities],
+            "endpoints": [endpoint.path for endpoint in spec.endpoints],
+            "pages": [page.name for page in spec.pages],
+            "files": [file.path for file in spec.generation_order],
+        },
+        f"Built project plan for {spec.project_name}",
+        workflow_id="plan-prd",
+    )
     _print_project_plan(spec, console)
     request = ApprovalRequest(
         action_type="file_write",
@@ -204,7 +249,16 @@ def _handle_plan_prd(
         working_dir=str(workspace),
         reason="M3 only stores resume metadata; it does not generate project files.",
     )
-    if not approval_func(request):
+    _log_event(session_logger, "approval.request", {"request": request}, request.description, "plan-prd")
+    approved = approval_func(request)
+    _log_event(
+        session_logger,
+        "approval.result",
+        {"action_type": request.action_type, "approved": approved},
+        f"Approval {'granted' if approved else 'denied'}: {request.description}",
+        "plan-prd",
+    )
+    if not approved:
         console.print("[yellow]Project plan was not approved. No state was written.[/yellow]")
         return
 
@@ -218,6 +272,7 @@ def _handle_generate_django(
     workspace: Path,
     console: Console,
     approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+    session_logger: SessionLogger | None = None,
 ) -> None:
     _, _, path_text = user_input.partition(" ")
     cleaned_path = path_text.strip().strip('"').strip("'")
@@ -237,9 +292,32 @@ def _handle_generate_django(
     except PRDParseError as exc:
         console.print(f"[red]{exc}[/red]")
         return
+    _log_event(
+        session_logger,
+        "prd.parsed",
+        {"path": str(file_path), "title": parsed.title, "sections": list(parsed.sections)},
+        f"Parsed PRD {file_path.name}",
+        workflow_id="generate-django",
+    )
     spec = build_project_spec(parsed)
+    _log_event(
+        session_logger,
+        "project.planned",
+        {
+            "project": spec.project_name,
+            "app": spec.app_name,
+            "entities": [entity.name for entity in spec.entities],
+            "files": [file.path for file in spec.generation_order],
+        },
+        f"Built project plan for {spec.project_name}",
+        workflow_id="generate-django",
+    )
     _print_project_plan(spec, console)
-    writer = DjangoProjectWriter(workspace, approval_func=approval_func)
+    writer = DjangoProjectWriter(
+        workspace,
+        approval_func=approval_func,
+        session_logger=session_logger,
+    )
     try:
         state = writer.write_project(spec, file_path)
     except (PermissionError, ValueError) as exc:
@@ -436,43 +514,176 @@ def _print_runtime_status(console: Console, status=None) -> None:
     console.print(table)
 
 
-async def _handle_request(user_input: str, workspace: Path, console: Console) -> None:
+def _start_session(args: argparse.Namespace, workspace: Path, console: Console) -> SessionLogger:
+    manager = SessionManager(workspace)
+    if args.new_session is not None:
+        logger = manager.create_session(args.new_session)
+    elif args.session:
+        logger = manager.resume_session(args.session)
+    else:
+        logger = manager.get_or_create_latest()
+    console.print(f"[dim]Session: {logger.session_id} ({logger.metadata.title})[/dim]")
+    return logger
+
+
+def _handle_sessions(
+    user_input: str,
+    manager: SessionManager,
+    current: SessionLogger,
+    console: Console,
+) -> SessionLogger:
+    parts = user_input.split(maxsplit=3)
+    command = parts[1].lower() if len(parts) > 1 else "list"
+    try:
+        if command == "list":
+            table = Table(title="Sessions")
+            table.add_column("ID")
+            table.add_column("Title")
+            table.add_column("Status")
+            table.add_column("Updated")
+            table.add_column("Events")
+            for item in manager.list_sessions():
+                table.add_row(item.session_id, item.title, item.status, item.updated_at, str(item.event_count))
+            console.print(table)
+            return current
+        if command == "current":
+            _print_session(current.metadata, console)
+            return current
+        if command == "show" and len(parts) >= 3:
+            _print_session(manager.resolve(parts[2]), console)
+            return current
+        if command == "resume" and len(parts) >= 3:
+            resumed = manager.resume_session(parts[2])
+            console.print(f"[green]Resumed session {resumed.session_id}[/green]")
+            return resumed
+        if command == "rename" and len(parts) >= 4:
+            renamed = manager.rename_session(parts[2], parts[3])
+            console.print(f"[green]Renamed session {renamed.session_id}[/green]")
+            if renamed.session_id == current.session_id:
+                return SessionLogger(manager, renamed)
+            return current
+        if command == "close":
+            target = parts[2] if len(parts) >= 3 else current.session_id
+            closed = manager.close_session(target)
+            console.print(f"[yellow]Closed session {closed.session_id}[/yellow]")
+            if closed.session_id == current.session_id:
+                return manager.create_session("SHAMSU Session")
+            return current
+        if command == "export" and len(parts) >= 3:
+            path = manager.export_session(parts[2])
+            console.print(f"[green]Exported session bundle: {path}[/green]")
+            return current
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return current
+    console.print("[red]Usage: sessions list|current|show|resume|rename|close|export[/red]")
+    return current
+
+
+def _print_session(metadata, console: Console) -> None:
+    table = Table(title=f"Session {metadata.session_id}")
+    table.add_column("Field")
+    table.add_column("Value")
+    for key, value in metadata.__dict__.items():
+        table.add_row(key, str(value))
+    console.print(table)
+
+
+def _handle_log(user_input: str, logger: SessionLogger, console: Console) -> None:
+    parts = user_input.split()
+    count = 20
+    if len(parts) >= 3 and parts[1].lower() == "tail":
+        try:
+            count = int(parts[2])
+        except ValueError:
+            count = 20
+    events = logger.tail(count=count)
+    if not events:
+        console.print("[yellow]No session events yet.[/yellow]")
+        return
+    table = Table(title=f"Last {len(events)} Events")
+    table.add_column("Time")
+    table.add_column("Type")
+    table.add_column("Summary")
+    for event in events:
+        table.add_row(event["timestamp"], event["event_type"], event.get("summary", ""))
+    console.print(table)
+
+
+def _log_event(
+    session_logger: SessionLogger | None,
+    event_type: str,
+    payload: dict,
+    summary: str,
+    workflow_id: str | None = None,
+) -> None:
+    if session_logger:
+        session_logger.log(event_type, payload, summary, workflow_id=workflow_id)
+
+
+async def _handle_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
     if _looks_like_django_generation_request(user_input):
         generate_command = f"generate-django {_extract_prd_path_from_prompt(user_input)}"
-        _handle_generate_django(generate_command, workspace, console)
+        _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
         return
     if _looks_like_prd_plan_request(user_input):
         plan_command = f"plan-prd {_extract_prd_path_from_prompt(user_input)}"
-        _handle_plan_prd(plan_command, workspace, console)
+        _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
     search, uses_real_index = _build_search_agent(workspace)
     if not uses_real_index:
         console.print(
             "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
         )
-    llm = LLMManager()
+    llm = LLMManager(session_logger=session_logger)
     decision = await _route_prompt(user_input, llm)
     _print_decision(decision, console)
 
     try:
+        _log_event(
+            session_logger,
+            "workflow.started",
+            {"intent": decision.intent, "prompt": user_input},
+            f"Workflow started: {decision.intent}",
+            workflow_id=decision.intent,
+        )
         if decision.intent in {"qa", "explain"}:
             await _run_qa(user_input, workspace, console, llm)
         elif decision.intent == "code_edit":
-            await _run_code_edit(user_input, workspace, search, console, llm)
+            await _run_code_edit(user_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
-            await _run_bug_fix(user_input, workspace, search, console, llm)
+            await _run_bug_fix(user_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
             await _run_audit(user_input, search, console, llm)
         elif decision.intent == "test_gen":
-            await _run_test_generation(user_input, workspace, search, console, llm)
+            await _run_test_generation(user_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "doc_gen":
-            await _run_docs(user_input, workspace, search, console, llm)
+            await _run_docs(user_input, workspace, search, console, llm, session_logger)
         else:
             console.print("[yellow]Project generation is not wired into this CLI yet.[/yellow]")
+        _log_event(
+            session_logger,
+            "workflow.finished",
+            {"intent": decision.intent},
+            f"Workflow finished: {decision.intent}",
+            workflow_id=decision.intent,
+        )
     except Exception as exc:
         message = str(exc)
         if _looks_like_runtime_error(message):
             message = f"{message}\n\nRun `models status` or `models repair`."
+        _log_event(
+            session_logger,
+            "workflow.failed",
+            {"intent": decision.intent, "error": message},
+            f"Workflow failed: {decision.intent}",
+            workflow_id=decision.intent,
+        )
         console.print(Panel(message, title="Workflow Unavailable", border_style="red"))
 
 
@@ -586,8 +797,12 @@ async def _run_code_edit(
     search: SearchAgent | EmptySearchAgent,
     console: Console,
     llm: LLMManager,
+    session_logger: SessionLogger | None = None,
 ) -> None:
-    result = await CodeEditWorkflow(workspace, search=search, llm=llm).run(
+    kwargs = {}
+    if session_logger:
+        kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
+    result = await CodeEditWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "edit")
     )
     _print_patch_result("Code Edit", result.applied, result.changed_files, result.error, console)
@@ -599,8 +814,12 @@ async def _run_bug_fix(
     search: SearchAgent | EmptySearchAgent,
     console: Console,
     llm: LLMManager,
+    session_logger: SessionLogger | None = None,
 ) -> None:
-    result = await BugFixWorkflow(workspace, search=search, llm=llm).run(
+    kwargs = {}
+    if session_logger:
+        kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
+    result = await BugFixWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "fix")
     )
     _print_patch_result("Bug Fix", result.applied, result.changed_files, result.error, console)
@@ -639,8 +858,13 @@ async def _run_test_generation(
     search: SearchAgent | EmptySearchAgent,
     console: Console,
     llm: LLMManager,
+    session_logger: SessionLogger | None = None,
 ) -> None:
-    result = await TestGenerationWorkflow(workspace, search=search, llm=llm).run(
+    kwargs = {}
+    if session_logger:
+        kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
+        kwargs["command_runner"] = CommandRunner(workspace, session_logger=session_logger)
+    result = await TestGenerationWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "test-gen")
     )
     _print_patch_result("Test Generation", result.applied, result.changed_files, result.error, console)
@@ -652,11 +876,17 @@ async def _run_docs(
     search: SearchAgent | EmptySearchAgent,
     console: Console,
     llm: LLMManager,
+    session_logger: SessionLogger | None = None,
 ) -> None:
     result = await DocumentationWorkflow(
         search=search,
         llm=llm,
         workspace_root=workspace,
+        **(
+            {"patch_engine": PatchEngine(workspace, session_logger=session_logger)}
+            if session_logger
+            else {}
+        ),
     ).apply_readme_update(request=_strip_forced_prefix(user_input, "docs"))
     _print_patch_result("Documentation", result.applied, result.changed_files, result.error, console)
 
@@ -719,6 +949,12 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
     console.print(f"[dim]Workspace: {workspace}[/dim]")
     console.print(f"[dim]{status_text(collect_status())}[/dim]")
+    session_manager = SessionManager(workspace)
+    try:
+        session_logger = _start_session(args, workspace, console)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        sys.exit(2)
     console.print("[dim]Type a prompt, or `help` for commands.[/dim]\n")
     session = _make_prompt_session(workspace)
 
@@ -737,6 +973,12 @@ def main(argv: list[str] | None = None) -> None:
         if user_input.lower() in {"exit", "quit"}:
             print("Goodbye.")
             break
+        session_logger.log(
+            "user.prompt",
+            {"prompt": user_input},
+            "User submitted prompt",
+            workflow_id="repl",
+        )
         if user_input.lower() == "help":
             _print_help(console)
             continue
@@ -756,16 +998,22 @@ def main(argv: list[str] | None = None) -> None:
             _handle_parse_prd(user_input, workspace, console)
             continue
         if user_input.lower().startswith("plan-prd "):
-            _handle_plan_prd(user_input, workspace, console)
+            _handle_plan_prd(user_input, workspace, console, session_logger=session_logger)
             continue
         if user_input.lower().startswith("generate-django "):
-            _handle_generate_django(user_input, workspace, console)
+            _handle_generate_django(user_input, workspace, console, session_logger=session_logger)
             continue
         if user_input.lower().startswith("models"):
             _handle_models(user_input, console)
             continue
+        if user_input.lower().startswith("sessions"):
+            session_logger = _handle_sessions(user_input, session_manager, session_logger, console)
+            continue
+        if user_input.lower() == "log" or user_input.lower().startswith("log "):
+            _handle_log(user_input, session_logger, console)
+            continue
 
-        asyncio.run(_handle_request(user_input, workspace, console))
+        asyncio.run(_handle_request(user_input, workspace, console, session_logger))
 
 
 if __name__ == "__main__":
