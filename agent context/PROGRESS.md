@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 1 merged to `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, and native local Ollama runtime bootstrap complete locally on `dev-b`.
+- Status: Milestone 2 merged into `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, and native local Ollama runtime bootstrap complete.
 - Tests: `116 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: open/merge Milestone 2 workflow + native runtime PR into `develop`, then start PRD-to-project planning and Django generation.
+- Current next focus: start Milestone 3 PRD-to-project planning and Django generation.
 
 ## Completed Features
 
@@ -74,21 +74,21 @@ blocker.
 
 ## In Progress
 
-- [ ] Review and merge Milestone 2 PR into `develop`.
+- [ ] Milestone 3 planning and PRD-to-project workflow.
 
 ## Next Queue
 
-1. Open/review Dev B Milestone 2 PR into `develop`.
+1. Add `ProjectSpec` JSON preview command for PRDs.
 2. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-3. Add `ProjectSpec` JSON preview command for PRDs.
+3. Add file generation order and resume state for PRD-to-project generation.
 
 ## Known Notes
 
 - Keep `shamsu/types.py` and `shamsu/interfaces.py` stable unless the team explicitly agrees to change the contract.
 - The root README is for humans; `agent context/AGENTS.md` and this file are for future agent handoff.
 - `agent context/DEV-TASK-DIVI.MD` is the issue/PR planning board for the remaining MVP work.
-- `agent context/MILESTONE-2-FINISH-PLAN.md` is the takeover checklist for
-  merging and verifying Milestone 2.
+- `agent context/MILESTONE-2-FINISH-PLAN.md` records the completed Milestone 2
+  merge checklist and verification path.
 - Feature work should branch from `develop` and merge back through PRs. `main`
   is protected for stable milestone merges only.
 - `SHAMSU_day1_scaffold.zip` remains at the repo root as the original scaffold artifact.
