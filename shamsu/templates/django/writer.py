@@ -19,6 +19,7 @@ from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 from shamsu.templates.django.checker import BackendConsistencyChecker, ConsistencyDiagnostic
+from shamsu.templates.django.docs import render_generated_project_readme
 from shamsu.templates.django.frontend import render_django_test_files, render_frontend_django_files
 from shamsu.templates.django.generators import render_backend_django_files
 from shamsu.templates.django.renderer import render_fixed_django_files
@@ -69,6 +70,7 @@ class DjangoProjectWriter:
             **render_backend_django_files(project),
             **render_frontend_django_files(project),
             **render_django_test_files(project),
+            "README.md": render_generated_project_readme(project),
         }
         for step in state.generation_order:
             if step.status.value == "done":

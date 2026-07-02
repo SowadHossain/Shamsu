@@ -13,6 +13,7 @@ from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 from shamsu.templates.django.checker import ConsistencyDiagnostic
+from shamsu.templates.django.docs import render_pipeline_summary
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.types import ProjectSpec, TestRunResult
@@ -179,7 +180,7 @@ class FullDjangoPipeline:
             },
             "Full Django pipeline finished" if success else "Full Django pipeline stopped",
         )
-        return FullPipelineResult(
+        result = FullPipelineResult(
             prd_path=prd_path,
             target_dir=target_dir,
             project=project,
@@ -191,6 +192,12 @@ class FullDjangoPipeline:
             success=success,
             error=error,
         )
+        self._write_summary(result)
+        return result
+
+    def _write_summary(self, result: FullPipelineResult) -> None:
+        target = self.sandbox.validate(result.target_dir / "SHAMSU_SUMMARY.md")
+        target.write_text(render_pipeline_summary(result), encoding="utf-8")
 
     def _log(self, event_type: str, payload: dict, summary: str) -> None:
         if self.session_logger:

@@ -200,7 +200,7 @@ def test_generate_django_logs_prd_plan_and_generated_files(tmp_path: Path):
         session_logger=logger,
     )
 
-    event_types = [event["event_type"] for event in logger.tail(30)]
+    event_types = [event["event_type"] for event in logger.tail(80)]
     assert "prd.parsed" in event_types
     assert "project.planned" in event_types
     assert "project.generated" in event_types
