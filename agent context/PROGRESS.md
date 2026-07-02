@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, and dirty-worktree edit warnings complete.
+- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, and MVP release docs complete.
 - Tests: `183 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: finish remaining Milestone 6 Dev C status/log/progress, release docs, final safety audit, then release cut.
+- Current next focus: merge MVP release cut into `main` after release PR verification.
 
 ## Completed Features
 
@@ -103,16 +103,18 @@ blocker.
 - [x] Added MVP benchmark script and `BENCHMARK.md` recording representative PRD generation runtime and peak RSS against the 7 GB target.
 - [x] Added frontend consistency checker for generated Django templates covering missing URL names, invalid model field references, missing HTMX targets, and raw generated form controls.
 - [x] Added dirty-worktree warning before edit/fix/test-generation/docs workflows.
+- [x] Added MVP `CHANGELOG.md` and `DEMO.md`.
+- [x] Updated README for the full `generate-prd`, generated-project setup/test/fix loop, current verification count, and MVP limitations.
 
 ## In Progress
 
-- [ ] Milestone 6 status/log/progress views, safety audit, release docs, and final release cut.
+- [ ] Issue #40 release PR from `develop`/`release/mvp` into `main`.
 
 ## Next Queue
 
-1. Open PR for Issue #27 from `feature/dev-a/frontend-consistency-checker` into `develop`.
-2. Rebuild or replace stale/conflicting PR #54 from fresh `develop` for Issues #33/#34/#38/#39.
-3. Finish Issue #40 release cut after all Issues #1-#39 are merged and verified.
+1. Run full verification on `release/mvp`.
+2. Open release PR to `main` with `Closes #40`.
+3. Merge the release PR when GitHub checks and review rules allow.
 
 ## Known Notes
 
