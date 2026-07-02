@@ -769,6 +769,9 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 32: Full PRD To Django Pipeline Orchestrator
 
+Status: implemented locally on `feature/dev-b/full-django-pipeline`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:core`, `area:django`, `type:integration`,
   `priority:p0`

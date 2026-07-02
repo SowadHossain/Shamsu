@@ -1,0 +1,197 @@
+"""Full PRD-to-Django pipeline orchestration."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
+
+from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop, ErrorFeedbackResult
+from shamsu.interfaces import ISearchAgent
+from shamsu.prd.input import parse_prd_file
+from shamsu.prd.project import build_project_spec
+from shamsu.safety.approval import ask_approval
+from shamsu.safety.sandbox import Sandbox
+from shamsu.session.manager import SessionLogger
+from shamsu.templates.django.checker import ConsistencyDiagnostic
+from shamsu.templates.django.writer import DjangoProjectWriter
+from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
+from shamsu.types import ProjectSpec, TestRunResult
+
+
+class SetupRunnerLike(Protocol):
+    def run(self, project_cwd: Path | str = ".") -> DjangoSetupResult: ...
+
+
+class TestRunnerLike(Protocol):
+    def run(self, project_cwd: Path | str = ".") -> TestRunResult: ...
+
+
+class FeedbackLoopLike(Protocol):
+    async def run(self, project_cwd: Path | str = ".") -> ErrorFeedbackResult: ...
+
+
+@dataclass(frozen=True)
+class FullPipelineResult:
+    prd_path: Path
+    target_dir: Path
+    project: ProjectSpec | None = None
+    written_files: list[str] | None = None
+    diagnostics: list[ConsistencyDiagnostic] | None = None
+    setup_result: DjangoSetupResult | None = None
+    test_result: TestRunResult | None = None
+    feedback_result: ErrorFeedbackResult | None = None
+    success: bool = False
+    error: str = ""
+
+
+class FullDjangoPipeline:
+    def __init__(
+        self,
+        workspace_root: Path,
+        search: ISearchAgent,
+        approval_func=ask_approval,
+        session_logger: SessionLogger | None = None,
+        setup_runner: SetupRunnerLike | None = None,
+        test_runner: TestRunnerLike | None = None,
+        feedback_loop: FeedbackLoopLike | None = None,
+    ) -> None:
+        self.workspace_root = Path(workspace_root).resolve()
+        self.sandbox = Sandbox(self.workspace_root)
+        self.search = search
+        self.approval_func = approval_func
+        self.session_logger = session_logger
+        self.setup_runner = setup_runner
+        self.test_runner = test_runner
+        self.feedback_loop = feedback_loop
+
+    async def run(self, prd_path: Path | str, target_dir: Path | str | None = None) -> FullPipelineResult:
+        try:
+            validated_prd = self._validate_prd(prd_path)
+            validated_target = self.sandbox.validate(target_dir or ".")
+            parsed = parse_prd_file(validated_prd)
+            project = build_project_spec(parsed)
+            self._log("workflow.started", {"prd_path": str(validated_prd)}, "Full Django pipeline started")
+
+            writer = DjangoProjectWriter(
+                self.workspace_root,
+                approval_func=self.approval_func,
+                session_logger=self.session_logger,
+            )
+            state = writer.write_project(project, validated_prd, target_dir=validated_target)
+            diagnostics = writer.check_project(project, target_dir=validated_target)
+            written_files = [step.file.path for step in state.generation_order if step.status.value == "done"]
+
+            if diagnostics:
+                return self._result(
+                    validated_prd,
+                    validated_target,
+                    project,
+                    written_files,
+                    diagnostics,
+                    success=False,
+                    error="Generated backend consistency checks reported diagnostics.",
+                )
+
+            setup_result = (self.setup_runner or DjangoSetupRunner(
+                self.workspace_root,
+                session_logger=self.session_logger,
+            )).run(validated_target)
+            if not setup_result.ok:
+                return self._result(
+                    validated_prd,
+                    validated_target,
+                    project,
+                    written_files,
+                    diagnostics,
+                    setup_result=setup_result,
+                    success=False,
+                    error="Django setup failed.",
+                )
+
+            test_result = (self.test_runner or DjangoTestRunner(
+                self.workspace_root,
+                session_logger=self.session_logger,
+            )).run(validated_target)
+            if test_result.failed == 0:
+                return self._result(
+                    validated_prd,
+                    validated_target,
+                    project,
+                    written_files,
+                    diagnostics,
+                    setup_result=setup_result,
+                    test_result=test_result,
+                    success=True,
+                )
+
+            feedback_result = await (self.feedback_loop or ErrorFeedbackLoop(
+                self.workspace_root,
+                search=self.search,
+                session_logger=self.session_logger,
+            )).run(validated_target)
+            return self._result(
+                validated_prd,
+                validated_target,
+                project,
+                written_files,
+                diagnostics,
+                setup_result=setup_result,
+                test_result=feedback_result.final_result,
+                feedback_result=feedback_result,
+                success=feedback_result.success,
+                error="" if feedback_result.success else feedback_result.error,
+            )
+        except Exception as exc:
+            path = Path(prd_path)
+            target = self.sandbox.validate(target_dir or ".")
+            self._log("workflow.failed", {"error": str(exc)}, "Full Django pipeline failed")
+            return FullPipelineResult(prd_path=path, target_dir=target, success=False, error=str(exc))
+
+    def _validate_prd(self, prd_path: Path | str) -> Path:
+        path = self.sandbox.validate(prd_path)
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"PRD file not found: {path}")
+        return path
+
+    def _result(
+        self,
+        prd_path: Path,
+        target_dir: Path,
+        project: ProjectSpec,
+        written_files: list[str],
+        diagnostics: list[ConsistencyDiagnostic],
+        setup_result: DjangoSetupResult | None = None,
+        test_result: TestRunResult | None = None,
+        feedback_result: ErrorFeedbackResult | None = None,
+        success: bool = False,
+        error: str = "",
+    ) -> FullPipelineResult:
+        event_type = "workflow.finished" if success else "workflow.failed"
+        self._log(
+            event_type,
+            {
+                "project": project.project_name,
+                "target_dir": str(target_dir),
+                "written_files": written_files,
+                "diagnostics": [vars(item) for item in diagnostics],
+                "success": success,
+                "error": error,
+            },
+            "Full Django pipeline finished" if success else "Full Django pipeline stopped",
+        )
+        return FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=target_dir,
+            project=project,
+            written_files=written_files,
+            diagnostics=diagnostics,
+            setup_result=setup_result,
+            test_result=test_result,
+            feedback_result=feedback_result,
+            success=success,
+            error=error,
+        )
+
+    def _log(self, event_type: str, payload: dict, summary: str) -> None:
+        if self.session_logger:
+            self.session_logger.log(event_type, payload, summary, workflow_id="full-django-pipeline")

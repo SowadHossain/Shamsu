@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import json
 import re
+import shlex
 import sqlite3
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
+from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.qa_workflow import QAWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
@@ -116,6 +118,7 @@ def _print_help(console: Console) -> None:
                     "  parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  plan-prd <file>          Preview and approve a project plan",
                     "  generate-django <file>   Generate deterministic Django backend files",
+                    "  generate-prd <file> --output <dir>",
                     "  django setup [dir]       Install generated deps and run migrations",
                     "  django test [dir]        Run generated Django tests",
                     "  django fix-tests [dir]   Run tests and apply bug-fix loop",
@@ -341,6 +344,58 @@ def _handle_generate_django(
         console.print(table)
     else:
         console.print("[green]Backend consistency check passed.[/green]")
+
+
+async def _handle_generate_prd(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    try:
+        prd_path, output_dir = _parse_generate_prd_args(user_input)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    search, _uses_real_index = _build_search_agent(workspace)
+    result = await FullDjangoPipeline(
+        workspace,
+        search=search,
+        session_logger=session_logger,
+    ).run(prd_path, target_dir=output_dir)
+    _print_full_pipeline_result(result, console)
+
+
+def _parse_generate_prd_args(user_input: str) -> tuple[str, str]:
+    parts = shlex.split(user_input)
+    if len(parts) < 2:
+        raise ValueError("Usage: generate-prd <file> --output <dir>")
+    prd_path = parts[1]
+    output_dir = "."
+    if "--output" in parts:
+        index = parts.index("--output")
+        if index + 1 >= len(parts):
+            raise ValueError("Usage: generate-prd <file> --output <dir>")
+        output_dir = parts[index + 1]
+    return prd_path, output_dir
+
+
+def _print_full_pipeline_result(result: FullPipelineResult, console: Console) -> None:
+    table = Table(title="Full Django Pipeline")
+    table.add_column("Step")
+    table.add_column("Status")
+    table.add_row("Project", result.project.project_name if result.project else "not built")
+    table.add_row("Target", str(result.target_dir))
+    table.add_row("Files", str(len(result.written_files or [])))
+    table.add_row("Diagnostics", str(len(result.diagnostics or [])))
+    if result.setup_result:
+        table.add_row("Setup", "ok" if result.setup_result.ok else "failed")
+    if result.test_result:
+        table.add_row("Tests", f"{result.test_result.passed} passed, {result.test_result.failed} failed")
+    table.add_row("Result", "success" if result.success else "failed")
+    console.print(table)
+    if result.error:
+        console.print(Panel(result.error, title="Pipeline Error", border_style="red"))
 
 
 def _print_project_plan(spec: ProjectSpec, console: Console) -> None:
@@ -1084,6 +1139,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower().startswith("generate-django "):
             _handle_generate_django(user_input, workspace, console, session_logger=session_logger)
+            continue
+        if user_input.lower().startswith("generate-prd "):
+            asyncio.run(_handle_generate_prd(user_input, workspace, console, session_logger))
             continue
         if user_input.lower().startswith("models"):
             _handle_models(user_input, console)

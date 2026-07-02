@@ -7,7 +7,7 @@ blocker.
 ## Current State
 
 - Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, and workspace-local session logging/resume complete.
-- Tests: `167 passed`
+- Tests: `171 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
 - Current next focus: finish Milestone 5 from fresh branches based on `develop`.
@@ -96,16 +96,18 @@ blocker.
 - [x] Added deterministic dashboard/resource frontend templates for M5, including DaisyUI stats/tables/cards and crispy/HTMX form markup.
 - [x] Added error feedback loop that runs generated Django tests, sends failures into `BugFixWorkflow`, applies approved diffs, and retries up to three times.
 - [x] Added REPL `django fix-tests [project-dir]` command for the generated-project test/fix loop.
+- [x] Added M6 full PRD-to-Django pipeline orchestrator that parses a PRD, builds a project plan, writes generated files, runs setup, runs Django tests, and invokes the error feedback loop when tests fail.
+- [x] Added REPL `generate-prd <file> --output <dir>` command for the full pipeline.
 
 ## In Progress
 
-- [ ] Milestone 5 resource HTMX refinement and frontend consistency checker.
+- [ ] Milestone 6 status/log/progress views, generated project docs, fixtures, benchmarks, safety audit, and release cut.
 
 ## Next Queue
 
-1. Open PR for Dev B M5 batch from `feature/dev-b/m5-tests-error-dashboard` into `develop`.
-2. Finish Issue #26 resource HTMX partial generators.
-3. Finish Issue #27 frontend consistency checker.
+1. Open PR for Issue #32 from `feature/dev-b/full-django-pipeline` into `develop`.
+2. Finish Issue #33/#34 status/log/progress and audit trail polish.
+3. Add M6 E2E fixtures, generated docs, benchmarks, safety audit, and release docs.
 
 ## Known Notes
 
