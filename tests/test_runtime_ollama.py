@@ -9,7 +9,9 @@ from shamsu.runtime.models import SPECIALIST_MODELS, required_model_names
 from shamsu.runtime.ollama import (
     RuntimeStatus,
     find_ollama_executable,
+    list_installed_models,
     parse_ollama_list,
+    pull_model,
     status_text,
     write_runtime_config,
 )
@@ -53,6 +55,42 @@ qwen2.5-coder:7b-instruct-q4_K_M         def456          4.7 GB    2 hours ago
         "phi3:mini-4k-instruct",
         "qwen2.5-coder:7b-instruct-q4_K_M",
     ]
+
+
+def test_ollama_list_uses_utf8_replacement_decoding(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "NAME ID SIZE\nphi3:mini latest 1 GB\n"})()
+
+    monkeypatch.setattr("shamsu.runtime.ollama.subprocess.run", fake_run)
+
+    assert list_installed_models(tmp_path / "ollama.exe") == ["phi3:mini"]
+    kwargs = calls[0][1]
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
+    assert kwargs["env"]["PYTHONUTF8"] == "1"
+
+
+def test_ollama_pull_uses_utf8_replacement_decoding(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return type("Completed", (), {"returncode": 0, "stdout": "pulled ✓", "stderr": ""})()
+
+    monkeypatch.setattr("shamsu.runtime.ollama.subprocess.run", fake_run)
+
+    code, stdout, stderr = pull_model(tmp_path / "ollama.exe", "phi3:mini")
+
+    assert code == 0
+    assert stdout == "pulled ✓"
+    assert stderr == ""
+    kwargs = calls[0][1]
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
+    assert kwargs["env"]["PYTHONUTF8"] == "1"
 
 
 def test_status_text_is_friendly_for_missing_runtime():

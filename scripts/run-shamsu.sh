@@ -6,6 +6,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 VENV_PYTHON_UNIX="${REPO_ROOT}/.venv/bin/python"
 VENV_PYTHON_WIN="${REPO_ROOT}/.venv/Scripts/python.exe"
 WORKSPACE="${SHAMSU_WORKSPACE:-$(pwd)}"
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 USES_WINDOWS_PYTHON=0
 if [[ -x "${VENV_PYTHON_UNIX}" ]]; then
