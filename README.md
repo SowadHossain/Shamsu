@@ -24,32 +24,45 @@ Working now:
 - Python symbol extraction with `ast`
 - Stale index cleanup when files move or disappear
 - Markdown PRD parsing
+- Markdown, TXT, and PDF PRD file input
 - Rule-based PRD entity extraction
 - `ProjectSpec` assembly from PRDs
-- Fixed Django template constants and renderer
-- QA context preview using real indexed search when an index exists
+- PRD plan preview/approval and generation resume state
+- Deterministic Django fixed templates and backend generators
+- Approval-backed Django project writer and backend/frontend consistency checks
+- Full PRD-to-Django pipeline with generated-project setup, migrations, tests,
+  and error feedback loop
+- Deterministic generated Django README and `SHAMSU_SUMMARY.md`
+- Todo, Expense Tracker, and Blog PRD fixtures for integration coverage
+- MVP benchmark report for representative runtime and peak memory
+- QA, code-edit, bug-fix, audit, test-generation, and documentation workflows
+- Claude-like prompt loop with local model routing and keyword fallback
+- Workspace-local sessions, resume, redacted event logs, and export bundles
 - Workspace path sandbox for file inputs such as `parse-prd`
 - Command risk classifier and secret redaction helpers
 - Internal command runner with workspace checks, blocked-command rejection,
   approval gates, timeouts, captured output, and redaction
 - Internal patch validation and Rich diff preview for unified diffs
+- Approval-backed patch apply/rollback with post-patch re-indexing
 - Agent progress tracking in `agent context/PROGRESS.md`
 
-Planned next:
+Still intentionally limited:
 
-- Patch application and rollback behind approval
-- Writing generated Django files behind approval
-- Full PRD-to-Django project generation
-- Local Ollama-backed specialist responses beyond preview mode
+- SHAMSU generates Django MVP projects, but this is not yet a polished visual
+  app builder.
+- It uses deterministic generation first; local LLM repair/refinement remains
+  bounded by the installed Ollama models.
+- Runtime execution is still local workspace automation, not Docker or full OS
+  isolation.
 
 ## Requirements
 
 - Python 3.11 or newer
 - PowerShell on Windows, or Bash on Linux/macOS
-- Optional: Ollama for local model calls
+- Ollama for local model calls. The installer can bootstrap it for you.
 
-The current CLI works without Ollama. If Ollama is not running, SHAMSU falls
-back to a safe QA preview instead of crashing.
+Runtime inference is local-only through Ollama on `localhost:11434`. SHAMSU does
+not configure cloud AI APIs.
 
 ## Safe Install
 
@@ -68,7 +81,7 @@ Docker or OS-level sandbox.
 From the SHAMSU repo root:
 
 ```powershell
-.\scripts\install.ps1
+.\scripts\install.ps1 -Yes
 ```
 
 If PowerShell blocks script execution on your machine, run:
@@ -82,7 +95,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 From the SHAMSU repo root:
 
 ```bash
-bash scripts/install.sh
+bash scripts/install.sh --yes
 ```
 
 If your Python command is not `python3`, choose one explicitly:
@@ -90,6 +103,20 @@ If your Python command is not `python3`, choose one explicitly:
 ```bash
 PYTHON=python3.11 bash scripts/install.sh
 ```
+
+Installer flags:
+
+```text
+-Yes / --yes                         approve runtime bootstrap prompts
+-SkipOllamaInstall / --skip-ollama-install
+-SkipModels / --skip-models
+-ModelsPath <path> / --models-path <path>
+```
+
+The installer may download Ollama and model weights when approved. SHAMSU itself
+does not edit your PowerShell profile, PATH, registry, shell startup files, or
+global Python. If Ollama's official installer makes normal app/service entries,
+that is Ollama's installer behavior, not extra SHAMSU configuration.
 
 ## Run SHAMSU Safely
 
@@ -150,6 +177,23 @@ status
 search <query>
 symbols <name>
 parse-prd <file.md>
+plan-prd <file.md|file.txt|file.pdf>
+generate-django <file.md|file.txt|file.pdf>
+generate-prd <file.md|file.txt|file.pdf> --output <dir>
+django setup [project-dir]
+django test [project-dir]
+django fix-tests [project-dir]
+models status
+models pull
+models repair
+sessions list
+sessions current
+sessions show <id>
+sessions resume <id-or-title>
+sessions rename <id> <title>
+sessions close [id]
+sessions export <id>
+log tail
 help
 exit
 ```
@@ -197,15 +241,101 @@ Looks up indexed symbols.
 shamsu> symbols build_project_spec
 ```
 
-### `parse-prd <file.md>`
+### `parse-prd <file>`
 
-Parses a Markdown PRD inside the workspace.
+Parses a Markdown, TXT, or PDF PRD inside the workspace.
 
 ```text
 shamsu> parse-prd "agent context/SHAMSU_10day_dev_plan.md"
 ```
 
 Paths outside the workspace are rejected.
+
+### `plan-prd <file>`
+
+Parses a PRD, builds a `ProjectSpec`, prints a Rich preview, and asks approval
+before recording the plan state.
+
+```text
+shamsu> plan-prd TODO_PRD.md
+```
+
+### `generate-django <file>`
+
+Parses and previews a PRD, asks approval, writes deterministic Django backend
+files inside the workspace, updates generation state, and runs static backend
+consistency checks.
+
+```text
+shamsu> generate-django TODO_PRD.md
+```
+
+### `generate-prd <file> --output <dir>`
+
+Runs the full MVP pipeline:
+
+1. Parse the PRD.
+2. Build a `ProjectSpec`.
+3. Generate Django project files.
+4. Run static backend and frontend consistency checks.
+5. Install generated requirements and run migrations through guarded command
+   execution.
+6. Run generated Django tests.
+7. Invoke the bug-fix feedback loop when tests fail.
+8. Write generated-project docs and `SHAMSU_SUMMARY.md`.
+
+```text
+shamsu> generate-prd TODO_PRD.md --output generated_todo
+```
+
+### `django setup|test|fix-tests`
+
+Generated-project helpers run inside the selected workspace only:
+
+```text
+shamsu> django setup generated_todo
+shamsu> django test generated_todo
+shamsu> django fix-tests generated_todo
+```
+
+`django setup` installs the generated project's requirements and runs
+`makemigrations`/`migrate` through the guarded command runner. `django test`
+runs the generated Django test suite. `django fix-tests` runs tests, sends
+failures into the bug-fix workflow, applies approved patches, and retries.
+
+### Sessions And Logs
+
+SHAMSU creates or resumes a workspace-local session on startup. Session data
+lives under:
+
+```text
+.shamsu/sessions/
+```
+
+Start a named session:
+
+```powershell
+.\scripts\run-shamsu.ps1 --new-session "Todo PRD run"
+```
+
+Resume one later:
+
+```powershell
+.\scripts\run-shamsu.ps1 --session 20260702
+```
+
+Inside the REPL:
+
+```text
+sessions list
+sessions current
+sessions resume <id-or-title>
+sessions export <id>
+log tail
+```
+
+Exports are redacted ZIP bundles containing `session.json`, `events.jsonl`, and
+a Markdown summary.
 
 ### Natural-Language Request
 
@@ -217,6 +347,19 @@ shamsu> how does project spec work?
 
 If an index exists, SHAMSU uses real indexed search to assemble the preview. If
 Ollama is unavailable, the routing step falls back to safe QA mode.
+
+### `models status|pull|repair`
+
+Checks and repairs the local AI runtime.
+
+```text
+shamsu> models status
+shamsu> models pull
+shamsu> models repair
+```
+
+`models repair` starts local Ollama when possible and pulls missing required
+models. It does not install Ollama; use the installer for first-time bootstrap.
 
 ## Smoke Test
 
@@ -250,7 +393,7 @@ Run lint:
 Expected current result:
 
 ```text
-60 passed
+183 passed
 All checks passed!
 ```
 
@@ -275,8 +418,19 @@ Workspace sandbox:
 
 - The CLI resolves one workspace at startup.
 - `parse-prd` validates file paths with `Sandbox.validate()`.
+- Project generation, session logs, generated summaries, command cwd values,
+  and patch paths are validated against the workspace boundary.
 - Paths outside the workspace are rejected.
 - Index data stays inside `<workspace>/.shamsu/`.
+- Session logs and exports stay inside `<workspace>/.shamsu/sessions/`.
+
+Local AI runtime:
+
+- SHAMSU only allows LLM calls to `localhost`, `127.0.0.1`, or `::1`.
+- Runtime status is stored in repo-local `.shamsu/runtime.json`.
+- Required model checks use Ollama's local CLI and local HTTP API.
+- Setup-time downloads require installer approval or `-Yes`/`--yes`.
+- Runtime inference does not call cloud AI endpoints.
 
 Internal command execution:
 
@@ -285,8 +439,8 @@ Internal command execution:
 - Blocked commands are rejected without approval or execution.
 - Medium-risk and unknown commands require approval.
 - Captured command output is redacted before it is returned.
-- This runner is available internally for future workflows such as tests and
-  patch validation. It is not exposed as a general REPL command yet.
+- This runner is available internally for generated-project setup, migrations,
+  tests, and patch validation. It is not exposed as a general REPL command.
 
 Internal patch review:
 
@@ -294,14 +448,24 @@ Internal patch review:
   use it.
 - Patch paths are normalized and checked against the workspace sandbox.
 - `patch.preview` renders a Rich diff summary and colorized diff body.
-- Patch application and rollback are intentionally not enabled yet.
+- Patch application requires approval, writes backups, rolls back failed
+  applies, and refreshes the workspace index after success.
+
+Session logging:
+
+- Session logs are local JSONL files under the active workspace.
+- Prompts, routing decisions, context packs, LLM calls, approvals, patches,
+  commands, PRD planning, and Django generation events are logged.
+- Log payloads are redacted and large strings are truncated by default.
+- Exports are meant to be shareable debugging bundles, not raw source dumps.
 
 Important limitation:
 
 - This is not a full OS sandbox.
 - This is not Docker isolation.
-- Future file writes, patch application, rollback, and user-facing command
-  execution still need approval gates before they become public workflows.
+- User-facing arbitrary shell execution is still not exposed as a REPL command.
+- Session logs are redacted metadata by default, not a forensic or compliance
+  audit system.
 
 ## Troubleshooting
 

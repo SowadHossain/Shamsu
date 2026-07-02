@@ -1,6 +1,6 @@
 # SHAMSU Dev Task Division
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 This file is the issue-ready build plan for the rest of SHAMSU. Use it to create
 GitHub issues, assign work, open branches, and track PRs.
@@ -12,8 +12,8 @@ Current baseline:
 - Indexing, Python symbols, FTS search, PRD parsing, `ProjectSpec`, fixed Django
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
-- Current verified state: `60 passed`, `ruff check shamsu tests` clean.
-- Next implementation focus: patch application and rollback behind approval.
+- Current verified state: `183 passed`, `ruff check shamsu tests scripts` clean.
+- Next implementation focus: release PR from `release/mvp` into `main`.
 
 ## Already Done - Do Not Create Issues
 
@@ -61,8 +61,61 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   and workspace-safe paths.
 - [x] Rich patch preview exists with changed-file summary and colorized diff
   body.
-- [x] Patch `apply()` and `rollback()` are intentionally non-mutating stubs until
-  Issue 1.
+- [x] Issue 1 implementation is complete locally on `dev-a`: approval-backed
+  patch apply, `.bak` backups, rollback, create/delete handling, and failure
+  restore.
+- [x] Issue 2 implementation is complete locally on `dev-a`: successful patch
+  apply refreshes the workspace index and keeps `.bak` files out of the index.
+- [x] Issue 3 implementation is complete locally on `dev-a`: read-only git
+  status/diff helper reports dirty worktrees without git write commands.
+- [x] Issue 5 implementation is complete locally on `dev-b`: real indexed QA is
+  used when `.shamsu/index.db` exists, with a clear no-index fallback.
+- [x] Live QA integration is complete locally on `dev-b`: SHAMSU attempts the
+  local `qa` specialist through Ollama and falls back to the indexed context
+  preview if Ollama is unavailable.
+- [x] Issue 7 implementation is complete locally on `dev-b`: audit workflow uses
+  indexed search, reviewer context, and structured findings without applying
+  changes.
+- [x] Issue 9 proposal layer is complete locally on `dev-b`: documentation
+  workflow uses indexed context, calls `doc_agent`, and produces README diffs.
+  Approval-backed application is also complete locally on `dev-b`.
+- [x] Issue 4 implementation is complete locally on `dev-b`: code edit workflow
+  searches indexed context, calls `coder`, validates diff output, applies via
+  `PatchEngine`, and reports changed files.
+- [x] Issue 6 implementation is complete locally on `dev-b`: bug fix workflow
+  parses traceback locations, gathers indexed context, calls `bugfix`, validates
+  unified diffs, applies through `PatchEngine`, and reports changed files.
+- [x] Issue 8 implementation is complete locally on `dev-b`: test generation
+  workflow gathers indexed context, calls `test_gen`, validates pytest-oriented
+  unified diffs, applies through `PatchEngine`, and can run tests through
+  `CommandRunner`.
+- [x] Issue 10 implementation is complete locally on `dev-b`: CLI workflow
+  routing gives SHAMSU a Claude-like prompt loop with prompt-toolkit input,
+  natural-language routing, keyword fallback, and explicit commands for edit,
+  fix, test-gen, audit, and docs.
+- [x] Native local runtime bootstrap is complete locally on `dev-b`: installer
+  flags support Ollama/model setup, runtime checks remain local-only, REPL has
+  `models status|pull|repair`, and SHAMSU scripts avoid profile/PATH/registry
+  edits.
+- [x] Claude-like session logging and resume is complete locally: sessions live
+  under workspace `.shamsu/sessions/`, default startup resumes the latest active
+  session, `--session` and `--new-session` are supported, REPL session commands
+  can list/show/resume/rename/close/export sessions, and `log tail` shows recent
+  redacted events.
+- [x] Structured event tracing is complete locally for prompts, routing,
+  context packs, local LLM calls, approvals, patches, commands, PRD parsing,
+  project planning, and Django generation. New workflows should keep passing an
+  optional `SessionLogger` through dependency injection.
+- [x] Issue 27 implementation is complete locally on
+  `feature/dev-a/frontend-consistency-checker`: generated Django templates are
+  checked for missing URL names, invalid model field references, missing HTMX
+  targets, and raw generated form controls.
+- [x] Dirty-worktree edit warnings are complete locally before edit/fix/test-gen/docs
+  workflows; this safely salvages the useful part of stale PR #53.
+- [x] MVP release docs are complete locally on `release/mvp`: README reflects
+  `generate-prd`, generated-project setup/test/fix helpers, current safety
+  boundaries, and current verification count; `CHANGELOG.md` and `DEMO.md`
+  capture the MVP release notes and walkthrough.
 
 The issue list below starts from remaining work only.
 
@@ -187,6 +240,9 @@ re-index changed files.
 
 ### Issue 1: Patch Apply And Rollback Behind Approval
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:patch`, `area:safety`, `type:feature`,
   `priority:p0`
@@ -208,6 +264,9 @@ re-index changed files.
 
 ### Issue 2: Re-Index Changed Files After Patch Apply
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:index`, `area:patch`, `type:feature`,
   `priority:p1`
@@ -222,6 +281,9 @@ re-index changed files.
 
 ### Issue 3: Git Status And Diff Read-Only Tooling
 
+Status: implemented locally on `dev-a`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:patch`, `area:safety`, `type:feature`,
   `priority:p1`
@@ -235,6 +297,9 @@ re-index changed files.
   - Tests cover clean repo, dirty file, and non-git workspace behavior.
 
 ### Issue 4: Code Edit Workflow End To End
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:patch`, `type:feature`,
@@ -257,6 +322,9 @@ tests, and generate docs against an indexed workspace.
 
 ### Issue 5: Real Indexed QA As Default
 
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:index`, `type:feature`,
   `priority:p0`
@@ -271,6 +339,9 @@ tests, and generate docs against an indexed workspace.
   - Tests cover indexed and unindexed workspaces.
 
 ### Issue 6: Bug Fix Workflow
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:patch`, `type:feature`,
@@ -288,6 +359,9 @@ tests, and generate docs against an indexed workspace.
 
 ### Issue 7: Audit Workflow
 
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:safety`, `type:feature`,
   `priority:p1`
@@ -302,6 +376,9 @@ tests, and generate docs against an indexed workspace.
   - Tests verify output structure from mocked LLM responses.
 
 ### Issue 8: Test Generation Workflow
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:tests`, `area:llm`, `type:feature`,
@@ -319,6 +396,9 @@ tests, and generate docs against an indexed workspace.
 
 ### Issue 9: Documentation Generation Workflow
 
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:docs`, `area:llm`, `type:feature`,
   `priority:p2`
@@ -332,6 +412,9 @@ tests, and generate docs against an indexed workspace.
   - Tests cover mocked doc output.
 
 ### Issue 10: CLI Workflow Routing
+
+Status: implemented locally on `dev-b`; keep GitHub issue open until the PR
+into `develop` merges.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:cli`, `area:llm`, `type:feature`,
@@ -351,7 +434,10 @@ tests, and generate docs against an indexed workspace.
 Goal: SHAMSU converts Markdown/TXT/PDF PRDs into a structured plan and shows it
 to the user before any files are written.
 
-### Issue 11: TXT And PDF PRD Input
+Status: Implemented locally on top of `develop`; pending full-suite verification
+and PR split/merge.
+
+### Issue 11: TXT And PDF PRD Input [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:prd`, `type:feature`, `priority:p1`
@@ -364,7 +450,7 @@ to the user before any files are written.
   - PDF text extraction handles empty/unreadable PDFs with friendly errors.
   - Tests cover Markdown, TXT, PDF fallback/error paths.
 
-### Issue 12: PRD Extractor V2 Relationships And Field Types
+### Issue 12: PRD Extractor V2 Relationships And Field Types [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:prd`, `area:django`, `type:feature`,
@@ -380,7 +466,7 @@ to the user before any files are written.
   - Infers dashboard/list/detail pages when pages are missing.
   - Tests cover Todo, Expense Tracker, and Blog PRDs.
 
-### Issue 13: Project Plan Preview And Approval
+### Issue 13: Project Plan Preview And Approval [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:prd`, `area:cli`, `area:safety`,
@@ -396,7 +482,7 @@ to the user before any files are written.
   - Requires approval before moving into generation.
   - Tests cover preview output and denied approval.
 
-### Issue 14: File Generation Order And Resume State
+### Issue 14: File Generation Order And Resume State [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:core`, `area:django`, `type:feature`,
@@ -415,7 +501,10 @@ to the user before any files are written.
 
 Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
 
-### Issue 15: Approval-Backed Django Project Writer
+Status: Implemented locally on top of `develop`; pending full-suite verification
+and PR split/merge.
+
+### Issue 15: Approval-Backed Django Project Writer [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:django`, `area:safety`, `type:feature`,
@@ -430,7 +519,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Records written files for resume/logging.
   - Tests cover new project, existing file, denied approval, path escape.
 
-### Issue 16: Fixed Django Template Completion
+### Issue 16: Fixed Django Template Completion [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:django`, `type:feature`, `priority:p0`
@@ -445,7 +534,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Templates do not require Node or a build step.
   - Tests assert key imports/settings/HTML tags are present.
 
-### Issue 17: Django Models Generator
+### Issue 17: Django Models Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:llm`, `type:feature`,
@@ -460,7 +549,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Correctly maps extracted fields and relationships.
   - Tests cover Todo, Expense, Blog model specs.
 
-### Issue 18: Django Serializers Generator
+### Issue 18: Django Serializers Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:llm`, `type:feature`,
@@ -474,7 +563,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates serializer fields against model fields.
   - Tests cover field matching and invalid field rejection.
 
-### Issue 19: Django Forms Generator
+### Issue 19: Django Forms Generator [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:django`, `area:llm`, `type:feature`,
@@ -488,7 +577,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates fields against generated models.
   - Tests cover normal fields and relationship fields.
 
-### Issue 20: Django Views Generator
+### Issue 20: Django Views Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:llm`, `type:feature`,
@@ -503,7 +592,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates imports and referenced classes.
   - Tests cover public vs private page behavior at code level.
 
-### Issue 21: Django URLs Generator
+### Issue 21: Django URLs Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `type:feature`, `priority:p0`
@@ -517,7 +606,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates all referenced views exist.
   - Tests cover URL name extraction for templates.
 
-### Issue 22: Django Admin Generator
+### Issue 22: Django Admin Generator [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `type:feature`, `priority:p1`
@@ -530,7 +619,7 @@ Goal: A PRD can generate a runnable Django + DRF + DaisyUI + HTMX project.
   - Validates output with `ast.parse()`.
   - Tests cover multiple model registration.
 
-### Issue 23: Backend Consistency Checker
+### Issue 23: Backend Consistency Checker [done]
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:django`, `area:tests`, `type:feature`,
@@ -568,6 +657,9 @@ self-correct common generated-code mistakes.
 
 ### Issue 25: Dashboard Generator
 
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:django`, `area:frontend`, `area:llm`,
   `type:feature`, `priority:p1`
@@ -596,6 +688,9 @@ self-correct common generated-code mistakes.
   - Tests verify URL names and object field names are consistent.
 
 ### Issue 27: Frontend Consistency Checker
+
+Status: implemented locally on `feature/dev-a/frontend-consistency-checker`;
+keep GitHub issue open until the PR into `develop` merges.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:django`, `area:frontend`, `area:tests`,
@@ -629,6 +724,9 @@ self-correct common generated-code mistakes.
 
 ### Issue 29: Django Test Runner
 
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:tests`, `area:django`, `type:feature`,
   `priority:p0`
@@ -644,6 +742,9 @@ self-correct common generated-code mistakes.
 
 ### Issue 30: Error Feedback Loop
 
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:llm`, `area:tests`, `area:patch`,
   `type:feature`, `priority:p0`
@@ -658,6 +759,9 @@ self-correct common generated-code mistakes.
   - Tests mock two failing iterations followed by success.
 
 ### Issue 31: Django Test File Generator
+
+Status: implemented locally on `feature/dev-b/m5-tests-error-dashboard`; keep
+GitHub issue open until the PR into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:tests`, `area:django`, `area:llm`,
@@ -678,6 +782,9 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 32: Full PRD To Django Pipeline Orchestrator
 
+Status: implemented locally on `feature/dev-b/full-django-pipeline`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:core`, `area:django`, `type:integration`,
   `priority:p0`
@@ -694,6 +801,10 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 33: CLI Status, Log, And Progress Views
 
+Status: core session/log commands implemented locally; PR #54 attempted related
+work but is stale/conflicting and failing CI. Rebuild any useful changes from
+fresh `develop`.
+
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:cli`, `area:safety`, `type:feature`,
   `priority:p1`
@@ -709,6 +820,10 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 34: Structured Audit Trail
 
+Status: core structured session event trail implemented locally; future command
+and full-pipeline work should add event types to `SessionLogger` rather than
+creating parallel audit files. PR #54 is not safe to merge directly.
+
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:safety`, `type:feature`, `priority:p1`
 - Branch: `feature/dev-c/audit-trail`
@@ -722,6 +837,9 @@ projects from multiple PRDs, with clear progress and safety logs.
   - Tests verify redaction and event shape.
 
 ### Issue 35: End-To-End PRD Fixtures
+
+Status: implemented locally on `feature/dev-b-dev-a/m6-fixtures-bench-docs`; keep
+GitHub issue open until the PR into `develop` merges.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:tests`, `area:django`, `type:integration`,
@@ -737,6 +855,9 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 36: RAM And Performance Benchmarking
 
+Status: implemented locally on `feature/dev-b-dev-a/m6-fixtures-bench-docs`; keep
+GitHub issue open until the PR into `develop` merges.
+
 - Owner: Dev A
 - Labels: `owner:dev-a`, `area:tests`, `type:hardening`, `priority:p1`
 - Branch: `feature/dev-a/ram-performance-benchmark`
@@ -749,6 +870,9 @@ projects from multiple PRDs, with clear progress and safety logs.
   - Writes results to `BENCHMARK.md`.
 
 ### Issue 37: Generated Project README And Summary Report
+
+Status: implemented locally on `feature/dev-b-dev-a/m6-fixtures-bench-docs`; keep
+GitHub issue open until the PR into `develop` merges.
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:docs`, `area:django`, `area:llm`,
@@ -764,6 +888,9 @@ projects from multiple PRDs, with clear progress and safety logs.
 
 ### Issue 38: Release Docs And Demo Script
 
+Status: PR #54 attempted related work but is stale/conflicting and failing CI.
+Reapply useful docs onto a fresh branch from `develop`.
+
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:docs`, `type:hardening`, `priority:p1`
 - Branch: `feature/dev-c/release-docs-demo`
@@ -776,6 +903,9 @@ projects from multiple PRDs, with clear progress and safety logs.
   - Known limitations are explicit.
 
 ### Issue 39: Final Safety Audit
+
+Status: PR #54 attempted related work but is stale/conflicting and failing CI.
+Reapply useful audit coverage onto a fresh branch from `develop`.
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:safety`, `type:hardening`, `priority:p0`
@@ -792,6 +922,9 @@ projects from multiple PRDs, with clear progress and safety logs.
   - Tests cover all safety gates.
 
 ### Issue 40: MVP Release Cut
+
+Status: in release cut on `release/mvp`; keep GitHub issue open until the PR
+into `main` merges.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `type:hardening`, `priority:p0`

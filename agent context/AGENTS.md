@@ -163,25 +163,33 @@ Completed first slice:
 - The file walker removes stale index rows after file moves/deletes.
 - `core/coordinator.py` routes requests and falls back to QA preview if Ollama is unavailable.
 - `agents/qa_workflow.py` wires `SearchAgentStub` to `ContextBuilder`.
-- `prd/parser.py` parses Markdown PRDs into `ParsedPRD`.
-- `prd/extractor.py` extracts `EntitySpec` values from PRD entity sections.
-- `prd/project.py` assembles `ProjectSpec` values.
+- `prd/parser.py` parses Markdown/plain-text PRD content into `ParsedPRD`.
+- `prd/input.py` accepts Markdown, TXT, and PDF PRD files.
+- `prd/extractor.py` extracts `EntitySpec` values, field types, choices, optional fields, and relationships from PRD entity sections.
+- `prd/project.py` assembles `ProjectSpec` values with inferred endpoints, pages, theme, and generation order.
+- `prd/state.py` stores accepted generation-plan resume state under workspace `.shamsu/`.
 - `templates/django/constants.py` and `templates/django/renderer.py` provide deterministic fixed Django generation.
+- `templates/django/generators.py` deterministically generates backend `models.py`, `serializers.py`, `forms.py`, `views.py`, app `urls.py`, and `admin.py`.
+- `templates/django/writer.py` writes generated Django files inside the workspace behind approval and updates generation resume state.
+- `templates/django/checker.py` statically checks backend model/serializer/form/view/url/admin references.
+- `session/manager.py` stores workspace-local sessions, appends redacted JSONL events, supports resume/list/rename/close/export, and writes shareable ZIP bundles.
 - `safety/approval.py` displays Rich approval panels.
-- `cli/repl.py` supports `--workspace <path>`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file.md>`, and QA context preview.
+- `cli/repl.py` supports `--workspace <path>`, `--session <id-or-title>`, `--new-session [title]`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file>`, `plan-prd <file>`, `generate-django <file>`, session management commands, `log tail`, and QA context preview.
 - `scripts/install.ps1` and `scripts/install.sh` install into repo-local `.venv`.
 - `scripts/run-shamsu.ps1` and `scripts/run-shamsu.sh` run SHAMSU from that `.venv` while preserving the caller workspace.
-- `parse-prd` file inputs are validated through `Sandbox.validate()`.
+- `parse-prd` and `plan-prd` file inputs are validated through `Sandbox.validate()`.
 - `tools/executor.py` provides an internal `CommandRunner` with workspace-bound `cwd` validation, blocked-command rejection, approval gates, timeout handling, output capture, and redaction.
 - `patch/engine.py` validates unified diffs, checks hunk structure and counts, and rejects unsafe patch paths.
 - `patch/preview.py` renders Rich patch summaries and colorized diff previews.
+- `LLMManager`, `CommandRunner`, `PatchEngine`, and `DjangoProjectWriter` accept an optional `SessionLogger` and keep normal behavior unchanged when no logger is passed.
 
 Recommended next slice:
 
-1. Add patch application and rollback behind approval.
-2. Add deterministic Django project writer behind approval.
-3. Add `ProjectSpec` JSON preview command for PRDs.
-4. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
+1. Add frontend page generation for dashboard/list/detail/form templates.
+2. Add migration/dependency/test runner flow for generated Django projects.
+3. Add generated-project feedback loop that uses test/check failures to produce fixes.
+4. Keep the session logger wired into new workflows through optional dependency injection.
+5. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
 
 ## Suggested Initial File Layout
 
@@ -240,6 +248,25 @@ python -m ruff check shamsu tests
 python -m shamsu.indexer.walker
 .\scripts\install.ps1
 .\scripts\run-shamsu.ps1
+```
+
+Session commands:
+
+```powershell
+.\scripts\run-shamsu.ps1 --new-session "Todo PRD run"
+.\scripts\run-shamsu.ps1 --session 20260702
+```
+
+Inside the REPL:
+
+```text
+sessions list
+sessions current
+sessions resume <id-or-title>
+sessions rename <id> <title>
+sessions close [id]
+sessions export <id>
+log tail
 ```
 
 REPL smoke checks:

@@ -35,6 +35,7 @@ DEFAULT_IGNORE_DIRS = {
 
 DEFAULT_IGNORE_PATTERNS = {
     "*.bmp",
+    "*.bak",
     "*.db",
     "*.egg-info",
     "*.gif",

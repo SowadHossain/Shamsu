@@ -9,7 +9,7 @@ from shamsu.core.coordinator import Coordinator
 from shamsu.indexer.walker import FileWalker, sha256_file
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.safety.approval import ask_approval
-from shamsu.types import ApprovalRequest, RoutingDecision
+from shamsu.types import ApprovalRequest, LLMResponse, RoutingDecision
 
 
 class FakeLLM:
@@ -24,6 +24,14 @@ class FakeLLM:
 
     async def run_specialist(self, specialist, pack):  # pragma: no cover - Day 1 preview only
         raise NotImplementedError
+
+
+class FakeLiveLLM(FakeLLM):
+    async def run_specialist(self, specialist, pack):
+        return LLMResponse(
+            raw=f"Answer from {specialist}: {pack.user_request}",
+            model_used="fake-qa",
+        )
 
 
 def test_file_walker_indexes_files_and_ignores_heavy_dirs(tmp_path):
@@ -78,6 +86,20 @@ async def test_coordinator_routes_and_builds_qa_preview():
 
     assert result.decision.intent == "qa"
     assert result.preview.rstrip().endswith("explain authentication")
+    assert result.answer == ""
+    assert result.fallback_reason.startswith("Live QA unavailable")
+
+
+@pytest.mark.asyncio
+async def test_coordinator_returns_live_qa_answer_when_specialist_runs():
+    result = await Coordinator(llm=FakeLiveLLM(), qa_workflow=QAWorkflow()).handle(
+        "explain authentication"
+    )
+
+    assert result.decision.intent == "qa"
+    assert result.answer == "Answer from qa: explain authentication"
+    assert result.model_used == "fake-qa"
+    assert result.fallback_reason == ""
 
 
 def test_approval_accepts_yes(monkeypatch):

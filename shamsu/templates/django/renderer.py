@@ -5,6 +5,7 @@ import re
 import secrets
 
 from shamsu.templates.django.constants import (
+    APP_CONFIG_TEMPLATE,
     ASGI_TEMPLATE,
     BASE_HTML_TEMPLATE,
     ENV_EXAMPLE_TEMPLATE,
@@ -40,14 +41,18 @@ def render_fixed_django_files(project: ProjectSpec, secret_key: str | None = Non
         "theme": project.theme,
         "secret_key": secret,
         "nav_links": _render_nav_links(project.pages),
+        "app_config_class": f"{_to_pascal_case(project.app_name)}Config",
     }
 
     return {
         "manage.py": render_template(MANAGE_TEMPLATE, values),
+        f"{project.project_name}/__init__.py": "",
         f"{project.project_name}/settings.py": render_template(SETTINGS_TEMPLATE, values),
         f"{project.project_name}/urls.py": render_template(PROJECT_URLS_TEMPLATE, values),
         f"{project.project_name}/wsgi.py": render_template(WSGI_TEMPLATE, values),
         f"{project.project_name}/asgi.py": render_template(ASGI_TEMPLATE, values),
+        f"{project.app_name}/__init__.py": "",
+        f"{project.app_name}/apps.py": render_template(APP_CONFIG_TEMPLATE, values),
         f"{project.app_name}/templates/base.html": render_template(BASE_HTML_TEMPLATE, values),
         f"{project.app_name}/templates/login.html": render_template(LOGIN_HTML_TEMPLATE, values),
         f"{project.app_name}/templates/register.html": render_template(REGISTER_HTML_TEMPLATE, values),
@@ -80,6 +85,10 @@ def _url_name(page: PageSpec) -> str:
 
 def _display_name(project_name: str) -> str:
     return project_name.replace("_", " ").replace("-", " ").title()
+
+
+def _to_pascal_case(text: str) -> str:
+    return "".join(part.capitalize() for part in re.split(r"[^A-Za-z0-9]+", text) if part)
 
 
 def _to_kebab_case(text: str) -> str:

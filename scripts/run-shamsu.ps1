@@ -10,6 +10,7 @@ param(
 begin {
     $ErrorActionPreference = "Stop"
     Set-StrictMode -Version Latest
+    $env:PYTHONUTF8 = "1"
 
     $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
     $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
@@ -28,6 +29,7 @@ end {
     }
 
     $ResolvedWorkspace = Resolve-Path $Workspace
+    & $VenvPython -m shamsu.runtime.ollama status
 
     if ($PipedInput.Count -gt 0) {
         $PipedInput -join [Environment]::NewLine | & $VenvPython -m shamsu.cli.repl --workspace $ResolvedWorkspace @ShamsuArgs

@@ -12,7 +12,9 @@ import re
 from shamsu.types import EntityFieldSpec, EntitySpec, ParsedPRD
 
 ENTITY_LINE_RE = re.compile(r"^(?:[-*+]\s*)?(?:\*\*)?([A-Za-z][\w ]+)(?:\*\*)?\s*:\s*(.+)$")
-FIELD_RE = re.compile(r"^(?P<name>[A-Za-z_][\w ]*)\s*(?:\((?P<type>[^)]*)\))?$")
+FIELD_RE = re.compile(
+    r"^(?P<name>[A-Za-z_][\w ]*)\s*(?:\((?P<type>[^)]*)\)|:\s*(?P<colon_type>.+))?$"
+)
 
 
 TYPE_MAP = {
@@ -25,10 +27,12 @@ TYPE_MAP = {
     "int": ("IntegerField", {}),
     "integer": ("IntegerField", {}),
     "long text": ("TextField", {}),
+    "markdown": ("TextField", {}),
     "number": ("IntegerField", {}),
     "str": ("CharField", {"max_length": 200}),
     "string": ("CharField", {"max_length": 200}),
     "text": ("CharField", {"max_length": 200}),
+    "url": ("URLField", {}),
 }
 
 
@@ -71,27 +75,42 @@ def _parse_field(raw_field: str) -> EntityFieldSpec | None:
         return None
 
     name = _to_snake_case(match.group("name"))
-    raw_type = (match.group("type") or "text").strip().lower()
-    nullable = "optional" in raw_type or "null" in raw_type
-    raw_type = raw_type.replace("optional", "").replace("required", "").strip(" ,")
+    raw_type = (match.group("type") or match.group("colon_type") or "text").strip().lower()
+    nullable = any(marker in raw_type for marker in ("optional", "nullable", "null", "blank"))
+    raw_type = _strip_constraints(raw_type)
 
     relation = _parse_relation(raw_type)
     if relation is not None:
         django_type, target = relation
+        kwargs = {"to": target}
+        if django_type == "ForeignKey":
+            kwargs["on_delete"] = "CASCADE"
+        if nullable:
+            kwargs.update({"null": True, "blank": True})
         return EntityFieldSpec(
             name=name,
             django_type=django_type,
-            kwargs={"to": target, "on_delete": "CASCADE"} if django_type == "ForeignKey" else {"to": target},
+            kwargs=kwargs,
         )
 
-    if raw_type.startswith("choices"):
-        kwargs: dict[str, object] = {"max_length": 50}
-        choices = raw_type.split(":", 1)[1].strip() if ":" in raw_type else ""
+    if raw_type.startswith(("choices", "choice", "enum")):
+        kwargs: dict[str, object] = {"max_length": _parse_max_length(raw_type) or 50}
+        choices = _parse_choices(raw_type)
         if choices:
-            kwargs["choices"] = [choice.strip() for choice in choices.split("/") if choice.strip()]
+            kwargs["choices"] = choices
+        if nullable:
+            kwargs.update({"null": True, "blank": True})
         return EntityFieldSpec(name=name, django_type="CharField", kwargs=kwargs)
 
-    django_type, kwargs = TYPE_MAP.get(raw_type, ("CharField", {"max_length": 200}))
+    base_type = _base_type(raw_type)
+    django_type, kwargs = TYPE_MAP.get(base_type, ("CharField", {"max_length": 200}))
+    kwargs = {**kwargs, **_parse_numeric_kwargs(raw_type)}
+    max_length = _parse_max_length(raw_type)
+    if max_length and django_type in {"CharField", "EmailField", "URLField"}:
+        kwargs["max_length"] = max_length
+    default = _parse_default(raw_type)
+    if default is not None:
+        kwargs["default"] = default
     if nullable:
         kwargs = {**kwargs, "null": True, "blank": True}
     return EntityFieldSpec(name=name, django_type=django_type, kwargs=dict(kwargs))
@@ -101,13 +120,70 @@ def _parse_relation(raw_type: str) -> tuple[str, str] | None:
     patterns = [
         (r"^(?:fk|foreignkey|foreign key)\s+(?:to\s+)?(?P<target>[A-Za-z]\w*)$", "ForeignKey"),
         (r"^belongs\s+to\s+(?P<target>[A-Za-z]\w*)$", "ForeignKey"),
+        (r"^owner\s+(?:user|auth user)$", "ForeignKey"),
+        (r"^(?:user|auth user|django user)$", "ForeignKey"),
         (r"^(?:m2m|manytomany|many to many)\s+(?:to\s+)?(?P<target>[A-Za-z]\w*)$", "ManyToManyField"),
     ]
     for pattern, django_type in patterns:
         match = re.match(pattern, raw_type)
         if match:
-            return django_type, _to_pascal_case(match.group("target"))
+            target = match.groupdict().get("target") or "User"
+            return django_type, _to_pascal_case(target)
     return None
+
+
+def _strip_constraints(raw_type: str) -> str:
+    cleaned = raw_type
+    for marker in ("optional", "nullable", "required", "blank", "null"):
+        cleaned = re.sub(rf"\b{marker}\b", "", cleaned)
+    return cleaned.strip(" ,;")
+
+
+def _parse_choices(raw_type: str) -> list[str]:
+    choices = ""
+    if ":" in raw_type:
+        choices = raw_type.split(":", 1)[1]
+    elif " " in raw_type:
+        choices = raw_type.split(" ", 1)[1]
+    choices = re.sub(r"\bmax_length\s*=?\s*\d+\b", "", choices)
+    return [choice.strip(" '\"") for choice in re.split(r"[/|,]", choices) if choice.strip(" '\"")]
+
+
+def _parse_max_length(raw_type: str) -> int | None:
+    match = re.search(r"max[_ -]?length\s*[=:]?\s*(\d+)", raw_type)
+    return int(match.group(1)) if match else None
+
+
+def _parse_numeric_kwargs(raw_type: str) -> dict[str, int]:
+    if "decimal" not in raw_type:
+        return {}
+    max_digits = re.search(r"max[_ -]?digits\s*[=:]?\s*(\d+)", raw_type)
+    decimal_places = re.search(r"decimal[_ -]?places\s*[=:]?\s*(\d+)", raw_type)
+    kwargs = {"max_digits": 10, "decimal_places": 2}
+    if max_digits:
+        kwargs["max_digits"] = int(max_digits.group(1))
+    if decimal_places:
+        kwargs["decimal_places"] = int(decimal_places.group(1))
+    return kwargs
+
+
+def _base_type(raw_type: str) -> str:
+    for known in sorted(TYPE_MAP, key=len, reverse=True):
+        if raw_type == known or raw_type.startswith(f"{known} "):
+            return known
+    return raw_type
+
+
+def _parse_default(raw_type: str) -> object | None:
+    match = re.search(r"default\s*[=:]\s*([^,;)]+)", raw_type)
+    if not match:
+        return None
+    value = match.group(1).strip().strip("'\"")
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    if value.isdigit():
+        return int(value)
+    return value
 
 
 def _split_fields(fields_text: str) -> list[str]:

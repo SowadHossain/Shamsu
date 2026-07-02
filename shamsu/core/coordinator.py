@@ -19,6 +19,9 @@ from shamsu.types import RoutingDecision
 class CoordinatorResult:
     decision: RoutingDecision
     preview: str
+    answer: str = ""
+    model_used: str = ""
+    fallback_reason: str = ""
 
 
 class Coordinator:
@@ -44,6 +47,22 @@ class Coordinator:
                 confidence=0.2,
             )
         preview = ""
+        answer = ""
+        model_used = ""
+        fallback_reason = ""
         if decision.intent in {"qa", "explain"}:
-            preview = self.qa_workflow.build_prompt(user_input).prompt
-        return CoordinatorResult(decision=decision, preview=preview)
+            try:
+                qa_answer = await self.qa_workflow.answer(user_input, self.llm)
+                preview = qa_answer.prompt
+                answer = qa_answer.answer
+                model_used = qa_answer.model_used
+            except Exception as exc:
+                preview = self.qa_workflow.build_prompt(user_input).prompt
+                fallback_reason = f"Live QA unavailable: {exc}"
+        return CoordinatorResult(
+            decision=decision,
+            preview=preview,
+            answer=answer,
+            model_used=model_used,
+            fallback_reason=fallback_reason,
+        )
