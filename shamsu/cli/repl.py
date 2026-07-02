@@ -37,6 +37,7 @@ from shamsu.retriever.search import SearchAgent
 from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
 
 if sys.platform == "win32":
@@ -97,6 +98,7 @@ def _print_help(console: Console) -> None:
                     "  symbols <name>           Look up indexed symbols",
                     "  parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  plan-prd <file>          Preview and approve a project plan",
+                    "  generate-django <file>   Generate deterministic Django backend files",
                     "  models status            Show local Ollama/model status",
                     "  models pull              Pull missing local models",
                     "  models repair            Start Ollama and pull missing models",
@@ -209,6 +211,53 @@ def _handle_plan_prd(
     state = create_generation_state(spec, file_path, workspace, accepted=True)
     path = save_generation_state(state, workspace)
     console.print(f"[green]Project plan approved and saved: {path}[/green]")
+
+
+def _handle_generate_django(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+) -> None:
+    _, _, path_text = user_input.partition(" ")
+    cleaned_path = path_text.strip().strip('"').strip("'")
+    if not cleaned_path:
+        console.print("[red]Usage: generate-django <file>[/red]")
+        return
+    try:
+        file_path = _resolve_workspace_file(cleaned_path, workspace)
+    except SecurityError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if not file_path.exists() or not file_path.is_file():
+        console.print(f"[red]File not found: {file_path}[/red]")
+        return
+    try:
+        parsed = parse_prd_file(file_path)
+    except PRDParseError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    spec = build_project_spec(parsed)
+    _print_project_plan(spec, console)
+    writer = DjangoProjectWriter(workspace, approval_func=approval_func)
+    try:
+        state = writer.write_project(spec, file_path)
+    except (PermissionError, ValueError) as exc:
+        console.print(f"[yellow]{exc}[/yellow]")
+        return
+    diagnostics = writer.check_project(spec)
+    done = [step.file.path for step in state.generation_order if step.status.value == "done"]
+    console.print(Panel("\n".join(f"- {path}" for path in done), title="Django Files Written"))
+    if diagnostics:
+        table = Table(title="Backend Consistency Diagnostics")
+        table.add_column("File")
+        table.add_column("Symbol")
+        table.add_column("Message")
+        for diagnostic in diagnostics:
+            table.add_row(diagnostic.file_path, diagnostic.symbol, diagnostic.message)
+        console.print(table)
+    else:
+        console.print("[green]Backend consistency check passed.[/green]")
 
 
 def _print_project_plan(spec: ProjectSpec, console: Console) -> None:
@@ -388,6 +437,10 @@ def _print_runtime_status(console: Console, status=None) -> None:
 
 
 async def _handle_request(user_input: str, workspace: Path, console: Console) -> None:
+    if _looks_like_django_generation_request(user_input):
+        generate_command = f"generate-django {_extract_prd_path_from_prompt(user_input)}"
+        _handle_generate_django(generate_command, workspace, console)
+        return
     if _looks_like_prd_plan_request(user_input):
         plan_command = f"plan-prd {_extract_prd_path_from_prompt(user_input)}"
         _handle_plan_prd(plan_command, workspace, console)
@@ -457,7 +510,9 @@ def _forced_decision(user_input: str) -> RoutingDecision | None:
 def _keyword_decision(user_input: str) -> RoutingDecision:
     text = user_input.lower()
     intent = "qa"
-    if _looks_like_prd_plan_request(user_input):
+    if _looks_like_django_generation_request(user_input):
+        intent = "generate"
+    elif _looks_like_prd_plan_request(user_input):
         intent = "generate"
     elif any(word in text for word in ("traceback", "exception", "error:", "failing", "fix ")):
         intent = "bug_fix"
@@ -482,6 +537,14 @@ def _looks_like_prd_plan_request(user_input: str) -> bool:
     text = user_input.lower()
     return (
         any(phrase in text for phrase in ("plan project", "project plan", "plan-prd"))
+        and bool(_extract_prd_path_from_prompt(user_input))
+    )
+
+
+def _looks_like_django_generation_request(user_input: str) -> bool:
+    text = user_input.lower()
+    return (
+        any(phrase in text for phrase in ("generate django", "generate project", "build django"))
         and bool(_extract_prd_path_from_prompt(user_input))
     )
 
@@ -694,6 +757,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower().startswith("plan-prd "):
             _handle_plan_prd(user_input, workspace, console)
+            continue
+        if user_input.lower().startswith("generate-django "):
+            _handle_generate_django(user_input, workspace, console)
             continue
         if user_input.lower().startswith("models"):
             _handle_models(user_input, console)

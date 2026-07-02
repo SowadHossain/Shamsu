@@ -126,6 +126,14 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "{{ project_name }}.settings")
 application = get_asgi_application()
 """
 
+APP_CONFIG_TEMPLATE = """from django.apps import AppConfig
+
+
+class {{ app_config_class }}(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "{{ app_name }}"
+"""
+
 BASE_HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en" data-theme="{{ theme }}">
 <head>
