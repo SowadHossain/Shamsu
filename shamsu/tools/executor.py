@@ -10,6 +10,7 @@ from pathlib import Path
 
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.audit import AuditLogger
 from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.types import ApprovalRequest, CommandRisk, TestRunResult
@@ -31,15 +32,26 @@ class CommandRunner(ICommandRunner):
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
         self.timeout_seconds = timeout_seconds
+        self.audit_logger = AuditLogger(self.workspace_root)
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
         try:
             validated_cwd = self._validate_cwd(cwd)
         except (SecurityError, ValueError) as exc:
+            self.audit_logger.log(
+                "command_run",
+                "error",
+                details={"command": command, "stderr": str(exc)},
+            )
             return WORKSPACE_EXIT_CODE, "", str(exc)
 
         risk = classify_command(command)
         if risk == CommandRisk.BLOCKED:
+            self.audit_logger.log(
+                "command_run",
+                "blocked",
+                details={"command": command, "risk": risk.value},
+            )
             return BLOCKED_EXIT_CODE, "", f"Blocked command: {command}"
 
         if risk == CommandRisk.MEDIUM:
@@ -52,7 +64,22 @@ class CommandRunner(ICommandRunner):
                 reason="Command is medium risk or unknown.",
             )
             if not self.approval_func(request):
+                self.audit_logger.log(
+                    "approval",
+                    "denied",
+                    details={"action_type": request.action_type, "preview": request.preview},
+                )
+                self.audit_logger.log(
+                    "command_run",
+                    "denied",
+                    details={"command": command, "risk": risk.value},
+                )
                 return DENIED_EXIT_CODE, "", f"Command denied by user: {command}"
+            self.audit_logger.log(
+                "approval",
+                "approved",
+                details={"action_type": request.action_type, "preview": request.preview},
+            )
 
         try:
             completed = subprocess.run(
@@ -69,8 +96,24 @@ class CommandRunner(ICommandRunner):
             message = f"Command timed out after {self.timeout_seconds} seconds: {command}"
             if stderr:
                 message = f"{message}\n{stderr}"
+            self.audit_logger.log(
+                "command_run",
+                "timeout",
+                details={"command": command, "stdout": stdout, "stderr": message},
+            )
             return TIMEOUT_EXIT_CODE, stdout, message
 
+        result = "success" if completed.returncode == 0 else "error"
+        self.audit_logger.log(
+            "command_run",
+            result,
+            details={
+                "command": command,
+                "exit_code": completed.returncode,
+                "stdout": completed.stdout or "",
+                "stderr": completed.stderr or "",
+            },
+        )
         return (
             completed.returncode,
             redact(completed.stdout or ""),
