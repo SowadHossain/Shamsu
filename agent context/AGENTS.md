@@ -163,24 +163,26 @@ Completed first slice:
 - The file walker removes stale index rows after file moves/deletes.
 - `core/coordinator.py` routes requests and falls back to QA preview if Ollama is unavailable.
 - `agents/qa_workflow.py` wires `SearchAgentStub` to `ContextBuilder`.
-- `prd/parser.py` parses Markdown PRDs into `ParsedPRD`.
-- `prd/extractor.py` extracts `EntitySpec` values from PRD entity sections.
-- `prd/project.py` assembles `ProjectSpec` values.
+- `prd/parser.py` parses Markdown/plain-text PRD content into `ParsedPRD`.
+- `prd/input.py` accepts Markdown, TXT, and PDF PRD files.
+- `prd/extractor.py` extracts `EntitySpec` values, field types, choices, optional fields, and relationships from PRD entity sections.
+- `prd/project.py` assembles `ProjectSpec` values with inferred endpoints, pages, theme, and generation order.
+- `prd/state.py` stores accepted generation-plan resume state under workspace `.shamsu/`.
 - `templates/django/constants.py` and `templates/django/renderer.py` provide deterministic fixed Django generation.
 - `safety/approval.py` displays Rich approval panels.
-- `cli/repl.py` supports `--workspace <path>`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file.md>`, and QA context preview.
+- `cli/repl.py` supports `--workspace <path>`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file>`, `plan-prd <file>`, and QA context preview.
 - `scripts/install.ps1` and `scripts/install.sh` install into repo-local `.venv`.
 - `scripts/run-shamsu.ps1` and `scripts/run-shamsu.sh` run SHAMSU from that `.venv` while preserving the caller workspace.
-- `parse-prd` file inputs are validated through `Sandbox.validate()`.
+- `parse-prd` and `plan-prd` file inputs are validated through `Sandbox.validate()`.
 - `tools/executor.py` provides an internal `CommandRunner` with workspace-bound `cwd` validation, blocked-command rejection, approval gates, timeout handling, output capture, and redaction.
 - `patch/engine.py` validates unified diffs, checks hunk structure and counts, and rejects unsafe patch paths.
 - `patch/preview.py` renders Rich patch summaries and colorized diff previews.
 
 Recommended next slice:
 
-1. Add patch application and rollback behind approval.
-2. Add deterministic Django project writer behind approval.
-3. Add `ProjectSpec` JSON preview command for PRDs.
+1. Add deterministic Django project writer behind approval.
+2. Wire approved `generation-state.json` into the M4 file-writing pipeline.
+3. Add Django backend generators for models, serializers, views, URLs, forms, and admin.
 4. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
 
 ## Suggested Initial File Layout

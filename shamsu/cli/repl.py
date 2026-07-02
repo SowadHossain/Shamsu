@@ -8,9 +8,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
@@ -28,11 +30,14 @@ from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
 from shamsu.indexer.walker import FileWalker
 from shamsu.llm.manager import LLMManager
-from shamsu.prd.parser import MarkdownPRDParser
+from shamsu.prd.input import PRDParseError, parse_prd_file
+from shamsu.prd.project import build_project_spec
+from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.retriever.search import SearchAgent
 from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
+from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox, SecurityError
-from shamsu.types import RoutingDecision, SearchResult
+from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
 
 if sys.platform == "win32":
     from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
@@ -90,7 +95,8 @@ def _print_help(console: Console) -> None:
                     "  status                   Show index counts",
                     "  search <query>           Search indexed snippets",
                     "  symbols <name>           Look up indexed symbols",
-                    "  parse-prd <file.md>      Parse a Markdown PRD into sections",
+                    "  parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
+                    "  plan-prd <file>          Preview and approve a project plan",
                     "  models status            Show local Ollama/model status",
                     "  models pull              Pull missing local models",
                     "  models repair            Start Ollama and pull missing models",
@@ -142,7 +148,7 @@ def _handle_parse_prd(user_input: str, workspace: Path, console: Console) -> Non
     _, _, path_text = user_input.partition(" ")
     cleaned_path = path_text.strip().strip('"').strip("'")
     if not cleaned_path:
-        console.print("[red]Usage: parse-prd <file.md>[/red]")
+        console.print("[red]Usage: parse-prd <file>[/red]")
         return
     try:
         file_path = _resolve_workspace_file(cleaned_path, workspace)
@@ -152,9 +158,128 @@ def _handle_parse_prd(user_input: str, workspace: Path, console: Console) -> Non
     if not file_path.exists() or not file_path.is_file():
         console.print(f"[red]File not found: {file_path}[/red]")
         return
-    parsed = MarkdownPRDParser().parse(file_path)
+    try:
+        parsed = parse_prd_file(file_path)
+    except PRDParseError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
     console.print(f"Title: {parsed.title}")
     console.print(json.dumps(parsed.sections, indent=2))
+
+
+def _handle_plan_prd(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+) -> None:
+    _, _, path_text = user_input.partition(" ")
+    cleaned_path = path_text.strip().strip('"').strip("'")
+    if not cleaned_path:
+        console.print("[red]Usage: plan-prd <file>[/red]")
+        return
+    try:
+        file_path = _resolve_workspace_file(cleaned_path, workspace)
+    except SecurityError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if not file_path.exists() or not file_path.is_file():
+        console.print(f"[red]File not found: {file_path}[/red]")
+        return
+    try:
+        parsed = parse_prd_file(file_path)
+    except PRDParseError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+
+    spec = build_project_spec(parsed)
+    _print_project_plan(spec, console)
+    request = ApprovalRequest(
+        action_type="file_write",
+        description="Record this PRD project plan as approved for future generation.",
+        risk_level="medium",
+        preview=_project_plan_summary(spec),
+        working_dir=str(workspace),
+        reason="M3 only stores resume metadata; it does not generate project files.",
+    )
+    if not approval_func(request):
+        console.print("[yellow]Project plan was not approved. No state was written.[/yellow]")
+        return
+
+    state = create_generation_state(spec, file_path, workspace, accepted=True)
+    path = save_generation_state(state, workspace)
+    console.print(f"[green]Project plan approved and saved: {path}[/green]")
+
+
+def _print_project_plan(spec: ProjectSpec, console: Console) -> None:
+    console.print(Panel(_project_plan_summary(spec), title="Project Plan"))
+
+    entities = Table(title="Entities")
+    entities.add_column("Entity")
+    entities.add_column("Fields")
+    entities.add_column("Relationships")
+    for entity in spec.entities:
+        fields = ", ".join(
+            f"{field.name}:{field.django_type}" for field in entity.fields
+        )
+        entities.add_row(entity.name, fields, ", ".join(entity.relationships) or "-")
+    console.print(entities)
+
+    endpoints = Table(title="Endpoints")
+    endpoints.add_column("Method")
+    endpoints.add_column("Path")
+    endpoints.add_column("Resource")
+    endpoints.add_column("Auth")
+    for endpoint in spec.endpoints:
+        endpoints.add_row(
+            endpoint.method,
+            endpoint.path,
+            endpoint.resource,
+            "yes" if endpoint.auth_required else "no",
+        )
+    console.print(endpoints)
+
+    pages = Table(title="Pages")
+    pages.add_column("Name")
+    pages.add_column("Type")
+    pages.add_column("Resource")
+    pages.add_column("Login")
+    for page in spec.pages:
+        pages.add_row(
+            page.name,
+            page.page_type,
+            page.resource or "-",
+            "yes" if page.requires_login else "no",
+        )
+    console.print(pages)
+
+    files = Table(title="Generation Order")
+    files.add_column("#")
+    files.add_column("Path")
+    files.add_column("Generator")
+    files.add_column("Specialist")
+    for index, file_spec in enumerate(spec.generation_order, start=1):
+        files.add_row(
+            str(index),
+            file_spec.path,
+            file_spec.generator,
+            file_spec.specialist or "-",
+        )
+    console.print(files)
+
+
+def _project_plan_summary(spec: ProjectSpec) -> str:
+    return "\n".join(
+        [
+            f"Project: {spec.project_name}",
+            f"App: {spec.app_name}",
+            f"Theme: {spec.theme}",
+            f"Entities: {len(spec.entities)}",
+            f"Endpoints: {len(spec.endpoints)}",
+            f"Pages: {len(spec.pages)}",
+            f"Files planned: {len(spec.generation_order)}",
+        ]
+    )
 
 
 def _resolve_workspace_file(path_text: str, workspace: Path) -> Path:
@@ -263,6 +388,10 @@ def _print_runtime_status(console: Console, status=None) -> None:
 
 
 async def _handle_request(user_input: str, workspace: Path, console: Console) -> None:
+    if _looks_like_prd_plan_request(user_input):
+        plan_command = f"plan-prd {_extract_prd_path_from_prompt(user_input)}"
+        _handle_plan_prd(plan_command, workspace, console)
+        return
     search, uses_real_index = _build_search_agent(workspace)
     if not uses_real_index:
         console.print(
@@ -328,7 +457,9 @@ def _forced_decision(user_input: str) -> RoutingDecision | None:
 def _keyword_decision(user_input: str) -> RoutingDecision:
     text = user_input.lower()
     intent = "qa"
-    if any(word in text for word in ("traceback", "exception", "error:", "failing", "fix ")):
+    if _looks_like_prd_plan_request(user_input):
+        intent = "generate"
+    elif any(word in text for word in ("traceback", "exception", "error:", "failing", "fix ")):
         intent = "bug_fix"
     elif any(word in text for word in ("write tests", "generate tests", "test for", "pytest")):
         intent = "test_gen"
@@ -345,6 +476,22 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
         needs_tools=["search"],
         confidence=0.35,
     )
+
+
+def _looks_like_prd_plan_request(user_input: str) -> bool:
+    text = user_input.lower()
+    return (
+        any(phrase in text for phrase in ("plan project", "project plan", "plan-prd"))
+        and bool(_extract_prd_path_from_prompt(user_input))
+    )
+
+
+def _extract_prd_path_from_prompt(user_input: str) -> str:
+    quoted = re.search(r"['\"]([^'\"]+\.(?:md|markdown|txt|pdf))['\"]", user_input, re.I)
+    if quoted:
+        return quoted.group(1)
+    match = re.search(r"([^\s]+?\.(?:md|markdown|txt|pdf))", user_input, re.I)
+    return match.group(1) if match else ""
 
 
 def _print_decision(decision: RoutingDecision, console: Console) -> None:
@@ -544,6 +691,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower().startswith("parse-prd "):
             _handle_parse_prd(user_input, workspace, console)
+            continue
+        if user_input.lower().startswith("plan-prd "):
+            _handle_plan_prd(user_input, workspace, console)
             continue
         if user_input.lower().startswith("models"):
             _handle_models(user_input, console)

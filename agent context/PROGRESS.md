@@ -6,11 +6,11 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 2 merged into `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, and native local Ollama runtime bootstrap complete.
-- Tests: `116 passed`
+- Status: Milestone 3 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, and generation resume state complete.
+- Tests: `130 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-02
-- Current next focus: start Milestone 3 PRD-to-project planning and Django generation.
+- Current next focus: verify full suite, open M3 PRs, then start Milestone 4 Django project writing/generation.
 
 ## Completed Features
 
@@ -71,16 +71,23 @@ blocker.
 - [x] Added LLM model aliases for `bugfix` and `test_gen` specialists so workflow names map to the intended local models.
 - [x] Added native local runtime management for Ollama detection, local-only status, model checks/pulls, runtime config, and REPL `models status|pull|repair` commands.
 - [x] Extended install scripts with safe runtime bootstrap flags while avoiding PowerShell profile, PATH, registry, shell startup files, and global Python edits.
+- [x] Added unified PRD input parsing for Markdown, TXT, and PDF files.
+- [x] Added friendly PRD parse errors for unsupported and empty/unreadable PDF inputs.
+- [x] Extended PRD extraction for relationships, auth user references, choices, optional fields, decimals, booleans, text fields, max length, and defaults.
+- [x] Extended `ProjectSpec` generation order into the future Django pipeline order.
+- [x] Added REPL `plan-prd <file>` preview with entities, endpoints, pages, planned files, and approval gate.
+- [x] Added natural-language PRD plan routing for prompts that mention a PRD file.
+- [x] Added workspace-local `.shamsu/generation-state.json` helpers for accepted plans, step status, completed files, errors, and resume.
 
 ## In Progress
 
-- [ ] Milestone 3 planning and PRD-to-project workflow.
+- [ ] M3 PR split/merge preparation.
 
 ## Next Queue
 
-1. Add `ProjectSpec` JSON preview command for PRDs.
-2. Add deterministic Django project writer that can write rendered fixed templates into a target directory behind approval.
-3. Add file generation order and resume state for PRD-to-project generation.
+1. Open/merge M3 PRs for issues #11-#14.
+2. Sync `dev-a`, `dev-b`, and `dev-c` after M3 merges.
+3. Start Milestone 4 with approval-backed Django project writer.
 
 ## Known Notes
 

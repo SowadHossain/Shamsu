@@ -415,7 +415,10 @@ into `develop` merges.
 Goal: SHAMSU converts Markdown/TXT/PDF PRDs into a structured plan and shows it
 to the user before any files are written.
 
-### Issue 11: TXT And PDF PRD Input
+Status: Implemented locally on top of `develop`; pending full-suite verification
+and PR split/merge.
+
+### Issue 11: TXT And PDF PRD Input [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:prd`, `type:feature`, `priority:p1`
@@ -428,7 +431,7 @@ to the user before any files are written.
   - PDF text extraction handles empty/unreadable PDFs with friendly errors.
   - Tests cover Markdown, TXT, PDF fallback/error paths.
 
-### Issue 12: PRD Extractor V2 Relationships And Field Types
+### Issue 12: PRD Extractor V2 Relationships And Field Types [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:prd`, `area:django`, `type:feature`,
@@ -444,7 +447,7 @@ to the user before any files are written.
   - Infers dashboard/list/detail pages when pages are missing.
   - Tests cover Todo, Expense Tracker, and Blog PRDs.
 
-### Issue 13: Project Plan Preview And Approval
+### Issue 13: Project Plan Preview And Approval [done]
 
 - Owner: Dev C
 - Labels: `owner:dev-c`, `area:prd`, `area:cli`, `area:safety`,
@@ -460,7 +463,7 @@ to the user before any files are written.
   - Requires approval before moving into generation.
   - Tests cover preview output and denied approval.
 
-### Issue 14: File Generation Order And Resume State
+### Issue 14: File Generation Order And Resume State [done]
 
 - Owner: Dev B
 - Labels: `owner:dev-b`, `area:core`, `area:django`, `type:feature`,
