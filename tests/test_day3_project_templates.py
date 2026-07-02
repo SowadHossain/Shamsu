@@ -5,6 +5,7 @@ import ast
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.prd.project import build_project_spec
 from shamsu.templates.django.renderer import render_fixed_django_files, render_template
+from shamsu.types import ParsedPRD
 
 
 def test_build_project_spec_extracts_entities_pages_endpoints_and_order(tmp_path):
@@ -71,3 +72,17 @@ def test_render_fixed_django_files_are_deterministic_and_python_valid(tmp_path):
     for path, content in files.items():
         if path.endswith(".py"):
             ast.parse(content)
+
+
+def test_project_theme_selection_covers_common_domains():
+    cases = [
+        ("Expense Manager", "Track finance, expenses, budgets, and business reports.", "corporate"),
+        ("Writing Desk", "A creative blog for long-form writing and publishing.", "nord"),
+        ("Dev Portal", "A technical developer dashboard for code review.", "dark"),
+        ("Inventory", "Track stock counts and warehouse transfers.", "corporate"),
+    ]
+
+    for title, raw_text, expected_theme in cases:
+        spec = build_project_spec(ParsedPRD(title=title, sections={}, raw_text=raw_text))
+
+        assert spec.theme == expected_theme
