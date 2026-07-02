@@ -10,6 +10,8 @@ def test_install_scripts_do_not_edit_shell_profiles_or_path():
     scripts = [
         REPO_ROOT / "scripts" / "install.ps1",
         REPO_ROOT / "scripts" / "install.sh",
+        REPO_ROOT / "scripts" / "install-command.ps1",
+        REPO_ROOT / "scripts" / "install-command.sh",
         REPO_ROOT / "scripts" / "run-shamsu.ps1",
         REPO_ROOT / "scripts" / "run-shamsu.sh",
     ]
@@ -22,6 +24,7 @@ def test_install_scripts_do_not_edit_shell_profiles_or_path():
         ">> ~/.zshrc",
         ">> ~/.profile",
         "pip install -g",
+        "export PATH=",
     ]
 
     for script in scripts:
@@ -54,3 +57,20 @@ def test_windows_runtime_scripts_force_python_utf8_for_ollama_output():
     assert '$env:PYTHONUTF8 = "1"' in run_ps1
     assert 'export PYTHONUTF8="${PYTHONUTF8:-1}"' in install_sh
     assert 'export PYTHONUTF8="${PYTHONUTF8:-1}"' in run_sh
+
+
+def test_command_installers_create_thin_launchers_without_profile_edits():
+    ps1 = (REPO_ROOT / "scripts" / "install-command.ps1").read_text(encoding="utf-8")
+    sh = (REPO_ROOT / "scripts" / "install-command.sh").read_text(encoding="utf-8")
+
+    assert "scripts\\run-shamsu.ps1" in ps1
+    assert "shamsu.ps1" in ps1
+    assert "shamsu.cmd" in ps1
+    assert "@ShamsuArgs" in ps1
+    assert "Get-Location" not in ps1
+    assert "did not edit your PowerShell profile, PATH, registry, or global Python" in ps1
+
+    assert "scripts/run-shamsu.sh" in sh
+    assert 'exec "${RUN_SCRIPT}" "\\$@"' in sh
+    assert "${HOME}/.local/bin" in sh
+    assert "did not edit your shell profile, PATH, global Python, or system registry" in sh
