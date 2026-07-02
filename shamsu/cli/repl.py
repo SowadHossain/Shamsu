@@ -829,7 +829,9 @@ def _handle_models(
     if command == "pull":
         status = collect_status()
         if not status.ollama_found:
-            console.print("[red]Ollama was not found. Run `models repair` after installing Ollama.[/red]")
+            console.print(
+                "[red]Ollama was not found. Run `models repair` after installing Ollama.[/red]"
+            )
             return
         if not status.server_running:
             console.print("[yellow]Ollama is not running. Starting local Ollama...[/yellow]")
@@ -3227,7 +3229,13 @@ async def _run_test_generation(
     result = await TestGenerationWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "test-gen")
     )
-    _print_patch_result("Test Generation", result.applied, result.changed_files, result.error, console)
+    _print_patch_result(
+        "Test Generation",
+        result.applied,
+        result.changed_files,
+        result.error,
+        console,
+    )
 
 
 async def _run_docs(
@@ -3255,7 +3263,13 @@ async def _run_docs(
             else {}
         ),
     ).apply_readme_update(request=_strip_forced_prefix(user_input, "docs"))
-    _print_patch_result("Documentation", result.applied, result.changed_files, result.error, console)
+    _print_patch_result(
+        "Documentation",
+        result.applied,
+        result.changed_files,
+        result.error,
+        console,
+    )
 
 
 def _warn_if_dirty_before_edit(workspace: Path, console: Console) -> None:
@@ -3304,7 +3318,9 @@ def _print_patch_result(
         files = "\n".join(f"- {path}" for path in changed_files) or "No files reported."
         console.print(Panel(files, title=f"{title} Applied", border_style="green"))
         return
-    console.print(Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow"))
+    console.print(
+        Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow")
+    )
 
 
 def _looks_like_runtime_error(message: str) -> bool:
