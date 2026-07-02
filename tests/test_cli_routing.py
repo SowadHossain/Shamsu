@@ -46,6 +46,16 @@ class FakeCodeEditWorkflow:
         return _PatchResult(applied=True, changed_files=["app.py"], error="")
 
 
+class FakeGitTool:
+    warning: str | None = None
+
+    def __init__(self, workspace_root: Path) -> None:
+        self.workspace_root = workspace_root
+
+    def warn_if_dirty(self) -> str | None:
+        return self.warning
+
+
 class _PatchResult:
     def __init__(self, applied: bool, changed_files: list[str], error: str) -> None:
         self.applied = applied
@@ -84,6 +94,8 @@ def test_route_prompt_falls_back_to_keyword_router_when_llm_is_down():
 def test_code_edit_handler_prints_applied_result(monkeypatch, tmp_path):
     console, output = _console_output()
     monkeypatch.setattr(repl, "CodeEditWorkflow", FakeCodeEditWorkflow)
+    monkeypatch.setattr(repl, "GitTool", FakeGitTool)
+    FakeGitTool.warning = None
 
     asyncio.run(
         repl._run_code_edit(
@@ -98,3 +110,25 @@ def test_code_edit_handler_prints_applied_result(monkeypatch, tmp_path):
     rendered = output.getvalue()
     assert "Code Edit Applied" in rendered
     assert "app.py" in rendered
+    assert "uncommitted changes" not in rendered
+
+
+def test_code_edit_handler_warns_before_editing_dirty_worktree(monkeypatch, tmp_path):
+    console, output = _console_output()
+    monkeypatch.setattr(repl, "CodeEditWorkflow", FakeCodeEditWorkflow)
+    monkeypatch.setattr(repl, "GitTool", FakeGitTool)
+    FakeGitTool.warning = "Workspace has uncommitted changes: app.py"
+
+    asyncio.run(
+        repl._run_code_edit(
+            "edit change value",
+            tmp_path,
+            FakeSearch(),
+            console,
+            FakeLLM(),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Workspace has uncommitted changes: app.py" in rendered
+    assert rendered.index("Workspace has uncommitted changes") < rendered.index("Code Edit Applied")
