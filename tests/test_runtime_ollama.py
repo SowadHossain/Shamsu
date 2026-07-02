@@ -47,12 +47,12 @@ def test_find_ollama_executable_uses_known_paths_when_path_lookup_misses(monkeyp
 
 def test_parse_ollama_list_extracts_model_names():
     output = """NAME                                      ID              SIZE      MODIFIED
-phi3:mini-4k-instruct                    abc123          2.2 GB    1 hour ago
+phi3:mini                                abc123          2.2 GB    1 hour ago
 qwen2.5-coder:7b-instruct-q4_K_M         def456          4.7 GB    2 hours ago
 """
 
     assert parse_ollama_list(output) == [
-        "phi3:mini-4k-instruct",
+        "phi3:mini",
         "qwen2.5-coder:7b-instruct-q4_K_M",
     ]
 

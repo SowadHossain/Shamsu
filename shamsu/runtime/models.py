@@ -14,7 +14,7 @@ class ModelSpec:
 
 
 MODEL_SPECS: tuple[ModelSpec, ...] = (
-    ModelSpec("phi3:mini-4k-instruct", ("router", "qa", "planner", "doc_agent", "summarizer")),
+    ModelSpec("phi3:mini", ("router", "qa", "planner", "doc_agent", "summarizer")),
     ModelSpec("qwen2.5-coder:7b-instruct-q4_K_M", ("coder", "test_gen", "test_agent")),
     ModelSpec("deepseek-coder:6.7b-instruct-q4_K_M", ("bugfix", "bugfixer")),
     ModelSpec("mistral:7b-instruct-q4_K_M", ("reviewer",)),
