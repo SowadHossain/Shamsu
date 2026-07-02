@@ -24,23 +24,29 @@ Working now:
 - Python symbol extraction with `ast`
 - Stale index cleanup when files move or disappear
 - Markdown PRD parsing
+- Markdown, TXT, and PDF PRD file input
 - Rule-based PRD entity extraction
 - `ProjectSpec` assembly from PRDs
-- Fixed Django template constants and renderer
-- QA context preview using real indexed search when an index exists
+- PRD plan preview/approval and generation resume state
+- Deterministic Django fixed templates and backend generators
+- Approval-backed Django project writer and backend consistency checker
+- QA, code-edit, bug-fix, audit, test-generation, and documentation workflows
+- Claude-like prompt loop with local model routing and keyword fallback
+- Workspace-local sessions, resume, redacted event logs, and export bundles
 - Workspace path sandbox for file inputs such as `parse-prd`
 - Command risk classifier and secret redaction helpers
 - Internal command runner with workspace checks, blocked-command rejection,
   approval gates, timeouts, captured output, and redaction
 - Internal patch validation and Rich diff preview for unified diffs
+- Approval-backed patch apply/rollback with post-patch re-indexing
 - Agent progress tracking in `agent context/PROGRESS.md`
 
 Planned next:
 
-- Patch application and rollback behind approval
-- Writing generated Django files behind approval
-- Full PRD-to-Django project generation
-- Local Ollama-backed specialist responses beyond preview mode
+- Frontend page/template generation
+- Generated-project dependency install, migrations, and tests
+- Error feedback loop for generated-project failures
+- Full PRD-to-Django pipeline orchestration
 
 ## Requirements
 
@@ -164,9 +170,19 @@ status
 search <query>
 symbols <name>
 parse-prd <file.md>
+plan-prd <file.md|file.txt|file.pdf>
+generate-django <file.md|file.txt|file.pdf>
 models status
 models pull
 models repair
+sessions list
+sessions current
+sessions show <id>
+sessions resume <id-or-title>
+sessions rename <id> <title>
+sessions close [id]
+sessions export <id>
+log tail
 help
 exit
 ```
@@ -214,15 +230,68 @@ Looks up indexed symbols.
 shamsu> symbols build_project_spec
 ```
 
-### `parse-prd <file.md>`
+### `parse-prd <file>`
 
-Parses a Markdown PRD inside the workspace.
+Parses a Markdown, TXT, or PDF PRD inside the workspace.
 
 ```text
 shamsu> parse-prd "agent context/SHAMSU_10day_dev_plan.md"
 ```
 
 Paths outside the workspace are rejected.
+
+### `plan-prd <file>`
+
+Parses a PRD, builds a `ProjectSpec`, prints a Rich preview, and asks approval
+before recording the plan state.
+
+```text
+shamsu> plan-prd TODO_PRD.md
+```
+
+### `generate-django <file>`
+
+Parses and previews a PRD, asks approval, writes deterministic Django backend
+files inside the workspace, updates generation state, and runs static backend
+consistency checks.
+
+```text
+shamsu> generate-django TODO_PRD.md
+```
+
+### Sessions And Logs
+
+SHAMSU creates or resumes a workspace-local session on startup. Session data
+lives under:
+
+```text
+.shamsu/sessions/
+```
+
+Start a named session:
+
+```powershell
+.\scripts\run-shamsu.ps1 --new-session "Todo PRD run"
+```
+
+Resume one later:
+
+```powershell
+.\scripts\run-shamsu.ps1 --session 20260702
+```
+
+Inside the REPL:
+
+```text
+sessions list
+sessions current
+sessions resume <id-or-title>
+sessions export <id>
+log tail
+```
+
+Exports are redacted ZIP bundles containing `session.json`, `events.jsonl`, and
+a Markdown summary.
 
 ### Natural-Language Request
 
@@ -280,7 +349,7 @@ Run lint:
 Expected current result:
 
 ```text
-105 passed
+152 passed
 All checks passed!
 ```
 
@@ -307,6 +376,7 @@ Workspace sandbox:
 - `parse-prd` validates file paths with `Sandbox.validate()`.
 - Paths outside the workspace are rejected.
 - Index data stays inside `<workspace>/.shamsu/`.
+- Session logs and exports stay inside `<workspace>/.shamsu/sessions/`.
 
 Local AI runtime:
 
@@ -332,14 +402,24 @@ Internal patch review:
   use it.
 - Patch paths are normalized and checked against the workspace sandbox.
 - `patch.preview` renders a Rich diff summary and colorized diff body.
-- Patch application and rollback are intentionally not enabled yet.
+- Patch application requires approval, writes backups, rolls back failed
+  applies, and refreshes the workspace index after success.
+
+Session logging:
+
+- Session logs are local JSONL files under the active workspace.
+- Prompts, routing decisions, context packs, LLM calls, approvals, patches,
+  commands, PRD planning, and Django generation events are logged.
+- Log payloads are redacted and large strings are truncated by default.
+- Exports are meant to be shareable debugging bundles, not raw source dumps.
 
 Important limitation:
 
 - This is not a full OS sandbox.
 - This is not Docker isolation.
-- Future file writes, patch application, rollback, and user-facing command
-  execution still need approval gates before they become public workflows.
+- User-facing arbitrary shell execution is still not exposed as a REPL command.
+- Session logs are redacted metadata by default, not a forensic or compliance
+  audit system.
 
 ## Troubleshooting
 
