@@ -43,9 +43,13 @@ SECRET_PATTERNS = [
     r"ghp_[a-zA-Z0-9]{36}",                   # GitHub token
     r"-----BEGIN.*PRIVATE KEY",
     r"password\s*=\s*['\"][^'\"]+",
+    r'"password"\s*:\s*"[^"]+"',
     r"api_key\s*=\s*['\"][^'\"]+",
+    r'"api_key"\s*:\s*"[^"]+"',
     r"secret\s*=\s*['\"][^'\"]+",
+    r'"secret"\s*:\s*"[^"]+"',
     r"SECRET_KEY\s*=\s*['\"][^'\"]+",         # Django-specific
+    r'"SECRET_KEY"\s*:\s*"[^"]+"',             # Django-specific JSON logs
     r"postgresql://[^@]*:[^@]*@",
     r"mysql://[^@]*:[^@]*@",
 ]
