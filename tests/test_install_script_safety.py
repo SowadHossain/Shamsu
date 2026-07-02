@@ -67,7 +67,10 @@ def test_command_installers_create_thin_launchers_without_profile_edits():
     assert "shamsu.ps1" in ps1
     assert "shamsu.cmd" in ps1
     assert "@ShamsuArgs" in ps1
-    assert "Get-Location" not in ps1
+    assert "(Get-Location).Path" in ps1
+    assert "-InputObject (`$PipedInput -join [Environment]::NewLine)" in ps1
+    assert "-Workspace `$Workspace @ShamsuArgs" in ps1
+    assert '-Workspace "%CD%" %*' in ps1
     assert "did not edit your PowerShell profile, PATH, registry, or global Python" in ps1
 
     assert "scripts/run-shamsu.sh" in sh
