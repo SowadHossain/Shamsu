@@ -5,8 +5,10 @@ from io import StringIO
 
 from rich.console import Console
 
+from shamsu.cli import repl
 from shamsu.cli.repl import _build_workspace_qa_workflow, _handle_request
 from shamsu.indexer.walker import FileWalker
+from shamsu.types import LLMResponse
 
 
 def _console_output() -> tuple[Console, StringIO]:
@@ -64,6 +66,30 @@ def test_repl_greeting_prints_ready_message_without_model_qa(tmp_path):
     assert "intent=qa" not in rendered
     assert "No index found" not in rendered
     assert "Context Preview" not in rendered
+
+
+def test_repl_general_chat_without_index_uses_local_chat(monkeypatch, tmp_path):
+    console, output = _console_output()
+
+    class FakeLLM:
+        def __init__(self, session_logger=None):
+            self.session_logger = session_logger
+
+        async def run_specialist(self, specialist, pack):
+            assert specialist == "qa"
+            assert pack.task_id == "general-chat"
+            assert "No indexed project context" in pack.prd_context
+            return LLMResponse(raw="General answer", model_used="fake-phi3")
+
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    asyncio.run(_handle_request("what is recursion?", tmp_path, console))
+
+    rendered = output.getvalue()
+    assert "General answer" in rendered
+    assert "Chat (fake-phi3)" in rendered
+    assert "No index found" not in rendered
+    assert "intent=qa" not in rendered
 
 
 def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):

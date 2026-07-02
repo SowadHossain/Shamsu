@@ -12,6 +12,8 @@ def test_install_scripts_do_not_edit_shell_profiles_or_path():
         REPO_ROOT / "scripts" / "install.sh",
         REPO_ROOT / "scripts" / "run-shamsu.ps1",
         REPO_ROOT / "scripts" / "run-shamsu.sh",
+        REPO_ROOT / "scripts" / "uninstall.ps1",
+        REPO_ROOT / "scripts" / "uninstall.sh",
     ]
     forbidden = [
         "$PROFILE",
@@ -83,3 +85,22 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert "LAUNCHER_ON_PATH" in sh
     assert "Add ${BIN_DIR} to PATH if you want plain 'shamsu'" in sh
     assert "did not edit your shell profile, PATH, global Python, or system registry" in sh
+
+
+def test_uninstall_scripts_remove_only_shamsu_managed_files():
+    ps1 = (REPO_ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
+    sh = (REPO_ROOT / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+
+    assert ".venv" in ps1
+    assert ".shamsu" in ps1
+    assert "shamsu.ps1" in ps1
+    assert "shamsu.cmd" in ps1
+    assert "did not remove Ollama" in ps1
+    assert "$PROFILE" not in ps1
+    assert "SetEnvironmentVariable" not in ps1
+
+    assert ".venv" in sh
+    assert ".shamsu" in sh
+    assert "/shamsu" in sh
+    assert "did not remove Ollama" in sh
+    assert "export PATH=" not in sh

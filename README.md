@@ -19,6 +19,7 @@ retrieves relevant files first, then builds a compact context pack.
 Working now:
 
 - CLI REPL through `shamsu`
+- General local chat for non-project prompts
 - Workspace-scoped indexing into `.shamsu/index.db`
 - SQLite FTS5 snippet search
 - Python symbol extraction with `ast`
@@ -223,6 +224,14 @@ help
 exit
 ```
 
+Natural chat also works when you are not asking about the current workspace:
+
+```text
+shamsu> what is recursion?
+shamsu> write a short status update for my team
+shamsu> brainstorm names for a budgeting app
+```
+
 ### `index`
 
 Indexes the selected workspace.
@@ -331,14 +340,15 @@ a Markdown summary.
 
 ### Natural-Language Request
 
-Any other text builds a routed QA context preview:
+Any other text routes into the local assistant:
 
 ```text
 shamsu> how does project spec work?
 ```
 
-If an index exists, SHAMSU uses real indexed search to assemble the preview. If
-Ollama is unavailable, the routing step falls back to safe QA mode.
+If an index exists, SHAMSU uses real indexed search for project-aware answers.
+If no index exists, SHAMSU still handles general local chat and only asks for
+`index` when the prompt is clearly workspace-specific.
 
 ### `models status|pull|repair`
 
@@ -351,7 +361,9 @@ shamsu> models repair
 ```
 
 `models repair` starts local Ollama when possible and pulls missing required
-models. It does not install Ollama; use the installer for first-time bootstrap.
+models. If a workflow hits a local-runtime failure, SHAMSU can kick off this
+guided repair flow from inside the chat instead of only surfacing the raw
+error.
 
 ## Smoke Test
 
@@ -500,6 +512,26 @@ Bash:
 rm -rf .venv
 bash scripts/install.sh
 ```
+
+### Uninstall SHAMSU
+
+Remove SHAMSU-managed files from this repo install.
+
+Windows:
+
+```powershell
+.\scripts\uninstall.ps1
+```
+
+Bash:
+
+```bash
+bash scripts/uninstall.sh
+```
+
+This removes the repo `.venv`, the repo `.shamsu` runtime/config state, and
+the user-local SHAMSU launcher. It does not remove Ollama or `.shamsu` folders
+inside your other project workspaces.
 
 ### Rebuild The Index
 

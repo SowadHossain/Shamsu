@@ -54,7 +54,7 @@ from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
-from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
+from shamsu.types import ApprovalRequest, ContextPack, ProjectSpec, RoutingDecision, SearchResult
 
 if sys.platform == "win32":
     from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
@@ -832,18 +832,24 @@ async def _handle_request(
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
     search, uses_real_index = _build_search_agent(workspace)
+    llm = LLMManager(session_logger=session_logger)
     if not uses_real_index:
+        decision = _keyword_decision(user_input)
+        if decision.intent in {"qa", "explain"}:
+            if _is_general_chat_prompt(user_input):
+                await _run_general_chat(user_input, console, llm)
+            else:
+                console.print(
+                    "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
+                )
+                console.print(
+                    "I can still do general local chat without an index, but for this workspace-specific question "
+                    "I need you to run `index` first."
+                )
+            return
         console.print(
             "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
         )
-        decision = _keyword_decision(user_input)
-        if decision.intent in {"qa", "explain"}:
-            console.print(
-                "I need an index before I can answer from this project. "
-                "Run `index`, then ask again."
-            )
-            return
-    llm = LLMManager(session_logger=session_logger)
     decision = await _route_prompt(user_input, llm)
     _print_decision(decision, console)
 
@@ -879,7 +885,15 @@ async def _handle_request(
     except Exception as exc:
         message = str(exc)
         if _looks_like_runtime_error(message):
-            message = f"{message}\n\nRun `models status` or `models repair`."
+            console.print(
+                Panel(
+                    f"{message}\n\nSHAMSU can try to repair the local runtime now.",
+                    title="Workflow Unavailable",
+                    border_style="red",
+                )
+            )
+            _handle_models("models repair", console)
+            return
         _log_event(
             session_logger,
             "workflow.failed",
@@ -994,6 +1008,27 @@ async def _run_qa(
         console.print(Panel(result.preview, title="Context Preview"))
 
 
+async def _run_general_chat(
+    user_input: str,
+    console: Console,
+    llm: LLMManager,
+) -> None:
+    pack = ContextPack(
+        task_id="general-chat",
+        step_id=1,
+        specialist="qa",
+        user_request=user_input,
+        prd_context=(
+            "No indexed project context is attached. "
+            "Answer as a general local assistant. "
+            "Do not claim you saw code, tests, or files unless they were actually provided."
+        ),
+    )
+    response = await llm.run_specialist("qa", pack)
+    title = f"Chat ({response.model_used})" if response.model_used else "Chat"
+    console.print(Panel(response.raw.strip(), title=title))
+
+
 def _is_casual_prompt(user_input: str) -> bool:
     text = re.sub(r"[^\w\s]", "", user_input.lower()).strip()
     return text in {
@@ -1007,6 +1042,44 @@ def _is_casual_prompt(user_input: str) -> bool:
         "good afternoon",
         "good evening",
     }
+
+
+def _is_general_chat_prompt(user_input: str) -> bool:
+    text = user_input.strip().lower()
+    if not text:
+        return True
+    if _is_casual_prompt(text):
+        return True
+    project_markers = (
+        "this project",
+        "this repo",
+        "this codebase",
+        "this code",
+        "workspace",
+        "index",
+        "file ",
+        ".py",
+        ".md",
+        "function",
+        "class",
+        "module",
+        "traceback",
+        "stack trace",
+        "failing test",
+        "test failure",
+        "bug",
+        "fix ",
+        "edit ",
+        "readme",
+        "endpoint",
+        "serializer",
+        "viewset",
+        "model ",
+        "django",
+        "auth",
+        "login",
+    )
+    return not any(marker in text for marker in project_markers)
 
 
 def _print_ready_message(workspace: Path, console: Console) -> None:
