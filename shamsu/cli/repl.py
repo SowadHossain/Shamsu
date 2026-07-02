@@ -119,7 +119,7 @@ def _index_db_path(workspace: Path) -> Path:
 
 
 def _log_path(workspace: Path) -> Path:
-    return workspace / ".shamsu" / "shamsu.log"
+    return Sandbox(workspace).validate(Path(".shamsu") / "shamsu.log")
 
 
 def _has_index(workspace: Path) -> bool:
