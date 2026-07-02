@@ -5,6 +5,8 @@ PYTHON_BIN="${PYTHON:-python3}"
 YES=0
 SKIP_OLLAMA_INSTALL=0
 SKIP_MODELS=0
+SKIP_COMMAND_INSTALL=0
+BIN_DIR="${HOME}/.local/bin"
 MODELS_PATH=""
 export PYTHONUTF8="${PYTHONUTF8:-1}"
 
@@ -22,6 +24,14 @@ while [[ $# -gt 0 ]]; do
       SKIP_MODELS=1
       shift
       ;;
+    --skip-command-install)
+      SKIP_COMMAND_INSTALL=1
+      shift
+      ;;
+    --bin-dir)
+      BIN_DIR="${2:-}"
+      shift 2
+      ;;
     --models-path)
       MODELS_PATH="${2:-}"
       shift 2
@@ -37,6 +47,7 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 VENV_DIR="${REPO_ROOT}/.venv"
 VENV_PYTHON_UNIX="${VENV_DIR}/bin/python"
 VENV_PYTHON_WIN="${VENV_DIR}/Scripts/python.exe"
+RUN_SCRIPT="${REPO_ROOT}/scripts/run-shamsu.sh"
 
 find_venv_python() {
   if [[ -x "${VENV_PYTHON_UNIX}" ]]; then
@@ -94,6 +105,7 @@ elif [[ "${SKIP_OLLAMA_INSTALL}" -eq 0 ]]; then
 fi
 
 if [[ "${SKIP_MODELS}" -eq 0 ]] && ! "${VENV_PYTHON}" -m shamsu.runtime.ollama status --json | grep -q '"ollama_path": "";'; then
+  echo "Checking and pulling missing local models. This can take a long time for first install."
   "${VENV_PYTHON}" -m shamsu.runtime.ollama repair
 elif "${VENV_PYTHON}" -m shamsu.runtime.ollama status --json | grep -q '"ollama_path": "";'; then
   echo "Ollama is still missing. SHAMSU installed, but local inference needs 'models repair' after Ollama is installed." >&2
@@ -101,8 +113,43 @@ fi
 
 "${VENV_PYTHON}" -m shamsu.runtime.ollama write-config
 
+if [[ "${SKIP_COMMAND_INSTALL}" -eq 0 ]]; then
+  mkdir -p "${BIN_DIR}"
+  LAUNCHER="${BIN_DIR}/shamsu"
+  LAUNCHER_ON_PATH=0
+  cat > "${LAUNCHER}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${RUN_SCRIPT}" "\$@"
+EOF
+  chmod +x "${LAUNCHER}"
+  echo "Installed SHAMSU launcher:"
+  echo "  ${LAUNCHER}"
+  case ":${PATH}:" in
+    *":${BIN_DIR}:"*) LAUNCHER_ON_PATH=1 ;;
+    *)
+      echo
+      echo "Launcher directory is not on PATH for the current shell."
+      echo "Run directly with:"
+      echo "  ${LAUNCHER}"
+      echo
+      echo "Or add this directory to PATH yourself if you want plain 'shamsu':"
+      echo "  ${BIN_DIR}"
+      ;;
+  esac
+fi
+
 echo
 echo "Install complete."
 echo "SHAMSU did not edit your shell profile, PATH, global Python, or system registry."
 echo "Run from any workspace with:"
-echo "  ${REPO_ROOT}/scripts/run-shamsu.sh"
+if [[ "${SKIP_COMMAND_INSTALL}" -eq 0 ]]; then
+  if [[ "${LAUNCHER_ON_PATH:-0}" -eq 1 ]]; then
+    echo "  shamsu"
+  else
+    echo "  ${LAUNCHER}"
+    echo "Add ${BIN_DIR} to PATH if you want plain 'shamsu' in new terminals."
+  fi
+else
+  echo "  ${REPO_ROOT}/scripts/run-shamsu.sh"
+fi
