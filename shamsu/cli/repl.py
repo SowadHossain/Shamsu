@@ -20,6 +20,7 @@ from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.panel import Panel
+from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 
 from shamsu.agents.audit_workflow import AuditWorkflow
@@ -37,7 +38,14 @@ from shamsu.prd.input import PRDParseError, parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.retriever.search import SearchAgent
-from shamsu.runtime.ollama import collect_status, pull_missing_models, repair_runtime, status_text
+from shamsu.runtime.ollama import (
+    collect_status,
+    pull_model_streaming,
+    repair_runtime,
+    start_ollama,
+    status_text,
+    wait_until_running,
+)
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch.engine import PatchEngine
@@ -530,7 +538,11 @@ def _handle_symbols(user_input: str, workspace: Path, console: Console) -> None:
         console.print(f"{symbol}: {result.file_path}:{result.line_start}-{result.line_end}")
 
 
-def _handle_models(user_input: str, console: Console) -> None:
+def _handle_models(
+    user_input: str,
+    console: Console,
+    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "status"
     if command == "status":
@@ -542,23 +554,90 @@ def _handle_models(user_input: str, console: Console) -> None:
             console.print("[red]Ollama was not found. Run `models repair` after installing Ollama.[/red]")
             return
         if not status.server_running:
-            console.print("[yellow]Ollama is not running. Run `models repair`.[/yellow]")
-            return
+            console.print("[yellow]Ollama is not running. Starting local Ollama...[/yellow]")
+            start_ollama(Path(status.ollama_path))
+            wait_until_running()
+            status = collect_status(Path(status.ollama_path))
         if not status.missing_models:
             console.print("[green]All required local models are installed.[/green]")
             return
-        console.print(f"Pulling missing models: {', '.join(status.missing_models)}")
-        results = pull_missing_models(Path(status.ollama_path), status.missing_models)
-        for model, exit_code in results.items():
-            style = "green" if exit_code == 0 else "red"
-            console.print(f"[{style}]{model}: exit {exit_code}[/{style}]")
+        if not _approve_model_download(status.missing_models, console, approval_func):
+            console.print("[yellow]Model download cancelled.[/yellow]")
+            return
+        results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
+        _print_model_pull_results(results, console)
         _print_runtime_status(console)
         return
     if command == "repair":
-        status = repair_runtime(pull_models=True)
+        status = repair_runtime(pull_models=False)
+        if status.ollama_found and not status.server_running:
+            console.print("[yellow]Starting local Ollama...[/yellow]")
+            start_ollama(Path(status.ollama_path))
+            wait_until_running()
+            status = collect_status(Path(status.ollama_path))
+        if status.ollama_found and status.server_running and status.missing_models:
+            if not _approve_model_download(status.missing_models, console, approval_func):
+                console.print("[yellow]Model download cancelled.[/yellow]")
+                _print_runtime_status(console, status=status)
+                return
+            results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
+            _print_model_pull_results(results, console)
+            status = collect_status(Path(status.ollama_path))
         _print_runtime_status(console, status=status)
         return
     console.print("[red]Usage: models status|pull|repair[/red]")
+
+
+def _approve_model_download(
+    missing_models: list[str],
+    _console: Console,
+    approval_func: Callable[[ApprovalRequest], bool],
+) -> bool:
+    return approval_func(
+        ApprovalRequest(
+            action_type="run_command",
+            description=f"Download {len(missing_models)} missing local Ollama model(s).",
+            risk_level="medium",
+            preview="\n".join(f"- {model}" for model in missing_models),
+            reason=(
+                "SHAMSU needs these local models for offline inference. "
+                "Re-running `models pull` resumes partial Ollama downloads."
+            ),
+        )
+    )
+
+
+def _pull_models_with_progress(
+    ollama_path: Path,
+    models: list[str],
+    console: Console,
+) -> dict[str, int]:
+    results: dict[str, int] = {}
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    ) as progress:
+        for model in models:
+            task_id = progress.add_task(f"Pulling {model} (resumes if interrupted)", total=None)
+            exit_code = pull_model_streaming(
+                ollama_path,
+                model,
+                progress_callback=lambda _chunk: progress.advance(task_id),
+            )
+            results[model] = exit_code
+            progress.update(task_id, description=f"{'Installed' if exit_code == 0 else 'Failed'} {model}")
+    return results
+
+
+def _print_model_pull_results(results: dict[str, int], console: Console) -> None:
+    for model, exit_code in results.items():
+        if exit_code == 0:
+            console.print(f"[green]{model}: installed[/green]")
+        else:
+            console.print(f"[red]{model}: failed with exit {exit_code}. Re-run `models pull` to resume.[/red]")
 
 
 def _handle_django(
