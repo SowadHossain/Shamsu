@@ -87,6 +87,8 @@ blocker.
 - Keep `shamsu/types.py` and `shamsu/interfaces.py` stable unless the team explicitly agrees to change the contract.
 - The root README is for humans; `agent context/AGENTS.md` and this file are for future agent handoff.
 - `agent context/DEV-TASK-DIVI.MD` is the issue/PR planning board for the remaining MVP work.
+- `agent context/MILESTONE-2-FINISH-PLAN.md` is the takeover checklist for
+  merging and verifying Milestone 2.
 - Feature work should branch from `develop` and merge back through PRs. `main`
   is protected for stable milestone merges only.
 - `SHAMSU_day1_scaffold.zip` remains at the repo root as the original scaffold artifact.
