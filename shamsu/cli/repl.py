@@ -820,6 +820,9 @@ async def _handle_request(
     console: Console,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    if _is_casual_prompt(user_input):
+        _print_ready_message(workspace, console)
+        return
     if _looks_like_django_generation_request(user_input):
         generate_command = f"generate-django {_extract_prd_path_from_prompt(user_input)}"
         _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
@@ -833,6 +836,13 @@ async def _handle_request(
         console.print(
             "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
         )
+        decision = _keyword_decision(user_input)
+        if decision.intent in {"qa", "explain"}:
+            console.print(
+                "I need an index before I can answer from this project. "
+                "Run `index`, then ask again."
+            )
+            return
     llm = LLMManager(session_logger=session_logger)
     decision = await _route_prompt(user_input, llm)
     _print_decision(decision, console)
@@ -980,8 +990,46 @@ async def _run_qa(
         console.print(Panel(result.answer, title=title))
     elif result.fallback_reason:
         console.print(f"[yellow]{result.fallback_reason}[/yellow]")
-    if result.preview:
+    if result.preview and _preview_contains_context(result.preview):
         console.print(Panel(result.preview, title="Context Preview"))
+
+
+def _is_casual_prompt(user_input: str) -> bool:
+    text = re.sub(r"[^\w\s]", "", user_input.lower()).strip()
+    return text in {
+        "hi",
+        "hello",
+        "hey",
+        "yo",
+        "sup",
+        "hiya",
+        "good morning",
+        "good afternoon",
+        "good evening",
+    }
+
+
+def _print_ready_message(workspace: Path, console: Console) -> None:
+    console.print(
+        "[green]SHAMSU is ready.[/green] "
+        f"Workspace: [bold]{workspace}[/bold]\n"
+        "Run `index` for project-aware answers, `models status` for local AI status, "
+        "or ask me to edit, test, audit, document, or generate a Django project."
+    )
+
+
+def _preview_contains_context(preview: str) -> bool:
+    if "# File:" in preview:
+        return True
+    for section in ("Context", "Errors / test output"):
+        match = re.search(
+            rf"## {re.escape(section)}\n(?P<body>.*?)(?=\n## |\Z)",
+            preview,
+            flags=re.S,
+        )
+        if match and match.group("body").strip():
+            return True
+    return False
 
 
 async def _run_code_edit(

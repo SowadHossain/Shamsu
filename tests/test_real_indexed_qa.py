@@ -49,7 +49,21 @@ def test_repl_request_reports_missing_index_without_stub_preview(tmp_path):
 
     rendered = output.getvalue()
     assert "No index found. Run `index` first" in rendered
+    assert "Context Preview" not in rendered
     assert "stub/example.py" not in rendered
+
+
+def test_repl_greeting_prints_ready_message_without_model_qa(tmp_path):
+    console, output = _console_output()
+
+    asyncio.run(_handle_request("hi", tmp_path, console))
+
+    rendered = output.getvalue()
+    assert "SHAMSU is ready" in rendered
+    assert "Workspace:" in rendered
+    assert "intent=qa" not in rendered
+    assert "No index found" not in rendered
+    assert "Context Preview" not in rendered
 
 
 def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):
