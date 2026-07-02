@@ -3,16 +3,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.commands import redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
+from shamsu.types import TestFailure, TestRunResult
 
 INSTALL_REQUIREMENTS_COMMAND = "pip install -r requirements.txt"
 MAKE_MIGRATIONS_COMMAND = "python manage.py makemigrations"
 MIGRATE_COMMAND = "python manage.py migrate"
+DJANGO_TEST_COMMAND = "python manage.py test --verbosity=2"
 
 
 @dataclass(frozen=True)
@@ -168,3 +171,121 @@ def _failure_from_result(result: DjangoCommandResult) -> DjangoSetupFailure:
         stdout=result.stdout,
         stderr=result.stderr,
     )
+
+
+class DjangoTestRunner:
+    def __init__(
+        self,
+        workspace_root: Path,
+        command_runner: ICommandRunner | None = None,
+        session_logger: SessionLogger | None = None,
+    ) -> None:
+        self.workspace_root = Path(workspace_root).resolve()
+        self.sandbox = Sandbox(self.workspace_root)
+        self.command_runner = command_runner or CommandRunner(
+            self.workspace_root,
+            session_logger=session_logger,
+        )
+        self.session_logger = session_logger
+
+    def run(self, project_cwd: Path | str = ".") -> TestRunResult:
+        try:
+            cwd = self._validate_project_cwd(project_cwd)
+        except (SecurityError, ValueError) as exc:
+            output = redact(str(exc))
+            result = TestRunResult(passed=0, failed=1, raw_output=output)
+            self._log_result(result, project_cwd)
+            return result
+        exit_code, stdout, stderr = self.command_runner.run(DJANGO_TEST_COMMAND, cwd)
+        raw_output = "\n".join(part for part in (stdout, stderr) if part)
+        result = parse_django_test_output(raw_output, exit_code)
+        self._log_result(result, cwd)
+        return result
+
+    def _validate_project_cwd(self, project_cwd: Path | str) -> Path:
+        cwd = self.sandbox.validate(project_cwd)
+        if not cwd.is_dir():
+            raise ValueError(f"Generated project directory does not exist: {cwd}")
+        if not (cwd / "manage.py").is_file():
+            raise ValueError(f"manage.py not found in generated project: {cwd}")
+        return cwd
+
+    def _log_result(self, result: TestRunResult, cwd: Path | str) -> None:
+        if not self.session_logger:
+            return
+        self.session_logger.log(
+            "command.finished",
+            {
+                "command": DJANGO_TEST_COMMAND,
+                "cwd": str(cwd),
+                "passed": result.passed,
+                "failed": result.failed,
+                "failures": [vars(failure) for failure in result.failures],
+            },
+            f"Django tests finished: {result.passed} passed, {result.failed} failed",
+            workflow_id="django-test",
+        )
+
+
+def parse_django_test_output(output: str, exit_code: int = 0) -> TestRunResult:
+    redacted = redact(output)
+    ran = _ran_count(redacted)
+    failed = _failed_count(redacted)
+    if exit_code == 0 and "OK" in redacted:
+        passed = ran
+    else:
+        passed = max(ran - failed, 0)
+    if exit_code != 0 and failed == 0:
+        failed = 1
+    return TestRunResult(
+        passed=passed,
+        failed=failed,
+        failures=_parse_failures(redacted),
+        raw_output=redacted,
+    )
+
+
+def _ran_count(output: str) -> int:
+    match = re.search(r"Ran\s+(\d+)\s+tests?", output)
+    return int(match.group(1)) if match else 0
+
+
+def _failed_count(output: str) -> int:
+    match = re.search(r"FAILED\s+\(([^)]+)\)", output)
+    if not match:
+        return 0
+    total = 0
+    for _name, count in re.findall(r"(failures|errors)=(\d+)", match.group(1)):
+        total += int(count)
+    return total
+
+
+def _parse_failures(output: str) -> list[TestFailure]:
+    failures: list[TestFailure] = []
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^(FAIL|ERROR):\s+([^\s]+)(?:\s+\(([^)]+)\))?", line.strip())
+        if not match:
+            continue
+        block = "\n".join(lines[index : index + 18])
+        file_match = re.search(r'File "([^"]+)", line (\d+)', block)
+        message = _failure_message(block) or match.group(1)
+        failures.append(
+            TestFailure(
+                file=file_match.group(1) if file_match else "",
+                line=int(file_match.group(2)) if file_match else None,
+                test_name=match.group(3) or match.group(2),
+                error_message=message,
+            )
+        )
+    return failures
+
+
+def _failure_message(block: str) -> str:
+    for line in reversed(block.splitlines()):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("File ", "Traceback", "----", "====")):
+            continue
+        if re.match(r"^[A-Za-z_][\w.]*Error[:\s]", stripped) or stripped.startswith("AssertionError"):
+            return stripped
+    return ""

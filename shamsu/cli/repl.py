@@ -25,6 +25,7 @@ from shamsu.agents.audit_workflow import AuditWorkflow
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
+from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.qa_workflow import QAWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
@@ -40,7 +41,7 @@ from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch.engine import PatchEngine
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
-from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner
+from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
 
@@ -116,6 +117,8 @@ def _print_help(console: Console) -> None:
                     "  plan-prd <file>          Preview and approve a project plan",
                     "  generate-django <file>   Generate deterministic Django backend files",
                     "  django setup [dir]       Install generated deps and run migrations",
+                    "  django test [dir]        Run generated Django tests",
+                    "  django fix-tests [dir]   Run tests and apply bug-fix loop",
                     "  models status            Show local Ollama/model status",
                     "  models pull              Pull missing local models",
                     "  models repair            Start Ollama and pull missing models",
@@ -510,12 +513,16 @@ def _handle_django(
 ) -> None:
     parts = user_input.split(maxsplit=2)
     command = parts[1].strip().lower() if len(parts) > 1 else ""
-    if command != "setup":
-        console.print("[red]Usage: django setup [project-dir][/red]")
-        return
     project_dir = parts[2].strip() if len(parts) > 2 else "."
-    result = DjangoSetupRunner(workspace, session_logger=session_logger).run(project_dir)
-    _print_django_setup_result(result, console)
+    if command == "setup":
+        result = DjangoSetupRunner(workspace, session_logger=session_logger).run(project_dir)
+        _print_django_setup_result(result, console)
+        return
+    if command == "test":
+        result = DjangoTestRunner(workspace, session_logger=session_logger).run(project_dir)
+        _print_django_test_result(result, console)
+        return
+    console.print("[red]Usage: django setup|test|fix-tests [project-dir][/red]")
 
 
 def _print_django_setup_result(result: DjangoSetupResult, console: Console) -> None:
@@ -534,6 +541,21 @@ def _print_django_setup_result(result: DjangoSetupResult, console: Console) -> N
         console.print("[green]Django dependencies installed and migrations completed.[/green]")
         return
     console.print(Panel(result.bugfix_context, title="Setup Failure", border_style="red"))
+
+
+def _print_django_test_result(result, console: Console) -> None:
+    table = Table(title="Django Tests")
+    table.add_column("Passed")
+    table.add_column("Failed")
+    style = "green" if result.failed == 0 else "red"
+    table.add_row(str(result.passed), str(result.failed), style=style)
+    console.print(table)
+    if result.failures:
+        failures = "\n".join(
+            f"- {failure.test_name} {failure.file}:{failure.line or ''} {failure.error_message}"
+            for failure in result.failures
+        )
+        console.print(Panel(failures, title="Failures", border_style="red"))
 
 
 def _print_runtime_status(console: Console, status=None) -> None:
@@ -927,6 +949,30 @@ async def _run_docs(
     _print_patch_result("Documentation", result.applied, result.changed_files, result.error, console)
 
 
+async def _handle_django_fix_tests(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    parts = user_input.split(maxsplit=2)
+    project_dir = parts[2].strip() if len(parts) > 2 else "."
+    search, _uses_real_index = _build_search_agent(workspace)
+    llm = LLMManager(session_logger=session_logger)
+    result = await ErrorFeedbackLoop(
+        workspace,
+        search=search,
+        llm=llm,
+        patch_engine=PatchEngine(workspace, session_logger=session_logger),
+        session_logger=session_logger,
+    ).run(project_dir)
+    _print_django_test_result(result.final_result, console)
+    if result.success:
+        console.print(f"[green]Django tests passed after {len(result.iterations)} fix attempt(s).[/green]")
+        return
+    console.print(Panel(result.error or "Django tests still failing.", title="Fix Loop Stopped", border_style="red"))
+
+
 def _print_patch_result(
     title: str,
     applied: bool,
@@ -1043,7 +1089,10 @@ def main(argv: list[str] | None = None) -> None:
             _handle_models(user_input, console)
             continue
         if user_input.lower().startswith("django"):
-            _handle_django(user_input, workspace, console, session_logger=session_logger)
+            if user_input.lower().startswith("django fix-tests"):
+                asyncio.run(_handle_django_fix_tests(user_input, workspace, console, session_logger))
+            else:
+                _handle_django(user_input, workspace, console, session_logger=session_logger)
             continue
         if user_input.lower().startswith("sessions"):
             session_logger = _handle_sessions(user_input, session_manager, session_logger, console)

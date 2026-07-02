@@ -8,7 +8,7 @@ from rich.console import Console
 
 from shamsu.cli import repl
 from shamsu.tools.django import DjangoCommandResult, DjangoSetupResult
-from shamsu.types import ContextPack, LLMResponse, SearchResult
+from shamsu.types import ContextPack, LLMResponse, SearchResult, TestRunResult as ShamsuTestRunResult
 
 
 class FakeSearch:
@@ -134,3 +134,24 @@ def test_django_setup_command_prints_runner_result(monkeypatch, tmp_path):
     assert "Django Setup" in rendered
     assert "install_requirements" in rendered
     assert "dependencies installed" in rendered
+
+
+def test_django_test_command_prints_runner_result(monkeypatch, tmp_path):
+    console, output = _console_output()
+
+    class FakeDjangoTestRunner:
+        def __init__(self, workspace_root: Path, session_logger=None) -> None:
+            assert workspace_root == tmp_path
+            assert session_logger is None
+
+        def run(self, project_dir: str) -> ShamsuTestRunResult:
+            assert project_dir == "generated"
+            return ShamsuTestRunResult(passed=3, failed=0, raw_output="OK")
+
+    monkeypatch.setattr(repl, "DjangoTestRunner", FakeDjangoTestRunner)
+
+    repl._handle_django("django test generated", tmp_path, console)
+
+    rendered = output.getvalue()
+    assert "Django Tests" in rendered
+    assert "3" in rendered
