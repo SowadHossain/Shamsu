@@ -109,6 +109,7 @@ def render_views(project: ProjectSpec) -> str:
     ]
     for entity in entities:
         blocks.extend(_render_viewset(entity))
+        blocks.extend(_render_delete_view(entity))
     rendered_pages: set[str] = set()
     for page in project.pages:
         function_name = _page_function_name(page)
@@ -147,6 +148,14 @@ def render_app_urls(project: ProjectSpec) -> str:
         if name in seen:
             continue
         seen.add(name)
+        blocks.append(f'    path("{route}", views.{view}, name="{name}"),')
+    for entity in entities:
+        name = f"{_resource_url_name(entity.name)}-delete"
+        if name in seen:
+            continue
+        seen.add(name)
+        route = f"{_resource_slug(entity.name)}/<int:pk>/delete/"
+        view = f"{_to_snake_case(entity.name)}_delete"
         blocks.append(f'    path("{route}", views.{view}, name="{name}"),')
     if "dashboard" not in seen:
         blocks.append('    path("dashboard/", views.dashboard, name="dashboard"),')
@@ -254,6 +263,20 @@ def _render_page_view(page: PageSpec, entities: list[EntitySpec]) -> list[str]:
         blocks.append(f'    return render(request, "{template}")')
     blocks.append("")
     return blocks
+
+
+def _render_delete_view(entity: EntitySpec) -> list[str]:
+    object_name = _to_snake_case(entity.name)
+    list_url = f"{_resource_url_name(entity.name)}-list"
+    return [
+        "@login_required",
+        f"def {_to_snake_case(entity.name)}_delete(request, pk):",
+        f"    {object_name} = {entity.name}.objects.get(pk=pk)",
+        "    if request.method == \"POST\" or request.method == \"DELETE\":",
+        f"        {object_name}.delete()",
+        f"    return redirect(\"{list_url}\")",
+        "",
+    ]
 
 
 def _render_register_view() -> list[str]:
