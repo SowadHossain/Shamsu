@@ -22,7 +22,7 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         endpoints=endpoints,
         pages=pages,
         theme=theme,
-        generation_order=_fixed_generation_order(project_name, app_name),
+        generation_order=_fixed_generation_order(project_name, app_name, pages),
     )
 
 
@@ -106,8 +106,12 @@ def _extract_pages(parsed: ParsedPRD) -> list[PageSpec]:
     return pages
 
 
-def _fixed_generation_order(project_name: str, app_name: str) -> list[DjangoFileSpec]:
-    return [
+def _fixed_generation_order(
+    project_name: str,
+    app_name: str,
+    pages: list[PageSpec],
+) -> list[DjangoFileSpec]:
+    files = [
         DjangoFileSpec("manage.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/settings.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/urls.py", "fixed_template", None),
@@ -119,6 +123,29 @@ def _fixed_generation_order(project_name: str, app_name: str) -> list[DjangoFile
         DjangoFileSpec("requirements.txt", "fixed_template", None),
         DjangoFileSpec(".env.example", "fixed_template", None),
     ]
+    seen_resources: set[str] = set()
+    for page in pages:
+        if page.page_type != "list" or not page.resource:
+            continue
+        resource_key = _to_kebab_case(page.resource)
+        if not resource_key or resource_key in seen_resources:
+            continue
+        seen_resources.add(resource_key)
+        files.extend(
+            [
+                DjangoFileSpec(
+                    f"{app_name}/templates/{resource_key}/list.html",
+                    "fixed_template",
+                    None,
+                ),
+                DjangoFileSpec(
+                    f"{app_name}/templates/{resource_key}/_item.html",
+                    "fixed_template",
+                    None,
+                ),
+            ]
+        )
+    return files
 
 
 def _split_name_and_purpose(line: str) -> tuple[str, str]:
