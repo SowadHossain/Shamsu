@@ -75,6 +75,7 @@ fi
 
 "${VENV_PYTHON}" -m pip install --upgrade pip
 "${VENV_PYTHON}" -m pip install -e ".[dev]"
+"${VENV_PYTHON}" -m playwright install chromium
 
 if [[ -n "${MODELS_PATH}" ]]; then
   export OLLAMA_MODELS="${MODELS_PATH}"

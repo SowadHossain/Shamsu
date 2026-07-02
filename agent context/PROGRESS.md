@@ -6,8 +6,8 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, general no-index local chat, guided in-chat runtime repair prompt, and uninstall scripts complete.
-- Tests: `193 passed`
+- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, general no-index local chat, guided in-chat runtime repair prompt, uninstall scripts, autonomous web lookup, Playwright browser debugging hooks, and smarter local/web/browser routing complete.
+- Tests: `198 passed`
 - Lint: `python -m ruff check shamsu tests` passes.
 - Last verified: 2026-07-03
 - Current next focus: finish remaining Milestone 6 Dev C status/log/progress, release docs, final safety audit, then release cut.
@@ -109,6 +109,9 @@ blocker.
 - [x] Added no-index general local chat so conversational prompts work without forcing project indexing first.
 - [x] Added guided runtime-repair prompt from workflow failures so SHAMSU can kick off `models repair` from inside the chat flow.
 - [x] Added uninstall scripts for Windows and Bash that remove SHAMSU-managed repo state and user-local launchers without touching Ollama or other workspace `.shamsu` folders.
+- [x] Added automatic permission-gated web lookup routing plus explicit `/web` commands for external/current questions.
+- [x] Added Playwright-backed browser tooling and explicit `/browse` commands for local app preview and debugging flows.
+- [x] Replaced `phi3:mini` with `gemma3:4b` for router/chat/planner/docs/summarizer and taught installers to install Playwright Chromium support.
 
 ## In Progress
 

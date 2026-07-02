@@ -111,6 +111,7 @@ try {
 
     & $VenvPython -m pip install --upgrade pip
     & $VenvPython -m pip install -e ".[dev]"
+    & $VenvPython -m playwright install chromium
 
     if ($ModelsPath) {
         $env:OLLAMA_MODELS = $ModelsPath

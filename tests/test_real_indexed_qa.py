@@ -8,12 +8,21 @@ from rich.console import Console
 from shamsu.cli import repl
 from shamsu.cli.repl import _build_workspace_qa_workflow, _handle_request
 from shamsu.indexer.walker import FileWalker
+from shamsu.tools.browser import BrowserTool
+from shamsu.tools.web import WebTool
 from shamsu.types import LLMResponse
 
 
 def _console_output() -> tuple[Console, StringIO]:
     output = StringIO()
     return Console(file=output, force_terminal=False, width=120), output
+
+
+def _tools(root):
+    return (
+        WebTool(approval_func=lambda _request: False),
+        BrowserTool(root, approval_func=lambda _request: False),
+    )
 
 
 def test_workspace_qa_workflow_uses_empty_search_without_index(tmp_path):
@@ -46,8 +55,9 @@ def test_workspace_qa_workflow_uses_real_index_when_available(tmp_path):
 
 def test_repl_request_reports_missing_index_without_stub_preview(tmp_path):
     console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
 
-    asyncio.run(_handle_request("how does auth work?", tmp_path, console))
+    asyncio.run(_handle_request("how does auth work?", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
     assert "No index found. Run `index` first" in rendered
@@ -57,8 +67,9 @@ def test_repl_request_reports_missing_index_without_stub_preview(tmp_path):
 
 def test_repl_greeting_prints_ready_message_without_model_qa(tmp_path):
     console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
 
-    asyncio.run(_handle_request("hi", tmp_path, console))
+    asyncio.run(_handle_request("hi", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
     assert "SHAMSU is ready" in rendered
@@ -70,6 +81,7 @@ def test_repl_greeting_prints_ready_message_without_model_qa(tmp_path):
 
 def test_repl_general_chat_without_index_uses_local_chat(monkeypatch, tmp_path):
     console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
 
     class FakeLLM:
         def __init__(self, session_logger=None):
@@ -83,13 +95,28 @@ def test_repl_general_chat_without_index_uses_local_chat(monkeypatch, tmp_path):
 
     monkeypatch.setattr(repl, "LLMManager", FakeLLM)
 
-    asyncio.run(_handle_request("what is recursion?", tmp_path, console))
+    asyncio.run(_handle_request("what is recursion?", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
     assert "General answer" in rendered
     assert "Chat (fake-phi3)" in rendered
     assert "No index found" not in rendered
     assert "intent=qa" not in rendered
+
+
+def test_repl_workspace_prd_request_finds_single_prd_without_routing(tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+    prd = tmp_path / "TODO_PRD.md"
+    prd.write_text("# Todo App\n\n## Entities\n- Task: title (text)\n", encoding="utf-8")
+
+    asyncio.run(_handle_request("i have add a prd to my working folder can you check that out?", tmp_path, console, web_tool, browser_tool))
+
+    rendered = output.getvalue()
+    assert "PRD Found" in rendered
+    assert "TODO_PRD.md" in rendered
+    assert "/plan-prd" in rendered
+    assert "Code Edit Not Applied" not in rendered
 
 
 def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):
@@ -102,8 +129,9 @@ def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):
     )
     FileWalker(tmp_path).index()
     console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
 
-    asyncio.run(_handle_request("charge card", tmp_path, console))
+    asyncio.run(_handle_request("charge card", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
     assert "payments.py" in rendered

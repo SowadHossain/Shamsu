@@ -4,9 +4,11 @@ import asyncio
 from io import StringIO
 from pathlib import Path
 
+from prompt_toolkit.document import Document
 from rich.console import Console
 
 from shamsu.cli import repl
+from shamsu.tools.browser import BrowserActionResult
 from shamsu.tools.django import DjangoCommandResult, DjangoSetupResult
 from shamsu.types import ContextPack, LLMResponse, SearchResult, TestRunResult as ShamsuTestRunResult
 
@@ -85,11 +87,56 @@ def test_keyword_decision_routes_common_agent_prompts():
     assert repl._keyword_decision("how does auth work?").intent == "qa"
 
 
+def test_keyword_decision_does_not_misroute_prd_chat_as_code_edit():
+    assert repl._keyword_decision(
+        "i have add a prd to my working folder can you check that out?"
+    ).intent == "qa"
+
+
 def test_route_prompt_falls_back_to_keyword_router_when_llm_is_down():
     decision = asyncio.run(repl._route_prompt("write tests for parser", FakeLLM()))
 
     assert decision.intent == "test_gen"
     assert decision.confidence == 0.35
+
+
+def test_normalize_command_input_strips_leading_slash():
+    assert repl._normalize_command_input("/models repair") == "models repair"
+    assert repl._normalize_command_input("/help") == "help"
+    assert repl._normalize_command_input("hello there") == "hello there"
+
+
+def test_slash_command_completer_suggests_system_commands():
+    completer = repl.SlashCommandCompleter()
+
+    completions = list(completer.get_completions(Document("/mod"), None))
+
+    texts = [item.text for item in completions]
+    assert "/models status" in texts
+    assert "/models pull" in texts
+    assert "/models repair" in texts
+
+
+def test_slash_command_completer_suggests_web_and_browser_commands():
+    completer = repl.SlashCommandCompleter()
+
+    web_texts = [item.text for item in completer.get_completions(Document("/web"), None)]
+    browse_texts = [item.text for item in completer.get_completions(Document("/browse"), None)]
+
+    assert "/web search " in web_texts
+    assert "/browse open " in browse_texts
+    assert "/browse screenshot" in browse_texts
+
+
+def test_web_needed_prompt_detects_external_docs_requests():
+    assert repl._looks_like_web_needed_prompt("look up the latest Django auth docs")
+    assert not repl._looks_like_web_needed_prompt("how does auth work in this repo?")
+
+
+def test_browser_needed_prompt_detects_local_preview_requests():
+    assert repl._looks_like_browser_needed_prompt("check the app and verify the dashboard")
+    assert repl._looks_like_browser_needed_prompt("open http://127.0.0.1:8000 and inspect the rendered ui")
+    assert not repl._looks_like_browser_needed_prompt("summarize https://docs.djangoproject.com/en/5.1/")
 
 
 def test_code_edit_handler_prints_applied_result(monkeypatch, tmp_path):
@@ -133,6 +180,27 @@ def test_code_edit_handler_warns_before_editing_dirty_worktree(monkeypatch, tmp_
     rendered = output.getvalue()
     assert "Workspace has uncommitted changes: app.py" in rendered
     assert rendered.index("Workspace has uncommitted changes") < rendered.index("Code Edit Applied")
+
+
+def test_code_edit_handler_skips_non_git_warning(monkeypatch, tmp_path):
+    console, output = _console_output()
+    monkeypatch.setattr(repl, "CodeEditWorkflow", FakeCodeEditWorkflow)
+    monkeypatch.setattr(repl, "GitTool", FakeGitTool)
+    FakeGitTool.warning = "Workspace is not a git repository."
+
+    asyncio.run(
+        repl._run_code_edit(
+            "edit change value",
+            tmp_path,
+            FakeSearch(),
+            console,
+            FakeLLM(),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Workspace is not a git repository." not in rendered
+    assert "Code Edit Applied" in rendered
 
 
 def test_django_setup_command_prints_runner_result(monkeypatch, tmp_path):
@@ -189,3 +257,36 @@ def test_django_test_command_prints_runner_result(monkeypatch, tmp_path):
     rendered = output.getvalue()
     assert "Django Tests" in rendered
     assert "3" in rendered
+
+
+def test_browse_handler_prints_opened_page(monkeypatch, tmp_path):
+    console, output = _console_output()
+
+    class FakeBrowserTool:
+        def open(self, url: str, reason: str = "", require_approval: bool = True):
+            assert url == "http://127.0.0.1:8000"
+            return BrowserActionResult(
+                ok=True,
+                url=url,
+                title="Demo App",
+                visible_text="Welcome to SHAMSU",
+            )
+
+        def read(self):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+        def click(self, selector: str):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+        def type_text(self, selector: str, text: str):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+        def screenshot(self):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+    repl._handle_browse("browse open http://127.0.0.1:8000", console, FakeBrowserTool())
+
+    rendered = output.getvalue()
+    assert "Browser" in rendered
+    assert "Demo App" in rendered
+    assert "Welcome to SHAMSU" in rendered

@@ -20,6 +20,8 @@ Working now:
 
 - CLI REPL through `shamsu`
 - General local chat for non-project prompts
+- Automatic permission-gated web lookup for external/current questions
+- Automatic browser inspection for local app preview/debug prompts
 - Workspace-scoped indexing into `.shamsu/index.db`
 - SQLite FTS5 snippet search
 - Python symbol extraction with `ast`
@@ -212,6 +214,13 @@ generate-django <file.md|file.txt|file.pdf>
 models status
 models pull
 models repair
+/web search <query>
+/web open <url>
+/browse open <url>
+/browse read
+/browse click <selector>
+/browse type <selector> <text>
+/browse screenshot
 sessions list
 sessions current
 sessions show <id>
@@ -230,6 +239,13 @@ Natural chat also works when you are not asking about the current workspace:
 shamsu> what is recursion?
 shamsu> write a short status update for my team
 shamsu> brainstorm names for a budgeting app
+```
+
+SHAMSU can also decide on its own when to ask for web or browser access:
+
+```text
+shamsu> look up the latest Django auth docs
+shamsu> check the app and verify the dashboard
 ```
 
 ### `index`
@@ -365,6 +381,37 @@ models. If a workflow hits a local-runtime failure, SHAMSU can kick off this
 guided repair flow from inside the chat instead of only surfacing the raw
 error.
 
+### `/web ...` and automatic web lookup
+
+SHAMSU stays local-first, but if a prompt clearly needs external or current
+information it can ask permission to search the web automatically.
+
+Optional explicit commands:
+
+```text
+shamsu> /web search latest Django auth docs
+shamsu> /web open https://docs.djangoproject.com/
+```
+
+Web lookups require approval and are logged as redacted session events.
+
+### `/browse ...` and browser debugging
+
+SHAMSU can use a local Playwright browser session for preview and debugging
+flows, especially when a prompt is about checking a running app or rendered UI.
+
+Optional explicit commands:
+
+```text
+shamsu> /browse open http://127.0.0.1:8000
+shamsu> /browse read
+shamsu> /browse click text=Login
+shamsu> /browse screenshot
+```
+
+Browser actions require approval before opening the session and before
+state-changing actions like click/type.
+
 ## Smoke Test
 
 From the SHAMSU repo root after install:
@@ -433,6 +480,7 @@ Local AI runtime:
 - Required model checks use Ollama's local CLI and local HTTP API.
 - Setup-time downloads require installer approval or `-Yes`/`--yes`.
 - Runtime inference does not call cloud AI endpoints.
+- The default router/chat model is `gemma3:4b`.
 
 Internal command execution:
 
@@ -457,7 +505,8 @@ Session logging:
 
 - Session logs are local JSONL files under the active workspace.
 - Prompts, routing decisions, context packs, LLM calls, approvals, patches,
-  commands, PRD planning, and Django generation events are logged.
+  commands, web lookups, browser actions, PRD planning, and Django generation
+  events are logged.
 - Log payloads are redacted and large strings are truncated by default.
 - Exports are meant to be shareable debugging bundles, not raw source dumps.
 

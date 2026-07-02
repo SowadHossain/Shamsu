@@ -51,6 +51,14 @@ def test_install_scripts_expose_safe_runtime_flags():
     assert "--models-path" in sh
 
 
+def test_install_scripts_install_playwright_browser_support():
+    ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+    assert "-m playwright install chromium" in ps1
+    assert '-m playwright install chromium' in sh
+
+
 def test_windows_runtime_scripts_force_python_utf8_for_ollama_output():
     install_ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
     run_ps1 = (REPO_ROOT / "scripts" / "run-shamsu.ps1").read_text(encoding="utf-8")

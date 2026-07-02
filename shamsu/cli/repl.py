@@ -14,8 +14,10 @@ import sqlite3
 import sys
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.styles import Style
 from rich.console import Console
@@ -51,6 +53,8 @@ from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch.engine import PatchEngine
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
+from shamsu.tools.browser import BrowserTool
+from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
@@ -71,6 +75,59 @@ class EmptySearchAgent:
 
     def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         return []
+
+
+SYSTEM_COMMANDS = (
+    "/help",
+    "/index",
+    "/status",
+    "/search ",
+    "/symbols ",
+    "/parse-prd ",
+    "/plan-prd ",
+    "/generate-django ",
+    "/generate-prd ",
+    "/models status",
+    "/models pull",
+    "/models repair",
+    "/web search ",
+    "/web open ",
+    "/web summarize ",
+    "/browse open ",
+    "/browse read",
+    "/browse click ",
+    "/browse type ",
+    "/browse screenshot",
+    "/django setup ",
+    "/django test ",
+    "/django fix-tests ",
+    "/sessions list",
+    "/sessions current",
+    "/sessions show ",
+    "/sessions resume ",
+    "/sessions rename ",
+    "/sessions close",
+    "/sessions export ",
+    "/log",
+    "/log tail",
+    "/edit ",
+    "/fix ",
+    "/test-gen ",
+    "/audit ",
+    "/docs ",
+    "/exit",
+)
+
+
+class SlashCommandCompleter(Completer):
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/"):
+            return
+        lowered = text.lower()
+        for command in SYSTEM_COMMANDS:
+            if command.startswith(lowered):
+                yield Completion(command, start_position=-len(text))
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -120,35 +177,43 @@ def _print_help(console: Console) -> None:
                     "  update the README",
                     "",
                     "Commands:",
-                    "  index                    Index the current workspace",
-                    "  status                   Show index counts",
-                    "  search <query>           Search indexed snippets",
-                    "  symbols <name>           Look up indexed symbols",
-                    "  parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
-                    "  plan-prd <file>          Preview and approve a project plan",
-                    "  generate-django <file>   Generate deterministic Django backend files",
-                    "  generate-prd <file> --output <dir>",
-                    "  django setup [dir]       Install generated deps and run migrations",
-                    "  django test [dir]        Run generated Django tests",
-                    "  django fix-tests [dir]   Run tests and apply bug-fix loop",
-                    "  models status            Show local Ollama/model status",
-                    "  models pull              Pull missing local models",
-                    "  models repair            Start Ollama and pull missing models",
-                    "  sessions list            List workspace sessions",
-                    "  sessions current         Show current session",
-                    "  sessions show <id>       Show session metadata",
-                    "  sessions resume <id>     Resume another session",
-                    "  sessions rename <id> <title>",
-                    "  sessions close [id]      Close a session",
-                    "  sessions export <id>     Export redacted session bundle",
-                    "  log tail                 Show recent session events",
-                    "  edit <request>           Force code-edit workflow",
-                    "  fix <bug/traceback>      Force bug-fix workflow",
-                    "  test-gen <request>       Force test-generation workflow",
-                    "  audit <request>          Force audit workflow",
-                    "  docs <request>           Force README documentation workflow",
-                    "  help                     Show commands",
-                    "  exit                     Quit",
+                    "  /index                    Index the current workspace",
+                    "  /status                   Show index counts",
+                    "  /search <query>           Search indexed snippets",
+                    "  /symbols <name>           Look up indexed symbols",
+                    "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
+                    "  /plan-prd <file>          Preview and approve a project plan",
+                    "  /generate-django <file>   Generate deterministic Django backend files",
+                    "  /generate-prd <file> --output <dir>",
+                    "  /django setup [dir]       Install generated deps and run migrations",
+                    "  /django test [dir]        Run generated Django tests",
+                    "  /django fix-tests [dir]   Run tests and apply bug-fix loop",
+                    "  /models status            Show local Ollama/model status",
+                    "  /models pull              Pull missing local models",
+                    "  /models repair            Start Ollama and pull missing models",
+                    "  /web search <query>       Search the web with approval",
+                    "  /web open <url>           Fetch and summarize a web page",
+                    "  /web summarize <url>      Alias for /web open",
+                    "  /browse open <url>        Open a page in the local browser",
+                    "  /browse read              Read the current browser page",
+                    "  /browse click <selector>  Click the current page",
+                    "  /browse type <selector> <text>",
+                    "  /browse screenshot        Save a browser screenshot",
+                    "  /sessions list            List workspace sessions",
+                    "  /sessions current         Show current session",
+                    "  /sessions show <id>       Show session metadata",
+                    "  /sessions resume <id>     Resume another session",
+                    "  /sessions rename <id> <title>",
+                    "  /sessions close [id]      Close a session",
+                    "  /sessions export <id>     Export redacted session bundle",
+                    "  /log tail                 Show recent session events",
+                    "  /edit <request>           Force code-edit workflow",
+                    "  /fix <bug/traceback>      Force bug-fix workflow",
+                    "  /test-gen <request>       Force test-generation workflow",
+                    "  /audit <request>          Force audit workflow",
+                    "  /docs <request>           Force README documentation workflow",
+                    "  /help                     Show commands",
+                    "  /exit                     Quit",
                     "",
                     "File edits are previewed and require approval before applying.",
                 ]
@@ -588,6 +653,69 @@ def _handle_models(
     console.print("[red]Usage: models status|pull|repair[/red]")
 
 
+def _handle_web(
+    user_input: str,
+    console: Console,
+    web_tool: WebTool,
+    llm: LLMManager,
+) -> None:
+    parts = user_input.split(maxsplit=2)
+    command = parts[1].strip().lower() if len(parts) > 1 else ""
+    argument = parts[2].strip() if len(parts) > 2 else ""
+    if command == "search":
+        if not argument:
+            console.print("[red]Usage: web search <query>[/red]")
+            return
+        result = web_tool.search(argument, reason="User explicitly requested a web search.")
+        asyncio.run(_print_web_answer(argument, result, [], console, llm))
+        return
+    if command in {"open", "summarize"}:
+        if not argument:
+            console.print("[red]Usage: web open <url>[/red]")
+            return
+        fetch = web_tool.fetch(argument, reason="User explicitly requested a web page fetch.")
+        _print_web_fetch(fetch, console)
+        return
+    console.print("[red]Usage: web search <query>|open <url>|summarize <url>[/red]")
+
+
+def _handle_browse(
+    user_input: str,
+    console: Console,
+    browser_tool: BrowserTool,
+) -> None:
+    parts = user_input.split(maxsplit=3)
+    command = parts[1].strip().lower() if len(parts) > 1 else ""
+    if command == "open":
+        if len(parts) < 3:
+            console.print("[red]Usage: browse open <url>[/red]")
+            return
+        _print_browser_result(
+            browser_tool.open(parts[2].strip(), reason="User explicitly requested browser access."),
+            console,
+        )
+        return
+    if command == "read":
+        _print_browser_result(browser_tool.read(), console)
+        return
+    if command == "click":
+        if len(parts) < 3:
+            console.print("[red]Usage: browse click <selector>[/red]")
+            return
+        _print_browser_result(browser_tool.click(parts[2].strip()), console)
+        return
+    if command == "type":
+        if len(parts) < 4:
+            console.print("[red]Usage: browse type <selector> <text>[/red]")
+            return
+        _print_browser_result(browser_tool.type_text(parts[2].strip(), parts[3]), console)
+        return
+    if command == "screenshot":
+        _print_browser_result(browser_tool.screenshot(), console)
+        return
+    console.print("[red]Usage: browse open|read|click|type|screenshot[/red]")
+
+
 def _approve_model_download(
     missing_models: list[str],
     _console: Console,
@@ -818,10 +946,21 @@ async def _handle_request(
     user_input: str,
     workspace: Path,
     console: Console,
+    web_tool: WebTool,
+    browser_tool: BrowserTool,
     session_logger: SessionLogger | None = None,
 ) -> None:
     if _is_casual_prompt(user_input):
         _print_ready_message(workspace, console)
+        return
+    if _looks_like_workspace_prd_request(user_input):
+        _handle_workspace_prd_request(workspace, console)
+        return
+    if _looks_like_browser_needed_prompt(user_input):
+        await _run_browser_assist(user_input, console, llm=LLMManager(session_logger=session_logger), browser_tool=browser_tool)
+        return
+    if _looks_like_web_needed_prompt(user_input):
+        await _run_web_assist(user_input, console, llm=LLMManager(session_logger=session_logger), web_tool=web_tool)
         return
     if _looks_like_django_generation_request(user_input):
         generate_command = f"generate-django {_extract_prd_path_from_prompt(user_input)}"
@@ -950,7 +1089,7 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
         intent = "audit"
     elif any(word in text for word in ("readme", "documentation", "docs")):
         intent = "doc_gen"
-    elif any(word in text for word in ("change", "edit", "add ", "remove ", "update")):
+    elif _looks_like_code_edit_request(user_input):
         intent = "code_edit"
     return RoutingDecision(
         intent=intent,
@@ -969,12 +1108,70 @@ def _looks_like_prd_plan_request(user_input: str) -> bool:
     )
 
 
+def _looks_like_workspace_prd_request(user_input: str) -> bool:
+    text = user_input.lower()
+    return (
+        "prd" in text
+        and not bool(_extract_prd_path_from_prompt(user_input))
+        and any(
+            phrase in text
+            for phrase in (
+                "check that out",
+                "check it out",
+                "check the prd",
+                "look at the prd",
+                "look at that prd",
+                "review the prd",
+                "read the prd",
+                "added a prd",
+                "add a prd",
+                "working folder",
+                "workspace",
+            )
+        )
+    )
+
+
 def _looks_like_django_generation_request(user_input: str) -> bool:
     text = user_input.lower()
     return (
         any(phrase in text for phrase in ("generate django", "generate project", "build django"))
         and bool(_extract_prd_path_from_prompt(user_input))
     )
+
+
+def _looks_like_web_needed_prompt(user_input: str) -> bool:
+    text = user_input.lower()
+    if _looks_like_browser_needed_prompt(user_input):
+        return False
+    extracted_url = _extract_url_from_prompt(user_input)
+    if extracted_url and not _is_local_url(extracted_url):
+        return True
+    if any(phrase in text for phrase in ("search the web", "look up", "find docs", "documentation for", "official docs", "latest ", "current ")):
+        return True
+    if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
+        return True
+    return False
+
+
+def _looks_like_browser_needed_prompt(user_input: str) -> bool:
+    text = user_input.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "check the app",
+            "open the app",
+            "open the site",
+            "show me the project",
+            "show the project",
+            "debug this page",
+            "verify the dashboard",
+            "inspect the rendered ui",
+            "see if login works",
+            "open localhost",
+            "preview the app",
+        )
+    ) or _is_local_url(_extract_url_from_prompt(user_input))
 
 
 def _extract_prd_path_from_prompt(user_input: str) -> str:
@@ -985,9 +1182,98 @@ def _extract_prd_path_from_prompt(user_input: str) -> str:
     return match.group(1) if match else ""
 
 
+def _extract_url_from_prompt(user_input: str) -> str:
+    match = re.search(r"(https?://[^\s]+)", user_input, re.I)
+    return match.group(1) if match else ""
+
+
+def _is_local_url(url: str) -> bool:
+    if not url:
+        return False
+    hostname = urlparse(url).hostname or ""
+    return hostname in {"localhost", "127.0.0.1", "::1"}
+
+
 def _print_decision(decision: RoutingDecision, console: Console) -> None:
     console.print(
         f"[dim]intent={decision.intent} confidence={decision.confidence:.2f}[/dim]"
+    )
+
+
+def _looks_like_code_edit_request(user_input: str) -> bool:
+    text = user_input.lower().strip()
+    if any(word in text for word in ("change", "edit", "update")):
+        return True
+    if text.startswith("remove "):
+        return True
+    if text.startswith("add "):
+        code_targets = (
+            "function",
+            "class",
+            "test",
+            "endpoint",
+            "route",
+            "model",
+            "view",
+            "serializer",
+            "field",
+            "button",
+            "banner",
+            "readme",
+            "docstring",
+            "logging",
+            "validation",
+        )
+        return any(target in text for target in code_targets)
+    return False
+
+
+def _find_workspace_prd_files(workspace: Path) -> list[Path]:
+    candidates: list[Path] = []
+    for path in workspace.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".md", ".markdown", ".txt", ".pdf"}:
+            continue
+        if "prd" not in path.name.lower():
+            continue
+        try:
+            candidates.append(path.relative_to(workspace))
+        except ValueError:
+            continue
+    return sorted(candidates)
+
+
+def _handle_workspace_prd_request(workspace: Path, console: Console) -> None:
+    candidates = _find_workspace_prd_files(workspace)
+    if not candidates:
+        console.print(
+            "[yellow]I couldn't find a PRD file in this workspace yet.[/yellow] "
+            "Add a `.md`, `.txt`, or `.pdf` file with `prd` in the name, then ask again or run `/parse-prd <file>`."
+        )
+        return
+    if len(candidates) > 1:
+        console.print("[yellow]I found multiple PRD files in this workspace:[/yellow]")
+        for path in candidates[:10]:
+            console.print(f"- {path}")
+        console.print("Tell me which one to open, or run `/parse-prd <file>` or `/plan-prd <file>`.")
+        return
+    relative_path = candidates[0]
+    absolute_path = workspace / relative_path
+    try:
+        parsed = parse_prd_file(absolute_path)
+    except PRDParseError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    section_names = ", ".join(parsed.sections.keys()) or "none"
+    console.print(
+        Panel(
+            f"File: {relative_path}\n"
+            f"Title: {parsed.title}\n"
+            f"Sections: {section_names}\n\n"
+            f"Use `/plan-prd \"{relative_path}\"` if you want me to turn it into a project plan.",
+            title="PRD Found",
+        )
     )
 
 
@@ -1012,6 +1298,7 @@ async def _run_general_chat(
     user_input: str,
     console: Console,
     llm: LLMManager,
+    extra_context: str = "",
 ) -> None:
     pack = ContextPack(
         task_id="general-chat",
@@ -1022,11 +1309,156 @@ async def _run_general_chat(
             "No indexed project context is attached. "
             "Answer as a general local assistant. "
             "Do not claim you saw code, tests, or files unless they were actually provided."
+            + (f" {extra_context}" if extra_context else "")
         ),
     )
     response = await llm.run_specialist("qa", pack)
     title = f"Chat ({response.model_used})" if response.model_used else "Chat"
     console.print(Panel(response.raw.strip(), title=title))
+
+
+async def _run_web_assist(
+    user_input: str,
+    console: Console,
+    llm: LLMManager,
+    web_tool: WebTool,
+) -> None:
+    result = web_tool.search(
+        user_input,
+        reason=(
+            "SHAMSU thinks this request needs current or external information from the web."
+        ),
+    )
+    fetches: list[WebFetchResult] = []
+    if not result.approved:
+        await _run_general_chat(
+            user_input,
+            console,
+            llm,
+            extra_context=(
+                "External web access was denied. Answer with general knowledge only and mention that current details may be stale."
+            ),
+        )
+        return
+    if result.error:
+        console.print(f"[yellow]Web search failed: {result.error}[/yellow]")
+        await _run_general_chat(
+            user_input,
+            console,
+            llm,
+            extra_context="Web lookup failed. Answer locally and mention that external lookup was unavailable.",
+        )
+        return
+    for hit in result.hits[:3]:
+        fetch = web_tool.fetch(
+            hit.url,
+            reason="SHAMSU wants to read the matching page to answer your question accurately.",
+        )
+        if fetch.approved and not fetch.error:
+            fetches.append(fetch)
+    await _print_web_answer(user_input, result, fetches, console, llm)
+
+
+async def _run_browser_assist(
+    user_input: str,
+    console: Console,
+    llm: LLMManager,
+    browser_tool: BrowserTool,
+) -> None:
+    url = _extract_url_from_prompt(user_input) or browser_tool.discover_local_url()
+    if not url:
+        console.print(
+            "[yellow]I could not find a running local app to open.[/yellow] "
+            "Mention a URL like `http://127.0.0.1:8000`, or start your app first."
+        )
+        return
+    opened = browser_tool.open(
+        url,
+        reason="SHAMSU wants to inspect the local app in a browser for preview or debugging.",
+    )
+    if not opened.ok:
+        if "denied" in opened.message.lower():
+            console.print("[yellow]Browser access denied. Staying in local-only mode.[/yellow]")
+            return
+        console.print(Panel(opened.message, title="Browser Unavailable", border_style="red"))
+        return
+    pack = ContextPack(
+        task_id="browser-inspect",
+        step_id=1,
+        specialist="qa",
+        user_request=user_input,
+        prd_context=(
+            f"Browser page URL: {opened.url}\n"
+            f"Browser page title: {opened.title}\n"
+            f"Visible page text:\n{opened.visible_text}"
+        ),
+    )
+    response = await llm.run_specialist("qa", pack)
+    console.print(
+        Panel(
+            f"{response.raw.strip()}\n\nURL: {opened.url}\nTitle: {opened.title}",
+            title=f"Browser Inspection ({response.model_used})" if response.model_used else "Browser Inspection",
+        )
+    )
+
+
+async def _print_web_answer(
+    query: str,
+    result: WebSearchResult,
+    fetches: list[WebFetchResult],
+    console: Console,
+    llm: LLMManager,
+) -> None:
+    if result.error:
+        console.print(f"[yellow]Web search failed: {result.error}[/yellow]")
+        return
+    if not result.hits:
+        console.print("[yellow]No web results found.[/yellow]")
+        return
+    if fetches:
+        context = "\n\n".join(
+            f"Source: {item.url}\nTitle: {item.title}\n{item.text[:2500]}"
+            for item in fetches
+        )
+        pack = ContextPack(
+            task_id="web-qa",
+            step_id=1,
+            specialist="qa",
+            user_request=query,
+            prd_context=(
+                "Use these web sources to answer. Cite the sources by URL in a brief source list.\n\n"
+                f"{context}"
+            ),
+        )
+        response = await llm.run_specialist("qa", pack)
+        body = response.raw.strip()
+    else:
+        body = "\n".join(f"- {hit.title}\n  {hit.url}" for hit in result.hits[:5])
+    sources = "\n".join(f"- {hit.title}: {hit.url}" for hit in result.hits[:5])
+    console.print(Panel(f"{body}\n\nSources:\n{sources}", title="Web Answer"))
+
+
+def _print_web_fetch(fetch: WebFetchResult, console: Console) -> None:
+    if not fetch.approved:
+        console.print("[yellow]Web fetch denied by user.[/yellow]")
+        return
+    if fetch.error:
+        console.print(Panel(fetch.error, title="Web Fetch Failed", border_style="red"))
+        return
+    preview = fetch.text[:3000] if fetch.text else "(no visible text extracted)"
+    console.print(Panel(f"URL: {fetch.url}\nTitle: {fetch.title}\n\n{preview}", title="Web Page"))
+
+
+def _print_browser_result(result, console: Console) -> None:
+    if not result.ok:
+        console.print(Panel(result.message, title="Browser Action Failed", border_style="red"))
+        return
+    body = result.message or result.visible_text[:3000] or "Browser action completed."
+    if result.screenshot_path:
+        body = f"{body}\n\nScreenshot: {result.screenshot_path}"
+    if result.url:
+        body = f"URL: {result.url}\nTitle: {result.title}\n\n{body}"
+    console.print(Panel(body, title="Browser"))
 
 
 def _is_casual_prompt(user_input: str) -> bool:
@@ -1080,6 +1512,10 @@ def _is_general_chat_prompt(user_input: str) -> bool:
         "login",
     )
     return not any(marker in text for marker in project_markers)
+
+
+def _is_project_local_prompt(text: str) -> bool:
+    return not _is_general_chat_prompt(text)
 
 
 def _print_ready_message(workspace: Path, console: Console) -> None:
@@ -1211,7 +1647,7 @@ async def _run_docs(
 
 def _warn_if_dirty_before_edit(workspace: Path, console: Console) -> None:
     warning = GitTool(workspace).warn_if_dirty()
-    if warning:
+    if warning and warning != "Workspace is not a git repository.":
         console.print(f"[yellow]{warning}[/yellow]")
 
 
@@ -1262,10 +1698,33 @@ def _looks_like_runtime_error(message: str) -> bool:
 
 
 def _strip_forced_prefix(user_input: str, command: str) -> str:
+    normalized = _normalize_command_input(user_input)
     prefix = f"{command} "
-    if user_input.lower().startswith(prefix):
-        return user_input[len(prefix):].strip()
+    if normalized.lower().startswith(prefix):
+        return normalized[len(prefix):].strip()
     return user_input
+
+
+def _normalize_command_input(user_input: str) -> str:
+    stripped = user_input.strip()
+    if stripped.startswith("/"):
+        return stripped[1:].strip()
+    return stripped
+
+
+def _thinking_status_for_input(user_input: str) -> str:
+    normalized = _normalize_command_input(user_input).lower()
+    if normalized.startswith("parse-prd ") or "prd" in normalized:
+        return "[dim]Checking workspace PRD files...[/dim]"
+    if normalized.startswith("web ") or _looks_like_web_needed_prompt(user_input):
+        return "[dim]Checking whether web lookup is needed...[/dim]"
+    if normalized.startswith("browse ") or _looks_like_browser_needed_prompt(user_input):
+        return "[dim]Inspecting in the browser...[/dim]"
+    if normalized.startswith("search ") or normalized.startswith("symbols "):
+        return "[dim]Searching indexed workspace context...[/dim]"
+    if normalized.startswith(("edit ", "fix ", "test-gen ", "audit ", "docs ")):
+        return "[dim]Thinking through the requested workflow...[/dim]"
+    return "[dim]Thinking...[/dim]"
 
 
 def _make_prompt_session(workspace: Path) -> PromptSession | None:
@@ -1279,7 +1738,9 @@ def _make_prompt_session(workspace: Path) -> PromptSession | None:
         return PromptSession(
             history=InMemoryHistory(),
             style=style,
-            bottom_toolbar=f"Workspace: {workspace} | help | index | exit",
+            completer=SlashCommandCompleter(),
+            complete_while_typing=True,
+            bottom_toolbar=f"Workspace: {workspace} | /help | /index | /exit",
         )
     except NoConsoleScreenBufferError:
         return None
@@ -1303,7 +1764,9 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
-    console.print("[dim]Type a prompt, or `help` for commands.[/dim]\n")
+    console.print("[dim]Type a prompt, or `/help` for commands.[/dim]\n")
+    web_tool = WebTool(session_logger=session_logger)
+    browser_tool = BrowserTool(workspace, session_logger=session_logger)
     session = _make_prompt_session(workspace)
 
     while True:
@@ -1318,7 +1781,9 @@ def main(argv: list[str] | None = None) -> None:
 
         if not user_input:
             continue
-        if user_input.lower() in {"exit", "quit"}:
+        normalized_input = _normalize_command_input(user_input)
+        lowered_input = normalized_input.lower()
+        if lowered_input in {"exit", "quit"}:
             print("Goodbye.")
             break
         session_logger.log(
@@ -1327,50 +1792,74 @@ def main(argv: list[str] | None = None) -> None:
             "User submitted prompt",
             workflow_id="repl",
         )
-        if user_input.lower() == "help":
+        if lowered_input == "help":
             _print_help(console)
             continue
-        if user_input.lower() == "index":
-            _handle_index(workspace, console)
+        if lowered_input == "index":
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_index(workspace, console)
             continue
-        if user_input.lower() == "status":
+        if lowered_input == "status":
             _handle_status(workspace, console)
             continue
-        if user_input.lower().startswith("search "):
-            _handle_search(user_input, workspace, console)
+        if lowered_input.startswith("search "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_search(normalized_input, workspace, console)
             continue
-        if user_input.lower().startswith("symbols "):
-            _handle_symbols(user_input, workspace, console)
+        if lowered_input.startswith("symbols "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_symbols(normalized_input, workspace, console)
             continue
-        if user_input.lower().startswith("parse-prd "):
-            _handle_parse_prd(user_input, workspace, console)
+        if lowered_input.startswith("parse-prd "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_parse_prd(normalized_input, workspace, console)
             continue
-        if user_input.lower().startswith("plan-prd "):
-            _handle_plan_prd(user_input, workspace, console, session_logger=session_logger)
+        if lowered_input.startswith("plan-prd "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_plan_prd(normalized_input, workspace, console, session_logger=session_logger)
             continue
-        if user_input.lower().startswith("generate-django "):
-            _handle_generate_django(user_input, workspace, console, session_logger=session_logger)
+        if lowered_input.startswith("generate-django "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_generate_django(normalized_input, workspace, console, session_logger=session_logger)
             continue
-        if user_input.lower().startswith("generate-prd "):
-            asyncio.run(_handle_generate_prd(user_input, workspace, console, session_logger))
+        if lowered_input.startswith("generate-prd "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                asyncio.run(_handle_generate_prd(normalized_input, workspace, console, session_logger))
             continue
-        if user_input.lower().startswith("models"):
-            _handle_models(user_input, console)
+        if lowered_input.startswith("models"):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_models(normalized_input, console)
             continue
-        if user_input.lower().startswith("django"):
-            if user_input.lower().startswith("django fix-tests"):
-                asyncio.run(_handle_django_fix_tests(user_input, workspace, console, session_logger))
-            else:
-                _handle_django(user_input, workspace, console, session_logger=session_logger)
+        if lowered_input.startswith("web "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_web(normalized_input, console, web_tool, LLMManager(session_logger=session_logger))
             continue
-        if user_input.lower().startswith("sessions"):
-            session_logger = _handle_sessions(user_input, session_manager, session_logger, console)
+        if lowered_input.startswith("browse "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_browse(normalized_input, console, browser_tool)
             continue
-        if user_input.lower() == "log" or user_input.lower().startswith("log "):
-            _handle_log(user_input, session_logger, console)
+        if lowered_input.startswith("django"):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                if lowered_input.startswith("django fix-tests"):
+                    asyncio.run(_handle_django_fix_tests(normalized_input, workspace, console, session_logger))
+                else:
+                    _handle_django(normalized_input, workspace, console, session_logger=session_logger)
+            continue
+        if lowered_input.startswith("sessions"):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                session_logger = _handle_sessions(normalized_input, session_manager, session_logger, console)
+                web_tool.session_logger = session_logger
+                browser_tool.session_logger = session_logger
+            continue
+        if lowered_input == "log" or lowered_input.startswith("log "):
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_log(normalized_input, session_logger, console)
             continue
 
-        asyncio.run(_handle_request(user_input, workspace, console, session_logger))
+        with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+            asyncio.run(_handle_request(user_input, workspace, console, web_tool, browser_tool, session_logger))
+
+    browser_tool.close()
 
 
 if __name__ == "__main__":
