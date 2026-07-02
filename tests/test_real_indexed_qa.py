@@ -119,6 +119,33 @@ def test_repl_workspace_prd_request_finds_single_prd_without_routing(tmp_path):
     assert "Code Edit Not Applied" not in rendered
 
 
+def test_repl_workspace_file_question_lists_real_files(tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+    (tmp_path / "README.md").write_text("# Test\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+
+    asyncio.run(_handle_request("hi what files do i have here?", tmp_path, console, web_tool, browser_tool))
+
+    rendered = output.getvalue()
+    assert "Workspace Files" in rendered
+    assert "README.md" in rendered
+    assert "src" in rendered
+    assert "I cannot see any files" not in rendered
+
+
+def test_repl_workspace_location_question_reports_workspace(tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+
+    asyncio.run(_handle_request("what folder are you in rn?", tmp_path, console, web_tool, browser_tool))
+
+    rendered = output.getvalue()
+    assert "Current Workspace" in rendered
+    assert str(tmp_path) in rendered
+    assert "I don’t have a current working directory" not in rendered
+
+
 def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):
     source = tmp_path / "payments.py"
     source.write_text(

@@ -953,6 +953,12 @@ async def _handle_request(
     if _is_casual_prompt(user_input):
         _print_ready_message(workspace, console)
         return
+    if _looks_like_workspace_location_prompt(user_input):
+        _print_workspace_location(workspace, console)
+        return
+    if _looks_like_workspace_files_prompt(user_input):
+        _print_workspace_files(workspace, console)
+        return
     if _looks_like_workspace_prd_request(user_input):
         _handle_workspace_prd_request(workspace, console)
         return
@@ -1132,6 +1138,45 @@ def _looks_like_workspace_prd_request(user_input: str) -> bool:
     )
 
 
+def _looks_like_workspace_location_prompt(user_input: str) -> bool:
+    text = user_input.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "what folder are you in",
+            "what folder you're in",
+            "where are you right now",
+            "where are you rn",
+            "what directory are you in",
+            "what workspace are you in",
+            "where am i",
+            "current folder",
+            "current directory",
+            "current workspace",
+        )
+    )
+
+
+def _looks_like_workspace_files_prompt(user_input: str) -> bool:
+    text = user_input.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "what files do i have here",
+            "what files are here",
+            "what's in this folder",
+            "whats in this folder",
+            "what's in this directory",
+            "whats in this directory",
+            "list files",
+            "show files",
+            "show me the files",
+            "what files do i have",
+            "what files are in this workspace",
+        )
+    )
+
+
 def _looks_like_django_generation_request(user_input: str) -> bool:
     text = user_input.lower()
     return (
@@ -1197,6 +1242,41 @@ def _is_local_url(url: str) -> bool:
 def _print_decision(decision: RoutingDecision, console: Console) -> None:
     console.print(
         f"[dim]intent={decision.intent} confidence={decision.confidence:.2f}[/dim]"
+    )
+
+
+def _print_workspace_location(workspace: Path, console: Console) -> None:
+    console.print(
+        Panel(
+            f"I am working in:\n{workspace}",
+            title="Current Workspace",
+        )
+    )
+
+
+def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -> None:
+    entries = sorted(
+        [
+            path for path in workspace.iterdir()
+            if path.name != ".shamsu"
+        ],
+        key=lambda path: (not path.is_dir(), path.name.lower()),
+    )
+    if not entries:
+        console.print(Panel(f"{workspace}\n\nThis workspace is empty.", title="Workspace Files"))
+        return
+    shown = entries[:limit]
+    body = "\n".join(
+        f"[dir]  {item.name}" if item.is_dir() else f"[file] {item.name}"
+        for item in shown
+    )
+    if len(entries) > limit:
+        body = f"{body}\n... {len(entries) - limit} more"
+    console.print(
+        Panel(
+            f"Workspace: {workspace}\n\n{body}",
+            title="Workspace Files",
+        )
     )
 
 
