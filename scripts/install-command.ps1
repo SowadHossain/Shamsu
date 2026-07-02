@@ -31,20 +31,40 @@ $EscapedRunScript = $RunScript.Replace("'", "''")
 $PsContent = @"
 [CmdletBinding()]
 param(
+    [Parameter(ValueFromPipeline = `$true)]
+    [string]`$InputObject,
     [Parameter(ValueFromRemainingArguments = `$true)]
     [string[]]`$ShamsuArgs
 )
 
-`$ErrorActionPreference = "Stop"
-Set-StrictMode -Version Latest
-`$RunScript = '$EscapedRunScript'
-& `$RunScript @ShamsuArgs
+begin {
+    `$ErrorActionPreference = "Stop"
+    Set-StrictMode -Version Latest
+    `$RunScript = '$EscapedRunScript'
+    `$PipedInput = [System.Collections.Generic.List[string]]::new()
+}
+
+process {
+    if (`$null -ne `$InputObject) {
+        `$PipedInput.Add(`$InputObject)
+    }
+}
+
+end {
+    `$Workspace = (Get-Location).Path
+    if (`$PipedInput.Count -gt 0) {
+        & `$RunScript -Workspace `$Workspace -InputObject (`$PipedInput -join [Environment]::NewLine) @ShamsuArgs
+    }
+    else {
+        & `$RunScript -Workspace `$Workspace @ShamsuArgs
+    }
+}
 "@
 
 $CmdRunScript = $RunScript.Replace("%", "%%")
 $CmdContent = @"
 @echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" %*
+powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "%CD%" %*
 "@
 
 Set-Content -Path $PsLauncher -Value $PsContent -Encoding UTF8
