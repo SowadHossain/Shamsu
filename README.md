@@ -3,8 +3,8 @@
 Local-first autonomous coding agent for low-resource machines.
 
 SHAMSU is being built as a lightweight coding teammate that can inspect,
-index, search, explain, parse PRDs, and eventually edit, fix, test, document,
-and generate software projects without depending on expensive cloud AI APIs.
+index, search, explain, parse PRDs, edit, fix, test, document, and generate
+software project scaffolds without depending on expensive cloud AI APIs.
 
 The core rule:
 
@@ -33,11 +33,18 @@ Working now:
 - Internal command runner with workspace checks, blocked-command rejection,
   approval gates, timeouts, captured output, and redaction
 - Internal patch validation and Rich diff preview for unified diffs
+- Approval-backed patch apply and rollback with backups
+- Read-only git status/diff awareness before edits
+- Natural prompt routing for QA, code edit, bug fix, audit, test generation,
+  documentation, and project-generation intents
+- Django setup helper for generated projects: install requirements,
+  makemigrations, and migrate
+- Status and log commands for workspace state and local structured logs
+- Local JSONL audit trail for safety-sensitive actions
 - Agent progress tracking in `agent context/PROGRESS.md`
 
 Planned next:
 
-- Patch application and rollback behind approval
 - Writing generated Django files behind approval
 - Full PRD-to-Django project generation
 - Local Ollama-backed specialist responses beyond preview mode
@@ -161,12 +168,14 @@ Inside the REPL:
 ```text
 index
 status
+log [n]
 search <query>
 symbols <name>
 parse-prd <file.md>
 models status
 models pull
 models repair
+django setup [project-dir]
 help
 exit
 ```
@@ -189,7 +198,8 @@ The index includes file metadata, Python symbols, and searchable text snippets.
 
 ### `status`
 
-Shows index counts.
+Shows workspace, index, task, model/runtime, and pending approval status when
+available.
 
 ```text
 shamsu> status
@@ -197,6 +207,22 @@ Files: 53
 Symbols: 313
 Snippets: 181
 ```
+
+### `log [n]`
+
+Tails local structured logs from the selected workspace.
+
+```text
+shamsu> log 50
+```
+
+Logs stay under:
+
+```text
+.shamsu/
+```
+
+Secrets are redacted before display.
 
 ### `search <query>`
 
@@ -224,6 +250,165 @@ shamsu> parse-prd "agent context/SHAMSU_10day_dev_plan.md"
 
 Paths outside the workspace are rejected.
 
+## PRD Format Guide
+
+SHAMSU works best when a PRD uses clear Markdown headings and short bullets.
+The parser preserves the original text, while deterministic extractors look for
+common section names and simple entity descriptions.
+
+Recommended sections:
+
+```markdown
+# Todo App
+
+## Overview
+- A small task tracker for one user.
+
+## Entities
+- Task: title (text), description (text), due_date (date), done (boolean)
+- Category: name (text)
+
+## Pages
+- Dashboard: show open tasks and completion counts
+- Task List: list, add, complete, and delete tasks
+
+## API
+- GET /api/tasks/
+- POST /api/tasks/
+- DELETE /api/tasks/{id}/
+
+## Auth
+- Users must log in before managing tasks.
+
+## Non Functional Requirements
+- Use SQLite for local development.
+- Keep the UI server-rendered.
+```
+
+Entity field hints SHAMSU understands well:
+
+- `text`, `string`, `char`, or `title` for short text fields
+- `description`, `body`, or `notes` for long text fields
+- `integer`, `number`, `decimal`, `money`, or `amount` for numeric fields
+- `date`, `datetime`, `boolean`, or `status` for common app fields
+- `belongs_to:<Entity>` style relationship notes when useful
+
+Good PRDs name the resources, pages, and actions directly. Avoid relying on
+long prose alone for critical data fields.
+
+## Generated Project Run Guide
+
+Generated Django projects use Django 5, Django REST Framework, Simple JWT,
+crispy forms, DaisyUI, HTMX, and SQLite. They do not require Node, npm, Vite,
+Webpack, or a frontend build step.
+
+After SHAMSU has written a generated project directory, install dependencies
+and run migrations through the approval-backed setup helper:
+
+```text
+shamsu> django setup generated
+```
+
+That helper runs these commands in the generated project directory:
+
+```text
+pip install -r requirements.txt
+python manage.py makemigrations
+python manage.py migrate
+```
+
+To run the generated app manually:
+
+Windows PowerShell:
+
+```powershell
+cd .\generated
+.\.venv\Scripts\python.exe manage.py runserver
+```
+
+If the generated project uses your active shell Python instead of a local venv:
+
+```powershell
+python manage.py runserver
+```
+
+Bash:
+
+```bash
+cd generated
+python manage.py runserver
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8000/
+http://127.0.0.1:8000/admin/
+```
+
+Create a Django admin user when needed:
+
+```powershell
+python manage.py createsuperuser
+```
+
+The generated frontend is plain Django templates plus CDN-loaded DaisyUI/HTMX,
+so the browser can load the app directly from Django's development server.
+
+## Demo Script
+
+Use this path for a live MVP demo:
+
+1. Start SHAMSU in a clean workspace.
+
+   ```powershell
+   .\scripts\run-shamsu.ps1 -Workspace .\demo-workspace
+   ```
+
+2. Add a PRD such as `TODO_PRD.md` using the format above.
+
+3. Parse and review the PRD.
+
+   ```text
+   shamsu> parse-prd TODO_PRD.md
+   ```
+
+4. Generate the Django project from the PRD once the project-generation command
+   is available in the active branch.
+
+   ```text
+   shamsu> generate project from TODO_PRD.md into generated
+   ```
+
+5. Install generated requirements and run migrations.
+
+   ```text
+   shamsu> django setup generated
+   ```
+
+6. Start the generated Django server.
+
+   ```powershell
+   cd .\demo-workspace\generated
+   python manage.py runserver
+   ```
+
+7. Open the browser walkthrough.
+
+   ```text
+   http://127.0.0.1:8000/
+   http://127.0.0.1:8000/admin/
+   ```
+
+8. Show the local safety trail.
+
+   ```text
+   shamsu> status
+   shamsu> log 50
+   ```
+
+See `DEMO_SCRIPT.md` for the presenter checklist version.
+
 ### Natural-Language Request
 
 Any other text builds a routed QA context preview:
@@ -247,6 +432,16 @@ shamsu> models repair
 
 `models repair` starts local Ollama when possible and pulls missing required
 models. It does not install Ollama; use the installer for first-time bootstrap.
+
+### `django setup [project-dir]`
+
+Runs the generated-project dependency and migration setup flow. `pip install`,
+`makemigrations`, and `migrate` all go through workspace-bound command
+execution and approval/redaction handling.
+
+```text
+shamsu> django setup generated
+```
 
 ## Smoke Test
 
@@ -293,7 +488,7 @@ On Bash:
 
 ## Safety Model
 
-SHAMSU currently has two safety layers.
+SHAMSU currently has several safety layers.
 
 Dependency isolation:
 
@@ -305,8 +500,11 @@ Workspace sandbox:
 
 - The CLI resolves one workspace at startup.
 - `parse-prd` validates file paths with `Sandbox.validate()`.
+- Generated project setup validates the project directory inside the workspace.
+- Patch paths and audit-log paths are validated through the same sandbox.
 - Paths outside the workspace are rejected.
 - Index data stays inside `<workspace>/.shamsu/`.
+- Audit logs stay inside `<workspace>/.shamsu/audit.jsonl`.
 
 Local AI runtime:
 
@@ -323,8 +521,9 @@ Internal command execution:
 - Blocked commands are rejected without approval or execution.
 - Medium-risk and unknown commands require approval.
 - Captured command output is redacted before it is returned.
-- This runner is available internally for future workflows such as tests and
-  patch validation. It is not exposed as a general REPL command yet.
+- Django setup uses this runner for generated project requirements and
+  migrations.
+- There is no arbitrary shell command exposed in the REPL.
 
 Internal patch review:
 
@@ -332,14 +531,30 @@ Internal patch review:
   use it.
 - Patch paths are normalized and checked against the workspace sandbox.
 - `patch.preview` renders a Rich diff summary and colorized diff body.
-- Patch application and rollback are intentionally not enabled yet.
+- Patch application requires approval and creates backups for existing files.
+- Failed patch application restores backups and removes newly-created files.
+- Applied patches re-index changed workspace content.
+
+Local audit trail:
+
+- File writes, patch applies, command runs, approvals, denials, errors, and
+  generated-file events can be recorded as JSONL.
+- Each event includes a timestamp, action type, result, affected paths, and
+  redacted details.
 
 Important limitation:
 
 - This is not a full OS sandbox.
 - This is not Docker isolation.
-- Future file writes, patch application, rollback, and user-facing command
-  execution still need approval gates before they become public workflows.
+- A malicious local process outside SHAMSU can still edit files in the same
+  workspace.
+- Project generation support is still branch-dependent; use the demo script's
+  generation command only when the active branch includes the full pipeline.
+- Generated apps target local development with SQLite, not production
+  deployment.
+- PostgreSQL, Docker, React SPA generation, file uploads, email delivery, and
+  background workers are outside the MVP scope.
+- LLM output quality depends on the installed local Ollama models.
 
 ## Troubleshooting
 
