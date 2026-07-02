@@ -13,6 +13,7 @@ from shamsu.indexer.walker import FileWalker
 from shamsu.interfaces import IPatchEngine
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
+from shamsu.safety.audit import AuditLogger
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
@@ -97,6 +98,7 @@ class PatchEngine(IPatchEngine):
         self.approval_func = approval_func
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
+        self.audit_logger = AuditLogger(self.workspace_root)
 
     def validate_diff(self, diff_text: str) -> tuple[bool, str | None]:
         try:
@@ -108,10 +110,12 @@ class PatchEngine(IPatchEngine):
     def apply(self, diff_text: str, workspace_root: Path) -> bool:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
+        self.audit_logger = AuditLogger(self.workspace_root)
         try:
             patches = parse_file_patches(diff_text, self.sandbox)
         except DiffValidationError:
             self._log("patch.failed", {"error": "Diff validation failed"}, "Patch validation failed")
+            self.audit_logger.log("patch_apply", "error", details={"error": "invalid diff"})
             return False
 
         from shamsu.patch.preview import print_diff_preview
@@ -129,7 +133,20 @@ class PatchEngine(IPatchEngine):
         self.approval_manager.session_logger = self.session_logger
         if not self.approval_manager.ask(request):
             self._log("patch.denied", {"files": [patch.display_path for patch in patches]}, "Patch denied")
+            self.audit_logger.log(
+                "approval",
+                "denied",
+                affected_paths=_patch_paths(patches),
+                details={"action_type": request.action_type, "preview": request.preview},
+            )
+            self.audit_logger.log("patch_apply", "denied", affected_paths=_patch_paths(patches))
             return False
+        self.audit_logger.log(
+            "approval",
+            "approved",
+            affected_paths=_patch_paths(patches),
+            details={"action_type": request.action_type, "preview": request.preview},
+        )
 
         backups: dict[Path, Path] = {}
         created_files: list[Path] = []
@@ -142,9 +159,11 @@ class PatchEngine(IPatchEngine):
                 if created.exists():
                     created.unlink()
             self._log("patch.failed", {"files": [patch.display_path for patch in patches]}, "Patch failed")
+            self.audit_logger.log("patch_apply", "error", affected_paths=_patch_paths(patches))
             return False
         FileWalker(self.workspace_root, session_logger=self.session_logger).index()
         self._log("patch.applied", {"files": [patch.display_path for patch in patches]}, "Patch applied")
+        self.audit_logger.log("patch_apply", "success", affected_paths=_patch_paths(patches))
         return True
 
     def rollback(self, file_path: Path) -> bool:
@@ -230,6 +249,10 @@ def parse_unified_diff(
         )
         for patch in parse_file_patches(diff_text, sandbox)
     ]
+
+
+def _patch_paths(patches: list[FilePatch]) -> list[str]:
+    return [patch.display_path for patch in patches]
 
 
 def parse_file_patches(
