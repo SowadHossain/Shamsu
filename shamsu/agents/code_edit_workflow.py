@@ -12,6 +12,7 @@ from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearc
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
+from shamsu.templates.frontend import frontend_prompt_rules
 from shamsu.types import ContextPack, SearchResult
 
 CODE_EDIT_INSTRUCTIONS = """You are SHAMSU's code editor.
@@ -101,9 +102,14 @@ class CodeEditWorkflow:
 
     def _build_pack(self, request: str) -> tuple[ContextPack, list[str]]:
         results = self.search.search(request, top_k=8)
+        prompt_request = (
+            f"{CODE_EDIT_INSTRUCTIONS}\n\n"
+            f"{frontend_prompt_rules()}\n\n"
+            f"User request: {request}"
+        )
         pack = self.context_builder.pack(
             results=results,
-            request=f"{CODE_EDIT_INSTRUCTIONS}\n\nUser request: {request}",
+            request=prompt_request,
             task_id="code-edit",
             step_id=1,
             specialist="coder",

@@ -108,6 +108,37 @@ class SequenceLLM:
 
 
 @pytest.mark.asyncio
+async def test_code_edit_prompt_includes_frontend_rules(tmp_path: Path):
+    target = tmp_path / "templates" / "dashboard.html"
+    target.parent.mkdir()
+    target.write_text("{% extends 'base.html' %}\n", encoding="utf-8")
+    diff = """--- a/templates/dashboard.html
++++ b/templates/dashboard.html
+@@ -1 +1,2 @@
+ {% extends 'base.html' %}
++<button class="btn btn-primary">Save</button>
+"""
+    llm = FakeLLM(diff)
+
+    await CodeEditWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(file_path="templates/dashboard.html"),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("add a save action to the dashboard template")
+
+    assert llm.pack is not None
+    prompt = llm.pack.user_request
+    assert "Use DaisyUI semantic classes" in prompt
+    assert "Prefer HTMX attributes" in prompt
+    assert "Do not hand-code raw <input>" in prompt
+    assert "<select>" in prompt
+    assert "<textarea>" in prompt
+    assert "{{ form|crispy }}" in prompt
+    assert "do not require Node, npm, bundlers" in prompt
+
+
+@pytest.mark.asyncio
 async def test_code_edit_workflow_reports_error_when_diff_and_rewrite_both_fail(tmp_path: Path):
     # A malformed diff triggers the full-rewrite fallback; if that also yields
     # nothing usable, the workflow reports the error and leaves the file intact.
