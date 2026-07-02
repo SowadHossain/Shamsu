@@ -40,6 +40,7 @@ from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch.engine import PatchEngine
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
+from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import ApprovalRequest, ProjectSpec, RoutingDecision, SearchResult
 
@@ -114,6 +115,7 @@ def _print_help(console: Console) -> None:
                     "  parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  plan-prd <file>          Preview and approve a project plan",
                     "  generate-django <file>   Generate deterministic Django backend files",
+                    "  django setup [dir]       Install generated deps and run migrations",
                     "  models status            Show local Ollama/model status",
                     "  models pull              Pull missing local models",
                     "  models repair            Start Ollama and pull missing models",
@@ -498,6 +500,40 @@ def _handle_models(user_input: str, console: Console) -> None:
         _print_runtime_status(console, status=status)
         return
     console.print("[red]Usage: models status|pull|repair[/red]")
+
+
+def _handle_django(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    parts = user_input.split(maxsplit=2)
+    command = parts[1].strip().lower() if len(parts) > 1 else ""
+    if command != "setup":
+        console.print("[red]Usage: django setup [project-dir][/red]")
+        return
+    project_dir = parts[2].strip() if len(parts) > 2 else "."
+    result = DjangoSetupRunner(workspace, session_logger=session_logger).run(project_dir)
+    _print_django_setup_result(result, console)
+
+
+def _print_django_setup_result(result: DjangoSetupResult, console: Console) -> None:
+    table = Table(title="Django Setup")
+    table.add_column("Step")
+    table.add_column("Command")
+    table.add_column("Exit")
+    for command in result.commands:
+        style = "green" if command.ok else "red"
+        table.add_row(command.step, command.command, f"[{style}]{command.exit_code}[/{style}]")
+    if not result.commands and result.failures:
+        failure = result.failures[0]
+        table.add_row(failure.step, failure.command or "validate project", "[red]1[/red]")
+    console.print(table)
+    if result.ok:
+        console.print("[green]Django dependencies installed and migrations completed.[/green]")
+        return
+    console.print(Panel(result.bugfix_context, title="Setup Failure", border_style="red"))
 
 
 def _print_runtime_status(console: Console, status=None) -> None:
@@ -1005,6 +1041,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if user_input.lower().startswith("models"):
             _handle_models(user_input, console)
+            continue
+        if user_input.lower().startswith("django"):
+            _handle_django(user_input, workspace, console, session_logger=session_logger)
             continue
         if user_input.lower().startswith("sessions"):
             session_logger = _handle_sessions(user_input, session_manager, session_logger, console)

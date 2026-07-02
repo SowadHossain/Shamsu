@@ -7,6 +7,7 @@ from pathlib import Path
 from rich.console import Console
 
 from shamsu.cli import repl
+from shamsu.tools.django import DjangoCommandResult, DjangoSetupResult
 from shamsu.types import ContextPack, LLMResponse, SearchResult
 
 
@@ -98,3 +99,38 @@ def test_code_edit_handler_prints_applied_result(monkeypatch, tmp_path):
     rendered = output.getvalue()
     assert "Code Edit Applied" in rendered
     assert "app.py" in rendered
+
+
+def test_django_setup_command_prints_runner_result(monkeypatch, tmp_path):
+    console, output = _console_output()
+    project = tmp_path / "generated"
+    project.mkdir()
+
+    class FakeDjangoSetupRunner:
+        def __init__(self, workspace_root: Path, session_logger=None) -> None:
+            assert workspace_root == tmp_path
+            assert session_logger is None
+
+        def run(self, project_dir: str) -> DjangoSetupResult:
+            assert project_dir == "generated"
+            return DjangoSetupResult(
+                project_cwd=project,
+                commands=[
+                    DjangoCommandResult(
+                        step="install_requirements",
+                        command="pip install -r requirements.txt",
+                        cwd=project,
+                        exit_code=0,
+                        stdout="installed",
+                    )
+                ],
+            )
+
+    monkeypatch.setattr(repl, "DjangoSetupRunner", FakeDjangoSetupRunner)
+
+    repl._handle_django("django setup generated", tmp_path, console)
+
+    rendered = output.getvalue()
+    assert "Django Setup" in rendered
+    assert "install_requirements" in rendered
+    assert "dependencies installed" in rendered
