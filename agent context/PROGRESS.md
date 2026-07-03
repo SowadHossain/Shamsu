@@ -6,8 +6,8 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, general no-index local chat, guided in-chat runtime repair prompt, uninstall scripts, autonomous web lookup, Playwright browser debugging hooks, smarter local/web/browser routing, agent orchestrator memory/context, workspace file tools, `@file` context, central approval logging, cleaner web extraction, and `qwen3:8b` main model routing complete.
-- Tests: `225 passed`
+- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, general no-index local chat, guided in-chat runtime repair prompt, uninstall scripts, autonomous web lookup, Playwright browser debugging hooks, smarter local/web/browser routing, agent orchestrator memory/context, workspace file tools, `@file` context, central approval logging, cleaner web extraction, `qwen3:8b` main model routing, stateful Ollama ReAct loop, markdown file-write fallback, and slash-command hardening complete.
+- Tests: `232 passed`
 - Lint: `python -m ruff check shamsu tests scripts` passes.
 - Last verified: 2026-07-03
 - Current next focus: finish remaining Milestone 6 Dev C status/log/progress, release docs, final safety audit, then release cut.
@@ -117,6 +117,9 @@ blocker.
 - [x] Added central `ApprovalManager` logging for permission-gated web, browser, command, and patch actions.
 - [x] Improved web page extraction with `trafilatura`, useful-page filtering, source summaries, and location clarification for weather prompts.
 - [x] Replaced `phi3:mini`/`gemma3:4b` primary routing with `qwen3:8b` for router/chat/planner/docs/summarizer, keeping `gemma3:4b` as a low-resource fallback option and teaching installers to install Playwright Chromium support.
+- [x] Added stateful `ChatState` plus Ollama SDK ReAct loop with native tool calls for file reads/writes, command execution, index search, and file listing.
+- [x] Added markdown code-block fallback for small models that fail native tool calling on simple file creation prompts.
+- [x] Hardened slash-command routing so invalid `/...` input never reaches the LLM and suggests nearby commands locally.
 
 ## In Progress
 

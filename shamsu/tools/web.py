@@ -8,7 +8,11 @@ from typing import Callable
 from urllib.parse import quote_plus, urlparse
 
 import httpx
-import trafilatura
+
+try:
+    import trafilatura
+except ModuleNotFoundError:  # pragma: no cover - exercised when old/global launchers miss deps
+    trafilatura = None
 
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
@@ -105,13 +109,7 @@ class WebTool:
         try:
             response = self._client().get(url, headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=True)
             response.raise_for_status()
-            extracted = trafilatura.extract(
-                response.text,
-                url=str(response.url),
-                include_comments=False,
-                include_tables=False,
-                favor_precision=True,
-            )
+            extracted = _extract_readable_text(response.text, str(response.url))
             title_parser = _VisibleTextParser()
             title_parser.feed(response.text)
             if extracted:
@@ -223,6 +221,18 @@ class _VisibleTextParser(HTMLParser):
 
 def _normalize_space(text: str) -> str:
     return " ".join(unescape(text).split())
+
+
+def _extract_readable_text(html: str, url: str) -> str | None:
+    if trafilatura is None:
+        return None
+    return trafilatura.extract(
+        html,
+        url=url,
+        include_comments=False,
+        include_tables=False,
+        favor_precision=True,
+    )
 
 
 def _hostname(url: str) -> str:

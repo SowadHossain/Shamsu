@@ -138,6 +138,16 @@ EOF
       echo "  ${BIN_DIR}"
       ;;
   esac
+  if [[ "${LAUNCHER_ON_PATH}" -eq 1 ]] && command -v shamsu >/dev/null 2>&1; then
+    RESOLVED_SHAMSU="$(command -v shamsu)"
+    if [[ "${RESOLVED_SHAMSU}" != "${LAUNCHER}" ]]; then
+      echo
+      echo "Warning: plain 'shamsu' currently resolves to a different command:"
+      echo "  ${RESOLVED_SHAMSU}"
+      echo "Run this launcher directly, or move ${BIN_DIR} earlier in PATH:"
+      echo "  ${LAUNCHER}"
+    fi
+  fi
 fi
 
 echo

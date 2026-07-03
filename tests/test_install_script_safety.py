@@ -79,11 +79,14 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert "shamsu.ps1" in ps1
     assert "shamsu.cmd" in ps1
     assert "@ShamsuArgs" in ps1
+    assert '$ShamsuArgs = `$args' in ps1
+    assert "`$PipedInput = @(`$input)" in ps1
     assert "(Get-Location).Path" in ps1
     assert "-InputObject (`$PipedInput -join [Environment]::NewLine)" in ps1
     assert "-Workspace `$Workspace @ShamsuArgs" in ps1
     assert '-Workspace "%CD%" %*' in ps1
     assert "$LauncherOnPath" in ps1
+    assert "Plain 'shamsu' currently resolves to a different command" in ps1
     assert "Add $BinDir to PATH if you want plain 'shamsu'" in ps1
     assert "did not edit your PowerShell profile, PATH, registry, or global Python" in ps1
 
@@ -91,6 +94,7 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert 'exec "${RUN_SCRIPT}" "\\$@"' in sh
     assert "${HOME}/.local/bin" in sh
     assert "LAUNCHER_ON_PATH" in sh
+    assert "plain 'shamsu' currently resolves to a different command" in sh
     assert "Add ${BIN_DIR} to PATH if you want plain 'shamsu'" in sh
     assert "did not edit your shell profile, PATH, global Python, or system registry" in sh
 

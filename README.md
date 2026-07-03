@@ -241,6 +241,16 @@ shamsu> write a short status update for my team
 shamsu> brainstorm names for a budgeting app
 ```
 
+Natural prompts can also use the stateful ReAct agent loop. SHAMSU keeps
+ordered chat/tool state, exposes safe local tools to Ollama, and only reports
+file writes or command results after a tool confirms them:
+
+```text
+shamsu> create hello.py with a small hello world script
+shamsu> run the tests
+shamsu> what did you just create?
+```
+
 SHAMSU answers basic workspace questions with local tools before calling a
 model:
 
@@ -383,8 +393,12 @@ shamsu> how does project spec work?
 ```
 
 If an index exists, SHAMSU uses real indexed search for project-aware answers.
-If no index exists, SHAMSU still handles general local chat and only asks for
-`index` when the prompt is clearly workspace-specific.
+If no index exists, SHAMSU still handles general local chat through the
+stateful local agent loop and only asks for `index` when the prompt is clearly
+workspace-specific.
+
+Slash commands are always routed locally. Unknown slash commands such as
+`/inde` are rejected locally with suggestions and are never sent to the LLM.
 
 ### `models status|pull|repair`
 
@@ -500,6 +514,8 @@ Workspace sandbox:
 Local AI runtime:
 
 - SHAMSU only allows LLM calls to `localhost`, `127.0.0.1`, or `::1`.
+- Natural agent chat uses Ollama's local Python SDK and native tool-calling
+  API.
 - Runtime status is stored in repo-local `.shamsu/runtime.json`.
 - Required model checks use Ollama's local CLI and local HTTP API.
 - Setup-time downloads require installer approval or `-Yes`/`--yes`.
@@ -515,6 +531,18 @@ Internal command execution:
 - Captured command output is redacted before it is returned.
 - This runner is available internally for future workflows such as tests and
   patch validation. It is not exposed as a general REPL command yet.
+
+Stateful agent loop:
+
+- `ChatState` appends `system`, `user`, `assistant`, and `tool` messages in
+  order and stores them in the active workspace session log.
+- The ReAct loop exposes `list_files`, `read_file`, `write_file`,
+  `run_command`, and `search_index` to Ollama.
+- File writes and commands still go through workspace sandboxing and approval
+  gates.
+- If a small model returns a markdown code block instead of a native tool call,
+  SHAMSU can save it through the same approved `write_file` path when the
+  target file is unambiguous.
 
 Internal patch review:
 

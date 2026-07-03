@@ -36,35 +36,18 @@ function Install-ShamsuLauncher {
     $CmdLauncher = Join-Path $ResolvedBinDir "shamsu.cmd"
     $EscapedRunScript = $RunScript.Replace("'", "''")
     $PsContent = @"
-[CmdletBinding()]
-param(
-    [Parameter(ValueFromPipeline = `$true)]
-    [string]`$InputObject,
-    [Parameter(ValueFromRemainingArguments = `$true)]
-    [string[]]`$ShamsuArgs
-)
+`$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+`$RunScript = '$EscapedRunScript'
+`$Workspace = (Get-Location).Path
+`$ShamsuArgs = `$args
+`$PipedInput = @(`$input)
 
-begin {
-    `$ErrorActionPreference = "Stop"
-    Set-StrictMode -Version Latest
-    `$RunScript = '$EscapedRunScript'
-    `$PipedInput = [System.Collections.Generic.List[string]]::new()
+if (`$PipedInput.Count -gt 0) {
+    & `$RunScript -Workspace `$Workspace -InputObject (`$PipedInput -join [Environment]::NewLine) @ShamsuArgs
 }
-
-process {
-    if (`$null -ne `$InputObject) {
-        `$PipedInput.Add(`$InputObject)
-    }
-}
-
-end {
-    `$Workspace = (Get-Location).Path
-    if (`$PipedInput.Count -gt 0) {
-        & `$RunScript -Workspace `$Workspace -InputObject (`$PipedInput -join [Environment]::NewLine) @ShamsuArgs
-    }
-    else {
-        & `$RunScript -Workspace `$Workspace @ShamsuArgs
-    }
+else {
+    & `$RunScript -Workspace `$Workspace @ShamsuArgs
 }
 "@
 
@@ -96,6 +79,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "
         Write-Host ""
         Write-Host "Or add this directory to PATH yourself if you want plain 'shamsu':"
         Write-Host "  $ResolvedBinDir"
+    }
+    else {
+        $ResolvedLauncher = [System.IO.Path]::GetFullPath($CmdLauncher)
+        $ExistingCommand = Get-Command shamsu -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($ExistingCommand -and ([System.IO.Path]::GetFullPath($ExistingCommand.Source) -ine $ResolvedLauncher)) {
+            Write-Host ""
+            Write-Warning "Plain 'shamsu' currently resolves to a different command:"
+            Write-Host "  $($ExistingCommand.Source)"
+            Write-Host "Run this launcher directly, or move $ResolvedBinDir earlier in PATH:"
+            Write-Host "  & `"$PsLauncher`""
+        }
     }
 }
 

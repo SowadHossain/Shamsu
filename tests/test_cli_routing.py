@@ -106,6 +106,12 @@ def test_normalize_command_input_strips_leading_slash():
     assert repl._normalize_command_input("hello there") == "hello there"
 
 
+def test_react_prompt_detects_file_and_command_requests():
+    assert repl._looks_like_react_prompt("create hello.py")
+    assert repl._looks_like_react_prompt("run the tests")
+    assert not repl._looks_like_react_prompt("explain this repo")
+
+
 def test_slash_command_completer_suggests_system_commands():
     completer = repl.SlashCommandCompleter()
 

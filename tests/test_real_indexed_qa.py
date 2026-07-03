@@ -80,27 +80,26 @@ def test_repl_greeting_prints_ready_message_without_model_qa(tmp_path):
     assert "Context Preview" not in rendered
 
 
-def test_repl_general_chat_without_index_uses_local_chat(monkeypatch, tmp_path):
+def test_repl_general_chat_without_index_uses_agent_loop(monkeypatch, tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
 
-    class FakeLLM:
-        def __init__(self, session_logger=None):
+    class FakeAgentChatLoop:
+        def __init__(self, workspace, session_logger=None):
+            assert workspace == tmp_path
             self.session_logger = session_logger
 
-        async def run_specialist(self, specialist, pack):
-            assert specialist == "qa"
-            assert pack.task_id == "general-chat"
-            assert "No indexed project context" in pack.prd_context
-            return LLMResponse(raw="General answer", model_used="fake-qwen")
+        async def run(self, user_input):
+            assert "what is recursion?" in user_input
+            return type("Result", (), {"final": "General answer"})()
 
-    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+    monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
 
     asyncio.run(_handle_request("what is recursion?", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
     assert "General answer" in rendered
-    assert "Chat (fake-qwen)" in rendered
+    assert "Agent" in rendered
     assert "No index found" not in rendered
     assert "intent=qa" not in rendered
 

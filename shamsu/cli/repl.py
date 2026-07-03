@@ -27,11 +27,13 @@ from rich.table import Table
 
 from shamsu.agents.audit_workflow import AuditWorkflow
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
+from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
+from shamsu.cli.command_router import CommandRouter
 from shamsu.agents.qa_workflow import QAWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
@@ -1016,6 +1018,9 @@ async def _handle_request(
             session_logger=session_logger,
         )
         return
+    if _looks_like_react_prompt(effective_input):
+        await _run_agent_chat(effective_input, workspace, console, session_logger=session_logger)
+        return
     if _looks_like_django_generation_request(effective_input):
         generate_command = f"generate-django {_extract_prd_path_from_prompt(effective_input)}"
         _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
@@ -1030,7 +1035,12 @@ async def _handle_request(
         decision = _keyword_decision(effective_input)
         if decision.intent in {"qa", "explain"}:
             if _is_general_chat_prompt(effective_input):
-                await _run_general_chat(effective_input, console, llm, extra_context=agent_context, session_logger=session_logger)
+                await _run_agent_chat(
+                    _append_agent_context(effective_input, agent_context),
+                    workspace,
+                    console,
+                    session_logger=session_logger,
+                )
             else:
                 console.print(
                     "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
@@ -1055,7 +1065,15 @@ async def _handle_request(
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
-            await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger)
+            if _is_general_chat_prompt(effective_input):
+                await _run_agent_chat(
+                    _append_agent_context(effective_input, agent_context),
+                    workspace,
+                    console,
+                    session_logger=session_logger,
+                )
+            else:
+                await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger)
         elif decision.intent == "code_edit":
             await _run_code_edit(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
@@ -1477,6 +1495,18 @@ async def _run_general_chat(
     _log_assistant_message(session_logger, body, workflow_id="general-chat")
 
 
+async def _run_agent_chat(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    result = await AgentChatLoop(workspace, session_logger=session_logger).run(user_input)
+    body = result.final.strip() or "No response returned."
+    console.print(Panel(body, title="Agent"))
+    _log_assistant_message(session_logger, body, workflow_id="agent-chat")
+
+
 async def _run_web_assist(
     user_input: str,
     console: Console,
@@ -1693,6 +1723,27 @@ def _is_general_chat_prompt(user_input: str) -> bool:
 
 def _is_project_local_prompt(text: str) -> bool:
     return not _is_general_chat_prompt(text)
+
+
+def _looks_like_react_prompt(user_input: str) -> bool:
+    text = user_input.lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "create file",
+            "create a file",
+            "write file",
+            "write a file",
+            "save as ",
+            "run command",
+            "run this command",
+            "run the tests",
+            "run tests",
+            "what did you just",
+            "what did you make",
+            "what did you create",
+        )
+    ) or bool(re.search(r"\b(create|write|make)\s+[\w./\\ -]+\.[A-Za-z0-9_]+\b", user_input, re.I))
 
 
 def _print_ready_message(workspace: Path, console: Console) -> None:
@@ -1945,6 +1996,7 @@ def main(argv: list[str] | None = None) -> None:
     web_tool = WebTool(session_logger=session_logger)
     browser_tool = BrowserTool(workspace, session_logger=session_logger)
     session = _make_prompt_session(workspace)
+    command_router = CommandRouter(SYSTEM_COMMANDS)
 
     while True:
         try:
@@ -1958,11 +2010,6 @@ def main(argv: list[str] | None = None) -> None:
 
         if not user_input:
             continue
-        normalized_input = _normalize_command_input(user_input)
-        lowered_input = normalized_input.lower()
-        if lowered_input in {"exit", "quit"}:
-            print("Goodbye.")
-            break
         previous_user_prompt = session_logger.metadata.last_user_prompt
         session_logger.log(
             "user.prompt",
@@ -1970,6 +2017,20 @@ def main(argv: list[str] | None = None) -> None:
             "User submitted prompt",
             workflow_id="repl",
         )
+        if user_input.startswith("/"):
+            route = command_router.route(user_input)
+            if not route.valid:
+                console.print(f"[red]{route.error}[/red]")
+                if route.suggestions:
+                    console.print("Did you mean: " + ", ".join(route.suggestions))
+                continue
+            normalized_input = route.normalized
+        else:
+            normalized_input = _normalize_command_input(user_input)
+        lowered_input = normalized_input.lower()
+        if lowered_input in {"exit", "quit"}:
+            print("Goodbye.")
+            break
         if lowered_input == "help":
             _print_help(console)
             continue
