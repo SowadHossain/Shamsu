@@ -13,8 +13,7 @@ Current baseline:
   template constants, command runner, patch validation, and Rich patch preview
   are complete.
 - Current verified state: `183 passed`, `ruff check shamsu tests scripts` clean.
-- Next implementation focus: remaining Milestone 6 status/log/progress, release docs,
-  final safety audit, and release cut.
+- Next implementation focus: release PR from `release/mvp` into `main`.
 
 ## Already Done - Do Not Create Issues
 
@@ -113,6 +112,10 @@ Do not create new GitHub issues for them unless a bug/regression is found.
   targets, and raw generated form controls.
 - [x] Dirty-worktree edit warnings are complete locally before edit/fix/test-gen/docs
   workflows; this safely salvages the useful part of stale PR #53.
+- [x] MVP release docs are complete locally on `release/mvp`: README reflects
+  `generate-prd`, generated-project setup/test/fix helpers, current safety
+  boundaries, and current verification count; `CHANGELOG.md` and `DEMO.md`
+  capture the MVP release notes and walkthrough.
 
 The issue list below starts from remaining work only.
 
@@ -920,7 +923,8 @@ Reapply useful audit coverage onto a fresh branch from `develop`.
 
 ### Issue 40: MVP Release Cut
 
-Status: blocked until issues #33, #34, #38, and #39 are complete and merged.
+Status: in release cut on `release/mvp`; keep GitHub issue open until the PR
+into `main` merges.
 
 - Owner: Dev A
 - Labels: `owner:dev-a`, `type:hardening`, `priority:p0`
