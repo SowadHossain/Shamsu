@@ -132,6 +132,14 @@ when the SHAMSU manifest says SHAMSU added it. If the directory was already on
 PATH before install, uninstall leaves it alone. Bash install still prints the
 exact direct command and PATH note instead of editing shell startup files.
 
+The Windows installer broadcasts an environment refresh after updating user
+PATH, but already-open terminal tabs can still have stale PATH values. If a
+current terminal does not recognize `shamsu`, open a new terminal or run:
+
+```cmd
+set "PATH=%USERPROFILE%\.shamsu\bin;%PATH%"
+```
+
 ## Run SHAMSU Safely
 
 SHAMSU treats the selected workspace as the project boundary. Indexes and

@@ -49,6 +49,43 @@ function Test-PathContainsEntry {
     return $false
 }
 
+function Send-EnvironmentChangeNotice {
+    $TypeName = "Shamsu.NativeMethods"
+    if (-not ($TypeName -as [type])) {
+        Add-Type -Namespace Shamsu -Name NativeMethods -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError=true, CharSet=System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessageTimeout(
+    System.IntPtr hWnd,
+    uint Msg,
+    System.IntPtr wParam,
+    string lParam,
+    uint fuFlags,
+    uint uTimeout,
+    out System.IntPtr lpdwResult);
+"@
+    }
+    $HWND_BROADCAST = [IntPtr]0xffff
+    $WM_SETTINGCHANGE = 0x001A
+    $SMTO_ABORTIFHUNG = 0x0002
+    $Result = [IntPtr]::Zero
+    [Shamsu.NativeMethods]::SendMessageTimeout(
+        $HWND_BROADCAST,
+        $WM_SETTINGCHANGE,
+        [IntPtr]::Zero,
+        "Environment",
+        $SMTO_ABORTIFHUNG,
+        5000,
+        [ref]$Result
+    ) | Out-Null
+}
+
+function Add-ProcessPathEntry {
+    param([string]$PathEntry)
+    if (-not (Test-PathContainsEntry -PathValue $env:PATH -PathEntry $PathEntry)) {
+        $env:PATH = "$PathEntry$([IO.Path]::PathSeparator)$env:PATH"
+    }
+}
+
 function Add-ShamsuUserPath {
     param([string]$BinDir)
 
@@ -59,12 +96,28 @@ function Add-ShamsuUserPath {
 
     $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
     if (Test-PathContainsEntry -PathValue $UserPath -PathEntry $ResolvedBinDir) {
+        $AddedByShamsu = $false
+        $ShamsuLaunchersExist = (Test-Path (Join-Path $ResolvedBinDir "shamsu.ps1")) -and (Test-Path (Join-Path $ResolvedBinDir "shamsu.cmd"))
+        if (Test-Path $ManifestPath) {
+            try {
+                $ExistingManifest = Get-Content $ManifestPath -Raw | ConvertFrom-Json
+                $AddedByShamsu = [bool]$ExistingManifest.added_by_shamsu -or $ShamsuLaunchersExist
+            }
+            catch {
+                $AddedByShamsu = $ShamsuLaunchersExist
+            }
+        }
+        else {
+            $AddedByShamsu = $ShamsuLaunchersExist
+        }
         $Manifest = @{
             managed_by = "SHAMSU"
             path_entry = $ResolvedBinDir
-            added_by_shamsu = $false
+            added_by_shamsu = $AddedByShamsu
         }
         Set-Content -Path $ManifestPath -Value ($Manifest | ConvertTo-Json -Depth 4) -Encoding UTF8
+        Add-ProcessPathEntry -PathEntry $ResolvedBinDir
+        Send-EnvironmentChangeNotice
         Write-Host "SHAMSU launcher directory is already present in user PATH."
         return
     }
@@ -76,7 +129,8 @@ function Add-ShamsuUserPath {
         "$ResolvedBinDir$([IO.Path]::PathSeparator)$UserPath"
     }
     [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
-    $env:PATH = "$ResolvedBinDir$([IO.Path]::PathSeparator)$env:PATH"
+    Add-ProcessPathEntry -PathEntry $ResolvedBinDir
+    Send-EnvironmentChangeNotice
 
     $Manifest = @{
         managed_by = "SHAMSU"
@@ -136,7 +190,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "
     Write-Host "  $PsLauncher"
     Write-Host "  $CmdLauncher"
 
-    $OnPath = Test-PathContainsEntry -PathValue $env:PATH -PathEntry $ResolvedBinDir
+    $PathForCheck = $env:PATH
+    if ($WillUpdatePath) {
+        $PathForCheck = "$PathForCheck$([IO.Path]::PathSeparator)$([Environment]::GetEnvironmentVariable("PATH", "User"))"
+    }
+    $OnPath = Test-PathContainsEntry -PathValue $PathForCheck -PathEntry $ResolvedBinDir
     $script:LauncherOnPath = $OnPath
 
     if (-not $OnPath -and $WillUpdatePath) {

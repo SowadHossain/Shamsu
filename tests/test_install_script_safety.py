@@ -89,6 +89,7 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert "Plain 'shamsu' currently resolves to a different command" in ps1
     assert "Add $BinDir to PATH if you want plain 'shamsu'" in ps1
     assert "Add-ShamsuUserPath" in ps1
+    assert "Send-EnvironmentChangeNotice" in ps1
     assert "path.json" in ps1
     assert "did not edit your PowerShell profile, registry, or global Python" in ps1
 
