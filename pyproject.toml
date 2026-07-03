@@ -35,6 +35,7 @@ dependencies = [
     "psutil>=5.9",
     "watchdog>=4.0",
     "playwright>=1.54",
+    "trafilatura>=1.12",
 
     # Keyword extraction (near-zero RAM, no model)
     "yake>=0.4.8",

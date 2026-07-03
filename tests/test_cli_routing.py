@@ -128,6 +128,15 @@ def test_slash_command_completer_suggests_web_and_browser_commands():
     assert "/browse screenshot" in browse_texts
 
 
+def test_slash_command_completer_suggests_at_files(tmp_path):
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    completer = repl.SlashCommandCompleter(tmp_path)
+
+    texts = [item.text for item in completer.get_completions(Document("@REA"), None)]
+
+    assert texts == ["@README.md"]
+
+
 def test_web_needed_prompt_detects_external_docs_requests():
     assert repl._looks_like_web_needed_prompt("look up the latest Django auth docs")
     assert repl._looks_like_web_needed_prompt("whats the weather today?")

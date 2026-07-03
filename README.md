@@ -241,6 +241,26 @@ shamsu> write a short status update for my team
 shamsu> brainstorm names for a budgeting app
 ```
 
+SHAMSU answers basic workspace questions with local tools before calling a
+model:
+
+```text
+shamsu> what folder are you in?
+shamsu> what files do I have here?
+shamsu> what PRD files are in this repo?
+```
+
+Attach files or folders to a prompt with `@`:
+
+```text
+shamsu> summarize @README.md
+shamsu> explain how @shamsu/cli/repl.py handles sessions
+shamsu> update the docs using @"agent context/PROGRESS.md"
+```
+
+`@` paths are validated against the active workspace sandbox. SHAMSU will not
+read files outside that workspace.
+
 SHAMSU can also decide on its own when to ask for web or browser access:
 
 ```text
@@ -386,9 +406,13 @@ error.
 SHAMSU stays local-first, but if a prompt clearly needs external or current
 information it can ask permission to search the web automatically.
 
+For underspecified current-information prompts, SHAMSU asks for missing details
+first. For example, weather requests need a location before web lookup.
+
 Optional explicit commands:
 
 ```text
+shamsu> what is the weather in Dhaka today?
 shamsu> /web search latest Django auth docs
 shamsu> /web open https://docs.djangoproject.com/
 ```
@@ -480,7 +504,7 @@ Local AI runtime:
 - Required model checks use Ollama's local CLI and local HTTP API.
 - Setup-time downloads require installer approval or `-Yes`/`--yes`.
 - Runtime inference does not call cloud AI endpoints.
-- The default router/chat model is `gemma3:4b`.
+- The default router/chat/planner model is `qwen3:8b`; `gemma3:4b` remains the low-resource fallback option.
 
 Internal command execution:
 

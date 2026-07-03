@@ -4,7 +4,7 @@ from pathlib import Path
 
 from shamsu.session.manager import SessionManager
 from shamsu.tools.browser import BrowserTool
-from shamsu.tools.web import WebTool
+from shamsu.tools.web import WebFetchResult, WebTool
 
 
 def test_web_tool_denied_search_skips_network(tmp_path, monkeypatch):
@@ -22,6 +22,22 @@ def test_web_tool_denied_search_skips_network(tmp_path, monkeypatch):
     assert not result.approved
     assert not called
     assert "denied" in result.error.lower()
+
+
+def test_web_tool_logs_central_approval_result(tmp_path, monkeypatch):
+    logger = SessionManager(tmp_path).create_session("Web")
+
+    def fake_client():
+        raise AssertionError("network should not be called")
+
+    tool = WebTool(approval_func=lambda _request: False, session_logger=logger)
+    monkeypatch.setattr(tool, "_client", fake_client)
+
+    tool.search("latest django docs")
+
+    event_types = [event["event_type"] for event in logger.tail(10)]
+    assert "approval.request" in event_types
+    assert "approval.result" in event_types
 
 
 def test_web_tool_search_parses_results(monkeypatch):
@@ -77,3 +93,15 @@ def test_browser_tool_logs_screenshot_event(tmp_path, monkeypatch):
     assert result.ok
     assert "browser.screenshot" in events
     assert result.screenshot_path.endswith(".png")
+
+
+def test_web_fetch_result_shape_for_useful_page():
+    result = WebFetchResult(
+        approved=True,
+        url="https://example.com",
+        title="Example",
+        text="Useful content " * 20,
+    )
+
+    assert result.approved
+    assert len(result.text) > 120

@@ -8,8 +8,10 @@ from typing import Callable
 from urllib.parse import quote_plus, urlparse
 
 import httpx
+import trafilatura
 
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
 
@@ -48,6 +50,7 @@ class WebTool:
         timeout_seconds: int = 15,
     ) -> None:
         self.approval_func = approval_func
+        self.approval_manager = ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
         self.timeout_seconds = timeout_seconds
 
@@ -60,7 +63,8 @@ class WebTool:
             reason=reason or "This request appears to need external knowledge.",
         )
         self._log("web.search.requested", {"query": query, "reason": reason}, f"Requested web search: {query}")
-        if not self.approval_func(request):
+        self.approval_manager.session_logger = self.session_logger
+        if not self.approval_manager.ask(request):
             self._log("web.search.denied", {"query": query}, f"Denied web search: {query}")
             return WebSearchResult(approved=False, query=query, error="Web search denied by user.")
 
@@ -92,7 +96,8 @@ class WebTool:
             reason=reason or "SHAMSU wants to inspect an external page for this request.",
         )
         self._log("web.fetch.requested", {"url": url, "reason": reason}, f"Requested fetch: {url}")
-        if not self.approval_func(request):
+        self.approval_manager.session_logger = self.session_logger
+        if not self.approval_manager.ask(request):
             self._log("web.fetch.denied", {"url": url}, f"Denied fetch: {url}")
             return WebFetchResult(approved=False, url=url, error="Web fetch denied by user.")
 
@@ -100,10 +105,20 @@ class WebTool:
         try:
             response = self._client().get(url, headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=True)
             response.raise_for_status()
-            parser = _VisibleTextParser()
-            parser.feed(response.text)
-            text = parser.text()[:8000]
-            title = parser.title.strip() or _hostname(url)
+            extracted = trafilatura.extract(
+                response.text,
+                url=str(response.url),
+                include_comments=False,
+                include_tables=False,
+                favor_precision=True,
+            )
+            title_parser = _VisibleTextParser()
+            title_parser.feed(response.text)
+            if extracted:
+                text = _normalize_space(extracted)[:8000]
+            else:
+                text = title_parser.text()[:8000]
+            title = title_parser.title.strip() or _hostname(url)
             self._log("web.fetch.finished", {"url": url, "title": title}, f"Finished fetch: {url}")
             return WebFetchResult(approved=True, url=str(response.url), title=title, text=text)
         except Exception as exc:

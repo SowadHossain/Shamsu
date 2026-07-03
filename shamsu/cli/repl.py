@@ -31,6 +31,7 @@ from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
+from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.agents.qa_workflow import QAWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
@@ -58,6 +59,7 @@ from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
+from shamsu.tools.workspace import WorkspaceTool
 from shamsu.types import ApprovalRequest, ContextPack, ProjectSpec, RoutingDecision, SearchResult
 
 if sys.platform == "win32":
@@ -120,8 +122,17 @@ SYSTEM_COMMANDS = (
 
 
 class SlashCommandCompleter(Completer):
+    def __init__(self, workspace: Path | None = None) -> None:
+        self.workspace = workspace
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+        token = text.rsplit(maxsplit=1)[-1] if text.strip() else text
+        if token.startswith("@") and self.workspace is not None:
+            prefix = token[1:]
+            for suggestion in WorkspaceTool(self.workspace).mention_suggestions(prefix):
+                yield Completion(suggestion, start_position=-len(token))
+            return
         if not text.startswith("/"):
             return
         lowered = text.lower()
@@ -942,6 +953,26 @@ def _log_event(
         session_logger.log(event_type, payload, summary, workflow_id=workflow_id)
 
 
+def _log_assistant_message(
+    session_logger: SessionLogger | None,
+    message: str,
+    workflow_id: str | None = None,
+) -> None:
+    if session_logger and message:
+        session_logger.log(
+            "assistant.message",
+            {"message": message},
+            "Assistant responded",
+            workflow_id=workflow_id,
+        )
+
+
+def _append_agent_context(user_input: str, agent_context: str) -> str:
+    if not agent_context:
+        return user_input
+    return f"{user_input}\n\nAdditional SHAMSU context:\n{agent_context}"
+
+
 async def _handle_request(
     user_input: str,
     workspace: Path,
@@ -951,9 +982,18 @@ async def _handle_request(
     previous_user_prompt: str = "",
     session_logger: SessionLogger | None = None,
 ) -> None:
-    effective_input = _expand_followup_prompt(user_input, previous_user_prompt)
+    agent_result = AgentOrchestrator(workspace, session_logger=session_logger).run(user_input)
+    effective_input = agent_result.effective_input or user_input
+    if session_logger is None:
+        effective_input = _expand_followup_prompt(effective_input, previous_user_prompt)
+    agent_context = agent_result.context
+    if agent_result.handled:
+        console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
+        _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
+        return
     if _is_casual_prompt(user_input):
         _print_ready_message(workspace, console)
+        _log_assistant_message(session_logger, "SHAMSU is ready.", workflow_id="agent")
         return
     if _looks_like_workspace_location_prompt(effective_input):
         _print_workspace_location(workspace, console)
@@ -968,7 +1008,13 @@ async def _handle_request(
         await _run_browser_assist(effective_input, console, llm=LLMManager(session_logger=session_logger), browser_tool=browser_tool)
         return
     if _looks_like_web_needed_prompt(effective_input):
-        await _run_web_assist(effective_input, console, llm=LLMManager(session_logger=session_logger), web_tool=web_tool)
+        await _run_web_assist(
+            effective_input,
+            console,
+            llm=LLMManager(session_logger=session_logger),
+            web_tool=web_tool,
+            session_logger=session_logger,
+        )
         return
     if _looks_like_django_generation_request(effective_input):
         generate_command = f"generate-django {_extract_prd_path_from_prompt(effective_input)}"
@@ -984,7 +1030,7 @@ async def _handle_request(
         decision = _keyword_decision(effective_input)
         if decision.intent in {"qa", "explain"}:
             if _is_general_chat_prompt(effective_input):
-                await _run_general_chat(effective_input, console, llm)
+                await _run_general_chat(effective_input, console, llm, extra_context=agent_context, session_logger=session_logger)
             else:
                 console.print(
                     "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
@@ -1009,17 +1055,17 @@ async def _handle_request(
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
-            await _run_qa(effective_input, workspace, console, llm)
+            await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger)
         elif decision.intent == "code_edit":
-            await _run_code_edit(effective_input, workspace, search, console, llm, session_logger)
+            await _run_code_edit(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
-            await _run_bug_fix(effective_input, workspace, search, console, llm, session_logger)
+            await _run_bug_fix(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
-            await _run_audit(effective_input, search, console, llm)
+            await _run_audit(_append_agent_context(effective_input, agent_context), search, console, llm)
         elif decision.intent == "test_gen":
-            await _run_test_generation(effective_input, workspace, search, console, llm, session_logger)
+            await _run_test_generation(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
         elif decision.intent == "doc_gen":
-            await _run_docs(effective_input, workspace, search, console, llm, session_logger)
+            await _run_docs(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
         else:
             console.print("[yellow]Project generation is not wired into this CLI yet.[/yellow]")
         _log_event(
@@ -1389,12 +1435,16 @@ async def _run_qa(
     workspace: Path,
     console: Console,
     llm: LLMManager,
+    extra_context: str = "",
+    session_logger: SessionLogger | None = None,
 ) -> None:
     qa_workflow, _uses_real_index = _build_workspace_qa_workflow(workspace)
-    result = await Coordinator(llm=llm, qa_workflow=qa_workflow).handle(user_input)
+    request = _append_agent_context(user_input, extra_context)
+    result = await Coordinator(llm=llm, qa_workflow=qa_workflow).handle(request)
     if result.answer:
         title = f"Answer ({result.model_used})" if result.model_used else "Answer"
         console.print(Panel(result.answer, title=title))
+        _log_assistant_message(session_logger, result.answer, workflow_id="qa")
     elif result.fallback_reason:
         console.print(f"[yellow]{result.fallback_reason}[/yellow]")
     if result.preview and _preview_contains_context(result.preview):
@@ -1406,6 +1456,7 @@ async def _run_general_chat(
     console: Console,
     llm: LLMManager,
     extra_context: str = "",
+    session_logger: SessionLogger | None = None,
 ) -> None:
     pack = ContextPack(
         task_id="general-chat",
@@ -1421,7 +1472,9 @@ async def _run_general_chat(
     )
     response = await llm.run_specialist("qa", pack)
     title = f"Chat ({response.model_used})" if response.model_used else "Chat"
-    console.print(Panel(response.raw.strip(), title=title))
+    body = response.raw.strip()
+    console.print(Panel(body, title=title))
+    _log_assistant_message(session_logger, body, workflow_id="general-chat")
 
 
 async def _run_web_assist(
@@ -1429,6 +1482,7 @@ async def _run_web_assist(
     console: Console,
     llm: LLMManager,
     web_tool: WebTool,
+    session_logger: SessionLogger | None = None,
 ) -> None:
     result = web_tool.search(
         user_input,
@@ -1461,9 +1515,9 @@ async def _run_web_assist(
             hit.url,
             reason="SHAMSU wants to read the matching page to answer your question accurately.",
         )
-        if fetch.approved and not fetch.error:
+        if fetch.approved and not fetch.error and _is_useful_web_fetch(fetch):
             fetches.append(fetch)
-    await _print_web_answer(user_input, result, fetches, console, llm)
+    await _print_web_answer(user_input, result, fetches, console, llm, session_logger=session_logger)
 
 
 async def _run_browser_assist(
@@ -1515,6 +1569,7 @@ async def _print_web_answer(
     fetches: list[WebFetchResult],
     console: Console,
     llm: LLMManager,
+    session_logger: SessionLogger | None = None,
 ) -> None:
     if result.error:
         console.print(f"[yellow]Web search failed: {result.error}[/yellow]")
@@ -1533,7 +1588,8 @@ async def _print_web_answer(
             specialist="qa",
             user_request=query,
             prd_context=(
-                "Use these web sources to answer. Cite the sources by URL in a brief source list.\n\n"
+                "Answer the user's question first. Use these web sources. "
+                "Cite the sources by URL in a brief source list.\n\n"
                 f"{context}"
             ),
         )
@@ -1542,7 +1598,21 @@ async def _print_web_answer(
     else:
         body = "\n".join(f"- {hit.title}\n  {hit.url}" for hit in result.hits[:5])
     sources = "\n".join(f"- {hit.title}: {hit.url}" for hit in result.hits[:5])
-    console.print(Panel(f"{body}\n\nSources:\n{sources}", title="Web Answer"))
+    message = f"{body}\n\nSources:\n{sources}"
+    console.print(Panel(message, title="Web Answer"))
+    _log_assistant_message(session_logger, message, workflow_id="web")
+
+
+def _is_useful_web_fetch(fetch: WebFetchResult) -> bool:
+    text = fetch.text.strip()
+    if len(text) < 120:
+        return False
+    lowered = text.lower()
+    navigation_markers = sum(
+        marker in lowered
+        for marker in ("cookie", "subscribe", "sign in", "menu", "advertisement")
+    )
+    return navigation_markers < 4
 
 
 def _print_web_fetch(fetch: WebFetchResult, console: Console) -> None:
@@ -1845,7 +1915,7 @@ def _make_prompt_session(workspace: Path) -> PromptSession | None:
         return PromptSession(
             history=InMemoryHistory(),
             style=style,
-            completer=SlashCommandCompleter(),
+            completer=SlashCommandCompleter(workspace),
             complete_while_typing=True,
             bottom_toolbar=f"Workspace: {workspace} | /help | /index | /exit",
         )

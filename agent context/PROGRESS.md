@@ -6,9 +6,9 @@ blocker.
 
 ## Current State
 
-- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, general no-index local chat, guided in-chat runtime repair prompt, uninstall scripts, autonomous web lookup, Playwright browser debugging hooks, and smarter local/web/browser routing complete.
-- Tests: `198 passed`
-- Lint: `python -m ruff check shamsu tests` passes.
+- Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, general no-index local chat, guided in-chat runtime repair prompt, uninstall scripts, autonomous web lookup, Playwright browser debugging hooks, smarter local/web/browser routing, agent orchestrator memory/context, workspace file tools, `@file` context, central approval logging, cleaner web extraction, and `qwen3:8b` main model routing complete.
+- Tests: `225 passed`
+- Lint: `python -m ruff check shamsu tests scripts` passes.
 - Last verified: 2026-07-03
 - Current next focus: finish remaining Milestone 6 Dev C status/log/progress, release docs, final safety audit, then release cut.
 
@@ -111,7 +111,12 @@ blocker.
 - [x] Added uninstall scripts for Windows and Bash that remove SHAMSU-managed repo state and user-local launchers without touching Ollama or other workspace `.shamsu` folders.
 - [x] Added automatic permission-gated web lookup routing plus explicit `/web` commands for external/current questions.
 - [x] Added Playwright-backed browser tooling and explicit `/browse` commands for local app preview and debugging flows.
-- [x] Replaced `phi3:mini` with `gemma3:4b` for router/chat/planner/docs/summarizer and taught installers to install Playwright Chromium support.
+- [x] Added `AgentOrchestrator` that injects workspace facts, conversation memory, available tools, and `@file` context before model routing.
+- [x] Added durable session-based conversation memory for follow-up prompts like "check on the web", "open it", and "do that".
+- [x] Added read-only workspace tools for file listing, PRD discovery, file reads, folder summaries, and prompt-toolkit `@` path autocomplete.
+- [x] Added central `ApprovalManager` logging for permission-gated web, browser, command, and patch actions.
+- [x] Improved web page extraction with `trafilatura`, useful-page filtering, source summaries, and location clarification for weather prompts.
+- [x] Replaced `phi3:mini`/`gemma3:4b` primary routing with `qwen3:8b` for router/chat/planner/docs/summarizer, keeping `gemma3:4b` as a low-resource fallback option and teaching installers to install Playwright Chromium support.
 
 ## In Progress
 
@@ -141,7 +146,7 @@ blocker.
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest tests/ -q
-.\.venv\Scripts\python.exe -m ruff check shamsu tests
+.\.venv\Scripts\python.exe -m ruff check shamsu tests scripts
 .\scripts\run-shamsu.ps1
 ```
 

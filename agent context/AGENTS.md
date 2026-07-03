@@ -6,8 +6,8 @@ This file is the quick-start context for agents working in this repository.
 
 - Repo path: `F:\Work\PROJECTS\shamsu\Shamsu`
 - Remote: `https://github.com/SowadHossain/Shamsu.git`
-- Current branch: `main`
-- Current state: Day-1 scaffold unpacked, installed, and extended with the first dev-plan slice.
+- Current branch: feature/hardening branches target `develop`; do not push directly to `main`.
+- Current state: local-first coding agent with workspace indexing, PRD planning/generation, Django generation/test/fix loops, session logging/resume, one-command install, permission-gated web/browser tools, agent orchestrator memory, workspace file tools, and `@file` context.
 - Existing source documents:
   - `agent context/REQUIREMENTS.md`: full product requirements for SHAMSU.
   - `agent context/SHAMSU_week2_milestone_v2.md`: v0.2.0 implementation milestone focused on PRD-to-Django project generation.
@@ -146,6 +146,9 @@ The system is safety-first by design:
 - Redact secrets in logs and summaries.
 - Do not send private project source code to external web services.
 - Log file modifications and command executions.
+- Answer local workspace questions with deterministic tools before calling an LLM.
+- Resolve `@file` and `@folder` mentions through the workspace sandbox only.
+- Preserve recent conversation turns so follow-up prompts inherit the right context.
 
 ## Practical Next Implementation Path
 
@@ -182,6 +185,11 @@ Completed first slice:
 - `patch/engine.py` validates unified diffs, checks hunk structure and counts, and rejects unsafe patch paths.
 - `patch/preview.py` renders Rich patch summaries and colorized diff previews.
 - `LLMManager`, `CommandRunner`, `PatchEngine`, and `DjangoProjectWriter` accept an optional `SessionLogger` and keep normal behavior unchanged when no logger is passed.
+- `agents/orchestrator.py` is the main pre-routing agent layer for workspace facts, conversation memory, `@file` context, and deterministic local tool answers.
+- `session/memory.py` builds compact conversation context from session JSONL events.
+- `tools/workspace.py` provides read-only workspace listing, file reading, PRD discovery, and `@` mention resolution.
+- `safety/approval_manager.py` centralizes approval request/result logging.
+- The primary local router/chat/planner model is now `qwen3:8b`; `gemma3:4b` is a low-resource fallback option.
 
 Recommended next slice:
 
@@ -244,7 +252,7 @@ git status --short --branch
 git log --oneline -5
 rg -n "^(#|##|###) " "agent context"
 python -m pytest tests/ -v
-python -m ruff check shamsu tests
+python -m ruff check shamsu tests scripts
 python -m shamsu.indexer.walker
 .\scripts\install.ps1
 .\scripts\run-shamsu.ps1

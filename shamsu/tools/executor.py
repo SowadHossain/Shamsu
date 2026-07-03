@@ -10,6 +10,7 @@ from pathlib import Path
 
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
@@ -32,6 +33,7 @@ class CommandRunner(ICommandRunner):
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
+        self.approval_manager = ApprovalManager(approval_func, session_logger)
         self.timeout_seconds = timeout_seconds
         self.session_logger = session_logger
 
@@ -75,7 +77,8 @@ class CommandRunner(ICommandRunner):
                 working_dir=str(validated_cwd),
                 reason="Command is medium risk or unknown.",
             )
-            if not self.approval_func(request):
+            self.approval_manager.session_logger = self.session_logger
+            if not self.approval_manager.ask(request):
                 if self.session_logger:
                     self.session_logger.log(
                         "command.denied",

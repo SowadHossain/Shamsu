@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from shamsu.indexer.walker import FileWalker
 from shamsu.interfaces import IPatchEngine
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
@@ -93,6 +94,7 @@ class PatchEngine(IPatchEngine):
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
+        self.approval_manager = ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
 
     def validate_diff(self, diff_text: str) -> tuple[bool, str | None]:
@@ -123,12 +125,10 @@ class PatchEngine(IPatchEngine):
             reason="Patch application modifies files inside the selected workspace.",
         )
         self._log("patch.preview", {"files": [patch.display_path for patch in patches]}, request.description)
-        self._log("approval.request", {"request": request}, request.description)
-        if not self.approval_func(request):
-            self._log("approval.result", {"approved": False}, "Patch approval denied")
+        self.approval_manager.session_logger = self.session_logger
+        if not self.approval_manager.ask(request):
             self._log("patch.denied", {"files": [patch.display_path for patch in patches]}, "Patch denied")
             return False
-        self._log("approval.result", {"approved": True}, "Patch approval granted")
 
         backups: dict[Path, Path] = {}
         created_files: list[Path] = []

@@ -9,6 +9,7 @@ from typing import Callable, Any
 import httpx
 
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
@@ -47,6 +48,7 @@ class BrowserTool:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
+        self.approval_manager = ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
         self._playwright_ctx = None
         self._browser = None
@@ -195,7 +197,8 @@ class BrowserTool:
             reason=reason,
         )
         self._log("browser.approval.requested", {"preview": preview, "reason": reason}, description)
-        approved = self.approval_func(request)
+        self.approval_manager.session_logger = self.session_logger
+        approved = self.approval_manager.ask(request)
         self._log("browser.approval.result", {"preview": preview, "approved": approved}, f"Browser approval result: {approved}")
         return approved
 
