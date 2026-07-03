@@ -73,7 +73,7 @@ def test_handle_parse_prd_reports_outside_workspace(tmp_path):
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=100)
 
-    def test_handle_parse_prd_reports_outside_workspace(tmp_path):
+   def test_handle_parse_prd_reports_outside_workspace(tmp_path):
     outside = tmp_path.parent / "OUTSIDE_PRD.md"
     outside.write_text("# Outside\n", encoding="utf-8")
     output = StringIO()
