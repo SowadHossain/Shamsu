@@ -75,6 +75,6 @@ def test_handle_parse_prd_reports_outside_workspace(tmp_path):
 
     try:
         _handle_parse_prd(f'parse-prd "{outside}"', tmp_path, console)
-        assert "outside workspace" in output.getvalue()
+        assert "outside \nworkspace" in output.getvalue()
     finally:
         outside.unlink(missing_ok=True)
