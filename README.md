@@ -29,7 +29,12 @@ Working now:
 - `ProjectSpec` assembly from PRDs
 - PRD plan preview/approval and generation resume state
 - Deterministic Django fixed templates and backend generators
-- Approval-backed Django project writer and backend consistency checker
+- Approval-backed Django project writer and backend/frontend consistency checks
+- Full PRD-to-Django pipeline with generated-project setup, migrations, tests,
+  and error feedback loop
+- Deterministic generated Django README and `SHAMSU_SUMMARY.md`
+- Todo, Expense Tracker, and Blog PRD fixtures for integration coverage
+- MVP benchmark report for representative runtime and peak memory
 - QA, code-edit, bug-fix, audit, test-generation, and documentation workflows
 - Claude-like prompt loop with local model routing and keyword fallback
 - Workspace-local sessions, resume, redacted event logs, and export bundles
@@ -41,12 +46,14 @@ Working now:
 - Approval-backed patch apply/rollback with post-patch re-indexing
 - Agent progress tracking in `agent context/PROGRESS.md`
 
-Planned next:
+Still intentionally limited:
 
-- Frontend page/template generation
-- Generated-project dependency install, migrations, and tests
-- Error feedback loop for generated-project failures
-- Full PRD-to-Django pipeline orchestration
+- SHAMSU generates Django MVP projects, but this is not yet a polished visual
+  app builder.
+- It uses deterministic generation first; local LLM repair/refinement remains
+  bounded by the installed Ollama models.
+- Runtime execution is still local workspace automation, not Docker or full OS
+  isolation.
 
 ## Requirements
 
@@ -208,6 +215,10 @@ symbols <name>
 parse-prd <file.md>
 plan-prd <file.md|file.txt|file.pdf>
 generate-django <file.md|file.txt|file.pdf>
+generate-prd <file.md|file.txt|file.pdf> --output <dir>
+django setup [project-dir]
+django test [project-dir]
+django fix-tests [project-dir]
 models status
 models pull
 models repair
@@ -294,6 +305,39 @@ consistency checks.
 ```text
 shamsu> generate-django TODO_PRD.md
 ```
+
+### `generate-prd <file> --output <dir>`
+
+Runs the full MVP pipeline:
+
+1. Parse the PRD.
+2. Build a `ProjectSpec`.
+3. Generate Django project files.
+4. Run static backend and frontend consistency checks.
+5. Install generated requirements and run migrations through guarded command
+   execution.
+6. Run generated Django tests.
+7. Invoke the bug-fix feedback loop when tests fail.
+8. Write generated-project docs and `SHAMSU_SUMMARY.md`.
+
+```text
+shamsu> generate-prd TODO_PRD.md --output generated_todo
+```
+
+### `django setup|test|fix-tests`
+
+Generated-project helpers run inside the selected workspace only:
+
+```text
+shamsu> django setup generated_todo
+shamsu> django test generated_todo
+shamsu> django fix-tests generated_todo
+```
+
+`django setup` installs the generated project's requirements and runs
+`makemigrations`/`migrate` through the guarded command runner. `django test`
+runs the generated Django test suite. `django fix-tests` runs tests, sends
+failures into the bug-fix workflow, applies approved patches, and retries.
 
 ### Sessions And Logs
 
@@ -385,7 +429,7 @@ Run lint:
 Expected current result:
 
 ```text
-152 passed
+183 passed
 All checks passed!
 ```
 
@@ -410,6 +454,8 @@ Workspace sandbox:
 
 - The CLI resolves one workspace at startup.
 - `parse-prd` validates file paths with `Sandbox.validate()`.
+- Project generation, session logs, generated summaries, command cwd values,
+  and patch paths are validated against the workspace boundary.
 - Paths outside the workspace are rejected.
 - Index data stays inside `<workspace>/.shamsu/`.
 - Session logs and exports stay inside `<workspace>/.shamsu/sessions/`.
@@ -429,8 +475,8 @@ Internal command execution:
 - Blocked commands are rejected without approval or execution.
 - Medium-risk and unknown commands require approval.
 - Captured command output is redacted before it is returned.
-- This runner is available internally for future workflows such as tests and
-  patch validation. It is not exposed as a general REPL command yet.
+- This runner is available internally for generated-project setup, migrations,
+  tests, and patch validation. It is not exposed as a general REPL command.
 
 Internal patch review:
 
