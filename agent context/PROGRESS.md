@@ -7,7 +7,7 @@ blocker.
 ## Current State
 
 - Status: Milestone 4 implemented locally on top of `develop`; Day 1 scaffold complete; Day 2 indexing/PRD extraction complete; deterministic Django template and ProjectSpec slice complete; install/run scripts, safer workspace CLI, internal command runner, patch validation/preview, patch apply/rollback, post-patch re-indexing, read-only git tooling, code edit workflow, real indexed QA fallback, live QA integration, audit workflow, documentation proposal/apply workflow, bug fix workflow, test generation workflow, CLI workflow routing, native local Ollama runtime bootstrap, TXT/PDF PRD input, PRD extractor v2, project plan preview/approval, generation resume state, deterministic Django backend generation, approval-backed project writer, backend consistency checker, workspace-local session logging/resume, M5 generated-project setup/test/fix loop, M6 full pipeline fixtures/benchmark/docs, Dev A frontend consistency checking, dirty-worktree edit warnings, Windows-safe Ollama model pull/repair decoding, single-command install with user-local launchers, managed user PATH install/uninstall, general no-index local chat, guided in-chat runtime repair prompt, uninstall scripts, autonomous web lookup, Playwright browser debugging hooks, smarter local/web/browser routing, agent orchestrator memory/context, workspace file tools, `@file` context, central approval logging, cleaner web extraction, `qwen3:8b` main model routing, stateful Ollama ReAct loop, markdown file-write fallback, and slash-command hardening complete.
-- Tests: `232 passed`
+- Tests: `233 passed`
 - Lint: `python -m ruff check shamsu tests scripts` passes.
 - Last verified: 2026-07-03
 - Current next focus: finish remaining Milestone 6 Dev C status/log/progress, release docs, final safety audit, then release cut.
@@ -72,6 +72,7 @@ blocker.
 - [x] Added native local runtime management for Ollama detection, local-only status, model checks/pulls, runtime config, and REPL `models status|pull|repair` commands.
 - [x] Extended install scripts with safe runtime bootstrap flags while avoiding PowerShell profile, registry, shell startup files, and global Python edits.
 - [x] Added managed Windows user PATH setup for `$HOME\.shamsu\bin` with a SHAMSU-owned manifest so uninstall removes only entries SHAMSU added.
+- [x] Added safe Ollama-down handling in the ReAct chat loop so a stopped local runtime returns a `/models repair` message instead of crashing the REPL.
 - [x] Added unified PRD input parsing for Markdown, TXT, and PDF files.
 - [x] Added friendly PRD parse errors for unsupported and empty/unreadable PDF inputs.
 - [x] Extended PRD extraction for relationships, auth user references, choices, optional fields, decimals, booleans, text fields, max length, and defaults.

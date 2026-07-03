@@ -65,13 +65,18 @@ class AgentChatLoop:
     async def run(self, user_input: str) -> AgentLoopResult:
         self.state.append_user(user_input)
         for round_index in range(self.max_tool_rounds):
-            response = await self.client.chat(
-                model=self.model_name,
-                messages=self.state.messages(),
-                tools=self.tools.tool_schemas(),
-                stream=False,
-                options={"temperature": 0.1, "num_ctx": 8192},
-            )
+            try:
+                response = await self.client.chat(
+                    model=self.model_name,
+                    messages=self.state.messages(),
+                    tools=self.tools.tool_schemas(),
+                    stream=False,
+                    options={"temperature": 0.1, "num_ctx": 8192},
+                )
+            except Exception as exc:
+                final = _friendly_ollama_error(exc)
+                self.state.append_assistant(final)
+                return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
             message = _message_from_response(response)
             content = str(_get(message, "content", "") or "")
             tool_calls = _tool_calls_from_message(message)
@@ -98,6 +103,22 @@ class AgentChatLoop:
 
 def _system_prompt(workspace: Path) -> str:
     return f"{AGENT_SYSTEM_PROMPT}\nWorkspace: {workspace}\n"
+
+
+def _friendly_ollama_error(exc: Exception) -> str:
+    message = str(exc).strip()
+    lowered = message.lower()
+    if "connect" in lowered or "connection" in lowered or "not running" in lowered:
+        return (
+            "Local AI is unavailable because Ollama is not running. "
+            "Run `/models repair` to start/repair the local runtime, then try again."
+        )
+    if "model" in lowered and ("not found" in lowered or "pull" in lowered):
+        return (
+            "The required local model is missing. "
+            "Run `/models pull` to download missing models, then try again."
+        )
+    return f"Local AI failed safely: {message or exc.__class__.__name__}"
 
 
 def _message_from_response(response: Any) -> Any:

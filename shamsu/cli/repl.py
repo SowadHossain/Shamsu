@@ -1065,7 +1065,7 @@ async def _handle_request(
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
-            if _is_general_chat_prompt(effective_input):
+            if _is_general_chat_prompt(effective_input) and not uses_real_index:
                 await _run_agent_chat(
                     _append_agent_context(effective_input, agent_context),
                     workspace,

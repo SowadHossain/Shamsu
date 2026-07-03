@@ -20,6 +20,16 @@ class FakeOllamaClient:
         return self.responses.pop(0)
 
 
+class FailingOllamaClient:
+    def __init__(self, exc: Exception):
+        self.exc = exc
+        self.calls = []
+
+    async def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        raise self.exc
+
+
 def test_chat_state_appends_messages_in_order(tmp_path):
     state = ChatState("system", hydrate=False)
 
@@ -86,6 +96,18 @@ async def test_agent_chat_loop_markdown_fallback_writes_file(tmp_path):
     assert result.final == "Created fallback.py."
     assert (tmp_path / "fallback.py").read_text(encoding="utf-8") == "print('fallback')\n"
     assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_handles_ollama_connection_failure(tmp_path):
+    client = FailingOllamaClient(ConnectionError("Failed to connect to Ollama"))
+
+    result = await AgentChatLoop(tmp_path, client=client).run("hhhhhhhhhhh")
+
+    assert result.stopped
+    assert "/models repair" in result.final
+    assert "Ollama is not running" in result.final
+    assert len(client.calls) == 1
 
 
 def test_agent_tool_registry_blocks_dangerous_command(tmp_path):
