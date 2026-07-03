@@ -993,10 +993,6 @@ async def _handle_request(
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
         return
-    if _is_casual_prompt(user_input):
-        _print_ready_message(workspace, console)
-        _log_assistant_message(session_logger, "SHAMSU is ready.", workflow_id="agent")
-        return
     if _looks_like_workspace_location_prompt(effective_input):
         _print_workspace_location(workspace, console)
         return
@@ -1035,8 +1031,11 @@ async def _handle_request(
         decision = _keyword_decision(effective_input)
         if decision.intent in {"qa", "explain"}:
             if _is_general_chat_prompt(effective_input):
+                chat_input = effective_input
+                if not _is_casual_prompt(effective_input):
+                    chat_input = _append_agent_context(effective_input, agent_context)
                 await _run_agent_chat(
-                    _append_agent_context(effective_input, agent_context),
+                    chat_input,
                     workspace,
                     console,
                     session_logger=session_logger,

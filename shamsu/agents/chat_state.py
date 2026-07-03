@@ -81,24 +81,31 @@ class ChatState:
             payload = event.get("payload", {})
             if event.get("event_type") == "chat.message":
                 role = str(payload.get("role", "")).strip()
-                if role in {"user", "assistant", "tool"}:
+                content = str(payload.get("content", ""))
+                if role in {"user", "assistant", "tool"} and _should_hydrate_chat_message(role, content):
                     self._append(
                         ChatMessage(
                             role=role,
-                            content=str(payload.get("content", "")),
+                            content=content,
                             tool_call_id=str(payload.get("tool_call_id", "")),
                             name=str(payload.get("name", "")),
                             tool_calls=_list_of_dicts(payload.get("tool_calls", [])),
                         ),
                         persist=False,
                     )
-            elif event.get("event_type") == "assistant.message":
-                message = str(payload.get("message", "")).strip()
-                if message:
-                    self._append(ChatMessage("assistant", message), persist=False)
-
 
 def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
     return [item for item in value if isinstance(item, dict)]
+
+
+def _should_hydrate_chat_message(role: str, content: str) -> bool:
+    if role != "assistant":
+        return True
+    normalized = " ".join(content.strip().lower().split())
+    blocked_status_messages = {
+        "shamsu is ready.",
+        "shamsu is ready",
+    }
+    return normalized not in blocked_status_messages

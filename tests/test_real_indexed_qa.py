@@ -66,15 +66,24 @@ def test_repl_request_reports_missing_index_without_stub_preview(tmp_path):
     assert "stub/example.py" not in rendered
 
 
-def test_repl_greeting_prints_ready_message_without_model_qa(tmp_path):
+def test_repl_greeting_uses_agent_chat_without_index(monkeypatch, tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
+
+    class FakeAgentChatLoop:
+        def __init__(self, workspace, session_logger=None):
+            assert workspace == tmp_path
+
+        async def run(self, user_input):
+            assert user_input == "hi"
+            return type("Result", (), {"final": "Hey, I am here."})()
+
+    monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
 
     asyncio.run(_handle_request("hi", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
-    assert "SHAMSU is ready" in rendered
-    assert "Workspace:" in rendered
+    assert "Hey, I am here." in rendered
     assert "intent=qa" not in rendered
     assert "No index found" not in rendered
     assert "Context Preview" not in rendered

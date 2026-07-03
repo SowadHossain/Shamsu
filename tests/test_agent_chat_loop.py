@@ -45,6 +45,35 @@ def test_chat_state_appends_messages_in_order(tmp_path):
     ]
 
 
+def test_chat_state_hydrates_only_chat_messages():
+    class FakeLogger:
+        def tail(self, count=80):
+            return [
+                {
+                    "event_type": "assistant.message",
+                    "payload": {"message": "SHAMSU is ready."},
+                },
+                {
+                    "event_type": "chat.message",
+                    "payload": {"role": "assistant", "content": "SHAMSU is ready."},
+                },
+                {
+                    "event_type": "chat.message",
+                    "payload": {"role": "user", "content": "hello"},
+                },
+                {
+                    "event_type": "chat.message",
+                    "payload": {"role": "assistant", "content": "Hey."},
+                },
+            ]
+
+    state = ChatState("system", session_logger=FakeLogger())
+
+    contents = [message["content"] for message in state.messages()]
+    assert "SHAMSU is ready." not in contents
+    assert contents == ["system", "hello", "Hey."]
+
+
 @pytest.mark.asyncio
 async def test_agent_chat_loop_executes_native_write_file_tool(tmp_path):
     client = FakeOllamaClient(
