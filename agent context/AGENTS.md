@@ -7,7 +7,7 @@ This file is the quick-start context for agents working in this repository.
 - Repo path: `F:\Work\PROJECTS\shamsu\Shamsu`
 - Remote: `https://github.com/SowadHossain/Shamsu.git`
 - Current branch: feature/hardening branches target `develop`; do not push directly to `main`.
-- Current state: local-first coding agent with workspace indexing, PRD planning/generation, Django generation/test/fix loops, session logging/resume, one-command install, permission-gated web/browser tools, agent orchestrator memory, workspace file tools, `@file` context, and a stateful Ollama ReAct loop for direct tools.
+- Current state: local-first coding agent with workspace indexing, PRD planning/generation, Django generation/test/fix loops, session logging/resume, one-command install with managed user PATH setup/uninstall, permission-gated web/browser tools, agent orchestrator memory, workspace file tools, `@file` context, and a stateful Ollama ReAct loop for direct tools.
 - Existing source documents:
   - `agent context/REQUIREMENTS.md`: full product requirements for SHAMSU.
   - `agent context/SHAMSU_week2_milestone_v2.md`: v0.2.0 implementation milestone focused on PRD-to-Django project generation.

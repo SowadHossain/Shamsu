@@ -4,6 +4,7 @@ param(
     [switch]$SkipOllamaInstall,
     [switch]$SkipModels,
     [switch]$SkipCommandInstall,
+    [switch]$SkipPathUpdate,
     [string]$BinDir = (Join-Path $HOME ".shamsu\bin"),
     [string]$ModelsPath = ""
 )
@@ -18,11 +19,81 @@ $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 $RunScript = Join-Path $RepoRoot "scripts\run-shamsu.ps1"
 $InstalledLauncher = ""
 $LauncherOnPath = $false
+$PathManifest = Join-Path (Split-Path $BinDir -Parent) "path.json"
+
+function Normalize-PathEntry {
+    param([string]$PathEntry)
+    if (-not $PathEntry) {
+        return ""
+    }
+    $Expanded = [Environment]::ExpandEnvironmentVariables($PathEntry.Trim())
+    try {
+        return [System.IO.Path]::GetFullPath($Expanded).TrimEnd('\')
+    }
+    catch {
+        return $Expanded.TrimEnd('\')
+    }
+}
+
+function Test-PathContainsEntry {
+    param(
+        [string]$PathValue,
+        [string]$PathEntry
+    )
+    $Needle = Normalize-PathEntry $PathEntry
+    foreach ($entry in ($PathValue -split [IO.Path]::PathSeparator)) {
+        if ((Normalize-PathEntry $entry) -ieq $Needle) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Add-ShamsuUserPath {
+    param([string]$BinDir)
+
+    $ResolvedBinDir = Normalize-PathEntry $BinDir
+    $StateDir = Split-Path $ResolvedBinDir -Parent
+    $ManifestPath = Join-Path $StateDir "path.json"
+    New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
+
+    $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
+    if (Test-PathContainsEntry -PathValue $UserPath -PathEntry $ResolvedBinDir) {
+        $Manifest = @{
+            managed_by = "SHAMSU"
+            path_entry = $ResolvedBinDir
+            added_by_shamsu = $false
+        }
+        Set-Content -Path $ManifestPath -Value ($Manifest | ConvertTo-Json -Depth 4) -Encoding UTF8
+        Write-Host "SHAMSU launcher directory is already present in user PATH."
+        return
+    }
+
+    $NewPath = if ([string]::IsNullOrWhiteSpace($UserPath)) {
+        $ResolvedBinDir
+    }
+    else {
+        "$ResolvedBinDir$([IO.Path]::PathSeparator)$UserPath"
+    }
+    [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+    $env:PATH = "$ResolvedBinDir$([IO.Path]::PathSeparator)$env:PATH"
+
+    $Manifest = @{
+        managed_by = "SHAMSU"
+        path_entry = $ResolvedBinDir
+        added_by_shamsu = $true
+    }
+    Set-Content -Path $ManifestPath -Value ($Manifest | ConvertTo-Json -Depth 4) -Encoding UTF8
+    Write-Host "Added SHAMSU launcher directory to user PATH:"
+    Write-Host "  $ResolvedBinDir"
+    Write-Host "Open a new terminal for Windows to refresh PATH everywhere."
+}
 
 function Install-ShamsuLauncher {
     param(
         [string]$BinDir,
-        [string]$RunScript
+        [string]$RunScript,
+        [bool]$WillUpdatePath = $false
     )
 
     if (-not (Test-Path $RunScript)) {
@@ -65,13 +136,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "
     Write-Host "  $PsLauncher"
     Write-Host "  $CmdLauncher"
 
-    $PathEntries = [Environment]::GetEnvironmentVariable("PATH", "Process") -split [IO.Path]::PathSeparator
-    $OnPath = $PathEntries | Where-Object {
-        $_ -and ([System.IO.Path]::GetFullPath($_) -ieq $ResolvedBinDir)
-    }
-    $script:LauncherOnPath = [bool]$OnPath
+    $OnPath = Test-PathContainsEntry -PathValue $env:PATH -PathEntry $ResolvedBinDir
+    $script:LauncherOnPath = $OnPath
 
-    if (-not $OnPath) {
+    if (-not $OnPath -and $WillUpdatePath) {
+        Write-Host ""
+        Write-Host "Launcher directory will be added to your user PATH by this install:"
+        Write-Host "  $ResolvedBinDir"
+    }
+    elseif (-not $OnPath) {
         Write-Host ""
         Write-Host "Launcher directory is not on PATH for the current shell."
         Write-Host "Run directly with:"
@@ -146,12 +219,16 @@ try {
     & $VenvPython -m shamsu.runtime.ollama write-config
 
     if (-not $SkipCommandInstall) {
-        Install-ShamsuLauncher -BinDir $BinDir -RunScript $RunScript
+        Install-ShamsuLauncher -BinDir $BinDir -RunScript $RunScript -WillUpdatePath (-not $SkipPathUpdate)
+        if (-not $SkipPathUpdate) {
+            Add-ShamsuUserPath -BinDir $BinDir
+            $LauncherOnPath = $true
+        }
     }
 
     Write-Host ""
     Write-Host "Install complete."
-    Write-Host "SHAMSU did not edit your PowerShell profile, PATH, registry, or global Python."
+    Write-Host "SHAMSU did not edit your PowerShell profile, registry, or global Python."
     Write-Host "Run from any workspace with:"
     if ($SkipCommandInstall) {
         Write-Host "  & `"$RepoRoot\scripts\run-shamsu.ps1`""

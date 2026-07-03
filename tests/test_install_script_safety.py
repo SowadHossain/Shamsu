@@ -6,7 +6,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_install_scripts_do_not_edit_shell_profiles_or_path():
+def test_install_scripts_do_not_edit_shell_profiles_registry_or_global_python():
     scripts = [
         REPO_ROOT / "scripts" / "install.ps1",
         REPO_ROOT / "scripts" / "install.sh",
@@ -17,7 +17,6 @@ def test_install_scripts_do_not_edit_shell_profiles_or_path():
     ]
     forbidden = [
         "$PROFILE",
-        "SetEnvironmentVariable",
         "setx ",
         "reg add",
         ">> ~/.bashrc",
@@ -41,6 +40,7 @@ def test_install_scripts_expose_safe_runtime_flags():
     assert "$SkipOllamaInstall" in ps1
     assert "$SkipModels" in ps1
     assert "$SkipCommandInstall" in ps1
+    assert "$SkipPathUpdate" in ps1
     assert "$BinDir" in ps1
     assert "$ModelsPath" in ps1
     assert "--yes" in sh
@@ -88,7 +88,9 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert "$LauncherOnPath" in ps1
     assert "Plain 'shamsu' currently resolves to a different command" in ps1
     assert "Add $BinDir to PATH if you want plain 'shamsu'" in ps1
-    assert "did not edit your PowerShell profile, PATH, registry, or global Python" in ps1
+    assert "Add-ShamsuUserPath" in ps1
+    assert "path.json" in ps1
+    assert "did not edit your PowerShell profile, registry, or global Python" in ps1
 
     assert "scripts/run-shamsu.sh" in sh
     assert 'exec "${RUN_SCRIPT}" "\\$@"' in sh
@@ -107,9 +109,11 @@ def test_uninstall_scripts_remove_only_shamsu_managed_files():
     assert ".shamsu" in ps1
     assert "shamsu.ps1" in ps1
     assert "shamsu.cmd" in ps1
+    assert "Remove-ShamsuUserPath" in ps1
+    assert "added_by_shamsu" in ps1
+    assert "path.json" in ps1
     assert "did not remove Ollama" in ps1
     assert "$PROFILE" not in ps1
-    assert "SetEnvironmentVariable" not in ps1
 
     assert ".venv" in sh
     assert ".shamsu" in sh

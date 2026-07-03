@@ -67,8 +67,9 @@ The recommended install uses a repo-local virtual environment:
 - Creates `.venv/` inside this repository
 - Installs SHAMSU into that `.venv`
 - Installs a user-local `shamsu` launcher
+- Adds the launcher directory to your user PATH on Windows, unless skipped
 - Does not install packages into global Python
-- Does not edit PATH, shell profiles, registry, or system files
+- Does not edit shell profiles, registry, or system files
 
 This is dependency isolation plus SHAMSU's workspace sandbox. It is not a full
 Docker or OS-level sandbox.
@@ -108,23 +109,28 @@ Installer flags:
 -SkipOllamaInstall / --skip-ollama-install
 -SkipModels / --skip-models
 -SkipCommandInstall / --skip-command-install
+-SkipPathUpdate
 -BinDir <path> / --bin-dir <path>
 -ModelsPath <path> / --models-path <path>
 ```
 
 The installer may download Ollama and model weights when approved. SHAMSU itself
-does not edit your PowerShell profile, PATH, registry, shell startup files, or
-global Python. If Ollama's official installer makes normal app/service entries,
-that is Ollama's installer behavior, not extra SHAMSU configuration.
+does not edit your PowerShell profile, registry, shell startup files, or global
+Python. On Windows, it can add only the SHAMSU launcher directory to your user
+PATH and records that in `$HOME\.shamsu\path.json`. If Ollama's official
+installer makes normal app/service entries, that is Ollama's installer behavior,
+not extra SHAMSU configuration.
 
 The installer also writes user-local launcher files:
 
 - Windows default: `$HOME\.shamsu\bin\shamsu.ps1` and `shamsu.cmd`
 - Linux/macOS default: `$HOME/.local/bin/shamsu`
 
-It does not edit PATH, shell profiles, registry, global Python, or system
-Python. If the bin directory is not already on PATH, the installer prints the
-exact direct command and the directory you can add manually.
+Windows install prepends `$HOME\.shamsu\bin` to your user PATH so `shamsu`
+wins over any stale global Python script. Uninstall removes that PATH entry only
+when the SHAMSU manifest says SHAMSU added it. If the directory was already on
+PATH before install, uninstall leaves it alone. Bash install still prints the
+exact direct command and PATH note instead of editing shell startup files.
 
 ## Run SHAMSU Safely
 
@@ -501,7 +507,9 @@ Dependency isolation:
 
 - Install scripts use only `.venv/`.
 - No global `pip install`.
-- No PATH or shell profile edits.
+- No shell profile edits.
+- Windows user PATH changes are limited to the SHAMSU launcher directory and
+  tracked in `$HOME\.shamsu\path.json` for safe uninstall.
 
 Workspace sandbox:
 
