@@ -15,6 +15,16 @@ from shamsu.llm.manager import LLMManager
 from shamsu.retriever.search import SearchAgentStub
 from shamsu.types import ContextPack
 
+NO_LIVE_TOOLS_NOTICE = (
+    "Answer using ONLY the workspace context already provided above (file listings, "
+    "code snippets, and conversation). Those workspace files ARE available to you as "
+    "context — do NOT claim you 'cannot access files'; read and use what is shown. "
+    "In this reply you cannot fetch new data or run tools, so if the question needs "
+    "real-time external info (weather, news, prices) or an action beyond answering "
+    "from the given context, say so briefly. Never claim you searched the web, ran "
+    "code, or edited files unless a tool result is actually shown."
+)
+
 
 @dataclass
 class QAPreview:
@@ -48,6 +58,7 @@ class QAWorkflow:
             step_id=1,
             specialist="qa",
         )
+        pack.prd_context = NO_LIVE_TOOLS_NOTICE
         return QAPreview(pack=pack, prompt=LLMManager._format_pack(pack))
 
     async def answer(

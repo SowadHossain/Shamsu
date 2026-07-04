@@ -16,6 +16,30 @@ class PRDParseError(Exception):
 
 SUPPORTED_PRD_EXTENSIONS = {".md", ".markdown", ".txt", ".pdf"}
 
+# Phrases (beyond the bare "prd" acronym) that mark a file as a PRD by name.
+# "prd" itself is matched as a plain substring — it is a rare letter sequence
+# in real words, so this keeps names like `myprd.md` while not matching
+# ordinary words (e.g. "upward" has no "prd" substring).
+_PRD_NAME_PHRASES = (
+    "prd",
+    "product requirements",
+    "product requirement",
+    "requirements document",
+)
+
+
+def is_prd_filename(name: str) -> bool:
+    """True if a filename looks like a PRD (by extension + name heuristics).
+
+    Recognizes both the `prd` acronym and spelled-out names like
+    `Product Requirements Document.pdf` that contain no literal "prd".
+    """
+    lowered = name.lower()
+    if Path(lowered).suffix not in SUPPORTED_PRD_EXTENSIONS:
+        return False
+    stem = Path(lowered).stem
+    return any(phrase in stem for phrase in _PRD_NAME_PHRASES)
+
 
 class PRDInputParser:
     def parse(self, file_path: Path) -> ParsedPRD:

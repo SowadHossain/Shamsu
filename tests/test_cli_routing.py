@@ -41,6 +41,54 @@ class FakeLLM:
         return LLMResponse(raw="", model_used="fake")
 
 
+class StreamingFakeLLM:
+    """A fake manager that streams tokens, like the real LLMManager."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self.tokens = tokens
+
+    async def run_specialist_stream(self, specialist, pack, on_token):
+        for token in self.tokens:
+            on_token(token)
+        return LLMResponse(raw="".join(self.tokens), model_used="fake-stream")
+
+    async def run_specialist(self, specialist, pack):  # pragma: no cover - not reached
+        return LLMResponse(raw="".join(self.tokens), model_used="fake-stream")
+
+
+def test_run_qa_streams_tokens_to_console(tmp_path):
+    console, output = _console_output()
+
+    asyncio.run(
+        repl._run_qa(
+            "how does auth work?",
+            tmp_path,
+            console,
+            StreamingFakeLLM(["Auth ", "works ", "like this."]),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Answer" in rendered
+    assert "Auth works like this." in rendered
+
+
+def test_run_general_chat_streams_tokens_to_console(tmp_path):
+    console, output = _console_output()
+
+    asyncio.run(
+        repl._run_general_chat(
+            "hi there",
+            console,
+            StreamingFakeLLM(["Hey", "!"]),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Chat" in rendered
+    assert "Hey!" in rendered
+
+
 class FakeCodeEditWorkflow:
     def __init__(self, workspace_root: Path, search, llm=None) -> None:
         self.workspace_root = workspace_root
@@ -147,6 +195,108 @@ def test_web_needed_prompt_detects_external_docs_requests():
     assert repl._looks_like_web_needed_prompt("look up the latest Django auth docs")
     assert repl._looks_like_web_needed_prompt("whats the weather today?")
     assert not repl._looks_like_web_needed_prompt("how does auth work in this repo?")
+
+
+def test_is_prd_filename_matches_spelled_out_and_acronym_names():
+    from shamsu.prd.input import is_prd_filename
+
+    assert is_prd_filename("Product Requirements Document.pdf")
+    assert is_prd_filename("myprd.md")
+    assert is_prd_filename("PRD.txt")
+    assert is_prd_filename("requirements document.md")
+    assert not is_prd_filename("notes.txt")
+    assert not is_prd_filename("upward.md")
+    assert not is_prd_filename("report.pdf")
+    assert not is_prd_filename("game.py")  # unsupported extension
+
+
+def test_prd_build_request_fires_on_build_phrasing_with_a_workspace_prd(tmp_path):
+    (tmp_path / "Product Requirements Document.md").write_text(
+        "# Cube Runner\n\n## Milestone 1: Setup\n", encoding="utf-8"
+    )
+
+    assert repl._looks_like_prd_build_request("build me the product from this prd", tmp_path)
+    # Works even without the literal word "prd" because a single PRD file exists.
+    assert repl._looks_like_prd_build_request("finish the product please", tmp_path)
+
+
+def test_prd_build_request_does_not_fire_on_narrow_or_casual_prompts(tmp_path):
+    (tmp_path / "Product Requirements Document.md").write_text("# X\n", encoding="utf-8")
+
+    assert not repl._looks_like_prd_build_request("build the navbar", tmp_path)
+    assert not repl._looks_like_prd_build_request("hola", tmp_path)
+    assert not repl._looks_like_prd_build_request("how does auth work?", tmp_path)
+
+
+def test_vague_action_request_detects_imperatives_but_not_questions():
+    for imperative in ("do the task", "do it", "continue", "go", "build it", "keep going", "finish it"):
+        assert repl._looks_like_vague_action_request(imperative), imperative
+    for question in ("how does auth work?", "what files do i have here?", "hi there",
+                     "explain the payment module in detail please"):
+        assert not repl._looks_like_vague_action_request(question), question
+
+
+def test_action_request_catches_imperatives_beyond_the_phrase_list():
+    # Real prompts that previously fell through to the tool-less QA brain and
+    # got a described-but-not-applied answer.
+    actions = (
+        "okay you should do the thing",
+        "fix the code and check the requirements and fix it",
+        "fix the collision detection",
+        "implement the game over screen",
+        "add sound effects to the game",
+        "refactor script.js",
+        "can you fix the bug in movement",
+        "review the code and correct the scoring",
+        "do the rest",
+    )
+    for prompt in actions:
+        assert repl._looks_like_action_request(prompt), prompt
+
+    # Genuine questions must still go to QA, not the agent loop.
+    questions = (
+        "how do i fix the collision bug?",
+        "what does spawnObstacles do",
+        "why is the cube spinning",
+        "is the scoring correct",
+        "explain the movement logic",
+        "does the game track high scores?",
+    )
+    for prompt in questions:
+        assert not repl._looks_like_action_request(prompt), prompt
+
+
+def test_vague_action_with_a_prd_present_routes_to_build(tmp_path):
+    # "do the task" in a workspace with exactly one PRD means "build that PRD".
+    (tmp_path / "Product Requirements Document.md").write_text(
+        "# Cube Runner\n\n## Milestones\nMilestone 1: Setup\n", encoding="utf-8"
+    )
+    assert repl._looks_like_prd_build_request("do the task", tmp_path)
+    assert repl._looks_like_prd_build_request("continue", tmp_path)
+
+
+def test_vague_action_without_a_prd_does_not_trigger_build(tmp_path):
+    # No PRD present -> not a build request (it will fall through to the agent
+    # loop, which has real tools, instead of the tool-less QA path).
+    assert not repl._looks_like_prd_build_request("do the task", tmp_path)
+
+
+def test_web_needed_prompt_tolerates_common_weather_typos():
+    """A typo like "weither" must still route to the real web-search path
+    rather than silently falling through to a tool-less chat completion
+    that has no way to actually check the weather."""
+    assert repl._looks_like_web_needed_prompt("can you check the weither today")
+    assert repl._looks_like_web_needed_prompt("whats the wheather like")
+    assert not repl._looks_like_web_needed_prompt("hola")
+    assert not repl._looks_like_web_needed_prompt("how you doin?")
+
+
+def test_qa_workflow_prompt_includes_no_live_tools_notice():
+    from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
+
+    preview = QAWorkflow(search=FakeSearch()).build_prompt("can you check the weither today")
+
+    assert NO_LIVE_TOOLS_NOTICE in preview.prompt
 
 
 def test_browser_needed_prompt_detects_local_preview_requests():

@@ -315,6 +315,96 @@ class LLMManager(ILLMManager):
             )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
 
+    async def _generate_stream(
+        self, model: str, system: str, prompt: str,
+        on_token: Callable[[str], None],
+        temperature: float = 0.1, keep_alive: str = "10m", num_ctx: int = 8192,
+    ) -> str:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "system": system,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": num_ctx,
+                "top_p": 0.9,
+                "repeat_penalty": 1.0,
+            },
+            "keep_alive": keep_alive,
+        }
+        chunks: list[str] = []
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    token = data.get("response", "")
+                    if token:
+                        chunks.append(token)
+                        on_token(token)
+                    if data.get("done"):
+                        break
+        return "".join(chunks)
+
+    async def run_specialist_stream(
+        self, specialist: str, pack: ContextPack, on_token: Callable[[str], None]
+    ) -> LLMResponse:
+        """Like run_specialist, but streams tokens to on_token as they arrive.
+
+        Falls back cleanly: the caller still gets the full text in the returned
+        LLMResponse, so a non-streaming renderer can print it after the fact.
+        """
+        model_name = OLLAMA_MODELS.get(specialist) or self.router_model
+        await self._ensure_model(model_name)
+        temp = SPECIALIST_TEMPS.get(specialist, 0.2)
+        prompt = self._format_pack(pack)
+        started = time.perf_counter()
+        if self.session_logger:
+            self.session_logger.log_context_pack(pack, workflow_id=pack.task_id)
+            self.session_logger.log(
+                "llm.request",
+                {
+                    "specialist": specialist,
+                    "model": model_name,
+                    "endpoint": self.base_url,
+                    "prompt_token_estimate": pack.token_estimate,
+                    "streaming": True,
+                },
+                f"Specialist request sent to {specialist} (streaming)",
+                workflow_id=pack.task_id,
+            )
+        try:
+            raw = await self._generate_stream(model_name, "", prompt, on_token, temperature=temp)
+        except Exception as exc:
+            if self.session_logger:
+                self.session_logger.log(
+                    "llm.error",
+                    {"specialist": specialist, "model": model_name, "error": str(exc)},
+                    f"Specialist {specialist} failed",
+                    workflow_id=pack.task_id,
+                )
+            raise
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.response",
+                {
+                    "specialist": specialist,
+                    "model": model_name,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "response_chars": len(raw),
+                    "retry_count": 0,
+                },
+                f"Specialist {specialist} returned a streamed response",
+                workflow_id=pack.task_id,
+            )
+        return LLMResponse(raw=raw, format="text", model_used=model_name)
+
     def _log_route_decision(
         self,
         decision: RoutingDecision,

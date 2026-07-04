@@ -117,7 +117,7 @@ def test_repl_greeting_uses_agent_chat_when_indexing_is_unavailable(monkeypatch,
     _fail_indexing(monkeypatch)
 
     class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None, tools=None, long_running=False):
+        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None):
             assert workspace == tmp_path
 
         async def run(self, user_input):
@@ -141,7 +141,7 @@ def test_repl_general_chat_uses_agent_loop_when_indexing_is_unavailable(monkeypa
     _fail_indexing(monkeypatch)
 
     class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None, tools=None, long_running=False):
+        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None):
             assert workspace == tmp_path
             self.session_logger = session_logger
 

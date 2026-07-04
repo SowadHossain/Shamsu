@@ -182,6 +182,66 @@ def test_ensure_model_available_forwards_progress_chunks(monkeypatch, tmp_path):
     assert chunks == ["chunk"]
 
 
+def test_no_window_flags_is_zero_off_windows(monkeypatch):
+    from shamsu.runtime import ollama
+
+    monkeypatch.setattr(ollama.sys, "platform", "linux")
+    assert ollama._no_window_flags() == 0
+
+
+def test_no_window_flags_hides_console_on_windows(monkeypatch):
+    from shamsu.runtime import ollama
+
+    monkeypatch.setattr(ollama.sys, "platform", "win32")
+    # CREATE_NO_WINDOW is a Windows-only attribute; getattr keeps this portable
+    # if the suite is ever run on a non-Windows host.
+    expected = getattr(ollama.subprocess, "CREATE_NO_WINDOW", 0)
+    if expected:
+        assert ollama._no_window_flags() == expected
+
+
+def test_ollama_list_command_hides_console_window(monkeypatch, tmp_path):
+    from shamsu.runtime import ollama
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        return type("Completed", (), {"returncode": 0, "stdout": "NAME\nphi3:mini x\n"})()
+
+    monkeypatch.setattr("shamsu.runtime.ollama.subprocess.run", fake_run)
+
+    list_installed_models(tmp_path / "ollama.exe")
+
+    assert calls[0]["creationflags"] == ollama._no_window_flags()
+
+
+def test_streaming_pull_hides_console_window(monkeypatch, tmp_path):
+    from shamsu.runtime import ollama
+
+    class FakeStdout:
+        def read(self, _size: int) -> str:
+            return ""
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def wait(self) -> int:
+            return 0
+
+    calls = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("shamsu.runtime.ollama.subprocess.Popen", fake_popen)
+
+    pull_model_streaming(tmp_path / "ollama.exe", "phi3:mini")
+
+    assert calls[0]["creationflags"] == ollama._no_window_flags()
+
+
 def test_status_text_is_friendly_for_missing_runtime():
     status = RuntimeStatus(missing_models=required_model_names())
 

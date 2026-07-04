@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -97,6 +98,7 @@ class CommandRunner(ICommandRunner):
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = redact(_as_text(exc.stdout))

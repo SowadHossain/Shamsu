@@ -17,7 +17,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from shamsu.llm.manager import OLLAMA_BASE_URL
-from shamsu.runtime.models import required_model_names
+from shamsu.runtime.models import MODEL_SPECS, required_model_names
+from shamsu.runtime.session_registry import (
+    clear_ollama_ownership,
+    live_session_pids,
+    pid_alive,
+    read_ollama_owner,
+    unregister_session,
+)
+
+_KNOWN_MODEL_NAMES = frozenset(spec.name for spec in MODEL_SPECS)
 
 HEALTH_TIMEOUT_SECONDS = 2
 
@@ -85,14 +94,24 @@ def is_ollama_running(base_url: str = OLLAMA_BASE_URL) -> bool:
         return False
 
 
-def start_ollama(ollama_path: Path) -> None:
-    subprocess.Popen(
-        [str(ollama_path), "serve"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=_creationflags(),
-    )
+def start_ollama(ollama_path: Path) -> int | None:
+    """Start ``ollama serve`` detached and return its PID (or None on failure).
+
+    The PID lets the caller record that SHAMSU *owns* this server, so the
+    last-session-exit cleanup may stop it later (a pre-existing/tray-app Ollama
+    is never started here and therefore never owned or stopped).
+    """
+    try:
+        process = subprocess.Popen(
+            [str(ollama_path), "serve"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=_creationflags(),
+        )
+    except OSError:
+        return None
+    return process.pid
 
 
 def wait_until_running(
@@ -105,6 +124,119 @@ def wait_until_running(
             return True
         time.sleep(0.5)
     return False
+
+
+def list_loaded_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
+    """Model names currently resident in the Ollama server's memory (``/api/ps``)."""
+    try:
+        with urllib.request.urlopen(
+            f"{base_url.rstrip('/')}/api/ps", timeout=HEALTH_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return []
+    names: list[str] = []
+    for entry in payload.get("models", []):
+        name = entry.get("name") or entry.get("model")
+        if name:
+            names.append(name)
+    return names
+
+
+def unload_model(model: str, base_url: str = OLLAMA_BASE_URL) -> bool:
+    """Evict a model from RAM immediately by asking Ollama for ``keep_alive=0``."""
+    data = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/generate",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10):
+            return True
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def unload_shamsu_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
+    """Unload only SHAMSU's own models that are currently loaded.
+
+    Used when the server is not SHAMSU-owned (e.g. the Windows tray app): we
+    free our footprint — notably the router model pinned with ``keep_alive=-1``
+    — without touching the server process or any unrelated model.
+    """
+    loaded = set(list_loaded_models(base_url))
+    unloaded: list[str] = []
+    for name in sorted(loaded & _KNOWN_MODEL_NAMES):
+        if unload_model(name, base_url):
+            unloaded.append(name)
+    return unloaded
+
+
+def stop_server(serve_pid: int) -> bool:
+    """Terminate a SHAMSU-started ``ollama serve`` process (and its children)."""
+    if serve_pid <= 0 or not pid_alive(serve_pid):
+        return False
+    try:
+        import psutil
+
+        proc = psutil.Process(serve_pid)
+        children = proc.children(recursive=True)
+        proc.terminate()
+        for child in children:
+            try:
+                child.terminate()
+            except psutil.Error:
+                pass
+        _, alive = psutil.wait_procs([proc, *children], timeout=5)
+        for survivor in alive:
+            try:
+                survivor.kill()
+            except psutil.Error:
+                pass
+        return True
+    except Exception:
+        try:  # pragma: no cover - psutil path is the norm
+            os.kill(serve_pid, getattr(__import__("signal"), "SIGTERM", 15))
+            return True
+        except OSError:
+            return False
+
+
+def shutdown_if_last_session(
+    self_pid: int | None = None,
+    *,
+    base_url: str = OLLAMA_BASE_URL,
+    server_stopper: Callable[[int], bool] | None = None,
+    model_unloader: Callable[[str], list[str]] | None = None,
+) -> str:
+    """Free SHAMSU's Ollama footprint when the *last* session exits.
+
+    Deregisters this session, then — only if no other live SHAMSU session
+    remains — stops the server when SHAMSU started it, otherwise unloads
+    SHAMSU's own models so the ``keep_alive=-1`` router does not stay pinned in
+    RAM. Returns a short tag for logging/tests: ``not-last``, ``stopped-server``,
+    ``unloaded`` or ``noop``. Best-effort: never raises.
+    """
+    self_pid = self_pid or os.getpid()
+    try:
+        unregister_session(self_pid)
+        if live_session_pids(exclude=self_pid):
+            return "not-last"
+        owner = read_ollama_owner()
+        serve_pid = int(owner.get("serve_pid", 0)) if owner else 0
+        if serve_pid and pid_alive(serve_pid):
+            stopper = server_stopper or stop_server
+            if stopper(serve_pid):
+                clear_ollama_ownership()
+                return "stopped-server"
+            return "noop"
+        if owner:
+            clear_ollama_ownership()
+        unloader = model_unloader or unload_shamsu_models
+        return "unloaded" if unloader(base_url) else "noop"
+    except Exception:
+        return "noop"
 
 
 def list_installed_models(ollama_path: Path) -> list[str]:
@@ -144,6 +276,7 @@ def pull_model_streaming(
         encoding="utf-8",
         errors="replace",
         env=env,
+        creationflags=_no_window_flags(),
     )
     if process.stdout:
         for chunk in iter(lambda: process.stdout.read(1), ""):
@@ -280,6 +413,20 @@ def _creationflags() -> int:
     return subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
 
 
+def _no_window_flags() -> int:
+    """Hide the console window for captured/piped subprocesses on Windows.
+
+    Distinct from `_creationflags()`, which also sets `DETACHED_PROCESS` — that
+    is only correct for the fire-and-forget `serve` process, not for calls whose
+    stdout/stderr we read (DETACHED_PROCESS interferes with pipe inheritance).
+    Without this flag, `ollama.exe` (a console app) flashes a window on every
+    invocation — and `list_installed_models` runs before every LLM call.
+    """
+    if sys.platform != "win32":
+        return 0
+    return subprocess.CREATE_NO_WINDOW
+
+
 def _run_ollama_command(
     ollama_path: Path,
     *args: str,
@@ -296,6 +443,7 @@ def _run_ollama_command(
         timeout=timeout,
         check=False,
         env=env,
+        creationflags=_no_window_flags(),
     )
 
 

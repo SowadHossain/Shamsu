@@ -10,8 +10,11 @@ from __future__ import annotations
 from rich.console import Console
 from rich.panel import Panel
 
+from shamsu.safety.approval import _pause_console_live
+
 
 def ask_clarifying_question(question: str, console: Console | None = None) -> str:
     console = console or Console()
     console.print(Panel(question, title="Need Input", border_style="cyan"))
+    _pause_console_live(console)
     return input("Your answer: ").strip()

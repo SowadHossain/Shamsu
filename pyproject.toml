@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.7",
     "instructor>=1.3",
     "json-repair>=0.25",
+    "tokenizers>=0.21",
 
     # Retrieval — zero/near-zero RAM cost (see ENGINEERING_HARNESS.md)
     "rank_bm25>=0.2",
@@ -49,8 +50,11 @@ dev = [
     "ruff>=0.4",
 ]
 
-[project.scripts]
-shamsu = "shamsu.cli.repl:main"
+# NOTE: intentionally NO [project.scripts] entry point. SHAMSU ships a managed
+# launcher at ~/.shamsu/bin (see scripts/install.*), which sets PYTHONUTF8 and
+# resolves the workspace. A pip console-script named `shamsu` would create a
+# second, competing `shamsu.exe` in .venv/Scripts and shadow the launcher when
+# the venv is on PATH. Run via the launcher or `python -m shamsu.cli.repl`.
 
 [build-system]
 requires = ["hatchling"]

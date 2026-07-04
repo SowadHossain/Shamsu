@@ -124,20 +124,24 @@ class WorkspaceTool:
         return matches
 
     def find_prds(self, limit: int = 20) -> list[Path]:
+        from shamsu.prd.input import is_prd_filename
+
         candidates = []
         for path in self._walk_files_and_dirs():
-            if path.is_file() and path.suffix.lower() in {".md", ".markdown", ".txt", ".pdf"}:
-                if "prd" in path.name.lower():
-                    candidates.append(path.relative_to(self.workspace_root))
-                    if len(candidates) >= limit:
-                        break
+            if path.is_file() and is_prd_filename(path.name):
+                candidates.append(path.relative_to(self.workspace_root))
+                if len(candidates) >= limit:
+                    break
         return sorted(candidates)
 
     def mention_suggestions(self, prefix: str, limit: int = 30) -> list[str]:
-        return [
-            f"@{path.relative_to(self.workspace_root).as_posix()}"
-            for path in self.find_files(prefix, limit=limit)
-        ]
+        suggestions: list[str] = []
+        for path in self.find_files(prefix, limit=limit):
+            rel = path.relative_to(self.workspace_root).as_posix()
+            # Quote paths with spaces so the mention regex (which stops at the
+            # first space for unquoted paths) still captures the whole name.
+            suggestions.append(f'@"{rel}"' if " " in rel else f"@{rel}")
+        return suggestions
 
     def _walk_files_and_dirs(self) -> list[Path]:
         results: list[Path] = []
@@ -182,10 +186,23 @@ class MentionResolver:
             listing = WorkspaceTool(path).list_files(limit=20).render()
             return MentionContext(mention=mention, workspace_root=self.workspace_root, path=rel, kind="folder", content=listing)
         try:
-            content = self.tool.read_file(str(rel))
+            if path.suffix.lower() == ".pdf":
+                content = self._read_pdf(path)
+            else:
+                content = self.tool.read_file(str(rel))
         except Exception as exc:
             return MentionContext(mention=mention, workspace_root=self.workspace_root, path=rel, error=str(exc))
         return MentionContext(mention=mention, workspace_root=self.workspace_root, path=rel, kind="file", content=content)
+
+    def _read_pdf(self, path: Path, max_chars: int = MAX_FILE_CHARS) -> str:
+        # Lazy import: pdf extraction (via pdfplumber) is heavy and only needed
+        # when a PDF is actually mentioned.
+        from shamsu.prd.input import parse_prd_file
+
+        text = parse_prd_file(path).raw_text
+        if len(text) > max_chars:
+            return f"{text[:max_chars]}\n... [truncated {len(text) - max_chars} chars]"
+        return text
 
 
 def render_mention_context(contexts: list[MentionContext]) -> str:

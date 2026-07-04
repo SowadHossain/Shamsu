@@ -88,6 +88,23 @@ def test_medium_risk_command_runs_when_approved(tmp_path: Path):
     assert requests
 
 
+def test_safe_command_hides_console_window(monkeypatch, tmp_path: Path):
+    import shamsu.tools.executor as executor
+
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append(kwargs)
+        return type("Completed", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(executor.subprocess, "run", fake_run)
+
+    CommandRunner(tmp_path).run("python -m pytest --version", tmp_path)
+
+    expected = executor.subprocess.CREATE_NO_WINDOW if executor.sys.platform == "win32" else 0
+    assert calls[0]["creationflags"] == expected
+
+
 def test_cwd_outside_workspace_is_rejected(tmp_path: Path):
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"

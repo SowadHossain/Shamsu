@@ -5,10 +5,11 @@ from io import StringIO
 
 from rich.console import Console
 
-from shamsu.safety.approval import ask_remember_choice
+from shamsu.safety.approval import ask_approval_menu, ask_remember_choice
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import is_auto_approvable_action
 from shamsu.safety.permission_store import PermissionMemory
+from shamsu.cli.repl import _install_console_status_tracker
 from shamsu.types import ApprovalRequest
 
 
@@ -185,6 +186,106 @@ def test_approval_manager_defaults_are_fully_backward_compatible():
 
     assert approved is True
     assert logged == ["approval.request", "approval.result"]
+
+
+def _menu_console() -> Console:
+    return Console(file=StringIO(), force_terminal=False, width=100)
+
+
+def test_ask_approval_menu_accepts_number_or_yes(monkeypatch):
+    console = _menu_console()
+    for answer in ("1", "y", "yes"):
+        monkeypatch.setattr("builtins.input", lambda _prompt="", a=answer: a)
+        approved, scope = ask_approval_menu(_request("file_write"), offer_remember=False, console=console)
+        assert approved is True
+        assert scope == "none"
+
+
+def test_ask_approval_menu_number_two_is_no_without_remember(monkeypatch):
+    console = _menu_console()
+    # Without the remember option, "2" is the No option.
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "2")
+    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
+    assert approved is False
+    assert scope == "none"
+
+
+def test_ask_approval_menu_number_two_remembers_when_offered(monkeypatch):
+    console = _menu_console()
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "2")
+    approved, scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
+    assert approved is True
+    assert scope == "workspace"
+    # With the remember option present, "3" is the No option.
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "3")
+    approved, scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
+    assert approved is False
+
+
+def test_ask_approval_menu_empty_or_garbage_defaults_to_no(monkeypatch):
+    console = _menu_console()
+    for answer in ("", "nope", "5"):
+        monkeypatch.setattr("builtins.input", lambda _prompt="", a=answer: a)
+        approved, _scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
+        assert approved is False
+
+
+def test_ask_approval_menu_pauses_tracked_status_before_input(monkeypatch):
+    console = _menu_console()
+    _install_console_status_tracker(console)
+    live_states_at_input = []
+
+    def fake_input(_prompt=""):
+        active = getattr(console, "_shamsu_active_statuses", [])
+        assert active
+        live_states_at_input.append(active[-1]._live.is_started)
+        return "1"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    with console.status("thinking"):
+        approved, scope = ask_approval_menu(
+            _request("file_write"), offer_remember=False, console=console
+        )
+
+    assert approved is True
+    assert scope == "none"
+    assert live_states_at_input == [False]
+
+
+def test_approval_manager_menu_prompt_folds_remember_into_one_prompt(tmp_path):
+    memory = PermissionMemory(tmp_path)
+    calls = []
+
+    def fake_menu(request, offer_remember):
+        calls.append((request.action_type, offer_remember))
+        return True, "workspace"
+
+    manager = ApprovalManager(memory=memory, menu_prompt=fake_menu)
+
+    assert manager.ask(_request("file_write")) is True
+    # offered remember (auto-approvable + memory), and it stuck for next time.
+    assert calls == [("file_write", True)]
+    assert memory.is_remembered("file_write")
+    # Second identical request is auto-approved without hitting the menu again.
+    assert manager.ask(_request("file_write")) is True
+    assert len(calls) == 1
+
+
+def test_approval_manager_menu_prompt_never_offers_remember_for_run_command(tmp_path):
+    memory = PermissionMemory(tmp_path)
+    calls = []
+
+    def fake_menu(request, offer_remember):
+        calls.append((request.action_type, offer_remember))
+        return True, "workspace"
+
+    manager = ApprovalManager(memory=memory, menu_prompt=fake_menu)
+
+    assert manager.ask(_request("run_command")) is True
+    assert calls == [("run_command", False)]
+    # A "workspace" scope returned for a non-auto-approvable action is ignored.
+    assert not memory.is_remembered("run_command")
 
 
 def test_ask_remember_choice_parses_session_workspace_and_none(monkeypatch):

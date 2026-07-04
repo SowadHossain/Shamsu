@@ -17,6 +17,7 @@ class ApprovalManager:
         session_logger: SessionLogger | None = None,
         memory: PermissionMemory | None = None,
         remember_prompt: Callable[[str], str] | None = None,
+        menu_prompt: Callable[[ApprovalRequest, bool], tuple[bool, str]] | None = None,
     ) -> None:
         self.approval_func = approval_func
         self.session_logger = session_logger
@@ -24,6 +25,12 @@ class ApprovalManager:
         # exactly as before for any caller that doesn't opt into the feature.
         self.memory = memory
         self.remember_prompt = remember_prompt
+        # When set (interactive REPL), a single Claude-Code-style numbered menu
+        # handles both the yes/no choice AND the "don't ask again" option, so
+        # the user answers one prompt instead of two. When None, the legacy
+        # approval_func (+ optional separate remember_prompt) path is used, so
+        # existing callers/tests are unaffected.
+        self.menu_prompt = menu_prompt
 
     def ask(self, request: ApprovalRequest) -> bool:
         auto_approvable = is_auto_approvable_action(request.action_type)
@@ -40,6 +47,24 @@ class ApprovalManager:
             {"request": request},
             f"Approval requested: {request.action_type}",
         )
+
+        if self.menu_prompt is not None:
+            offer_remember = bool(auto_approvable and self.memory)
+            approved, scope = self.menu_prompt(request, offer_remember)
+            self._log(
+                "approval.result",
+                {"action_type": request.action_type, "approved": approved},
+                f"Approval {'granted' if approved else 'denied'}: {request.action_type}",
+            )
+            if approved and offer_remember and scope in {"session", "workspace"}:
+                self.memory.remember(request.action_type, scope)
+                self._log(
+                    "approval.remembered",
+                    {"action_type": request.action_type, "scope": scope},
+                    f"Will auto-approve future '{request.action_type}' actions ({scope})",
+                )
+            return approved
+
         approved = self.approval_func(request)
         self._log(
             "approval.result",

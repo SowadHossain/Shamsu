@@ -5,12 +5,22 @@ venv/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
-.shamsu/index.db
-.shamsu/index.db-wal
-.shamsu/index.db-shm
-.shamsu/logs/*.jsonl
-.shamsu/tasks/*.json
-.shamsu/context/*.json
+
+# SHAMSU workspace-local runtime state. Keep placeholder dirs tracked, but do
+# not push local indexes, runtime config, sessions, logs, permissions, tasks,
+# generated state, or other machine-specific agent state.
+.shamsu/**
+!.shamsu/
+!.shamsu/.gitkeep
+!.shamsu/context/
+!.shamsu/context/.gitkeep
+!.shamsu/logs/
+!.shamsu/logs/.gitkeep
+!.shamsu/skills/
+!.shamsu/skills/.gitkeep
+!.shamsu/tasks/
+!.shamsu/tasks/.gitkeep
+
 *.sqlite3
 db.sqlite3
 .env

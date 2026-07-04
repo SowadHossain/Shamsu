@@ -91,6 +91,32 @@ def test_workspace_tool_suggests_at_mentions(tmp_path):
     assert suggestions == ["@src/app.py"]
 
 
+def test_workspace_tool_quotes_at_mentions_with_spaces(tmp_path):
+    (tmp_path / "Product Requirements Document.pdf").write_bytes(b"%PDF-1.4 stub")
+
+    suggestions = WorkspaceTool(tmp_path).mention_suggestions("Product")
+
+    assert suggestions == ['@"Product Requirements Document.pdf"']
+
+
+def test_mention_resolver_reads_pdf_via_extractor(monkeypatch, tmp_path):
+    (tmp_path / "Product Requirements Document.pdf").write_bytes(b"%PDF-1.4 stub")
+
+    from shamsu.types import ParsedPRD
+
+    def fake_parse(path):
+        return ParsedPRD(title="Cube Runner", sections={}, raw_text="Milestone 1: Setup the game")
+
+    # _read_pdf imports parse_prd_file lazily from shamsu.prd.input.
+    monkeypatch.setattr("shamsu.prd.input.parse_prd_file", fake_parse)
+
+    contexts = MentionResolver(tmp_path).resolve_all('@"Product Requirements Document.pdf" summarize')
+
+    assert contexts[0].resolved
+    assert contexts[0].kind == "file"
+    assert "Milestone 1: Setup the game" in contexts[0].content
+
+
 def test_weather_without_location_asks_before_web(tmp_path):
     result = AgentOrchestrator(tmp_path).run("what is the weather today?")
 

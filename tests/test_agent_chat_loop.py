@@ -111,6 +111,37 @@ async def test_agent_chat_loop_executes_native_write_file_tool(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_chat_loop_reports_tool_activity(tmp_path):
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"filepath": "game.js", "content": "// game\n"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "Done.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    activity: list[str] = []
+
+    await AgentChatLoop(
+        tmp_path, client=client, tools=tools, on_activity=activity.append
+    ).run("create game.js")
+
+    assert "Writing game.js" in activity
+
+
+@pytest.mark.asyncio
 async def test_agent_chat_loop_markdown_fallback_writes_file(tmp_path):
     client = FakeOllamaClient(
         [

@@ -57,7 +57,8 @@ class AgentOrchestrator:
             if not prds:
                 message = (
                     "I couldn't find a PRD file in this workspace. "
-                    "Add a `.md`, `.txt`, or `.pdf` file with `prd` in the name, then ask again."
+                    "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or "
+                    "`Product Requirements*`), then ask again."
                 )
             else:
                 body = "\n".join(f"- {path.as_posix()}" for path in prds)
@@ -178,7 +179,8 @@ def _asks_workspace_files(text: str) -> bool:
 
 def _asks_prd_files(text: str) -> bool:
     lowered = text.lower()
-    return "prd" in lowered and any(
+    mentions_prd = "prd" in lowered or "product requirements" in lowered
+    return mentions_prd and any(
         phrase in lowered
         for phrase in (
             "what prds",
@@ -186,6 +188,9 @@ def _asks_prd_files(text: str) -> bool:
             "find prd",
             "find the prd",
             "prd files",
+            "what product requirements",
+            "which product requirements",
+            "find product requirements",
         )
     )
 

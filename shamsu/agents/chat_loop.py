@@ -58,6 +58,7 @@ class AgentChatLoop:
         max_tool_rounds: int = 5,
         long_running: bool = False,
         clarify_prompt: Callable[[str], str] | None = ask_clarifying_question,
+        on_activity: Callable[[str], None] | None = None,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -65,6 +66,9 @@ class AgentChatLoop:
         self.model_name = model_name or SPECIALIST_MODELS["qa"]
         self.client = client or ollama.AsyncClient(host=base_url)
         self.tools = tools or AgentToolRegistry(self.workspace_root, session_logger=session_logger)
+        # Optional hook to surface live tool activity (e.g. "Writing game.js")
+        # to the REPL while the loop runs. None keeps the loop silent (tests).
+        self.on_activity = on_activity
         self.state = state or ChatState(
             _system_prompt(self.workspace_root),
             session_logger=session_logger,
@@ -113,7 +117,11 @@ class AgentChatLoop:
                 if self.long_running and signature == last_call_signature:
                     return self._handle_stuck_repetition(name, round_index)
                 last_call_signature = signature
+                if self.on_activity:
+                    self.on_activity(_describe_tool_call(name, arguments))
                 result = self.tools.execute(name, arguments)
+                if self.on_activity and not result.ok:
+                    self.on_activity(f"failed: {result.message}")
                 self.state.append_tool(_tool_call_id(call, name), name, result.to_json())
         final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
         self.state.append_assistant(final)
@@ -147,6 +155,21 @@ class AgentChatLoop:
                 workflow_id="agent-chat",
             )
         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+
+
+def _describe_tool_call(name: str, arguments: dict[str, Any]) -> str:
+    """A short human-readable label for a tool call, for live REPL activity."""
+    if name == "write_file":
+        return f"Writing {arguments.get('filepath', '?')}"
+    if name == "read_file":
+        return f"Reading {arguments.get('filepath', '?')}"
+    if name == "run_command":
+        return f"Running: {arguments.get('command', '?')}"
+    if name == "list_files":
+        return f"Listing {arguments.get('path', '.')}"
+    if name == "search_index":
+        return f"Searching: {arguments.get('query', '?')}"
+    return f"Tool: {name}"
 
 
 def _system_prompt(workspace: Path) -> str:

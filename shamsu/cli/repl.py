@@ -7,23 +7,27 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
+import difflib
 import json
 import re
 import shlex
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.text import Text
 
 from shamsu.agents.audit_workflow import AuditWorkflow
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
@@ -34,26 +38,39 @@ from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.cli.command_router import CommandRouter
-from shamsu.agents.qa_workflow import QAWorkflow
+from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
 from shamsu.indexer.walker import FileWalker, ensure_index
 from shamsu.llm.manager import LLMManager, ModelPullProgress
-from shamsu.prd.input import PRDParseError, parse_prd_file
+from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.retriever.search import SearchAgent
-from shamsu.tasks.state import MilestoneTask, list_task_ids, load_task
+from shamsu.tasks.state import (
+    MilestoneTask,
+    advance_phase,
+    create_task,
+    list_task_ids,
+    load_task,
+    mark_step_done,
+    mark_step_failed,
+    mark_step_running,
+    save_task,
+)
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
+from shamsu.runtime.models import SPECIALIST_MODELS
 from shamsu.runtime.ollama import (
     collect_status,
     pull_model_streaming,
     repair_runtime,
+    shutdown_if_last_session,
     start_ollama,
     status_text,
     wait_until_running,
 )
-from shamsu.safety.approval import ask_approval, ask_remember_choice
+from shamsu.runtime.session_registry import claim_ollama_ownership, register_session
+from shamsu.safety.approval import ask_approval, ask_approval_menu
 from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.permission_store import PermissionMemory
@@ -67,13 +84,14 @@ from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
-from shamsu.tools.workspace import WorkspaceTool
+from shamsu.tools.workspace import MentionResolver, WorkspaceTool
 from shamsu.types import (
     ApprovalRequest,
     ContextPack,
     ProjectSpec,
     RoutingDecision,
     SearchResult,
+    TaskStep,
     TaskStepStatus,
 )
 
@@ -81,6 +99,8 @@ if sys.platform == "win32":
     from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
 else:
     NoConsoleScreenBufferError = RuntimeError
+
+DEFAULT_ASK_APPROVAL = ask_approval
 
 
 class EmptySearchAgent:
@@ -204,6 +224,7 @@ def _print_help(console: Console) -> None:
                 [
                     "Natural prompts:",
                     "  explain how auth works",
+                    "  build the product from this PRD",
                     "  change the CLI banner text",
                     "  fix this traceback: <paste error>",
                     "  write tests for the parser",
@@ -385,7 +406,7 @@ def _handle_plan_prd(
         working_dir=str(workspace),
         reason="M3 only stores resume metadata; it does not generate project files.",
     )
-    approved = ApprovalManager(approval_func, session_logger).ask(request)
+    approved = _make_approval_manager(workspace, session_logger, console, approval_func).ask(request)
     if not approved:
         console.print("[yellow]Project plan was not approved. No state was written.[/yellow]")
         return
@@ -483,6 +504,7 @@ async def _handle_generate_prd(
         workspace,
         search=search,
         session_logger=session_logger,
+        approval_func=lambda request: ask_approval(request, console=console),
         long_running=is_long_running_enabled(workspace),
     ).run(prd_path, target_dir=output_dir)
     _print_full_pipeline_result(result, console)
@@ -786,7 +808,9 @@ def _handle_models(
             return
         if not status.server_running:
             console.print("[yellow]Ollama is not running. Starting local Ollama...[/yellow]")
-            start_ollama(Path(status.ollama_path))
+            serve_pid = start_ollama(Path(status.ollama_path))
+            if serve_pid:
+                claim_ollama_ownership(serve_pid)
             wait_until_running()
             status = collect_status(Path(status.ollama_path))
         if not status.missing_models:
@@ -803,7 +827,9 @@ def _handle_models(
         status = repair_runtime(pull_models=False)
         if status.ollama_found and not status.server_running:
             console.print("[yellow]Starting local Ollama...[/yellow]")
-            start_ollama(Path(status.ollama_path))
+            serve_pid = start_ollama(Path(status.ollama_path))
+            if serve_pid:
+                claim_ollama_ownership(serve_pid)
             wait_until_running()
             status = collect_status(Path(status.ollama_path))
         if status.ollama_found and status.server_running and status.missing_models:
@@ -884,10 +910,15 @@ def _handle_browse(
 
 def _approve_model_download(
     missing_models: list[str],
-    _console: Console,
+    console: Console,
     approval_func: Callable[[ApprovalRequest], bool],
 ) -> bool:
-    return ApprovalManager(approval_func).ask(
+    prompt_func = (
+        (lambda request: ask_approval(request, console=console))
+        if approval_func is DEFAULT_ASK_APPROVAL
+        else approval_func
+    )
+    return ApprovalManager(prompt_func).ask(
         ApprovalRequest(
             action_type="run_command",
             description=f"Download {len(missing_models)} missing local Ollama model(s).",
@@ -986,20 +1017,21 @@ def _make_approval_manager(
     console: Console,
     approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
 ) -> ApprovalManager:
-    # Only offer the "remember" follow-up when this is the real interactive
-    # prompt. Callers (mainly tests) that inject their own approval_func get
-    # memory-gated auto-approval but never the remember prompt itself, so a
-    # substituted approval_func's behavior isn't silently overridden here.
-    remember_prompt = (
-        (lambda action_type: ask_remember_choice(action_type, console=console))
-        if approval_func is ask_approval
+    # Only use the interactive single-menu (yes / yes+remember / no) when this
+    # is the real interactive prompt. Callers (mainly tests) that inject their
+    # own approval_func get memory-gated auto-approval but keep their own
+    # approval behavior, so a substituted approval_func isn't silently
+    # overridden here.
+    menu_prompt = (
+        (lambda request, offer: ask_approval_menu(request, offer_remember=offer, console=console))
+        if approval_func is DEFAULT_ASK_APPROVAL
         else None
     )
     return ApprovalManager(
         approval_func=approval_func,
         session_logger=session_logger,
         memory=_get_permission_memory(workspace),
-        remember_prompt=remember_prompt,
+        menu_prompt=menu_prompt,
     )
 
 
@@ -1232,6 +1264,7 @@ async def _handle_request(
     browser_tool: BrowserTool,
     previous_user_prompt: str = "",
     session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
 ) -> None:
     agent_result = AgentOrchestrator(workspace, session_logger=session_logger).run(user_input)
     effective_input = agent_result.effective_input or user_input
@@ -1247,6 +1280,9 @@ async def _handle_request(
         return
     if _looks_like_workspace_files_prompt(effective_input):
         _print_workspace_files(workspace, console)
+        return
+    if _looks_like_prd_build_request(effective_input, workspace):
+        await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
         return
     if _looks_like_workspace_prd_request(effective_input):
         _handle_workspace_prd_request(workspace, console)
@@ -1313,15 +1349,24 @@ async def _handle_request(
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
-            if _is_general_chat_prompt(effective_input) and not uses_real_index:
+            # An imperative ("fix the code", "do the thing", "continue", ...) is
+            # an action, not a question. Route it to the agent loop, which
+            # actually has file and command tools, instead of the tool-less QA
+            # brain that would only describe the fix (or claim it can't access
+            # files). With `/autonomy on` the edits run hands-free; otherwise
+            # each write asks for approval.
+            if _looks_like_action_request(effective_input) or (
+                _is_general_chat_prompt(effective_input) and not uses_real_index
+            ):
                 await _run_agent_chat(
                     _append_agent_context(effective_input, agent_context),
                     workspace,
                     console,
                     session_logger=session_logger,
+                    auto_approve=is_long_running_enabled(workspace),
                 )
             else:
-                await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger)
+                await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger, thinking_status=thinking_status)
         elif decision.intent == "code_edit":
             await _run_code_edit(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
@@ -1510,9 +1555,25 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
         return True
     if any(word in text for word in ("weather", "forecast", "temperature", "rain today", "news today", "stock price", "exchange rate")):
         return True
+    if _has_fuzzy_web_keyword(text):
+        return True
     if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
         return True
     return False
+
+
+_WEB_FUZZY_KEYWORDS = ("weather", "forecast", "temperature")
+
+
+def _has_fuzzy_web_keyword(text: str) -> bool:
+    """Catches common typos (e.g. "weither" for "weather") that exact
+    substring matching above would otherwise silently miss, sending the
+    prompt into a tool-less chat path that hallucinates a fake search."""
+    words = re.findall(r"[a-z]+", text)
+    return any(
+        difflib.get_close_matches(word, _WEB_FUZZY_KEYWORDS, n=1, cutoff=0.8)
+        for word in words
+    )
 
 
 def _looks_like_browser_needed_prompt(user_input: str) -> bool:
@@ -1652,9 +1713,7 @@ def _find_workspace_prd_files(workspace: Path) -> list[Path]:
     for path in workspace.rglob("*"):
         if not path.is_file():
             continue
-        if path.suffix.lower() not in {".md", ".markdown", ".txt", ".pdf"}:
-            continue
-        if "prd" not in path.name.lower():
+        if not is_prd_filename(path.name):
             continue
         try:
             candidates.append(path.relative_to(workspace))
@@ -1668,7 +1727,8 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> None:
     if not candidates:
         console.print(
             "[yellow]I couldn't find a PRD file in this workspace yet.[/yellow] "
-            "Add a `.md`, `.txt`, or `.pdf` file with `prd` in the name, then ask again or run `/parse-prd <file>`."
+            "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or `Product Requirements*`), "
+            "then ask again or run `/parse-prd <file>`."
         )
         return
     if len(candidates) > 1:
@@ -1696,6 +1756,390 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> None:
     )
 
 
+_PRD_BUILD_VERBS = ("build", "finish", "implement", "generate", "make", "create", "develop")
+_PRD_BUILD_NOUNS = ("product", "app", "application", "game", "project", "website", "site", "it", "this", "prd")
+
+# Terse imperative "just do it" style commands. These carry no task detail of
+# their own, so they must be routed to something that can actually act (the
+# PRD build when a PRD is present, otherwise the tool-having agent loop) — never
+# the tool-less QA brain, which would hallucinate "I cannot access files".
+_VAGUE_ACTION_WORDS = {"go", "start", "build", "continue", "proceed", "run", "do"}
+_VAGUE_ACTION_PHRASES = (
+    "do the task",
+    "do this task",
+    "do that task",
+    "do the tasks",
+    "do that",
+    "do it",
+    "do this",
+    "do them",
+    "get it done",
+    "get this done",
+    "keep going",
+    "go ahead",
+    "carry on",
+    "finish it",
+    "finish the task",
+    "finish this",
+    "complete it",
+    "complete the task",
+    "start building",
+    "start the build",
+    "make it happen",
+    "just do it",
+    "make it",
+    "build it",
+    "run it",
+)
+
+
+def _looks_like_vague_action_request(user_input: str) -> bool:
+    text = re.sub(r"[^\w\s]", "", user_input.lower()).strip()
+    words = text.split()
+    if not words or len(words) > 6:
+        return False
+    if text in _VAGUE_ACTION_WORDS:
+        return True
+    return any(phrase in text for phrase in _VAGUE_ACTION_PHRASES)
+
+
+# Verbs that mean "modify the project" — their presence (outside obvious
+# question phrasing) marks a request as an action to perform, not a question.
+_ACTION_VERBS = {
+    "fix", "build", "make", "create", "add", "implement", "update", "change",
+    "edit", "modify", "write", "refactor", "rewrite", "improve", "apply",
+    "generate", "install", "setup", "configure", "continue", "finish",
+    "complete", "proceed", "resume", "redo", "regenerate", "review", "debug",
+    "resolve", "correct", "patch",
+}
+
+# Leading phrasing that marks a genuine question/explanation → keep it on QA.
+_QUESTION_PREFIXES = (
+    "what", "why", "how", "when", "where", "who", "which", "whose",
+    "explain", "tell me", "show me", "describe", "list ", "summarize",
+    "is ", "are ", "was ", "were ", "does ", "do you", "did you", "should i",
+    "can you explain", "could you explain", "whats", "hows",
+)
+
+
+def _looks_like_action_request(user_input: str) -> bool:
+    """True when the prompt asks SHAMSU to *do work* (fix/edit/build) rather
+    than answer a question. Broader than the narrow PRD-build trigger: any clear
+    imperative or action verb (outside obvious question phrasing) should reach
+    the tool-having agent loop, never the tool-less QA specialist that can only
+    describe changes. This is deliberately verb-based, not a fixed phrase list,
+    so new phrasings ("do the thing", "fix the code and check the reqs") are
+    caught without another edit here."""
+    raw = user_input.strip().lower()
+    if not raw:
+        return False
+    if _looks_like_vague_action_request(user_input):
+        return True
+    # A trailing '?' or question-style opening → it's a question, leave on QA.
+    if raw.endswith("?"):
+        return False
+    if any(raw.startswith(prefix) for prefix in _QUESTION_PREFIXES):
+        return False
+    words = set(re.sub(r"[^\w\s]", "", raw).split())
+    if _ACTION_VERBS & words:
+        return True
+    # Generic "do the thing / work / rest / task" imperatives.
+    if "do" in words and words & {"thing", "things", "work", "stuff", "rest", "task", "tasks", "job"}:
+        return True
+    return False
+
+
+def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
+    """Detect a natural-language "build the product from this PRD" request.
+
+    Conservative: requires BOTH a build verb + product noun AND a real PRD
+    signal (the word prd/product requirements, an @-mentioned doc, or exactly
+    one PRD file present). This keeps narrow prompts like "build the navbar"
+    or "fix the build" from triggering a full autonomous product build.
+    A terse "do the task"/"continue" also counts when exactly one PRD is present
+    — in a PRD workspace that almost always means "build that PRD", and the
+    build is approval-gated anyway so it is safe to route here.
+    """
+    if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
+        return True
+    text = user_input.lower()
+    has_build_verb = any(verb in text for verb in _PRD_BUILD_VERBS)
+    has_product_noun = any(noun in text for noun in _PRD_BUILD_NOUNS)
+    if not (has_build_verb and has_product_noun):
+        return False
+    if "prd" in text or "product requirements" in text or "requirements document" in text:
+        return True
+    if _resolve_build_prd(user_input, workspace) is not None:
+        return True
+    return False
+
+
+def _resolve_build_prd(user_input: str, workspace: Path) -> Path | None:
+    """Resolve which PRD a build request refers to (relative to workspace).
+
+    Order: explicit path in the prompt -> a resolved @-mention that is a PRD
+    -> the single workspace PRD if exactly one exists. Returns None when
+    ambiguous (multiple) or nothing is found.
+    """
+    explicit = _extract_prd_path_from_prompt(user_input)
+    if explicit:
+        try:
+            resolved = _resolve_workspace_file(explicit, workspace)
+        except SecurityError:
+            return None
+        if resolved.exists() and resolved.is_file():
+            return resolved
+
+    for mention in MentionResolver(workspace).resolve_all(user_input):
+        if mention.resolved and mention.path is not None and is_prd_filename(mention.path.name):
+            return workspace / mention.path
+
+    candidates = _find_workspace_prd_files(workspace)
+    if len(candidates) == 1:
+        return workspace / candidates[0]
+    return None
+
+
+def _extract_prd_milestones(parsed) -> list[str]:
+    lines = parsed.raw_text.splitlines() if parsed.raw_text else []
+    milestones = [
+        line.strip()
+        for line in lines
+        if re.match(r"^\s*(milestone|phase|step)\s*\d", line, re.I)
+    ]
+    return milestones
+
+
+def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None:
+    section_names = list(parsed.sections.keys())
+    milestones = _extract_prd_milestones(parsed)
+    lines = [
+        f"File: {relative_path.as_posix()}",
+        f"Title: {parsed.title}",
+        "",
+        "Sections: " + (", ".join(section_names) if section_names else "none"),
+    ]
+    if milestones:
+        lines.append("")
+        lines.append("Milestones detected:")
+        lines.extend(f"  - {item}" for item in milestones[:12])
+        if len(milestones) > 12:
+            lines.append(f"  ... {len(milestones) - 12} more")
+    lines.append("")
+    lines.append("I'll build this now, autonomously (long-running mode), writing files in")
+    lines.append("your workspace until it's implemented. Type `exit` to stop.")
+    console.print(Panel("\n".join(lines), title="PRD Build Plan"))
+
+
+PRD_BUILD_FRAMING = (
+    "Build complete, runnable product files. Do not create TODO-only stubs or placeholder implementations. "
+    "Before rewriting any file that already exists, read it first with read_file and EXTEND it — never "
+    "regenerate a file from scratch in a way that drops features implemented in earlier milestones. "
+    "Keep the app wired together: if the project has a script.js, index.html must load it with "
+    "<script src=\"script.js\"></script> and must NOT keep its own inline game logic or a leftover "
+    "placeholder demo (e.g. a rotating-cube snippet). All logic lives in script.js. "
+    "Use write_file for file changes and run_command to verify when possible. "
+    "A milestone is done only when its acceptance criteria are implemented and the files are wired together "
+    "and mutually consistent. If blocked, stop and explain exactly what input is needed."
+)
+
+
+async def _handle_prd_build_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    prd_path = _resolve_build_prd(user_input, workspace)
+    if prd_path is None:
+        candidates = _find_workspace_prd_files(workspace)
+        if len(candidates) > 1:
+            console.print("[yellow]I found multiple PRD files — which one should I build from?[/yellow]")
+            for path in candidates[:10]:
+                console.print(f"- {path.as_posix()}")
+            console.print("Name one, e.g. `build the product from \"<file>\"`.")
+        else:
+            console.print(
+                "[yellow]I couldn't find a PRD to build from.[/yellow] "
+                "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or `Product Requirements*`), "
+                "then ask again."
+            )
+        return
+
+    try:
+        parsed = parse_prd_file(prd_path)
+    except PRDParseError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+
+    try:
+        relative_path = prd_path.relative_to(workspace)
+    except ValueError:
+        relative_path = prd_path
+
+    _print_prd_build_plan(parsed, relative_path, console)
+    _log_event(
+        session_logger,
+        "prd.build.planned",
+        {"path": str(prd_path), "title": parsed.title, "sections": list(parsed.sections)},
+        f"Planned PRD build for {prd_path.name}",
+        workflow_id="prd-build",
+    )
+
+    # The build request itself ("build the product from this prd") is the
+    # consent, and the plan above was shown for review — so start the build
+    # directly and let it write files without further prompts. This avoids the
+    # fragile mid-flow input() approval that could silently auto-deny on some
+    # interactive terminals.
+    console.print(
+        "[green]Building now — I'll read the PRD and write files in your workspace. "
+        "Type `exit` to stop.[/green]"
+    )
+    milestones = _extract_prd_milestones(parsed)
+    if not milestones:
+        await _run_agent_chat(
+            _build_prd_build_request(parsed, relative_path),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+        return
+
+    task = _create_prd_build_task(user_input, parsed.title, milestones)
+    save_task(task, workspace)
+    console.print(f"[dim]Tracking PRD build task: {task.task_id}[/dim]")
+    prd_text = parsed.raw_text or _render_sections(parsed)
+    for index, milestone in enumerate(milestones):
+        step = task.steps[index]
+        task = mark_step_running(task, step.id)
+        save_task(task, workspace)
+        console.print(f"[dim]  -> Milestone {index + 1}/{len(milestones)}: {milestone}[/dim]")
+        try:
+            await _run_agent_chat(
+                _build_prd_milestone_request(parsed.title, relative_path, prd_text, milestone, index + 1, len(milestones)),
+                workspace,
+                console,
+                session_logger=session_logger,
+                force_long_running=True,
+                auto_approve=True,
+            )
+        except Exception as exc:
+            task = mark_step_failed(task, step.id, str(exc))
+            save_task(task, workspace)
+            raise
+        task = mark_step_done(task, step.id, "Agent completed this milestone build pass.")
+        if index < len(milestones) - 1:
+            if not advance_phase(task, f"milestone-{index + 2}"):
+                save_task(task, workspace)
+                console.print(Panel(task.next_action, title="PRD Build Paused", border_style="yellow"))
+                return
+        save_task(task, workspace)
+    console.print(f"[green]PRD milestone build flow complete. Task: {task.task_id}[/green]")
+
+
+def _build_prd_build_request(parsed, relative_path: Path) -> str:
+    return (
+        f"{PRD_BUILD_FRAMING}\n\n"
+        "Build the complete product described by the following PRD. Create all necessary files "
+        "in the workspace, working milestone by milestone. Do not claim work you did not do.\n\n"
+        f"=== PRD: {relative_path.as_posix()} ===\n"
+        f"{parsed.raw_text or _render_sections(parsed)}"
+    )
+
+
+def _build_prd_milestone_request(
+    title: str,
+    relative_path: Path,
+    prd_text: str,
+    milestone: str,
+    milestone_index: int,
+    milestone_count: int,
+) -> str:
+    return (
+        f"{PRD_BUILD_FRAMING}\n\n"
+        f"Project: {title}\n"
+        f"PRD file: {relative_path.as_posix()}\n"
+        f"Current milestone {milestone_index}/{milestone_count}: {milestone}\n\n"
+        "FIRST list and read the files already in the workspace (index.html, style.css, script.js, etc.) so "
+        "you build ON TOP of the previous milestones instead of replacing their work. THEN implement only this "
+        "milestone by editing and extending those files. Every feature from earlier milestones must keep "
+        "working, index.html must load script.js (with no inline game logic left behind), and you must write "
+        "complete runnable files. Verify with run_command when possible.\n\n"
+        f"Full PRD context:\n{prd_text}"
+    )
+
+
+def _create_prd_build_task(user_request: str, title: str, milestones: list[str]) -> MilestoneTask:
+    steps = [
+        TaskStep(
+            id=index + 1,
+            description=f"{title}: {milestone}",
+            type="file_create",
+            specialist="coder",
+            phase=f"milestone-{index + 1}",
+            depends_on=[index] if index else [],
+        )
+        for index, milestone in enumerate(milestones)
+    ]
+    return create_task(user_request=user_request, steps=steps, phase="milestone-1")
+
+
+def _render_sections(parsed) -> str:
+    parts = []
+    for name, lines in parsed.sections.items():
+        parts.append(f"## {name}")
+        parts.extend(lines)
+    return "\n".join(parts)
+
+
+async def _stream_answer(
+    console: Console,
+    llm: LLMManager,
+    pack: ContextPack,
+    title: str,
+    session_logger: SessionLogger | None,
+    workflow_id: str,
+    thinking_status: Any = None,
+) -> tuple[bool, str]:
+    """Stream a specialist answer token-by-token as plain flowing text.
+
+    Returns (streamed, text). `streamed` is False when nothing was rendered
+    (immediate failure before any token) so the caller can fall back to the
+    non-streaming path. Stops `thinking_status` on the first token to avoid a
+    nested Rich Live conflict with the spinner.
+    """
+    state = {"started": False}
+    chunks: list[str] = []
+
+    def on_token(token: str) -> None:
+        if not state["started"]:
+            if thinking_status is not None:
+                thinking_status.stop()
+            console.print(f"[bold cyan]{title}[/bold cyan]")
+            state["started"] = True
+        chunks.append(token)
+        console.file.write(token)
+        console.file.flush()
+
+    try:
+        await llm.run_specialist_stream("qa", pack, on_token)
+    except Exception:
+        if state["started"]:
+            console.file.write("\n")
+            console.file.flush()
+        else:
+            raise
+    if state["started"]:
+        console.file.write("\n")
+        console.file.flush()
+        text = "".join(chunks).strip()
+        _log_assistant_message(session_logger, text, workflow_id=workflow_id)
+        return True, text
+    return False, ""
+
+
 async def _run_qa(
     user_input: str,
     workspace: Path,
@@ -1703,9 +2147,25 @@ async def _run_qa(
     llm: LLMManager,
     extra_context: str = "",
     session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
 ) -> None:
     qa_workflow, _uses_real_index = _build_workspace_qa_workflow(workspace, session_logger)
     request = _append_agent_context(user_input, extra_context)
+    # Stream when the manager supports it (real LLMManager). Test doubles that
+    # only implement run_specialist fall through to the Coordinator path below,
+    # preserving their exact behavior.
+    if hasattr(llm, "run_specialist_stream"):
+        preview = qa_workflow.build_prompt(request)
+        try:
+            streamed, _text = await _stream_answer(
+                console, llm, preview.pack, "Answer", session_logger, "qa", thinking_status
+            )
+        except Exception:
+            streamed = False
+        if streamed:
+            if preview.prompt and _preview_contains_context(preview.prompt):
+                console.print(Panel(preview.prompt, title="Context Preview"))
+            return
     result = await Coordinator(llm=llm, qa_workflow=qa_workflow).handle(request)
     if result.answer:
         title = f"Answer ({result.model_used})" if result.model_used else "Answer"
@@ -1723,6 +2183,7 @@ async def _run_general_chat(
     llm: LLMManager,
     extra_context: str = "",
     session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
 ) -> None:
     pack = ContextPack(
         task_id="general-chat",
@@ -1732,10 +2193,20 @@ async def _run_general_chat(
         prd_context=(
             "No indexed project context is attached. "
             "Answer as a general local assistant. "
-            "Do not claim you saw code, tests, or files unless they were actually provided."
+            "Do not claim you saw code, tests, or files unless they were actually provided. "
+            + NO_LIVE_TOOLS_NOTICE
             + (f" {extra_context}" if extra_context else "")
         ),
     )
+    if hasattr(llm, "run_specialist_stream"):
+        try:
+            streamed, _text = await _stream_answer(
+                console, llm, pack, "Chat", session_logger, "general-chat", thinking_status
+            )
+        except Exception:
+            streamed = False
+        if streamed:
+            return
     response = await llm.run_specialist("qa", pack)
     title = f"Chat ({response.model_used})" if response.model_used else "Chat"
     body = response.raw.strip()
@@ -1748,17 +2219,26 @@ async def _run_agent_chat(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None = None,
+    force_long_running: bool = False,
+    auto_approve: bool = False,
 ) -> None:
+    # auto_approve is used for an explicitly user-consented PRD build: the user
+    # already approved building the whole product, so the agent's file writes
+    # and verification commands during that build run without further prompts
+    # (this also sidesteps the fragile mid-flow input() approval on Windows).
+    approval_func = (lambda _request: True) if auto_approve else ask_approval
     tools = AgentToolRegistry(
         workspace,
         session_logger=session_logger,
-        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
     )
+    long_running = force_long_running or is_long_running_enabled(workspace)
     result = await AgentChatLoop(
         workspace,
         session_logger=session_logger,
         tools=tools,
-        long_running=is_long_running_enabled(workspace),
+        long_running=long_running,
+        on_activity=lambda msg: console.print(f"[dim]  → {msg}[/dim]"),
     ).run(user_input)
     body = result.final.strip() or "No response returned."
     console.print(Panel(body, title="Agent"))
@@ -1798,13 +2278,36 @@ async def _run_web_assist(
             extra_context="Web lookup failed. Answer locally and mention that external lookup was unavailable.",
         )
         return
-    for hit in result.hits[:3]:
-        fetch = web_tool.fetch(
-            hit.url,
-            reason="SHAMSU wants to read the matching page to answer your question accurately.",
-        )
-        if fetch.approved and not fetch.error and _is_useful_web_fetch(fetch):
-            fetches.append(fetch)
+    top_hits = result.hits[:3]
+    if top_hits:
+        approval_manager = getattr(web_tool, "approval_manager", None)
+        read_approved = True
+        if approval_manager is not None:
+            approval_manager.session_logger = session_logger
+            read_approved = approval_manager.ask(
+                ApprovalRequest(
+                    action_type="web_search",
+                    description="Fetch and read the top web search results.",
+                    risk_level="medium",
+                    preview="\n".join(f"- {hit.title}: {hit.url}" for hit in top_hits),
+                    reason="SHAMSU wants to read the top results once to answer accurately.",
+                )
+            )
+        if read_approved:
+            for hit in top_hits:
+                try:
+                    fetch = web_tool.fetch(
+                        hit.url,
+                        reason="SHAMSU already has approval to read the top search results.",
+                        require_approval=False,
+                    )
+                except TypeError:
+                    fetch = web_tool.fetch(
+                        hit.url,
+                        reason="SHAMSU already has approval to read the top search results.",
+                    )
+                if fetch.approved and not fetch.error and _is_useful_web_fetch(fetch):
+                    fetches.append(fetch)
     await _print_web_answer(user_input, result, fetches, console, llm, session_logger=session_logger)
 
 
@@ -1884,7 +2387,24 @@ async def _print_web_answer(
         response = await llm.run_specialist("qa", pack)
         body = response.raw.strip()
     else:
-        body = "\n".join(f"- {hit.title}\n  {hit.url}" for hit in result.hits[:5])
+        context = "\n".join(
+            f"Source: {hit.url}\nTitle: {hit.title}\nSnippet: {hit.snippet or '(no snippet)'}"
+            for hit in result.hits[:5]
+        )
+        pack = ContextPack(
+            task_id="web-qa-snippets",
+            step_id=1,
+            specialist="qa",
+            user_request=query,
+            prd_context=(
+                "SHAMSU could not extract readable page bodies from the web results. "
+                "Answer the user's question from the search result titles/snippets and general knowledge. "
+                "Be direct, mention uncertainty when snippets are insufficient, and cite the URLs.\n\n"
+                f"{context}"
+            ),
+        )
+        response = await llm.run_specialist("qa", pack)
+        body = response.raw.strip() or "I found sources, but could not synthesize an answer from the snippets."
     sources = "\n".join(f"- {hit.title}: {hit.url}" for hit in result.hits[:5])
     message = f"{body}\n\nSources:\n{sources}"
     console.print(Panel(message, title="Web Answer"))
@@ -2237,11 +2757,106 @@ def _thinking_status_for_input(user_input: str) -> str:
     return "[dim]Thinking...[/dim]"
 
 
-def _make_prompt_session(workspace: Path) -> PromptSession | None:
+def _install_console_status_tracker(console: Console) -> None:
+    """Track active Rich statuses so blocking prompts can pause them."""
+    if getattr(console, "_shamsu_status_tracker_installed", False):
+        return
+    original_status = console.status
+
+    class _TrackedStatus:
+        def __init__(self, status) -> None:
+            self._status = status
+
+        def __enter__(self):
+            active = getattr(console, "_shamsu_active_statuses", None)
+            if active is None:
+                active = []
+                setattr(console, "_shamsu_active_statuses", active)
+            active.append(self._status)
+            return self._status.__enter__()
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            try:
+                return self._status.__exit__(exc_type, exc_val, exc_tb)
+            finally:
+                active = getattr(console, "_shamsu_active_statuses", [])
+                if self._status in active:
+                    active.remove(self._status)
+
+        def __getattr__(self, name: str):
+            return getattr(self._status, name)
+
+    def tracked_status(*args, **kwargs):
+        return _TrackedStatus(original_status(*args, **kwargs))
+
+    console.status = tracked_status
+    setattr(console, "_shamsu_status_tracker_installed", True)
+
+
+def _print_startup_banner(workspace: Path, console: Console) -> None:
+    model = SPECIALIST_MODELS.get("qa", "local")
+    autonomy = "on" if is_long_running_enabled(workspace) else "off"
+    runtime = status_text(collect_status())
+    body = Text()
+    body.append("SHAMSU v0.3.0", style="bold")
+    body.append("  ·  Local AI coding agent\n", style="dim")
+    body.append("Workspace: ", style="dim")
+    body.append(f"{workspace}\n")
+    body.append("Model: ", style="dim")
+    body.append(f"{model}", style="cyan")
+    body.append("  ·  Autonomy: ", style="dim")
+    body.append(autonomy, style=("green" if autonomy == "on" else "yellow"))
+    body.append("\nRuntime: ", style="dim")
+    body.append(runtime, style="dim")
+    console.print(Panel(body, title="SHAMSU", border_style="cyan"))
+
+
+def _bottom_toolbar(workspace: Path) -> str:
+    autonomy = "on" if is_long_running_enabled(workspace) else "off"
+    model = SPECIALIST_MODELS.get("qa", "local")
+    return f" {workspace}  ·  model: {model}  ·  autonomy: {autonomy}  ·  /help  /exit "
+
+
+class CachedBottomToolbar:
+    def __init__(self, workspace: Path) -> None:
+        self.workspace = workspace
+        self.value = _bottom_toolbar(workspace)
+
+    def refresh(self) -> None:
+        self.value = _bottom_toolbar(self.workspace)
+
+    def __call__(self) -> str:
+        return self.value
+
+
+def _make_input_key_bindings() -> KeyBindings:
+    """Enter submits; Alt+Enter (Meta+Enter) inserts a newline for deliberate
+    multi-line input. Combined with multiline=True this also lets pasted,
+    multi-line text (tracebacks, PRDs) land intact without submitting early."""
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def _(event) -> None:
+        buffer = event.current_buffer
+        completion_state = buffer.complete_state
+        if completion_state is not None and completion_state.current_completion is not None:
+            buffer.apply_completion(completion_state.current_completion)
+            return
+        buffer.validate_and_handle()
+
+    @kb.add("escape", "enter")
+    def _(event) -> None:
+        event.current_buffer.insert_text("\n")
+
+    return kb
+
+
+def _make_prompt_session(workspace: Path, bottom_toolbar: Callable[[], str] | None = None) -> PromptSession | None:
     style = Style.from_dict(
         {
             "prompt": "ansigreen bold",
             "workspace": "ansiblue",
+            "bottom-toolbar": "bg:#222222 #aaaaaa",
         }
     )
     try:
@@ -2250,23 +2865,47 @@ def _make_prompt_session(workspace: Path) -> PromptSession | None:
             style=style,
             completer=SlashCommandCompleter(workspace),
             complete_while_typing=True,
-            bottom_toolbar=f"Workspace: {workspace} | /help | /index | /exit",
+            bottom_toolbar=bottom_toolbar or CachedBottomToolbar(workspace),
+            multiline=True,
+            key_bindings=_make_input_key_bindings(),
+            prompt_continuation=lambda width, line_number, is_soft_wrap: "".ljust(width),
         )
     except NoConsoleScreenBufferError:
         return None
 
 
+def _force_utf8_stdio() -> None:
+    """Best-effort: make stdout/stderr UTF-8 so non-ASCII output (→, box glyphs)
+    never crashes on a Windows console, even if PYTHONUTF8 wasn't set by the
+    launcher (e.g. run directly via `python -m shamsu.cli.repl`)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def main(argv: list[str] | None = None) -> None:
+    _force_utf8_stdio()
     args = parse_args(argv)
     console = Console()
-    console.print(Panel("SHAMSU v0.3.0\nLocal AI coding agent", title="SHAMSU"))
+    _install_console_status_tracker(console)
 
     try:
         workspace = resolve_workspace(args.workspace)
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
-    console.print(f"[dim]Workspace: {workspace}[/dim]")
+
+    # Track this session so the last one to exit can free SHAMSU's Ollama
+    # footprint (stop a SHAMSU-started server, or unload SHAMSU's models — incl.
+    # the keep_alive=-1 router — from a shared/tray-app server). Best-effort.
+    session_pid = register_session()
+    atexit.register(shutdown_if_last_session, session_pid)
+
+    _print_startup_banner(workspace, console)
     ancestor_workspace = find_ancestor_workspace(workspace)
     if ancestor_workspace is not None:
         console.print(
@@ -2275,7 +2914,6 @@ def main(argv: list[str] | None = None) -> None:
             f"{workspace}. Pass --workspace {ancestor_workspace} to use the existing one "
             f"instead, or run `/doctor` for more detail.[/yellow]"
         )
-    console.print(f"[dim]{status_text(collect_status())}[/dim]")
     session_manager = SessionManager(workspace)
     try:
         session_logger = _start_session(args, workspace, console)
@@ -2292,19 +2930,24 @@ def main(argv: list[str] | None = None) -> None:
         session_logger=session_logger,
         approval_manager=_make_approval_manager(workspace, session_logger, console),
     )
-    session = _make_prompt_session(workspace)
+    bottom_toolbar = CachedBottomToolbar(workspace)
+    session = _make_prompt_session(workspace, bottom_toolbar)
     command_router = CommandRouter(SYSTEM_COMMANDS)
 
     while True:
         try:
             if session is None:
-                user_input = input("shamsu> ").strip()
+                raw_input_text = input("shamsu> ")
             else:
-                user_input = session.prompt([("class:prompt", "shamsu> ")]).strip()
+                raw_input_text = session.prompt([("class:prompt", "shamsu> ")])
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
             sys.exit(0)
 
+        # Strip a stray leading BOM (﻿) that piped stdin can prepend; it is
+        # not whitespace, so .strip() alone leaves it and it would break slash
+        # commands and pollute previews.
+        user_input = raw_input_text.lstrip("﻿").strip()
         if not user_input:
             continue
         previous_user_prompt = session_logger.metadata.last_user_prompt
@@ -2399,13 +3042,14 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("autonomy"):
             _handle_autonomy(normalized_input, workspace, console)
+            bottom_toolbar.refresh()
             continue
         if lowered_input == "log" or lowered_input.startswith("log "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
                 _handle_log(normalized_input, session_logger, console)
             continue
 
-        with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+        with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
             asyncio.run(
                 _handle_request(
                     user_input,
@@ -2415,6 +3059,7 @@ def main(argv: list[str] | None = None) -> None:
                     browser_tool,
                     previous_user_prompt=previous_user_prompt,
                     session_logger=session_logger,
+                    thinking_status=thinking,
                 )
             )
 

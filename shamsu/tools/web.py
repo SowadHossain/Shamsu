@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from html import unescape
 from html.parser import HTMLParser
 from typing import Callable
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 
@@ -92,19 +92,20 @@ class WebTool:
             self._log("web.search.failed", {"query": query, "error": message}, f"Failed web search: {query}")
             return WebSearchResult(approved=True, query=query, error=message)
 
-    def fetch(self, url: str, reason: str = "") -> WebFetchResult:
-        request = ApprovalRequest(
-            action_type="web_search",
-            description="Fetch and read a web page.",
-            risk_level="medium",
-            preview=url,
-            reason=reason or "SHAMSU wants to inspect an external page for this request.",
-        )
-        self._log("web.fetch.requested", {"url": url, "reason": reason}, f"Requested fetch: {url}")
-        self.approval_manager.session_logger = self.session_logger
-        if not self.approval_manager.ask(request):
-            self._log("web.fetch.denied", {"url": url}, f"Denied fetch: {url}")
-            return WebFetchResult(approved=False, url=url, error="Web fetch denied by user.")
+    def fetch(self, url: str, reason: str = "", require_approval: bool = True) -> WebFetchResult:
+        if require_approval:
+            request = ApprovalRequest(
+                action_type="web_search",
+                description="Fetch and read a web page.",
+                risk_level="medium",
+                preview=url,
+                reason=reason or "SHAMSU wants to inspect an external page for this request.",
+            )
+            self._log("web.fetch.requested", {"url": url, "reason": reason}, f"Requested fetch: {url}")
+            self.approval_manager.session_logger = self.session_logger
+            if not self.approval_manager.ask(request):
+                self._log("web.fetch.denied", {"url": url}, f"Denied fetch: {url}")
+                return WebFetchResult(approved=False, url=url, error="Web fetch denied by user.")
 
         self._log("web.fetch.started", {"url": url}, f"Started fetch: {url}")
         try:
@@ -161,8 +162,9 @@ class _DuckDuckGoParser(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         if tag == "a" and self._in_link:
             title = _normalize_space("".join(self._current_title))
-            if title and self._current_href:
-                self.results.append(SearchHit(title=title, url=self._current_href, snippet=""))
+            href = _normalize_ddg_href(self._current_href)
+            if title and href:
+                self.results.append(SearchHit(title=title, url=href, snippet=""))
             self._in_link = False
         elif self._capture_snippet and tag in {"a", "div"}:
             if self.results:
@@ -222,6 +224,23 @@ class _VisibleTextParser(HTMLParser):
 
 def _normalize_space(text: str) -> str:
     return " ".join(unescape(text).split())
+
+
+def _normalize_ddg_href(href: str) -> str:
+    href = unescape(href).strip()
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = f"https:{href}"
+    elif href.startswith("/"):
+        href = f"https://duckduckgo.com{href}"
+
+    parsed = urlparse(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path == "/l/":
+        uddg = parse_qs(parsed.query).get("uddg", [""])[0]
+        if uddg:
+            return unquote(uddg)
+    return href
 
 
 def _extract_readable_text(html: str, url: str) -> str | None:

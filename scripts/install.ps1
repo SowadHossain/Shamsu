@@ -213,9 +213,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "
         Write-Host "  $ResolvedBinDir"
     }
     else {
-        $ResolvedLauncher = [System.IO.Path]::GetFullPath($CmdLauncher)
+        $ResolvedPsLauncher = [System.IO.Path]::GetFullPath($PsLauncher)
+        $ResolvedCmdLauncher = [System.IO.Path]::GetFullPath($CmdLauncher)
         $ExistingCommand = Get-Command shamsu -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($ExistingCommand -and ([System.IO.Path]::GetFullPath($ExistingCommand.Source) -ine $ResolvedLauncher)) {
+        if ($ExistingCommand) {
+            $ResolvedExisting = [System.IO.Path]::GetFullPath($ExistingCommand.Source)
+        }
+        if ($ExistingCommand -and $ResolvedExisting -ine $ResolvedPsLauncher -and $ResolvedExisting -ine $ResolvedCmdLauncher) {
             Write-Host ""
             Write-Warning "Plain 'shamsu' currently resolves to a different command:"
             Write-Host "  $($ExistingCommand.Source)"
