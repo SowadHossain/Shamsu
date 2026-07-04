@@ -26,9 +26,29 @@ def _tools(root):
     )
 
 
-def test_workspace_qa_workflow_uses_empty_search_without_index(tmp_path):
-    workflow, uses_real_index = _build_workspace_qa_workflow(tmp_path)
+def test_workspace_qa_workflow_auto_indexes_when_no_index_exists_yet(tmp_path):
+    """Indexing is transparent now: no prior `/index` step is required."""
+    assert not (tmp_path / ".shamsu" / "index.db").exists()
 
+    workflow, uses_real_index = _build_workspace_qa_workflow(tmp_path)
+    preview = workflow.build_prompt("how does auth work?")
+
+    assert uses_real_index is True
+    assert (tmp_path / ".shamsu" / "index.db").exists()
+    assert "stub/example.py" not in preview.prompt
+
+
+def test_workspace_qa_workflow_falls_back_to_empty_search_when_indexing_fails(monkeypatch, tmp_path):
+    class _FailingFileWalker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def index(self, full: bool = False):
+            raise OSError("simulated indexing failure")
+
+    monkeypatch.setattr("shamsu.indexer.walker.FileWalker", _FailingFileWalker)
+
+    workflow, uses_real_index = _build_workspace_qa_workflow(tmp_path)
     preview = workflow.build_prompt("how does auth work?")
 
     assert uses_real_index is False
@@ -54,24 +74,50 @@ def test_workspace_qa_workflow_uses_real_index_when_available(tmp_path):
     assert "stub/example.py" not in preview.prompt
 
 
-def test_repl_request_reports_missing_index_without_stub_preview(tmp_path):
+def test_repl_request_auto_indexes_workspace_without_manual_index_step(tmp_path):
+    """The user should never need to run `/index` before asking a question."""
+    source = tmp_path / "auth.py"
+    source.write_text(
+        "def authenticate_user(username, password):\n"
+        "    return username == 'admin' and bool(password)\n",
+        encoding="utf-8",
+    )
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
 
     asyncio.run(_handle_request("how does auth work?", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
-    assert "No index found. Run `index` first" in rendered
-    assert "Context Preview" not in rendered
+    assert (tmp_path / ".shamsu" / "index.db").exists()
+    assert "No index found" not in rendered
     assert "stub/example.py" not in rendered
 
 
-def test_repl_greeting_uses_agent_chat_without_index(monkeypatch, tmp_path):
+def _fail_indexing(monkeypatch) -> None:
+    """Simulate indexing being unavailable (e.g. a read-only workspace) so
+    the pre-existing no-index fallback routing can still be exercised, since
+    indexing now normally succeeds transparently and that path is otherwise
+    unreachable in tests."""
+
+    class _FailingFileWalker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def index(self, full: bool = False):
+            raise OSError("simulated indexing failure")
+
+    # ensure_index() (repl._ensure_index is re-exported from here) looks up
+    # FileWalker via indexer.walker's own module globals, not repl's.
+    monkeypatch.setattr("shamsu.indexer.walker.FileWalker", _FailingFileWalker)
+
+
+def test_repl_greeting_uses_agent_chat_when_indexing_is_unavailable(monkeypatch, tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
+    _fail_indexing(monkeypatch)
 
     class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None):
+        def __init__(self, workspace, session_logger=None, tools=None, long_running=False):
             assert workspace == tmp_path
 
         async def run(self, user_input):
@@ -89,12 +135,13 @@ def test_repl_greeting_uses_agent_chat_without_index(monkeypatch, tmp_path):
     assert "Context Preview" not in rendered
 
 
-def test_repl_general_chat_without_index_uses_agent_loop(monkeypatch, tmp_path):
+def test_repl_general_chat_uses_agent_loop_when_indexing_is_unavailable(monkeypatch, tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
+    _fail_indexing(monkeypatch)
 
     class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None):
+        def __init__(self, workspace, session_logger=None, tools=None, long_running=False):
             assert workspace == tmp_path
             self.session_logger = session_logger
 
@@ -176,7 +223,7 @@ def test_repl_weather_question_without_location_asks_location(monkeypatch, tmp_p
             )()
 
     class FakeLLM:
-        def __init__(self, session_logger=None):
+        def __init__(self, session_logger=None, model_pull_progress=None):
             self.session_logger = session_logger
 
         async def run_specialist(self, specialist, pack):
@@ -219,7 +266,7 @@ def test_repl_weather_question_with_location_uses_web_tool(monkeypatch, tmp_path
             )()
 
     class FakeLLM:
-        def __init__(self, session_logger=None):
+        def __init__(self, session_logger=None, model_pull_progress=None):
             self.session_logger = session_logger
 
         async def run_specialist(self, specialist, pack):
@@ -256,7 +303,7 @@ def test_repl_followup_web_request_uses_previous_prompt(monkeypatch, tmp_path):
             raise AssertionError("fetch should not be called")
 
     class FakeLLM:
-        def __init__(self, session_logger=None):
+        def __init__(self, session_logger=None, model_pull_progress=None):
             self.session_logger = session_logger
 
         async def run_specialist(self, specialist, pack):

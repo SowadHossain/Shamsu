@@ -51,6 +51,17 @@ SECRET_PATTERNS = [
 ]
 
 
+# Action types that MAY be auto-approved once the user chooses to remember
+# a decision for them (see shamsu/safety/permission_store.py). Shell commands,
+# deletions, and external network actions are never auto-approvable here,
+# regardless of remembered choices — those always go through approval_func.
+AUTO_APPROVABLE_ACTION_TYPES = {"file_write", "file_edit"}
+
+
+def is_auto_approvable_action(action_type: str) -> bool:
+    return action_type in AUTO_APPROVABLE_ACTION_TYPES
+
+
 def classify_command(cmd: str) -> CommandRisk:
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, cmd, re.IGNORECASE):

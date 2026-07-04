@@ -8,6 +8,7 @@ from shamsu.llm.manager import LLMManager
 from shamsu.runtime.models import SPECIALIST_MODELS, required_model_names
 from shamsu.runtime.ollama import (
     RuntimeStatus,
+    ensure_model_available,
     find_ollama_executable,
     list_installed_models,
     parse_ollama_list,
@@ -123,6 +124,62 @@ def test_streaming_pull_reports_progress_chunks(monkeypatch, tmp_path):
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
     assert kwargs["env"]["PYTHONUTF8"] == "1"
+
+
+def test_ensure_model_available_skips_pull_when_already_installed(monkeypatch, tmp_path):
+    pull_calls = []
+    monkeypatch.setattr(
+        "shamsu.runtime.ollama.list_installed_models", lambda _path: ["qwen3:8b"]
+    )
+    monkeypatch.setattr(
+        "shamsu.runtime.ollama.pull_model_streaming",
+        lambda *args, **kwargs: pull_calls.append(args) or 0,
+    )
+
+    assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is True
+    assert pull_calls == []
+
+
+def test_ensure_model_available_pulls_when_missing(monkeypatch, tmp_path):
+    pull_calls = []
+
+    def fake_list(_path):
+        return ["qwen3:8b"] if pull_calls else []
+
+    def fake_pull(_path, model_name, _progress_callback=None):
+        pull_calls.append(model_name)
+        return 0
+
+    monkeypatch.setattr("shamsu.runtime.ollama.list_installed_models", fake_list)
+    monkeypatch.setattr("shamsu.runtime.ollama.pull_model_streaming", fake_pull)
+
+    assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is True
+    assert pull_calls == ["qwen3:8b"]
+
+
+def test_ensure_model_available_returns_false_when_pull_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr("shamsu.runtime.ollama.list_installed_models", lambda _path: [])
+    monkeypatch.setattr(
+        "shamsu.runtime.ollama.pull_model_streaming", lambda *args, **kwargs: 1
+    )
+
+    assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is False
+
+
+def test_ensure_model_available_forwards_progress_chunks(monkeypatch, tmp_path):
+    chunks = []
+
+    def fake_pull(_path, _model_name, progress_callback=None):
+        if progress_callback:
+            progress_callback("chunk")
+        return 0
+
+    monkeypatch.setattr("shamsu.runtime.ollama.list_installed_models", lambda _path: [])
+    monkeypatch.setattr("shamsu.runtime.ollama.pull_model_streaming", fake_pull)
+
+    ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b", chunks.append)
+
+    assert chunks == ["chunk"]
 
 
 def test_status_text_is_friendly_for_missing_runtime():

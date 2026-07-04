@@ -14,7 +14,7 @@ class FakeSearch:
         self.queries: list[str] = []
         self.file_path = file_path
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
         self.queries.append(query)
         return [
             SearchResult(

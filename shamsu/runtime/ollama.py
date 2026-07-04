@@ -152,6 +152,23 @@ def pull_model_streaming(
     return process.wait()
 
 
+def ensure_model_available(
+    ollama_path: Path,
+    model_name: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> bool:
+    """Pull `model_name` if it isn't already installed.
+
+    Returns whether the model is available after this call.
+    """
+    if model_name in list_installed_models(ollama_path):
+        return True
+    exit_code = pull_model_streaming(ollama_path, model_name, progress_callback)
+    if exit_code != 0:
+        return False
+    return model_name in list_installed_models(ollama_path)
+
+
 def pull_missing_models(ollama_path: Path, missing_models: list[str]) -> dict[str, int]:
     results: dict[str, int] = {}
     for model in missing_models:

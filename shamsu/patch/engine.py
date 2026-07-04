@@ -90,11 +90,12 @@ class PatchEngine(IPatchEngine):
         workspace_root: Path | None = None,
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         session_logger: SessionLogger | None = None,
+        approval_manager: ApprovalManager | None = None,
     ) -> None:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
-        self.approval_manager = ApprovalManager(approval_func, session_logger)
+        self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
 
     def validate_diff(self, diff_text: str) -> tuple[bool, str | None]:
@@ -142,7 +143,7 @@ class PatchEngine(IPatchEngine):
                     created.unlink()
             self._log("patch.failed", {"files": [patch.display_path for patch in patches]}, "Patch failed")
             return False
-        FileWalker(self.workspace_root).index()
+        FileWalker(self.workspace_root, session_logger=self.session_logger).index()
         self._log("patch.applied", {"files": [patch.display_path for patch in patches]}, "Patch applied")
         return True
 

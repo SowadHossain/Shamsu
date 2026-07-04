@@ -8,6 +8,7 @@ from typing import Any
 
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
@@ -31,6 +32,7 @@ class AgentToolRegistry:
         workspace_root: Path,
         approval_func=ask_approval,
         session_logger: SessionLogger | None = None,
+        approval_manager: ApprovalManager | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -39,9 +41,11 @@ class AgentToolRegistry:
             self.workspace_root,
             approval_func=approval_func,
             session_logger=session_logger,
+            approval_manager=approval_manager,
         )
         self.approval_func = approval_func
         self.session_logger = session_logger
+        self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         return [
@@ -153,7 +157,7 @@ class AgentToolRegistry:
             working_dir=str(self.workspace_root),
             reason="The agent requested a workspace file write.",
         )
-        if not self.approval_func(request):
+        if not self.approval_manager.ask(request):
             return ToolResult(False, "File write denied by user.", {"filepath": filepath})
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")

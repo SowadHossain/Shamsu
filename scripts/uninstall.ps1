@@ -93,6 +93,13 @@ if (Test-Path $RuntimeDir) {
     Write-Host "Removed repo runtime state: $RuntimeDir"
 }
 
+$NestedShamsuDirs = Get-ChildItem -Path $RepoRoot -Recurse -Directory -Filter ".shamsu" -ErrorAction SilentlyContinue |
+    Where-Object { $_.FullName -notmatch '\\\.venv\\' -and $_.FullName -notmatch '\\\.git\\' }
+foreach ($dir in $NestedShamsuDirs) {
+    Remove-Item -LiteralPath $dir.FullName -Recurse -Force
+    Write-Host "Removed stray nested workspace state: $($dir.FullName)"
+}
+
 Write-Host ""
 Write-Host "SHAMSU uninstall complete."
 Write-Host "This removed SHAMSU-managed files from this repo, your user-local launcher directory, and SHAMSU-managed PATH entry."

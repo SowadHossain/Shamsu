@@ -3,6 +3,7 @@ param(
     [switch]$Yes,
     [switch]$SkipOllamaInstall,
     [switch]$SkipModels,
+    [switch]$PrefetchModels,
     [switch]$SkipCommandInstall,
     [switch]$SkipPathUpdate,
     [string]$BinDir = (Join-Path $HOME ".shamsu\bin"),
@@ -236,7 +237,24 @@ try {
 
     & $VenvPython -m pip install --upgrade pip
     & $VenvPython -m pip install -e ".[dev]"
-    & $VenvPython -m playwright install chromium
+
+    $PlaywrightMarker = Join-Path $VenvDir ".shamsu-playwright-chromium-ok"
+    if (Test-Path $PlaywrightMarker) {
+        Write-Host "Playwright Chromium already installed (skipping browser download check)."
+    }
+    else {
+        try {
+            & $VenvPython -m playwright install chromium
+            if ($LASTEXITCODE -ne 0) {
+                throw "playwright install chromium exited with code $LASTEXITCODE"
+            }
+            New-Item -ItemType File -Force -Path $PlaywrightMarker | Out-Null
+        }
+        catch {
+            Write-Warning "Playwright Chromium install failed or was skipped: $_"
+            Write-Warning "Browser-based debugging (/browse commands) may not work until this succeeds. Rerun this script to retry."
+        }
+    }
 
     if ($ModelsPath) {
         $env:OLLAMA_MODELS = $ModelsPath
@@ -255,7 +273,16 @@ try {
         if ($InstallOllama) {
             if (Get-Command winget -ErrorAction SilentlyContinue) {
                 Write-Host "Installing Ollama through winget. SHAMSU will not edit PATH or shell profiles."
-                winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements
+                try {
+                    winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "winget install exited with code $LASTEXITCODE"
+                    }
+                }
+                catch {
+                    Write-Warning "Ollama install through winget failed: $_"
+                    Write-Warning "Install Ollama manually from https://ollama.com/download, then run ``models repair``."
+                }
             }
             else {
                 Write-Warning "winget was not found. Install Ollama from https://ollama.com/download, then rerun this script."
@@ -266,12 +293,16 @@ try {
     $RuntimeStatusJson = & $VenvPython -m shamsu.runtime.ollama status --json
     $RuntimeStatus = $RuntimeStatusJson | ConvertFrom-Json
 
-    if (-not $SkipModels -and $RuntimeStatus.ollama_path) {
-        Write-Host "Checking and pulling missing local models. This can take a long time for first install."
+    if ($PrefetchModels -and -not $SkipModels -and $RuntimeStatus.ollama_path) {
+        Write-Host "Checking and pulling all required local models now. This can take a long time."
         & $VenvPython -m shamsu.runtime.ollama repair
     }
     elseif (-not $RuntimeStatus.ollama_path) {
         Write-Warning "Ollama is still missing. SHAMSU installed, but local inference needs `models repair` after Ollama is installed."
+    }
+    else {
+        Write-Host "Skipping upfront model downloads. SHAMSU pulls each model automatically the first time it's actually needed."
+        Write-Host "Pass -PrefetchModels to this script to download all required models now instead."
     }
 
     & $VenvPython -m shamsu.runtime.ollama write-config

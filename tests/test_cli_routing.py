@@ -14,7 +14,7 @@ from shamsu.types import ContextPack, LLMResponse, SearchResult, TestRunResult a
 
 
 class FakeSearch:
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
         return [
             SearchResult(
                 file_path="app.py",

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,8 +13,14 @@ from shamsu.agents.chat_state import ChatState
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.llm.manager import OLLAMA_BASE_URL, _validate_local_llm_url
 from shamsu.runtime.models import SPECIALIST_MODELS
+from shamsu.safety.clarify import ask_clarifying_question
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
+
+# Circuit-breaker ceiling used only in long-running mode — a backstop, not
+# the normal stop condition (the repetition guard is what actually catches
+# a stuck loop; this just bounds worst-case cost on a local machine).
+LONG_RUNNING_MAX_TOOL_ROUNDS = 40
 
 AGENT_SYSTEM_PROMPT = """You are SHAMSU, a local coding agent running inside one workspace.
 
@@ -49,6 +56,8 @@ class AgentChatLoop:
         tools: AgentToolRegistry | None = None,
         state: ChatState | None = None,
         max_tool_rounds: int = 5,
+        long_running: bool = False,
+        clarify_prompt: Callable[[str], str] | None = ask_clarifying_question,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -60,11 +69,16 @@ class AgentChatLoop:
             _system_prompt(self.workspace_root),
             session_logger=session_logger,
         )
-        self.max_tool_rounds = max_tool_rounds
+        self.long_running = long_running
+        self.max_tool_rounds = LONG_RUNNING_MAX_TOOL_ROUNDS if long_running else max_tool_rounds
+        # Only used when long_running=True; None disables the clarifying
+        # question (falls back to a plain stop message) — useful for tests.
+        self.clarify_prompt = clarify_prompt if long_running else None
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
     async def run(self, user_input: str) -> AgentLoopResult:
         self.state.append_user(user_input)
+        last_call_signature: tuple[str, str] | None = None
         for round_index in range(self.max_tool_rounds):
             try:
                 response = await self.client.chat(
@@ -95,11 +109,44 @@ class AgentChatLoop:
             for call in tool_calls:
                 name = _tool_call_name(call)
                 arguments = _tool_call_arguments(call)
+                signature = (name, json.dumps(arguments, sort_keys=True, default=str))
+                if self.long_running and signature == last_call_signature:
+                    return self._handle_stuck_repetition(name, round_index)
+                last_call_signature = signature
                 result = self.tools.execute(name, arguments)
                 self.state.append_tool(_tool_call_id(call, name), name, result.to_json())
-        final = "I stopped after 5 tool rounds to avoid looping."
+        final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
         self.state.append_assistant(final)
         return AgentLoopResult(final=final, tool_rounds=self.max_tool_rounds, stopped=True)
+
+    def _handle_stuck_repetition(self, tool_name: str, round_index: int) -> AgentLoopResult:
+        """The exact same tool call repeated consecutively — the agent is
+        stuck, not making progress. In long-running mode, ask a genuine
+        clarifying question instead of silently looping or giving up.
+        """
+        question = (
+            f"I tried to repeat the exact same action ({tool_name}) without making "
+            f"progress. What should I do differently, or should I stop?"
+        )
+        if self.clarify_prompt is None:
+            final = f"I stopped because I kept repeating the same action ({tool_name}) without making progress."
+            self.state.append_assistant(final)
+            return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+        answer = self.clarify_prompt(question)
+        self.state.append_assistant(question)
+        self.state.append_user(answer)
+        final = (
+            f"{question}\n\nYou said: {answer}\n\n"
+            f"I've noted that — ask me to continue and I'll factor it in."
+        )
+        if self.session_logger:
+            self.session_logger.log(
+                "agent.clarify",
+                {"tool_name": tool_name, "question": question, "answer": answer},
+                "Asked a clarifying question after a stuck repetition",
+                workflow_id="agent-chat",
+            )
+        return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
 
 
 def _system_prompt(workspace: Path) -> str:

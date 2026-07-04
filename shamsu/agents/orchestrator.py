@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.indexer.walker import ensure_index
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
 from shamsu.tools.workspace import MentionContext, MentionResolver, WorkspaceTool, render_mention_context
@@ -86,6 +87,7 @@ class AgentOrchestrator:
                 effective_input=effective_input,
                 action="web.needs_location",
             )
+        ensure_index(self.workspace_root, self.session_logger)
         return AgentResult(
             handled=False,
             effective_input=effective_input,

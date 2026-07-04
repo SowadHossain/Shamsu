@@ -19,8 +19,11 @@ to decide what's resident.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
@@ -44,6 +47,28 @@ SPECIALIST_TEMPS = {
     "test_gen": 0.1, "test_agent": 0.1,
     "doc_agent": 0.4, "summarizer": 0.3, "qa": 0.2,
 }
+
+# Guards concurrent lazy pulls of the same model across LLMManager instances
+# (e.g. two workflows both needing "coder" right after a fresh install).
+_MODEL_PULL_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _pull_lock_for(model_name: str) -> asyncio.Lock:
+    lock = _MODEL_PULL_LOCKS.get(model_name)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MODEL_PULL_LOCKS[model_name] = lock
+    return lock
+
+
+@dataclass
+class ModelPullProgress:
+    """Optional hooks a caller can use to render UI around a lazy model pull."""
+
+    on_start: Callable[[str], None] | None = None
+    on_chunk: Callable[[str, str], None] | None = None
+    on_finish: Callable[[str, bool], None] | None = None
+
 
 ROUTER_SYSTEM_PROMPT = """You are SHAMSU's routing brain. Your ONLY job is to classify
 the user's request and output a routing decision as JSON.
@@ -84,11 +109,63 @@ ROUTING_JSON_SCHEMA = {
 
 
 class LLMManager(ILLMManager):
-    def __init__(self, base_url: str = OLLAMA_BASE_URL, session_logger: SessionLogger | None = None):
+    def __init__(
+        self,
+        base_url: str = OLLAMA_BASE_URL,
+        session_logger: SessionLogger | None = None,
+        model_pull_progress: ModelPullProgress | None = None,
+    ):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
         self.router_model = OLLAMA_MODELS["router"]
         self.session_logger = session_logger
+        self.model_pull_progress = model_pull_progress
+
+    async def _ensure_model(self, model_name: str) -> None:
+        """Lazily pull `model_name` the first time it's actually needed."""
+        # Local import: shamsu.runtime.ollama imports OLLAMA_BASE_URL from
+        # this module at top level, so a module-level import here would cycle.
+        from shamsu.runtime.ollama import (
+            ensure_model_available,
+            find_ollama_executable,
+            list_installed_models,
+        )
+
+        ollama_path = find_ollama_executable()
+        if ollama_path is None:
+            return  # let _generate's HTTP call surface the real error
+
+        lock = _pull_lock_for(model_name)
+        async with lock:
+            installed = await asyncio.to_thread(list_installed_models, ollama_path)
+            if model_name in installed:
+                return
+            if self.session_logger:
+                self.session_logger.log(
+                    "model.pull.started",
+                    {"model": model_name},
+                    f"Pulling missing model {model_name}",
+                    workflow_id="model_pull",
+                )
+            if self.model_pull_progress and self.model_pull_progress.on_start:
+                self.model_pull_progress.on_start(model_name)
+
+            def _on_chunk(chunk: str) -> None:
+                if self.model_pull_progress and self.model_pull_progress.on_chunk:
+                    self.model_pull_progress.on_chunk(model_name, chunk)
+
+            available = await asyncio.to_thread(
+                ensure_model_available, ollama_path, model_name, _on_chunk
+            )
+            if self.model_pull_progress and self.model_pull_progress.on_finish:
+                self.model_pull_progress.on_finish(model_name, available)
+            if self.session_logger:
+                self.session_logger.log(
+                    "model.pull.finished",
+                    {"model": model_name, "success": available},
+                    f"Pull finished for {model_name}" if available else f"Pull failed for {model_name}",
+                    workflow_id="model_pull",
+                )
 
     async def _generate(
         self, model: str, system: str, prompt: str,
@@ -123,6 +200,7 @@ class LLMManager(ILLMManager):
         primary defense against malformed routing JSON, not a try/except.
         """
         started = time.perf_counter()
+        await self._ensure_model(self.router_model)
         user_msg = f"USER PROMPT: {prompt}\n\nPROJECT: {project_summary}"
         if self.session_logger:
             self.session_logger.log(
@@ -194,6 +272,7 @@ class LLMManager(ILLMManager):
 
     async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
         model_name = OLLAMA_MODELS.get(specialist) or self.router_model
+        await self._ensure_model(model_name)
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
         prompt = self._format_pack(pack)
         started = time.perf_counter()

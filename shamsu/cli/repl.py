@@ -37,12 +37,14 @@ from shamsu.cli.command_router import CommandRouter
 from shamsu.agents.qa_workflow import QAWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
-from shamsu.indexer.walker import FileWalker
-from shamsu.llm.manager import LLMManager
+from shamsu.indexer.walker import FileWalker, ensure_index
+from shamsu.llm.manager import LLMManager, ModelPullProgress
 from shamsu.prd.input import PRDParseError, parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.retriever.search import SearchAgent
+from shamsu.tasks.state import MilestoneTask, list_task_ids, load_task
+from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
 from shamsu.runtime.ollama import (
     collect_status,
     pull_model_streaming,
@@ -51,18 +53,29 @@ from shamsu.runtime.ollama import (
     status_text,
     wait_until_running,
 )
-from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval import ask_approval, ask_remember_choice
+from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
+from shamsu.safety.approval_manager import ApprovalManager
+from shamsu.safety.permission_store import PermissionMemory
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch.engine import PatchEngine
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
+from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
 from shamsu.tools.workspace import WorkspaceTool
-from shamsu.types import ApprovalRequest, ContextPack, ProjectSpec, RoutingDecision, SearchResult
+from shamsu.types import (
+    ApprovalRequest,
+    ContextPack,
+    ProjectSpec,
+    RoutingDecision,
+    SearchResult,
+    TaskStepStatus,
+)
 
 if sys.platform == "win32":
     from prompt_toolkit.output.win32 import NoConsoleScreenBufferError
@@ -71,7 +84,7 @@ else:
 
 
 class EmptySearchAgent:
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
         return []
 
     def symbol_lookup(self, name: str) -> list[SearchResult]:
@@ -85,6 +98,7 @@ SYSTEM_COMMANDS = (
     "/help",
     "/index",
     "/status",
+    "/doctor",
     "/search ",
     "/symbols ",
     "/parse-prd ",
@@ -112,6 +126,13 @@ SYSTEM_COMMANDS = (
     "/sessions rename ",
     "/sessions close",
     "/sessions export ",
+    "/permissions list",
+    "/permissions clear",
+    "/tasks list",
+    "/tasks show ",
+    "/autonomy status",
+    "/autonomy on",
+    "/autonomy off",
     "/log",
     "/log tail",
     "/edit ",
@@ -192,6 +213,7 @@ def _print_help(console: Console) -> None:
                     "Commands:",
                     "  /index                    Index the current workspace",
                     "  /status                   Show index counts",
+                    "  /doctor                   Diagnose install/workspace health (read-only)",
                     "  /search <query>           Search indexed snippets",
                     "  /symbols <name>           Look up indexed symbols",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
@@ -219,6 +241,12 @@ def _print_help(console: Console) -> None:
                     "  /sessions rename <id> <title>",
                     "  /sessions close [id]      Close a session",
                     "  /sessions export <id>     Export redacted session bundle",
+                    "  /permissions list         Show remembered 'always allow' decisions",
+                    "  /permissions clear        Forget all remembered approval decisions",
+                    "  /tasks list               List tracked multi-step tasks",
+                    "  /tasks show <id>          Show a task's steps, phase, and blockers",
+                    "  /autonomy status          Show whether long-running mode is on",
+                    "  /autonomy on|off          Toggle long-running autonomous mode for this workspace",
                     "  /log tail                 Show recent session events",
                     "  /edit <request>           Force code-edit workflow",
                     "  /fix <bug/traceback>      Force bug-fix workflow",
@@ -244,19 +272,32 @@ def _has_index(workspace: Path) -> bool:
     return _index_db_path(workspace).exists()
 
 
-def _build_search_agent(workspace: Path) -> tuple[SearchAgent | EmptySearchAgent, bool]:
+# Re-exported so existing call sites/tests can keep using repl._ensure_index;
+# the shared implementation lives in indexer.walker so AgentOrchestrator can
+# use the exact same best-effort auto-indexing without importing this module.
+_ensure_index = ensure_index
+
+
+def _build_search_agent(
+    workspace: Path,
+    session_logger: SessionLogger | None = None,
+) -> tuple[SearchAgent | EmptySearchAgent, bool]:
+    _ensure_index(workspace, session_logger)
     if _has_index(workspace):
         return SearchAgent(_index_db_path(workspace)), True
     return EmptySearchAgent(), False
 
 
-def _build_workspace_qa_workflow(workspace: Path) -> tuple[QAWorkflow, bool]:
-    search, uses_real_index = _build_search_agent(workspace)
+def _build_workspace_qa_workflow(
+    workspace: Path,
+    session_logger: SessionLogger | None = None,
+) -> tuple[QAWorkflow, bool]:
+    search, uses_real_index = _build_search_agent(workspace, session_logger)
     return QAWorkflow(search=search), uses_real_index
 
 
-def _handle_index(workspace: Path, console: Console) -> None:
-    entries = FileWalker(workspace).index()
+def _handle_index(workspace: Path, console: Console, session_logger: SessionLogger | None = None) -> None:
+    entries = FileWalker(workspace, session_logger=session_logger).index()
     console.print(f"Indexed {len(entries)} files.")
     for entry in entries[:20]:
         console.print(f"{entry.language:10} {entry.path}")
@@ -344,15 +385,7 @@ def _handle_plan_prd(
         working_dir=str(workspace),
         reason="M3 only stores resume metadata; it does not generate project files.",
     )
-    _log_event(session_logger, "approval.request", {"request": request}, request.description, "plan-prd")
-    approved = approval_func(request)
-    _log_event(
-        session_logger,
-        "approval.result",
-        {"action_type": request.action_type, "approved": approved},
-        f"Approval {'granted' if approved else 'denied'}: {request.description}",
-        "plan-prd",
-    )
+    approved = ApprovalManager(approval_func, session_logger).ask(request)
     if not approved:
         console.print("[yellow]Project plan was not approved. No state was written.[/yellow]")
         return
@@ -412,6 +445,7 @@ def _handle_generate_django(
         workspace,
         approval_func=approval_func,
         session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
     )
     try:
         state = writer.write_project(spec, file_path)
@@ -444,11 +478,12 @@ async def _handle_generate_prd(
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         return
-    search, _uses_real_index = _build_search_agent(workspace)
+    search, _uses_real_index = _build_search_agent(workspace, session_logger)
     result = await FullDjangoPipeline(
         workspace,
         search=search,
         session_logger=session_logger,
+        long_running=is_long_running_enabled(workspace),
     ).run(prd_path, target_dir=output_dir)
     _print_full_pipeline_result(result, console)
 
@@ -560,11 +595,9 @@ def _resolve_workspace_file(path_text: str, workspace: Path) -> Path:
     return Sandbox(workspace).validate(path_text)
 
 
-def _handle_status(workspace: Path, console: Console) -> None:
+def _handle_status(workspace: Path, console: Console, session_logger: SessionLogger | None = None) -> None:
+    _ensure_index(workspace, session_logger)
     db_path = _index_db_path(workspace)
-    if not db_path.exists():
-        console.print("[yellow]No index found. Run `index` first.[/yellow]")
-        return
 
     conn = sqlite3.connect(db_path)
     try:
@@ -578,15 +611,18 @@ def _handle_status(workspace: Path, console: Console) -> None:
     console.print(f"Snippets: {snippets}")
 
 
-def _handle_search(user_input: str, workspace: Path, console: Console) -> None:
+def _handle_search(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
     _, _, query = user_input.partition(" ")
     query = query.strip()
     if not query:
         console.print("[red]Usage: search <query>[/red]")
         return
-    if not _has_index(workspace):
-        console.print("[yellow]No index found. Run `index` first.[/yellow]")
-        return
+    _ensure_index(workspace, session_logger)
     results = SearchAgent(_index_db_path(workspace)).search(query, top_k=5)
     if not results:
         console.print("[yellow]No results.[/yellow]")
@@ -598,15 +634,132 @@ def _handle_search(user_input: str, workspace: Path, console: Console) -> None:
         )
 
 
-def _handle_symbols(user_input: str, workspace: Path, console: Console) -> None:
+def _handle_doctor(workspace: Path, console: Console) -> None:
+    report = run_doctor(workspace=workspace)
+    console.print(format_report(report))
+
+
+def _handle_permissions(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=1)
+    command = parts[1].strip().lower() if len(parts) > 1 else "list"
+    memory = _get_permission_memory(workspace)
+    if command == "clear":
+        memory.forget_all()
+        console.print("[green]Forgot all remembered approval decisions.[/green]")
+        return
+    if command == "list":
+        remembered = memory.list_remembered()
+        if not remembered:
+            console.print("[dim]No remembered approval decisions for this workspace.[/dim]")
+            return
+        table = Table(title="Remembered Approvals")
+        table.add_column("Action Type")
+        table.add_column("Scope")
+        for action_type, scope in sorted(remembered.items()):
+            table.add_row(action_type, scope)
+        console.print(table)
+        return
+    console.print("[red]Usage: permissions list|clear[/red]")
+
+
+def _print_task(task: MilestoneTask, console: Console) -> None:
+    console.print(f"Task: {task.task_id}")
+    console.print(f"Request: {task.user_request}")
+    console.print(f"Phase: {task.phase}")
+    if task.next_action:
+        console.print(f"[yellow]Next action: {task.next_action}[/yellow]")
+    table = Table(title="Steps")
+    table.add_column("ID")
+    table.add_column("Phase")
+    table.add_column("Description")
+    table.add_column("Status")
+    table.add_column("Error")
+    for step in task.steps:
+        table.add_row(str(step.id), step.phase, step.description, step.status.value, step.error or "")
+    console.print(table)
+    if task.files_created:
+        console.print(f"Files created: {', '.join(task.files_created)}")
+    if task.files_edited:
+        console.print(f"Files edited: {', '.join(task.files_edited)}")
+
+
+def _handle_autonomy(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=1)
+    command = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if command == "on":
+        set_long_running_enabled(workspace, True)
+        console.print(
+            "[green]Long-running mode enabled for this workspace.[/green] "
+            "Agent chat, the Django fix-tests loop, and full PRD generation will use "
+            "higher round/iteration ceilings with a repetition guard and stall detection "
+            "instead of the default low caps."
+        )
+        return
+    if command == "off":
+        set_long_running_enabled(workspace, False)
+        console.print("[yellow]Long-running mode disabled. Back to the default low caps.[/yellow]")
+        return
+    if command == "status":
+        enabled = is_long_running_enabled(workspace)
+        state = "[green]on[/green]" if enabled else "[dim]off (default)[/dim]"
+        console.print(f"Long-running mode: {state}")
+        return
+    console.print("[red]Usage: autonomy status|on|off[/red]")
+
+
+def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=2)
+    command = parts[1].strip().lower() if len(parts) > 1 else "list"
+    if command == "list":
+        task_ids = list_task_ids(workspace)
+        if not task_ids:
+            console.print("[dim]No tracked tasks for this workspace.[/dim]")
+            return
+        table = Table(title="Tasks")
+        table.add_column("ID")
+        table.add_column("Phase")
+        table.add_column("Pending")
+        table.add_column("Blocked")
+        table.add_column("Next Action")
+        for task_id in task_ids:
+            try:
+                task = load_task(workspace, task_id)
+            except (OSError, ValueError, KeyError) as exc:
+                table.add_row(task_id, "-", "-", "-", f"Could not load: {exc}")
+                continue
+            pending = sum(1 for step in task.steps if step.status == TaskStepStatus.PENDING)
+            table.add_row(
+                task.task_id, task.phase, str(pending), str(len(task.blocked_steps)),
+                task.next_action or "-",
+            )
+        console.print(table)
+        return
+    if command == "show":
+        if len(parts) < 3:
+            console.print("[red]Usage: tasks show <id>[/red]")
+            return
+        try:
+            task = load_task(workspace, parts[2].strip())
+        except (OSError, ValueError) as exc:
+            console.print(f"[red]Could not load task {parts[2].strip()}: {exc}[/red]")
+            return
+        _print_task(task, console)
+        return
+    console.print("[red]Usage: tasks list|show <id>[/red]")
+
+
+def _handle_symbols(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
     _, _, name = user_input.partition(" ")
     name = name.strip()
     if not name:
         console.print("[red]Usage: symbols <name>[/red]")
         return
-    if not _has_index(workspace):
-        console.print("[yellow]No index found. Run `index` first.[/yellow]")
-        return
+    _ensure_index(workspace, session_logger)
     results = SearchAgent(_index_db_path(workspace)).symbol_lookup(name)
     if not results:
         console.print("[yellow]No symbols found.[/yellow]")
@@ -734,7 +887,7 @@ def _approve_model_download(
     _console: Console,
     approval_func: Callable[[ApprovalRequest], bool],
 ) -> bool:
-    return approval_func(
+    return ApprovalManager(approval_func).ask(
         ApprovalRequest(
             action_type="run_command",
             description=f"Download {len(missing_models)} missing local Ollama model(s).",
@@ -748,19 +901,115 @@ def _approve_model_download(
     )
 
 
+def _build_pull_progress(console: Console) -> Progress:
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+    )
+
+
+class _LazyModelPullProgress:
+    """Drives a Rich progress bar for models pulled on-demand mid-workflow.
+
+    Unlike `_pull_models_with_progress` (a known batch pulled up front by
+    `/models pull`), models here become needed one at a time from inside
+    async workflows, so the bar is started lazily and torn down once no
+    pull is in flight.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+        self._progress: Progress | None = None
+        self._task_ids: dict[str, int] = {}
+
+    def _ensure_progress(self) -> Progress:
+        if self._progress is None:
+            self._progress = _build_pull_progress(self._console)
+            self._progress.start()
+        return self._progress
+
+    def on_start(self, model_name: str) -> None:
+        progress = self._ensure_progress()
+        self._task_ids[model_name] = progress.add_task(
+            f"Pulling {model_name} (first use of this model)", total=None
+        )
+
+    def on_chunk(self, model_name: str, _chunk: str) -> None:
+        task_id = self._task_ids.get(model_name)
+        if task_id is not None and self._progress is not None:
+            self._progress.advance(task_id)
+
+    def on_finish(self, model_name: str, success: bool) -> None:
+        task_id = self._task_ids.pop(model_name, None)
+        if task_id is not None and self._progress is not None:
+            self._progress.update(
+                task_id,
+                description=f"{'Installed' if success else 'Failed'} {model_name}",
+            )
+        if self._progress is not None and not self._task_ids:
+            self._progress.stop()
+            self._progress = None
+
+    def as_model_pull_progress(self) -> ModelPullProgress:
+        return ModelPullProgress(on_start=self.on_start, on_chunk=self.on_chunk, on_finish=self.on_finish)
+
+
+def _make_llm_manager(session_logger: SessionLogger | None, console: Console) -> LLMManager:
+    lazy_progress = _LazyModelPullProgress(console)
+    return LLMManager(
+        session_logger=session_logger,
+        model_pull_progress=lazy_progress.as_model_pull_progress(),
+    )
+
+
+# One PermissionMemory per workspace per process, so "always allow" choices
+# made in one workflow (e.g. /edit) are honored by later ones (e.g. /fix)
+# within the same REPL session, not just within a single handler call.
+_PERMISSION_MEMORY_CACHE: dict[Path, PermissionMemory] = {}
+
+
+def _get_permission_memory(workspace: Path) -> PermissionMemory:
+    resolved = workspace.resolve()
+    memory = _PERMISSION_MEMORY_CACHE.get(resolved)
+    if memory is None:
+        memory = PermissionMemory(resolved)
+        _PERMISSION_MEMORY_CACHE[resolved] = memory
+    return memory
+
+
+def _make_approval_manager(
+    workspace: Path,
+    session_logger: SessionLogger | None,
+    console: Console,
+    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+) -> ApprovalManager:
+    # Only offer the "remember" follow-up when this is the real interactive
+    # prompt. Callers (mainly tests) that inject their own approval_func get
+    # memory-gated auto-approval but never the remember prompt itself, so a
+    # substituted approval_func's behavior isn't silently overridden here.
+    remember_prompt = (
+        (lambda action_type: ask_remember_choice(action_type, console=console))
+        if approval_func is ask_approval
+        else None
+    )
+    return ApprovalManager(
+        approval_func=approval_func,
+        session_logger=session_logger,
+        memory=_get_permission_memory(workspace),
+        remember_prompt=remember_prompt,
+    )
+
+
 def _pull_models_with_progress(
     ollama_path: Path,
     models: list[str],
     console: Console,
 ) -> dict[str, int]:
     results: dict[str, int] = {}
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        TimeElapsedColumn(),
-        console=console,
-        transient=False,
-    ) as progress:
+    with _build_pull_progress(console) as progress:
         for model in models:
             task_id = progress.add_task(f"Pulling {model} (resumes if interrupted)", total=None)
             exit_code = pull_model_streaming(
@@ -1003,13 +1252,13 @@ async def _handle_request(
         _handle_workspace_prd_request(workspace, console)
         return
     if _looks_like_browser_needed_prompt(effective_input):
-        await _run_browser_assist(effective_input, console, llm=LLMManager(session_logger=session_logger), browser_tool=browser_tool)
+        await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console), browser_tool=browser_tool)
         return
     if _looks_like_web_needed_prompt(effective_input):
         await _run_web_assist(
             effective_input,
             console,
-            llm=LLMManager(session_logger=session_logger),
+            llm=_make_llm_manager(session_logger, console),
             web_tool=web_tool,
             session_logger=session_logger,
         )
@@ -1025,8 +1274,8 @@ async def _handle_request(
         plan_command = f"plan-prd {_extract_prd_path_from_prompt(effective_input)}"
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
-    search, uses_real_index = _build_search_agent(workspace)
-    llm = LLMManager(session_logger=session_logger)
+    search, uses_real_index = _build_search_agent(workspace, session_logger)
+    llm = _make_llm_manager(session_logger, console)
     if not uses_real_index:
         decision = _keyword_decision(effective_input)
         if decision.intent in {"qa", "explain"}:
@@ -1455,7 +1704,7 @@ async def _run_qa(
     extra_context: str = "",
     session_logger: SessionLogger | None = None,
 ) -> None:
-    qa_workflow, _uses_real_index = _build_workspace_qa_workflow(workspace)
+    qa_workflow, _uses_real_index = _build_workspace_qa_workflow(workspace, session_logger)
     request = _append_agent_context(user_input, extra_context)
     result = await Coordinator(llm=llm, qa_workflow=qa_workflow).handle(request)
     if result.answer:
@@ -1500,7 +1749,17 @@ async def _run_agent_chat(
     console: Console,
     session_logger: SessionLogger | None = None,
 ) -> None:
-    result = await AgentChatLoop(workspace, session_logger=session_logger).run(user_input)
+    tools = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+    )
+    result = await AgentChatLoop(
+        workspace,
+        session_logger=session_logger,
+        tools=tools,
+        long_running=is_long_running_enabled(workspace),
+    ).run(user_input)
     body = result.final.strip() or "No response returned."
     console.print(Panel(body, title="Agent"))
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
@@ -1779,7 +2038,11 @@ async def _run_code_edit(
     _warn_if_dirty_before_edit(workspace, console)
     kwargs = {}
     if session_logger:
-        kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
+        kwargs["patch_engine"] = PatchEngine(
+            workspace,
+            session_logger=session_logger,
+            approval_manager=_make_approval_manager(workspace, session_logger, console),
+        )
     result = await CodeEditWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "edit")
     )
@@ -1797,7 +2060,11 @@ async def _run_bug_fix(
     _warn_if_dirty_before_edit(workspace, console)
     kwargs = {}
     if session_logger:
-        kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
+        kwargs["patch_engine"] = PatchEngine(
+            workspace,
+            session_logger=session_logger,
+            approval_manager=_make_approval_manager(workspace, session_logger, console),
+        )
     result = await BugFixWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "fix")
     )
@@ -1842,8 +2109,13 @@ async def _run_test_generation(
     _warn_if_dirty_before_edit(workspace, console)
     kwargs = {}
     if session_logger:
-        kwargs["patch_engine"] = PatchEngine(workspace, session_logger=session_logger)
-        kwargs["command_runner"] = CommandRunner(workspace, session_logger=session_logger)
+        approval_manager = _make_approval_manager(workspace, session_logger, console)
+        kwargs["patch_engine"] = PatchEngine(
+            workspace, session_logger=session_logger, approval_manager=approval_manager
+        )
+        kwargs["command_runner"] = CommandRunner(
+            workspace, session_logger=session_logger, approval_manager=approval_manager
+        )
     result = await TestGenerationWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "test-gen")
     )
@@ -1864,7 +2136,13 @@ async def _run_docs(
         llm=llm,
         workspace_root=workspace,
         **(
-            {"patch_engine": PatchEngine(workspace, session_logger=session_logger)}
+            {
+                "patch_engine": PatchEngine(
+                    workspace,
+                    session_logger=session_logger,
+                    approval_manager=_make_approval_manager(workspace, session_logger, console),
+                )
+            }
             if session_logger
             else {}
         ),
@@ -1886,14 +2164,19 @@ async def _handle_django_fix_tests(
 ) -> None:
     parts = user_input.split(maxsplit=2)
     project_dir = parts[2].strip() if len(parts) > 2 else "."
-    search, _uses_real_index = _build_search_agent(workspace)
-    llm = LLMManager(session_logger=session_logger)
+    search, _uses_real_index = _build_search_agent(workspace, session_logger)
+    llm = _make_llm_manager(session_logger, console)
     result = await ErrorFeedbackLoop(
         workspace,
         search=search,
         llm=llm,
-        patch_engine=PatchEngine(workspace, session_logger=session_logger),
+        patch_engine=PatchEngine(
+            workspace,
+            session_logger=session_logger,
+            approval_manager=_make_approval_manager(workspace, session_logger, console),
+        ),
         session_logger=session_logger,
+        long_running=is_long_running_enabled(workspace),
     ).run(project_dir)
     _print_django_test_result(result.final_result, console)
     if result.success:
@@ -1984,6 +2267,14 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     console.print(f"[dim]Workspace: {workspace}[/dim]")
+    ancestor_workspace = find_ancestor_workspace(workspace)
+    if ancestor_workspace is not None:
+        console.print(
+            f"[yellow]Note: a parent directory already has a SHAMSU workspace at "
+            f"{ancestor_workspace}. Continuing here will create a separate workspace at "
+            f"{workspace}. Pass --workspace {ancestor_workspace} to use the existing one "
+            f"instead, or run `/doctor` for more detail.[/yellow]"
+        )
     console.print(f"[dim]{status_text(collect_status())}[/dim]")
     session_manager = SessionManager(workspace)
     try:
@@ -1992,8 +2283,15 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
     console.print("[dim]Type a prompt, or `/help` for commands.[/dim]\n")
-    web_tool = WebTool(session_logger=session_logger)
-    browser_tool = BrowserTool(workspace, session_logger=session_logger)
+    web_tool = WebTool(
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+    )
+    browser_tool = BrowserTool(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+    )
     session = _make_prompt_session(workspace)
     command_router = CommandRouter(SYSTEM_COMMANDS)
 
@@ -2035,18 +2333,22 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input == "index":
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_index(workspace, console)
+                _handle_index(workspace, console, session_logger=session_logger)
             continue
         if lowered_input == "status":
-            _handle_status(workspace, console)
+            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                _handle_status(workspace, console, session_logger=session_logger)
+            continue
+        if lowered_input == "doctor":
+            _handle_doctor(workspace, console)
             continue
         if lowered_input.startswith("search "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_search(normalized_input, workspace, console)
+                _handle_search(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("symbols "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_symbols(normalized_input, workspace, console)
+                _handle_symbols(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("parse-prd "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
@@ -2070,7 +2372,7 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("web "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_web(normalized_input, console, web_tool, LLMManager(session_logger=session_logger))
+                _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console))
             continue
         if lowered_input.startswith("browse "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
@@ -2088,6 +2390,15 @@ def main(argv: list[str] | None = None) -> None:
                 session_logger = _handle_sessions(normalized_input, session_manager, session_logger, console)
                 web_tool.session_logger = session_logger
                 browser_tool.session_logger = session_logger
+            continue
+        if lowered_input.startswith("permissions"):
+            _handle_permissions(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("tasks"):
+            _handle_tasks(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("autonomy"):
+            _handle_autonomy(normalized_input, workspace, console)
             continue
         if lowered_input == "log" or lowered_input.startswith("log "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

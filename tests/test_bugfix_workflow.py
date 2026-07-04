@@ -13,7 +13,7 @@ class FakeSearch:
     def __init__(self) -> None:
         self.queries: list[str] = []
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
         self.queries.append(query)
         return [
             SearchResult(
@@ -46,6 +46,26 @@ class FakeLLM:
         self.specialist = specialist
         self.pack = pack
         return LLMResponse(raw=self.raw, format="diff", model_used="fake-bugfix")
+
+
+class FakeCouncilLLM:
+    """Distinguishes bugfix (draft/reconcile) vs reviewer (critique) calls."""
+
+    def __init__(self, bugfix_responses: list[str], reviewer_responses: list[str]) -> None:
+        self.bugfix_responses = list(bugfix_responses)
+        self.reviewer_responses = list(reviewer_responses)
+        self.specialists_called: list[str] = []
+
+    async def route(self, prompt: str, project_summary: str):  # pragma: no cover
+        raise NotImplementedError
+
+    async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
+        self.specialists_called.append(specialist)
+        if specialist == "reviewer":
+            raw = self.reviewer_responses.pop(0)
+        else:
+            raw = self.bugfix_responses.pop(0)
+        return LLMResponse(raw=raw, format="diff", model_used=f"fake-{specialist}")
 
 
 def test_parse_traceback_locations_accepts_tracebacks_and_plain_locations():
@@ -144,3 +164,66 @@ async def test_bugfix_workflow_reports_denied_apply(tmp_path: Path):
     assert result.error == "Patch was not applied."
     assert result.changed_files == ["app.py"]
     assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_bugfix_workflow_convenes_council_for_security_sensitive_traceback(tmp_path: Path):
+    target = tmp_path / "shamsu" / "safety" / "approval.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def ask_approval():\n    return True\n", encoding="utf-8")
+    draft_diff = """--- a/shamsu/safety/approval.py
++++ b/shamsu/safety/approval.py
+@@ -1,2 +1,2 @@
+ def ask_approval():
+-    return True
++    return False
+"""
+    reconciled_diff = """--- a/shamsu/safety/approval.py
++++ b/shamsu/safety/approval.py
+@@ -1,2 +1,3 @@
+ def ask_approval():
++    # fixed after review
+     return True
+"""
+    llm = FakeCouncilLLM(
+        bugfix_responses=[draft_diff, reconciled_diff],
+        reviewer_responses=["Security risk: this silently flips approval to always-deny."],
+    )
+    report = 'Traceback (most recent call last):\n  File "shamsu/safety/approval.py", line 2\nAssertionError'
+
+    result = await BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run(report)
+
+    assert llm.specialists_called == ["bugfix", "reviewer", "bugfix"]
+    assert result.applied is True
+    assert "fixed after review" in target.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_bugfix_workflow_skips_council_for_ordinary_traceback(tmp_path: Path):
+    target = tmp_path / "app.py"
+    target.write_text("def divide(a, b):\n    return a / b\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1,2 +1,4 @@
+ def divide(a, b):
++    if b == 0:
++        return 0
+     return a / b
+"""
+    llm = FakeCouncilLLM(bugfix_responses=[diff], reviewer_responses=[])
+    report = 'Traceback (most recent call last):\n  File "app.py", line 2\nZeroDivisionError'
+
+    result = await BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run(report)
+
+    assert llm.specialists_called == ["bugfix"]
+    assert result.applied is True

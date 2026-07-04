@@ -78,6 +78,91 @@ def test_file_walker_removes_stale_index_rows(tmp_path):
     assert all("old_symbol" not in row[0] for row in snippets)
 
 
+def test_file_walker_skips_unchanged_files_on_reindex(tmp_path, monkeypatch):
+    (tmp_path / "auth.py").write_text(
+        "class LoginView:\n    def authenticate_user(self):\n        return 1\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / ".shamsu" / "index.db"
+    first_entries = FileWalker(tmp_path, db_path=db_path).index()
+    assert first_entries[0].symbol_count == 2
+
+    rebuild_calls = []
+    monkeypatch.setattr(
+        FileWalker,
+        "_replace_file_index",
+        staticmethod(lambda conn, file_id, path, language: rebuild_calls.append(path)),
+    )
+
+    second_entries = FileWalker(tmp_path, db_path=db_path).index()
+
+    assert rebuild_calls == []
+    assert second_entries[0].symbol_count == first_entries[0].symbol_count
+    assert second_entries[0].hash == first_entries[0].hash
+
+
+def test_file_walker_rebuilds_when_content_hash_changes(tmp_path):
+    source = tmp_path / "auth.py"
+    source.write_text("def authenticate_user():\n    return 1\n", encoding="utf-8")
+    db_path = tmp_path / ".shamsu" / "index.db"
+    first_entries = FileWalker(tmp_path, db_path=db_path).index()
+
+    source.write_text(
+        "def authenticate_user():\n    return 1\n\n\ndef extra():\n    return 2\n",
+        encoding="utf-8",
+    )
+    second_entries = FileWalker(tmp_path, db_path=db_path).index()
+
+    assert second_entries[0].hash != first_entries[0].hash
+    assert second_entries[0].symbol_count == 2
+
+
+def test_file_walker_full_forces_rebuild_even_when_unchanged(tmp_path, monkeypatch):
+    (tmp_path / "auth.py").write_text("def authenticate_user():\n    return 1\n", encoding="utf-8")
+    db_path = tmp_path / ".shamsu" / "index.db"
+    FileWalker(tmp_path, db_path=db_path).index()
+
+    rebuild_calls = []
+    monkeypatch.setattr(
+        FileWalker,
+        "_replace_file_index",
+        staticmethod(lambda conn, file_id, path, language: rebuild_calls.append(path)),
+    )
+
+    FileWalker(tmp_path, db_path=db_path).index(full=True)
+
+    assert len(rebuild_calls) == 1
+
+
+def test_file_walker_logs_index_updated_event(tmp_path):
+    (tmp_path / "auth.py").write_text("def authenticate_user():\n    return 1\n", encoding="utf-8")
+    db_path = tmp_path / ".shamsu" / "index.db"
+
+    class RecordingLogger:
+        def __init__(self):
+            self.events = []
+
+        def log(self, event_type, payload, summary, workflow_id=None):
+            self.events.append((event_type, payload))
+
+    logger = RecordingLogger()
+    FileWalker(tmp_path, db_path=db_path, session_logger=logger).index()
+
+    assert len(logger.events) == 1
+    event_type, payload = logger.events[0]
+    assert event_type == "index.updated"
+    assert payload["files_scanned"] == 1
+    assert payload["files_changed"] == 1
+    assert payload["files_skipped"] == 0
+
+    logger.events.clear()
+    FileWalker(tmp_path, db_path=db_path, session_logger=logger).index()
+
+    _, second_payload = logger.events[0]
+    assert second_payload["files_changed"] == 0
+    assert second_payload["files_skipped"] == 1
+
+
 def test_extract_entities_from_prd_sections(tmp_path):
     prd_path = tmp_path / "todo.md"
     prd_path.write_text(

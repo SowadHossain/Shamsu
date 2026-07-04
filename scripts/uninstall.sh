@@ -54,6 +54,11 @@ if [[ -d "${RUNTIME_DIR}" ]]; then
   echo "Removed repo runtime state: ${RUNTIME_DIR}"
 fi
 
+while IFS= read -r -d '' nested_dir; do
+  rm -rf "${nested_dir}"
+  echo "Removed stray nested workspace state: ${nested_dir}"
+done < <(find "${REPO_ROOT}" -type d -name ".shamsu" -not -path "*/.venv/*" -not -path "*/.git/*" -print0 2>/dev/null)
+
 echo
 echo "SHAMSU uninstall complete."
 echo "This removed SHAMSU-managed files from this repo and your user-local launcher directory."

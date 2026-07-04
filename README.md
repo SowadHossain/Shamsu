@@ -108,11 +108,18 @@ Installer flags:
 -Yes / --yes                         approve runtime bootstrap prompts
 -SkipOllamaInstall / --skip-ollama-install
 -SkipModels / --skip-models
+-PrefetchModels / --prefetch-models   download all required models now instead of on first use
 -SkipCommandInstall / --skip-command-install
 -SkipPathUpdate
 -BinDir <path> / --bin-dir <path>
 -ModelsPath <path> / --models-path <path>
 ```
+
+By default, install does **not** download any model weights. The CLI starts up
+immediately, and each model downloads itself (with a progress bar) the first
+time a task actually needs it. Pass `-PrefetchModels`/`--prefetch-models` if
+you want every required model pulled upfront instead — for example, to
+guarantee the machine works fully offline before you disconnect it.
 
 The installer may download Ollama and model weights when approved. SHAMSU itself
 does not edit your PowerShell profile, registry, shell startup files, or global
@@ -612,9 +619,34 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 
 This does not permanently change your execution policy.
 
-### Reinstall Dependencies
+### Something Feels Broken
 
-Remove the local venv and reinstall.
+Editing `shamsu` source code never requires a reinstall — install uses an
+editable Python install, so code changes take effect the next time you run
+`shamsu`. Before reinstalling anything, run the read-only diagnostic first:
+
+Windows:
+
+```powershell
+.\scripts\doctor.ps1
+```
+
+Bash:
+
+```bash
+bash scripts/doctor.sh
+```
+
+`doctor` checks the editable install, Ollama status, PATH setup, and for
+stray nested `.shamsu` workspace folders (a common cause of "wrong index" or
+"it forgot everything" symptoms when `shamsu` was run from different
+directories inside the same project). It only reports; it never changes
+anything.
+
+### Reinstall Dependencies (last resort)
+
+Only do this if `doctor` reports the virtual environment itself is
+corrupted. This re-downloads dependencies and is slower than a normal run.
 
 Windows:
 
