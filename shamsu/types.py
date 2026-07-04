@@ -125,6 +125,14 @@ class TaskState:
 # Project generation spec (PRD → Django project)
 # ─────────────────────────────────────────────────────────────────────────
 
+class Archetype(str, Enum):
+    WEB_CRUD = "web_crud"
+    REST_API = "rest_api"
+    SAAS_FULLSTACK = "saas_fullstack"
+    REALTIME_3D_GAME = "realtime_3d_game"
+    GENERIC_WEB = "generic_web"
+
+
 @dataclass
 class EntityFieldSpec:
     name: str
@@ -166,6 +174,23 @@ class DjangoFileSpec:
 
 
 @dataclass
+class Hole:
+    id: str
+    hole_type: str
+    target_file: str
+    description: str
+    signature: Optional[str] = None
+    schema: Optional[dict[str, Any]] = None
+    depends_on: list[str] = field(default_factory=list)
+    specialist: str = "coder"
+
+
+@dataclass
+class GenerationManifest:
+    holes: list[Hole] = field(default_factory=list)
+
+
+@dataclass
 class ProjectSpec:
     project_name: str
     app_name: str
@@ -174,6 +199,9 @@ class ProjectSpec:
     pages: list[PageSpec]
     theme: str = "corporate"            # DaisyUI theme
     generation_order: list[DjangoFileSpec] = field(default_factory=list)
+    archetype: Archetype = Archetype.WEB_CRUD
+    archetype_confidence: float = 1.0
+    archetype_spec: Any = None
 
 
 # ─────────────────────────────────────────────────────────────────────────

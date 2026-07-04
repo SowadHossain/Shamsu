@@ -30,7 +30,7 @@ import httpx
 from json_repair import repair_json
 
 from shamsu.interfaces import ILLMManager
-from shamsu.runtime.models import SPECIALIST_MODELS
+from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
 
@@ -117,7 +117,7 @@ class LLMManager(ILLMManager):
     ):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
-        self.router_model = OLLAMA_MODELS["router"]
+        self.router_model = model_for_role("router")
         self.session_logger = session_logger
         self.model_pull_progress = model_pull_progress
 
@@ -271,7 +271,7 @@ class LLMManager(ILLMManager):
             return None
 
     async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
-        model_name = OLLAMA_MODELS.get(specialist) or self.router_model
+        model_name = model_for_role(specialist)
         await self._ensure_model(model_name)
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
         prompt = self._format_pack(pack)
@@ -360,7 +360,7 @@ class LLMManager(ILLMManager):
         Falls back cleanly: the caller still gets the full text in the returned
         LLMResponse, so a non-streaming renderer can print it after the fact.
         """
-        model_name = OLLAMA_MODELS.get(specialist) or self.router_model
+        model_name = model_for_role(specialist)
         await self._ensure_model(model_name)
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
         prompt = self._format_pack(pack)

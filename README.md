@@ -543,7 +543,10 @@ Local AI runtime:
 - Required model checks use Ollama's local CLI and local HTTP API.
 - Setup-time downloads require installer approval or `-Yes`/`--yes`.
 - Runtime inference does not call cloud AI endpoints.
-- The default router/chat/planner model is `qwen3:8b`; `gemma3:4b` remains the low-resource fallback option.
+- The default v2.2 model map uses two 8GB-friendly anchors: `qwen3:8b`
+  for routing/chat/planning/review/docs and `qwen2.5-coder:7b-instruct`
+  for code, tests, and bug-fix work. Set `SHAMSU_SINGLE_MODEL_MODE=1` to
+  route every role through `qwen3:8b` for zero-swap measurement.
 
 Internal command execution:
 

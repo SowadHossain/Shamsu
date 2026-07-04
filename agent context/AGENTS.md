@@ -190,7 +190,7 @@ Completed first slice:
 - `tools/workspace.py` provides read-only workspace listing, file reading, PRD discovery, and `@` mention resolution.
 - `safety/approval_manager.py` centralizes approval request/result logging.
 - `agents/chat_loop.py`, `agents/chat_state.py`, and `tools/agent_tools.py` provide the stateful Ollama SDK ReAct loop and local tool registry.
-- The primary local router/chat/planner model is now `qwen3:8b`; `gemma3:4b` is a low-resource fallback option.
+- The v2.2 local model map is two-anchor: `qwen3:8b` for router/chat/planner/classifier/review/docs/summarizer and `qwen2.5-coder:7b-instruct` for code/test/bug-fix roles. `SHAMSU_SINGLE_MODEL_MODE=1` routes every role to `qwen3:8b` for zero-swap measurement.
 
 Recommended next slice:
 

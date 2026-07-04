@@ -96,13 +96,15 @@ Runtime design:
 - Subprocesses use Windows no-window flags where needed to avoid flashing
   hidden terminals.
 
-Default model map from `shamsu/runtime/models.py`:
+Default v2.2 model map from `shamsu/runtime/models.py`:
 
-- `qwen3:8b`: router, QA, planner, docs, summarizer.
-- `gemma3:4b`: optional low-resource fallback chat model.
-- `qwen2.5-coder:7b-instruct-q4_K_M`: coder, test generation.
-- `deepseek-coder:6.7b-instruct-q4_K_M`: bug fix.
-- `mistral:7b-instruct-q4_K_M`: review/audit.
+- `qwen3:8b`: router, QA/chat, planner, classifier, review, docs, summarizer.
+- `qwen2.5-coder:7b-instruct`: coder, frontend/backend generation, tests,
+  bug fix, and repair loops.
+
+`SHAMSU_SINGLE_MODEL_MODE=1` routes every role through `qwen3:8b` for
+zero-swap measurement. The runtime cookbook refuses pulls outside these
+8GB-friendly anchors.
 
 ## Workspace State Layout
 
