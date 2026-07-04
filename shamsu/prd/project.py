@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import re
 
+from shamsu.prd.classifier import classify_archetype
 from shamsu.prd.extractor import extract_entities
-from shamsu.types import DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
+from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
 
 def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
@@ -14,6 +15,13 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
     endpoints = _extract_or_infer_endpoints(parsed, entities)
     pages = _extract_or_infer_pages(parsed, entities)
     theme = _select_theme(parsed.raw_text)
+    archetype = classify_archetype(parsed)
+
+    generation_order = (
+        _fixed_generation_order(project_name, app_name)
+        if archetype.archetype in {Archetype.WEB_CRUD, Archetype.REST_API}
+        else _generic_generation_order()
+    )
 
     return ProjectSpec(
         project_name=project_name,
@@ -22,8 +30,18 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         endpoints=endpoints,
         pages=pages,
         theme=theme,
-        generation_order=_fixed_generation_order(project_name, app_name),
+        generation_order=generation_order,
+        archetype=archetype.archetype,
+        archetype_confidence=archetype.confidence,
+        archetype_spec={"reason": archetype.reason},
     )
+
+
+def _generic_generation_order() -> list[DjangoFileSpec]:
+    return [
+        DjangoFileSpec("index.html", "generic_template", None),
+        DjangoFileSpec("README.md", "generic_docs", None),
+    ]
 
 
 def _extract_or_infer_endpoints(parsed: ParsedPRD, entities) -> list[EndpointSpec]:

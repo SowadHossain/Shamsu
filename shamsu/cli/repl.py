@@ -59,7 +59,7 @@ from shamsu.tasks.state import (
     save_task,
 )
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
-from shamsu.runtime.models import SPECIALIST_MODELS
+from shamsu.runtime.models import model_for_role
 from shamsu.runtime.ollama import (
     collect_status,
     pull_model_streaming,
@@ -2794,7 +2794,7 @@ def _install_console_status_tracker(console: Console) -> None:
 
 
 def _print_startup_banner(workspace: Path, console: Console) -> None:
-    model = SPECIALIST_MODELS.get("qa", "local")
+    model = model_for_role("qa")
     autonomy = "on" if is_long_running_enabled(workspace) else "off"
     runtime = status_text(collect_status())
     body = Text()
@@ -2813,7 +2813,7 @@ def _print_startup_banner(workspace: Path, console: Console) -> None:
 
 def _bottom_toolbar(workspace: Path) -> str:
     autonomy = "on" if is_long_running_enabled(workspace) else "off"
-    model = SPECIALIST_MODELS.get("qa", "local")
+    model = model_for_role("qa")
     return f" {workspace}  ·  model: {model}  ·  autonomy: {autonomy}  ·  /help  /exit "
 
 

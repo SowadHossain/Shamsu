@@ -12,6 +12,7 @@ from shamsu.runtime.doctor import (
     DoctorReport,
     check_ancestor_workspace,
     check_editable_install,
+    check_cookbook,
     check_nested_workspaces,
     check_ollama,
     check_path_manifest,
@@ -60,6 +61,31 @@ def test_check_ollama_warns_when_not_ready():
 
     assert check.ok is False
     assert "models repair" in check.suggestion
+
+
+def test_check_cookbook_ok_when_only_allowed_models_are_installed():
+    status = RuntimeStatus(
+        ollama_path="/usr/bin/ollama",
+        server_running=True,
+        installed_models=["qwen3:8b", "qwen2.5-coder:7b-instruct"],
+    )
+
+    check = check_cookbook(status)
+
+    assert check.ok is True
+
+
+def test_check_cookbook_warns_for_off_cookbook_models():
+    status = RuntimeStatus(
+        ollama_path="/usr/bin/ollama",
+        server_running=True,
+        installed_models=["qwen3:8b", "mistral:7b-instruct-q4_K_M"],
+    )
+
+    check = check_cookbook(status)
+
+    assert check.ok is False
+    assert "mistral" in check.detail
 
 
 def test_find_nested_workspaces_ignores_repo_root_shamsu(tmp_path):
@@ -209,7 +235,7 @@ def test_run_doctor_combines_all_checks(tmp_path):
     )
 
     assert isinstance(report, DoctorReport)
-    assert len(report.checks) == 5
+    assert len(report.checks) == 6
     assert report.all_ok is True
 
 

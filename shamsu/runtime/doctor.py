@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from shamsu.runtime.ollama import RuntimeStatus, collect_status, repo_root_from_runtime
+from shamsu.runtime.models import allowed_model_names, is_allowed_model
 
 IGNORED_DIR_NAMES = {".venv", ".git", "node_modules", "__pycache__"}
 
@@ -69,6 +70,30 @@ def check_ollama(status: RuntimeStatus | None = None) -> DoctorCheck:
         )
     detail = status.message or "Ollama runtime is not ready."
     return DoctorCheck("ollama", False, detail, "Run `models repair` (or `/models repair` in the REPL).")
+
+
+def check_cookbook(status: RuntimeStatus | None = None) -> DoctorCheck:
+    status = status if status is not None else collect_status()
+    if not status.installed_models:
+        return DoctorCheck(
+            "model_cookbook",
+            True,
+            "No installed Ollama models were reported; cookbook enforcement will apply on pulls.",
+        )
+    off_cookbook = [model for model in status.installed_models if not is_allowed_model(model)]
+    if not off_cookbook:
+        return DoctorCheck(
+            "model_cookbook",
+            True,
+            "Installed SHAMSU models fit the 8GB cookbook.",
+        )
+    return DoctorCheck(
+        "model_cookbook",
+        False,
+        f"Installed model(s) outside SHAMSU's 8GB cookbook: {', '.join(off_cookbook)}",
+        f"SHAMSU will only pull allowed models: {', '.join(allowed_model_names())}. "
+        "Remove larger models manually if they are causing memory pressure.",
+    )
 
 
 def _global_launcher_dir() -> Path:
@@ -192,6 +217,7 @@ def run_doctor(
     checks = (
         check_editable_install(resolved_repo_root),
         check_ollama(ollama_status),
+        check_cookbook(ollama_status),
         check_nested_workspaces(resolved_workspace),
         check_ancestor_workspace(resolved_workspace),
         check_path_manifest(bin_dir),

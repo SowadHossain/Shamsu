@@ -9,9 +9,10 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-# Effective budget = num_ctx * safety margin (leave room for the response).
-# 8192 * 0.80 ~= 6554.
-TOTAL_BUDGET_DEFAULT = 6554
+# Effective budget = num_ctx * safety margin (leave room for response + tool
+# metadata). v2.2 targets 8GB machines, so prompts stay tighter by default.
+TOTAL_BUDGET_DEFAULT = 6000
+PER_HOLE_BUDGET_DEFAULT = 3500
 
 CHARS_PER_TOKEN_ESTIMATE = 4
 TOKENIZER_ASSET = Path(__file__).resolve().parent / "assets" / "qwen3-tokenizer.json"

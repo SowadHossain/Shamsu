@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from shamsu.llm.manager import OLLAMA_BASE_URL
-from shamsu.runtime.models import MODEL_SPECS, required_model_names
+from shamsu.runtime.models import MODEL_SPECS, is_allowed_model, required_model_names
 from shamsu.runtime.session_registry import (
     clear_ollama_ownership,
     live_session_pids,
@@ -257,6 +257,12 @@ def parse_ollama_list(output: str) -> list[str]:
 
 
 def pull_model(ollama_path: Path, model_name: str) -> tuple[int, str, str]:
+    if not is_allowed_model(model_name):
+        return (
+            2,
+            "",
+            f"Refusing to pull '{model_name}': it is not in SHAMSU's 8GB model cookbook.",
+        )
     completed = _run_ollama_command(ollama_path, "pull", model_name, timeout=3600)
     return completed.returncode, completed.stdout or "", completed.stderr or ""
 
@@ -266,6 +272,12 @@ def pull_model_streaming(
     model_name: str,
     progress_callback: Callable[[str], None] | None = None,
 ) -> int:
+    if not is_allowed_model(model_name):
+        if progress_callback:
+            progress_callback(
+                f"Refusing to pull '{model_name}': it is not in SHAMSU's 8GB model cookbook."
+            )
+        return 2
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     process = subprocess.Popen(
@@ -294,6 +306,12 @@ def ensure_model_available(
 
     Returns whether the model is available after this call.
     """
+    if not is_allowed_model(model_name):
+        if progress_callback:
+            progress_callback(
+                f"Refusing to pull '{model_name}': it is not in SHAMSU's 8GB model cookbook."
+            )
+        return False
     if model_name in list_installed_models(ollama_path):
         return True
     exit_code = pull_model_streaming(ollama_path, model_name, progress_callback)
@@ -305,6 +323,9 @@ def ensure_model_available(
 def pull_missing_models(ollama_path: Path, missing_models: list[str]) -> dict[str, int]:
     results: dict[str, int] = {}
     for model in missing_models:
+        if not is_allowed_model(model):
+            results[model] = 2
+            continue
         exit_code, _stdout, _stderr = pull_model(ollama_path, model)
         results[model] = exit_code
     return results

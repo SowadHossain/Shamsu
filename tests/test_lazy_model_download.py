@@ -60,9 +60,9 @@ async def test_ensure_model_pulls_when_missing_and_logs(monkeypatch, tmp_path):
 
     logger = RecordingLogger()
     manager = _StubLLMManager(session_logger=logger)
-    await manager._ensure_model("qwen2.5-coder:7b-instruct-q4_K_M")
+    await manager._ensure_model("qwen2.5-coder:7b-instruct")
 
-    assert pull_calls == ["qwen2.5-coder:7b-instruct-q4_K_M"]
+    assert pull_calls == ["qwen2.5-coder:7b-instruct"]
     assert "model.pull.started" in logger.events
     assert "model.pull.finished" in logger.events
 
@@ -87,12 +87,12 @@ async def test_ensure_model_reports_progress_via_hooks(monkeypatch, tmp_path):
     )
     manager = _StubLLMManager(model_pull_progress=progress)
 
-    await manager._ensure_model("mistral:7b-instruct-q4_K_M")
+    await manager._ensure_model("qwen2.5-coder:7b-instruct")
 
-    assert events[0] == ("start", "mistral:7b-instruct-q4_K_M")
-    assert ("chunk", "mistral:7b-instruct-q4_K_M", "chunk-1") in events
-    assert ("chunk", "mistral:7b-instruct-q4_K_M", "chunk-2") in events
-    assert events[-1] == ("finish", "mistral:7b-instruct-q4_K_M", "True")
+    assert events[0] == ("start", "qwen2.5-coder:7b-instruct")
+    assert ("chunk", "qwen2.5-coder:7b-instruct", "chunk-1") in events
+    assert ("chunk", "qwen2.5-coder:7b-instruct", "chunk-2") in events
+    assert events[-1] == ("finish", "qwen2.5-coder:7b-instruct", "True")
 
 
 @pytest.mark.asyncio
@@ -125,7 +125,7 @@ async def test_run_specialist_ensures_model_before_generating(monkeypatch, tmp_p
     pack = ContextPack(task_id="t1", step_id=1, specialist="coder", user_request="do it")
     await manager.run_specialist("coder", pack)
 
-    assert calls == ["qwen2.5-coder:7b-instruct-q4_K_M"]
+    assert calls == ["qwen2.5-coder:7b-instruct"]
 
 
 @pytest.mark.asyncio

@@ -5,7 +5,13 @@ import json
 import pytest
 
 from shamsu.llm.manager import LLMManager
-from shamsu.runtime.models import SPECIALIST_MODELS, required_model_names
+from shamsu.runtime.models import (
+    SPECIALIST_MODELS,
+    allowed_model_names,
+    is_allowed_model,
+    model_for_role,
+    required_model_names,
+)
 from shamsu.runtime.ollama import (
     RuntimeStatus,
     ensure_model_available,
@@ -33,10 +39,27 @@ def test_llm_manager_rejects_remote_urls():
 def test_model_defaults_are_shared_by_runtime_and_llm_manager():
     required = required_model_names()
 
+    assert required == ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
     assert SPECIALIST_MODELS["router"] in required
     assert SPECIALIST_MODELS["coder"] in required
     assert SPECIALIST_MODELS["bugfix"] in required
     assert SPECIALIST_MODELS["reviewer"] in required
+    assert SPECIALIST_MODELS["bugfix"] == SPECIALIST_MODELS["coder"]
+    assert SPECIALIST_MODELS["reviewer"] == SPECIALIST_MODELS["router"]
+
+
+def test_single_model_mode_routes_all_roles_to_qwen3(monkeypatch):
+    monkeypatch.setenv("SHAMSU_SINGLE_MODEL_MODE", "1")
+
+    assert required_model_names() == ["qwen3:8b"]
+    assert model_for_role("coder") == "qwen3:8b"
+    assert model_for_role("bugfix") == "qwen3:8b"
+
+
+def test_model_cookbook_allows_only_v2_2_anchor_models():
+    assert allowed_model_names() == ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
+    assert is_allowed_model("qwen3:8b") is True
+    assert is_allowed_model("mistral:7b-instruct-q4_K_M") is False
 
 
 def test_find_ollama_executable_uses_known_paths_when_path_lookup_misses(monkeypatch, tmp_path):
@@ -50,12 +73,12 @@ def test_find_ollama_executable_uses_known_paths_when_path_lookup_misses(monkeyp
 def test_parse_ollama_list_extracts_model_names():
     output = """NAME                                      ID              SIZE      MODIFIED
 phi3:mini                                abc123          2.2 GB    1 hour ago
-qwen2.5-coder:7b-instruct-q4_K_M         def456          4.7 GB    2 hours ago
+qwen2.5-coder:7b-instruct         def456          4.7 GB    2 hours ago
 """
 
     assert parse_ollama_list(output) == [
         "phi3:mini",
-        "qwen2.5-coder:7b-instruct-q4_K_M",
+        "qwen2.5-coder:7b-instruct",
     ]
 
 
@@ -84,7 +107,7 @@ def test_ollama_pull_uses_utf8_replacement_decoding(monkeypatch, tmp_path):
 
     monkeypatch.setattr("shamsu.runtime.ollama.subprocess.run", fake_run)
 
-    code, stdout, stderr = pull_model(tmp_path / "ollama.exe", "phi3:mini")
+    code, stdout, stderr = pull_model(tmp_path / "ollama.exe", "qwen3:8b")
 
     assert code == 0
     assert stdout == "pulled ✓"
@@ -93,6 +116,13 @@ def test_ollama_pull_uses_utf8_replacement_decoding(monkeypatch, tmp_path):
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
     assert kwargs["env"]["PYTHONUTF8"] == "1"
+
+
+def test_ollama_pull_refuses_off_cookbook_model(tmp_path):
+    code, _stdout, stderr = pull_model(tmp_path / "ollama.exe", "mistral:7b-instruct-q4_K_M")
+
+    assert code == 2
+    assert "cookbook" in stderr
 
 
 def test_streaming_pull_reports_progress_chunks(monkeypatch, tmp_path):
@@ -118,12 +148,21 @@ def test_streaming_pull_reports_progress_chunks(monkeypatch, tmp_path):
     chunks = []
     monkeypatch.setattr("shamsu.runtime.ollama.subprocess.Popen", fake_popen)
 
-    assert pull_model_streaming(tmp_path / "ollama.exe", "phi3:mini", chunks.append) == 0
+    assert pull_model_streaming(tmp_path / "ollama.exe", "qwen3:8b", chunks.append) == 0
     assert chunks == ["a", "b"]
     kwargs = calls[0][1]
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"
     assert kwargs["env"]["PYTHONUTF8"] == "1"
+
+
+def test_streaming_pull_refuses_off_cookbook_model(tmp_path):
+    chunks: list[str] = []
+
+    code = pull_model_streaming(tmp_path / "ollama.exe", "mistral:7b-instruct-q4_K_M", chunks.append)
+
+    assert code == 2
+    assert "cookbook" in chunks[0]
 
 
 def test_ensure_model_available_skips_pull_when_already_installed(monkeypatch, tmp_path):
@@ -164,6 +203,17 @@ def test_ensure_model_available_returns_false_when_pull_fails(monkeypatch, tmp_p
     )
 
     assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is False
+
+
+def test_ensure_model_available_refuses_off_cookbook_model(tmp_path):
+    chunks: list[str] = []
+
+    assert ensure_model_available(
+        tmp_path / "ollama.exe",
+        "deepseek-coder:6.7b-instruct-q4_K_M",
+        chunks.append,
+    ) is False
+    assert "cookbook" in chunks[0]
 
 
 def test_ensure_model_available_forwards_progress_chunks(monkeypatch, tmp_path):
@@ -237,7 +287,7 @@ def test_streaming_pull_hides_console_window(monkeypatch, tmp_path):
 
     monkeypatch.setattr("shamsu.runtime.ollama.subprocess.Popen", fake_popen)
 
-    pull_model_streaming(tmp_path / "ollama.exe", "phi3:mini")
+    pull_model_streaming(tmp_path / "ollama.exe", "qwen3:8b")
 
     assert calls[0]["creationflags"] == ollama._no_window_flags()
 

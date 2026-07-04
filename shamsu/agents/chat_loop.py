@@ -12,7 +12,7 @@ import ollama
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.llm.manager import OLLAMA_BASE_URL, _validate_local_llm_url
-from shamsu.runtime.models import SPECIALIST_MODELS
+from shamsu.runtime.models import model_for_role
 from shamsu.safety.clarify import ask_clarifying_question
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
@@ -63,7 +63,7 @@ class AgentChatLoop:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
-        self.model_name = model_name or SPECIALIST_MODELS["qa"]
+        self.model_name = model_name or model_for_role("qa")
         self.client = client or ollama.AsyncClient(host=base_url)
         self.tools = tools or AgentToolRegistry(self.workspace_root, session_logger=session_logger)
         # Optional hook to surface live tool activity (e.g. "Writing game.js")
