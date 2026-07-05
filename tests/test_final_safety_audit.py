@@ -8,13 +8,13 @@ from rich.console import Console
 
 from shamsu.cli.repl import (
     _handle_log,
-    _log_path,
     _print_help,
     _resolve_workspace_file,
 )
 from shamsu.patch.engine import PatchEngine
 from shamsu.safety.audit import AuditLogger
 from shamsu.safety.sandbox import SecurityError
+from shamsu.session.manager import SessionManager
 from shamsu.tools.django import DjangoSetupRunner
 from shamsu.tools.executor import (
     BLOCKED_EXIT_CODE,
@@ -84,19 +84,15 @@ def test_patch_apply_blocks_path_traversal_before_approval(tmp_path: Path):
     assert not (tmp_path.parent / "outside.py").exists()
 
 
-def test_log_paths_stay_inside_workspace_and_redact_secrets(tmp_path: Path):
-    log_path = _log_path(tmp_path)
-    assert log_path == (tmp_path / ".shamsu" / "shamsu.log").resolve()
+def test_session_log_paths_stay_inside_workspace_and_redact_secrets(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("safety-test")
+    logger.log("test.event", {"message": 'password = "abc123"'}, 'password = "abc123"')
+    assert logger.events_path.is_relative_to(tmp_path / ".shamsu" / "sessions")
 
-    (tmp_path / ".shamsu").mkdir()
-    log_path.write_text(
-        '{"message":"password = \\"abc123\\""}\n',
-        encoding="utf-8",
-    )
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
 
-    _handle_log("log", tmp_path, console)
+    _handle_log("log tail 5", logger, console)
 
     rendered = output.getvalue()
     assert "[REDACTED]" in rendered

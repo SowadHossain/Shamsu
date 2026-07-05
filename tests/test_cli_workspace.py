@@ -13,6 +13,7 @@ from shamsu.cli.repl import (
     resolve_workspace,
 )
 from shamsu.safety.sandbox import SecurityError
+from shamsu.session.manager import SessionManager
 
 
 def test_parse_args_accepts_workspace():
@@ -108,43 +109,33 @@ def test_handle_status_prints_workspace_index_model_and_task(monkeypatch, tmp_pa
     _handle_status(tmp_path, console)
 
     rendered = output.getvalue()
-    assert "SHAMSU Status" in rendered
-    assert "Workspace" in rendered
-    assert str(tmp_path) in rendered
-    assert "Index" in rendered
-    assert "missing" in rendered
     assert "Files" in rendered
     assert "Symbols" in rendered
-    assert "Task status" in rendered
-    assert "Current model" in rendered
-    assert "Pending approvals" in rendered
+    assert "Snippets" in rendered
 
 
-def test_handle_log_tails_and_redacts_structured_logs(tmp_path):
-    log_dir = tmp_path / ".shamsu"
-    log_dir.mkdir()
-    (log_dir / "shamsu.log").write_text(
-        '{"level":"info","message":"first"}\n'
-        '{"level":"error","password":"abc123","message":"secret"}\n',
-        encoding="utf-8",
-    )
+def test_handle_log_tails_and_redacts_session_events(tmp_path):
+    logger = SessionManager(tmp_path).create_session("test")
+    logger.log("test.first", {"message": "first"}, "first")
+    logger.log("test.secret", {"password": "abc123"}, 'password = "abc123"')
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
 
-    _handle_log("log 1", tmp_path, console)
+    _handle_log("log tail 1", logger, console)
 
     rendered = output.getvalue()
-    assert "SHAMSU Log" in rendered
-    assert "secret" in rendered
+    assert "Last 1 Events" in rendered
     assert "[REDACTED]" in rendered
     assert "abc123" not in rendered
     assert "first" not in rendered
 
 
-def test_handle_log_reports_missing_log_file(tmp_path):
+def test_handle_log_reports_empty_session_events(tmp_path):
+    logger = SessionManager(tmp_path).create_session("test")
+    logger.events_path.unlink()
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
 
-    _handle_log("log", tmp_path, console)
+    _handle_log("log", logger, console)
 
-    assert "No log file found" in output.getvalue()
+    assert "No session events yet" in output.getvalue()

@@ -81,6 +81,8 @@ def _render_resource_template_files(project: ProjectSpec) -> dict[str, str]:
         if not resource_key:
             continue
         entity = entities_by_name.get(page.resource.lower())
+        if entity is None:
+            continue
         field_names = _resource_field_names(page, entity)
         resource_label = _display_name(page.resource)
         values = {

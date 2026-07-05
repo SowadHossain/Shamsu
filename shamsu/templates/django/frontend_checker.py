@@ -49,7 +49,7 @@ def _url_names(project: ProjectSpec, project_root: Path) -> set[str]:
         names.update(re.findall(r"name=['\"]([^'\"]+)['\"]", app_urls.read_text(encoding="utf-8")))
     for entity in _business_entities(project):
         base = _resource_url_name(entity.name)
-        names.update({f"{base}-list", f"{base}-detail", f"{base}-form"})
+        names.update({f"{base}-list", f"{base}-detail", f"{base}-form", f"{base}-delete"})
     return names
 
 
@@ -108,8 +108,14 @@ def _check_field_refs(
     model_fields: dict[str, set[str]],
 ) -> list[ConsistencyDiagnostic]:
     diagnostics: list[ConsistencyDiagnostic] = []
+    scoped_vars = dict(entity_vars)
+    folder = Path(file_path).parent.name
+    for entity in model_fields:
+        if _resource_url_name(entity) == folder:
+            scoped_vars["object"] = entity
+            break
     for variable, field in VARIABLE_RE.findall(content):
-        entity = entity_vars.get(variable)
+        entity = scoped_vars.get(variable)
         if not entity:
             continue
         if field not in model_fields.get(entity, set()):
