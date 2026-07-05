@@ -153,6 +153,9 @@ def _read_approval_answer(console: Console) -> str | None:
         try:
             answer = input("> ").strip().lower()
         except EOFError:
+            fallback = _read_windows_console_answer(console)
+            if fallback is not None:
+                return fallback
             console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
             return None
         if answer or not sys.stdin.isatty():
@@ -162,3 +165,40 @@ def _read_approval_answer(console: Console) -> str | None:
             console.print("[yellow]No approval answer was received. Action cancelled.[/yellow]")
             return None
         console.print("[yellow]Please choose 1 or 2.[/yellow]")
+
+
+def _read_windows_console_answer(console: Console) -> str | None:
+    """Fallback for Windows terminals where prompt-toolkit closes stdin.
+
+    After prompt-toolkit has owned the console, built-in ``input()`` can raise
+    EOF even though the terminal is still interactive. ``msvcrt.getwch`` reads a
+    single key directly from the Windows console, which is enough for SHAMSU's
+    numbered approval menus.
+    """
+    if sys.platform != "win32" or not console.is_terminal:
+        return None
+    try:
+        import msvcrt
+    except ImportError:
+        return None
+    console.print("[dim]Press 1 to approve or 2 to cancel.[/dim]")
+    while True:
+        try:
+            char = msvcrt.getwch()
+        except (OSError, EOFError):
+            return None
+        if char in {"\x00", "\xe0"}:
+            try:
+                msvcrt.getwch()
+            except (OSError, EOFError):
+                pass
+            continue
+        lowered = char.lower()
+        if lowered in {"\x03", "\x1a"}:  # Ctrl+C / Ctrl+Z
+            return None
+        if lowered == "\x1b":  # Esc
+            console.print("2")
+            return "2"
+        if lowered in {"1", "2", "3", "y", "n"}:
+            console.print(char)
+            return lowered
