@@ -68,7 +68,7 @@ class SearchAgent(ISearchAgent):
         terms = [t for t in cleaned.split() if t]
         if not terms:
             return '""'
-        return " OR ".join(terms)
+        return " OR ".join(f'"{term}"' for term in terms)
 
     def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         """

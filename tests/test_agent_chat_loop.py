@@ -111,6 +111,43 @@ async def test_agent_chat_loop_executes_native_write_file_tool(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_write_file_tool_overwrites_existing_without_a_flag(tmp_path):
+    # The model must be able to UPDATE an existing file without remembering an
+    # overwrite flag — otherwise small models get blocked and hallucinate success.
+    (tmp_path / "hello.py").write_text("old = 1\n", encoding="utf-8")
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"filepath": "hello.py", "content": "new = 2\n"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "Updated hello.py.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    await AgentChatLoop(tmp_path, client=client, tools=tools).run("update hello.py")
+
+    assert (tmp_path / "hello.py").read_text(encoding="utf-8") == "new = 2\n"
+    tool_message = client.calls[1]["messages"][-1]
+    assert json.loads(tool_message["content"])["ok"] is True
+    # The overwrite flag is no longer part of the model-facing schema.
+    schemas = tools.tool_schemas()
+    write_schema = next(s for s in schemas if s["function"]["name"] == "write_file")
+    assert "overwrite" not in write_schema["function"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
 async def test_agent_chat_loop_reports_tool_activity(tmp_path):
     client = FakeOllamaClient(
         [
@@ -155,6 +192,53 @@ async def test_agent_chat_loop_markdown_fallback_writes_file(tmp_path):
 
     assert result.final == "Created fallback.py."
     assert (tmp_path / "fallback.py").read_text(encoding="utf-8") == "print('fallback')\n"
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_markdown_fallback_handles_generate_file_wording(tmp_path):
+    client = FakeOllamaClient(
+        [
+            {"message": {"content": "```ts\nexport const value = 1;\n```", "tool_calls": []}},
+            {"message": {"content": "Generated src/value.ts.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("generate file src/value.ts")
+
+    assert result.final == "Generated src/value.ts."
+    assert (tmp_path / "src" / "value.ts").read_text(encoding="utf-8") == "export const value = 1;\n"
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_markdown_fallback_writes_multiple_commented_files(tmp_path):
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": (
+                        "```ts\n// src/game/entities.ts\nexport type Player = { id: string };\n```\n"
+                        "```tsx\n// src/ui/Hud.tsx\nexport function Hud() { return null; }\n```"
+                    ),
+                    "tool_calls": [],
+                }
+            },
+            {"message": {"content": "Wrote the files.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("fill the game requirements")
+
+    assert result.final == "Wrote the files."
+    assert (tmp_path / "src" / "game" / "entities.ts").read_text(encoding="utf-8") == (
+        "export type Player = { id: string };\n"
+    )
+    assert (tmp_path / "src" / "ui" / "Hud.tsx").read_text(encoding="utf-8") == (
+        "export function Hud() { return null; }\n"
+    )
     assert len(client.calls) == 2
 
 

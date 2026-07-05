@@ -10,9 +10,11 @@ import asyncio
 import atexit
 import difflib
 import json
+import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -46,6 +48,7 @@ from shamsu.llm.manager import LLMManager, ModelPullProgress
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.state import create_generation_state, save_generation_state
+from shamsu.registry.schema import Category
 from shamsu.retriever.search import SearchAgent
 from shamsu.tasks.state import (
     MilestoneTask,
@@ -838,7 +841,7 @@ def _handle_models(
         if not status.missing_models:
             console.print("[green]All required local models are installed.[/green]")
             return
-        # Typing `/models pull` is itself the consent — download directly rather
+        # Typing `/models pull` is itself the consent - download directly rather
         # than gating on a second y/n prompt (which can auto-cancel on some
         # Windows terminals where built-in input() sees a non-interactive stdin).
         console.print(
@@ -858,7 +861,7 @@ def _handle_models(
             wait_until_running()
             status = collect_status(Path(status.ollama_path))
         if status.ollama_found and status.server_running and status.missing_models:
-            # Explicit `/models repair` is consent — download directly.
+            # Explicit `/models repair` is consent - download directly.
             console.print(
                 "[cyan]Downloading missing local model(s):[/cyan] " + ", ".join(status.missing_models)
             )
@@ -1285,8 +1288,30 @@ async def _handle_request(
     if _looks_like_prd_build_request(effective_input, workspace):
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
         return
+    if _looks_like_file_write_request(effective_input):
+        await _run_agent_chat(
+            _append_agent_context(effective_input, agent_context),
+            workspace,
+            console,
+            session_logger=session_logger,
+            auto_approve=is_long_running_enabled(workspace),
+        )
+        return
     if _looks_like_workspace_prd_request(effective_input):
         _handle_workspace_prd_request(workspace, console)
+        return
+    if _looks_like_affirmative_continue(effective_input) and _multiplayer_template_present(workspace):
+        await _run_agent_chat(
+            _build_continue_game_request(),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+        return
+    if _looks_like_run_game_request(effective_input):
+        await _handle_run_game(workspace, console, session_logger=session_logger)
         return
     if _looks_like_browser_needed_prompt(effective_input):
         await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console), browser_tool=browser_tool)
@@ -1356,8 +1381,10 @@ async def _handle_request(
             # brain that would only describe the fix (or claim it can't access
             # files). With `/autonomy on` the edits run hands-free; otherwise
             # each write asks for approval.
-            if _looks_like_action_request(effective_input) or (
-                _is_general_chat_prompt(effective_input) and not uses_real_index
+            if (
+                _looks_like_action_request(effective_input)
+                or _looks_like_trouble_report(effective_input)
+                or (_is_general_chat_prompt(effective_input) and not uses_real_index)
             ):
                 await _run_agent_chat(
                     _append_agent_context(effective_input, agent_context),
@@ -1762,7 +1789,7 @@ _PRD_BUILD_NOUNS = ("product", "app", "application", "game", "project", "website
 
 # Terse imperative "just do it" style commands. These carry no task detail of
 # their own, so they must be routed to something that can actually act (the
-# PRD build when a PRD is present, otherwise the tool-having agent loop) — never
+# PRD build when a PRD is present, otherwise the tool-having agent loop) - never
 # the tool-less QA brain, which would hallucinate "I cannot access files".
 _VAGUE_ACTION_WORDS = {"go", "start", "build", "continue", "proceed", "run", "do"}
 _VAGUE_ACTION_PHRASES = (
@@ -1804,7 +1831,7 @@ def _looks_like_vague_action_request(user_input: str) -> bool:
     return any(phrase in text for phrase in _VAGUE_ACTION_PHRASES)
 
 
-# Verbs that mean "modify the project" — their presence (outside obvious
+# Verbs that mean "modify the project" - their presence (outside obvious
 # question phrasing) marks a request as an action to perform, not a question.
 _ACTION_VERBS = {
     "fix", "build", "make", "create", "add", "implement", "update", "change",
@@ -1814,7 +1841,7 @@ _ACTION_VERBS = {
     "resolve", "correct", "patch",
 }
 
-# Leading phrasing that marks a genuine question/explanation → keep it on QA.
+# Leading phrasing that marks a genuine question/explanation: keep it on QA.
 _QUESTION_PREFIXES = (
     "what", "why", "how", "when", "where", "who", "which", "whose",
     "explain", "tell me", "show me", "describe", "list ", "summarize",
@@ -1836,7 +1863,7 @@ def _looks_like_action_request(user_input: str) -> bool:
         return False
     if _looks_like_vague_action_request(user_input):
         return True
-    # A trailing '?' or question-style opening → it's a question, leave on QA.
+    # A trailing '?' or question-style opening means it is a question, leave on QA.
     if raw.endswith("?"):
         return False
     if any(raw.startswith(prefix) for prefix in _QUESTION_PREFIXES):
@@ -1850,6 +1877,250 @@ def _looks_like_action_request(user_input: str) -> bool:
     return False
 
 
+# "It's broken" reports and pasted error/stack-trace logs. These are implicit
+# fix requests: the user is showing a problem, not asking a question, so they
+# must reach the tool-having agent loop, which can read the files and repair,
+# not the tool-less QA brain that returns a troubleshooting checklist.
+_TROUBLE_SIGNALS = (
+    "not working", "cant see", "can't see", "cannot see", "doesnt work", "doesn't work",
+    "does not work", "not showing", "nothing happens", "nothing shows", "still broken",
+    "still not", "blank page", "blank screen", "white screen", "wont run", "won't run",
+    "crashes", "not rendering", "isnt working", "isn't working", "no game", "page is blank",
+)
+_ERROR_LOG_SIGNALS = (
+    "error:", "cannot find", "is not exported", "has no exported member", "failed to compile",
+    "uncaught", "syntaxerror", "referenceerror", "typeerror", "module not found",
+    "cannot find module", "unexpected token", "traceback (most recent", "does not exist on type",
+    "ts(", "vite:", "[plugin:",
+)
+
+
+def _looks_like_trouble_report(user_input: str) -> bool:
+    low = user_input.lower()
+    return any(s in low for s in _TROUBLE_SIGNALS) or any(s in low for s in _ERROR_LOG_SIGNALS)
+
+
+_FILE_WRITE_VERBS = {
+    "create", "write", "save", "generate", "make", "add", "edit", "update",
+    "modify", "overwrite",
+}
+
+_FILE_HINT_WORDS = {
+    "file", "files", "script", "component", "module", "readme", "gitignore",
+    "config", "page", "class", "test", "tests",
+}
+
+_FILELIKE_RE = re.compile(
+    r"(?:^|\s|['\"`@])(?:[A-Za-z0-9_. -]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?:\s|$|['\"`,.;:])"
+)
+
+
+def _looks_like_file_write_request(user_input: str) -> bool:
+    """Route explicit file-creation/edit prompts to the ReAct tool loop.
+
+    This avoids handing "create hello.py" to the router/specialist stack, where
+    a small model may produce prose or an invalid diff instead of using the
+    safe write_file tool. Questions still stay on QA.
+    """
+    raw = user_input.strip().lower()
+    if not raw or raw.endswith("?"):
+        return False
+    if any(raw.startswith(prefix) for prefix in _QUESTION_PREFIXES):
+        return False
+    words = set(re.sub(r"[^\w\s]", " ", raw).split())
+    if not (_FILE_WRITE_VERBS & words):
+        return False
+    if _FILELIKE_RE.search(user_input):
+        return True
+    return bool(words & _FILE_HINT_WORDS)
+
+
+def _looks_like_run_game_request(user_input: str) -> bool:
+    text = user_input.lower()
+    has_run = any(word in text for word in ("run", "start", "launch", "serve", "open"))
+    has_game = any(word in text for word in ("game", "app", "site", "preview", "link", "access"))
+    return has_run and has_game
+
+
+def _looks_like_affirmative_continue(user_input: str) -> bool:
+    text = re.sub(r"[^\w\s]", " ", user_input.lower()).strip()
+    if not text:
+        return False
+    return text in {
+        "yes", "yes please", "yeah", "yep", "ok", "okay", "sure",
+        "continue", "go ahead", "do it", "proceed",
+    }
+
+
+async def _handle_run_game(
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    package_json = workspace / "package.json"
+    if not package_json.exists():
+        console.print(
+            Panel(
+                "I could not find `package.json` in this workspace, so there is no game dev server to start yet.\n"
+                "Build/scaffold the game first, then run this again.",
+                title="Game Server",
+                border_style="yellow",
+            )
+        )
+        return
+
+    log_dir = workspace / ".shamsu" / "dev-server"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    if not _ensure_node_modules(workspace, console):
+        return
+
+    # Typecheck-and-fix before previewing: a dropped export or bad import would
+    # otherwise start the server but leave a blank/crashing page in the browser.
+    await _verify_and_repair_frontend(workspace, Path("."), console, session_logger=session_logger)
+
+    relay = _start_background_command(
+        "npm run dev:relay",
+        workspace,
+        log_dir / "relay.log",
+        visible_console=True,
+    )
+    vite = _start_background_command(
+        "npm run dev",
+        workspace,
+        log_dir / "vite.log",
+        visible_console=True,
+    )
+    url = "http://localhost:5173"
+    console.print(
+        Panel(
+            f"Game dev server started in separate terminal windows you can watch.\n\n"
+            f"Open: {url}\n\n"
+            f"Vite PID: {vite.pid}\n"
+            f"Relay PID: {relay.pid}\n"
+            f"Logs: {log_dir}",
+            title="Game Running",
+            border_style="green",
+        )
+    )
+    _log_event(
+        session_logger,
+        "project.preview.started",
+        {"url": url, "vite_pid": vite.pid, "relay_pid": relay.pid, "logs": str(log_dir)},
+        f"Started game preview at {url}",
+        workflow_id="game-preview",
+    )
+
+    # Read the Vite log back and, if it failed to boot cleanly, fix the errors.
+    console.print("[dim]Watching the dev server start up for errors...[/dim]")
+    errors = await _await_dev_server_settle(log_dir / "vite.log")
+    if errors:
+        console.print(Panel(errors, title="Vite reported errors on startup", border_style="yellow"))
+        console.print("[cyan]Fixing the dev-server errors...[/cyan]")
+        await _run_agent_chat(
+            _build_frontend_repair_request(errors, Path(".")),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+        console.print(
+            "[green]Applied fixes. Vite hot-reloads automatically - refresh the browser "
+            f"at {url} (the dev window shows live logs).[/green]"
+        )
+    else:
+        console.print(f"[green]Dev server looks healthy. Open {url} in your browser.[/green]")
+
+
+def _start_background_command(
+    command: str,
+    cwd: Path,
+    log_path: Path,
+    visible_console: bool = False,
+) -> subprocess.Popen:
+    if visible_console and sys.platform == "win32":
+        # Open a NEW visible console the user can watch AND tee output to the
+        # log file so SHAMSU can read errors too. PowerShell Tee-Object writes
+        # to both the window and the file; -NoExit keeps the window open if the
+        # process stops so the final error stays on screen.
+        log_path.write_text("", encoding="utf-8")
+        # `cmd /c '<cmd> 2>&1'` merges stderr at the cmd level so PowerShell does
+        # not wrap native stderr in NativeCommandError noise; Tee-Object then
+        # shows output in the window and writes it (UTF-16) to the log.
+        ps_command = f"cmd /c '{command} 2>&1' | Tee-Object -FilePath '{log_path}'"
+        return subprocess.Popen(
+            ["powershell", "-NoProfile", "-NoExit", "-Command", ps_command],
+            cwd=cwd,
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+        )
+    log = log_path.open("a", encoding="utf-8")
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    return subprocess.Popen(
+        command,
+        shell=True,
+        cwd=cwd,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+        creationflags=creationflags,
+    )
+
+
+_DEV_ERROR_SIGNALS = (
+    "failed to resolve import", "internal server error", "pre-transform error",
+    "could not resolve", "transform failed", "[plugin:", "has no exported member",
+    "is not exported", "cannot find module", "cannot find name", "unexpected token",
+    "syntaxerror", "referenceerror", "error ts", "tsc: error", "npm err!",
+    "module not found", "failed to compile",
+)
+_DEV_READY_SIGNALS = ("ready in", "localhost:5173", "vite v", "local:   http")
+
+
+def _dev_log_indicates_ready(text: str) -> bool:
+    low = text.lower()
+    return any(signal in low for signal in _DEV_READY_SIGNALS)
+
+
+def _scan_dev_log_for_errors(text: str) -> str | None:
+    """Return the tail of a dev-server log if it shows a real error, else None."""
+    low = text.lower()
+    if not any(signal in low for signal in _DEV_ERROR_SIGNALS):
+        return None
+    return text.strip()[-3000:]
+
+
+def _read_text_safe(path: Path) -> str:
+    """Read a log file, tolerating the UTF-16 that Windows PowerShell's
+    Tee-Object writes (detected by BOM) as well as plain UTF-8."""
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return ""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    return data.decode("utf-8", errors="replace")
+
+
+async def _await_dev_server_settle(log_path: Path, timeout: float = 24.0) -> str | None:
+    """Poll a dev-server log until it looks ready or reports an error.
+
+    Returns the error text if the server failed to start cleanly, else None.
+    """
+    interval = 1.5
+    for _ in range(max(1, int(timeout / interval))):
+        await asyncio.sleep(interval)
+        text = _read_text_safe(log_path)
+        errors = _scan_dev_log_for_errors(text)
+        if errors:
+            return errors
+        if _dev_log_indicates_ready(text):
+            return None
+    return None
+
+
 def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     """Detect a natural-language "build the product from this PRD" request.
 
@@ -1858,13 +2129,16 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     one PRD file present). This keeps narrow prompts like "build the navbar"
     or "fix the build" from triggering a full autonomous product build.
     A terse "do the task"/"continue" also counts when exactly one PRD is present
-    — in a PRD workspace that almost always means "build that PRD", and the
+    - in a PRD workspace that almost always means "build that PRD", and the
     build is approval-gated anyway so it is safe to route here.
     """
     if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
         return True
     text = user_input.lower()
-    has_build_verb = any(verb in text for verb in _PRD_BUILD_VERBS)
+    words = re.sub(r"[^\w\s]", " ", text).split()
+    has_build_verb = any(verb in text for verb in _PRD_BUILD_VERBS) or _has_fuzzy_word(
+        words, _PRD_BUILD_VERBS
+    )
     has_product_noun = any(noun in text for noun in _PRD_BUILD_NOUNS)
     if not (has_build_verb and has_product_noun):
         return False
@@ -1872,6 +2146,13 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
         return True
     if _resolve_build_prd(user_input, workspace) is not None:
         return True
+    return False
+
+
+def _has_fuzzy_word(words: list[str], targets: tuple[str, ...], cutoff: float = 0.78) -> bool:
+    for word in words:
+        if difflib.get_close_matches(word, targets, n=1, cutoff=cutoff):
+            return True
     return False
 
 
@@ -1934,7 +2215,7 @@ def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None
 
 PRD_BUILD_FRAMING = (
     "Build complete, runnable product files. Do not create TODO-only stubs or placeholder implementations. "
-    "Before rewriting any file that already exists, read it first with read_file and EXTEND it — never "
+    "Before rewriting any file that already exists, read it first with read_file and EXTEND it - never "
     "regenerate a file from scratch in a way that drops features implemented in earlier milestones. "
     "Keep the app wired together: if the project has a script.js, index.html must load it with "
     "<script src=\"script.js\"></script> and must NOT keep its own inline game logic or a leftover "
@@ -1943,6 +2224,163 @@ PRD_BUILD_FRAMING = (
     "A milestone is done only when its acceptance criteria are implemented and the files are wired together "
     "and mutually consistent. If blocked, stop and explain exactly what input is needed."
 )
+
+
+def _ensure_git_repo(
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Initialize a git repo (and a basic .gitignore) if the workspace has none,
+    so a build starts from a clean, revertable baseline."""
+    if (workspace / ".git").exists():
+        return
+    try:
+        result = subprocess.run(
+            "git init",
+            shell=True,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
+        return
+    gitignore = workspace / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(
+            "node_modules/\ndist/\n.shamsu/\n__pycache__/\n*.log\n", encoding="utf-8"
+        )
+    console.print("[dim]Initialized a git repository for this project.[/dim]")
+    _log_event(
+        session_logger,
+        "project.git.init",
+        {"workspace": str(workspace)},
+        "Initialized git repository for the build",
+        workflow_id="prd-build",
+    )
+
+
+def _ensure_node_modules(workspace: Path, console: Console) -> bool:
+    """Ensure dependencies are installed. Returns True if node_modules is ready."""
+    if (workspace / "node_modules").exists():
+        return True
+    console.print("[dim]Installing dependencies (npm install) - first run only...[/dim]")
+    try:
+        result = subprocess.run(
+            "npm install",
+            shell=True,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=600,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        console.print(f"[yellow]Could not run npm install: {exc}[/yellow]")
+        return False
+    if result.returncode != 0:
+        console.print(
+            Panel(
+                (result.stderr or result.stdout or "npm install failed").strip()[-3000:],
+                title="npm install failed",
+                border_style="red",
+            )
+        )
+        return False
+    return True
+
+
+def _run_frontend_typecheck(workspace: Path) -> tuple[bool, str]:
+    """Run `tsc --noEmit` for a real compile check. Returns (ok, output)."""
+    try:
+        result = subprocess.run(
+            "npx --no-install tsc --noEmit",
+            shell=True,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"Could not run tsc: {exc}"
+    return result.returncode == 0, ((result.stdout or "") + (result.stderr or "")).strip()
+
+
+def _build_frontend_repair_request(errors: str, relative_path: Path) -> str:
+    return (
+        "The project does NOT compile. Your ONLY task right now is to make `tsc --noEmit` pass by fixing "
+        "every TypeScript error below. Do NOT add features, do NOT start a new milestone.\n\n"
+        "Critical rules:\n"
+        "- Read each failing file AND the files that import it before editing.\n"
+        "- App.tsx imports createInitialState, createInputState, and updateGameState from ./game/rules - "
+        "every export another file imports MUST exist and keep a compatible signature. Never delete an export "
+        "that something imports.\n"
+        "- Keep the frontend wired to the game logic: App.tsx must import and render the game state; do not "
+        "orphan rules.ts/entities.ts.\n"
+        "- Fix ALL errors, use write_file for each change, then stop.\n\n"
+        f"PRD file: {relative_path.as_posix()}\n\n"
+        f"`tsc --noEmit` output:\n{errors[-4000:]}"
+    )
+
+
+async def _verify_and_repair_frontend(
+    workspace: Path,
+    relative_path: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+    max_attempts: int = 3,
+) -> bool:
+    """Compile-gate a JS/TS project: typecheck, and if it fails, feed the errors
+    back to the agent to fix, looping up to `max_attempts`. Returns True when it
+    compiles cleanly. A non-node project (no package.json) is treated as OK."""
+    if not (workspace / "package.json").exists():
+        return True
+    if not (workspace / "tsconfig.json").exists():
+        # Not a TypeScript project: nothing for tsc to gate on.
+        return True
+    if not _ensure_node_modules(workspace, console):
+        console.print("[yellow]Skipping compile check - dependencies are not installed.[/yellow]")
+        return False
+    for attempt in range(1, max_attempts + 1):
+        console.print(f"[dim]Checking the game compiles (tsc, attempt {attempt}/{max_attempts})...[/dim]")
+        ok, output = _run_frontend_typecheck(workspace)
+        if ok:
+            console.print(
+                "[green]OK: The game compiles cleanly - frontend and game logic are wired together.[/green]"
+            )
+            _log_event(
+                session_logger, "project.typecheck.ok", {"attempt": attempt},
+                "Frontend typecheck passed", workflow_id="prd-build",
+            )
+            return True
+        console.print(
+            Panel(output[-3000:] or "tsc reported errors.", title=f"Compile errors (attempt {attempt})", border_style="yellow")
+        )
+        _log_event(
+            session_logger, "project.typecheck.failed", {"attempt": attempt},
+            "Frontend typecheck failed", workflow_id="prd-build",
+        )
+        if attempt == max_attempts:
+            console.print(
+                "[red]Still not compiling after repair attempts. The errors above are what's blocking the "
+                "game from showing - tell me to keep fixing and I'll continue.[/red]"
+            )
+            return False
+        console.print("[cyan]Fixing the compile errors before moving on...[/cyan]")
+        await _run_agent_chat(
+            _build_frontend_repair_request(output, relative_path),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+    return False
 
 
 async def _handle_prd_build_request(
@@ -1955,7 +2393,7 @@ async def _handle_prd_build_request(
     if prd_path is None:
         candidates = _find_workspace_prd_files(workspace)
         if len(candidates) > 1:
-            console.print("[yellow]I found multiple PRD files — which one should I build from?[/yellow]")
+            console.print("[yellow]I found multiple PRD files - which one should I build from?[/yellow]")
             for path in candidates[:10]:
                 console.print(f"- {path.as_posix()}")
             console.print("Name one, e.g. `build the product from \"<file>\"`.")
@@ -1978,6 +2416,59 @@ async def _handle_prd_build_request(
     except ValueError:
         relative_path = prd_path
 
+    _ensure_git_repo(workspace, console, session_logger)
+
+    project = build_project_spec(parsed)
+    if project.category == Category.MULTIPLAYER_GAME.value:
+        if not _multiplayer_template_present(workspace):
+            console.print(
+                Panel(
+                    "Detected category: multiplayer-game\n"
+                    "Using the v2.3 multiplayer template before model edits.\n"
+                    "SHAMSU will create the project folder structure and copy the boilerplate "
+                    "into this workspace, then run the template Definition of Done checks.",
+                    title="Template Build",
+                )
+            )
+            search, _uses_real_index = _build_search_agent(workspace, session_logger)
+            result = await FullDjangoPipeline(
+                workspace,
+                search=search,
+                session_logger=session_logger,
+                approval_func=lambda _request: True,
+                long_running=is_long_running_enabled(workspace),
+            ).run(prd_path, target_dir=".")
+            _print_full_pipeline_result(result, console)
+            if not result.success:
+                return
+            console.print(
+                "[green]Template is ready. Now filling the game requirements from the PRD.[/green]"
+            )
+        else:
+            # Setup is already done in this workspace (the template files exist),
+            # so don't re-run or re-announce the scaffold step every turn - just
+            # continue filling the game from the PRD and the current code.
+            console.print(
+                "[dim]Continuing the game build - setup already done; reading the current files and the PRD.[/dim]"
+            )
+        await _run_agent_chat(
+            _build_multiplayer_game_request(parsed, relative_path),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+        # Gate on a real compile: the model just edited the game logic, so make
+        # sure it still typechecks (no dropped exports, no broken imports)
+        # before declaring victory. On failure, feed the exact errors back to
+        # the agent to fix; this is what stops "kept adding features while the
+        # frontend was crashing".
+        await _verify_and_repair_frontend(
+            workspace, relative_path, console, session_logger=session_logger
+        )
+        return
+
     _print_prd_build_plan(parsed, relative_path, console)
     _log_event(
         session_logger,
@@ -1988,12 +2479,12 @@ async def _handle_prd_build_request(
     )
 
     # The build request itself ("build the product from this prd") is the
-    # consent, and the plan above was shown for review — so start the build
+    # consent, and the plan above was shown for review - so start the build
     # directly and let it write files without further prompts. This avoids the
     # fragile mid-flow input() approval that could silently auto-deny on some
     # interactive terminals.
     console.print(
-        "[green]Building now — I'll read the PRD and write files in your workspace. "
+        "[green]Building now - I'll read the PRD and write files in your workspace. "
         "Type `exit` to stop.[/green]"
     )
     milestones = _extract_prd_milestones(parsed)
@@ -2038,6 +2529,45 @@ async def _handle_prd_build_request(
                 return
         save_task(task, workspace)
     console.print(f"[green]PRD milestone build flow complete. Task: {task.task_id}[/green]")
+
+
+def _multiplayer_template_present(workspace: Path) -> bool:
+    required = [
+        "package.json",
+        "src/App.tsx",
+        "src/game/entities.ts",
+        "src/game/rules.ts",
+        "src/ui/Hud.tsx",
+        "src/net/room.ts",
+        "server/relay.ts",
+    ]
+    return all((workspace / path).exists() for path in required)
+
+
+def _build_multiplayer_game_request(parsed, relative_path: Path) -> str:
+    return (
+        "You are now past scaffold setup. The multiplayer-game template files already exist in the workspace. "
+        "Do real coding work now.\n\n"
+        "Rules:\n"
+        "- Read the PRD and the existing template files before writing.\n"
+        "- Do not ask the user to provide index.html, style.css, script.js, or starter files.\n"
+        "- Do not replace the Colyseus relay, React-Three-Fiber scene, lobby, menu, or render loop plumbing.\n"
+        "- Fill and adapt the marked template holes in src/game/entities.ts, src/game/rules.ts, and src/ui/Hud.tsx.\n"
+        "- Implement the requested gameplay requirements, player rules, scoring, collisions/spawning, HUD values, and end condition.\n"
+        "- Use write_file for every file change. Run commands to verify when possible.\n"
+        "- Do not claim success unless files were actually written or verified by tool results.\n\n"
+        f"PRD file: {relative_path.as_posix()}\n\n"
+        f"PRD content:\n{parsed.raw_text or _render_sections(parsed)}"
+    )
+
+
+def _build_continue_game_request() -> str:
+    return (
+        "Continue the multiplayer game implementation from the previous task. "
+        "Do real coding work now: read the existing files, complete unfinished gameplay requirements, "
+        "and write the changed files with write_file. Do not print code blocks as the final answer. "
+        "Summarize the edited files and what changed after tool results confirm the writes."
+    )
 
 
 def _build_prd_build_request(parsed, relative_path: Path) -> str:
@@ -2164,7 +2694,7 @@ async def _run_qa(
         except Exception:
             streamed = False
         if streamed:
-            if preview.prompt and _preview_contains_context(preview.prompt):
+            if _should_show_context_preview() and preview.prompt and _preview_contains_context(preview.prompt):
                 console.print(Panel(preview.prompt, title="Context Preview"))
             return
     result = await Coordinator(llm=llm, qa_workflow=qa_workflow).handle(request)
@@ -2174,7 +2704,7 @@ async def _run_qa(
         _log_assistant_message(session_logger, result.answer, workflow_id="qa")
     elif result.fallback_reason:
         console.print(f"[yellow]{result.fallback_reason}[/yellow]")
-    if result.preview and _preview_contains_context(result.preview):
+    if _should_show_context_preview() and result.preview and _preview_contains_context(result.preview):
         console.print(Panel(result.preview, title="Context Preview"))
 
 
@@ -2234,16 +2764,69 @@ async def _run_agent_chat(
         approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
     )
     long_running = force_long_running or is_long_running_enabled(workspace)
+    activities: list[str] = []
+
+    def on_activity(msg: str) -> None:
+        activities.append(msg)
+        console.print(f"[dim]  -> {msg}[/dim]")
+
     result = await AgentChatLoop(
         workspace,
         session_logger=session_logger,
         tools=tools,
         long_running=long_running,
-        on_activity=lambda msg: console.print(f"[dim]  → {msg}[/dim]"),
+        on_activity=on_activity,
     ).run(user_input)
     body = result.final.strip() or "No response returned."
-    console.print(Panel(body, title="Agent"))
+    console.print(Panel(_agent_display_summary(body, activities), title="Agent"))
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
+
+
+def _should_show_context_preview() -> bool:
+    return os.environ.get("SHAMSU_SHOW_CONTEXT", "").lower() in {"1", "true", "yes"}
+
+
+def _agent_display_summary(body: str, activities: list[str]) -> str:
+    written = _written_files_from_activities(activities)
+    if "```" not in body and len(body) <= 1600:
+        return body
+
+    lines: list[str] = []
+    if written:
+        lines.append("Edited files:")
+        lines.extend(f"- {path}" for path in written)
+        lines.append("")
+    actions = _summary_bullets_from_text(body)
+    if actions:
+        lines.append("What changed:")
+        lines.extend(f"- {item}" for item in actions[:6])
+        lines.append("")
+    lines.append("Full generated code is in the edited files. Detailed raw output is kept in the session log.")
+    return "\n".join(lines).strip()
+
+
+def _written_files_from_activities(activities: list[str]) -> list[str]:
+    files: list[str] = []
+    for item in activities:
+        if item.startswith("Writing "):
+            path = item.removeprefix("Writing ").strip()
+            if path and path not in files:
+                files.append(path)
+    return files
+
+
+def _summary_bullets_from_text(body: str) -> list[str]:
+    clean = re.sub(r"```.*?```", "", body, flags=re.S)
+    bullets: list[str] = []
+    for line in clean.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        stripped = re.sub(r"^\d+\.\s*", "", stripped)
+        stripped = stripped.lstrip("-* ").strip()
+        if stripped and len(stripped) <= 180:
+            bullets.append(stripped)
+    return bullets
 
 
 async def _run_web_assist(
@@ -2567,6 +3150,8 @@ async def _run_code_edit(
     result = await CodeEditWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "edit")
     )
+    if getattr(result, "used_full_rewrite", False):
+        console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
     _print_patch_result("Code Edit", result.applied, result.changed_files, result.error, console)
 
 
@@ -2589,6 +3174,8 @@ async def _run_bug_fix(
     result = await BugFixWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "fix")
     )
+    if getattr(result, "used_full_rewrite", False):
+        console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
     _print_patch_result("Bug Fix", result.applied, result.changed_files, result.error, console)
 
 
@@ -2800,12 +3387,12 @@ def _print_startup_banner(workspace: Path, console: Console) -> None:
     runtime = status_text(collect_status())
     body = Text()
     body.append("SHAMSU v0.3.0", style="bold")
-    body.append("  ·  Local AI coding agent\n", style="dim")
+    body.append("  |  Local AI coding agent\n", style="dim")
     body.append("Workspace: ", style="dim")
     body.append(f"{workspace}\n")
     body.append("Model: ", style="dim")
     body.append(f"{model}", style="cyan")
-    body.append("  ·  Autonomy: ", style="dim")
+    body.append("  |  Autonomy: ", style="dim")
     body.append(autonomy, style=("green" if autonomy == "on" else "yellow"))
     body.append("\nRuntime: ", style="dim")
     body.append(runtime, style="dim")
@@ -2815,7 +3402,7 @@ def _print_startup_banner(workspace: Path, console: Console) -> None:
 def _bottom_toolbar(workspace: Path) -> str:
     autonomy = "on" if is_long_running_enabled(workspace) else "off"
     model = model_for_role("qa")
-    return f" {workspace}  ·  model: {model}  ·  autonomy: {autonomy}  ·  /help  /exit "
+    return f" {workspace}  |  model: {model}  |  autonomy: {autonomy}  |  /help  /exit "
 
 
 class CachedBottomToolbar:
@@ -2876,7 +3463,7 @@ def _make_prompt_session(workspace: Path, bottom_toolbar: Callable[[], str] | No
 
 
 def _force_utf8_stdio() -> None:
-    """Best-effort: make stdout/stderr UTF-8 so non-ASCII output (→, box glyphs)
+    """Best-effort: make stdout/stderr UTF-8 so non-ASCII output (arrow/box glyphs)
     never crashes on a Windows console, even if PYTHONUTF8 wasn't set by the
     launcher (e.g. run directly via `python -m shamsu.cli.repl`)."""
     for stream in (sys.stdout, sys.stderr):
@@ -2901,8 +3488,8 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
 
     # Track this session so the last one to exit can free SHAMSU's Ollama
-    # footprint (stop a SHAMSU-started server, or unload SHAMSU's models — incl.
-    # the keep_alive=-1 router — from a shared/tray-app server). Best-effort.
+    # footprint (stop a SHAMSU-started server, or unload SHAMSU's models - incl.
+    # the keep_alive=-1 router - from a shared/tray-app server). Best-effort.
     session_pid = register_session()
     atexit.register(shutdown_if_last_session, session_pid)
 
@@ -2945,10 +3532,10 @@ def main(argv: list[str] | None = None) -> None:
             print("\nGoodbye.")
             sys.exit(0)
 
-        # Strip a stray leading BOM (﻿) that piped stdin can prepend; it is
+        # Strip a stray leading BOM that piped stdin can prepend; it is
         # not whitespace, so .strip() alone leaves it and it would break slash
         # commands and pollute previews.
-        user_input = raw_input_text.lstrip("﻿").strip()
+        user_input = raw_input_text.lstrip("\ufeff").strip()
         if not user_input:
             continue
         previous_user_prompt = session_logger.metadata.last_user_prompt

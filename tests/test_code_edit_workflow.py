@@ -93,21 +93,58 @@ async def test_code_edit_workflow_applies_valid_diff_with_real_patch_engine(tmp_
     assert "Output ONLY a unified diff" in llm.pack.user_request
 
 
+class SequenceLLM:
+    """Returns each response in order across successive run_specialist calls."""
+
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+
+    async def route(self, prompt: str, project_summary: str):  # pragma: no cover
+        raise NotImplementedError
+
+    async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
+        raw = self.responses.pop(0) if self.responses else ""
+        return LLMResponse(raw=raw, model_used="fake")
+
+
 @pytest.mark.asyncio
-async def test_code_edit_workflow_rejects_malformed_diff_without_applying(tmp_path: Path):
+async def test_code_edit_workflow_reports_error_when_diff_and_rewrite_both_fail(tmp_path: Path):
+    # A malformed diff triggers the full-rewrite fallback; if that also yields
+    # nothing usable, the workflow reports the error and leaves the file intact.
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
 
     result = await CodeEditWorkflow(
         workspace_root=tmp_path,
         search=FakeSearch(),
-        llm=FakeLLM("Here is what I would change."),
+        llm=SequenceLLM(["Here is what I would change.", ""]),
         patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
     ).run("change value")
 
     assert result.applied is False
+    assert result.used_full_rewrite is False
     assert result.error.startswith("Invalid diff:")
     assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_code_edit_workflow_rewrites_whole_file_when_diff_is_malformed(tmp_path: Path):
+    # The model can't format a clean diff, but the fallback rewrite produces the
+    # corrected file — so the edit still lands instead of aborting.
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    result = await CodeEditWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=SequenceLLM(["not a valid diff at all", "value = 2\n"]),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("change value to 2")
+
+    assert result.applied is True
+    assert result.used_full_rewrite is True
+    assert result.changed_files == ["app.py"]
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
 
 
 @pytest.mark.asyncio

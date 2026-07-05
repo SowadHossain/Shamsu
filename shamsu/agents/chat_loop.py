@@ -29,13 +29,24 @@ Rules:
 - For greetings or casual chat, answer naturally in one short sentence.
 - Use tools for file reads, file writes, searches, and commands.
 - Never claim you created, edited, read, or ran anything unless a tool result confirms it.
-- If you need to create or modify a file, call write_file or ask for clarification.
+- If the user asks you to create, write, save, generate, add, edit, or update a file,
+  your next action must be a write_file tool call or a clarification question.
+- To create OR change a file, call write_file with the COMPLETE new file content. It
+  overwrites, so never send a partial file or a diff — send the whole file every time.
+- A file change only counts if the write_file tool result says ok. If a tool result shows
+  an error, the change did NOT happen: do not assume success, read the file if needed and
+  call write_file again with the full corrected content.
+- Never reply with conversational filler like "noted" or "ask me to continue". Either call a
+  tool to make progress or state the concrete result. Do not repeat an identical tool call.
 - If you need to run code/tests, call run_command.
 - If a slash command starts with /, do not answer it. The CLI handles slash commands.
 - Keep all paths relative to the workspace.
 - Do not access files outside the workspace.
 - After tool results, summarize exactly what happened and what remains.
 """
+
+# How many times the exact same tool call may repeat before we stop the loop.
+_MAX_REPEATED_CALLS = 3
 
 
 @dataclass(frozen=True)
@@ -83,6 +94,7 @@ class AgentChatLoop:
     async def run(self, user_input: str) -> AgentLoopResult:
         self.state.append_user(user_input)
         last_call_signature: tuple[str, str] | None = None
+        repeat_count = 0
         for round_index in range(self.max_tool_rounds):
             try:
                 response = await self.client.chat(
@@ -103,11 +115,19 @@ class AgentChatLoop:
             if not tool_calls:
                 fallback = self.markdown_fallback.maybe_write(user_input, content)
                 if fallback.handled:
-                    self.state.append_tool(
-                        "markdown_fallback",
-                        "write_file",
-                        fallback.tool_result.to_json() if fallback.tool_result else fallback.summary,
-                    )
+                    if fallback.tool_results:
+                        for index, tool_result in enumerate(fallback.tool_results):
+                            self.state.append_tool(
+                                f"markdown_fallback_{index}",
+                                "write_file",
+                                tool_result.to_json(),
+                            )
+                    else:
+                        self.state.append_tool(
+                            "markdown_fallback",
+                            "write_file",
+                            fallback.tool_result.to_json() if fallback.tool_result else fallback.summary,
+                        )
                     continue
                 return AgentLoopResult(final=content, tool_rounds=round_index)
             for call in tool_calls:
@@ -115,46 +135,67 @@ class AgentChatLoop:
                 arguments = _tool_call_arguments(call)
                 signature = (name, json.dumps(arguments, sort_keys=True, default=str))
                 if self.long_running and signature == last_call_signature:
-                    return self._handle_stuck_repetition(name, round_index)
+                    # The exact same call repeated — instead of stopping with
+                    # conversational filler, push a firm correction back into the
+                    # conversation and let the model try a DIFFERENT action.
+                    repeat_count += 1
+                    if repeat_count >= _MAX_REPEATED_CALLS:
+                        return self._give_up_on_repetition(name, round_index)
+                    self.state.append_user(_repetition_correction(name))
+                    break  # re-prompt without executing the repeat
                 last_call_signature = signature
+                repeat_count = 0
                 if self.on_activity:
                     self.on_activity(_describe_tool_call(name, arguments))
                 result = self.tools.execute(name, arguments)
                 if self.on_activity and not result.ok:
                     self.on_activity(f"failed: {result.message}")
                 self.state.append_tool(_tool_call_id(call, name), name, result.to_json())
+                if name == "write_file" and not result.ok:
+                    # A write that did not land is the #1 cause of the model
+                    # "hallucinating success" and then compiling half-written
+                    # files. Make the failure loud and demand a full re-write.
+                    self.state.append_user(
+                        _write_failure_correction(str(arguments.get("filepath", "the file")), result.message)
+                    )
         final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
         self.state.append_assistant(final)
         return AgentLoopResult(final=final, tool_rounds=self.max_tool_rounds, stopped=True)
 
-    def _handle_stuck_repetition(self, tool_name: str, round_index: int) -> AgentLoopResult:
-        """The exact same tool call repeated consecutively — the agent is
-        stuck, not making progress. In long-running mode, ask a genuine
-        clarifying question instead of silently looping or giving up.
-        """
-        question = (
-            f"I tried to repeat the exact same action ({tool_name}) without making "
-            f"progress. What should I do differently, or should I stop?"
-        )
-        if self.clarify_prompt is None:
-            final = f"I stopped because I kept repeating the same action ({tool_name}) without making progress."
-            self.state.append_assistant(final)
-            return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
-        answer = self.clarify_prompt(question)
-        self.state.append_assistant(question)
-        self.state.append_user(answer)
+    def _give_up_on_repetition(self, tool_name: str, round_index: int) -> AgentLoopResult:
+        """The same tool call repeated past the limit despite corrections — stop
+        cleanly rather than burn rounds. No clarifying question, no filler."""
         final = (
-            f"{question}\n\nYou said: {answer}\n\n"
-            f"I've noted that — ask me to continue and I'll factor it in."
+            f"I stopped because the same action ({tool_name}) kept repeating without making "
+            f"progress. It likely needs a different approach or more detail."
         )
+        self.state.append_assistant(final)
         if self.session_logger:
             self.session_logger.log(
-                "agent.clarify",
-                {"tool_name": tool_name, "question": question, "answer": answer},
-                "Asked a clarifying question after a stuck repetition",
+                "agent.stuck",
+                {"tool_name": tool_name},
+                "Stopped after repeated identical tool calls",
                 workflow_id="agent-chat",
             )
         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+
+
+def _repetition_correction(tool_name: str) -> str:
+    return (
+        f"STOP. You just issued the exact same {tool_name} call again, which did not make "
+        f"progress. Do NOT repeat it and do NOT reply with an apology or 'noted'. Take a "
+        f"DIFFERENT concrete action now: if a file write failed, read the file then call "
+        f"write_file with the COMPLETE corrected content; otherwise call a different tool to "
+        f"diagnose or advance. Respond with a tool call, not prose."
+    )
+
+
+def _write_failure_correction(filepath: str, message: str) -> str:
+    return (
+        f"Your write_file to {filepath} did NOT succeed: {message}. The file was NOT changed. "
+        f"Do not assume the fix was applied and do not move on. Call write_file again for "
+        f"{filepath} with the ENTIRE corrected file content."
+    )
 
 
 def _describe_tool_call(name: str, arguments: dict[str, Any]) -> str:
