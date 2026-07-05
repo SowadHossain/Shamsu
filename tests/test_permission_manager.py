@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import types
 from io import StringIO
 
 from rich.console import Console
 
+import shamsu.safety.approval as approval_module
 from shamsu.safety.approval import ask_approval_menu, ask_remember_choice
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import is_auto_approvable_action
@@ -256,6 +258,51 @@ def test_ask_approval_menu_cancels_on_eof(monkeypatch):
     assert approved is False
     assert scope == "none"
     assert "Action cancelled" in console.file.getvalue()
+
+
+def test_ask_approval_menu_windows_console_fallback_accepts_key(monkeypatch):
+    out = StringIO()
+    console = Console(file=out, force_terminal=True, width=100)
+
+    def raise_eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+    monkeypatch.setattr(approval_module.sys, "platform", "win32")
+    monkeypatch.setitem(
+        approval_module.sys.modules,
+        "msvcrt",
+        types.SimpleNamespace(getwch=lambda: "1"),
+    )
+
+    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
+
+    assert approved is True
+    assert scope == "none"
+    rendered = out.getvalue()
+    assert "approve" in rendered
+    assert "cancel" in rendered
+    assert "Action cancelled" not in rendered
+
+
+def test_ask_approval_menu_windows_console_fallback_rejects_key(monkeypatch):
+    console = Console(file=StringIO(), force_terminal=True, width=100)
+
+    def raise_eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+    monkeypatch.setattr(approval_module.sys, "platform", "win32")
+    monkeypatch.setitem(
+        approval_module.sys.modules,
+        "msvcrt",
+        types.SimpleNamespace(getwch=lambda: "2"),
+    )
+
+    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
+
+    assert approved is False
+    assert scope == "none"
 
 
 def test_ask_approval_menu_pauses_tracked_status_before_input(monkeypatch):
