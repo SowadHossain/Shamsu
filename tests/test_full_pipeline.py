@@ -227,6 +227,32 @@ def test_generate_prd_arg_parser_accepts_output():
     )
 
 
+@pytest.mark.asyncio
+async def test_full_pipeline_scaffolds_multiplayer_game_and_runs_dod(tmp_path: Path):
+    prd = tmp_path / "game.md"
+    prd.write_text(
+        "# Cube Runner\n\n"
+        "## Gameplay\n"
+        "- Build a multiplayer 3D cube runner game.\n"
+        "- Include a main menu, lobby, player list, local and remote players, HUD, and end condition.\n",
+        encoding="utf-8",
+    )
+
+    result = await FullDjangoPipeline(
+        tmp_path,
+        search=EmptySearch(),
+        approval_func=lambda _request: True,
+    ).run(prd, "generated-game")
+
+    assert result.success is True
+    assert result.project is not None
+    assert result.project.category == "multiplayer-game"
+    assert result.dod_result is not None
+    assert result.dod_result.ok is True
+    assert (tmp_path / "generated-game" / "src" / "App.tsx").exists()
+    assert (tmp_path / "generated-game" / "SHAMSU_SUMMARY.md").exists()
+
+
 def _prd(root: Path) -> Path:
     path = root / "todo.md"
     path.write_text(

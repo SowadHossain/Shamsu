@@ -41,6 +41,7 @@ dependencies = [
 
     # Keyword extraction (near-zero RAM, no model)
     "yake>=0.4.8",
+    "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]

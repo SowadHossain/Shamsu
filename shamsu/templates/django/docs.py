@@ -69,6 +69,11 @@ def render_pipeline_summary(result) -> str:
     feedback = "not run"
     if result.feedback_result:
         feedback = "success" if result.feedback_result.success else result.feedback_result.error
+    dod = "not run"
+    if getattr(result, "dod_result", None):
+        failures = result.dod_result.required_failures
+        dod = "ok" if not failures else "failed: " + ", ".join(item.item_id for item in failures)
+    preview = getattr(result, "preview_url", "") or "not available"
     return f"""# SHAMSU Generation Summary
 
 ## Result
@@ -83,6 +88,8 @@ def render_pipeline_summary(result) -> str:
 - Setup: {setup}
 - Tests: {tests}
 - Feedback loop: {feedback}
+- Definition of Done: {dod}
+- Preview URL: {preview}
 
 ## Generated Files
 

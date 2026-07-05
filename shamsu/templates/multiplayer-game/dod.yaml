@@ -1,0 +1,42 @@
+category: multiplayer-game
+items:
+  - id: build.succeeds
+    description: "Project has a Vite build script."
+    check: file_exists
+    args: { path: "package.json" }
+    severity: required
+  - id: menu.renders
+    description: "Main menu screen renders on load."
+    check: element_present
+    args: { file: "src/App.tsx", selector: "[data-testid=main-menu]" }
+    severity: required
+  - id: lobby.renders
+    description: "Lobby renders and lists players."
+    check: element_present
+    args: { file: "src/App.tsx", selector: "[data-testid=player-list]" }
+    severity: required
+  - id: net.connects
+    description: "Client opens a relay room connection."
+    check: websocket_opens
+    args: { file: "src/net/room.ts" }
+    severity: required
+  - id: net.two_players_visible
+    description: "Local and remote players are rendered distinctly."
+    check: two_clients_see_two_players
+    args: { file: "src/App.tsx", players: 2 }
+    severity: required
+  - id: loop.runs
+    description: "Game loop advances state over time."
+    check: state_advances
+    args: { file: "src/game/rules.ts" }
+    severity: required
+  - id: hud.visible
+    description: "HUD shows score and game state."
+    check: element_present
+    args: { file: "src/ui/Hud.tsx", selector: "[data-testid=hud]" }
+    severity: required
+  - id: end.condition
+    description: "An end condition can fire."
+    check: end_state_reachable
+    args: { file: "src/game/rules.ts" }
+    severity: required

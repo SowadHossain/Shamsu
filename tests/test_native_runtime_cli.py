@@ -30,53 +30,67 @@ def test_models_status_prints_missing_runtime_message(monkeypatch):
     assert "Ollama not found" in rendered
 
 
-def test_models_pull_asks_approval_before_downloading(monkeypatch, tmp_path):
+def test_models_pull_downloads_without_a_second_approval(monkeypatch, tmp_path):
+    # Typing `/models pull` is itself the consent — it must download directly
+    # and never sit on a fragile input() approval that can auto-cancel.
     console, output = _console_output()
-    status = RuntimeStatus(
+    before = RuntimeStatus(
         ollama_path=str(tmp_path / "ollama.exe"),
         server_running=True,
         missing_models=["qwen3:8b"],
     )
-    monkeypatch.setattr(repl, "collect_status", lambda *args, **kwargs: status)
+    after = RuntimeStatus(
+        ollama_path=str(tmp_path / "ollama.exe"),
+        server_running=True,
+        installed_models=["qwen3:8b"],
+        missing_models=[],
+    )
+    statuses = iter([before, after])
+    monkeypatch.setattr(repl, "collect_status", lambda *a, **k: next(statuses, after))
+    calls = []
     monkeypatch.setattr(
         repl,
         "_pull_models_with_progress",
-        lambda *_args, **_kwargs: {"qwen3:8b": 0},
+        lambda path, models, console: calls.append(list(models)) or {"qwen3:8b": 0},
     )
-
-    approvals = []
-
-    def deny(request):
-        approvals.append(request)
-        return False
-
-    repl._handle_models("models pull", console, approval_func=deny)
-
-    rendered = output.getvalue()
-    assert approvals[0].action_type == "run_command"
-    assert "qwen3:8b" in approvals[0].preview
-    assert "cancelled" in rendered
-
-
-def test_models_pull_closed_approval_input_does_not_crash(monkeypatch, tmp_path):
-    console, output = _console_output()
-    status = RuntimeStatus(
-        ollama_path=str(tmp_path / "ollama.exe"),
-        server_running=True,
-        missing_models=["qwen3:8b"],
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no approval prompt for explicit /models pull")),
     )
-    monkeypatch.setattr(repl, "collect_status", lambda *args, **kwargs: status)
-
-    def raise_eof(_prompt=""):
-        raise EOFError
-
-    monkeypatch.setattr("builtins.input", raise_eof)
 
     repl._handle_models("models pull", console)
 
     rendered = output.getvalue()
-    assert "Action cancelled" in rendered
-    assert "Model download cancelled" in rendered
+    assert calls == [["qwen3:8b"]]
+    assert "Downloading missing local model" in rendered
+    assert "cancelled" not in rendered.lower()
+
+
+def test_models_repair_downloads_without_a_second_approval(monkeypatch, tmp_path):
+    console, output = _console_output()
+    status = RuntimeStatus(
+        ollama_path=str(tmp_path / "ollama.exe"),
+        server_running=True,
+        missing_models=["qwen3:8b"],
+    )
+    monkeypatch.setattr(repl, "repair_runtime", lambda *a, **k: status)
+    monkeypatch.setattr(repl, "collect_status", lambda *a, **k: status)
+    calls = []
+    monkeypatch.setattr(
+        repl,
+        "_pull_models_with_progress",
+        lambda path, models, console: calls.append(list(models)) or {"qwen3:8b": 0},
+    )
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("no approval prompt for explicit /models repair")),
+    )
+
+    repl._handle_models("models repair", console)
+
+    rendered = output.getvalue()
+    assert calls == [["qwen3:8b"]]
+    assert "cancelled" not in rendered.lower()
 
 
 def test_models_pull_downloads_with_progress_when_approved(monkeypatch, tmp_path):
@@ -102,7 +116,7 @@ def test_models_pull_downloads_with_progress_when_approved(monkeypatch, tmp_path
 
     monkeypatch.setattr(repl, "_pull_models_with_progress", pull)
 
-    repl._handle_models("models pull", console, approval_func=lambda _request: True)
+    repl._handle_models("models pull", console)
 
     rendered = output.getvalue()
     assert calls[0][1] == ["qwen3:8b"]

@@ -202,6 +202,11 @@ class ProjectSpec:
     archetype: Archetype = Archetype.WEB_CRUD
     archetype_confidence: float = 1.0
     archetype_spec: Any = None
+    category: str | None = None
+    master_prompt: str = ""
+    manifest_path: str = ""
+    dod_path: str = ""
+    feature_requests: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────

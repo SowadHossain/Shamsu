@@ -1,0 +1,12 @@
+category: multiplayer-game
+name: Multiplayer 3D Browser Game
+stack:
+  runtime: node
+  framework: vite-react-ts
+  render: r3f
+  net: colyseus-relay
+  physics: rapier
+entry: src/main.tsx
+build_cmd: "npm install && npm run build"
+run_cmd: "npm run dev"
+preview_url: "http://localhost:5173"
