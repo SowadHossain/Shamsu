@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import pytest
 
-from shamsu.agents.chat_loop import LONG_RUNNING_MAX_TOOL_ROUNDS, AgentChatLoop
+from shamsu.agents.chat_loop import (
+    LONG_RUNNING_MAX_TOOL_ROUNDS,
+    _MAX_REPEATED_CALLS,
+    AgentChatLoop,
+)
 from shamsu.tools.agent_tools import AgentToolRegistry
 
 
@@ -66,43 +70,48 @@ async def test_long_running_mode_uses_higher_ceiling_for_non_repeating_calls(tmp
 
 
 @pytest.mark.asyncio
-async def test_long_running_mode_repetition_guard_asks_clarifying_question(tmp_path):
-    client = FakeOllamaClient([_list_files_call(), _list_files_call()])
-    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
-    asked = []
-
-    def fake_clarify(question: str) -> str:
-        asked.append(question)
-        return "Stop trying that, list the tests/ folder instead."
-
-    result = await AgentChatLoop(
-        tmp_path, client=client, tools=tools, long_running=True, clarify_prompt=fake_clarify,
-    ).run("list files forever")
-
-    assert len(asked) == 1
-    assert "list_files" in asked[0]
-    assert result.stopped is True
-    assert "Stop trying that" in result.final
-    # Only one round actually executed the tool before the repeat was caught.
-    assert len(client.calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_long_running_mode_without_clarify_prompt_stops_plainly_on_repetition(tmp_path):
-    client = FakeOllamaClient([_list_files_call(), _list_files_call()])
+async def test_long_running_mode_corrects_a_repeat_and_continues(tmp_path):
+    # A single repeat is not fatal: the loop pushes a correction back and lets
+    # the model take a different action (here, finishing) instead of stopping
+    # with conversational filler.
+    client = FakeOllamaClient(
+        [
+            _list_files_call(),
+            _list_files_call(),  # the repeat
+            {"message": {"content": "Done listing.", "tool_calls": []}},
+        ]
+    )
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
 
     result = await AgentChatLoop(
-        tmp_path, client=client, tools=tools, long_running=True, clarify_prompt=None,
-    ).run("list files forever")
+        tmp_path, client=client, tools=tools, long_running=True,
+    ).run("list files")
 
-    assert result.stopped is True
-    assert "kept repeating the same action" in result.final
+    assert result.stopped is False
+    assert result.final == "Done listing."
+    assert len(client.calls) == 3
+    # A firm correction was injected before the third turn.
+    third_turn_messages = client.calls[2]["messages"]
+    assert any("STOP" in str(msg.get("content", "")) for msg in third_turn_messages)
 
 
 @pytest.mark.asyncio
-async def test_long_running_mode_logs_clarify_event(tmp_path):
-    client = FakeOllamaClient([_list_files_call(), _list_files_call()])
+async def test_long_running_mode_stops_after_repeats_exceed_limit(tmp_path):
+    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS + 1)])
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    result = await AgentChatLoop(
+        tmp_path, client=client, tools=tools, long_running=True,
+    ).run("list files forever")
+
+    assert result.stopped is True
+    assert "kept repeating" in result.final
+    assert len(client.calls) == _MAX_REPEATED_CALLS + 1
+
+
+@pytest.mark.asyncio
+async def test_long_running_mode_logs_stuck_event(tmp_path):
+    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS + 1)])
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
 
     class RecordingLogger:
@@ -117,8 +126,43 @@ async def test_long_running_mode_logs_clarify_event(tmp_path):
 
     logger = RecordingLogger()
     await AgentChatLoop(
-        tmp_path, client=client, tools=tools, session_logger=logger,
-        long_running=True, clarify_prompt=lambda _q: "try something else",
+        tmp_path, client=client, tools=tools, session_logger=logger, long_running=True,
     ).run("list files forever")
 
-    assert "agent.clarify" in logger.events
+    assert "agent.stuck" in logger.events
+
+
+@pytest.mark.asyncio
+async def test_failed_write_injects_correction_and_reprompts(tmp_path):
+    # A denied/failed write must be made loud so the model re-writes the full
+    # file instead of assuming success and moving on.
+    (tmp_path / "x.py").write_text("old\n", encoding="utf-8")
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"filepath": "x.py", "content": "new\n"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "ok", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: False)
+
+    await AgentChatLoop(
+        tmp_path, client=client, tools=tools, long_running=True,
+    ).run("edit x.py")
+
+    assert len(client.calls) == 2
+    second_turn_messages = client.calls[1]["messages"]
+    assert any("did NOT succeed" in str(msg.get("content", "")) for msg in second_turn_messages)
+    assert (tmp_path / "x.py").read_text(encoding="utf-8") == "old\n"

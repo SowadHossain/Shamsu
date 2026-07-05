@@ -340,7 +340,7 @@ def test_repl_request_uses_indexed_context_when_index_exists(tmp_path):
     asyncio.run(_handle_request("charge card", tmp_path, console, web_tool, browser_tool))
 
     rendered = output.getvalue()
-    assert "payments.py" in rendered
     assert "charge_card" in rendered
+    assert "Context Preview" not in rendered
     assert "No index found" not in rendered
     assert "stub/example.py" not in rendered

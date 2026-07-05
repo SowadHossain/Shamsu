@@ -22,6 +22,13 @@ def test_bm25_index_is_not_built_until_first_search_call(tmp_path):
     assert agent._bm25_built is True
 
 
+def test_fts_query_quotes_boolean_words():
+    query = SearchAgent._build_fts_query("run the game now and give me the link")
+
+    assert '"and"' in query
+    assert " AND " not in query
+
+
 def test_bm25_index_builds_only_once_per_instance(tmp_path, monkeypatch):
     (tmp_path / "a.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
     agent = _index(tmp_path)

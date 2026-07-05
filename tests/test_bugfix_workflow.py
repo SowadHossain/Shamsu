@@ -125,21 +125,51 @@ ZeroDivisionError: division by zero
     assert "Output ONLY a unified diff" in llm.pack.user_request
 
 
+class SequenceLLM:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+
+    async def route(self, prompt: str, project_summary: str):  # pragma: no cover
+        raise NotImplementedError
+
+    async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
+        raw = self.responses.pop(0) if self.responses else ""
+        return LLMResponse(raw=raw, model_used="fake-bugfix")
+
+
 @pytest.mark.asyncio
-async def test_bugfix_workflow_rejects_malformed_output_without_applying(tmp_path: Path):
+async def test_bugfix_workflow_reports_error_when_diff_and_rewrite_both_fail(tmp_path: Path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
 
     result = await BugFixWorkflow(
         workspace_root=tmp_path,
         search=FakeSearch(),
-        llm=FakeLLM("The bug is in app.py."),
+        llm=SequenceLLM(["The bug is in app.py.", ""]),
         patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
     ).run("app.py:1 ValueError: wrong value")
 
     assert result.applied is False
+    assert result.used_full_rewrite is False
     assert result.error.startswith("Invalid diff:")
     assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_bugfix_workflow_rewrites_whole_file_when_diff_is_malformed(tmp_path: Path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+
+    result = await BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=SequenceLLM(["garbled diff, no markers", "value = 2\n"]),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("app.py:1 ValueError: wrong value")
+
+    assert result.applied is True
+    assert result.used_full_rewrite is True
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -28,6 +29,7 @@ class CodeEditResult:
     changed_files: list[str] = field(default_factory=list)
     applied: bool = False
     error: str = ""
+    used_full_rewrite: bool = False
     test_suggestion: str = "Run the relevant project tests after reviewing the patch."
 
 
@@ -55,30 +57,46 @@ class CodeEditWorkflow:
             response = await self.llm.run_specialist("coder", pack)
         diff_text = _clean_diff(response.raw)
         ok, error = self.patch_engine.validate_diff(diff_text)
-        if not ok:
-            return CodeEditResult(
-                request=request,
-                pack=pack,
-                diff_text=diff_text,
-                error=f"Invalid diff: {error}",
-            )
-
-        changed_files = _changed_files(diff_text)
-        applied = self.patch_engine.apply(diff_text, self.workspace_root)
-        if not applied:
+        if ok:
+            # A well-formed diff — apply it (this path honours approval/denial).
+            changed_files = _changed_files(diff_text)
+            applied = self.patch_engine.apply(diff_text, self.workspace_root)
             return CodeEditResult(
                 request=request,
                 pack=pack,
                 diff_text=diff_text,
                 changed_files=changed_files,
-                error="Patch was not applied.",
+                applied=applied,
+                error="" if applied else "Patch was not applied.",
+            )
+
+        # The diff was malformed (a formatting failure — common with small
+        # models), NOT a user denial. Instead of aborting with unchanged/broken
+        # code, rewrite the whole target file(s) from scratch and overwrite them.
+        targets = lenient_diff_target_paths(diff_text) or target_paths
+        rewritten = await rewrite_files_fully(
+            llm=self.llm,
+            context_builder=self.context_builder,
+            patch_engine=self.patch_engine,
+            workspace_root=self.workspace_root,
+            request=request,
+            target_paths=targets,
+            specialist="coder",
+        )
+        if rewritten:
+            return CodeEditResult(
+                request=request,
+                pack=pack,
+                diff_text=diff_text,
+                changed_files=rewritten,
+                applied=True,
+                used_full_rewrite=True,
             )
         return CodeEditResult(
             request=request,
             pack=pack,
             diff_text=diff_text,
-            changed_files=changed_files,
-            applied=True,
+            error=f"Invalid diff: {error}",
         )
 
     def _build_pack(self, request: str) -> tuple[ContextPack, list[str]]:

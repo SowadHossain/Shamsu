@@ -68,15 +68,12 @@ class AgentToolRegistry:
             ),
             _tool_schema(
                 "write_file",
-                "Create or overwrite a file inside the workspace.",
+                "Create or update a file inside the workspace. If the file exists it is "
+                "overwritten with the content you provide, so always pass the COMPLETE new "
+                "file content. Use this for every file change.",
                 {
                     "filepath": {"type": "string", "description": "Relative file path."},
                     "content": {"type": "string", "description": "Complete file content."},
-                    "overwrite": {
-                        "type": "boolean",
-                        "description": "Whether overwriting an existing file is intended.",
-                        "default": False,
-                    },
                 },
                 required=["filepath", "content"],
             ),
@@ -108,10 +105,13 @@ class AgentToolRegistry:
             if name == "read_file":
                 return self.read_file(str(arguments.get("filepath") or ""))
             if name == "write_file":
+                # The model-facing tool always overwrites: small models forget an
+                # overwrite flag, get blocked, and then hallucinate success. The
+                # internal `overwrite` param stays for callers that need it.
                 return self.write_file(
                     str(arguments.get("filepath") or ""),
                     str(arguments.get("content") or ""),
-                    bool(arguments.get("overwrite", False)),
+                    overwrite=True,
                 )
             if name == "run_command":
                 return self.run_command(

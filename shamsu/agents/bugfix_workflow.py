@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -41,6 +42,7 @@ class BugFixResult:
     changed_files: list[str] = field(default_factory=list)
     applied: bool = False
     error: str = ""
+    used_full_rewrite: bool = False
     test_suggestion: str = "Re-run the failing test or command that produced the bug report."
 
 
@@ -70,33 +72,48 @@ class BugFixWorkflow:
             response = await self.llm.run_specialist("bugfix", pack)
         diff_text = _clean_diff(response.raw)
         ok, error = self.patch_engine.validate_diff(diff_text)
-        if not ok:
-            return BugFixResult(
-                request=report,
-                pack=pack,
-                locations=locations,
-                diff_text=diff_text,
-                error=f"Invalid diff: {error}",
-            )
-
-        changed_files = _changed_files(diff_text)
-        applied = self.patch_engine.apply(diff_text, self.workspace_root)
-        if not applied:
+        if ok:
+            # Well-formed diff — apply it (this path honours approval/denial).
+            changed_files = _changed_files(diff_text)
+            applied = self.patch_engine.apply(diff_text, self.workspace_root)
             return BugFixResult(
                 request=report,
                 pack=pack,
                 locations=locations,
                 diff_text=diff_text,
                 changed_files=changed_files,
-                error="Patch was not applied.",
+                applied=applied,
+                error="" if applied else "Patch was not applied.",
+            )
+
+        # Malformed diff (a small-model formatting failure, not a denial) —
+        # rewrite the target file(s) in full rather than abandon the fix.
+        targets = lenient_diff_target_paths(diff_text) or target_paths
+        rewritten = await rewrite_files_fully(
+            llm=self.llm,
+            context_builder=self.context_builder,
+            patch_engine=self.patch_engine,
+            workspace_root=self.workspace_root,
+            request=report,
+            target_paths=targets,
+            specialist="bugfix",
+        )
+        if rewritten:
+            return BugFixResult(
+                request=report,
+                pack=pack,
+                locations=locations,
+                diff_text=diff_text,
+                changed_files=rewritten,
+                applied=True,
+                used_full_rewrite=True,
             )
         return BugFixResult(
             request=report,
             pack=pack,
             locations=locations,
             diff_text=diff_text,
-            changed_files=changed_files,
-            applied=True,
+            error=f"Invalid diff: {error}",
         )
 
     def _build_pack(self, report: str, locations: list[TracebackLocation]) -> ContextPack:

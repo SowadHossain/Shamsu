@@ -24,7 +24,7 @@ export function createInitialState(): GameState {
   ];
 
   return {
-    phase: "lobby",
+    phase: "menu",
     players,
     localPlayerId: "local-player",
     obstacles: [{ id: "center", position: [0, 0, -3], radius: 0.5 }],
