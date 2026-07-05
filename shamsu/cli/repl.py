@@ -2998,35 +2998,28 @@ def main(argv: list[str] | None = None) -> None:
                 _handle_parse_prd(normalized_input, workspace, console)
             continue
         if lowered_input.startswith("plan-prd "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_plan_prd(normalized_input, workspace, console, session_logger=session_logger)
+            _handle_plan_prd(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("generate-django "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_generate_django(normalized_input, workspace, console, session_logger=session_logger)
+            _handle_generate_django(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("generate-prd "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                asyncio.run(_handle_generate_prd(normalized_input, workspace, console, session_logger))
+            asyncio.run(_handle_generate_prd(normalized_input, workspace, console, session_logger))
             continue
         if lowered_input.startswith("models"):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_models(normalized_input, console)
+            _handle_models(normalized_input, console)
             continue
         if lowered_input.startswith("web "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console))
+            _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console))
             continue
         if lowered_input.startswith("browse "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_browse(normalized_input, console, browser_tool)
+            _handle_browse(normalized_input, console, browser_tool)
             continue
         if lowered_input.startswith("django"):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                if lowered_input.startswith("django fix-tests"):
-                    asyncio.run(_handle_django_fix_tests(normalized_input, workspace, console, session_logger))
-                else:
-                    _handle_django(normalized_input, workspace, console, session_logger=session_logger)
+            if lowered_input.startswith("django fix-tests"):
+                asyncio.run(_handle_django_fix_tests(normalized_input, workspace, console, session_logger))
+            else:
+                _handle_django(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("sessions"):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

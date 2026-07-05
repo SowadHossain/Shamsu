@@ -3,6 +3,8 @@ User approval prompt for risky actions.
 """
 from __future__ import annotations
 
+import sys
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
@@ -16,6 +18,7 @@ _ACTION_LABELS = {
 }
 
 _YES_ANSWERS = {"1", "y", "yes"}
+_MAX_EMPTY_TTY_READS = 3
 
 
 def _action_label(action_type: str) -> str:
@@ -86,8 +89,9 @@ def ask_approval_menu(
         no_answers = {"2", "n", "no", ""}
         remember_answer = None
 
-    _pause_console_live(console)
-    answer = input("> ").strip().lower()
+    answer = _read_approval_answer(console)
+    if answer is None:
+        return False, "none"
     if offer_remember and answer == remember_answer:
         return True, "workspace"
     if answer in _YES_ANSWERS:
@@ -122,9 +126,39 @@ def ask_remember_choice(action_type: str, console: Console | None = None) -> str
     console.print("  2. Yes, for this session")
     console.print("  3. Yes, for this workspace (saved)")
     _pause_console_live(console)
-    answer = input("> ").strip().lower()
+    try:
+        answer = input("> ").strip().lower()
+    except EOFError:
+        console.print("[yellow]Approval input was closed. Not remembering this choice.[/yellow]")
+        return "none"
     if answer in {"2", "s", "session"}:
         return "session"
     if answer in {"3", "w", "workspace"}:
         return "workspace"
     return "none"
+
+
+def _read_approval_answer(console: Console) -> str | None:
+    """Read a menu answer without crashing on closed stdin.
+
+    On real Windows terminals, Rich Live/status and raw ``input()`` can
+    occasionally produce an empty read instead of blocking. Treating that as
+    "No" makes the user's next keystroke become the next REPL prompt. For a TTY,
+    retry a few times; for non-interactive/piped tests, keep the old safe
+    default where an empty string means "No".
+    """
+    empty_reads = 0
+    while True:
+        _pause_console_live(console)
+        try:
+            answer = input("> ").strip().lower()
+        except EOFError:
+            console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
+            return None
+        if answer or not sys.stdin.isatty():
+            return answer
+        empty_reads += 1
+        if empty_reads >= _MAX_EMPTY_TTY_READS:
+            console.print("[yellow]No approval answer was received. Action cancelled.[/yellow]")
+            return None
+        console.print("[yellow]Please choose 1 or 2.[/yellow]")

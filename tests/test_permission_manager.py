@@ -230,6 +230,34 @@ def test_ask_approval_menu_empty_or_garbage_defaults_to_no(monkeypatch):
         assert approved is False
 
 
+def test_ask_approval_menu_retries_empty_tty_read(monkeypatch):
+    console = _menu_console()
+    answers = iter(["", "1"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
+
+    assert approved is True
+    assert scope == "none"
+    assert "Please choose" in console.file.getvalue()
+
+
+def test_ask_approval_menu_cancels_on_eof(monkeypatch):
+    console = _menu_console()
+
+    def raise_eof(_prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", raise_eof)
+
+    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
+
+    assert approved is False
+    assert scope == "none"
+    assert "Action cancelled" in console.file.getvalue()
+
+
 def test_ask_approval_menu_pauses_tracked_status_before_input(monkeypatch):
     console = _menu_console()
     _install_console_status_tracker(console)
