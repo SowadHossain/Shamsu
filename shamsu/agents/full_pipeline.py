@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop, ErrorFeedbackResult
 from shamsu.interfaces import ISearchAgent
 from shamsu.prd.input import parse_prd_file
@@ -55,6 +56,7 @@ class FullDjangoPipeline:
         setup_runner: SetupRunnerLike | None = None,
         test_runner: TestRunnerLike | None = None,
         feedback_loop: FeedbackLoopLike | None = None,
+        long_running: bool = False,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -64,6 +66,7 @@ class FullDjangoPipeline:
         self.setup_runner = setup_runner
         self.test_runner = test_runner
         self.feedback_loop = feedback_loop
+        self.long_running = long_running
 
     async def run(self, prd_path: Path | str, target_dir: Path | str | None = None) -> FullPipelineResult:
         try:
@@ -93,10 +96,15 @@ class FullDjangoPipeline:
                     error="Generated backend consistency checks reported diagnostics.",
                 )
 
-            setup_result = (self.setup_runner or DjangoSetupRunner(
+            setup_runner = self.setup_runner or DjangoSetupRunner(
                 self.workspace_root,
                 session_logger=self.session_logger,
-            )).run(validated_target)
+            )
+            setup_result = setup_runner.run(validated_target)
+            if not setup_result.ok and self.long_running:
+                setup_result = await self._retry_setup_via_bugfix(
+                    setup_result, setup_runner, validated_target,
+                )
             if not setup_result.ok:
                 return self._result(
                     validated_prd,
@@ -153,6 +161,31 @@ class FullDjangoPipeline:
         if not path.exists() or not path.is_file():
             raise ValueError(f"PRD file not found: {path}")
         return path
+
+    async def _retry_setup_via_bugfix(
+        self,
+        setup_result: DjangoSetupResult,
+        setup_runner: SetupRunnerLike,
+        target_dir: Path,
+    ) -> DjangoSetupResult:
+        """Long-running mode only: setup failures (missing migration, a
+        syntax error in generated code, ...) are often auto-fixable the same
+        way a failing test is, via BugFixWorkflow. One bounded retry, not an
+        unbounded loop — if the retry doesn't fix it, the caller still
+        reports Django setup failed rather than looping here.
+        """
+        self._log(
+            "workflow.retrying", {"target_dir": str(target_dir)},
+            "Django setup failed; attempting one bugfix-and-retry pass",
+        )
+        fix = await BugFixWorkflow(
+            self.workspace_root,
+            search=self.search,
+            session_logger=self.session_logger,
+        ).run(setup_result.bugfix_context)
+        if not fix.applied:
+            return setup_result
+        return setup_runner.run(target_dir)
 
     def _result(
         self,

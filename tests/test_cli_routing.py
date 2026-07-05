@@ -4,15 +4,17 @@ import asyncio
 from io import StringIO
 from pathlib import Path
 
+from prompt_toolkit.document import Document
 from rich.console import Console
 
 from shamsu.cli import repl
+from shamsu.tools.browser import BrowserActionResult
 from shamsu.tools.django import DjangoCommandResult, DjangoSetupResult
 from shamsu.types import ContextPack, LLMResponse, SearchResult, TestRunResult as ShamsuTestRunResult
 
 
 class FakeSearch:
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
         return [
             SearchResult(
                 file_path="app.py",
@@ -37,6 +39,54 @@ class FakeLLM:
 
     async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
         return LLMResponse(raw="", model_used="fake")
+
+
+class StreamingFakeLLM:
+    """A fake manager that streams tokens, like the real LLMManager."""
+
+    def __init__(self, tokens: list[str]) -> None:
+        self.tokens = tokens
+
+    async def run_specialist_stream(self, specialist, pack, on_token):
+        for token in self.tokens:
+            on_token(token)
+        return LLMResponse(raw="".join(self.tokens), model_used="fake-stream")
+
+    async def run_specialist(self, specialist, pack):  # pragma: no cover - not reached
+        return LLMResponse(raw="".join(self.tokens), model_used="fake-stream")
+
+
+def test_run_qa_streams_tokens_to_console(tmp_path):
+    console, output = _console_output()
+
+    asyncio.run(
+        repl._run_qa(
+            "how does auth work?",
+            tmp_path,
+            console,
+            StreamingFakeLLM(["Auth ", "works ", "like this."]),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Answer" in rendered
+    assert "Auth works like this." in rendered
+
+
+def test_run_general_chat_streams_tokens_to_console(tmp_path):
+    console, output = _console_output()
+
+    asyncio.run(
+        repl._run_general_chat(
+            "hi there",
+            console,
+            StreamingFakeLLM(["Hey", "!"]),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Chat" in rendered
+    assert "Hey!" in rendered
 
 
 class FakeCodeEditWorkflow:
@@ -85,11 +135,180 @@ def test_keyword_decision_routes_common_agent_prompts():
     assert repl._keyword_decision("how does auth work?").intent == "qa"
 
 
+def test_keyword_decision_does_not_misroute_prd_chat_as_code_edit():
+    assert repl._keyword_decision(
+        "i have add a prd to my working folder can you check that out?"
+    ).intent == "qa"
+
+
 def test_route_prompt_falls_back_to_keyword_router_when_llm_is_down():
     decision = asyncio.run(repl._route_prompt("write tests for parser", FakeLLM()))
 
     assert decision.intent == "test_gen"
     assert decision.confidence == 0.35
+
+
+def test_normalize_command_input_strips_leading_slash():
+    assert repl._normalize_command_input("/models repair") == "models repair"
+    assert repl._normalize_command_input("/help") == "help"
+    assert repl._normalize_command_input("hello there") == "hello there"
+
+
+def test_react_prompt_detects_file_and_command_requests():
+    assert repl._looks_like_react_prompt("create hello.py")
+    assert repl._looks_like_react_prompt("run the tests")
+    assert not repl._looks_like_react_prompt("explain this repo")
+
+
+def test_slash_command_completer_suggests_system_commands():
+    completer = repl.SlashCommandCompleter()
+
+    completions = list(completer.get_completions(Document("/mod"), None))
+
+    texts = [item.text for item in completions]
+    assert "/models status" in texts
+    assert "/models pull" in texts
+    assert "/models repair" in texts
+
+
+def test_slash_command_completer_suggests_web_and_browser_commands():
+    completer = repl.SlashCommandCompleter()
+
+    web_texts = [item.text for item in completer.get_completions(Document("/web"), None)]
+    browse_texts = [item.text for item in completer.get_completions(Document("/browse"), None)]
+
+    assert "/web search " in web_texts
+    assert "/browse open " in browse_texts
+    assert "/browse screenshot" in browse_texts
+
+
+def test_slash_command_completer_suggests_at_files(tmp_path):
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    completer = repl.SlashCommandCompleter(tmp_path)
+
+    texts = [item.text for item in completer.get_completions(Document("@REA"), None)]
+
+    assert texts == ["@README.md"]
+
+
+def test_web_needed_prompt_detects_external_docs_requests():
+    assert repl._looks_like_web_needed_prompt("look up the latest Django auth docs")
+    assert repl._looks_like_web_needed_prompt("whats the weather today?")
+    assert not repl._looks_like_web_needed_prompt("how does auth work in this repo?")
+
+
+def test_is_prd_filename_matches_spelled_out_and_acronym_names():
+    from shamsu.prd.input import is_prd_filename
+
+    assert is_prd_filename("Product Requirements Document.pdf")
+    assert is_prd_filename("myprd.md")
+    assert is_prd_filename("PRD.txt")
+    assert is_prd_filename("requirements document.md")
+    assert not is_prd_filename("notes.txt")
+    assert not is_prd_filename("upward.md")
+    assert not is_prd_filename("report.pdf")
+    assert not is_prd_filename("game.py")  # unsupported extension
+
+
+def test_prd_build_request_fires_on_build_phrasing_with_a_workspace_prd(tmp_path):
+    (tmp_path / "Product Requirements Document.md").write_text(
+        "# Cube Runner\n\n## Milestone 1: Setup\n", encoding="utf-8"
+    )
+
+    assert repl._looks_like_prd_build_request("build me the product from this prd", tmp_path)
+    # Works even without the literal word "prd" because a single PRD file exists.
+    assert repl._looks_like_prd_build_request("finish the product please", tmp_path)
+
+
+def test_prd_build_request_does_not_fire_on_narrow_or_casual_prompts(tmp_path):
+    (tmp_path / "Product Requirements Document.md").write_text("# X\n", encoding="utf-8")
+
+    assert not repl._looks_like_prd_build_request("build the navbar", tmp_path)
+    assert not repl._looks_like_prd_build_request("hola", tmp_path)
+    assert not repl._looks_like_prd_build_request("how does auth work?", tmp_path)
+
+
+def test_vague_action_request_detects_imperatives_but_not_questions():
+    for imperative in ("do the task", "do it", "continue", "go", "build it", "keep going", "finish it"):
+        assert repl._looks_like_vague_action_request(imperative), imperative
+    for question in ("how does auth work?", "what files do i have here?", "hi there",
+                     "explain the payment module in detail please"):
+        assert not repl._looks_like_vague_action_request(question), question
+
+
+def test_action_request_catches_imperatives_beyond_the_phrase_list():
+    # Real prompts that previously fell through to the tool-less QA brain and
+    # got a described-but-not-applied answer.
+    actions = (
+        "okay you should do the thing",
+        "fix the code and check the requirements and fix it",
+        "fix the collision detection",
+        "implement the game over screen",
+        "add sound effects to the game",
+        "refactor script.js",
+        "can you fix the bug in movement",
+        "review the code and correct the scoring",
+        "do the rest",
+    )
+    for prompt in actions:
+        assert repl._looks_like_action_request(prompt), prompt
+
+    # Genuine questions must still go to QA, not the agent loop.
+    questions = (
+        "how do i fix the collision bug?",
+        "what does spawnObstacles do",
+        "why is the cube spinning",
+        "is the scoring correct",
+        "explain the movement logic",
+        "does the game track high scores?",
+    )
+    for prompt in questions:
+        assert not repl._looks_like_action_request(prompt), prompt
+
+
+def test_vague_action_with_a_prd_present_routes_to_build(tmp_path):
+    # "do the task" in a workspace with exactly one PRD means "build that PRD".
+    (tmp_path / "Product Requirements Document.md").write_text(
+        "# Cube Runner\n\n## Milestones\nMilestone 1: Setup\n", encoding="utf-8"
+    )
+    assert repl._looks_like_prd_build_request("do the task", tmp_path)
+    assert repl._looks_like_prd_build_request("continue", tmp_path)
+
+
+def test_vague_action_without_a_prd_does_not_trigger_build(tmp_path):
+    # No PRD present -> not a build request (it will fall through to the agent
+    # loop, which has real tools, instead of the tool-less QA path).
+    assert not repl._looks_like_prd_build_request("do the task", tmp_path)
+
+
+def test_web_needed_prompt_tolerates_common_weather_typos():
+    """A typo like "weither" must still route to the real web-search path
+    rather than silently falling through to a tool-less chat completion
+    that has no way to actually check the weather."""
+    assert repl._looks_like_web_needed_prompt("can you check the weither today")
+    assert repl._looks_like_web_needed_prompt("whats the wheather like")
+    assert not repl._looks_like_web_needed_prompt("hola")
+    assert not repl._looks_like_web_needed_prompt("how you doin?")
+
+
+def test_qa_workflow_prompt_includes_no_live_tools_notice():
+    from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
+
+    preview = QAWorkflow(search=FakeSearch()).build_prompt("can you check the weither today")
+
+    assert NO_LIVE_TOOLS_NOTICE in preview.prompt
+
+
+def test_browser_needed_prompt_detects_local_preview_requests():
+    assert repl._looks_like_browser_needed_prompt("check the app and verify the dashboard")
+    assert repl._looks_like_browser_needed_prompt("open http://127.0.0.1:8000 and inspect the rendered ui")
+    assert not repl._looks_like_browser_needed_prompt("summarize https://docs.djangoproject.com/en/5.1/")
+
+
+def test_expand_followup_prompt_uses_previous_turn_for_web_followup():
+    expanded = repl._expand_followup_prompt("check on the web", "whats the weather today?")
+
+    assert expanded == "whats the weather today? Please check on the web for this."
 
 
 def test_code_edit_handler_prints_applied_result(monkeypatch, tmp_path):
@@ -133,6 +352,27 @@ def test_code_edit_handler_warns_before_editing_dirty_worktree(monkeypatch, tmp_
     rendered = output.getvalue()
     assert "Workspace has uncommitted changes: app.py" in rendered
     assert rendered.index("Workspace has uncommitted changes") < rendered.index("Code Edit Applied")
+
+
+def test_code_edit_handler_skips_non_git_warning(monkeypatch, tmp_path):
+    console, output = _console_output()
+    monkeypatch.setattr(repl, "CodeEditWorkflow", FakeCodeEditWorkflow)
+    monkeypatch.setattr(repl, "GitTool", FakeGitTool)
+    FakeGitTool.warning = "Workspace is not a git repository."
+
+    asyncio.run(
+        repl._run_code_edit(
+            "edit change value",
+            tmp_path,
+            FakeSearch(),
+            console,
+            FakeLLM(),
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Workspace is not a git repository." not in rendered
+    assert "Code Edit Applied" in rendered
 
 
 def test_django_setup_command_prints_runner_result(monkeypatch, tmp_path):
@@ -189,3 +429,36 @@ def test_django_test_command_prints_runner_result(monkeypatch, tmp_path):
     rendered = output.getvalue()
     assert "Django Tests" in rendered
     assert "3" in rendered
+
+
+def test_browse_handler_prints_opened_page(monkeypatch, tmp_path):
+    console, output = _console_output()
+
+    class FakeBrowserTool:
+        def open(self, url: str, reason: str = "", require_approval: bool = True):
+            assert url == "http://127.0.0.1:8000"
+            return BrowserActionResult(
+                ok=True,
+                url=url,
+                title="Demo App",
+                visible_text="Welcome to SHAMSU",
+            )
+
+        def read(self):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+        def click(self, selector: str):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+        def type_text(self, selector: str, text: str):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+        def screenshot(self):  # pragma: no cover - not used here
+            return BrowserActionResult(ok=False)
+
+    repl._handle_browse("browse open http://127.0.0.1:8000", console, FakeBrowserTool())
+
+    rendered = output.getvalue()
+    assert "Browser" in rendered
+    assert "Demo App" in rendered
+    assert "Welcome to SHAMSU" in rendered

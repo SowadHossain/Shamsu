@@ -99,6 +99,7 @@ class TaskStep:
     target_file: Optional[str] = None
     result: Optional[str] = None
     error: Optional[str] = None
+    phase: str = "default"
 
 
 @dataclass

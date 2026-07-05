@@ -35,13 +35,13 @@ def test_models_pull_asks_approval_before_downloading(monkeypatch, tmp_path):
     status = RuntimeStatus(
         ollama_path=str(tmp_path / "ollama.exe"),
         server_running=True,
-        missing_models=["phi3:mini"],
+        missing_models=["qwen3:8b"],
     )
     monkeypatch.setattr(repl, "collect_status", lambda *args, **kwargs: status)
     monkeypatch.setattr(
         repl,
         "_pull_models_with_progress",
-        lambda *_args, **_kwargs: {"phi3:mini": 0},
+        lambda *_args, **_kwargs: {"qwen3:8b": 0},
     )
 
     approvals = []
@@ -54,7 +54,7 @@ def test_models_pull_asks_approval_before_downloading(monkeypatch, tmp_path):
 
     rendered = output.getvalue()
     assert approvals[0].action_type == "run_command"
-    assert "phi3:mini" in approvals[0].preview
+    assert "qwen3:8b" in approvals[0].preview
     assert "cancelled" in rendered
 
 
@@ -64,7 +64,7 @@ def test_models_pull_downloads_with_progress_when_approved(monkeypatch, tmp_path
     status_before = RuntimeStatus(
         ollama_path=str(tmp_path / "ollama.exe"),
         server_running=True,
-        missing_models=["phi3:mini"],
+        missing_models=["qwen3:8b"],
     )
     status_after = RuntimeStatus(
         ollama_path=str(tmp_path / "ollama.exe"),
@@ -77,15 +77,15 @@ def test_models_pull_downloads_with_progress_when_approved(monkeypatch, tmp_path
 
     def pull(ollama_path, models, console):
         calls.append((ollama_path, models))
-        return {"phi3:mini": 0}
+        return {"qwen3:8b": 0}
 
     monkeypatch.setattr(repl, "_pull_models_with_progress", pull)
 
     repl._handle_models("models pull", console, approval_func=lambda _request: True)
 
     rendered = output.getvalue()
-    assert calls[0][1] == ["phi3:mini"]
-    assert "phi3:mini: installed" in rendered
+    assert calls[0][1] == ["qwen3:8b"]
+    assert "qwen3:8b: installed" in rendered
     assert "Local Runtime" in rendered
 
 

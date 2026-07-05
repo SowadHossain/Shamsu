@@ -19,6 +19,9 @@ retrieves relevant files first, then builds a compact context pack.
 Working now:
 
 - CLI REPL through `shamsu`
+- General local chat for non-project prompts
+- Automatic permission-gated web lookup for external/current questions
+- Automatic browser inspection for local app preview/debug prompts
 - Workspace-scoped indexing into `.shamsu/index.db`
 - SQLite FTS5 snippet search
 - Python symbol extraction with `ast`
@@ -64,8 +67,9 @@ The recommended install uses a repo-local virtual environment:
 - Creates `.venv/` inside this repository
 - Installs SHAMSU into that `.venv`
 - Installs a user-local `shamsu` launcher
+- Adds the launcher directory to your user PATH on Windows, unless skipped
 - Does not install packages into global Python
-- Does not edit PATH, shell profiles, registry, or system files
+- Does not edit shell profiles, registry, or system files
 
 This is dependency isolation plus SHAMSU's workspace sandbox. It is not a full
 Docker or OS-level sandbox.
@@ -104,24 +108,44 @@ Installer flags:
 -Yes / --yes                         approve runtime bootstrap prompts
 -SkipOllamaInstall / --skip-ollama-install
 -SkipModels / --skip-models
+-PrefetchModels / --prefetch-models   download all required models now instead of on first use
 -SkipCommandInstall / --skip-command-install
+-SkipPathUpdate
 -BinDir <path> / --bin-dir <path>
 -ModelsPath <path> / --models-path <path>
 ```
 
+By default, install does **not** download any model weights. The CLI starts up
+immediately, and each model downloads itself (with a progress bar) the first
+time a task actually needs it. Pass `-PrefetchModels`/`--prefetch-models` if
+you want every required model pulled upfront instead — for example, to
+guarantee the machine works fully offline before you disconnect it.
+
 The installer may download Ollama and model weights when approved. SHAMSU itself
-does not edit your PowerShell profile, PATH, registry, shell startup files, or
-global Python. If Ollama's official installer makes normal app/service entries,
-that is Ollama's installer behavior, not extra SHAMSU configuration.
+does not edit your PowerShell profile, registry, shell startup files, or global
+Python. On Windows, it can add only the SHAMSU launcher directory to your user
+PATH and records that in `$HOME\.shamsu\path.json`. If Ollama's official
+installer makes normal app/service entries, that is Ollama's installer behavior,
+not extra SHAMSU configuration.
 
 The installer also writes user-local launcher files:
 
 - Windows default: `$HOME\.shamsu\bin\shamsu.ps1` and `shamsu.cmd`
 - Linux/macOS default: `$HOME/.local/bin/shamsu`
 
-It does not edit PATH, shell profiles, registry, global Python, or system
-Python. If the bin directory is not already on PATH, the installer prints the
-exact direct command and the directory you can add manually.
+Windows install prepends `$HOME\.shamsu\bin` to your user PATH so `shamsu`
+wins over any stale global Python script. Uninstall removes that PATH entry only
+when the SHAMSU manifest says SHAMSU added it. If the directory was already on
+PATH before install, uninstall leaves it alone. Bash install still prints the
+exact direct command and PATH note instead of editing shell startup files.
+
+The Windows installer broadcasts an environment refresh after updating user
+PATH, but already-open terminal tabs can still have stale PATH values. If a
+current terminal does not recognize `shamsu`, open a new terminal or run:
+
+```cmd
+set "PATH=%USERPROFILE%\.shamsu\bin;%PATH%"
+```
 
 ## Run SHAMSU Safely
 
@@ -211,6 +235,13 @@ generate-django <file.md|file.txt|file.pdf>
 models status
 models pull
 models repair
+/web search <query>
+/web open <url>
+/browse open <url>
+/browse read
+/browse click <selector>
+/browse type <selector> <text>
+/browse screenshot
 sessions list
 sessions current
 sessions show <id>
@@ -221,6 +252,51 @@ sessions export <id>
 log tail
 help
 exit
+```
+
+Natural chat also works when you are not asking about the current workspace:
+
+```text
+shamsu> what is recursion?
+shamsu> write a short status update for my team
+shamsu> brainstorm names for a budgeting app
+```
+
+Natural prompts can also use the stateful ReAct agent loop. SHAMSU keeps
+ordered chat/tool state, exposes safe local tools to Ollama, and only reports
+file writes or command results after a tool confirms them:
+
+```text
+shamsu> create hello.py with a small hello world script
+shamsu> run the tests
+shamsu> what did you just create?
+```
+
+SHAMSU answers basic workspace questions with local tools before calling a
+model:
+
+```text
+shamsu> what folder are you in?
+shamsu> what files do I have here?
+shamsu> what PRD files are in this repo?
+```
+
+Attach files or folders to a prompt with `@`:
+
+```text
+shamsu> summarize @README.md
+shamsu> explain how @shamsu/cli/repl.py handles sessions
+shamsu> update the docs using @"agent context/PROGRESS.md"
+```
+
+`@` paths are validated against the active workspace sandbox. SHAMSU will not
+read files outside that workspace.
+
+SHAMSU can also decide on its own when to ask for web or browser access:
+
+```text
+shamsu> look up the latest Django auth docs
+shamsu> check the app and verify the dashboard
 ```
 
 ### `index`
@@ -331,14 +407,19 @@ a Markdown summary.
 
 ### Natural-Language Request
 
-Any other text builds a routed QA context preview:
+Any other text routes into the local assistant:
 
 ```text
 shamsu> how does project spec work?
 ```
 
-If an index exists, SHAMSU uses real indexed search to assemble the preview. If
-Ollama is unavailable, the routing step falls back to safe QA mode.
+If an index exists, SHAMSU uses real indexed search for project-aware answers.
+If no index exists, SHAMSU still handles general local chat through the
+stateful local agent loop and only asks for `index` when the prompt is clearly
+workspace-specific.
+
+Slash commands are always routed locally. Unknown slash commands such as
+`/inde` are rejected locally with suggestions and are never sent to the LLM.
 
 ### `models status|pull|repair`
 
@@ -351,7 +432,44 @@ shamsu> models repair
 ```
 
 `models repair` starts local Ollama when possible and pulls missing required
-models. It does not install Ollama; use the installer for first-time bootstrap.
+models. If a workflow hits a local-runtime failure, SHAMSU can kick off this
+guided repair flow from inside the chat instead of only surfacing the raw
+error.
+
+### `/web ...` and automatic web lookup
+
+SHAMSU stays local-first, but if a prompt clearly needs external or current
+information it can ask permission to search the web automatically.
+
+For underspecified current-information prompts, SHAMSU asks for missing details
+first. For example, weather requests need a location before web lookup.
+
+Optional explicit commands:
+
+```text
+shamsu> what is the weather in Dhaka today?
+shamsu> /web search latest Django auth docs
+shamsu> /web open https://docs.djangoproject.com/
+```
+
+Web lookups require approval and are logged as redacted session events.
+
+### `/browse ...` and browser debugging
+
+SHAMSU can use a local Playwright browser session for preview and debugging
+flows, especially when a prompt is about checking a running app or rendered UI.
+
+Optional explicit commands:
+
+```text
+shamsu> /browse open http://127.0.0.1:8000
+shamsu> /browse read
+shamsu> /browse click text=Login
+shamsu> /browse screenshot
+```
+
+Browser actions require approval before opening the session and before
+state-changing actions like click/type.
 
 ## Smoke Test
 
@@ -404,7 +522,9 @@ Dependency isolation:
 
 - Install scripts use only `.venv/`.
 - No global `pip install`.
-- No PATH or shell profile edits.
+- No shell profile edits.
+- Windows user PATH changes are limited to the SHAMSU launcher directory and
+  tracked in `$HOME\.shamsu\path.json` for safe uninstall.
 
 Workspace sandbox:
 
@@ -417,10 +537,13 @@ Workspace sandbox:
 Local AI runtime:
 
 - SHAMSU only allows LLM calls to `localhost`, `127.0.0.1`, or `::1`.
+- Natural agent chat uses Ollama's local Python SDK and native tool-calling
+  API.
 - Runtime status is stored in repo-local `.shamsu/runtime.json`.
 - Required model checks use Ollama's local CLI and local HTTP API.
 - Setup-time downloads require installer approval or `-Yes`/`--yes`.
 - Runtime inference does not call cloud AI endpoints.
+- The default router/chat/planner model is `qwen3:8b`; `gemma3:4b` remains the low-resource fallback option.
 
 Internal command execution:
 
@@ -431,6 +554,18 @@ Internal command execution:
 - Captured command output is redacted before it is returned.
 - This runner is available internally for future workflows such as tests and
   patch validation. It is not exposed as a general REPL command yet.
+
+Stateful agent loop:
+
+- `ChatState` appends `system`, `user`, `assistant`, and `tool` messages in
+  order and stores them in the active workspace session log.
+- The ReAct loop exposes `list_files`, `read_file`, `write_file`,
+  `run_command`, and `search_index` to Ollama.
+- File writes and commands still go through workspace sandboxing and approval
+  gates.
+- If a small model returns a markdown code block instead of a native tool call,
+  SHAMSU can save it through the same approved `write_file` path when the
+  target file is unambiguous.
 
 Internal patch review:
 
@@ -445,7 +580,8 @@ Session logging:
 
 - Session logs are local JSONL files under the active workspace.
 - Prompts, routing decisions, context packs, LLM calls, approvals, patches,
-  commands, PRD planning, and Django generation events are logged.
+  commands, web lookups, browser actions, PRD planning, and Django generation
+  events are logged.
 - Log payloads are redacted and large strings are truncated by default.
 - Exports are meant to be shareable debugging bundles, not raw source dumps.
 
@@ -483,9 +619,34 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 
 This does not permanently change your execution policy.
 
-### Reinstall Dependencies
+### Something Feels Broken
 
-Remove the local venv and reinstall.
+Editing `shamsu` source code never requires a reinstall — install uses an
+editable Python install, so code changes take effect the next time you run
+`shamsu`. Before reinstalling anything, run the read-only diagnostic first:
+
+Windows:
+
+```powershell
+.\scripts\doctor.ps1
+```
+
+Bash:
+
+```bash
+bash scripts/doctor.sh
+```
+
+`doctor` checks the editable install, Ollama status, PATH setup, and for
+stray nested `.shamsu` workspace folders (a common cause of "wrong index" or
+"it forgot everything" symptoms when `shamsu` was run from different
+directories inside the same project). It only reports; it never changes
+anything.
+
+### Reinstall Dependencies (last resort)
+
+Only do this if `doctor` reports the virtual environment itself is
+corrupted. This re-downloads dependencies and is slower than a normal run.
 
 Windows:
 
@@ -500,6 +661,26 @@ Bash:
 rm -rf .venv
 bash scripts/install.sh
 ```
+
+### Uninstall SHAMSU
+
+Remove SHAMSU-managed files from this repo install.
+
+Windows:
+
+```powershell
+.\scripts\uninstall.ps1
+```
+
+Bash:
+
+```bash
+bash scripts/uninstall.sh
+```
+
+This removes the repo `.venv`, the repo `.shamsu` runtime/config state, and
+the user-local SHAMSU launcher. It does not remove Ollama or `.shamsu` folders
+inside your other project workspaces.
 
 ### Rebuild The Index
 

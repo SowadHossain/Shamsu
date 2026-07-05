@@ -32,6 +32,14 @@ def test_resolve_workspace_uses_explicit_path(tmp_path):
     assert resolve_workspace(str(workspace)) == workspace.resolve()
 
 
+def test_resolve_workspace_does_not_auto_redirect_to_ancestor_workspace(tmp_path):
+    (tmp_path / ".shamsu").mkdir()
+    child = tmp_path / "scripts"
+    child.mkdir()
+
+    assert resolve_workspace(str(child)) == child.resolve()
+
+
 def test_parse_prd_path_accepts_file_inside_workspace(tmp_path):
     prd = tmp_path / "PROJECT.md"
     prd.write_text("# Project\n\n## Entities\n- Task: title (text)\n", encoding="utf-8")

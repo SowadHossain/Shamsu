@@ -5,6 +5,7 @@ PYTHON_BIN="${PYTHON:-python3}"
 YES=0
 SKIP_OLLAMA_INSTALL=0
 SKIP_MODELS=0
+PREFETCH_MODELS=0
 SKIP_COMMAND_INSTALL=0
 BIN_DIR="${HOME}/.local/bin"
 MODELS_PATH=""
@@ -22,6 +23,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-models)
       SKIP_MODELS=1
+      shift
+      ;;
+    --prefetch-models)
+      PREFETCH_MODELS=1
       shift
       ;;
     --skip-command-install)
@@ -76,6 +81,18 @@ fi
 "${VENV_PYTHON}" -m pip install --upgrade pip
 "${VENV_PYTHON}" -m pip install -e ".[dev]"
 
+PLAYWRIGHT_MARKER="${VENV_DIR}/.shamsu-playwright-chromium-ok"
+if [[ -f "${PLAYWRIGHT_MARKER}" ]]; then
+  echo "Playwright Chromium already installed (skipping browser download check)."
+else
+  if "${VENV_PYTHON}" -m playwright install chromium; then
+    touch "${PLAYWRIGHT_MARKER}"
+  else
+    echo "Warning: Playwright Chromium install failed or was skipped." >&2
+    echo "Warning: Browser-based debugging (/browse commands) may not work until this succeeds. Rerun this script to retry." >&2
+  fi
+fi
+
 if [[ -n "${MODELS_PATH}" ]]; then
   export OLLAMA_MODELS="${MODELS_PATH}"
   echo "Using Ollama model directory for this install run: ${MODELS_PATH}"
@@ -95,20 +112,27 @@ elif [[ "${SKIP_OLLAMA_INSTALL}" -eq 0 ]]; then
     echo "Installing Ollama through the official platform flow."
     echo "SHAMSU will not edit PATH or shell startup files."
     if [[ "$(uname -s)" == "Linux" ]]; then
-      curl -fsSL https://ollama.com/install.sh | sh
+      if ! curl -fsSL https://ollama.com/install.sh | sh; then
+        echo "Warning: Ollama install script failed. Install manually from https://ollama.com/download, then run 'models repair'." >&2
+      fi
     elif command -v brew >/dev/null 2>&1; then
-      brew install ollama
+      if ! brew install ollama; then
+        echo "Warning: 'brew install ollama' failed. Install manually from https://ollama.com/download, then run 'models repair'." >&2
+      fi
     else
       echo "Install Ollama from https://ollama.com/download, then rerun this script." >&2
     fi
   fi
 fi
 
-if [[ "${SKIP_MODELS}" -eq 0 ]] && ! "${VENV_PYTHON}" -m shamsu.runtime.ollama status --json | grep -q '"ollama_path": "";'; then
-  echo "Checking and pulling missing local models. This can take a long time for first install."
+if [[ "${PREFETCH_MODELS}" -eq 1 && "${SKIP_MODELS}" -eq 0 ]] && ! "${VENV_PYTHON}" -m shamsu.runtime.ollama status --json | grep -q '"ollama_path": "";'; then
+  echo "Checking and pulling all required local models now. This can take a long time."
   "${VENV_PYTHON}" -m shamsu.runtime.ollama repair
 elif "${VENV_PYTHON}" -m shamsu.runtime.ollama status --json | grep -q '"ollama_path": "";'; then
   echo "Ollama is still missing. SHAMSU installed, but local inference needs 'models repair' after Ollama is installed." >&2
+else
+  echo "Skipping upfront model downloads. SHAMSU pulls each model automatically the first time it's actually needed."
+  echo "Pass --prefetch-models to this script to download all required models now instead."
 fi
 
 "${VENV_PYTHON}" -m shamsu.runtime.ollama write-config
@@ -137,6 +161,16 @@ EOF
       echo "  ${BIN_DIR}"
       ;;
   esac
+  if [[ "${LAUNCHER_ON_PATH}" -eq 1 ]] && command -v shamsu >/dev/null 2>&1; then
+    RESOLVED_SHAMSU="$(command -v shamsu)"
+    if [[ "${RESOLVED_SHAMSU}" != "${LAUNCHER}" ]]; then
+      echo
+      echo "Warning: plain 'shamsu' currently resolves to a different command:"
+      echo "  ${RESOLVED_SHAMSU}"
+      echo "Run this launcher directly, or move ${BIN_DIR} earlier in PATH:"
+      echo "  ${LAUNCHER}"
+    fi
+  fi
 fi
 
 echo

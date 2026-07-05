@@ -14,11 +14,33 @@ against ISearchAgent.
 """
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 
+from rank_bm25 import BM25Okapi
+
 from shamsu.interfaces import ISearchAgent
 from shamsu.types import SearchResult
+
+# How many of the most-recently-touched snippets the lazy BM25 layer covers.
+RECENT_SNIPPET_LIMIT = 500
+
+# search() over-fetches from FTS5 before boosting/re-ranking, since a boost
+# can promote a result that plain FTS ranked outside the first top_k.
+OVER_FETCH_MULTIPLIER = 4
+MAX_OVER_FETCH = 40
+
+# Boosts are additive on top of FTS5's bm25 score (already flipped so higher
+# is better) — small, conservative nudges, not a replacement ranker.
+PATH_MATCH_BOOST = 0.3
+SYMBOL_MATCH_BOOST = 0.5
+RECENCY_BOOST = 0.2
+ERROR_TRACE_BOOST = 1.0
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"\w+", text.lower())
 
 
 class SearchAgent(ISearchAgent):
@@ -29,7 +51,8 @@ class SearchAgent(ISearchAgent):
         self.conn = sqlite3.connect(str(db_path))
         self.conn.row_factory = sqlite3.Row
         self._bm25_index = None          # lazy — built on first .search() call
-        self._bm25_corpus_ids: list[int] = []
+        self._bm25_built = False
+        self._bm25_keys: list[tuple[str, int, int]] = []
 
     @staticmethod
     def _build_fts_query(query: str) -> str:
@@ -109,13 +132,96 @@ class SearchAgent(ISearchAgent):
             for row in rows
         ]
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        boost_paths: list[str] | None = None,
+    ) -> list[SearchResult]:
         """
-        Default entry point. FTS5 first (cheap, always available).
-        BM25 in-memory layer is built lazily and only used as a
-        supplement once the corpus exists — see harness §3.
+        Default entry point. FTS5 first (cheap, always available, gives
+        broad recall across the whole corpus), then re-ranked with small
+        additive boosts: symbol-name match, file-path match, recency (via
+        the lazy in-memory BM25 layer over recently-touched snippets), and
+        optionally exact traceback/error-location matches via boost_paths
+        (e.g. from BugFixWorkflow). Boosts never replace FTS5 — they only
+        reorder results FTS5 already considered relevant.
         """
-        return self.fts_search(query, top_k=top_k)
+        over_fetch = min(max(top_k * OVER_FETCH_MULTIPLIER, top_k), MAX_OVER_FETCH)
+        results = self.fts_search(query, top_k=over_fetch)
+        if not results:
+            return results
+
+        query_terms = {term for term in _tokenize(query) if term}
+        boost_path_terms = [p.lower().replace("\\", "/") for p in (boost_paths or []) if p]
+        symbol_paths = self._files_with_matching_symbol(query_terms)
+        bm25_scores = self._recent_snippet_bm25_scores(query)
+
+        boosted: list[SearchResult] = []
+        for result in results:
+            score = result.score
+            path_lower = result.file_path.lower()
+            if any(term in path_lower for term in query_terms):
+                score += PATH_MATCH_BOOST
+            if result.file_path in symbol_paths:
+                score += SYMBOL_MATCH_BOOST
+            if any(path_lower.endswith(term) or term.endswith(path_lower) for term in boost_path_terms):
+                score += ERROR_TRACE_BOOST
+            key = (result.file_path, result.line_start, result.line_end)
+            if key in bm25_scores:
+                score += RECENCY_BOOST
+            boosted.append(
+                SearchResult(
+                    file_path=result.file_path, language=result.language,
+                    line_start=result.line_start, line_end=result.line_end,
+                    content=result.content, score=score,
+                    symbol_name=result.symbol_name, chunk_type=result.chunk_type,
+                )
+            )
+        boosted.sort(key=lambda r: r.score, reverse=True)
+        return boosted[:top_k]
+
+    def _files_with_matching_symbol(self, terms: set[str]) -> set[str]:
+        if not terms:
+            return set()
+        placeholders = " OR ".join(["sym.name LIKE ?"] * len(terms))
+        params = [f"%{term}%" for term in terms]
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT f.path
+            FROM symbols sym
+            JOIN files f ON f.id = sym.file_id
+            WHERE {placeholders}
+            """,
+            params,
+        ).fetchall()
+        return {row["path"] for row in rows}
+
+    def _ensure_bm25_index(self) -> None:
+        if self._bm25_built:
+            return
+        self._bm25_built = True
+        rows = self.conn.execute(
+            """
+            SELECT f.path, s.line_start, s.line_end, s.content
+            FROM snippets s
+            JOIN files f ON f.id = s.file_id
+            ORDER BY f.last_modified DESC
+            LIMIT ?
+            """,
+            (RECENT_SNIPPET_LIMIT,),
+        ).fetchall()
+        if not rows:
+            return
+        self._bm25_keys = [(row["path"], row["line_start"], row["line_end"]) for row in rows]
+        self._bm25_index = BM25Okapi([_tokenize(row["content"]) for row in rows])
+
+    def _recent_snippet_bm25_scores(self, query: str) -> dict[tuple[str, int, int], float]:
+        self._ensure_bm25_index()
+        if self._bm25_index is None:
+            return {}
+        scores = self._bm25_index.get_scores(_tokenize(query))
+        return {key: score for key, score in zip(self._bm25_keys, scores) if score > 0}
 
 
 class SearchAgentStub(ISearchAgent):
@@ -129,7 +235,12 @@ class SearchAgentStub(ISearchAgent):
     needed if you only ever called methods on ISearchAgent.
     """
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        boost_paths: list[str] | None = None,
+    ) -> list[SearchResult]:
         return [
             SearchResult(
                 file_path="stub/example.py",

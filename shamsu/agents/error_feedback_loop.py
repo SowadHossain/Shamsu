@@ -11,6 +11,11 @@ from shamsu.session.manager import SessionLogger
 from shamsu.tools.django import DjangoTestRunner
 from shamsu.types import TestRunResult
 
+# Circuit-breaker ceiling used only in long-running mode — a backstop, not
+# the normal stop condition (stall detection is what actually catches a fix
+# attempt that isn't working; this just bounds worst-case iteration count).
+LONG_RUNNING_MAX_ITERATIONS = 15
+
 
 class DjangoTestRunnerLike(Protocol):
     def run(self, project_cwd: Path | str = ".") -> TestRunResult: ...
@@ -48,6 +53,7 @@ class ErrorFeedbackLoop:
         bugfix_workflow: BugFixWorkflowLike | None = None,
         session_logger: SessionLogger | None = None,
         max_iterations: int = 3,
+        long_running: bool = False,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.search = search
@@ -62,7 +68,8 @@ class ErrorFeedbackLoop:
             patch_engine=patch_engine,
         )
         self.session_logger = session_logger
-        self.max_iterations = max_iterations
+        self.long_running = long_running
+        self.max_iterations = LONG_RUNNING_MAX_ITERATIONS if long_running else max_iterations
 
     async def run(self, project_cwd: Path | str = ".") -> ErrorFeedbackResult:
         iterations: list[FeedbackIteration] = []
@@ -71,6 +78,7 @@ class ErrorFeedbackLoop:
             self._log("workflow.finished", final_result, "Django tests passed before fixes")
             return ErrorFeedbackResult(success=True, iterations=[], final_result=final_result)
 
+        previous_failed = final_result.failed
         for index in range(1, self.max_iterations + 1):
             bug_report = _bug_report_from_tests(final_result, index)
             fix = await self.bugfix_workflow.run(bug_report)
@@ -99,6 +107,21 @@ class ErrorFeedbackLoop:
                     iterations=iterations,
                     final_result=final_result,
                 )
+            if self.long_running and final_result.failed >= previous_failed:
+                self._log(
+                    "workflow.failed", final_result,
+                    "Django tests stalled (no improvement) after fixes",
+                )
+                return ErrorFeedbackResult(
+                    success=False,
+                    iterations=iterations,
+                    final_result=final_result,
+                    error=(
+                        f"Stalled after iteration {index}: {final_result.failed} test(s) still "
+                        f"failing with no improvement over the previous attempt."
+                    ),
+                )
+            previous_failed = final_result.failed
 
         self._log("workflow.failed", final_result, "Django tests still failing after retries")
         return ErrorFeedbackResult(

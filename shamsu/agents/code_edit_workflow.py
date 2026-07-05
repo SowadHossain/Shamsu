@@ -8,9 +8,10 @@ from pathlib import Path
 
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
+from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
-from shamsu.types import ContextPack
+from shamsu.types import ContextPack, SearchResult
 
 CODE_EDIT_INSTRUCTIONS = """You are SHAMSU's code editor.
 Output ONLY a unified diff.
@@ -46,8 +47,12 @@ class CodeEditWorkflow:
         self.context_builder = context_builder or ContextBuilder()
 
     async def run(self, request: str) -> CodeEditResult:
-        pack = self._build_pack(request)
-        response = await self.llm.run_specialist("coder", pack)
+        pack, target_paths = self._build_pack(request)
+        if should_convene_council(target_paths=target_paths):
+            council_result = await run_council(self.llm, pack, specialist="coder")
+            response = council_result.final
+        else:
+            response = await self.llm.run_specialist("coder", pack)
         diff_text = _clean_diff(response.raw)
         ok, error = self.patch_engine.validate_diff(diff_text)
         if not ok:
@@ -76,15 +81,16 @@ class CodeEditWorkflow:
             applied=True,
         )
 
-    def _build_pack(self, request: str) -> ContextPack:
+    def _build_pack(self, request: str) -> tuple[ContextPack, list[str]]:
         results = self.search.search(request, top_k=8)
-        return self.context_builder.pack(
+        pack = self.context_builder.pack(
             results=results,
             request=f"{CODE_EDIT_INSTRUCTIONS}\n\nUser request: {request}",
             task_id="code-edit",
             step_id=1,
             specialist="coder",
         )
+        return pack, _target_paths(results)
 
 
 def _clean_diff(raw: str) -> str:
@@ -101,3 +107,11 @@ def _clean_diff(raw: str) -> str:
 
 def _changed_files(diff_text: str) -> list[str]:
     return [patch.display_path for patch in parse_unified_diff(diff_text)]
+
+
+def _target_paths(results: list[SearchResult]) -> list[str]:
+    paths: list[str] = []
+    for result in results:
+        if result.file_path not in paths:
+            paths.append(result.file_path)
+    return paths

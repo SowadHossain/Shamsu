@@ -16,6 +16,7 @@ from shamsu.prd.state import (
     state_path,
 )
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 from shamsu.templates.django.checker import BackendConsistencyChecker, ConsistencyDiagnostic
@@ -33,11 +34,13 @@ class DjangoProjectWriter:
         workspace_root: Path,
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         session_logger: SessionLogger | None = None,
+        approval_manager: ApprovalManager | None = None,
     ):
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
         self.session_logger = session_logger
+        self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
 
     def write_project(
         self,
@@ -58,9 +61,7 @@ class DjangoProjectWriter:
             working_dir=str(root),
             reason="Generate deterministic Django backend files from an approved PRD plan.",
         )
-        self._log_approval_request(request)
-        approved = self.approval_func(request)
-        self._log_approval_result(request, approved)
+        approved = self.approval_manager.ask(request)
         if not approved:
             raise PermissionError("Django project generation was not approved.")
 
@@ -133,9 +134,7 @@ class DjangoProjectWriter:
                 working_dir=str(root),
                 reason="The target file already exists.",
             )
-            self._log_approval_request(request)
-            approved = self.approval_func(request)
-            self._log_approval_result(request, approved)
+            approved = self.approval_manager.ask(request)
             if not approved:
                 raise PermissionError(f"Overwrite denied: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -144,13 +143,3 @@ class DjangoProjectWriter:
     def _log(self, event_type: str, payload: dict, summary: str) -> None:
         if self.session_logger:
             self.session_logger.log(event_type, payload, summary, workflow_id="generate-django")
-
-    def _log_approval_request(self, request: ApprovalRequest) -> None:
-        self._log("approval.request", {"request": request}, request.description)
-
-    def _log_approval_result(self, request: ApprovalRequest, approved: bool) -> None:
-        self._log(
-            "approval.result",
-            {"action_type": request.action_type, "approved": approved},
-            f"Approval {'granted' if approved else 'denied'}: {request.description}",
-        )

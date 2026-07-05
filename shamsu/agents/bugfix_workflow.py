@@ -9,6 +9,7 @@ from pathlib import Path
 
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
+from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.types import ContextPack, SearchResult
@@ -61,7 +62,12 @@ class BugFixWorkflow:
     async def run(self, report: str) -> BugFixResult:
         locations = parse_traceback_locations(report)
         pack = self._build_pack(report, locations)
-        response = await self.llm.run_specialist("bugfix", pack)
+        target_paths = [location.file_path for location in locations]
+        if should_convene_council(target_paths=target_paths):
+            council_result = await run_council(self.llm, pack, specialist="bugfix")
+            response = council_result.final
+        else:
+            response = await self.llm.run_specialist("bugfix", pack)
         diff_text = _clean_diff(response.raw)
         ok, error = self.patch_engine.validate_diff(diff_text)
         if not ok:
@@ -112,9 +118,10 @@ class BugFixWorkflow:
         report: str,
         locations: list[TracebackLocation],
     ) -> list[SearchResult]:
+        boost_paths = [location.file_path for location in locations]
         results: list[SearchResult] = []
         for query in _bug_queries(report, locations):
-            results.extend(self.search.search(query, top_k=5))
+            results.extend(self.search.search(query, top_k=5, boost_paths=boost_paths))
         return results[:12]
 
 

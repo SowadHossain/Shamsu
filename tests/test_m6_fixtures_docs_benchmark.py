@@ -15,7 +15,7 @@ FIXTURES = Path("tests/fixtures/prds")
 
 
 class EmptySearch:
-    def search(self, query: str, top_k: int = 5):
+    def search(self, query: str, top_k: int = 5, boost_paths=None):
         return []
 
     def symbol_lookup(self, name: str):

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Workspace = (Get-Location).Path,
     [Parameter(ValueFromPipeline = $true)]
@@ -29,7 +29,6 @@ end {
     }
 
     $ResolvedWorkspace = Resolve-Path $Workspace
-    & $VenvPython -m shamsu.runtime.ollama status
 
     if ($PipedInput.Count -gt 0) {
         $PipedInput -join [Environment]::NewLine | & $VenvPython -m shamsu.cli.repl --workspace $ResolvedWorkspace @ShamsuArgs

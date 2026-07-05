@@ -306,6 +306,33 @@ def test_apply_reindexes_modified_python_file(tmp_path):
     assert search.search("new_name")
 
 
+def test_apply_logs_index_updated_event_when_session_logger_provided(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("def old_name():\n    return 1\n", encoding="utf-8")
+    FileWalker(tmp_path).index()
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1,2 +1,2 @@
+-def old_name():
++def new_name():
+     return 1
+"""
+
+    class RecordingLogger:
+        def __init__(self):
+            self.events = []
+
+        def log(self, event_type, payload, summary, workflow_id=None):
+            self.events.append(event_type)
+
+    logger = RecordingLogger()
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True, session_logger=logger)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert "index.updated" in logger.events
+    assert "patch.applied" in logger.events
+
+
 def test_apply_indexes_created_python_file(tmp_path):
     FileWalker(tmp_path).index()
     diff = """--- /dev/null

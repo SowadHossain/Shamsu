@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import sqlite3
 from pathlib import Path
 
 from shamsu.indexer.parser import build_line_windows, parse_python_symbols, read_text_file
+from shamsu.session.manager import SessionLogger
 from shamsu.storage.schema import init_db
 from shamsu.types import IndexEntry
 
@@ -106,9 +108,15 @@ def sha256_file(path: Path) -> str:
 
 
 class FileWalker:
-    def __init__(self, workspace_root: Path, db_path: Path | None = None):
+    def __init__(
+        self,
+        workspace_root: Path,
+        db_path: Path | None = None,
+        session_logger: SessionLogger | None = None,
+    ):
         self.workspace_root = workspace_root.resolve()
         self.db_path = db_path or self.workspace_root / ".shamsu" / "index.db"
+        self.session_logger = session_logger
 
     def discover(self) -> list[Path]:
         files: list[Path] = []
@@ -119,9 +127,19 @@ class FileWalker:
                 files.append(path)
         return sorted(files, key=lambda p: p.relative_to(self.workspace_root).as_posix())
 
-    def index(self) -> list[IndexEntry]:
+    def index(self, full: bool = False) -> list[IndexEntry]:
+        """Index the workspace.
+
+        Only rehashes and rebuilds symbols/snippets for files whose size or
+        mtime changed since the last index (and only rebuilds symbols/snippets
+        if the hash actually changed) — a plain `touch` or unrelated file
+        doesn't pay the parse/rebuild cost. Pass full=True to force a
+        complete rebuild of every file regardless of stored state.
+        """
         conn = init_db(self.db_path)
         entries: list[IndexEntry] = []
+        files_changed = 0
+        files_skipped = 0
         try:
             discovered = self.discover()
             seen_paths = {
@@ -129,11 +147,34 @@ class FileWalker:
                 for path in discovered
             }
             self._remove_stale_files(conn, seen_paths)
+            previous_stats = {} if full else self._existing_file_stats(conn)
+
             for path in discovered:
                 stat = path.stat()
                 relative_path = path.relative_to(self.workspace_root).as_posix()
-                file_hash = sha256_file(path)
                 language = detect_language(path)
+                previous = previous_stats.get(relative_path)
+
+                if (
+                    previous is not None
+                    and previous["size"] == stat.st_size
+                    and previous["last_modified"] == stat.st_mtime
+                ):
+                    files_skipped += 1
+                    entries.append(
+                        IndexEntry(
+                            file_id=previous["id"],
+                            path=relative_path,
+                            language=previous["language"],
+                            hash=previous["hash"],
+                            symbol_count=previous["symbol_count"],
+                            last_modified=stat.st_mtime,
+                        )
+                    )
+                    continue
+
+                file_hash = sha256_file(path)
+                rebuild_needed = full or previous is None or previous["hash"] != file_hash
                 conn.execute(
                     """
                     INSERT INTO files (path, language, size, hash, last_modified)
@@ -150,7 +191,11 @@ class FileWalker:
                     "SELECT id FROM files WHERE path = ?",
                     (relative_path,),
                 ).fetchone()[0]
-                self._replace_file_index(conn, file_id, path, language)
+                if rebuild_needed:
+                    self._replace_file_index(conn, file_id, path, language)
+                    files_changed += 1
+                else:
+                    files_skipped += 1
                 symbol_count = conn.execute(
                     "SELECT COUNT(*) FROM symbols WHERE file_id = ?",
                     (file_id,),
@@ -168,7 +213,41 @@ class FileWalker:
             conn.commit()
         finally:
             conn.close()
+        if self.session_logger:
+            self.session_logger.log(
+                "index.updated",
+                {
+                    "files_scanned": len(entries),
+                    "files_changed": files_changed,
+                    "files_skipped": files_skipped,
+                },
+                f"Indexed {len(entries)} file(s): {files_changed} changed, {files_skipped} unchanged",
+                workflow_id="index",
+            )
         return entries
+
+    @staticmethod
+    def _existing_file_stats(conn) -> dict[str, dict]:
+        rows = conn.execute(
+            """
+            SELECT f.id, f.path, f.language, f.size, f.hash, f.last_modified,
+                   COUNT(s.id) AS symbol_count
+            FROM files f
+            LEFT JOIN symbols s ON s.file_id = f.id
+            GROUP BY f.id
+            """
+        ).fetchall()
+        return {
+            row[1]: {
+                "id": row[0],
+                "language": row[2],
+                "size": row[3],
+                "hash": row[4],
+                "last_modified": row[5],
+                "symbol_count": row[6],
+            }
+            for row in rows
+        }
 
     @staticmethod
     def _remove_stale_files(conn, seen_paths: set[str]) -> None:
@@ -224,6 +303,21 @@ class FileWalker:
                     symbol.docstring,
                 ),
             )
+
+
+def ensure_index(workspace_root: Path, session_logger: SessionLogger | None = None) -> None:
+    """Index the workspace transparently and best-effort.
+
+    Cheap after the first run (FileWalker.index() only rehashes/rebuilds
+    files that actually changed), so callers can call this unconditionally
+    before search/QA/context-building instead of requiring a manual `/index`
+    step. If indexing fails (e.g. a read-only workspace), this silently
+    no-ops; callers fall back to checking whether an index actually exists.
+    """
+    try:
+        FileWalker(workspace_root, session_logger=session_logger).index()
+    except (OSError, sqlite3.Error):
+        pass
 
 
 if __name__ == "__main__":

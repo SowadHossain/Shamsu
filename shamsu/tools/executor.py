@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import re
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
@@ -28,10 +30,12 @@ class CommandRunner(ICommandRunner):
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         timeout_seconds: int = 120,
         session_logger: SessionLogger | None = None,
+        approval_manager: ApprovalManager | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
+        self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.timeout_seconds = timeout_seconds
         self.session_logger = session_logger
 
@@ -75,7 +79,8 @@ class CommandRunner(ICommandRunner):
                 working_dir=str(validated_cwd),
                 reason="Command is medium risk or unknown.",
             )
-            if not self.approval_func(request):
+            self.approval_manager.session_logger = self.session_logger
+            if not self.approval_manager.ask(request):
                 if self.session_logger:
                     self.session_logger.log(
                         "command.denied",
@@ -93,6 +98,7 @@ class CommandRunner(ICommandRunner):
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = redact(_as_text(exc.stdout))
