@@ -70,6 +70,7 @@ The recommended install uses a repo-local virtual environment:
 
 - Creates `.venv/` inside this repository
 - Installs SHAMSU into that `.venv`
+- Installs a user-local `shamsu` launcher
 - Does not install packages into global Python
 - Does not edit PATH, shell profiles, registry, or system files
 
@@ -110,6 +111,8 @@ Installer flags:
 -Yes / --yes                         approve runtime bootstrap prompts
 -SkipOllamaInstall / --skip-ollama-install
 -SkipModels / --skip-models
+-SkipCommandInstall / --skip-command-install
+-BinDir <path> / --bin-dir <path>
 -ModelsPath <path> / --models-path <path>
 ```
 
@@ -118,10 +121,43 @@ does not edit your PowerShell profile, PATH, registry, shell startup files, or
 global Python. If Ollama's official installer makes normal app/service entries,
 that is Ollama's installer behavior, not extra SHAMSU configuration.
 
+The installer also writes user-local launcher files:
+
+- Windows default: `$HOME\.shamsu\bin\shamsu.ps1` and `shamsu.cmd`
+- Linux/macOS default: `$HOME/.local/bin/shamsu`
+
+It does not edit PATH, shell profiles, registry, global Python, or system
+Python. If the bin directory is not already on PATH, the installer prints the
+exact direct command and the directory you can add manually.
+
 ## Run SHAMSU Safely
 
 SHAMSU treats the selected workspace as the project boundary. Indexes and
 local state are written under that workspace's `.shamsu/` folder.
+
+### Run From Any Repo With `shamsu`
+
+After installing the user command, go to the project you want SHAMSU to inspect:
+
+```powershell
+cd F:\Work\my-project
+shamsu
+```
+
+That project folder becomes the default workspace sandbox. Workspace state is
+written under:
+
+```text
+F:\Work\my-project\.shamsu\
+```
+
+All arguments are forwarded:
+
+```powershell
+shamsu --new-session "my repo"
+shamsu --session 20260702
+shamsu --workspace .
+```
 
 ### Run From The Current Folder
 

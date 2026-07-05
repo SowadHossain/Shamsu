@@ -12,6 +12,7 @@ from shamsu.runtime.ollama import (
     list_installed_models,
     parse_ollama_list,
     pull_model,
+    pull_model_streaming,
     status_text,
     write_runtime_config,
 )
@@ -47,12 +48,12 @@ def test_find_ollama_executable_uses_known_paths_when_path_lookup_misses(monkeyp
 
 def test_parse_ollama_list_extracts_model_names():
     output = """NAME                                      ID              SIZE      MODIFIED
-phi3:mini-4k-instruct                    abc123          2.2 GB    1 hour ago
+phi3:mini                                abc123          2.2 GB    1 hour ago
 qwen2.5-coder:7b-instruct-q4_K_M         def456          4.7 GB    2 hours ago
 """
 
     assert parse_ollama_list(output) == [
-        "phi3:mini-4k-instruct",
+        "phi3:mini",
         "qwen2.5-coder:7b-instruct-q4_K_M",
     ]
 
@@ -87,6 +88,37 @@ def test_ollama_pull_uses_utf8_replacement_decoding(monkeypatch, tmp_path):
     assert code == 0
     assert stdout == "pulled ✓"
     assert stderr == ""
+    kwargs = calls[0][1]
+    assert kwargs["encoding"] == "utf-8"
+    assert kwargs["errors"] == "replace"
+    assert kwargs["env"]["PYTHONUTF8"] == "1"
+
+
+def test_streaming_pull_reports_progress_chunks(monkeypatch, tmp_path):
+    class FakeStdout:
+        def __init__(self) -> None:
+            self.chunks = iter(["a", "b", ""])
+
+        def read(self, _size: int) -> str:
+            return next(self.chunks)
+
+    class FakeProcess:
+        stdout = FakeStdout()
+
+        def wait(self) -> int:
+            return 0
+
+    calls = []
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeProcess()
+
+    chunks = []
+    monkeypatch.setattr("shamsu.runtime.ollama.subprocess.Popen", fake_popen)
+
+    assert pull_model_streaming(tmp_path / "ollama.exe", "phi3:mini", chunks.append) == 0
+    assert chunks == ["a", "b"]
     kwargs = calls[0][1]
     assert kwargs["encoding"] == "utf-8"
     assert kwargs["errors"] == "replace"

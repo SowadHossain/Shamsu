@@ -130,7 +130,7 @@ End of day: push WIP branch even if incomplete, open draft PR, run pytest + ruff
 - **Demo:** `symbol_lookup('Sandbox')` returns the real class from `safety/sandbox.py` with correct line numbers
 
 **Dev B** — `llm/manager.py` live Ollama test + `agents/qa_workflow.py` real call
-- Get Ollama running locally, pull `phi3:mini-4k-instruct` (small, fast to verify plumbing — swap to Qwen2.5-Coder once this works, per the harness)
+- Get Ollama running locally, pull `phi3:mini` (small, fast to verify plumbing — swap to Qwen2.5-Coder once this works, per the harness)
 - Replace the Day 1 "print the prompt" stub with a real `await llm.run_specialist("qa", pack)` call, stream the response
 - **Demo:** ask a real question against `SearchAgentStub`'s fake data, get a real model-generated answer back, end to end
 

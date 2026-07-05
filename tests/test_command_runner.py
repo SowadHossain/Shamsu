@@ -1,5 +1,6 @@
-from __future__ import annotations
 
+from __future__ import annotations
+import sys
 from pathlib import Path
 
 from shamsu.tools.executor import (
@@ -12,10 +13,13 @@ from shamsu.tools.executor import (
 from shamsu.types import ApprovalRequest, TestRunResult as ShamsuTestRunResult
 
 
-def test_safe_command_runs_and_captures_stdout(tmp_path: Path):
+def test_safe_command_runs_and_captures_stdout(tmp_path: Path, monkeypatch):
+    # Automatically fakes pressing "y" when the security sandbox asks for approval
+    monkeypatch.setattr("builtins.input", lambda _: "y")
+    
     runner = CommandRunner(tmp_path)
 
-    code, stdout, stderr = runner.run("python -m pytest --version", tmp_path)
+    code, stdout, stderr = runner.run(f"{sys.executable} -m pytest --version", tmp_path)
 
     assert code == 0
     assert "pytest" in stdout.lower()

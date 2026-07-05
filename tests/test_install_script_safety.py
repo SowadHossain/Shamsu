@@ -22,6 +22,7 @@ def test_install_scripts_do_not_edit_shell_profiles_or_path():
         ">> ~/.zshrc",
         ">> ~/.profile",
         "pip install -g",
+        "export PATH=",
     ]
 
     for script in scripts:
@@ -37,10 +38,14 @@ def test_install_scripts_expose_safe_runtime_flags():
     assert "$Yes" in ps1
     assert "$SkipOllamaInstall" in ps1
     assert "$SkipModels" in ps1
+    assert "$SkipCommandInstall" in ps1
+    assert "$BinDir" in ps1
     assert "$ModelsPath" in ps1
     assert "--yes" in sh
     assert "--skip-ollama-install" in sh
     assert "--skip-models" in sh
+    assert "--skip-command-install" in sh
+    assert "--bin-dir" in sh
     assert "--models-path" in sh
 
 
@@ -54,3 +59,27 @@ def test_windows_runtime_scripts_force_python_utf8_for_ollama_output():
     assert '$env:PYTHONUTF8 = "1"' in run_ps1
     assert 'export PYTHONUTF8="${PYTHONUTF8:-1}"' in install_sh
     assert 'export PYTHONUTF8="${PYTHONUTF8:-1}"' in run_sh
+
+
+def test_install_scripts_create_thin_launchers_without_profile_edits():
+    ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+    assert "scripts\\run-shamsu.ps1" in ps1
+    assert "shamsu.ps1" in ps1
+    assert "shamsu.cmd" in ps1
+    assert "@ShamsuArgs" in ps1
+    assert "(Get-Location).Path" in ps1
+    assert "-InputObject (`$PipedInput -join [Environment]::NewLine)" in ps1
+    assert "-Workspace `$Workspace @ShamsuArgs" in ps1
+    assert '-Workspace "%CD%" %*' in ps1
+    assert "$LauncherOnPath" in ps1
+    assert "Add $BinDir to PATH if you want plain 'shamsu'" in ps1
+    assert "did not edit your PowerShell profile, PATH, registry, or global Python" in ps1
+
+    assert "scripts/run-shamsu.sh" in sh
+    assert 'exec "${RUN_SCRIPT}" "\\$@"' in sh
+    assert "${HOME}/.local/bin" in sh
+    assert "LAUNCHER_ON_PATH" in sh
+    assert "Add ${BIN_DIR} to PATH if you want plain 'shamsu'" in sh
+    assert "did not edit your shell profile, PATH, global Python, or system registry" in sh

@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -126,6 +127,29 @@ def parse_ollama_list(output: str) -> list[str]:
 def pull_model(ollama_path: Path, model_name: str) -> tuple[int, str, str]:
     completed = _run_ollama_command(ollama_path, "pull", model_name, timeout=3600)
     return completed.returncode, completed.stdout or "", completed.stderr or ""
+
+
+def pull_model_streaming(
+    ollama_path: Path,
+    model_name: str,
+    progress_callback: Callable[[str], None] | None = None,
+) -> int:
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    process = subprocess.Popen(
+        [str(ollama_path), "pull", model_name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    if process.stdout:
+        for chunk in iter(lambda: process.stdout.read(1), ""):
+            if progress_callback and chunk:
+                progress_callback(chunk)
+    return process.wait()
 
 
 def pull_missing_models(ollama_path: Path, missing_models: list[str]) -> dict[str, int]:
