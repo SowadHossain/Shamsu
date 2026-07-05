@@ -525,19 +525,42 @@ def _parse_generate_prd_args(user_input: str) -> tuple[str, str]:
 
 
 def _print_full_pipeline_result(result: FullPipelineResult, console: Console) -> None:
-    table = Table(title="Full Django Pipeline")
+    table = Table(title="Full Project Pipeline")
     table.add_column("Step")
     table.add_column("Status")
     table.add_row("Project", result.project.project_name if result.project else "not built")
+    if result.project:
+        table.add_row("Category", result.project.category or result.project.archetype.value)
     table.add_row("Target", str(result.target_dir))
     table.add_row("Files", str(len(result.written_files or [])))
     table.add_row("Diagnostics", str(len(result.diagnostics or [])))
+    if result.preview_url:
+        table.add_row("Preview", result.preview_url)
     if result.setup_result:
         table.add_row("Setup", "ok" if result.setup_result.ok else "failed")
     if result.test_result:
         table.add_row("Tests", f"{result.test_result.passed} passed, {result.test_result.failed} failed")
+    if result.dod_result:
+        dod_status = "ok" if result.dod_result.ok else (
+            "failed: " + ", ".join(item.item_id for item in result.dod_result.required_failures)
+        )
+        table.add_row("Definition of Done", dod_status)
     table.add_row("Result", "success" if result.success else "failed")
     console.print(table)
+    if result.dod_result:
+        dod_table = Table(title="Definition of Done")
+        dod_table.add_column("Item")
+        dod_table.add_column("Severity")
+        dod_table.add_column("Status")
+        dod_table.add_column("Detail")
+        for item in result.dod_result.results:
+            dod_table.add_row(
+                item.item_id,
+                item.severity,
+                "pass" if item.passed else "fail",
+                item.detail,
+            )
+        console.print(dod_table)
     if result.error:
         console.print(Panel(result.error, title="Pipeline Error", border_style="red"))
 
@@ -794,7 +817,6 @@ def _handle_symbols(
 def _handle_models(
     user_input: str,
     console: Console,
-    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
 ) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "status"
@@ -816,9 +838,12 @@ def _handle_models(
         if not status.missing_models:
             console.print("[green]All required local models are installed.[/green]")
             return
-        if not _approve_model_download(status.missing_models, console, approval_func):
-            console.print("[yellow]Model download cancelled.[/yellow]")
-            return
+        # Typing `/models pull` is itself the consent — download directly rather
+        # than gating on a second y/n prompt (which can auto-cancel on some
+        # Windows terminals where built-in input() sees a non-interactive stdin).
+        console.print(
+            "[cyan]Downloading missing local model(s):[/cyan] " + ", ".join(status.missing_models)
+        )
         results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
         _print_model_pull_results(results, console)
         _print_runtime_status(console)
@@ -833,10 +858,10 @@ def _handle_models(
             wait_until_running()
             status = collect_status(Path(status.ollama_path))
         if status.ollama_found and status.server_running and status.missing_models:
-            if not _approve_model_download(status.missing_models, console, approval_func):
-                console.print("[yellow]Model download cancelled.[/yellow]")
-                _print_runtime_status(console, status=status)
-                return
+            # Explicit `/models repair` is consent — download directly.
+            console.print(
+                "[cyan]Downloading missing local model(s):[/cyan] " + ", ".join(status.missing_models)
+            )
             results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
             _print_model_pull_results(results, console)
             status = collect_status(Path(status.ollama_path))
@@ -906,30 +931,6 @@ def _handle_browse(
         _print_browser_result(browser_tool.screenshot(), console)
         return
     console.print("[red]Usage: browse open|read|click|type|screenshot[/red]")
-
-
-def _approve_model_download(
-    missing_models: list[str],
-    console: Console,
-    approval_func: Callable[[ApprovalRequest], bool],
-) -> bool:
-    prompt_func = (
-        (lambda request: ask_approval(request, console=console))
-        if approval_func is DEFAULT_ASK_APPROVAL
-        else approval_func
-    )
-    return ApprovalManager(prompt_func).ask(
-        ApprovalRequest(
-            action_type="run_command",
-            description=f"Download {len(missing_models)} missing local Ollama model(s).",
-            risk_level="medium",
-            preview="\n".join(f"- {model}" for model in missing_models),
-            reason=(
-                "SHAMSU needs these local models for offline inference. "
-                "Re-running `models pull` resumes partial Ollama downloads."
-            ),
-        )
-    )
 
 
 def _build_pull_progress(console: Console) -> Progress:

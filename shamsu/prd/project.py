@@ -5,6 +5,10 @@ import re
 
 from shamsu.prd.classifier import classify_archetype
 from shamsu.prd.extractor import extract_entities
+from shamsu.registry import load_registry_entry
+from shamsu.registry.categories import CATEGORY_TO_ARCHETYPE
+from shamsu.registry.detector import detect_category
+from shamsu.registry.schema import Category
 from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
 
@@ -16,12 +20,16 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
     pages = _extract_or_infer_pages(parsed, entities)
     theme = _select_theme(parsed.raw_text)
     archetype = classify_archetype(parsed)
+    category_decision = detect_category(parsed.raw_text)
+    category = _resolve_category(category_decision.category, archetype.archetype)
+    selected_archetype = CATEGORY_TO_ARCHETYPE.get(category, archetype.archetype)
 
     generation_order = (
         _fixed_generation_order(project_name, app_name)
-        if archetype.archetype in {Archetype.WEB_CRUD, Archetype.REST_API}
+        if selected_archetype in {Archetype.WEB_CRUD, Archetype.REST_API}
         else _generic_generation_order()
     )
+    master_prompt, manifest_path, dod_path = _registry_metadata(category)
 
     return ProjectSpec(
         project_name=project_name,
@@ -31,10 +39,49 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         pages=pages,
         theme=theme,
         generation_order=generation_order,
-        archetype=archetype.archetype,
-        archetype_confidence=archetype.confidence,
-        archetype_spec={"reason": archetype.reason},
+        archetype=selected_archetype,
+        archetype_confidence=max(archetype.confidence, category_decision.confidence),
+        archetype_spec={
+            "reason": archetype.reason,
+            "category_reason": category_decision.reason,
+            "category_scores": category_decision.scores,
+        },
+        category=category.value,
+        master_prompt=master_prompt,
+        manifest_path=manifest_path,
+        dod_path=dod_path,
+        feature_requests=_feature_requests(parsed),
     )
+
+
+def _resolve_category(category: Category, archetype: Archetype) -> Category:
+    if category != Category.GENERAL_WEB:
+        return category
+    if archetype == Archetype.WEB_CRUD:
+        return Category.WEB_CRUD
+    if archetype == Archetype.REST_API:
+        return Category.REST_API
+    return category
+
+
+def _registry_metadata(category: Category) -> tuple[str, str, str]:
+    try:
+        entry = load_registry_entry(category)
+    except (FileNotFoundError, ValueError):
+        return "", "", ""
+    return (
+        entry.master_prompt,
+        str(entry.root / "manifest.yaml"),
+        str(entry.root / "dod.yaml"),
+    )
+
+
+def _feature_requests(parsed: ParsedPRD) -> list[str]:
+    requests: list[str] = []
+    for heading, lines in parsed.sections.items():
+        if any(word in heading.lower() for word in ["feature", "requirement", "gameplay"]):
+            requests.extend(line.strip("- ").strip() for line in lines if line.strip())
+    return requests[:20]
 
 
 def _generic_generation_order() -> list[DjangoFileSpec]:

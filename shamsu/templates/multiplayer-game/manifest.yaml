@@ -1,0 +1,47 @@
+category: multiplayer-game
+stack:
+  runtime: node
+  framework: vite-react-ts
+  render: r3f
+  net: colyseus-relay
+  physics: rapier
+entry: src/main.tsx
+build_cmd: "npm install && npm run build"
+run_cmd: "npm run dev"
+preview_url: "http://localhost:5173"
+holes:
+  - id: entity.player
+    target_file: src/game/entities.ts
+    marker: "// HOLE:entity.player"
+    kind: schema
+    signature: "type Player = { id: string; name: string; position: Vec3; score: number; color: string }"
+    description: "Define the player entity fields the game needs."
+    depends_on: []
+  - id: entity.world
+    target_file: src/game/entities.ts
+    marker: "// HOLE:entity.world"
+    kind: schema
+    signature: "types for obstacles, pickups, and game state"
+    description: "Define non-player entities and game state for the requested game."
+    depends_on: []
+  - id: rule.update
+    target_file: src/game/rules.ts
+    marker: "// HOLE:rule.update"
+    kind: function
+    signature: "function updateGameState(state: GameState, input: InputState, dt: number): GameState"
+    description: "Advance game state each tick: movement, spawning, collisions, scoring."
+    depends_on: [entity.player, entity.world]
+  - id: rule.end_condition
+    target_file: src/game/rules.ts
+    marker: "// HOLE:rule.end_condition"
+    kind: function
+    signature: "function checkEndState(state: GameState): EndState"
+    description: "Decide when the game ends and why."
+    depends_on: [rule.update]
+  - id: ui.hud_fields
+    target_file: src/ui/Hud.tsx
+    marker: "{/* HOLE:ui.hud_fields */}"
+    kind: component
+    signature: "render score, player count, phase, and end-state message"
+    description: "Bind HUD fields to game state."
+    depends_on: [entity.player, rule.end_condition]

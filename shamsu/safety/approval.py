@@ -138,15 +138,47 @@ def ask_remember_choice(action_type: str, console: Console | None = None) -> str
     return "none"
 
 
-def _read_approval_answer(console: Console) -> str | None:
-    """Read a menu answer without crashing on closed stdin.
+def _prompt_toolkit_answer() -> str | None:
+    """Read one line via prompt_toolkit.
 
-    On real Windows terminals, Rich Live/status and raw ``input()`` can
-    occasionally produce an empty read instead of blocking. Treating that as
-    "No" makes the user's next keystroke become the next REPL prompt. For a TTY,
-    retry a few times; for non-interactive/piped tests, keep the old safe
-    default where an empty string means "No".
+    SHAMSU's launcher runs Python so that built-in ``input()`` can see a
+    non-interactive stdin (prompt_toolkit drives the Windows console directly),
+    which made ``input()`` return an empty string and silently cancel approval
+    menus. prompt_toolkit uses the same reliable console path as the main REPL
+    prompt. Returns the stripped, lowercased answer, or None if prompt_toolkit
+    is unavailable or the read was interrupted/closed.
     """
+    try:
+        from prompt_toolkit import prompt as ptk_prompt
+    except Exception:
+        return None
+    try:
+        return ptk_prompt("> ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    except Exception:
+        return None
+
+
+def _read_approval_answer(console: Console) -> str | None:
+    """Read a menu answer reliably, without crashing on closed stdin.
+
+    On an interactive terminal, read through prompt_toolkit — it drives the
+    console directly and works even when built-in ``input()`` sees a
+    non-interactive stdin (the cause of approval menus cancelling without
+    waiting for a keypress). Falls back to the Windows single-key reader, then
+    to ``input()`` for non-interactive/piped test contexts where an empty string
+    means "No".
+    """
+    _pause_console_live(console)
+    if console.is_terminal:
+        answer = _prompt_toolkit_answer()
+        if answer is not None:
+            return answer
+        fallback = _read_windows_console_answer(console)
+        if fallback is not None:
+            return fallback
+
     empty_reads = 0
     while True:
         _pause_console_live(console)

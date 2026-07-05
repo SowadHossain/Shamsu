@@ -10,6 +10,9 @@ from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop, ErrorFeedbackRe
 from shamsu.interfaces import ISearchAgent
 from shamsu.prd.input import parse_prd_file
 from shamsu.prd.project import build_project_spec
+from shamsu.registry import load_registry_entry
+from shamsu.registry.scaffold import scaffold_template
+from shamsu.registry.schema import Category
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
@@ -18,6 +21,7 @@ from shamsu.templates.django.docs import render_pipeline_summary
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.types import ProjectSpec, TestRunResult
+from shamsu.verify import DoDRunResult, run_dod
 
 
 class SetupRunnerLike(Protocol):
@@ -42,6 +46,8 @@ class FullPipelineResult:
     setup_result: DjangoSetupResult | None = None
     test_result: TestRunResult | None = None
     feedback_result: ErrorFeedbackResult | None = None
+    dod_result: DoDRunResult | None = None
+    preview_url: str = ""
     success: bool = False
     error: str = ""
 
@@ -75,6 +81,9 @@ class FullDjangoPipeline:
             parsed = parse_prd_file(validated_prd)
             project = build_project_spec(parsed)
             self._log("workflow.started", {"prd_path": str(validated_prd)}, "Full Django pipeline started")
+
+            if project.category == Category.MULTIPLAYER_GAME.value:
+                return self._run_registry_pipeline(validated_prd, validated_target, project)
 
             writer = DjangoProjectWriter(
                 self.workspace_root,
@@ -187,6 +196,67 @@ class FullDjangoPipeline:
             return setup_result
         return setup_runner.run(target_dir)
 
+    def _run_registry_pipeline(
+        self,
+        prd_path: Path,
+        target_dir: Path,
+        project: ProjectSpec,
+    ) -> FullPipelineResult:
+        entry = load_registry_entry(project.category or Category.GENERAL_WEB.value)
+        self._log(
+            "project.category_selected",
+            {
+                "category": entry.category.value,
+                "confidence": project.archetype_confidence,
+                "template": str(entry.root),
+            },
+            f"Selected project category {entry.category.value}",
+        )
+        scaffold = scaffold_template(
+            entry,
+            self.workspace_root,
+            target_dir,
+            approval_func=self.approval_func,
+            session_logger=self.session_logger,
+        )
+        dod_result = run_dod(
+            entry,
+            self.workspace_root,
+            scaffold.target_dir,
+            session_logger=self.session_logger,
+        )
+        failures = dod_result.required_failures
+        error = ""
+        if failures:
+            error = "Required DoD failed: " + ", ".join(failure.item_id for failure in failures)
+        result = FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=scaffold.target_dir,
+            project=project,
+            written_files=scaffold.copied_files,
+            diagnostics=[],
+            dod_result=dod_result,
+            preview_url=entry.manifest.preview_url,
+            success=not failures,
+            error=error,
+        )
+        event_type = "workflow.finished" if result.success else "workflow.failed"
+        self._log(
+            event_type,
+            {
+                "project": project.project_name,
+                "category": entry.category.value,
+                "target_dir": str(scaffold.target_dir),
+                "written_files": scaffold.copied_files,
+                "dod_required_failures": [failure.item_id for failure in failures],
+                "success": result.success,
+                "error": error,
+            },
+            "Category pipeline finished" if result.success else "Category pipeline stopped",
+        )
+        self._write_summary(result)
+        return result
+
     def _result(
         self,
         prd_path: Path,
@@ -197,6 +267,8 @@ class FullDjangoPipeline:
         setup_result: DjangoSetupResult | None = None,
         test_result: TestRunResult | None = None,
         feedback_result: ErrorFeedbackResult | None = None,
+        dod_result: DoDRunResult | None = None,
+        preview_url: str = "",
         success: bool = False,
         error: str = "",
     ) -> FullPipelineResult:
@@ -222,6 +294,8 @@ class FullDjangoPipeline:
             setup_result=setup_result,
             test_result=test_result,
             feedback_result=feedback_result,
+            dod_result=dod_result,
+            preview_url=preview_url,
             success=success,
             error=error,
         )
