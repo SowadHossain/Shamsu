@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, ISearchAgent
 from shamsu.llm.manager import LLMManager
-from shamsu.retriever.search import SearchAgentStub
+from shamsu.retriever.search import NullSearchAgent
 from shamsu.types import ContextPack
 
 NO_LIVE_TOOLS_NOTICE = (
@@ -46,7 +46,7 @@ class QAWorkflow:
         search: ISearchAgent | None = None,
         context_builder: IContextBuilder | None = None,
     ):
-        self.search = search or SearchAgentStub()
+        self.search = search or NullSearchAgent()
         self.context_builder = context_builder or ContextBuilder()
 
     def build_prompt(self, request: str, task_id: str = "qa-preview") -> QAPreview:

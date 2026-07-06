@@ -32,16 +32,6 @@ class SearchResult:
     chunk_type: Literal["function", "class", "import_block", "window", "html_block"] = "window"
 
 
-@dataclass
-class IndexEntry:
-    file_id: int
-    path: str
-    language: str
-    hash: str
-    symbol_count: int
-    last_modified: float
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # Context packs (Dev B owns the builder, the LLM layer consumes)
 # ─────────────────────────────────────────────────────────────────────────

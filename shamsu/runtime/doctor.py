@@ -16,6 +16,7 @@ from pathlib import Path
 
 from shamsu.runtime.ollama import RuntimeStatus, collect_status, repo_root_from_runtime
 from shamsu.runtime.models import allowed_model_names, is_allowed_model
+from shamsu.abstract.service import AbstractService
 
 IGNORED_DIR_NAMES = {".venv", ".git", "node_modules", "__pycache__"}
 
@@ -93,6 +94,29 @@ def check_cookbook(status: RuntimeStatus | None = None) -> DoctorCheck:
         f"Installed model(s) outside SHAMSU's 8GB cookbook: {', '.join(off_cookbook)}",
         f"SHAMSU will only pull allowed models: {', '.join(allowed_model_names())}. "
         "Remove larger models manually if they are causing memory pressure.",
+    )
+
+
+def check_codebase_memory(workspace: Path, service: AbstractService | None = None) -> DoctorCheck:
+    status = (service or AbstractService(workspace)).status()
+    if status.normal_mode_allowed and not status.index.stale:
+        return DoctorCheck(
+            "codebase_memory",
+            True,
+            f"Codebase-Memory MCP is healthy. {status.index.message}",
+        )
+    if not status.health.ok:
+        return DoctorCheck(
+            "codebase_memory",
+            False,
+            status.health.message,
+            "Run `/abstract setup` (or `python -m shamsu.abstract.cli setup`).",
+        )
+    return DoctorCheck(
+        "codebase_memory",
+        False,
+        status.index.message,
+        "Run `/abstract refresh` to rebuild the workspace code-memory index.",
     )
 
 
@@ -211,6 +235,7 @@ def run_doctor(
     repo_root: Path | None = None,
     ollama_status: RuntimeStatus | None = None,
     bin_dir: Path | None = None,
+    codebase_memory_service: AbstractService | None = None,
 ) -> DoctorReport:
     resolved_repo_root = (repo_root or repo_root_from_runtime()).resolve()
     resolved_workspace = (workspace or resolved_repo_root).resolve()
@@ -221,6 +246,7 @@ def run_doctor(
         check_nested_workspaces(resolved_workspace),
         check_ancestor_workspace(resolved_workspace),
         check_path_manifest(bin_dir),
+        check_codebase_memory(resolved_workspace, codebase_memory_service),
     )
     return DoctorReport(checks=checks)
 

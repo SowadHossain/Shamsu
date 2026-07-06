@@ -2,6 +2,7 @@ param(
     [string]$Python = "python",
     [switch]$Yes,
     [switch]$SkipOllamaInstall,
+    [switch]$SkipCodebaseMemoryInstall,
     [switch]$SkipModels,
     [switch]$PrefetchModels,
     [switch]$SkipCommandInstall,
@@ -310,6 +311,27 @@ try {
     }
 
     & $VenvPython -m shamsu.runtime.ollama write-config
+
+    if (-not $SkipCodebaseMemoryInstall) {
+        $AbstractStatusJson = & $VenvPython -m shamsu.abstract.cli status --workspace $RepoRoot --json
+        $AbstractStatus = $AbstractStatusJson | ConvertFrom-Json
+        if (-not $AbstractStatus.health.available) {
+            $InstallCodebaseMemory = $Yes
+            if (-not $InstallCodebaseMemory) {
+                $Answer = Read-Host "Install required local Codebase-Memory MCP tool? [y/N]"
+                $InstallCodebaseMemory = $Answer.ToLowerInvariant() -in @("y", "yes")
+            }
+            if ($InstallCodebaseMemory) {
+                & $VenvPython -m shamsu.abstract.cli setup --workspace $RepoRoot
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "Codebase-Memory MCP setup failed. Run '/abstract setup' or 'shamsu doctor' later to retry."
+                }
+            }
+            else {
+                Write-Warning "Skipping Codebase-Memory MCP install. SHAMSU codebase mode will not run normal code-agent workflows until '/abstract setup' completes."
+            }
+        }
+    }
 
     if (-not $SkipCommandInstall) {
         Install-ShamsuLauncher -BinDir $BinDir -RunScript $RunScript -WillUpdatePath (-not $SkipPathUpdate)

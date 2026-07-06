@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from shamsu.indexer.walker import ensure_index
+from shamsu.abstract.service import AbstractService
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
 from shamsu.tools.workspace import MentionContext, MentionResolver, WorkspaceTool, render_mention_context
@@ -23,11 +23,17 @@ class AgentResult:
 
 
 class AgentOrchestrator:
-    def __init__(self, workspace_root: Path, session_logger: SessionLogger | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        session_logger: SessionLogger | None = None,
+        abstract_service: AbstractService | None = None,
+    ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
         self.workspace_tool = WorkspaceTool(self.workspace_root)
         self.mention_resolver = MentionResolver(self.workspace_root)
+        self.abstract_service = abstract_service or AbstractService(self.workspace_root)
 
     def run(self, user_input: str) -> AgentResult:
         memory = ConversationMemory.from_session(self.session_logger)
@@ -88,7 +94,17 @@ class AgentOrchestrator:
                 effective_input=effective_input,
                 action="web.needs_location",
             )
-        ensure_index(self.workspace_root, self.session_logger)
+        gate = self.abstract_service.ensure_ready()
+        if not gate.allowed:
+            return AgentResult(
+                handled=True,
+                title="Codebase-Memory MCP Required",
+                message=gate.reason,
+                effective_input=effective_input,
+                context=context,
+                mentions=mentions,
+                action="abstract.blocked",
+            )
         return AgentResult(
             handled=False,
             effective_input=effective_input,
@@ -126,8 +142,7 @@ def _agent_context(
     listing = workspace_tool.list_files(limit=12).render(limit=12)
     parts = [
         f"Workspace root: {workspace}",
-        f"Index exists: {(workspace / '.shamsu' / 'index.db').exists()}",
-        "Available tools: workspace files, indexed search, @file context, web search with approval, browser with approval, patch preview/apply with approval.",
+        "Available tools: workspace files, Codebase-Memory MCP search, @file context, web search with approval, browser with approval, patch preview/apply with approval.",
         "Top-level workspace files:",
         listing,
         "Recent conversation:",

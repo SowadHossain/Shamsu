@@ -1,112 +1,69 @@
 from __future__ import annotations
 
-from shamsu.indexer.walker import FileWalker
-from shamsu.retriever.search import SearchAgent
+from pathlib import Path
+
+from shamsu.retriever.search import NullSearchAgent, SearchAgent
 
 
-def _index(tmp_path):
-    db_path = tmp_path / ".shamsu" / "index.db"
-    FileWalker(tmp_path, db_path=db_path).index()
-    return SearchAgent(db_path)
+class FakeCodebaseMemorySearchAdapter:
+    """Fake adapter simulating real Codebase-Memory MCP response shapes
+    (verified live against the actual tool) - no subprocess, no real binary."""
+
+    def __init__(self, code_matches=None, symbol_rows=None, snippets=None) -> None:
+        self.code_matches = code_matches or []
+        self.symbol_rows = symbol_rows or []
+        self.snippets = snippets or {}
+
+    def search_code(self, workspace, pattern, limit=20, ignore_case=True):
+        return {"ok": True, "results": self.code_matches[:limit]}
+
+    def get_symbols(self, workspace, query_or_path):
+        return {"ok": True, "results": self.symbol_rows}
+
+    def get_code_snippet(self, workspace, qualified_name):
+        snippet = self.snippets.get(qualified_name)
+        return {"ok": True, **snippet} if snippet else {"ok": False, "error": "not found"}
 
 
-def test_bm25_index_is_not_built_until_first_search_call(tmp_path):
-    (tmp_path / "a.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
-    agent = _index(tmp_path)
-
-    assert agent._bm25_built is False
-    assert agent._bm25_index is None
-
-    agent.search("helper")
-
-    assert agent._bm25_built is True
-
-
-def test_fts_query_quotes_boolean_words():
-    query = SearchAgent._build_fts_query("run the game now and give me the link")
-
-    assert '"and"' in query
-    assert " AND " not in query
-
-
-def test_bm25_index_builds_only_once_per_instance(tmp_path, monkeypatch):
-    (tmp_path / "a.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
-    agent = _index(tmp_path)
-
-    build_calls = []
-    original = agent._ensure_bm25_index
-
-    def spy():
-        build_calls.append(1)
-        original()
-
-    monkeypatch.setattr(agent, "_ensure_bm25_index", spy)
-
-    agent.search("helper")
-    agent.search("helper again")
-
-    assert len(build_calls) == 2  # called each time...
-    assert agent._bm25_built is True  # ...but the guard inside prevents rebuilding
-
-
-def test_symbol_match_boosts_file_containing_matching_symbol(tmp_path):
-    (tmp_path / "auth_helper.py").write_text(
-        "def authenticate_user():\n"
-        "    # verifies credentials\n"
-        "    return True\n",
-        encoding="utf-8",
+def test_fts_search_maps_search_code_results_to_search_results(tmp_path):
+    (tmp_path / "auth.py").write_text("def login():\n    return True\n", encoding="utf-8")
+    adapter = FakeCodebaseMemorySearchAdapter(
+        code_matches=[
+            {"node": "login", "qualified_name": "proj.auth.login", "file": "auth.py", "start_line": 1, "end_line": 2}
+        ]
     )
-    (tmp_path / "unrelated.py").write_text(
-        "def other_thing():\n"
-        "    # mentions authenticate_user in a comment only, no such symbol here\n"
-        "    return authenticate_user_flag\n",
-        encoding="utf-8",
+    agent = SearchAgent(tmp_path, adapter=adapter)
+
+    results = agent.fts_search("login")
+
+    assert len(results) == 1
+    assert results[0].file_path == "auth.py"
+    assert results[0].language == "python"
+    assert "def login" in results[0].content
+    assert results[0].symbol_name == "login"
+
+
+def test_search_returns_empty_when_adapter_reports_failure(tmp_path):
+    class FailingAdapter:
+        def search_code(self, workspace, pattern, limit=20, ignore_case=True):
+            return {"ok": False, "error": "Codebase-Memory MCP binary is not available."}
+
+    agent = SearchAgent(tmp_path, adapter=FailingAdapter())
+
+    assert agent.search("anything") == []
+    assert agent.fts_search("anything") == []
+
+
+def test_boost_paths_reorders_above_the_tools_own_ranking(tmp_path):
+    (tmp_path / "popular.py").write_text("def target_function():\n    pass\n", encoding="utf-8")
+    (tmp_path / "rare.py").write_text("def target_function():\n    pass\n", encoding="utf-8")
+    adapter = FakeCodebaseMemorySearchAdapter(
+        code_matches=[
+            {"node": "target_function", "file": "popular.py", "start_line": 1, "end_line": 2},
+            {"node": "target_function", "file": "rare.py", "start_line": 1, "end_line": 2},
+        ]
     )
-    agent = _index(tmp_path)
-
-    results = agent.search("authenticate_user", top_k=5)
-
-    assert results
-    assert results[0].file_path == "auth_helper.py"
-
-
-def test_path_match_boosts_file_whose_path_contains_query_term(tmp_path):
-    (tmp_path / "payments.py").write_text(
-        "class PaymentGateway:\n"
-        "    def charge(self):\n"
-        "        # payments logic lives here, mentions payments twice\n"
-        "        return True\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "misc.py").write_text(
-        "def unrelated():\n"
-        "    # also references payments in passing, same term frequency-ish\n"
-        "    return True\n",
-        encoding="utf-8",
-    )
-    agent = _index(tmp_path)
-
-    results = agent.search("payments", top_k=5)
-
-    assert results
-    assert results[0].file_path == "payments.py"
-
-
-def test_boost_paths_promotes_traceback_file_above_a_stronger_fts_match(tmp_path):
-    # "popular.py" repeats the query term many times so plain FTS5 bm25
-    # ranks it above "rare.py", which mentions it only once.
-    (tmp_path / "popular.py").write_text(
-        "def target_function():\n"
-        "    # target_function target_function target_function target_function\n"
-        "    return target_function\n",
-        encoding="utf-8",
-    )
-    (tmp_path / "rare.py").write_text(
-        "def target_function():\n"
-        "    return True\n",
-        encoding="utf-8",
-    )
-    agent = _index(tmp_path)
+    agent = SearchAgent(tmp_path, adapter=adapter)
 
     unboosted = agent.search("target_function", top_k=1)
     assert unboosted[0].file_path == "popular.py"
@@ -116,33 +73,51 @@ def test_boost_paths_promotes_traceback_file_above_a_stronger_fts_match(tmp_path
 
 
 def test_boost_paths_matches_absolute_traceback_paths_with_backslashes(tmp_path):
-    (tmp_path / "app.py").write_text(
-        "def crashes():\n    raise ValueError('boom')\n", encoding="utf-8"
+    (tmp_path / "app.py").write_text("def crashes():\n    pass\n", encoding="utf-8")
+    (tmp_path / "other.py").write_text("def crashes_too():\n    pass\n", encoding="utf-8")
+    adapter = FakeCodebaseMemorySearchAdapter(
+        code_matches=[
+            {"node": "crashes_too", "file": "other.py", "start_line": 1, "end_line": 2},
+            {"node": "crashes", "file": "app.py", "start_line": 1, "end_line": 2},
+        ]
     )
-    (tmp_path / "other.py").write_text(
-        "def crashes_too():\n    raise ValueError('boom boom boom')\n", encoding="utf-8"
-    )
-    agent = _index(tmp_path)
+    agent = SearchAgent(tmp_path, adapter=adapter)
 
-    boosted = agent.search("boom", top_k=1, boost_paths=[r"C:\repo\workspace\app.py"])
+    boosted = agent.search("crashes", top_k=1, boost_paths=[r"C:\repo\workspace\app.py"])
 
     assert boosted[0].file_path == "app.py"
 
 
-def test_search_still_returns_results_with_no_boosts_matching(tmp_path):
-    (tmp_path / "plain.py").write_text(
-        "def ordinary_function():\n    return 42\n", encoding="utf-8"
+def test_symbol_lookup_uses_get_code_snippet_for_real_source(tmp_path):
+    adapter = FakeCodebaseMemorySearchAdapter(
+        symbol_rows=[{"name": "login", "qualified_name": "proj.auth.login", "file_path": "auth.py", "signature": "()"}],
+        snippets={"proj.auth.login": {"source": "def login():\n    return True\n", "start_line": 3, "end_line": 4}},
     )
-    agent = _index(tmp_path)
+    agent = SearchAgent(tmp_path, adapter=adapter)
 
-    results = agent.search("ordinary_function")
+    results = agent.symbol_lookup("login")
 
-    assert results
-    assert results[0].file_path == "plain.py"
+    assert len(results) == 1
+    assert results[0].symbol_name == "login"
+    assert results[0].line_start == 3
+    assert results[0].line_end == 4
+    assert "return True" in results[0].content
 
 
-def test_search_returns_empty_when_no_fts_matches(tmp_path):
-    (tmp_path / "plain.py").write_text("def ordinary_function():\n    return 42\n", encoding="utf-8")
-    agent = _index(tmp_path)
+def test_symbol_lookup_falls_back_to_signature_when_snippet_unavailable(tmp_path):
+    adapter = FakeCodebaseMemorySearchAdapter(
+        symbol_rows=[{"name": "login", "qualified_name": "proj.auth.login", "file_path": "auth.py", "signature": "(request)"}],
+    )
+    agent = SearchAgent(tmp_path, adapter=adapter)
 
-    assert agent.search("zzz_nonexistent_term_zzz") == []
+    results = agent.symbol_lookup("login")
+
+    assert results[0].content == "(request)"
+
+
+def test_null_search_agent_returns_empty_results():
+    agent = NullSearchAgent()
+
+    assert agent.search("anything") == []
+    assert agent.symbol_lookup("anything") == []
+    assert agent.fts_search("anything") == []

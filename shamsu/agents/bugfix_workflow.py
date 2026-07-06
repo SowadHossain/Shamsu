@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.abstract.context import build_codebase_memory_brief
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -162,9 +163,15 @@ class BugFixWorkflow:
 
     def _build_pack(self, report: str, locations: list[TracebackLocation]) -> tuple[ContextPack, list[str]]:
         results = _dedupe_results(self._search_bug_context(report, locations))
-        request = f"{BUGFIX_INSTRUCTIONS}\n\nBug report, traceback, or failing test output:\n{report.strip()}"
+        target_paths = _target_paths(results)
+        memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
+        request = (
+            f"{BUGFIX_INSTRUCTIONS}\n\n"
+            + (f"{memory_brief}\n\n" if memory_brief else "")
+            + f"Bug report, traceback, or failing test output:\n{report.strip()}"
+        )
         pack = self.context_builder.pack(results=results, request=request, task_id="bug-fix", step_id=1, specialist="bugfix")
-        return pack, _target_paths(results)
+        return pack, target_paths
 
     def _build_repair_pack(
         self,

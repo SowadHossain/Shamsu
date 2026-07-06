@@ -9,7 +9,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from shamsu.indexer.walker import FileWalker
 from shamsu.interfaces import IPatchEngine
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
@@ -161,7 +160,7 @@ class PatchEngine(IPatchEngine):
             self._log("patch.failed", {"files": [patch.display_path for patch in patches]}, "Patch failed")
             self.audit_logger.log("patch_apply", "error", affected_paths=_patch_paths(patches))
             return False
-        FileWalker(self.workspace_root, session_logger=self.session_logger).index()
+        _queue_code_memory_refresh(self.workspace_root)
         self._log("patch.applied", {"files": [patch.display_path for patch in patches]}, "Patch applied")
         self.audit_logger.log("patch_apply", "success", affected_paths=_patch_paths(patches))
         return True
@@ -253,6 +252,16 @@ def parse_unified_diff(
 
 def _patch_paths(patches: list[FilePatch]) -> list[str]:
     return [patch.display_path for patch in patches]
+
+
+def _queue_code_memory_refresh(workspace_root: Path) -> None:
+    """Best-effort: never let code-memory bookkeeping break a successful patch."""
+    try:
+        from shamsu.abstract.service import AbstractService
+
+        AbstractService(workspace_root).queue_refresh()
+    except Exception:
+        pass
 
 
 def parse_file_patches(

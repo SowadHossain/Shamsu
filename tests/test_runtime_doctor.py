@@ -11,6 +11,7 @@ from shamsu.runtime.doctor import (
     DoctorCheck,
     DoctorReport,
     check_ancestor_workspace,
+    check_codebase_memory,
     check_editable_install,
     check_cookbook,
     check_nested_workspaces,
@@ -22,6 +23,8 @@ from shamsu.runtime.doctor import (
     run_doctor,
 )
 from shamsu.runtime.ollama import RuntimeStatus
+from shamsu.abstract.service import AbstractService
+from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 
 
 def test_check_editable_install_ok_when_package_is_inside_repo_root():
@@ -216,6 +219,24 @@ def test_check_path_manifest_warns_when_entry_missing_from_path(tmp_path, monkey
     assert "new terminal" in check.suggestion
 
 
+def test_check_codebase_memory_warns_when_unavailable(tmp_path):
+    service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=False))
+
+    check = check_codebase_memory(tmp_path, service)
+
+    assert check.ok is False
+    assert "/abstract setup" in check.suggestion
+
+
+def test_check_codebase_memory_ok_when_healthy_and_indexed(tmp_path):
+    service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=True))
+    service.ensure_ready()
+
+    check = check_codebase_memory(tmp_path, service)
+
+    assert check.ok is True
+
+
 def test_run_doctor_combines_all_checks(tmp_path):
     import shamsu
 
@@ -226,16 +247,19 @@ def test_run_doctor_combines_all_checks(tmp_path):
         installed_models=["qwen3:8b"],
         missing_models=[],
     )
+    cbm_service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=True))
+    cbm_service.ensure_ready()
 
     report = run_doctor(
         workspace=tmp_path,
         repo_root=repo_root,
         ollama_status=ready_status,
         bin_dir=tmp_path / "bin",
+        codebase_memory_service=cbm_service,
     )
 
     assert isinstance(report, DoctorReport)
-    assert len(report.checks) == 6
+    assert len(report.checks) == 7
     assert report.all_ok is True
 
 

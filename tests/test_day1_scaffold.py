@@ -6,69 +6,11 @@ them. Run with: pytest tests/test_day1_scaffold.py -v
 """
 import pytest
 
-from shamsu.storage.schema import init_db
-from shamsu.retriever.search import SearchAgent, SearchAgentStub
 from shamsu.context.builder import ContextBuilder, _truncate_middle, _deduplicate
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.safety.commands import classify_command, redact
 from shamsu.types import SearchResult, CommandRisk, ContextPack
 from shamsu.llm.manager import LLMManager
-
-
-@pytest.fixture
-def db(tmp_path):
-    db_path = tmp_path / "index.db"
-    conn = init_db(db_path)
-    conn.execute(
-        "INSERT INTO files (path, language, hash, last_modified) "
-        "VALUES ('app/auth.py','python','h1',0)"
-    )
-    file_id = conn.execute("SELECT id FROM files").fetchone()[0]
-    conn.execute(
-        "INSERT INTO snippets (file_id, content, line_start, line_end, chunk_index) "
-        "VALUES (?,?,?,?,?)",
-        (file_id, "def login(request):\n    return authenticate(request)", 1, 2, 0),
-    )
-    conn.execute(
-        "INSERT INTO symbols (file_id, name, kind, line_start, line_end, signature) "
-        "VALUES (?,?,?,?,?,?)",
-        (file_id, "login", "function", 1, 2, "def login(request):"),
-    )
-    conn.commit()
-    return db_path
-
-
-class TestSchema:
-    def test_creates_all_tables(self, tmp_path):
-        conn = init_db(tmp_path / "test.db")
-        tables = {
-            r[0] for r in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
-        }
-        assert {"files", "symbols", "snippets", "episodic_facts"}.issubset(tables)
-
-
-class TestSearchAgent:
-    def test_fts5_multiword_query_uses_or(self, db):
-        agent = SearchAgent(db)
-        # "login authentication" — bare FTS5 MATCH would AND these and miss,
-        # since "authentication" never appears verbatim in the seeded snippet.
-        results = agent.fts_search("login authentication")
-        assert len(results) == 1
-        assert results[0].file_path == "app/auth.py"
-
-    def test_symbol_lookup_finds_exact_function(self, db):
-        agent = SearchAgent(db)
-        results = agent.symbol_lookup("login")
-        assert len(results) == 1
-        assert results[0].symbol_name == "login"
-
-    def test_stub_returns_deterministic_data(self):
-        stub = SearchAgentStub()
-        results = stub.search("anything")
-        assert len(results) == 1
-        assert results[0].file_path == "stub/example.py"
 
 
 class TestContextBuilder:

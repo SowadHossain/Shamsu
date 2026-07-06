@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.abstract.context import build_codebase_memory_brief
 from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
@@ -102,10 +103,13 @@ class CodeEditWorkflow:
 
     def _build_pack(self, request: str) -> tuple[ContextPack, list[str]]:
         results = self.search.search(request, top_k=8)
+        target_paths = _target_paths(results)
+        memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
         prompt_request = (
             f"{CODE_EDIT_INSTRUCTIONS}\n\n"
             f"{frontend_prompt_rules()}\n\n"
-            f"User request: {request}"
+            + (f"{memory_brief}\n\n" if memory_brief else "")
+            + f"User request: {request}"
         )
         pack = self.context_builder.pack(
             results=results,
@@ -114,7 +118,7 @@ class CodeEditWorkflow:
             step_id=1,
             specialist="coder",
         )
-        return pack, _target_paths(results)
+        return pack, target_paths
 
 
 def _clean_diff(raw: str) -> str:

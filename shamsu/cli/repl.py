@@ -13,7 +13,6 @@ import json
 import os
 import re
 import shlex
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +30,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.text import Text
 
+from shamsu.abstract.service import REQUIRED_TOOL_MESSAGE, AbstractService
 from shamsu.agents.audit_workflow import AuditWorkflow
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.chat_loop import AgentChatLoop
@@ -44,13 +44,12 @@ from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
 from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
-from shamsu.indexer.walker import FileWalker, ensure_index
 from shamsu.llm.manager import LLMManager, ModelPullProgress
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.registry.schema import Category
-from shamsu.retriever.search import SearchAgent
+from shamsu.retriever.search import NullSearchAgent, SearchAgent
 from shamsu.tasks.state import (
     MilestoneTask,
     advance_phase,
@@ -108,25 +107,23 @@ else:
 
 DEFAULT_ASK_APPROVAL = ask_approval
 
-
-class EmptySearchAgent:
-    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
-        return []
-
-    def symbol_lookup(self, name: str) -> list[SearchResult]:
-        return []
-
-    def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        return []
+EmptySearchAgent = NullSearchAgent
 
 
 SYSTEM_COMMANDS = (
     "/help",
-    "/index",
-    "/status",
     "/doctor",
-    "/search ",
-    "/symbols ",
+    "/abstract status",
+    "/abstract setup",
+    "/abstract repair",
+    "/abstract build",
+    "/abstract refresh",
+    "/abstract query ",
+    "/abstract exports ",
+    "/abstract imports ",
+    "/abstract symbols ",
+    "/abstract who-uses ",
+    "/abstract impact ",
     "/parse-prd ",
     "/plan-prd ",
     "/generate-django ",
@@ -242,11 +239,16 @@ def _print_help(console: Console) -> None:
                     "  update the README",
                     "",
                     "Commands:",
-                    "  /index                    Index the current workspace",
-                    "  /status                   Show index counts",
                     "  /doctor                   Diagnose install/workspace health (read-only)",
-                    "  /search <query>           Search indexed snippets",
-                    "  /symbols <name>           Look up indexed symbols",
+                    "  /abstract status          Show Codebase-Memory MCP + index health",
+                    "  /abstract setup           Install the local Codebase-Memory MCP tool",
+                    "  /abstract repair          Re-check health and rebuild the index if needed",
+                    "  /abstract build|refresh   Build/refresh the workspace code-memory index",
+                    "  /abstract query <text>    Structural search over the code graph",
+                    "  /abstract exports|imports <file>",
+                    "  /abstract symbols <name-or-file>",
+                    "  /abstract who-uses <symbol>   Callers/importers of a symbol",
+                    "  /abstract impact <symbol>     Edit impact / blast radius",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  /plan-prd <file>          Preview and approve a project plan",
                     "  /generate-django <file>   Generate deterministic Django backend files",
@@ -295,27 +297,16 @@ def _print_help(console: Console) -> None:
     )
 
 
-def _index_db_path(workspace: Path) -> Path:
-    return workspace / ".shamsu" / "index.db"
-
-
-def _has_index(workspace: Path) -> bool:
-    return _index_db_path(workspace).exists()
-
-
-# Re-exported so existing call sites/tests can keep using repl._ensure_index;
-# the shared implementation lives in indexer.walker so AgentOrchestrator can
-# use the exact same best-effort auto-indexing without importing this module.
-_ensure_index = ensure_index
-
-
 def _build_search_agent(
     workspace: Path,
     session_logger: SessionLogger | None = None,
 ) -> tuple[SearchAgent | EmptySearchAgent, bool]:
-    _ensure_index(workspace, session_logger)
-    if _has_index(workspace):
-        return SearchAgent(_index_db_path(workspace)), True
+    """Codebase-Memory MCP-backed search, auto-building/refreshing the index
+    via the same gate `/abstract` and AgentOrchestrator use. Falls back to a
+    no-op agent (not a local SQLite index) when the tool is unavailable."""
+    gate = AbstractService(workspace).ensure_ready()
+    if gate.allowed:
+        return SearchAgent(workspace), True
     return EmptySearchAgent(), False
 
 
@@ -325,15 +316,6 @@ def _build_workspace_qa_workflow(
 ) -> tuple[QAWorkflow, bool]:
     search, uses_real_index = _build_search_agent(workspace, session_logger)
     return QAWorkflow(search=search), uses_real_index
-
-
-def _handle_index(workspace: Path, console: Console, session_logger: SessionLogger | None = None) -> None:
-    entries = FileWalker(workspace, session_logger=session_logger).index()
-    console.print(f"Indexed {len(entries)} files.")
-    for entry in entries[:20]:
-        console.print(f"{entry.language:10} {entry.path}")
-    if len(entries) > 20:
-        console.print(f"... {len(entries) - 20} more")
 
 
 def _handle_parse_prd(user_input: str, workspace: Path, console: Console) -> None:
@@ -650,48 +632,96 @@ def _resolve_workspace_file(path_text: str, workspace: Path) -> Path:
     return Sandbox(workspace).validate(path_text)
 
 
-def _handle_status(workspace: Path, console: Console, session_logger: SessionLogger | None = None) -> None:
-    _ensure_index(workspace, session_logger)
-    db_path = _index_db_path(workspace)
+def _ensure_code_memory_ready_at_startup(workspace: Path, console: Console) -> None:
+    """Startup-time Codebase-Memory MCP check: auto-build/refresh the index so
+    the first real prompt doesn't pay that cost, and surface the exact
+    required-tool message immediately if the tool itself is unavailable.
 
-    conn = sqlite3.connect(db_path)
+    Best-effort: an unexpected error here must never prevent SHAMSU from
+    starting - it's surfaced as a warning, and `/abstract repair` / `/doctor`
+    remain available to investigate."""
     try:
-        files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        symbols = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-        snippets = conn.execute("SELECT COUNT(*) FROM snippets").fetchone()[0]
-    finally:
-        conn.close()
-    console.print(f"Files: {files}")
-    console.print(f"Symbols: {symbols}")
-    console.print(f"Snippets: {snippets}")
-
-
-def _handle_search(
-    user_input: str,
-    workspace: Path,
-    console: Console,
-    session_logger: SessionLogger | None = None,
-) -> None:
-    _, _, query = user_input.partition(" ")
-    query = query.strip()
-    if not query:
-        console.print("[red]Usage: search <query>[/red]")
-        return
-    _ensure_index(workspace, session_logger)
-    results = SearchAgent(_index_db_path(workspace)).search(query, top_k=5)
-    if not results:
-        console.print("[yellow]No results.[/yellow]")
-        return
-    for result in results:
+        service = AbstractService(workspace)
+        health = service.adapter.healthcheck(workspace)
+        if not health.ok:
+            console.print(f"[yellow]{REQUIRED_TOOL_MESSAGE}[/yellow]")
+            return
+        index = service.index_status()
+        if not index.exists:
+            label = "[dim]Code memory: building...[/dim]"
+        elif index.stale:
+            label = "[dim]Code memory: refreshing...[/dim]"
+        else:
+            console.print("[dim]Code memory: ready[/dim]")
+            return
+        with console.status(label, spinner="dots"):
+            gate = service.ensure_ready()
+        if gate.allowed:
+            console.print("[dim]Code memory: ready[/dim]")
+        else:
+            console.print("[yellow]Code memory: failed, run /abstract repair[/yellow]")
+    except Exception as exc:
         console.print(
-            f"{result.file_path}:{result.line_start}-{result.line_end} "
-            f"score={result.score:.4f}"
+            f"[yellow]Code memory: startup check failed ({exc}). Run /abstract repair or /doctor.[/yellow]"
         )
 
 
 def _handle_doctor(workspace: Path, console: Console) -> None:
     report = run_doctor(workspace=workspace)
     console.print(format_report(report))
+
+
+def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else ""
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    service = AbstractService(workspace)
+
+    if subcommand == "status":
+        status = service.status()
+        console.print(f"Available: {status.health.available} ({status.health.message})")
+        console.print(f"Index: {'stale' if status.index.stale else 'fresh'} - {status.index.message}")
+        console.print(f"Normal code-agent mode allowed: {status.normal_mode_allowed}")
+        return
+    if subcommand == "setup":
+        result = service.setup()
+        console.print("[green]Setup complete.[/green]" if result.get("ok") else f"[red]Setup failed: {result.get('error', result)}[/red]")
+        return
+    if subcommand == "repair":
+        result = service.repair()
+        console.print("[green]Repair complete.[/green]" if result.get("ok") else f"[red]Repair failed: {result.get('message', result)}[/red]")
+        return
+    if subcommand == "build":
+        console.print(service.adapter.index_workspace(workspace))
+        return
+    if subcommand == "refresh":
+        console.print(service.adapter.refresh_workspace(workspace))
+        return
+    if subcommand == "query":
+        if not argument:
+            console.print("[red]Usage: /abstract query <query>[/red]")
+            return
+        console.print(service.adapter.query(workspace, argument))
+        return
+    if subcommand == "exports":
+        console.print(service.adapter.get_exports(workspace, argument))
+        return
+    if subcommand == "imports":
+        console.print(service.adapter.get_imports(workspace, argument))
+        return
+    if subcommand == "symbols":
+        console.print(service.adapter.get_symbols(workspace, argument))
+        return
+    if subcommand == "who-uses":
+        console.print(service.adapter.get_references(workspace, argument))
+        return
+    if subcommand == "impact":
+        console.print(service.adapter.get_impact(workspace, argument))
+        return
+    console.print(
+        "[red]Usage: /abstract status|setup|repair|build|refresh|query|exports|imports|symbols|who-uses|impact[/red]"
+    )
 
 
 def _handle_permissions(user_input: str, workspace: Path, console: Console) -> None:
@@ -844,27 +874,6 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
         _print_task(task, console)
         return
     console.print("[red]Usage: tasks list|show <id>[/red]")
-
-
-def _handle_symbols(
-    user_input: str,
-    workspace: Path,
-    console: Console,
-    session_logger: SessionLogger | None = None,
-) -> None:
-    _, _, name = user_input.partition(" ")
-    name = name.strip()
-    if not name:
-        console.print("[red]Usage: symbols <name>[/red]")
-        return
-    _ensure_index(workspace, session_logger)
-    results = SearchAgent(_index_db_path(workspace)).symbol_lookup(name)
-    if not results:
-        console.print("[yellow]No symbols found.[/yellow]")
-        return
-    for result in results:
-        symbol = result.symbol_name or name
-        console.print(f"{symbol}: {result.file_path}:{result.line_start}-{result.line_end}")
 
 
 def _handle_models(
@@ -1408,15 +1417,15 @@ async def _handle_request(
                 )
             else:
                 console.print(
-                    "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
+                    "[yellow]Codebase-Memory MCP is not ready. Run `/abstract setup` for project-specific QA.[/yellow]"
                 )
                 console.print(
-                    "I can still do general local chat without an index, but for this workspace-specific question "
-                    "I need you to run `index` first."
+                    "I can still do general local chat without it, but for this workspace-specific question "
+                    "I need Codebase-Memory MCP set up first."
                 )
             return
         console.print(
-            "[yellow]No index found. Run `index` first for project-specific QA.[/yellow]"
+            "[yellow]Codebase-Memory MCP is not ready. Run `/abstract setup` for project-specific QA.[/yellow]"
         )
     decision = await _route_prompt(effective_input, llm)
     _print_decision(decision, console)
@@ -3359,7 +3368,7 @@ def _print_ready_message(workspace: Path, console: Console) -> None:
     console.print(
         "[green]SHAMSU is ready.[/green] "
         f"Workspace: [bold]{workspace}[/bold]\n"
-        "Run `index` for project-aware answers, `models status` for local AI status, "
+        "Run `/abstract status` for code-memory health, `models status` for local AI status, "
         "or ask me to edit, test, audit, document, or generate a Django project."
     )
 
@@ -3610,8 +3619,8 @@ def _thinking_status_for_input(user_input: str) -> str:
         return "[dim]Checking whether web lookup is needed...[/dim]"
     if normalized.startswith("browse ") or _looks_like_browser_needed_prompt(user_input):
         return "[dim]Inspecting in the browser...[/dim]"
-    if normalized.startswith("search ") or normalized.startswith("symbols "):
-        return "[dim]Searching indexed workspace context...[/dim]"
+    if normalized.startswith("abstract "):
+        return "[dim]Querying Codebase-Memory MCP...[/dim]"
     if normalized.startswith(("edit ", "fix ", "test-gen ", "audit ", "docs ")):
         return "[dim]Thinking through the requested workflow...[/dim]"
     return "[dim]Thinking...[/dim]"
@@ -3766,6 +3775,7 @@ def main(argv: list[str] | None = None) -> None:
     atexit.register(shutdown_if_last_session, session_pid)
 
     _print_startup_banner(workspace, console)
+    _ensure_code_memory_ready_at_startup(workspace, console)
     ancestor_workspace = find_ancestor_workspace(workspace)
     if ancestor_workspace is not None:
         console.print(
@@ -3834,24 +3844,11 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input == "help":
             _print_help(console)
             continue
-        if lowered_input == "index":
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_index(workspace, console, session_logger=session_logger)
-            continue
-        if lowered_input == "status":
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_status(workspace, console, session_logger=session_logger)
-            continue
         if lowered_input == "doctor":
             _handle_doctor(workspace, console)
             continue
-        if lowered_input.startswith("search "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_search(normalized_input, workspace, console, session_logger=session_logger)
-            continue
-        if lowered_input.startswith("symbols "):
-            with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                _handle_symbols(normalized_input, workspace, console, session_logger=session_logger)
+        if lowered_input.startswith("abstract"):
+            _handle_abstract(normalized_input, workspace, console)
             continue
         if lowered_input.startswith("parse-prd "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

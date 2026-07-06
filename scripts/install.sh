@@ -7,6 +7,7 @@ SKIP_OLLAMA_INSTALL=0
 SKIP_MODELS=0
 PREFETCH_MODELS=0
 SKIP_COMMAND_INSTALL=0
+SKIP_CODEBASE_MEMORY_INSTALL=0
 BIN_DIR="${HOME}/.local/bin"
 MODELS_PATH=""
 export PYTHONUTF8="${PYTHONUTF8:-1}"
@@ -31,6 +32,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-command-install)
       SKIP_COMMAND_INSTALL=1
+      shift
+      ;;
+    --skip-codebase-memory-install)
+      SKIP_CODEBASE_MEMORY_INSTALL=1
       shift
       ;;
     --bin-dir)
@@ -136,6 +141,23 @@ else
 fi
 
 "${VENV_PYTHON}" -m shamsu.runtime.ollama write-config
+
+if [[ "${SKIP_CODEBASE_MEMORY_INSTALL}" -eq 0 ]] && ! "${VENV_PYTHON}" -m shamsu.abstract.cli status --workspace "${REPO_ROOT}" --json | grep -q '"available": true'; then
+  INSTALL_CBM="${YES}"
+  if [[ "${INSTALL_CBM}" -eq 0 ]]; then
+    read -r -p "Install required local Codebase-Memory MCP tool? [y/N] " ANSWER
+    if [[ "${ANSWER,,}" == "y" || "${ANSWER,,}" == "yes" ]]; then
+      INSTALL_CBM=1
+    fi
+  fi
+  if [[ "${INSTALL_CBM}" -eq 1 ]]; then
+    if ! "${VENV_PYTHON}" -m shamsu.abstract.cli setup --workspace "${REPO_ROOT}"; then
+      echo "Warning: Codebase-Memory MCP setup failed. Run '/abstract setup' or 'shamsu doctor' later to retry." >&2
+    fi
+  else
+    echo "Warning: Skipping Codebase-Memory MCP install. SHAMSU codebase mode will not run normal code-agent workflows until '/abstract setup' completes." >&2
+  fi
+fi
 
 if [[ "${SKIP_COMMAND_INSTALL}" -eq 0 ]]; then
   mkdir -p "${BIN_DIR}"

@@ -174,6 +174,7 @@ class AgentToolRegistry:
             return ToolResult(False, "File write denied by user.", {"filepath": filepath})
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        _mark_code_memory_stale(self.workspace_root)
         return ToolResult(
             True,
             f"Wrote {filepath}.",
@@ -191,10 +192,11 @@ class AgentToolRegistry:
         )
 
     def search_index(self, query: str) -> ToolResult:
-        index_path = self.workspace_root / ".shamsu" / "index.db"
-        if not index_path.exists():
-            return ToolResult(False, "No index found. Run /index first.", {"query": query})
-        results = SearchAgent(index_path).search(query, top_k=5)
+        from shamsu.abstract.service import AbstractService
+
+        if not AbstractService(self.workspace_root).ensure_ready().allowed:
+            return ToolResult(False, "Codebase-Memory MCP is not ready. Run /abstract setup.", {"query": query})
+        results = SearchAgent(self.workspace_root).search(query, top_k=5)
         return ToolResult(
             True,
             f"Found {len(results)} result(s).",
@@ -212,6 +214,16 @@ class AgentToolRegistry:
                 ],
             },
         )
+
+
+def _mark_code_memory_stale(workspace_root: Path) -> None:
+    """Best-effort: never let code-memory bookkeeping break a successful write."""
+    try:
+        from shamsu.abstract.service import AbstractService
+
+        AbstractService(workspace_root).mark_stale()
+    except Exception:
+        pass
 
 
 def _tool_schema(
