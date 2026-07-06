@@ -9,6 +9,9 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from shamsu.diagnostics.digest import DiagnosticDigest
+from shamsu.diagnostics.setup import DiagnosticsWorkspace
+from shamsu.diagnostics.types import ErrorPacket
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
@@ -16,6 +19,7 @@ from shamsu.safety.audit import AuditLogger
 from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
+from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.types import ApprovalRequest, CommandRisk, TestRunResult
 
 BLOCKED_EXIT_CODE = 126
@@ -32,6 +36,7 @@ class CommandRunner(ICommandRunner):
         timeout_seconds: int = 120,
         session_logger: SessionLogger | None = None,
         approval_manager: ApprovalManager | None = None,
+        diagnostic_digest: DiagnosticDigest | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -40,6 +45,11 @@ class CommandRunner(ICommandRunner):
         self.timeout_seconds = timeout_seconds
         self.session_logger = session_logger
         self.audit_logger = AuditLogger(self.workspace_root)
+        self.diagnostic_digest = diagnostic_digest or DiagnosticDigest(
+            self.workspace_root, memory_adapter=CodebaseMemoryAdapter()
+        )
+        self.diagnostics_workspace = DiagnosticsWorkspace(self.workspace_root)
+        self.last_error_packet: ErrorPacket | None = None
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
         if self.session_logger:
@@ -133,6 +143,7 @@ class CommandRunner(ICommandRunner):
                 "timeout",
                 details={"command": command, "stdout": stdout, "stderr": message},
             )
+            self._run_diagnostics(command, validated_cwd, TIMEOUT_EXIT_CODE, stdout, message)
             return TIMEOUT_EXIT_CODE, stdout, message
 
         result = (
@@ -157,7 +168,34 @@ class CommandRunner(ICommandRunner):
             "success" if result[0] == 0 else "error",
             details={"command": command, "exit_code": result[0], "stdout": result[1], "stderr": result[2]},
         )
+        self._run_diagnostics(command, validated_cwd, result[0], result[1], result[2])
         return result
+
+    def _run_diagnostics(self, command: str, cwd: Path, exit_code: int, stdout: str, stderr: str) -> None:
+        """Parse this command's output into a compact ErrorPacket *before*
+        anything reaches the model - never the other way around. Best-effort:
+        a digest failure must never break command execution or hide the raw
+        result already returned to the caller."""
+        try:
+            raw_log_path = str(self.session_logger.events_path) if self.session_logger else ""
+            packet = self.diagnostic_digest.run(command, cwd, exit_code, stdout, stderr, raw_log_path=raw_log_path)
+            self.last_error_packet = packet
+            self.diagnostics_workspace.save_packet(packet.to_dict())
+            if self.session_logger:
+                self.session_logger.log(
+                    "diagnostics.packet",
+                    packet.to_dict(),
+                    packet.summary or "Diagnostics parsed.",
+                    workflow_id="diagnostics",
+                )
+        except Exception as exc:  # pragma: no cover - defensive, must never break command execution
+            if self.session_logger:
+                self.session_logger.log(
+                    "diagnostics.error",
+                    {"command": command, "error": str(exc)},
+                    "DiagnosticDigest failed; raw output remains available in session logs.",
+                    workflow_id="diagnostics",
+                )
 
     def validate_and_approve(
         self,

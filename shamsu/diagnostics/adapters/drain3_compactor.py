@@ -82,7 +82,9 @@ def is_noisy_runtime_log(tool: str, structured_diagnostic_count: int, line_count
     tool known to run as a long-lived dev process is "noisy runtime log"
     territory, where Drain3-style compaction is appropriate - not a
     compiler/linter run where every line matters."""
-    noisy_tools = {"npm run dev", "vite", "node", "webpack-dev-server", "next dev"}
+    # Matches the canonical (tool, language) names shamsu.diagnostics.normalize
+    # .detect_tool() returns, plus a couple of raw aliases for direct callers.
+    noisy_tools = {"npm dev", "vite", "node", "webpack-dev-server", "next dev"}
     if structured_diagnostic_count > 0:
         return False
     return line_count > 40 and any(candidate in tool for candidate in noisy_tools)

@@ -32,6 +32,10 @@ from rich.text import Text
 
 from shamsu.abstract.service import REQUIRED_TOOL_MESSAGE, AbstractService
 from shamsu.agents.audit_workflow import AuditWorkflow
+from shamsu.diagnostics import doctor as diagnostics_doctor
+from shamsu.diagnostics import setup as diagnostics_setup
+from shamsu.diagnostics.digest import DiagnosticDigest
+from shamsu.diagnostics.setup import DiagnosticsWorkspace
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
@@ -95,6 +99,7 @@ from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.dev_server import DevServerManager, infer_dev_command, is_dev_server_command
 from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
+from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
@@ -181,6 +186,13 @@ SYSTEM_COMMANDS = (
     "/trace on",
     "/trace off",
     "/trace verbose",
+    "/diagnostics setup",
+    "/diagnostics repair",
+    "/diagnostics status",
+    "/diagnostics last",
+    "/diagnostics parse",
+    "/diagnostics explain",
+    "/diagnostics sources",
     "/log",
     "/log tail",
     "/edit ",
@@ -308,6 +320,13 @@ def _print_help(console: Console) -> None:
                     "  /tasks show <id>          Show a task's steps, phase, and blockers",
                     "  /autonomy status          Show whether long-running mode is on",
                     "  /autonomy on|off          Toggle long-running autonomous mode for this workspace",
+                    "  /diagnostics status       Show diagnostic helper availability (Drain3, etc.)",
+                    "  /diagnostics setup        Install optional local diagnostic helpers",
+                    "  /diagnostics repair       Re-check diagnostic helpers and print repair steps",
+                    "  /diagnostics last         Show the latest parsed ErrorPacket",
+                    "  /diagnostics parse        Re-parse the latest command output",
+                    "  /diagnostics explain      Explain the deterministic root-cause selection",
+                    "  /diagnostics sources      Show which parser handled the latest output",
                     "  /log tail                 Show recent session events",
                     "  /edit <request>           Force code-edit workflow",
                     "  /fix <bug/traceback>      Force bug-fix workflow",
@@ -769,6 +788,7 @@ def _memory_command_allowed(normalized_input: str) -> bool:
     return (
         lowered in {"help", "doctor", "exit", "quit"}
         or lowered.startswith("memory")
+        or lowered.startswith("diagnostics")
     )
 
 
@@ -974,6 +994,104 @@ def _handle_trace(user_input: str, workspace: Path, console: Console) -> None:
         console.print(f"Trace mode: [bold]{_trace_mode(workspace)}[/bold]")
         return
     console.print("[red]Usage: trace status|on|off|verbose[/red]")
+
+
+_ROOT_CAUSE_EXPLANATIONS = {
+    "missing_export": "an import/export mismatch was found; these are treated as the root cause because they typically cascade into many downstream type/symbol errors.",
+    "import_export_mismatch": "an import/export mismatch was found; these are treated as the root cause because they typically cascade into many downstream type/symbol errors.",
+    "runtime_missing_export": "a browser/runtime module failed to provide an expected export; treated as root cause ahead of any downstream errors it causes.",
+    "module_not_found": "a module could not be resolved at all; nothing downstream can be trusted until this resolves, so it is treated as root cause.",
+    "syntax_error": "a syntax error was found; syntax errors are prioritized ahead of type errors because the file cannot be parsed correctly until they're fixed.",
+    "type_error": "a type error was found with no higher-priority (syntax/import) error present.",
+    "test_failure": "a test failure was found with no higher-priority compiler/import error present.",
+    "exception": "an unhandled exception's final frame was identified as the most specific failure point.",
+}
+
+
+def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else ""
+    ws = DiagnosticsWorkspace(workspace)
+
+    if subcommand == "setup":
+        result = diagnostics_setup.setup(workspace)
+        console.print("[green]Diagnostics setup complete.[/green]" if result.get("ok") else f"[yellow]Diagnostics setup finished with issues: {result}[/yellow]")
+        return
+    if subcommand == "repair":
+        result = diagnostics_doctor.repair(workspace)
+        console.print(result.get("manual_steps", ""))
+        return
+    if subcommand == "status":
+        payload = diagnostics_doctor.check(workspace)
+        console.print(diagnostics_doctor.format_report(payload))
+        return
+    if subcommand in {"last", "parse", "explain", "sources"}:
+        packet = ws.last_packet()
+        if not packet:
+            console.print("[yellow]No ErrorPacket recorded yet. Run a command first (e.g. a build/test).[/yellow]")
+            return
+        if subcommand == "last":
+            console.print(f"[bold]{packet.get('summary', '')}[/bold]")
+            console.print(f"Command: {packet.get('command', '')} (exit {packet.get('exit_code')})")
+            for record in packet.get("root_diagnostics", []):
+                location = f"{record.get('file', '')}:{record.get('line', '')}" if record.get("file") else ""
+                console.print(f"- [{record.get('category')}] {record.get('code', '')} {location} {record.get('message', '')}".strip())
+            if packet.get("target_files"):
+                console.print("Target files: " + ", ".join(packet["target_files"]))
+            for snippet in packet.get("recommended_snippets", []):
+                console.print(f"Recommended snippet: {snippet['file']} lines {snippet['line_start']}-{snippet['line_end']} ({snippet['reason']})")
+            return
+        if subcommand == "sources":
+            console.print("Parser chain: " + (", ".join(packet.get("parser_chain", [])) or "none (no diagnostics extracted)"))
+            return
+        if subcommand == "explain":
+            root = packet.get("root_diagnostics", [])
+            if not root:
+                console.print("No root diagnostic was selected (command succeeded or nothing was extracted).")
+                return
+            category = root[0].get("category", "")
+            reason = _ROOT_CAUSE_EXPLANATIONS.get(category, "no higher-priority category matched, so this was the first diagnostic after deduping/grouping.")
+            console.print(f"Root cause selection: {reason}")
+            console.print(f"Diagnostic: [{category}] {root[0].get('code', '')} {root[0].get('message', '')}")
+            return
+        if subcommand == "parse":
+            reparsed = _reparse_last_command(workspace, ws)
+            if reparsed is None:
+                console.print("[yellow]No recent command output found in session logs to re-parse.[/yellow]")
+                return
+            console.print(f"[green]Re-parsed.[/green] {reparsed.summary}")
+            return
+    console.print("[red]Usage: /diagnostics setup|repair|status|last|parse|explain|sources[/red]")
+
+
+def _reparse_last_command(workspace: Path, ws: "DiagnosticsWorkspace"):
+    raw_log_path = Path((ws.last_packet() or {}).get("raw_log_path", ""))
+    if not raw_log_path.is_file():
+        return None
+    command_event = None
+    for line in reversed(raw_log_path.read_text(encoding="utf-8").splitlines()):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("event_type") in {"command.finished", "command.failed"}:
+            command_event = event
+            break
+    if not command_event:
+        return None
+    payload = command_event.get("payload", {})
+    digest = DiagnosticDigest(workspace, memory_adapter=CodebaseMemoryAdapter())
+    packet = digest.run(
+        payload.get("command", ""),
+        workspace,
+        payload.get("exit_code", 0),
+        payload.get("stdout", ""),
+        payload.get("stderr", ""),
+        raw_log_path=str(raw_log_path),
+    )
+    ws.save_packet(packet.to_dict())
+    return packet
 
 
 def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
@@ -4150,6 +4268,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("trace"):
             _handle_trace(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("diagnostics"):
+            _handle_diagnostics(normalized_input, workspace, console)
             continue
         if lowered_input == "log" or lowered_input.startswith("log "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

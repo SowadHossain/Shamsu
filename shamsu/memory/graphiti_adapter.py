@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -22,6 +23,10 @@ from shamsu.memory.types import GraphitiHealth, LongTermMemory, MemoryKind
 
 INSTALL_TIMEOUT_SECONDS = 600
 CALL_TIMEOUT_SECONDS = 120
+# add_episode/remember run several local-LLM round-trips for entity/edge
+# extraction against the episode text, which is much slower than a plain
+# embedding search - especially on the first call while the model loads.
+WRITE_CALL_TIMEOUT_SECONDS = 300
 VERSION_TIMEOUT_SECONDS = 10
 DOCKER_TIMEOUT_SECONDS = 60
 DOCKER_DAEMON_TIMEOUT_SECONDS = 90
@@ -89,6 +94,13 @@ def _is_default_falkordb_uri(uri: str) -> bool:
     )
 
 
+def _sanitize_group_id(name: str) -> str:
+    """graphiti-core's group_id must be only [a-zA-Z0-9_-], so a workspace
+    name with spaces, dots, colons, etc. can't be used verbatim."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-")
+    return cleaned or "workspace"
+
+
 def _find_docker_executable() -> str | None:
     found = shutil.which("docker")
     if found:
@@ -132,7 +144,7 @@ class GraphitiAdapter:
             "llm_model": os.environ.get("SHAMSU_GRAPHITI_LLM_MODEL", "qwen3:8b"),
             "embedding_model": os.environ.get("SHAMSU_GRAPHITI_EMBEDDING_MODEL", "nomic-embed-text"),
             "embedding_dim": int(os.environ.get("SHAMSU_GRAPHITI_EMBEDDING_DIM", "768")),
-            "group_id": f"shamsu:{Path(workspace).resolve().name}",
+            "group_id": f"shamsu-{_sanitize_group_id(Path(workspace).resolve().name)}",
             "telemetry": False,
         }
 
@@ -441,12 +453,17 @@ class GraphitiAdapter:
         if not health.ok:
             return {"ok": False, "error": health.message}
         python = Path(health.tool_path)
-        request = {"action": action, "config": {**self.default_config(workspace), **self._read_config(workspace)}, "payload": payload}
+        config = {**self.default_config(workspace), **self._read_config(workspace)}
+        # Sanitize even if an older saved config.json has a pre-fix group_id
+        # (e.g. containing ":") on disk from before workspace names were cleaned.
+        config["group_id"] = _sanitize_group_id(str(config.get("group_id") or "workspace"))
+        request = {"action": action, "config": config, "payload": payload}
         script = _GRAPHITI_HELPER
+        timeout = WRITE_CALL_TIMEOUT_SECONDS if action in {"add_episode", "remember"} else CALL_TIMEOUT_SECONDS
         try:
             completed = subprocess.run(
                 [str(python), "-c", script], input=json.dumps(request), capture_output=True,
-                text=True, timeout=CALL_TIMEOUT_SECONDS, creationflags=_no_window_flags()
+                text=True, timeout=timeout, creationflags=_no_window_flags()
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"ok": False, "error": f"Graphiti call failed: {exc}"}
@@ -462,6 +479,7 @@ class GraphitiAdapter:
 _GRAPHITI_HELPER = r'''
 import asyncio, json, os, sys
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 async def main():
     req = json.loads(sys.stdin.read())
@@ -478,7 +496,16 @@ async def main():
     embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(api_key="ollama", embedding_model=cfg["embedding_model"], embedding_dim=int(cfg.get("embedding_dim", 768)), base_url=cfg["llm_base_url"]))
     cross = OpenAIRerankerClient(client=llm_client, config=llm_config)
     uri = cfg["graph_backend_uri"]
-    graphiti = Graphiti(uri, "neo4j", "password", llm_client=llm_client, embedder=embedder, cross_encoder=cross)
+    # falkor:// is a SHAMSU-local convention, not a driver scheme Graphiti/Neo4j
+    # understands; the falkordb backend needs its own FalkorDriver instance,
+    # not a bare uri/user/password triple (which always builds a Neo4jDriver).
+    if cfg.get("backend", "falkordb") == "falkordb":
+        from graphiti_core.driver.falkordb_driver import FalkorDriver
+        parsed = urlparse(uri)
+        driver = FalkorDriver(host=parsed.hostname or "localhost", port=parsed.port or 6379)
+        graphiti = Graphiti(graph_driver=driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross)
+    else:
+        graphiti = Graphiti(uri, "neo4j", "password", llm_client=llm_client, embedder=embedder, cross_encoder=cross)
     action = req["action"]
     payload = req["payload"]
     group_id = cfg.get("group_id", "shamsu")

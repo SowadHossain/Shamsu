@@ -6,9 +6,12 @@ from pathlib import Path
 from typing import Protocol
 
 from shamsu.agents.bugfix_workflow import BugFixResult, BugFixWorkflow
+from shamsu.diagnostics.digest import DiagnosticDigest
+from shamsu.diagnostics.types import ErrorPacket
 from shamsu.interfaces import ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.session.manager import SessionLogger
-from shamsu.tools.django import DjangoTestRunner
+from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+from shamsu.tools.django import DJANGO_TEST_COMMAND, DjangoTestRunner
 from shamsu.types import TestRunResult
 from shamsu.ui.progress import ProgressReporter
 
@@ -33,6 +36,7 @@ class FeedbackIteration:
     fix_applied: bool = False
     changed_files: list[str] = field(default_factory=list)
     error: str = ""
+    diagnostics_summary: str = ""
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ class ErrorFeedbackLoop:
         long_running: bool = False,
         max_same_error_retries: int = 2,
         progress: ProgressReporter | None = None,
+        diagnostic_digest: DiagnosticDigest | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.search = search
@@ -75,6 +80,9 @@ class ErrorFeedbackLoop:
         self.max_iterations = LONG_RUNNING_MAX_ITERATIONS if long_running else max_iterations
         self.max_same_error_retries = max_same_error_retries
         self.progress = progress
+        self.diagnostic_digest = diagnostic_digest or DiagnosticDigest(
+            self.workspace_root, memory_adapter=CodebaseMemoryAdapter()
+        )
 
     async def run(self, project_cwd: Path | str = ".") -> ErrorFeedbackResult:
         iterations: list[FeedbackIteration] = []
@@ -104,7 +112,10 @@ class ErrorFeedbackLoop:
                     error=message,
                 )
             self._progress(f"Repair attempt {index}/{self.max_iterations}")
-            bug_report = _bug_report_from_tests(final_result, index)
+            packet = self._digest_test_result(final_result)
+            if packet.root_diagnostics:
+                self._progress(f"Diagnostics: {packet.summary}")
+            bug_report = _bug_report_from_tests(final_result, index, packet)
             fix = await self.bugfix_workflow.run(bug_report)
             iterations.append(
                 FeedbackIteration(
@@ -113,6 +124,7 @@ class ErrorFeedbackLoop:
                     fix_applied=fix.applied,
                     changed_files=fix.changed_files,
                     error=fix.error,
+                    diagnostics_summary=packet.summary,
                 )
             )
             if not fix.applied:
@@ -172,18 +184,34 @@ class ErrorFeedbackLoop:
         if self.progress:
             self.progress.step(message)
 
+    def _digest_test_result(self, result: TestRunResult) -> ErrorPacket:
+        """Parse the test run's raw output into a compact ErrorPacket before
+        it reaches the bugfix workflow's LLM call - never the other way
+        around. Best-effort: falls back to an empty packet on failure so the
+        existing raw-output-based bug report path still works."""
+        exit_code = 0 if result.failed == 0 else 1
+        try:
+            return self.diagnostic_digest.run(
+                DJANGO_TEST_COMMAND, self.workspace_root, exit_code, "", result.raw_output
+            )
+        except Exception:  # pragma: no cover - defensive, must never block the feedback loop
+            return ErrorPacket(command=DJANGO_TEST_COMMAND, exit_code=exit_code)
 
-def _bug_report_from_tests(result: TestRunResult, iteration: int) -> str:
+
+def _bug_report_from_tests(result: TestRunResult, iteration: int, packet: ErrorPacket | None = None) -> str:
     failures = "\n".join(
         f"- {failure.test_name} {failure.file}:{failure.line or ''} {failure.error_message}"
         for failure in result.failures
     )
+    diagnostics_section = f"{packet.to_model_context()}\n\n" if packet and packet.root_diagnostics else ""
+    log_section = packet.compact_log if packet and packet.root_diagnostics and packet.compact_log else result.raw_output
     return (
+        f"{diagnostics_section}"
         f"Django test feedback iteration {iteration} failed.\n"
         f"Passed: {result.passed}\n"
         f"Failed: {result.failed}\n\n"
         f"Structured failures:\n{failures or 'No structured failures parsed.'}\n\n"
-        f"Raw output:\n{result.raw_output}"
+        f"Raw output:\n{log_section}"
     )
 
 

@@ -33,7 +33,7 @@ MISSING_EXPORT_RE = re.compile(
     re.IGNORECASE,
 )
 MODULE_PATH_RE = re.compile(
-    r"(?:[Mm]odule\s+['\"](?P<module>[^'\"]+)['\"]|requested module\s+['\"](?P<requested>[^'\"]+)['\"])"
+    r"(?:[Mm]odule\s+['\"]+(?P<module>[^'\"]+)['\"]+|requested module\s+['\"]+(?P<requested>[^'\"]+)['\"]+)"
 )
 DID_YOU_MEAN_RE = re.compile(r"Did you mean\s+['\"](?P<suggestion>[A-Za-z_$][\w$]*)['\"]")
 
