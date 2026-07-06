@@ -811,42 +811,55 @@ def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> N
     _, _, rest = user_input.partition(" ")
     parts = rest.strip().split(maxsplit=1)
     subcommand = parts[0].lower() if parts else "status"
+    ws = DiagnosticsWorkspace(workspace)
     if subcommand == "status":
-        console.print(diagnostics_status(workspace))
+        console.print(diagnostics_doctor.format_report(diagnostics_doctor.check(workspace)))
         return
     if subcommand == "setup":
-        console.print(diagnostics_setup(workspace))
+        console.print(diagnostics_setup.setup(workspace))
         return
     if subcommand == "repair":
-        console.print(diagnostics_repair(workspace))
+        console.print(diagnostics_doctor.repair(workspace))
         return
     if subcommand == "last":
-        packet = diagnostics_last_packet(workspace)
-        if not packet.get("ok", True):
-            console.print(f"[yellow]{packet.get('error')}[/yellow]")
+        packet = ws.last_packet()
+        if not packet:
+            console.print("[yellow]No ErrorPacket recorded yet.[/yellow]")
             return
         console.print(Panel(_format_diagnostic_packet(packet), title="Latest ErrorPacket"))
         return
     if subcommand == "parse":
-        packet = diagnostics_last_packet(workspace)
-        raw_log = packet.get("raw_log_path") if packet.get("ok", True) else ""
+        packet = ws.last_packet()
+        raw_log = packet.get("raw_log_path") if packet else ""
         if not raw_log or not Path(raw_log).exists():
             console.print("[yellow]No raw diagnostic log is available to parse.[/yellow]")
             return
         text = Path(raw_log).read_text(encoding="utf-8", errors="replace")
-        digest = DiagnosticDigest(workspace)
-        parsed = digest.digest(packet.get("command", "unknown"), packet.get("cwd", workspace), int(packet.get("exit_code", 1)), stdout=text, stderr="")
-        console.print(Panel(parsed.compact_text(), title="Re-parsed ErrorPacket"))
+        parsed = DiagnosticDigest(workspace).run(
+            packet.get("command", "unknown"),
+            packet.get("cwd", workspace),
+            int(packet.get("exit_code", 1)),
+            text,
+            "",
+            raw_log_path=raw_log,
+        )
+        console.print(Panel(parsed.to_model_context(), title="Re-parsed ErrorPacket"))
         return
     if subcommand == "explain":
-        console.print(diagnostics_explain(workspace))
+        packet = ws.last_packet()
+        if not packet:
+            console.print("No ErrorPacket recorded yet.")
+            return
+        console.print(_explain_diagnostic_packet(packet))
         return
     if subcommand == "sources":
-        console.print(diagnostics_sources(workspace))
+        packet = ws.last_packet()
+        if not packet:
+            console.print("No ErrorPacket recorded yet.")
+            return
+        console.print("Parser chain: " + ", ".join(packet.get("parser_chain", []) or ["unknown"]))
         return
     console.print("[red]Usage: /diagnostics status|setup|repair|last|parse|explain|sources[/red]")
-
-
 
 def _explain_diagnostic_packet(packet: dict[str, Any]) -> str:
     lines = ["Deterministic root cause selection:"]
