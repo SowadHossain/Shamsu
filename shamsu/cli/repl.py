@@ -1,4 +1,4 @@
-﻿"""
+"""
 Minimal REPL shell.
 
 The selected workspace is the sandbox boundary for project reads and indexes.
@@ -141,6 +141,13 @@ SYSTEM_COMMANDS = (
     "/abstract symbols ",
     "/abstract who-uses ",
     "/abstract impact ",
+    "/diagnostics status",
+    "/diagnostics setup",
+    "/diagnostics repair",
+    "/diagnostics last",
+    "/diagnostics parse",
+    "/diagnostics explain",
+    "/diagnostics sources",
     "/memory status",
     "/memory setup",
     "/memory repair",
@@ -294,6 +301,13 @@ def _print_help(console: Console) -> None:
                     "  /abstract symbols <name-or-file>",
                     "  /abstract who-uses <symbol>   Callers/importers of a symbol",
                     "  /abstract impact <symbol>     Edit impact / blast radius",
+                    "  /diagnostics status      Show deterministic parser/compactor health",
+                    "  /diagnostics setup       Initialize local diagnostics config",
+                    "  /diagnostics repair      Re-check diagnostics helper setup",
+                    "  /diagnostics last        Show latest compact ErrorPacket",
+                    "  /diagnostics parse       Re-parse latest raw command log",
+                    "  /diagnostics explain     Explain root selection policy",
+                    "  /diagnostics sources     Show parser/helper chain for latest log",
                     "  /memory status           Show Graphiti long-term memory health",
                     "  /memory setup            Install/configure local Graphiti memory",
                     "  /memory repair           Re-check and repair Graphiti config",
@@ -395,7 +409,7 @@ def _handle_parse_prd(user_input: str, workspace: Path, console: Console) -> Non
     try:
         file_path = _resolve_workspace_file(cleaned_path, workspace)
     except SecurityError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     if not file_path.exists() or not file_path.is_file():
         console.print(f"[red]File not found: {file_path}[/red]")
@@ -403,7 +417,7 @@ def _handle_parse_prd(user_input: str, workspace: Path, console: Console) -> Non
     try:
         parsed = parse_prd_file(file_path)
     except PRDParseError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     console.print(f"Title: {parsed.title}")
     console.print(json.dumps(parsed.sections, indent=2))
@@ -424,7 +438,7 @@ def _handle_plan_prd(
     try:
         file_path = _resolve_workspace_file(cleaned_path, workspace)
     except SecurityError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     if not file_path.exists() or not file_path.is_file():
         console.print(f"[red]File not found: {file_path}[/red]")
@@ -432,7 +446,7 @@ def _handle_plan_prd(
     try:
         parsed = parse_prd_file(file_path)
     except PRDParseError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
 
     _log_event(
@@ -491,7 +505,7 @@ def _handle_generate_django(
     try:
         file_path = _resolve_workspace_file(cleaned_path, workspace)
     except SecurityError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     if not file_path.exists() or not file_path.is_file():
         console.print(f"[red]File not found: {file_path}[/red]")
@@ -499,7 +513,7 @@ def _handle_generate_django(
     try:
         parsed = parse_prd_file(file_path)
     except PRDParseError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     _log_event(
         session_logger,
@@ -557,7 +571,7 @@ async def _handle_generate_prd(
     try:
         prd_path, output_dir = _parse_generate_prd_args(user_input)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     search, _uses_real_index = _build_search_agent(workspace, session_logger)
     result = await FullDjangoPipeline(
@@ -792,6 +806,83 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
     )
 
 
+
+def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else "status"
+    if subcommand == "status":
+        console.print(diagnostics_status(workspace))
+        return
+    if subcommand == "setup":
+        console.print(diagnostics_setup(workspace))
+        return
+    if subcommand == "repair":
+        console.print(diagnostics_repair(workspace))
+        return
+    if subcommand == "last":
+        packet = diagnostics_last_packet(workspace)
+        if not packet.get("ok", True):
+            console.print(f"[yellow]{packet.get('error')}[/yellow]")
+            return
+        console.print(Panel(_format_diagnostic_packet(packet), title="Latest ErrorPacket"))
+        return
+    if subcommand == "parse":
+        packet = diagnostics_last_packet(workspace)
+        raw_log = packet.get("raw_log_path") if packet.get("ok", True) else ""
+        if not raw_log or not Path(raw_log).exists():
+            console.print("[yellow]No raw diagnostic log is available to parse.[/yellow]")
+            return
+        text = Path(raw_log).read_text(encoding="utf-8", errors="replace")
+        digest = DiagnosticDigest(workspace)
+        parsed = digest.digest(packet.get("command", "unknown"), packet.get("cwd", workspace), int(packet.get("exit_code", 1)), stdout=text, stderr="")
+        console.print(Panel(parsed.compact_text(), title="Re-parsed ErrorPacket"))
+        return
+    if subcommand == "explain":
+        console.print(diagnostics_explain(workspace))
+        return
+    if subcommand == "sources":
+        console.print(diagnostics_sources(workspace))
+        return
+    console.print("[red]Usage: /diagnostics status|setup|repair|last|parse|explain|sources[/red]")
+
+
+
+def _explain_diagnostic_packet(packet: dict[str, Any]) -> str:
+    lines = ["Deterministic root cause selection:"]
+    roots = packet.get("root_diagnostics", [])
+    if not roots:
+        lines.append("- No root diagnostics were recorded in the latest ErrorPacket.")
+        return "\n".join(lines)
+    lines.append("- Native/SARIF/errorformat parsing runs before fallback parsers; no LLM parses raw logs first.")
+    lines.append("- Syntax and import/export errors are ranked before cascading noise.")
+    for item in roots[:5]:
+        code = f" {item.get('code')}" if item.get("code") else ""
+        lines.append(f"- Root cause: {item.get('category')}{code} {item.get('message', '')}".strip())
+    return "\n".join(lines)
+def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
+    lines = [packet.get("summary", "No summary.")]
+    roots = packet.get("root_diagnostics", [])
+    if roots:
+        lines.append("Root diagnostics:")
+        for item in roots[:5]:
+            loc = item.get("file") or item.get("module") or "unknown"
+            if item.get("line"):
+                loc += f":{item.get('line')}"
+            code = f" {item.get('code')}" if item.get("code") else ""
+            lines.append(f"- {item.get('category')}{code} {loc} {item.get('message')}")
+    snippets = packet.get("recommended_snippets", [])
+    if snippets:
+        lines.append("Recommended snippets:")
+        for snippet in snippets[:8]:
+            lines.append(f"- {snippet.get('file')}:{snippet.get('line_start')}-{snippet.get('line_end')} {snippet.get('reason', '')}")
+    facts = packet.get("related_code_facts", [])
+    if facts:
+        lines.append("Related code facts:")
+        lines.extend(f"- {fact}" for fact in facts[:8])
+    if packet.get("raw_log_path"):
+        lines.append(f"Raw log: {packet.get('raw_log_path')}")
+    return "\n".join(lines)
 def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None:
     try:
         service = MemoryService(workspace)
@@ -1827,7 +1918,7 @@ def _handle_sessions(
             console.print(f"[green]Exported session bundle: {path}[/green]")
             return current
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return current
     console.print("[red]Usage: sessions list|current|show|resume|rename|close|export[/red]")
     return current
@@ -2429,7 +2520,7 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> None:
     try:
         parsed = parse_prd_file(absolute_path)
     except PRDParseError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
     section_names = ", ".join(parsed.sections.keys()) or "none"
     console.print(
@@ -3227,7 +3318,7 @@ async def _handle_prd_build_request(
     try:
         parsed = parse_prd_file(prd_path)
     except PRDParseError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return
 
     try:
@@ -4355,7 +4446,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         workspace = resolve_workspace(args.workspace)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         sys.exit(2)
 
     # Resolve the active model tier (env var > persisted workspace choice >
@@ -4386,7 +4477,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         session_logger = _start_session(args, workspace, console)
     except ValueError as exc:
-        console.print(f"[red]{exc}[/red]")
+        console.print(f"[red]{exc}[/red]", soft_wrap=True)
         sys.exit(2)
     console.print("[dim]Type a prompt, or `/help` for commands.[/dim]\n")
     web_tool = WebTool(
@@ -4455,6 +4546,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("abstract"):
             _handle_abstract(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("diagnostics"):
+            _handle_diagnostics(normalized_input, workspace, console)
             continue
         if lowered_input.startswith("parse-prd "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
@@ -4533,8 +4627,3 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-
-

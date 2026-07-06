@@ -1,7 +1,7 @@
-﻿"""
+"""
 Read-only environment diagnostics for SHAMSU.
 
-`doctor` never installs, deletes, or repairs anything â€” it only reports.
+`doctor` never installs, deletes, or repairs anything - it only reports.
 It exists so "something feels broken" no longer defaults to wiping the
 venv and reinstalling; run doctor first and see what it actually finds.
 """
@@ -18,6 +18,7 @@ from shamsu.runtime.ollama import RuntimeStatus, collect_status, repo_root_from_
 from shamsu.runtime.models import allowed_model_names, is_allowed_model
 from shamsu.abstract.service import AbstractService
 from shamsu.memory.service import MemoryService
+from shamsu.diagnostics import doctor as diagnostics_doctor
 
 IGNORED_DIR_NAMES = {".venv", ".git", "node_modules", "__pycache__"}
 
@@ -136,6 +137,24 @@ def check_codebase_memory(workspace: Path, service: AbstractService | None = Non
     )
 
 
+
+def check_diagnostics(workspace: Path) -> DoctorCheck:
+    try:
+        status = diagnostics_doctor.check(workspace)
+    except Exception as exc:
+        return DoctorCheck(
+            "diagnostics",
+            False,
+            f"Diagnostic helper status failed: {exc}",
+            "Run `/diagnostics repair`.",
+        )
+    llmlingua = status.get("llmlingua", {})
+    detail = (
+        f"Diagnostics config ready. reviewdog/errorformat={status.get('reviewdog_errorformat', {}).get('external_binary')}; "
+        f"Drain3-style compactor={status.get('drain3', {}).get('external_package')}; "
+        f"LLMLingua enabled={llmlingua.get('enabled', False)}."
+    )
+    return DoctorCheck("diagnostics", True, detail)
 def _global_launcher_dir() -> Path:
     """`~/.shamsu` holds the user-local launcher + PATH manifest, not a project workspace."""
     return (Path.home() / ".shamsu").resolve()
@@ -265,6 +284,7 @@ def run_doctor(
         check_path_manifest(bin_dir),
         check_graphiti_memory(resolved_workspace, graphiti_memory_service),
         check_codebase_memory(resolved_workspace, codebase_memory_service),
+        check_diagnostics(resolved_workspace),
     )
     return DoctorReport(checks=checks)
 
@@ -304,4 +324,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

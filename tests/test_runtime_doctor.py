@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -262,7 +262,8 @@ def test_run_doctor_combines_all_checks(tmp_path):
     )
 
     assert isinstance(report, DoctorReport)
-    assert len(report.checks) == 8
+    assert len(report.checks) == 9
+    assert any(check.name == "diagnostics" for check in report.checks)
     assert report.all_ok is True
 
 
@@ -297,4 +298,3 @@ def test_format_report_marks_ok():
 
     assert "OK" in text
     assert "Everything looks fine." in text
-
