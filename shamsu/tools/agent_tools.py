@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
@@ -40,6 +41,7 @@ class AgentToolRegistry:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.workspace_tool = WorkspaceTool(self.workspace_root)
+        self.transactions = TransactionWorkspace(self.workspace_root)
         self.command_runner = CommandRunner(
             self.workspace_root,
             approval_func=approval_func,
@@ -172,13 +174,25 @@ class AgentToolRegistry:
         )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "File write denied by user.", {"filepath": filepath})
+        # Every model-driven write goes through a transaction (backup + hash)
+        # even for this simple full-overwrite path, so it can be rolled back
+        # via /patch rollback like any other mutation - the model never gets
+        # to overwrite a file with no safety net.
+        transaction_id = self.transactions.begin(
+            reason=f"Agent write_file: {filepath}",
+            operations=[{"op": "edit_file" if exists else "create_file", "path": filepath, "dest_path": "", "reason": ""}],
+            destructive=False,
+        )
+        self.transactions.backup_file(transaction_id, filepath)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        self.transactions.record_after(transaction_id, filepath)
+        self.transactions.finalize(transaction_id, "applied")
         _mark_code_memory_stale(self.workspace_root)
         return ToolResult(
             True,
             f"Wrote {filepath}.",
-            {"filepath": filepath, "bytes_written": len(content.encode("utf-8"))},
+            {"filepath": filepath, "bytes_written": len(content.encode("utf-8")), "transaction_id": transaction_id},
         )
 
     def run_command(self, command: str, cwd: str = ".") -> ToolResult:

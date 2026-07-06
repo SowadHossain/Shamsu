@@ -10,11 +10,32 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from shamsu.interfaces import IPatchEngine
+from shamsu.patch import git_apply
+from shamsu.patch.file_mutations import FileMutationOps
+from shamsu.patch.formatter import run_formatter
+from shamsu.patch.journal import MutationJournal
+from shamsu.patch.safety import (
+    MutationSafetyError,
+    is_secret_file,
+    validate_mutation_path,
+)
+from shamsu.patch.trash import TrashWorkspace
+from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.patch.types import (
+    ChangeRequestError,
+    MutationResult,
+    Operation,
+    VerificationOutcome,
+    parse_change_request,
+)
+from shamsu.patch.verifier import is_stalled, run_verification
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.audit import AuditLogger
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
+from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+from shamsu.tools.executor import CommandRunner
 from shamsu.types import ApprovalRequest
 
 HUNK_HEADER_RE = re.compile(
@@ -91,6 +112,8 @@ class PatchEngine(IPatchEngine):
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         session_logger: SessionLogger | None = None,
         approval_manager: ApprovalManager | None = None,
+        command_runner: CommandRunner | None = None,
+        memory_adapter: CodebaseMemoryAdapter | None = None,
     ) -> None:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -98,6 +121,16 @@ class PatchEngine(IPatchEngine):
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
         self.audit_logger = AuditLogger(self.workspace_root)
+        self.memory_adapter = memory_adapter
+        self.command_runner = command_runner or CommandRunner(
+            self.workspace_root,
+            approval_func=approval_func,
+            session_logger=session_logger,
+            approval_manager=self.approval_manager,
+        )
+        self.transactions = TransactionWorkspace(self.workspace_root)
+        self.trash = TrashWorkspace(self.workspace_root)
+        self.journal = MutationJournal(self.workspace_root)
 
     def validate_diff(self, diff_text: str) -> tuple[bool, str | None]:
         try:
@@ -176,6 +209,173 @@ class PatchEngine(IPatchEngine):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(backup), str(target))
         return True
+
+    # -- structured model contract: transaction + verification pipeline ---------
+    #
+    # model proposes change -> validate -> transaction snapshot -> apply safely
+    # -> formatter -> verification -> diagnostics on failure -> rollback
+    # available -> success reported only after verification passes.
+
+    def execute_change_request(self, payload: dict) -> MutationResult:
+        """Entry point for the structured model output contract:
+        {"change_plan": {...}, "patch": "unified diff"}. Never trusts the
+        payload: every field is validated before anything touches disk."""
+        try:
+            request = parse_change_request(payload)
+        except ChangeRequestError as exc:
+            return MutationResult(ok=False, error=f"Rejected change request: {exc}")
+        change_plan = request.change_plan
+        patch_text = request.patch
+
+        try:
+            for path in change_plan.touched_paths:
+                validate_mutation_path(self.sandbox, path)
+        except MutationSafetyError as exc:
+            return MutationResult(ok=False, error=str(exc))
+
+        if patch_text.strip():
+            ok, error = self.validate_diff(patch_text)
+            if not ok:
+                return MutationResult(ok=False, error=f"Invalid diff: {error}")
+            if git_apply.available(self.workspace_root):
+                git_ok, git_message = git_apply.check(patch_text, self.workspace_root)
+                if not git_ok:
+                    return MutationResult(ok=False, error=f"git apply --check rejected the patch: {git_message}")
+
+        approval_request = self._build_change_plan_approval(change_plan, patch_text)
+        if not self.approval_manager.ask(approval_request):
+            self.audit_logger.log(
+                "approval", "denied",
+                affected_paths=change_plan.touched_paths,
+                details={"action_type": approval_request.action_type, "reason": change_plan.reason},
+            )
+            return MutationResult(ok=False, error="Change request denied by user.")
+        self.audit_logger.log(
+            "approval", "approved",
+            affected_paths=change_plan.touched_paths,
+            details={"action_type": approval_request.action_type, "reason": change_plan.reason},
+        )
+
+        transaction_id = self.transactions.begin(
+            change_plan.reason,
+            [op.to_dict() for op in change_plan.operations],
+            change_plan.destructive,
+        )
+        mutation_ops = FileMutationOps(
+            self.workspace_root, self.transactions, self.trash, memory_adapter=self.memory_adapter
+        )
+
+        try:
+            touched_files: list[str] = []
+            diff_paths: set[str] = set()
+            if patch_text.strip():
+                diff_paths = {patch.display_path for patch in parse_file_patches(patch_text, self.sandbox)}
+
+            for op in change_plan.operations:
+                if op.op == "apply_patch" and op.path not in diff_paths:
+                    raise DiffValidationError(
+                        f"apply_patch operation declares path {op.path} but the supplied patch has no hunk for it."
+                    )
+                if op.op == "edit_file" and op.path not in diff_paths and not op.content.strip():
+                    raise DiffValidationError(
+                        f"edit_file for {op.path} needs either inline 'content' or a matching patch hunk."
+                    )
+
+            if patch_text.strip():
+                touched_files.extend(
+                    _apply_patch_with_transaction(self.sandbox, self.transactions, transaction_id, patch_text)
+                )
+
+            for op in change_plan.operations:
+                if op.op == "apply_patch":
+                    continue  # already applied via the unified diff above
+                if op.op in {"create_file", "edit_file"} and op.path in diff_paths:
+                    continue  # this file's content already came from the unified diff
+                outcome = self._run_file_operation(mutation_ops, transaction_id, op)
+                if not outcome.ok:
+                    raise DiffValidationError(outcome.error)
+                touched_files.append(outcome.path)
+                if outcome.dest_path:
+                    touched_files.append(outcome.dest_path)
+        except (DiffValidationError, MutationSafetyError, OSError) as exc:
+            manifest = self.transactions.finalize(transaction_id, "failed", error=str(exc))
+            self.audit_logger.log("patch_apply", "error", affected_paths=manifest.get("touched_files", []))
+            return MutationResult(
+                ok=False, transaction_id=transaction_id, reason=change_plan.reason,
+                touched_files=manifest.get("touched_files", []),
+                error=str(exc), rollback_available=True,
+            )
+
+        formatter_result = run_formatter(self.command_runner, self.workspace_root, touched_files)
+        self._log("patch.formatter", formatter_result, "Formatter step finished.")
+
+        verification = VerificationOutcome(ran=False)
+        if change_plan.verification_command.strip():
+            verification = run_verification(self.command_runner, self.workspace_root, change_plan.verification_command)
+            previous_entry = self.journal.last() or {}
+            previous_verification = previous_entry.get("verification") or {}
+            verification.stalled = is_stalled(previous_verification.get("signature", ""), verification)
+        self.transactions.save_patch(transaction_id, patch_text)
+        self.transactions.save_verification(transaction_id, verification.to_dict())
+
+        verification_ok = (not change_plan.verification_command.strip()) or verification.passed
+        status = "applied" if verification_ok else "verification_failed"
+        manifest = self.transactions.finalize(transaction_id, status, error="" if verification_ok else "Verification failed.")
+        self.audit_logger.log(
+            "patch_apply", "success" if verification_ok else "error",
+            affected_paths=manifest.get("touched_files", []),
+        )
+
+        if verification_ok:
+            _queue_code_memory_refresh(self.workspace_root)
+            self._log("patch.applied", {"transaction_id": transaction_id, "files": touched_files}, "Change applied and verified.")
+            return MutationResult(
+                ok=True, transaction_id=transaction_id, reason=change_plan.reason,
+                touched_files=manifest.get("touched_files", []), verification=verification,
+                rollback_available=True,
+            )
+
+        self._log("patch.failed", {"transaction_id": transaction_id, "files": touched_files}, "Verification failed.")
+        return MutationResult(
+            ok=False, transaction_id=transaction_id, reason=change_plan.reason,
+            touched_files=manifest.get("touched_files", []),
+            error="Verification command exited non-zero; change was applied but is not reported as successful.",
+            verification=verification, rollback_available=True,
+        )
+
+    def rollback_transaction(self, transaction_id: str) -> tuple[bool, str]:
+        from shamsu.patch.rollback import rollback_transaction
+
+        return rollback_transaction(self.workspace_root, transaction_id)
+
+    def _run_file_operation(self, mutation_ops: FileMutationOps, transaction_id: str, op: Operation):
+        if op.op == "create_file":
+            return mutation_ops.create_file(transaction_id, op.path, op.content)
+        if op.op == "edit_file":
+            return mutation_ops.edit_file(transaction_id, op.path, op.content)
+        if op.op == "rename_file":
+            return mutation_ops.rename_file(transaction_id, op.path, op.dest_path)
+        if op.op == "move_file":
+            return mutation_ops.move_file(transaction_id, op.path, op.dest_path)
+        if op.op == "delete_file":
+            return mutation_ops.delete_file(transaction_id, op.path)
+        if op.op == "create_directory":
+            return mutation_ops.create_directory(transaction_id, op.path)
+        raise DiffValidationError(f"Unsupported operation: {op.op}")
+
+    def _build_change_plan_approval(self, change_plan, patch_text: str) -> ApprovalRequest:
+        secret_touched = [path for path in change_plan.touched_paths if is_secret_file(path)]
+        description = change_plan.reason
+        if secret_touched:
+            description += f" (WARNING: touches secret-like file(s): {', '.join(secret_touched)})"
+        return ApprovalRequest(
+            action_type="file_delete" if change_plan.destructive else "file_edit",
+            description=description,
+            risk_level="high" if (change_plan.destructive or secret_touched) else "medium",
+            preview=patch_text or "\n".join(str(op.to_dict()) for op in change_plan.operations),
+            working_dir=str(self.workspace_root),
+            reason="Structured change request modifies files inside the selected workspace.",
+        )
 
     def _log(self, event_type: str, payload: dict, summary: str) -> None:
         if self.session_logger:
@@ -467,3 +667,59 @@ def _write_lines(target: Path, lines: list[str]) -> None:
     if lines:
         text += "\n"
     target.write_text(text, encoding="utf-8")
+
+
+def _apply_patch_with_transaction(
+    sandbox: Sandbox,
+    transactions: TransactionWorkspace,
+    transaction_id: str,
+    diff_text: str,
+) -> list[str]:
+    """Apply a unified diff's hunks (reusing the same tested `_apply_hunks`
+    transform as the legacy `.apply()` path) while recording every touched
+    file's before/after state in the transaction store instead of a
+    throwaway `.bak` sibling file."""
+    patches = parse_file_patches(diff_text, sandbox)
+    touched: list[str] = []
+    for patch in patches:
+        old_target = None if patch.old_path == "/dev/null" else sandbox.validate(patch.old_path)
+        new_target = None if patch.new_path == "/dev/null" else sandbox.validate(patch.new_path)
+
+        if patch.is_create:
+            if new_target is None:
+                raise DiffValidationError("Create patch is missing target path.")
+            if new_target.exists():
+                raise DiffValidationError(f"Cannot create existing file: {new_target}")
+            transactions.backup_file(transaction_id, patch.new_path)
+            new_lines = _apply_hunks([], patch.hunks)
+            new_target.parent.mkdir(parents=True, exist_ok=True)
+            _write_lines(new_target, new_lines)
+            transactions.record_after(transaction_id, patch.new_path)
+            touched.append(patch.new_path)
+            continue
+
+        if old_target is None or not old_target.is_file():
+            raise DiffValidationError(f"Patch target does not exist: {old_target}")
+        transactions.backup_file(transaction_id, patch.old_path)
+        original_lines = old_target.read_text(encoding="utf-8").splitlines()
+        new_lines = _apply_hunks(original_lines, patch.hunks)
+
+        if patch.is_delete:
+            old_target.unlink()
+            transactions.record_after(transaction_id, patch.old_path)
+            touched.append(patch.old_path)
+            continue
+
+        if new_target is None:
+            raise DiffValidationError("Patch is missing output path.")
+        renamed = old_target != new_target
+        if renamed:
+            transactions.backup_file(transaction_id, patch.new_path)
+            new_target.parent.mkdir(parents=True, exist_ok=True)
+            old_target.unlink()
+        _write_lines(new_target, new_lines)
+        transactions.record_after(transaction_id, patch.old_path)
+        if renamed:
+            transactions.record_after(transaction_id, patch.new_path)
+        touched.append(patch.display_path)
+    return touched

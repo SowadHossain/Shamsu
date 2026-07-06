@@ -92,7 +92,10 @@ from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_ena
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.permission_store import PermissionMemory
 from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.patch import git_apply as patch_git_apply
+from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
+from shamsu.patch.preview import print_diff_preview
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
@@ -193,6 +196,15 @@ SYSTEM_COMMANDS = (
     "/diagnostics parse",
     "/diagnostics explain",
     "/diagnostics sources",
+    "/patch status",
+    "/patch preview ",
+    "/patch apply ",
+    "/patch rollback ",
+    "/patch journal",
+    "/patch last",
+    "/patch diff ",
+    "/patch trash",
+    "/patch clean-trash",
     "/log",
     "/log tail",
     "/edit ",
@@ -327,6 +339,15 @@ def _print_help(console: Console) -> None:
                     "  /diagnostics parse        Re-parse the latest command output",
                     "  /diagnostics explain      Explain the deterministic root-cause selection",
                     "  /diagnostics sources      Show which parser handled the latest output",
+                    "  /patch status             Show git-apply availability, trash, last transaction",
+                    "  /patch preview <file>     Preview a diff or change-request JSON without applying it",
+                    "  /patch apply <file>       Apply a change-request JSON through the mutation engine",
+                    "  /patch rollback <id>      Restore every file a transaction touched",
+                    "  /patch journal            List all recorded transactions",
+                    "  /patch last               Show the most recent transaction",
+                    "  /patch diff <id>          Show the diff applied by a transaction",
+                    "  /patch trash              List files moved to .shamsu/trash",
+                    "  /patch clean-trash        Permanently delete everything in trash (with approval)",
                     "  /log tail                 Show recent session events",
                     "  /edit <request>           Force code-edit workflow",
                     "  /fix <bug/traceback>      Force bug-fix workflow",
@@ -789,6 +810,7 @@ def _memory_command_allowed(normalized_input: str) -> bool:
         lowered in {"help", "doctor", "exit", "quit"}
         or lowered.startswith("memory")
         or lowered.startswith("diagnostics")
+        or lowered.startswith("patch")
     )
 
 
@@ -1092,6 +1114,218 @@ def _reparse_last_command(workspace: Path, ws: "DiagnosticsWorkspace"):
     )
     ws.save_packet(packet.to_dict())
     return packet
+
+
+def _handle_patch(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else "status"
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    engine = PatchEngine(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+    )
+
+    if subcommand == "status":
+        last = engine.journal.last()
+        trash_count = len(engine.trash.list_entries())
+        console.print(f"git apply available: {patch_git_apply.available(workspace)}")
+        console.print(f"Trashed file(s): {trash_count}")
+        if last:
+            console.print(f"Last transaction: {last['transaction_id']} ({last['status']}) - {last['reason']}")
+        else:
+            console.print("[dim]No transactions recorded yet.[/dim]")
+        return
+
+    if subcommand == "preview":
+        if not argument:
+            console.print("[red]Usage: /patch preview <path-to-diff-or-change-request-json>[/red]")
+            return
+        _patch_preview(argument, workspace, console, engine)
+        return
+
+    if subcommand == "apply":
+        if not argument:
+            console.print("[red]Usage: /patch apply <path-to-change-request-json>[/red]")
+            return
+        _patch_apply(argument, workspace, console, engine)
+        return
+
+    if subcommand == "rollback":
+        if not argument:
+            console.print("[red]Usage: /patch rollback <transaction-id>[/red]")
+            return
+        request = ApprovalRequest(
+            action_type="file_delete",
+            description=f"Roll back transaction {argument}.",
+            risk_level="high",
+            working_dir=str(workspace),
+            reason="Rollback restores backed-up files, overwriting current content.",
+        )
+        if not engine.approval_manager.ask(request):
+            console.print("[yellow]Rollback denied.[/yellow]")
+            return
+        ok, message = engine.rollback_transaction(argument)
+        console.print(f"[green]{message}[/green]" if ok else f"[red]{message}[/red]")
+        return
+
+    if subcommand == "journal":
+        entries = engine.journal.entries()
+        if not entries:
+            console.print("[dim]No transactions recorded yet.[/dim]")
+            return
+        table = Table(title="Patch Journal")
+        table.add_column("Transaction")
+        table.add_column("Status")
+        table.add_column("Files")
+        table.add_column("Verification")
+        table.add_column("Reason")
+        for entry in reversed(entries):
+            verification = entry.get("verification") or {}
+            verification_text = (
+                f"exit {verification.get('exit_code')}" if verification.get("ran") else "not run"
+            )
+            table.add_row(
+                entry.get("transaction_id", ""),
+                entry.get("status", ""),
+                str(len(entry.get("touched_files", []))),
+                verification_text,
+                entry.get("reason", ""),
+            )
+        console.print(table)
+        return
+
+    if subcommand == "last":
+        last = engine.journal.last()
+        if not last:
+            console.print("[dim]No transactions recorded yet.[/dim]")
+            return
+        console.print(f"[bold]{last['transaction_id']}[/bold] ({last['status']})")
+        console.print(f"Reason: {last.get('reason', '')}")
+        console.print("Files: " + (", ".join(last.get("touched_files", [])) or "none"))
+        verification = last.get("verification") or {}
+        if verification.get("ran"):
+            console.print(f"Verification: `{verification.get('command')}` exit {verification.get('exit_code')}")
+        return
+
+    if subcommand == "diff":
+        if not argument:
+            console.print("[red]Usage: /patch diff <transaction-id>[/red]")
+            return
+        patch_text = engine.transactions.load_patch(argument)
+        if not patch_text.strip():
+            console.print(f"[yellow]No stored diff for transaction {argument}.[/yellow]")
+            return
+        try:
+            print_diff_preview(patch_text, console=console, sandbox=engine.sandbox)
+        except Exception:
+            console.print(patch_text)
+        return
+
+    if subcommand == "trash":
+        entries = engine.trash.list_entries()
+        if not entries:
+            console.print("[dim]Trash is empty.[/dim]")
+            return
+        table = Table(title="Trash")
+        table.add_column("Transaction")
+        table.add_column("Path")
+        table.add_column("Size")
+        for item in entries:
+            table.add_row(item.transaction_id, item.relative_path, str(item.size_bytes))
+        console.print(table)
+        return
+
+    if subcommand == "clean-trash":
+        entries = engine.trash.list_entries()
+        if not entries:
+            console.print("[dim]Trash is already empty.[/dim]")
+            return
+        request = ApprovalRequest(
+            action_type="file_delete",
+            description=f"Permanently delete {len(entries)} trashed file(s).",
+            risk_level="high",
+            working_dir=str(workspace),
+            reason="Clean-trash permanently removes files SHAMSU previously moved to .shamsu/trash.",
+        )
+        if not engine.approval_manager.ask(request):
+            console.print("[yellow]Clean-trash denied.[/yellow]")
+            return
+        removed = engine.trash.clean()
+        console.print(f"[green]Permanently removed {removed} trashed file(s).[/green]")
+        return
+
+    console.print(
+        "[red]Usage: /patch status|preview|apply|rollback|journal|last|diff|trash|clean-trash[/red]"
+    )
+
+
+def _patch_preview(argument: str, workspace: Path, console: Console, engine: "PatchEngine") -> None:
+    try:
+        target = Sandbox(workspace).validate(argument)
+    except SecurityError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if not target.is_file():
+        console.print(f"[red]File not found: {argument}[/red]")
+        return
+    raw = target.read_text(encoding="utf-8")
+    payload = None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and "change_plan" in payload:
+        try:
+            change_plan = patch_types.parse_change_plan(payload["change_plan"])
+        except patch_types.ChangeRequestError as exc:
+            console.print(f"[red]Invalid change_plan: {exc}[/red]")
+            return
+        console.print(f"[bold]Reason:[/bold] {change_plan.reason}")
+        console.print(f"Destructive: {change_plan.destructive}")
+        for op in change_plan.operations:
+            console.print(f"- {op.op}: {op.path}" + (f" -> {op.dest_path}" if op.dest_path else ""))
+        patch_text = payload.get("patch", "")
+        if patch_text.strip():
+            print_diff_preview(patch_text, console=console, sandbox=engine.sandbox)
+        return
+    print_diff_preview(raw, console=console, sandbox=engine.sandbox)
+
+
+def _patch_apply(argument: str, workspace: Path, console: Console, engine: "PatchEngine") -> None:
+    try:
+        target = Sandbox(workspace).validate(argument)
+    except SecurityError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return
+    if not target.is_file():
+        console.print(f"[red]File not found: {argument}[/red]")
+        return
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        console.print(f"[red]Change request must be JSON matching the change_plan/patch contract: {exc}[/red]")
+        return
+    result = engine.execute_change_request(payload)
+    if result.ok:
+        body = "\n".join(f"- {path}" for path in result.touched_files) or "No files reported."
+        if result.verification and result.verification.ran:
+            body += f"\n\nVerification: `{result.verification.command}` exit {result.verification.exit_code}"
+        console.print(Panel(body, title=f"Applied ({result.transaction_id})", border_style="green"))
+    else:
+        detail = result.error
+        if result.verification and result.verification.ran and not result.verification.passed:
+            detail += f"\n\nVerification: `{result.verification.command}` exit {result.verification.exit_code}"
+            if result.verification.stalled:
+                detail += "\n[yellow]This failure signature matches the previous run - repeated failure, not retrying blindly.[/yellow]"
+        console.print(Panel(detail, title=f"Patch Rejected ({result.transaction_id or 'no transaction'})", border_style="red"))
 
 
 def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
@@ -4271,6 +4505,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("diagnostics"):
             _handle_diagnostics(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("patch"):
+            _handle_patch(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input == "log" or lowered_input.startswith("log "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
