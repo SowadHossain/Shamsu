@@ -7,7 +7,7 @@ import pytest
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.agents.chat_state import ChatState
 from shamsu.cli.command_router import CommandRouter
-from shamsu.tools.agent_tools import AgentToolRegistry
+from shamsu.tools.agent_tools import AgentToolRegistry, ToolResult
 
 
 class FakeOllamaClient:
@@ -72,6 +72,117 @@ def test_chat_state_hydrates_only_chat_messages():
     contents = [message["content"] for message in state.messages()]
     assert "SHAMSU is ready." not in contents
     assert contents == ["system", "hello", "Hey."]
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_calls_read_file_then_answers(tmp_path):
+    (tmp_path / "main.py").write_text("VALUE = 42\n", encoding="utf-8")
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "read-1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": {"filepath": "main.py"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "main.py defines VALUE = 42.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("what is in main.py?")
+
+    assert result.final == "main.py defines VALUE = 42."
+    observation = json.loads(client.calls[1]["messages"][-1]["content"])
+    assert observation["ok"] is True
+    assert "VALUE = 42" in observation["data"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_calls_search_index_before_workspace_answer(tmp_path):
+    class RecordingTools:
+        def __init__(self):
+            self.calls = []
+
+        def tool_schemas(self):
+            return AgentToolRegistry(tmp_path, approval_func=lambda _request: True).tool_schemas()
+
+        def execute(self, name, arguments):
+            self.calls.append((name, arguments))
+            return ToolResult(
+                True,
+                "Found 1 result(s).",
+                {"results": [{"file_path": "README.md", "content": "project notes"}]},
+            )
+
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "search-1",
+                            "function": {
+                                "name": "search_index",
+                                "arguments": {"query": "project notes"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "README.md contains project notes.", "tool_calls": []}},
+        ]
+    )
+    tools = RecordingTools()
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("what says project notes?")
+
+    assert result.final == "README.md contains project notes."
+    assert tools.calls == [("search_index", {"query": "project notes"})]
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_returns_final_when_no_tool_calls(tmp_path):
+    client = FakeOllamaClient([{"message": {"content": "Hello.", "tool_calls": []}}])
+
+    result = await AgentChatLoop(tmp_path, client=client).run("hello")
+
+    assert result.final == "Hello."
+    assert result.tool_rounds == 0
+    assert len(client.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_agent_chat_loop_accepts_valid_json_action_fallback(tmp_path):
+    (tmp_path / "main.py").write_text("print('json')\n", encoding="utf-8")
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": json.dumps(
+                        {"action": "read_file", "arguments": {"filepath": "main.py"}}
+                    ),
+                    "tool_calls": [],
+                }
+            },
+            {"message": {"content": "Read main.py.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("read main.py")
+
+    assert result.final == "Read main.py."
+    assert client.calls[1]["messages"][-1]["name"] == "read_file"
 
 
 @pytest.mark.asyncio
@@ -179,6 +290,46 @@ async def test_agent_chat_loop_reports_tool_activity(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_chat_loop_emits_progress_for_tool_calls(tmp_path):
+    class FakeProgress:
+        def __init__(self):
+            self.events = []
+
+        def tool_start(self, tool_name, args_summary):
+            self.events.append(("start", tool_name, args_summary))
+
+        def tool_result(self, tool_name, result_summary, ok=True):
+            self.events.append(("result", tool_name, ok, result_summary))
+
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": {"filepath": "note.txt"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "Read note.txt.", "tool_calls": []}},
+        ]
+    )
+    (tmp_path / "note.txt").write_text("hello\n", encoding="utf-8")
+    progress = FakeProgress()
+
+    await AgentChatLoop(tmp_path, client=client, progress=progress).run("read note")
+
+    assert progress.events[0] == ("start", "read_file", "file=note.txt")
+    assert progress.events[1][0:3] == ("result", "read_file", True)
+
+
+@pytest.mark.asyncio
 async def test_agent_chat_loop_markdown_fallback_writes_file(tmp_path):
     client = FakeOllamaClient(
         [
@@ -262,6 +413,73 @@ def test_agent_tool_registry_blocks_dangerous_command(tmp_path):
     assert not result.ok
     assert result.data["exit_code"] != 0
     assert "Blocked command" in result.data["stderr"]
+
+
+def test_write_file_uses_existing_approval_path(tmp_path):
+    approvals = []
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda request: approvals.append(request) or True)
+
+    result = tools.write_file("approved.txt", "yes\n")
+
+    assert result.ok is True
+    assert approvals
+    assert approvals[0].action_type == "file_write"
+    assert (tmp_path / "approved.txt").read_text(encoding="utf-8") == "yes\n"
+
+
+def test_run_command_uses_command_runner(tmp_path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    calls = []
+
+    def fake_run(command, cwd):
+        calls.append((command, cwd))
+        return 0, "ok", ""
+
+    tools.command_runner.run = fake_run
+
+    result = tools.run_command("python -m pytest tests/ -q", ".")
+
+    assert result.ok is True
+    assert calls == [("python -m pytest tests/ -q", tmp_path.resolve())]
+
+
+def test_large_tool_output_is_compact_truncated():
+    result = ToolResult(True, "large", {"stdout": "x" * 7000})
+
+    data = json.loads(result.to_json())
+
+    assert len(data["data"]["stdout"]) < 6500
+    assert "truncated" in data["data"]["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_failed_write_final_does_not_claim_success(tmp_path):
+    client = FakeOllamaClient(
+        [
+            {
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "write-1",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"filepath": "blocked.py", "content": "print('x')\n"},
+                            },
+                        }
+                    ],
+                }
+            },
+            {"message": {"content": "Updated blocked.py successfully.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: False)
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("write blocked.py")
+
+    assert result.stopped is True
+    assert "could not confirm the file edit" in result.final
+    assert not (tmp_path / "blocked.py").exists()
 
 
 def test_slash_command_router_rejects_unknown_with_suggestion():

@@ -5,43 +5,55 @@ stack:
   render: r3f
   net: colyseus-relay
   physics: rapier
-entry: src/main.tsx
+  db: sqlite
+  ui_state: zustand
+entry: client/src/main.tsx
 build_cmd: "npm install && npm run build"
 run_cmd: "npm run dev"
 preview_url: "http://localhost:5173"
+# Everything common to multiplayer games is pre-coded and working. The model
+# only fills these holes with game-specific logic. Read the file around each
+# marker before writing; keep every export the rest of the app imports.
 holes:
   - id: entity.player
-    target_file: src/game/entities.ts
+    target_file: client/src/game/entities.ts
     marker: "// HOLE:entity.player"
     kind: schema
-    signature: "type Player = { id: string; name: string; position: Vec3; score: number; color: string }"
-    description: "Define the player entity fields the game needs."
+    signature: "makePlayer(id: string, color: string): Entity"
+    description: "Player-specific fields (health, size, color, abilities) in the entity bag."
     depends_on: []
   - id: entity.world
-    target_file: src/game/entities.ts
+    target_file: client/src/game/entities.ts
     marker: "// HOLE:entity.world"
     kind: schema
-    signature: "types for obstacles, pickups, and game state"
-    description: "Define non-player entities and game state for the requested game."
+    signature: "makePickup(id, x, z) and any other non-player entity makers"
+    description: "Non-player entities (obstacles, pickups) and their fields."
     depends_on: []
   - id: rule.update
-    target_file: src/game/rules.ts
+    target_file: client/src/game/rules.ts
     marker: "// HOLE:rule.update"
     kind: function
-    signature: "function updateGameState(state: GameState, input: InputState, dt: number): GameState"
-    description: "Advance game state each tick: movement, spawning, collisions, scoring."
+    signature: "updateWorld(world: World, ctx: TickContext): void"
+    description: "Per-tick logic: move the player from input, move/spawn entities, handle collisions, call ctx.onScore."
     depends_on: [entity.player, entity.world]
-  - id: rule.end_condition
-    target_file: src/game/rules.ts
-    marker: "// HOLE:rule.end_condition"
+  - id: rule.win
+    target_file: client/src/game/rules.ts
+    marker: "// HOLE:rule.win"
     kind: function
-    signature: "function checkEndState(state: GameState): EndState"
-    description: "Decide when the game ends and why."
+    signature: "checkWin(world: World): boolean"
+    description: "The local end condition (the server also enforces score >= winScore)."
     depends_on: [rule.update]
-  - id: ui.hud_fields
-    target_file: src/ui/Hud.tsx
-    marker: "{/* HOLE:ui.hud_fields */}"
+  - id: rule.score
+    target_file: client/src/game/rules.ts
+    marker: "// HOLE:rule.score"
+    kind: function
+    signature: "scorePoints(): number"
+    description: "How many points one scoring event is worth."
+    depends_on: [rule.update]
+  - id: ui.hud
+    target_file: client/src/ui/Hud.tsx
+    marker: "// HOLE:ui.hud"
     kind: component
-    signature: "render score, player count, phase, and end-state message"
-    description: "Bind HUD fields to game state."
-    depends_on: [entity.player, rule.end_condition]
+    signature: "bind HUD slots to game state fields"
+    description: "Bind the pre-built HUD slots to the real game-state fields."
+    depends_on: [entity.player, rule.score]

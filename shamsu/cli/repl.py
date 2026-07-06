@@ -41,6 +41,7 @@ from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.cli.command_router import CommandRouter
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
+from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
 from shamsu.indexer.walker import FileWalker, ensure_index
@@ -83,11 +84,13 @@ from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
+from shamsu.tools.dev_server import DevServerManager, infer_dev_command, is_dev_server_command
 from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
 from shamsu.tools.workspace import MentionResolver, WorkspaceTool
+from shamsu.ui.progress import ProgressReporter
 from shamsu.types import (
     ApprovalRequest,
     ContextPack,
@@ -156,6 +159,10 @@ SYSTEM_COMMANDS = (
     "/autonomy status",
     "/autonomy on",
     "/autonomy off",
+    "/trace status",
+    "/trace on",
+    "/trace off",
+    "/trace verbose",
     "/log",
     "/log tail",
     "/edit ",
@@ -755,6 +762,49 @@ def _handle_autonomy(user_input: str, workspace: Path, console: Console) -> None
     console.print("[red]Usage: autonomy status|on|off[/red]")
 
 
+def _trace_config_path(workspace: Path) -> Path:
+    return Sandbox(workspace).validate(Path(".shamsu") / "trace.json")
+
+
+def _trace_mode(workspace: Path) -> str:
+    path = _trace_config_path(workspace)
+    if not path.exists():
+        return "normal"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "normal"
+    mode = str(data.get("mode", "normal")).lower()
+    return mode if mode in {"quiet", "normal", "verbose"} else "normal"
+
+
+def _set_trace_mode(workspace: Path, mode: str) -> None:
+    path = _trace_config_path(workspace)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mode": mode}, indent=2), encoding="utf-8")
+
+
+def _handle_trace(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=1)
+    command = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if command == "on":
+        _set_trace_mode(workspace, "normal")
+        console.print("[green]Trace mode is on.[/green]")
+        return
+    if command == "off":
+        _set_trace_mode(workspace, "quiet")
+        console.print("[yellow]Trace mode is quiet.[/yellow]")
+        return
+    if command == "verbose":
+        _set_trace_mode(workspace, "verbose")
+        console.print("[green]Trace mode is verbose.[/green]")
+        return
+    if command == "status":
+        console.print(f"Trace mode: [bold]{_trace_mode(workspace)}[/bold]")
+        return
+    console.print("[red]Usage: trace status|on|off|verbose[/red]")
+
+
 def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=2)
     command = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1315,6 +1365,9 @@ async def _handle_request(
     if _looks_like_run_game_request(effective_input):
         await _handle_run_game(workspace, console, session_logger=session_logger)
         return
+    if _looks_like_dev_server_prompt(effective_input):
+        _handle_dev_server(effective_input, workspace, console, session_logger=session_logger)
+        return
     if _looks_like_browser_needed_prompt(effective_input):
         await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console), browser_tool=browser_tool)
         return
@@ -1367,6 +1420,8 @@ async def _handle_request(
         )
     decision = await _route_prompt(effective_input, llm)
     _print_decision(decision, console)
+    task_plan = build_task_plan(decision, effective_input)
+    harness_input = append_task_handoff(effective_input, task_plan, agent_context)
 
     try:
         _log_event(
@@ -1374,6 +1429,13 @@ async def _handle_request(
             "workflow.started",
             {"intent": decision.intent, "prompt": user_input, "effective_prompt": effective_input},
             f"Workflow started: {decision.intent}",
+            workflow_id=decision.intent,
+        )
+        _log_event(
+            session_logger,
+            "workflow.plan",
+            plan_log_payload(task_plan),
+            f"Task harness selected {task_plan.mode} mode",
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
@@ -1389,7 +1451,7 @@ async def _handle_request(
                 or (_is_general_chat_prompt(effective_input) and not uses_real_index)
             ):
                 await _run_agent_chat(
-                    _append_agent_context(effective_input, agent_context),
+                    harness_input,
                     workspace,
                     console,
                     session_logger=session_logger,
@@ -1398,15 +1460,15 @@ async def _handle_request(
             else:
                 await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger, thinking_status=thinking_status)
         elif decision.intent == "code_edit":
-            await _run_code_edit(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
+            await _run_code_edit(harness_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
-            await _run_bug_fix(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
+            await _run_bug_fix(harness_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
-            await _run_audit(_append_agent_context(effective_input, agent_context), search, console, llm)
+            await _run_audit(harness_input, search, console, llm)
         elif decision.intent == "test_gen":
-            await _run_test_generation(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
+            await _run_test_generation(harness_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "doc_gen":
-            await _run_docs(_append_agent_context(effective_input, agent_context), workspace, search, console, llm, session_logger)
+            await _run_docs(harness_input, workspace, search, console, llm, session_logger)
         else:
             console.print("[yellow]Project generation is not wired into this CLI yet.[/yellow]")
         _log_event(
@@ -1443,7 +1505,12 @@ async def _route_prompt(user_input: str, llm: LLMManager) -> RoutingDecision:
     if forced is not None:
         return forced
     try:
-        return await llm.route(user_input, "Indexed workspace selected in SHAMSU CLI.")
+        decision = await llm.route(user_input, "Indexed workspace selected in SHAMSU CLI.")
+        if decision.intent in {"qa", "explain"} and decision.confidence < 0.6 and (
+            _looks_like_command_like_prompt(user_input) or _looks_like_trouble_report(user_input)
+        ):
+            return _keyword_decision(user_input)
+        return decision
     except Exception:
         return _keyword_decision(user_input)
 
@@ -1476,9 +1543,9 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
         intent = "generate"
     elif _looks_like_prd_plan_request(user_input):
         intent = "generate"
-    elif any(word in text for word in ("traceback", "exception", "error:", "failing", "fix ")):
+    elif _looks_like_trouble_report(user_input) or any(word in text for word in ("traceback", "exception", "error:", "failing", "fix ", "repair")):
         intent = "bug_fix"
-    elif any(word in text for word in ("write tests", "generate tests", "test for", "pytest")):
+    elif any(word in text for word in ("write tests", "generate tests", "test for", "pytest", "run tests", "test ")):
         intent = "test_gen"
     elif any(word in text for word in ("audit", "review", "security issue")):
         intent = "audit"
@@ -1840,7 +1907,8 @@ _ACTION_VERBS = {
     "edit", "modify", "write", "refactor", "rewrite", "improve", "apply",
     "generate", "install", "setup", "configure", "continue", "finish",
     "complete", "proceed", "resume", "redo", "regenerate", "review", "debug",
-    "resolve", "correct", "patch",
+    "resolve", "correct", "patch", "run", "start", "stop", "restart",
+    "execute", "launch", "open", "deploy", "compile", "rebuild",
 }
 
 # Leading phrasing that marks a genuine question/explanation: keep it on QA.
@@ -1893,7 +1961,8 @@ _ERROR_LOG_SIGNALS = (
     "error:", "cannot find", "is not exported", "has no exported member", "failed to compile",
     "uncaught", "syntaxerror", "referenceerror", "typeerror", "module not found",
     "cannot find module", "unexpected token", "traceback (most recent", "does not exist on type",
-    "ts(", "vite:", "[plugin:",
+    "does not provide an export named", "no exported member", "stack trace", " at ",
+    "ts2305", "ts2724", "ts2339", "ts2307", "ts(", "vite:", "[plugin:",
 )
 
 
@@ -1944,6 +2013,50 @@ def _looks_like_run_game_request(user_input: str) -> bool:
     return has_run and has_game
 
 
+def _looks_like_dev_server_prompt(user_input: str) -> bool:
+    normalized = _normalize_command_input(user_input).strip()
+    text = normalized.lower()
+    if is_dev_server_command(normalized):
+        return True
+    return any(
+        phrase in text
+        for phrase in (
+            "run dev",
+            "start dev",
+            "dev server",
+            "start server",
+            "run the code in dev",
+            "open dev",
+            "launch dev",
+        )
+    )
+
+
+def _looks_like_command_like_prompt(user_input: str) -> bool:
+    text = user_input.lower()
+    return _looks_like_dev_server_prompt(user_input) or any(
+        phrase in text
+        for phrase in (
+            "run ",
+            "repair",
+            "fix",
+            "compile",
+            "build",
+            "test",
+            "one part at a time",
+            "start server",
+            "dev server",
+        )
+    )
+
+
+def _extract_dev_command(user_input: str, workspace: Path) -> str:
+    normalized = _normalize_command_input(user_input).strip()
+    if is_dev_server_command(normalized):
+        return normalized
+    return infer_dev_command(workspace)
+
+
 def _looks_like_affirmative_continue(user_input: str) -> bool:
     text = re.sub(r"[^\w\s]", " ", user_input.lower()).strip()
     if not text:
@@ -1980,46 +2093,56 @@ async def _handle_run_game(
     # otherwise start the server but leave a blank/crashing page in the browser.
     await _verify_and_repair_frontend(workspace, Path("."), console, session_logger=session_logger)
 
-    relay = _start_background_command(
-        "npm run dev:relay",
-        workspace,
-        log_dir / "relay.log",
-        visible_console=True,
-    )
-    vite = _start_background_command(
-        "npm run dev",
-        workspace,
-        log_dir / "vite.log",
-        visible_console=True,
-    )
     url = "http://localhost:5173"
-    console.print(
-        Panel(
-            f"Game dev server started in separate terminal windows you can watch.\n\n"
-            f"Open: {url}\n\n"
-            f"Vite PID: {vite.pid}\n"
-            f"Relay PID: {relay.pid}\n"
-            f"Logs: {log_dir}",
-            title="Game Running",
-            border_style="green",
+    if (workspace / "client").is_dir() and (workspace / "server").is_dir():
+        # Monorepo: one `npm run dev` starts both the server and the client
+        # (concurrently), in one terminal window teed to a log.
+        dev = _start_background_command("npm run dev", workspace, log_dir / "dev.log", visible_console=True)
+        settle_log = log_dir / "dev.log"
+        console.print(
+            Panel(
+                f"Game dev server started in a terminal window you can watch.\n\n"
+                f"Open: {url}\n\n"
+                f"Dev PID: {dev.pid}\n"
+                f"Logs: {log_dir}",
+                title="Game Running",
+                border_style="green",
+            )
         )
-    )
-    _log_event(
-        session_logger,
-        "project.preview.started",
-        {"url": url, "vite_pid": vite.pid, "relay_pid": relay.pid, "logs": str(log_dir)},
-        f"Started game preview at {url}",
-        workflow_id="game-preview",
-    )
+        _log_event(
+            session_logger, "project.preview.started",
+            {"url": url, "dev_pid": dev.pid, "logs": str(log_dir)},
+            f"Started game preview at {url}", workflow_id="game-preview",
+        )
+    else:
+        relay = _start_background_command("npm run dev:relay", workspace, log_dir / "relay.log", visible_console=True)
+        vite = _start_background_command("npm run dev", workspace, log_dir / "vite.log", visible_console=True)
+        settle_log = log_dir / "vite.log"
+        console.print(
+            Panel(
+                f"Game dev server started in separate terminal windows you can watch.\n\n"
+                f"Open: {url}\n\n"
+                f"Vite PID: {vite.pid}\n"
+                f"Relay PID: {relay.pid}\n"
+                f"Logs: {log_dir}",
+                title="Game Running",
+                border_style="green",
+            )
+        )
+        _log_event(
+            session_logger, "project.preview.started",
+            {"url": url, "vite_pid": vite.pid, "relay_pid": relay.pid, "logs": str(log_dir)},
+            f"Started game preview at {url}", workflow_id="game-preview",
+        )
 
-    # Read the Vite log back and, if it failed to boot cleanly, fix the errors.
+    # Read the dev-server log back and, if it failed to boot cleanly, fix errors.
     console.print("[dim]Watching the dev server start up for errors...[/dim]")
-    errors = await _await_dev_server_settle(log_dir / "vite.log")
+    errors = await _await_dev_server_settle(settle_log)
     if errors:
         console.print(Panel(errors, title="Vite reported errors on startup", border_style="yellow"))
         console.print("[cyan]Fixing the dev-server errors...[/cyan]")
         await _run_agent_chat(
-            _build_frontend_repair_request(errors, Path(".")),
+            _build_frontend_repair_request(errors, workspace, Path(".")),
             workspace,
             console,
             session_logger=session_logger,
@@ -2032,6 +2155,49 @@ async def _handle_run_game(
         )
     else:
         console.print(f"[green]Dev server looks healthy. Open {url} in your browser.[/green]")
+
+
+def _handle_dev_server(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    command = _extract_dev_command(user_input, workspace)
+    progress = ProgressReporter(console, session_logger, title="Dev server", max_steps=3)
+    progress.step("Validating dev-server command")
+    manager = DevServerManager(
+        workspace,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        session_logger=session_logger,
+    )
+    progress.step(f"Launching dev server in a new terminal: {command}")
+    result = manager.start(command)
+    if not result.launched and not result.duplicate:
+        progress.failed(result.message or "Dev server was not launched")
+        console.print(Panel(result.message, title="Dev Server", border_style="red"))
+        return
+    if result.duplicate:
+        progress.done("Matching dev server already appears to be running")
+    else:
+        progress.done("Dev server launched")
+    console.print(
+        Panel(
+            "\n".join(
+                [
+                    "Launching dev server in a new CMD/terminal window...",
+                    "",
+                    f"Command:\n{result.command}",
+                    "",
+                    f"Likely URL:\n{result.url}",
+                    "",
+                    "Control returned to SHAMSU. I can keep working while the dev server runs.",
+                ]
+            ),
+            title="Dev Server",
+            border_style="green" if result.launched or result.duplicate else "yellow",
+        )
+    )
 
 
 def _start_background_command(
@@ -2296,37 +2462,98 @@ def _ensure_node_modules(workspace: Path, console: Console) -> bool:
     return True
 
 
+def _typecheck_command(workspace: Path) -> str | None:
+    """The command that compile-checks this project, or None if there is nothing
+    to check. A client/ + server/ monorepo builds both packages; a single-package
+    TS project runs tsc directly."""
+    if (workspace / "client" / "tsconfig.json").exists() and (workspace / "server").is_dir():
+        return "npm run build"
+    if (workspace / "tsconfig.json").exists():
+        return "npx --no-install tsc --noEmit"
+    return None
+
+
 def _run_frontend_typecheck(workspace: Path) -> tuple[bool, str]:
-    """Run `tsc --noEmit` for a real compile check. Returns (ok, output)."""
+    """Compile-check the project. Returns (ok, output). No TS project -> ok."""
+    command = _typecheck_command(workspace)
+    if command is None:
+        return True, ""
     try:
         result = subprocess.run(
-            "npx --no-install tsc --noEmit",
+            command,
             shell=True,
             cwd=workspace,
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=600,
             creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"Could not run tsc: {exc}"
+        return False, f"Could not run the build: {exc}"
     return result.returncode == 0, ((result.stdout or "") + (result.stderr or "")).strip()
 
 
-def _build_frontend_repair_request(errors: str, relative_path: Path) -> str:
+_TS_ERROR_LOCATION_RE = re.compile(
+    r"(?P<path>[\w./\\-]+\.(?:ts|tsx|js|jsx))\((?P<line>\d+),(?P<col>\d+)\)"
+)
+
+
+def _extract_error_snippets(
+    workspace: Path, errors: str, context_lines: int = 6, max_snippets: int = 6
+) -> str:
+    """Read the lines around each tsc error location and return them as a
+    labelled block. Small models frequently guess at broken syntax when only
+    given the error message; showing the actual surrounding code lets them fix
+    it instead of guessing."""
+    seen: set[tuple[str, int]] = set()
+    snippets: list[str] = []
+    for match in _TS_ERROR_LOCATION_RE.finditer(errors):
+        path_text = match.group("path")
+        line_no = int(match.group("line"))
+        key = (path_text, line_no)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            target = (workspace / path_text).resolve()
+            target.relative_to(workspace.resolve())
+        except (OSError, ValueError):
+            continue
+        if not target.is_file():
+            continue
+        try:
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        start = max(line_no - context_lines, 1)
+        end = min(line_no + context_lines, len(lines))
+        numbered = "\n".join(
+            f"{n:>5}{'>' if n == line_no else ' '} {lines[n - 1]}"
+            for n in range(start, end + 1)
+        )
+        snippets.append(f"--- {path_text} around line {line_no} ---\n{numbered}")
+        if len(snippets) >= max_snippets:
+            break
+    return "\n\n".join(snippets)
+
+
+def _build_frontend_repair_request(errors: str, workspace: Path, relative_path: Path) -> str:
+    snippets = _extract_error_snippets(workspace, errors)
+    snippet_section = (
+        f"\nActual code around each error location (fix what's really there, don't guess):\n{snippets}\n"
+        if snippets
+        else ""
+    )
     return (
-        "The project does NOT compile. Your ONLY task right now is to make `tsc --noEmit` pass by fixing "
+        "The project does NOT compile. Your ONLY task right now is to make the build pass by fixing "
         "every TypeScript error below. Do NOT add features, do NOT start a new milestone.\n\n"
         "Critical rules:\n"
         "- Read each failing file AND the files that import it before editing.\n"
-        "- App.tsx imports createInitialState, createInputState, and updateGameState from ./game/rules - "
-        "every export another file imports MUST exist and keep a compatible signature. Never delete an export "
-        "that something imports.\n"
-        "- Keep the frontend wired to the game logic: App.tsx must import and render the game state; do not "
-        "orphan rules.ts/entities.ts.\n"
+        "- Never delete or rename an export that another file imports; keep signatures compatible.\n"
+        "- Keep the app wired together (screens import game logic; do not orphan modules).\n"
         "- Fix ALL errors, use write_file for each change, then stop.\n\n"
-        f"PRD file: {relative_path.as_posix()}\n\n"
-        f"`tsc --noEmit` output:\n{errors[-4000:]}"
+        f"Build output:\n{errors[-4000:]}\n"
+        f"{snippet_section}"
     )
 
 
@@ -2342,8 +2569,8 @@ async def _verify_and_repair_frontend(
     compiles cleanly. A non-node project (no package.json) is treated as OK."""
     if not (workspace / "package.json").exists():
         return True
-    if not (workspace / "tsconfig.json").exists():
-        # Not a TypeScript project: nothing for tsc to gate on.
+    if _typecheck_command(workspace) is None:
+        # Not a TypeScript project: nothing to compile-gate on.
         return True
     if not _ensure_node_modules(workspace, console):
         console.print("[yellow]Skipping compile check - dependencies are not installed.[/yellow]")
@@ -2375,7 +2602,7 @@ async def _verify_and_repair_frontend(
             return False
         console.print("[cyan]Fixing the compile errors before moving on...[/cyan]")
         await _run_agent_chat(
-            _build_frontend_repair_request(output, relative_path),
+            _build_frontend_repair_request(output, workspace, relative_path),
             workspace,
             console,
             session_logger=session_logger,
@@ -2536,26 +2763,30 @@ async def _handle_prd_build_request(
 def _multiplayer_template_present(workspace: Path) -> bool:
     required = [
         "package.json",
-        "src/App.tsx",
-        "src/game/entities.ts",
-        "src/game/rules.ts",
-        "src/ui/Hud.tsx",
-        "src/net/room.ts",
-        "server/relay.ts",
+        "client/package.json",
+        "client/src/App.tsx",
+        "client/src/game/entities.ts",
+        "client/src/game/rules.ts",
+        "client/src/ui/Hud.tsx",
+        "server/src/index.ts",
+        "server/src/db.ts",
     ]
     return all((workspace / path).exists() for path in required)
 
 
 def _build_multiplayer_game_request(parsed, relative_path: Path) -> str:
     return (
-        "You are now past scaffold setup. The multiplayer-game template files already exist in the workspace. "
-        "Do real coding work now.\n\n"
+        "You are now past scaffold setup. The multiplayer-game template is a working monorepo "
+        "(client/ + server/) that already builds, runs, and passes its Definition of Done with a "
+        "placeholder game. Do real coding work now.\n\n"
         "Rules:\n"
         "- Read the PRD and the existing template files before writing.\n"
-        "- Do not ask the user to provide index.html, style.css, script.js, or starter files.\n"
-        "- Do not replace the Colyseus relay, React-Three-Fiber scene, lobby, menu, or render loop plumbing.\n"
-        "- Fill and adapt the marked template holes in src/game/entities.ts, src/game/rules.ts, and src/ui/Hud.tsx.\n"
-        "- Implement the requested gameplay requirements, player rules, scoring, collisions/spawning, HUD values, and end condition.\n"
+        "- Do not ask the user for starter files. Menus, lobby, Colyseus networking, the game loop, "
+        "Rapier physics, the HUD frame, and the SQLite leaderboard are already built - do not replace them.\n"
+        "- Fill and adapt ONLY the marked holes: client/src/game/entities.ts (// HOLE:entity.player, "
+        "// HOLE:entity.world), client/src/game/rules.ts (// HOLE:rule.update, // HOLE:rule.win, "
+        "// HOLE:rule.score), and client/src/ui/Hud.tsx (// HOLE:ui.hud).\n"
+        "- Never delete or rename an export another file imports; keep the project compiling.\n"
         "- Use write_file for every file change. Run commands to verify when possible.\n"
         "- Do not claim success unless files were actually written or verified by tool results.\n\n"
         f"PRD file: {relative_path.as_posix()}\n\n"
@@ -2767,10 +2998,19 @@ async def _run_agent_chat(
     )
     long_running = force_long_running or is_long_running_enabled(workspace)
     activities: list[str] = []
+    trace_mode = _trace_mode(workspace)
+    progress = ProgressReporter(
+        None if trace_mode == "quiet" else console,
+        session_logger,
+        title="Agent",
+        max_steps=50 if long_running else 20,
+        verbose=trace_mode == "verbose",
+    )
+    progress.step("Waiting for model response")
 
     def on_activity(msg: str) -> None:
         activities.append(msg)
-        console.print(f"[dim]  -> {msg}[/dim]")
+        progress.step(msg)
 
     result = await AgentChatLoop(
         workspace,
@@ -2778,8 +3018,13 @@ async def _run_agent_chat(
         tools=tools,
         long_running=long_running,
         on_activity=on_activity,
+        progress=progress,
     ).run(user_input)
     body = result.final.strip() or "No response returned."
+    if result.stopped:
+        progress.warning("Agent stopped before completing all requested work")
+    else:
+        progress.done("Agent finished")
     console.print(Panel(_agent_display_summary(body, activities), title="Agent"))
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
 
@@ -3178,7 +3423,14 @@ async def _run_bug_fix(
     )
     if getattr(result, "used_full_rewrite", False):
         console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
-    _print_patch_result("Bug Fix", result.applied, result.changed_files, result.error, console)
+    _print_patch_result(
+        "Bug Fix",
+        result.applied,
+        result.changed_files,
+        result.error,
+        console,
+        verification_status=getattr(result, "verification_status", ""),
+    )
 
 
 async def _run_audit(
@@ -3313,10 +3565,14 @@ def _print_patch_result(
     changed_files: list[str],
     error: str,
     console: Console,
+    verification_status: str = "",
 ) -> None:
     if applied:
         files = "\n".join(f"- {path}" for path in changed_files) or "No files reported."
-        console.print(Panel(files, title=f"{title} Applied", border_style="green"))
+        body = files
+        if verification_status:
+            body = f"Applied changes:\n{files}\n\nVerified results:\n{verification_status}"
+        console.print(Panel(body, title=f"{title} Applied", border_style="green"))
         return
     console.print(
         Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow")
@@ -3640,6 +3896,9 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input.startswith("autonomy"):
             _handle_autonomy(normalized_input, workspace, console)
             bottom_toolbar.refresh()
+            continue
+        if lowered_input.startswith("trace"):
+            _handle_trace(normalized_input, workspace, console)
             continue
         if lowered_input == "log" or lowered_input.startswith("log "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

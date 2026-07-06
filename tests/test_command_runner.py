@@ -88,6 +88,23 @@ def test_medium_risk_command_runs_when_approved(tmp_path: Path):
     assert requests
 
 
+def test_validate_and_approve_does_not_execute_medium_command(tmp_path: Path):
+    requests: list[ApprovalRequest] = []
+    runner = CommandRunner(tmp_path, approval_func=lambda request: requests.append(request) or True)
+
+    ok, code, message, cwd = runner.validate_and_approve(
+        "python -c \"print('would run')\"",
+        tmp_path,
+        description="Launch dev server",
+    )
+
+    assert ok is True
+    assert code == 0
+    assert message == "Command approved."
+    assert cwd == tmp_path
+    assert requests[0].description == "Launch dev server"
+
+
 def test_safe_command_hides_console_window(monkeypatch, tmp_path: Path):
     import shamsu.tools.executor as executor
 

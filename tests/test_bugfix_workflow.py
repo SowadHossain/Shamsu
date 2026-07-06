@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from shamsu.agents.bugfix_workflow import BugFixWorkflow, parse_traceback_locations
+from shamsu.agents.bugfix_workflow import (
+    BugFixWorkflow,
+    parse_import_export_error,
+    parse_traceback_locations,
+    scan_ts_exports,
+)
 from shamsu.patch.engine import PatchEngine
 from shamsu.types import ContextPack, LLMResponse, SearchResult
 
@@ -86,6 +91,29 @@ Also see app.py:2
     ]
 
 
+def test_parse_traceback_locations_accepts_tsc_style_locations():
+    report = (
+        "src/game/rules.ts(71,17): error TS1005: ')' expected.\n"
+        "src/game/rules.ts(71,32): error TS1005: ',' expected.\n"
+    )
+
+    locations = parse_traceback_locations(report)
+
+    assert [(location.file_path, location.line) for location in locations] == [
+        ("src/game/rules.ts", 71),
+    ]
+
+
+def test_parse_traceback_locations_accepts_colon_style_frontend_locations():
+    report = "src/App.tsx:23:10 - error TS2322: Type 'string' is not assignable."
+
+    locations = parse_traceback_locations(report)
+
+    assert [(location.file_path, location.line) for location in locations] == [
+        ("src/App.tsx", 23),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_bugfix_workflow_applies_valid_diff_with_real_patch_engine(tmp_path: Path):
     target = tmp_path / "app.py"
@@ -125,6 +153,24 @@ ZeroDivisionError: division by zero
     assert "Output ONLY a unified diff" in llm.pack.user_request
 
 
+def test_bugfix_workflow_includes_file_region_around_reported_line(tmp_path: Path):
+    target = tmp_path / "src" / "App.tsx"
+    target.parent.mkdir()
+    target.write_text("\n".join(f"line {index}" for index in range(1, 31)) + "\n", encoding="utf-8")
+    workflow = BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=FakeLLM(""),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    )
+
+    locations = parse_traceback_locations("src/App.tsx:20:5 - error TS1005: ';' expected")
+    pack, _paths = workflow._build_pack("src/App.tsx:20:5 - error TS1005: ';' expected", locations)
+    snippet = "\n".join(item.content for item in pack.snippets)
+    assert "line 20" in snippet
+    assert "line 15" in snippet
+
+
 class SequenceLLM:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
@@ -138,38 +184,122 @@ class SequenceLLM:
 
 
 @pytest.mark.asyncio
-async def test_bugfix_workflow_reports_error_when_diff_and_rewrite_both_fail(tmp_path: Path):
+async def test_bugfix_workflow_reports_error_when_diff_repair_fails(tmp_path: Path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
 
     result = await BugFixWorkflow(
         workspace_root=tmp_path,
         search=FakeSearch(),
-        llm=SequenceLLM(["The bug is in app.py.", ""]),
+        llm=SequenceLLM(["The bug is in app.py.", "", ""]),
         patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
     ).run("app.py:1 ValueError: wrong value")
 
     assert result.applied is False
     assert result.used_full_rewrite is False
     assert result.error.startswith("Invalid diff:")
+    assert "No file was changed" in result.error
     assert target.read_text(encoding="utf-8") == "value = 1\n"
 
 
 @pytest.mark.asyncio
-async def test_bugfix_workflow_rewrites_whole_file_when_diff_is_malformed(tmp_path: Path):
+async def test_bugfix_workflow_repairs_malformed_diff_and_applies(tmp_path: Path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    bad = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-value = 1
++value = 2
++extra
+"""
+    repaired = """--- a/app.py
++++ b/app.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+
+    result = await BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=SequenceLLM([bad, repaired]),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("app.py:1 ValueError: wrong value")
+
+    assert result.applied is True
+    assert result.used_full_rewrite is False
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_bugfix_workflow_tiny_targeted_edit_fallback_requires_unique_match(tmp_path: Path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
 
     result = await BugFixWorkflow(
         workspace_root=tmp_path,
         search=FakeSearch(),
-        llm=SequenceLLM(["garbled diff, no markers", "value = 2\n"]),
+        llm=SequenceLLM(["FILE: app.py\nSEARCH:\nvalue = 1\n\nREPLACE:\nvalue = 2\n", "", ""]),
         patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
-    ).run("app.py:1 ValueError: wrong value")
+    ).run("The value assertion is failing, please fix it")
 
     assert result.applied is True
-    assert result.used_full_rewrite is True
+    assert result.changed_files == ["app.py"]
     assert target.read_text(encoding="utf-8") == "value = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_bugfix_workflow_tiny_targeted_edit_fallback_refuses_ambiguous_match(tmp_path: Path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\nvalue = 1\n", encoding="utf-8")
+
+    result = await BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=SequenceLLM(["FILE: app.py\nSEARCH:\nvalue = 1\n\nREPLACE:\nvalue = 2\n", "", ""]),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("The value assertion is failing, please fix it")
+
+    assert result.applied is False
+    assert "matched 2 time" in result.error
+    assert target.read_text(encoding="utf-8") == "value = 1\nvalue = 1\n"
+
+
+def test_import_export_error_parser_and_export_scanner():
+    parsed = parse_import_export_error("src/session.ts:1:10 - error TS2305: Module './game/loop' has no exported member 'GameLoop'.")
+
+    assert parsed is not None
+    assert parsed.missing_export == "GameLoop"
+    assert parsed.module_path == "./game/loop"
+    assert scan_ts_exports("export const gameLoop = 1;\nexport { gameLoop as GameLoop };\nexport default class X {}\n") == {
+        "gameLoop",
+        "GameLoop",
+        "default",
+    }
+
+
+@pytest.mark.asyncio
+async def test_bugfix_workflow_rejects_patch_that_removes_ts_export(tmp_path: Path):
+    target = tmp_path / "loop.ts"
+    target.write_text("export const gameLoop = 1;\nexport const telemetry = 2;\n", encoding="utf-8")
+    diff = """--- a/loop.ts
++++ b/loop.ts
+@@ -1,2 +1 @@
+ export const gameLoop = 1;
+-export const telemetry = 2;
+"""
+
+    result = await BugFixWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=SequenceLLM([diff]),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("loop.ts:1 error TS2305")
+
+    assert result.applied is False
+    assert "removes existing export" in result.error
+    assert "telemetry" in target.read_text(encoding="utf-8")
 
 
 @pytest.mark.asyncio

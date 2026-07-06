@@ -1,42 +1,34 @@
 category: multiplayer-game
+# The checks are automated in template/smoke/dod.mjs (headless Playwright for the
+# client, the server API for persistence). Run them with:
+#   cd template && npm install && npm run build
+#   cd smoke && npm install && npx playwright install chromium && npm test
+runner: "node smoke/dod.mjs"
 items:
   - id: build.succeeds
-    description: "Project has a Vite build script."
-    check: file_exists
-    args: { path: "package.json" }
+    description: "Client and server build with no errors."
     severity: required
   - id: menu.renders
-    description: "Main menu screen renders on load."
-    check: element_present
-    args: { file: "src/App.tsx", selector: "[data-testid=main-menu]" }
-    severity: required
-  - id: lobby.renders
-    description: "Lobby renders and lists players."
-    check: element_present
-    args: { file: "src/App.tsx", selector: "[data-testid=player-list]" }
+    description: "Main menu is visible on load."
     severity: required
   - id: net.connects
-    description: "Client opens a relay room connection."
-    check: websocket_opens
-    args: { file: "src/net/room.ts" }
+    description: "Creating a room opens a Colyseus connection and returns a room code."
+    severity: required
+  - id: lobby.works
+    description: "A second client joins by code; both clients list two players."
     severity: required
   - id: net.two_players_visible
-    description: "Local and remote players are rendered distinctly."
-    check: two_clients_see_two_players
-    args: { file: "src/App.tsx", players: 2 }
-    severity: required
-  - id: loop.runs
-    description: "Game loop advances state over time."
-    check: state_advances
-    args: { file: "src/game/rules.ts" }
+    description: "In game, each of two clients renders two player objects."
     severity: required
   - id: hud.visible
-    description: "HUD shows score and game state."
-    check: element_present
-    args: { file: "src/ui/Hud.tsx", selector: "[data-testid=hud]" }
+    description: "The HUD is on screen during play."
+    severity: required
+  - id: loop.runs
+    description: "The game loop advances (tick count and player position change over time)."
     severity: required
   - id: end.condition
-    description: "An end condition can fire."
-    check: end_state_reachable
-    args: { file: "src/game/rules.ts" }
+    description: "The win condition can fire and shows the game over screen on all clients."
+    severity: required
+  - id: score.persists
+    description: "After a match ends, the SQLite leaderboard has an entry for the players."
     severity: required

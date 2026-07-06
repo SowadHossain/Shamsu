@@ -62,7 +62,9 @@ def parse_dod(path: Path) -> DefinitionOfDone:
         DoDItem(
             id=str(item["id"]),
             description=str(item["description"]),
-            check=str(item["check"]),
+            # `check` is optional: some templates (e.g. the multiplayer monorepo)
+            # verify via an external smoke runner rather than a built-in check.
+            check=str(item.get("check", "")),
             args=dict(item.get("args", {})),
             severity=str(item.get("severity", "required")),
         )

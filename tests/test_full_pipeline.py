@@ -249,7 +249,8 @@ async def test_full_pipeline_scaffolds_multiplayer_game_and_runs_dod(tmp_path: P
     assert result.project.category == "multiplayer-game"
     assert result.dod_result is not None
     assert result.dod_result.ok is True
-    assert (tmp_path / "generated-game" / "src" / "App.tsx").exists()
+    assert (tmp_path / "generated-game" / "client" / "src" / "App.tsx").exists()
+    assert (tmp_path / "generated-game" / "server" / "src" / "db.ts").exists()
     assert (tmp_path / "generated-game" / "SHAMSU_SUMMARY.md").exists()
 
 

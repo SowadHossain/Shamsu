@@ -1,18 +1,17 @@
-"""
-Bug fix workflow.
-"""
+"""Bug fix workflow."""
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
-from shamsu.patch.engine import PatchEngine, parse_unified_diff
+from shamsu.patch.engine import PatchEngine, parse_file_patches, parse_unified_diff, _apply_hunks
+from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.types import ContextPack, SearchResult
 
 BUGFIX_INSTRUCTIONS = """You are SHAMSU's bug fixer.
@@ -20,17 +19,38 @@ Output ONLY a unified diff.
 Do not include prose, markdown fences, explanations, or commands.
 Use --- a/path and +++ b/path headers.
 Make the smallest targeted fix for the reported bug.
-Do not refactor unrelated code."""
+Do not refactor unrelated code.
+Read the current file context. Preserve existing imports, exports, and public APIs."""
 
 TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)", line (\d+)')
-PLAIN_LOCATION_RE = re.compile(r"(?P<path>[\w./\\-]+\.py):(?P<line>\d+)")
+PLAIN_LOCATION_RE = re.compile(r"(?P<path>[\w./\\-]+\.(?:py|ts|tsx|js|jsx|html|css)):(?P<line>\d+)(?::\d+)?")
+TS_LOCATION_RE = re.compile(r"(?P<path>[\w./\\-]+\.(?:ts|tsx|js|jsx))\((?P<line>\d+),\d+\)")
 ERROR_LINE_RE = re.compile(r"^(?P<error>[A-Z][\w.]*Error|Exception|AssertionError):\s*(?P<message>.+)$")
+MISSING_EXPORT_RE = re.compile(
+    r"(?:has no exported member|does not provide an export named|no exported member)\s+['\"]?(?P<name>[A-Za-z_$][\w$]*)['\"]?",
+    re.IGNORECASE,
+)
+MODULE_PATH_RE = re.compile(r"(?:module|Module)\s+['\"](?P<module>[^'\"]+)['\"]|requested module ['\"](?P<requested>[^'\"]+)['\"]")
+IMPORT_FROM_RE = re.compile(r"import\s+[^;\n]*\b(?P<name>[A-Za-z_$][\w$]*)\b[^;\n]*\s+from\s+['\"](?P<module>[^'\"]+)['\"]")
+EXPORT_RE = re.compile(
+    r"^\s*export\s+(?:declare\s+)?(?:(?:async\s+)?function|const|let|var|class|interface|type|enum)\s+([A-Za-z_$][\w$]*)\b|"
+    r"^\s*export\s*\{([^}]+)\}|^\s*export\s+default\b",
+    re.MULTILINE,
+)
+SEARCH_REPLACE_RE = re.compile(r"(?s)FILE:\s*(?P<file>[^\n]+)\nSEARCH:\n(?P<search>.*?)\nREPLACE:\n(?P<replace>.*)")
 
 
 @dataclass(frozen=True)
 class TracebackLocation:
     file_path: str
     line: int
+
+
+@dataclass(frozen=True)
+class ImportExportError:
+    missing_export: str
+    module_path: str
+    importing_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -43,6 +63,7 @@ class BugFixResult:
     applied: bool = False
     error: str = ""
     used_full_rewrite: bool = False
+    verification_status: str = "Change applied, not yet verified."
     test_suggestion: str = "Re-run the failing test or command that produced the bug report."
 
 
@@ -63,18 +84,40 @@ class BugFixWorkflow:
 
     async def run(self, report: str) -> BugFixResult:
         locations = parse_traceback_locations(report)
-        pack = self._build_pack(report, locations)
+        import_error = parse_import_export_error(report)
+        if import_error and not locations:
+            locations = _locations_for_import_error(self.workspace_root, report, import_error)
+        pack, searched_paths = self._build_pack(report, locations)
         target_paths = [location.file_path for location in locations]
         if should_convene_council(target_paths=target_paths):
             council_result = await run_council(self.llm, pack, specialist="bugfix")
             response = council_result.final
         else:
             response = await self.llm.run_specialist("bugfix", pack)
+
         diff_text = _clean_diff(response.raw)
         ok, error = self.patch_engine.validate_diff(diff_text)
+        repair_attempts = 0
+        max_repair_attempts = 4 if "autonomy" in report.lower() else 2
+        while not ok and repair_attempts < max_repair_attempts:
+            repair_attempts += 1
+            repair_pack = self._build_repair_pack(report, diff_text, error or "Diff validation failed.", locations, searched_paths)
+            repair_response = await self.llm.run_specialist("bugfix", repair_pack)
+            diff_text = _clean_diff(repair_response.raw)
+            ok, error = self.patch_engine.validate_diff(diff_text)
+
         if ok:
-            # Well-formed diff — apply it (this path honours approval/denial).
             changed_files = _changed_files(diff_text)
+            contract_error = _module_contract_error(self.workspace_root, diff_text, report)
+            if contract_error:
+                return BugFixResult(
+                    request=report,
+                    pack=pack,
+                    locations=locations,
+                    diff_text=diff_text,
+                    error=contract_error,
+                    verification_status="No file was changed.",
+                )
             applied = self.patch_engine.apply(diff_text, self.workspace_root)
             return BugFixResult(
                 request=report,
@@ -84,62 +127,74 @@ class BugFixWorkflow:
                 changed_files=changed_files,
                 applied=applied,
                 error="" if applied else "Patch was not applied.",
+                verification_status="Change applied, not yet verified." if applied else "No file was changed.",
             )
 
-        # Malformed diff (a small-model formatting failure, not a denial) —
-        # rewrite the target file(s) in full rather than abandon the fix.
-        targets = lenient_diff_target_paths(diff_text) or target_paths
-        rewritten = await rewrite_files_fully(
-            llm=self.llm,
-            context_builder=self.context_builder,
-            patch_engine=self.patch_engine,
-            workspace_root=self.workspace_root,
-            request=report,
-            target_paths=targets,
-            specialist="bugfix",
-        )
-        if rewritten:
+        fallback = _parse_search_replace(response.raw)
+        if fallback:
+            rewritten, fallback_error = _apply_unique_search_replace(self.workspace_root, fallback, self.patch_engine)
+            if rewritten:
+                return BugFixResult(
+                    request=report,
+                    pack=pack,
+                    locations=locations,
+                    diff_text=diff_text,
+                    changed_files=[rewritten],
+                    applied=True,
+                    verification_status="Change applied, not yet verified.",
+                )
             return BugFixResult(
                 request=report,
                 pack=pack,
                 locations=locations,
                 diff_text=diff_text,
-                changed_files=rewritten,
-                applied=True,
-                used_full_rewrite=True,
+                error=f"Invalid diff: {error}; targeted edit fallback refused: {fallback_error}",
+                verification_status="No file was changed.",
             )
         return BugFixResult(
             request=report,
             pack=pack,
             locations=locations,
             diff_text=diff_text,
-            error=f"Invalid diff: {error}",
+            error=f"Invalid diff: {error}. Targeted files: {', '.join(target_paths or searched_paths) or 'unknown'}. No file was changed.",
+            verification_status="No file was changed.",
         )
 
-    def _build_pack(self, report: str, locations: list[TracebackLocation]) -> ContextPack:
+    def _build_pack(self, report: str, locations: list[TracebackLocation]) -> tuple[ContextPack, list[str]]:
         results = _dedupe_results(self._search_bug_context(report, locations))
-        request = (
-            f"{BUGFIX_INSTRUCTIONS}\n\n"
-            f"Bug report, traceback, or failing test output:\n{report.strip()}"
-        )
-        return self.context_builder.pack(
-            results=results,
-            request=request,
-            task_id="bug-fix",
-            step_id=1,
-            specialist="bugfix",
-        )
+        request = f"{BUGFIX_INSTRUCTIONS}\n\nBug report, traceback, or failing test output:\n{report.strip()}"
+        pack = self.context_builder.pack(results=results, request=request, task_id="bug-fix", step_id=1, specialist="bugfix")
+        return pack, _target_paths(results)
 
-    def _search_bug_context(
+    def _build_repair_pack(
         self,
         report: str,
+        bad_diff: str,
+        validation_error: str,
         locations: list[TracebackLocation],
-    ) -> list[SearchResult]:
+        searched_paths: list[str],
+    ) -> ContextPack:
+        paths = _dedupe_strings([location.file_path for location in locations] + searched_paths)
+        results = _full_file_results(self.workspace_root, paths)
+        request = (
+            f"{BUGFIX_INSTRUCTIONS}\n\n"
+            "The previous unified diff was rejected by PatchEngine.\n"
+            f"Patch validation error: {validation_error}\n\n"
+            f"Original bug report:\n{report.strip()}\n\n"
+            f"Rejected diff:\n{bad_diff.strip()}\n\n"
+            "Return a corrected unified diff only."
+        )
+        return self.context_builder.pack(results=results, request=request, task_id="bug-fix-diff-repair", step_id=2, specialist="bugfix")
+
+    def _search_bug_context(self, report: str, locations: list[TracebackLocation]) -> list[SearchResult]:
         boost_paths = [location.file_path for location in locations]
-        results: list[SearchResult] = []
+        results: list[SearchResult] = _location_snippets(self.workspace_root, locations)
+        import_error = parse_import_export_error(report)
+        if import_error:
+            results.extend(_full_file_results(self.workspace_root, _import_export_paths(self.workspace_root, report, import_error)))
         for query in _bug_queries(report, locations):
             results.extend(self.search.search(query, top_k=5, boost_paths=boost_paths))
-        return results[:12]
+        return results[:16]
 
 
 def parse_traceback_locations(report: str) -> list[TracebackLocation]:
@@ -155,7 +210,40 @@ def parse_traceback_locations(report: str) -> list[TracebackLocation]:
         if key not in seen:
             seen.add(key)
             locations.append(TracebackLocation(file_path=key[0], line=key[1]))
+    for match in TS_LOCATION_RE.finditer(report):
+        key = (match.group("path"), int(match.group("line")))
+        if key not in seen:
+            seen.add(key)
+            locations.append(TracebackLocation(file_path=key[0], line=key[1]))
     return locations
+
+
+def parse_import_export_error(report: str) -> ImportExportError | None:
+    missing = MISSING_EXPORT_RE.search(report)
+    module = MODULE_PATH_RE.search(report)
+    if not missing or not module:
+        return None
+    importing_file = parse_traceback_locations(report)[0].file_path if parse_traceback_locations(report) else ""
+    return ImportExportError(
+        missing_export=missing.group("name"),
+        module_path=module.group("module") or module.group("requested") or "",
+        importing_file=importing_file,
+    )
+
+
+def scan_ts_exports(content: str) -> set[str]:
+    exports: set[str] = set()
+    for match in EXPORT_RE.finditer(content):
+        if match.group(1):
+            exports.add(match.group(1))
+        elif match.group(2):
+            for item in match.group(2).split(","):
+                name = item.strip().split(" as ")[-1].strip()
+                if name:
+                    exports.add(name)
+        else:
+            exports.add("default")
+    return exports
 
 
 def _bug_queries(report: str, locations: list[TracebackLocation]) -> list[str]:
@@ -203,12 +291,177 @@ def _dedupe_results(results: list[SearchResult]) -> list[SearchResult]:
     return unique
 
 
+def _target_paths(results: list[SearchResult]) -> list[str]:
+    paths: list[str] = []
+    for result in results:
+        if result.file_path not in paths:
+            paths.append(result.file_path)
+    return paths
+
+
+def _location_snippets(workspace_root: Path, locations: list[TracebackLocation]) -> list[SearchResult]:
+    snippets: list[SearchResult] = []
+    for location in locations:
+        target = (workspace_root / location.file_path).resolve()
+        try:
+            target.relative_to(workspace_root)
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        except (OSError, ValueError):
+            continue
+        start = max(location.line - 6, 1)
+        end = min(location.line + 5, len(lines))
+        content = "\n".join(lines[start - 1:end])
+        snippets.append(
+            SearchResult(
+                file_path=location.file_path,
+                language=target.suffix.lstrip(".") or "text",
+                line_start=start,
+                line_end=end,
+                content=content,
+                score=10.0,
+            )
+        )
+    return snippets
+
+
+def _full_file_results(workspace_root: Path, paths: list[str]) -> list[SearchResult]:
+    results: list[SearchResult] = []
+    for path in _dedupe_strings(paths):
+        target = (workspace_root / path).resolve()
+        try:
+            target.relative_to(workspace_root)
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        results.append(
+            SearchResult(
+                file_path=path,
+                language=target.suffix.lstrip(".") or "text",
+                line_start=1,
+                line_end=max(1, len(content.splitlines())),
+                content=content,
+                score=20.0,
+            )
+        )
+    return results
+
+
 def _dedupe_strings(values: list[str]) -> list[str]:
     seen: set[str] = set()
     unique: list[str] = []
     for value in values:
-        if value in seen:
-            continue
-        seen.add(value)
-        unique.append(value)
+        if value and value not in seen:
+            seen.add(value)
+            unique.append(value)
     return unique
+
+
+def _locations_for_import_error(workspace_root: Path, report: str, error: ImportExportError) -> list[TracebackLocation]:
+    return [TracebackLocation(path, 1) for path in _import_export_paths(workspace_root, report, error)]
+
+
+def _import_export_paths(workspace_root: Path, report: str, error: ImportExportError) -> list[str]:
+    importer = error.importing_file or _find_importing_file(workspace_root, error.module_path, error.missing_export)
+    paths = [importer] if importer else []
+    exporter = _resolve_module_path(workspace_root, importer, error.module_path)
+    if exporter:
+        paths.append(exporter)
+    return paths
+
+
+def _find_importing_file(workspace_root: Path, module_path: str, name: str) -> str:
+    for path in workspace_root.rglob("*"):
+        if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"} or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if module_path in text and name in text:
+            return path.relative_to(workspace_root).as_posix()
+    return ""
+
+
+def _resolve_module_path(workspace_root: Path, importer: str, module_path: str) -> str:
+    module_path = module_path.replace("\\", "/")
+    if module_path.startswith("/"):
+        module_path = module_path.lstrip("/")
+    bases: list[Path] = []
+    if importer:
+        bases.append((workspace_root / importer).parent)
+    bases.append(workspace_root)
+    if module_path.startswith("."):
+        candidates = [base / module_path for base in bases]
+    else:
+        candidates = [workspace_root / module_path]
+    suffixes = ["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.tsx", "/index.js", "/index.jsx"]
+    for candidate in candidates:
+        for suffix in suffixes:
+            path = Path(str(candidate) + suffix).resolve()
+            if path.is_file():
+                try:
+                    return path.relative_to(workspace_root).as_posix()
+                except ValueError:
+                    return ""
+    return ""
+
+
+def _module_contract_error(workspace_root: Path, diff_text: str, report: str) -> str:
+    sandbox = Sandbox(workspace_root)
+    try:
+        patches = parse_file_patches(diff_text, sandbox)
+    except Exception as exc:
+        return f"Invalid diff: {exc}"
+    for patch in patches:
+        path = patch.display_path
+        if not path.endswith((".ts", ".tsx", ".js", ".jsx")) or patch.is_create or patch.is_delete:
+            continue
+        target = (workspace_root / path).resolve()
+        try:
+            before = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return f"Target file could not be read before patch: {path}"
+        before_exports = scan_ts_exports(before)
+        after_lines = _apply_hunks(before.splitlines(), patch.hunks)
+        after_exports = scan_ts_exports("\n".join(after_lines))
+        removed = sorted(before_exports - after_exports)
+        if removed and not _explicitly_allows_export_removal(report):
+            return f"Patch rejected: it removes existing export(s) from {path}: {', '.join(removed)}"
+    return ""
+
+
+def _explicitly_allows_export_removal(report: str) -> bool:
+    text = report.lower()
+    return "remove export" in text or "rename export" in text or "delete export" in text
+
+
+def _parse_search_replace(raw: str) -> tuple[str, str, str] | None:
+    match = SEARCH_REPLACE_RE.search(raw)
+    if not match:
+        return None
+    return match.group("file").strip(), match.group("search"), match.group("replace")
+
+
+def _apply_unique_search_replace(workspace_root: Path, fallback: tuple[str, str, str], patch_engine: IPatchEngine | None = None) -> tuple[str, str]:
+    file_path, search, replace = fallback
+    try:
+        Sandbox(workspace_root).validate(file_path)
+    except SecurityError as exc:
+        return "", str(exc)
+    target = (workspace_root / file_path).resolve()
+    try:
+        content = target.read_text(encoding="utf-8")
+    except OSError as exc:
+        return "", str(exc)
+    count = content.count(search)
+    if count != 1:
+        return "", f"target text matched {count} time(s), expected exactly once"
+    approval_func = getattr(patch_engine, "approval_func", None)
+    result = AgentToolRegistry(workspace_root, approval_func=approval_func).write_file(
+        file_path,
+        content.replace(search, replace, 1),
+        overwrite=True,
+    )
+    if not result.ok:
+        return "", result.message
+    return file_path, ""

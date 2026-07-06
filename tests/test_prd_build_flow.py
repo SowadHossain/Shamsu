@@ -147,16 +147,16 @@ def test_multiplayer_prd_build_scaffolds_template_then_runs_agent(tmp_path, monk
     assert "Template Build" in rendered
     assert "multiplayer-game" in rendered
     assert (tmp_path / "package.json").exists()
-    assert (tmp_path / "src" / "App.tsx").exists()
-    assert (tmp_path / "src" / "net" / "room.ts").exists()
-    assert (tmp_path / "server" / "relay.ts").exists()
+    assert (tmp_path / "client" / "src" / "App.tsx").exists()
+    assert (tmp_path / "server" / "src" / "index.ts").exists()
+    assert (tmp_path / "server" / "src" / "db.ts").exists()
     assert (tmp_path / "SHAMSU_SUMMARY.md").exists()
     assert len(captured) == 1
     assert captured[0][1] == tmp_path
     assert captured[0][2] is True
     assert captured[0][3] is True
     assert "Do real coding work now" in captured[0][0]
-    assert "Do not ask the user to provide index.html" in captured[0][0]
+    assert "// HOLE:rule.update" in captured[0][0]
 
 
 def test_multiplayer_prd_build_skips_scaffold_overwrite_and_runs_agent(tmp_path, monkeypatch):
@@ -166,21 +166,21 @@ def test_multiplayer_prd_build_skips_scaffold_overwrite_and_runs_agent(tmp_path,
         encoding="utf-8",
     )
     for relative in (
-        "src/game",
-        "src/ui",
-        "src/net",
-        "server",
+        "client/src/game",
+        "client/src/ui",
+        "server/src",
     ):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
-    existing_app = tmp_path / "src" / "App.tsx"
+    existing_app = tmp_path / "client" / "src" / "App.tsx"
     existing_app.write_text("// custom work\n", encoding="utf-8")
     for relative in (
         "package.json",
-        "src/game/entities.ts",
-        "src/game/rules.ts",
-        "src/ui/Hud.tsx",
-        "src/net/room.ts",
-        "server/relay.ts",
+        "client/package.json",
+        "client/src/game/entities.ts",
+        "client/src/game/rules.ts",
+        "client/src/ui/Hud.tsx",
+        "server/src/index.ts",
+        "server/src/db.ts",
     ):
         (tmp_path / relative).write_text("// existing\n", encoding="utf-8")
     captured = []

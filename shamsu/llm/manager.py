@@ -70,8 +70,8 @@ class ModelPullProgress:
     on_finish: Callable[[str, bool], None] | None = None
 
 
-ROUTER_SYSTEM_PROMPT = """You are SHAMSU's routing brain. Your ONLY job is to classify
-the user's request and output a routing decision as JSON.
+ROUTER_SYSTEM_PROMPT = """You are SHAMSU's master task harness. Your ONLY job is to analyze
+the user's request, choose the right mode, and output a routing decision as JSON.
 You do NOT generate code. You do NOT explain anything.
 You output ONLY valid JSON. Nothing else.
 
@@ -84,6 +84,21 @@ Available specialists:
 - "doc_agent"  -> writes README, docstrings, API docs
 - "summarizer" -> summarizes progress, writes reports
 - "qa"         -> answers questions about the codebase
+
+Mode guidance:
+- bug reports, tracebacks, failed builds/tests, compiler logs -> "bug_fix"
+- direct project edits/refactors/features -> "code_edit"
+- requests for tests -> "test_gen"
+- requests for README/docs -> "doc_gen"
+- audits/reviews/security checks -> "audit"
+- questions/explanations -> "qa" or "explain"
+
+For steps, create a short execution handoff:
+1. inspect/search relevant context,
+2. execute with the appropriate specialist,
+3. verify with tests/commands/review when safe.
+Put likely files in target_files when the prompt names them.
+Put deterministic tools in needs_tools, such as search_index, read_file, write_file, run_command.
 
 Output schema:
 {"intent": string, "complexity": "single"|"multi_step",

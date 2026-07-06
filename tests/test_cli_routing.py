@@ -320,6 +320,21 @@ def test_action_request_catches_imperatives_beyond_the_phrase_list():
         assert not repl._looks_like_action_request(prompt), prompt
 
 
+def test_action_request_catches_run_start_verbs():
+    # "run the server" was previously misrouted to the tool-less QA brain
+    # (intent=qa), which only described how to run it instead of executing it.
+    actions = (
+        "run the server",
+        "start the dev server",
+        "restart the backend",
+        "execute the tests",
+        "launch the game",
+        "rebuild the project",
+    )
+    for prompt in actions:
+        assert repl._looks_like_action_request(prompt), prompt
+
+
 def test_file_write_request_routes_explicit_file_prompts_to_agent_loop():
     writes = (
         "create hello.py with a hello world script",
@@ -471,20 +486,20 @@ async def test_file_write_prompt_bypasses_llm_router_and_uses_agent_chat(tmp_pat
 @pytest.mark.asyncio
 async def test_affirmative_followup_continues_game_agent_instead_of_qa(tmp_path, monkeypatch):
     for relative in (
-        "src/game",
-        "src/ui",
-        "src/net",
-        "server",
+        "client/src/game",
+        "client/src/ui",
+        "server/src",
     ):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
     for relative in (
         "package.json",
-        "src/App.tsx",
-        "src/game/entities.ts",
-        "src/game/rules.ts",
-        "src/ui/Hud.tsx",
-        "src/net/room.ts",
-        "server/relay.ts",
+        "client/package.json",
+        "client/src/App.tsx",
+        "client/src/game/entities.ts",
+        "client/src/game/rules.ts",
+        "client/src/ui/Hud.tsx",
+        "server/src/index.ts",
+        "server/src/db.ts",
     ):
         (tmp_path / relative).write_text("// existing\n", encoding="utf-8")
     calls = []
@@ -619,6 +634,134 @@ def test_code_edit_handler_skips_non_git_warning(monkeypatch, tmp_path):
     rendered = output.getvalue()
     assert "Workspace is not a git repository." not in rendered
     assert "Code Edit Applied" in rendered
+
+
+def test_routed_code_edit_includes_task_harness(monkeypatch, tmp_path):
+    console, output = _console_output()
+    captured: list[str] = []
+
+    class PlanLLM(FakeLLM):
+        async def route(self, prompt: str, project_summary: str):
+            from shamsu.types import RoutingDecision
+
+            return RoutingDecision(
+                intent="code_edit",
+                complexity="multi_step",
+                steps=[{"id": 1, "specialist": "coder", "task": "Update app.py"}],
+                needs_tools=["search_index", "read_file", "write_file"],
+                target_files=["app.py"],
+                confidence=0.9,
+            )
+
+    class CapturingCodeEditWorkflow:
+        def __init__(self, workspace_root: Path, search, llm=None, **kwargs) -> None:
+            pass
+
+        async def run(self, request: str):
+            captured.append(request)
+            return _PatchResult(applied=True, changed_files=["app.py"], error="")
+
+    monkeypatch.setattr(repl, "CodeEditWorkflow", CapturingCodeEditWorkflow)
+    monkeypatch.setattr(repl, "_build_search_agent", lambda workspace, logger=None: (FakeSearch(), True))
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *args, **kwargs: PlanLLM())
+    monkeypatch.setattr(repl, "ensure_index", lambda *args, **kwargs: None)
+    monkeypatch.setattr(repl, "GitTool", FakeGitTool)
+    FakeGitTool.warning = None
+
+    asyncio.run(
+        repl._handle_request(
+            "improve validation logic",
+            tmp_path,
+            console,
+            web_tool=None,
+            browser_tool=None,
+        )
+    )
+
+    assert captured
+    assert "## SHAMSU Task Harness" in captured[0]
+    assert "Mode: code_edit" in captured[0]
+    assert "Target files:\n- app.py" in captured[0]
+    assert "Code Edit Applied" in output.getvalue()
+
+
+def test_run_code_in_dev_routes_to_dev_server(monkeypatch, tmp_path):
+    console, output = _console_output()
+    calls = []
+
+    class FakeDevServerManager:
+        def __init__(self, workspace, approval_manager=None, session_logger=None):
+            pass
+
+        def start(self, command):
+            calls.append(command)
+            return type(
+                "Result",
+                (),
+                {
+                    "launched": True,
+                    "duplicate": False,
+                    "message": "launched",
+                    "command": command,
+                    "url": "http://localhost:5173/",
+                },
+            )()
+
+    monkeypatch.setattr(repl, "DevServerManager", FakeDevServerManager)
+
+    asyncio.run(
+        repl._handle_request(
+            "run the code in dev",
+            tmp_path,
+            console,
+            web_tool=None,
+            browser_tool=None,
+        )
+    )
+
+    assert calls == ["npm run dev"]
+    rendered = output.getvalue()
+    assert "Dev Server" in rendered
+    assert "http://localhost:5173/" in rendered
+
+
+def test_low_confidence_qa_for_command_like_prompt_is_corrected():
+    class LowConfidenceQA:
+        async def route(self, prompt: str, project_summary: str):
+            from shamsu.types import RoutingDecision
+
+            return RoutingDecision(intent="qa", complexity="single", confidence=0.2)
+
+    decision = asyncio.run(repl._route_prompt("repair one part at a time", LowConfidenceQA()))
+
+    assert decision.intent == "bug_fix"
+
+
+def test_import_export_runtime_error_routes_to_bug_fix():
+    decision = repl._keyword_decision(
+        "Uncaught SyntaxError: requested module '/src/game/loop.ts' does not provide an export named 'GameLoop'"
+    )
+
+    assert decision.intent == "bug_fix"
+
+
+def test_bug_followup_phrases_route_to_bug_fix():
+    assert repl._keyword_decision("this is an error i got TS2305 Module './rules' has no exported member 'World'").intent == "bug_fix"
+    assert repl._keyword_decision("fix it now").intent == "bug_fix"
+
+
+def test_run_prompts_route_to_command_or_dev_workflow():
+    assert repl._looks_like_command_like_prompt("run the code")
+    assert repl._looks_like_dev_server_prompt("run dev")
+
+
+def test_trace_command_persists_mode(tmp_path):
+    console, output = _console_output()
+
+    repl._handle_trace("trace verbose", tmp_path, console)
+
+    assert repl._trace_mode(tmp_path) == "verbose"
+    assert "verbose" in output.getvalue()
 
 
 def test_django_setup_command_prints_runner_result(monkeypatch, tmp_path):

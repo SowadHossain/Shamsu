@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +23,10 @@ class ToolResult:
     data: dict[str, Any]
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), ensure_ascii=True)
+        return json.dumps(
+            {"ok": self.ok, "message": self.message, "data": _compact_value(self.data)},
+            ensure_ascii=True,
+        )
 
 
 class AgentToolRegistry:
@@ -132,6 +135,16 @@ class AgentToolRegistry:
         return ToolResult(True, "Listed files.", {"path": path, "listing": listing})
 
     def read_file(self, filepath: str) -> ToolResult:
+        if Path(filepath).suffix.lower() == ".pdf":
+            target = self.sandbox.validate(filepath)
+            if not target.is_file():
+                return ToolResult(False, f"Not a file: {filepath}", {"filepath": filepath})
+            from shamsu.prd.input import parse_prd_file
+
+            content = parse_prd_file(target).raw_text
+            if len(content) > 6000:
+                content = f"{content[:6000]}\n... [truncated {len(content) - 6000} chars]"
+            return ToolResult(True, "Read file.", {"filepath": filepath, "content": content})
         content = self.workspace_tool.read_file(filepath)
         return ToolResult(True, "Read file.", {"filepath": filepath, "content": content})
 
@@ -219,3 +232,27 @@ def _tool_schema(
             },
         },
     }
+
+
+def _compact_value(value: Any, limit: int = 6000) -> Any:
+    if isinstance(value, str):
+        return _truncate_text(value, limit)
+    if isinstance(value, list):
+        compacted = [_compact_value(item, max(limit // 4, 500)) for item in value[:20]]
+        if len(value) > 20:
+            compacted.append(f"... [truncated {len(value) - 20} item(s)]")
+        return compacted
+    if isinstance(value, dict):
+        items = list(value.items())[:40]
+        per_item_limit = max(limit // max(len(items), 1), 500)
+        compacted = {str(key): _compact_value(item, per_item_limit) for key, item in items}
+        if len(value) > len(items):
+            compacted["..."] = f"truncated {len(value) - len(items)} key(s)"
+        return compacted
+    return value
+
+
+def _truncate_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}\n... [truncated {len(text) - limit} chars]"

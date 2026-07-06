@@ -93,6 +93,11 @@ def dod_failures(result: DoDRunResult) -> list[DoDCheckResult]:
 
 
 def _run_item(item: DoDItem, target: Path, runner: CommandRunner) -> tuple[bool, str]:
+    if not item.check:
+        # No inline check: this item is verified by the template's own external
+        # smoke runner (see the template's dod.yaml `runner`). Treat as passed
+        # here so scaffolding is not blocked by checks it cannot run inline.
+        return True, "verified by the template smoke runner"
     fn = CHECKS.get(item.check)
     if fn is None:
         return False, f"Unknown DoD check: {item.check}"

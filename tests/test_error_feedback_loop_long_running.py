@@ -66,7 +66,7 @@ async def test_long_running_mode_keeps_going_past_three_iterations_while_improvi
 @pytest.mark.asyncio
 async def test_long_running_mode_stops_early_when_stalled_instead_of_burning_the_ceiling(tmp_path: Path):
     # Failure count never improves: stays at 3 forever.
-    results = [TestRunResult(passed=0, failed=3)]
+    results = [TestRunResult(passed=0, failed=3, raw_output="same error")]
     tests = SequenceTestRunner(results)
     bugfix = FakeBugFixWorkflow(applied=True)
 
@@ -76,15 +76,19 @@ async def test_long_running_mode_stops_early_when_stalled_instead_of_burning_the
     ).run(tmp_path)
 
     assert result.success is False
-    assert "Stalled" in result.error
-    # Stopped after the first non-improving iteration, not after burning through
-    # all LONG_RUNNING_MAX_ITERATIONS attempts.
-    assert len(result.iterations) == 1
+    assert "Repeated the same error signature" in result.error
+    # Stopped by repeated-error guard, not after burning through all attempts.
+    assert len(result.iterations) == 2
 
 
 @pytest.mark.asyncio
 async def test_long_running_mode_stops_when_failures_increase(tmp_path: Path):
-    results = [TestRunResult(passed=0, failed=2), TestRunResult(passed=0, failed=4)]
+    results = [
+        TestRunResult(passed=0, failed=2, raw_output="first error"),
+        TestRunResult(passed=0, failed=4, raw_output="second error"),
+        TestRunResult(passed=0, failed=4, raw_output="second error"),
+        TestRunResult(passed=0, failed=4, raw_output="second error"),
+    ]
     tests = SequenceTestRunner(results)
     bugfix = FakeBugFixWorkflow(applied=True)
 
@@ -94,9 +98,8 @@ async def test_long_running_mode_stops_when_failures_increase(tmp_path: Path):
     ).run(tmp_path)
 
     assert result.success is False
-    # Detected immediately after the first fix made things worse (4 > 2),
-    # not after a second iteration.
-    assert len(result.iterations) == 1
+    assert "Repeated the same error signature" in result.error
+    assert len(result.iterations) == 3
 
 
 @pytest.mark.asyncio
@@ -114,3 +117,31 @@ async def test_default_mode_still_caps_at_three_iterations_even_when_improving(t
     assert result.success is False
     assert len(result.iterations) == 3
     assert "still failing after 3 fix attempts" in result.error
+
+
+@pytest.mark.asyncio
+async def test_progress_events_are_emitted_during_long_running_repair(tmp_path: Path):
+    results = [TestRunResult(passed=0, failed=2, raw_output="same error")]
+    tests = SequenceTestRunner(results)
+    bugfix = FakeBugFixWorkflow(applied=True)
+
+    class FakeProgress:
+        def __init__(self):
+            self.messages = []
+
+        def step(self, message):
+            self.messages.append(message)
+
+    progress = FakeProgress()
+
+    await ErrorFeedbackLoop(
+        tmp_path,
+        search=EmptySearch(),
+        test_runner=tests,
+        bugfix_workflow=bugfix,
+        long_running=True,
+        progress=progress,
+    ).run(tmp_path)
+
+    assert any("Running tests" in message for message in progress.messages)
+    assert any("Repair attempt" in message for message in progress.messages)

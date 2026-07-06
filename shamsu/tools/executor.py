@@ -159,6 +159,57 @@ class CommandRunner(ICommandRunner):
         )
         return result
 
+    def validate_and_approve(
+        self,
+        command: str,
+        cwd: Path,
+        description: str | None = None,
+    ) -> tuple[bool, int, str, Path | None]:
+        """Validate command/cwd and ask approval when needed without executing.
+
+        Used by detached dev-server launches: the command must pass the same
+        safety gates as normal command execution, but SHAMSU must not wait for
+        a long-running server process to exit.
+        """
+        try:
+            validated_cwd = self._validate_cwd(cwd)
+        except (SecurityError, ValueError) as exc:
+            return False, WORKSPACE_EXIT_CODE, str(exc), None
+
+        risk = classify_command(command)
+        if risk == CommandRisk.BLOCKED:
+            if self.session_logger:
+                self.session_logger.log(
+                    "command.blocked",
+                    {"command": command, "risk": risk.value},
+                    f"Blocked command: {command}",
+                    workflow_id="command",
+                )
+            self.audit_logger.log("command_run", "blocked", details={"command": command, "risk": risk.value})
+            return False, BLOCKED_EXIT_CODE, f"Blocked command: {command}", validated_cwd
+
+        if risk == CommandRisk.MEDIUM:
+            request = ApprovalRequest(
+                action_type="run_command",
+                description=description or f"Run command: {command}",
+                risk_level="medium",
+                preview=command,
+                working_dir=str(validated_cwd),
+                reason="Command is medium risk or unknown.",
+            )
+            self.approval_manager.session_logger = self.session_logger
+            if not self.approval_manager.ask(request):
+                if self.session_logger:
+                    self.session_logger.log(
+                        "command.denied",
+                        {"command": command, "cwd": str(validated_cwd)},
+                        f"Command denied: {command}",
+                        workflow_id="command",
+                    )
+                self.audit_logger.log("command_run", "denied", details={"command": command, "risk": risk.value})
+                return False, DENIED_EXIT_CODE, f"Command denied by user: {command}", validated_cwd
+        return True, 0, "Command approved.", validated_cwd
+
     def run_tests(self, cwd: Path) -> TestRunResult:
         exit_code, stdout, stderr = self.run("python -m pytest tests/ -q", cwd)
         raw_output = "\n".join(part for part in (stdout, stderr) if part)

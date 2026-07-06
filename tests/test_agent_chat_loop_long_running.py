@@ -34,18 +34,33 @@ def _list_files_call(call_id: str = "call-1"):
     }
 
 
+def _write_file_call(filepath: str, content: str, call_id: str = "call-1"):
+    return {
+        "message": {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "function": {
+                        "name": "write_file",
+                        "arguments": {"filepath": filepath, "content": content},
+                    },
+                }
+            ],
+        }
+    }
+
+
 @pytest.mark.asyncio
-async def test_default_mode_hard_stops_at_five_rounds_on_repetition(tmp_path):
-    """Confirms today's default (long_running=False) behavior is unchanged:
-    no repetition guard, just the fixed round cap."""
-    client = FakeOllamaClient([_list_files_call() for _ in range(5)])
+async def test_default_mode_stops_on_repetition_guard(tmp_path):
+    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS)])
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
 
     result = await AgentChatLoop(tmp_path, client=client, tools=tools).run("list files forever")
 
     assert result.stopped is True
-    assert "I stopped after 5 tool rounds" in result.final
-    assert len(client.calls) == 5
+    assert "kept repeating" in result.final
+    assert len(client.calls) == _MAX_REPEATED_CALLS
 
 
 @pytest.mark.asyncio
@@ -70,10 +85,26 @@ async def test_long_running_mode_uses_higher_ceiling_for_non_repeating_calls(tmp
 
 
 @pytest.mark.asyncio
-async def test_long_running_mode_corrects_a_repeat_and_continues(tmp_path):
-    # A single repeat is not fatal: the loop pushes a correction back and lets
-    # the model take a different action (here, finishing) instead of stopping
-    # with conversational filler.
+async def test_repetition_guard_allows_multiple_writes_to_different_files(tmp_path):
+    client = FakeOllamaClient(
+        [
+            _write_file_call("a.txt", "a\n", "write-a"),
+            _write_file_call("b.txt", "b\n", "write-b"),
+            {"message": {"content": "Done writing.", "tool_calls": []}},
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+
+    result = await AgentChatLoop(tmp_path, client=client, tools=tools, long_running=True).run("write two files")
+
+    assert result.stopped is False
+    assert result.final == "Done writing."
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "a\n"
+    assert (tmp_path / "b.txt").read_text(encoding="utf-8") == "b\n"
+
+
+@pytest.mark.asyncio
+async def test_long_running_mode_allows_one_repeat_and_continues(tmp_path):
     client = FakeOllamaClient(
         [
             _list_files_call(),
@@ -90,14 +121,11 @@ async def test_long_running_mode_corrects_a_repeat_and_continues(tmp_path):
     assert result.stopped is False
     assert result.final == "Done listing."
     assert len(client.calls) == 3
-    # A firm correction was injected before the third turn.
-    third_turn_messages = client.calls[2]["messages"]
-    assert any("STOP" in str(msg.get("content", "")) for msg in third_turn_messages)
 
 
 @pytest.mark.asyncio
 async def test_long_running_mode_stops_after_repeats_exceed_limit(tmp_path):
-    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS + 1)])
+    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS)])
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
 
     result = await AgentChatLoop(
@@ -106,12 +134,12 @@ async def test_long_running_mode_stops_after_repeats_exceed_limit(tmp_path):
 
     assert result.stopped is True
     assert "kept repeating" in result.final
-    assert len(client.calls) == _MAX_REPEATED_CALLS + 1
+    assert len(client.calls) == _MAX_REPEATED_CALLS
 
 
 @pytest.mark.asyncio
 async def test_long_running_mode_logs_stuck_event(tmp_path):
-    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS + 1)])
+    client = FakeOllamaClient([_list_files_call() for _ in range(_MAX_REPEATED_CALLS)])
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
 
     class RecordingLogger:

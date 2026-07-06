@@ -38,25 +38,28 @@ def test_loads_multiplayer_registry_entry() -> None:
     entry = load_registry_entry(Category.MULTIPLAYER_GAME)
 
     assert entry.category == Category.MULTIPLAYER_GAME
-    assert "MULTIPLAYER 3D BROWSER GAME" in entry.master_prompt
+    assert "multiplayer" in entry.master_prompt.lower()
     assert entry.manifest.stack["net"] == "colyseus-relay"
     assert entry.manifest.stack["physics"] == "rapier"
-    assert entry.manifest.entry == "src/main.tsx"
+    assert entry.manifest.entry == "client/src/main.tsx"
     assert {hole.id for hole in entry.manifest.holes} >= {"entity.player", "rule.update"}
-    assert {item.id for item in entry.dod.items} >= {"menu.renders", "lobby.renders"}
+    assert {item.id for item in entry.dod.items} >= {"menu.renders", "net.two_players_visible"}
 
 
 def test_multiplayer_stack_policy_is_forced_into_template() -> None:
     entry = load_registry_entry(Category.MULTIPLAYER_GAME)
     policy = stack_policy_for(Category.MULTIPLAYER_GAME)
-    package_json = json.loads((entry.root / "template" / "package.json").read_text(encoding="utf-8"))
-    dependencies = package_json["dependencies"] | package_json["devDependencies"]
+    client = json.loads((entry.root / "template" / "client" / "package.json").read_text(encoding="utf-8"))
+    server = json.loads((entry.root / "template" / "server" / "package.json").read_text(encoding="utf-8"))
+    client_deps = {**client.get("dependencies", {}), **client.get("devDependencies", {})}
+    server_deps = {**server.get("dependencies", {}), **server.get("devDependencies", {})}
 
     assert "Colyseus" in policy.backend
     assert "@dimforge/rapier3d-compat" in policy.required_packages
-    assert "colyseus" in dependencies
-    assert "colyseus.js" in dependencies
-    assert "@dimforge/rapier3d-compat" in dependencies
+    assert "colyseus" in server_deps
+    assert "better-sqlite3" in server_deps
+    assert "colyseus.js" in client_deps
+    assert "@dimforge/rapier3d-compat" in client_deps
 
 
 def test_scaffold_template_copies_inside_workspace(tmp_path: Path) -> None:
@@ -65,7 +68,8 @@ def test_scaffold_template_copies_inside_workspace(tmp_path: Path) -> None:
     result = scaffold_template(entry, tmp_path, "game", approval_func=lambda _request: True)
 
     assert (tmp_path / "game" / "package.json").exists()
-    assert (tmp_path / "game" / "src" / "App.tsx").exists()
+    assert (tmp_path / "game" / "client" / "src" / "App.tsx").exists()
+    assert (tmp_path / "game" / "server" / "src" / "db.ts").exists()
     assert "package.json" in result.copied_files
 
 
