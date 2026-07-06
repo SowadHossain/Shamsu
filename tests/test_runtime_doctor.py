@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import os
@@ -24,6 +24,8 @@ from shamsu.runtime.doctor import (
 )
 from shamsu.runtime.ollama import RuntimeStatus
 from shamsu.abstract.service import AbstractService
+from shamsu.memory.service import MemoryService
+from tests.test_graphiti_memory import FakeGraphitiAdapter
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 
 
@@ -256,10 +258,11 @@ def test_run_doctor_combines_all_checks(tmp_path):
         ollama_status=ready_status,
         bin_dir=tmp_path / "bin",
         codebase_memory_service=cbm_service,
+        graphiti_memory_service=MemoryService(tmp_path, adapter=FakeGraphitiAdapter(available=True)),
     )
 
     assert isinstance(report, DoctorReport)
-    assert len(report.checks) == 7
+    assert len(report.checks) == 8
     assert report.all_ok is True
 
 
@@ -294,3 +297,4 @@ def test_format_report_marks_ok():
 
     assert "OK" in text
     assert "Everything looks fine." in text
+

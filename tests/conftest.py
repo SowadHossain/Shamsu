@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import pytest
 
 from shamsu.abstract.types import GateResult
+from shamsu.memory.types import MemoryGate
 
 
 class _AlwaysOpenAbstractService:
@@ -17,6 +18,27 @@ class _AlwaysOpenAbstractService:
         return GateResult(allowed=True)
 
 
+
+class _AlwaysOpenMemoryService:
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def ensure_ready(self) -> MemoryGate:
+        return MemoryGate(allowed=True)
+
+    def render_relevant(self, *_args, **_kwargs) -> str:
+        return ""
+
+
+@pytest.fixture(autouse=True)
+def _graphiti_memory_gate_open(monkeypatch):
+    from shamsu.agents import orchestrator as orchestrator_module
+    from shamsu.agents import chat_loop as chat_loop_module
+    from shamsu.llm import manager as manager_module
+
+    monkeypatch.setattr(orchestrator_module, "MemoryService", _AlwaysOpenMemoryService)
+    monkeypatch.setattr(chat_loop_module, "MemoryService", _AlwaysOpenMemoryService)
+    monkeypatch.setattr(manager_module, "MemoryService", _AlwaysOpenMemoryService)
 @pytest.fixture(autouse=True)
 def _codebase_memory_gate_open(monkeypatch):
     """Default the Codebase-Memory MCP startup gate to open for the existing
@@ -54,3 +76,5 @@ def _model_tier_reset(monkeypatch):
     import shamsu.runtime.models as models_module
 
     monkeypatch.setattr(models_module, "_ACTIVE_TIER", models_module.DEFAULT_TIER)
+
+

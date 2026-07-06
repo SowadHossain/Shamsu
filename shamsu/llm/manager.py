@@ -1,17 +1,17 @@
-"""
-shamsu/llm/manager.py — Dev B owns this file.
+﻿"""
+shamsu/llm/manager.py â€” Dev B owns this file.
 
 Implements ILLMManager. Encodes the harness defaults directly:
-  - keep_alive=-1 (router never unloads; see ENGINEERING_HARNESS.md §8)
+  - keep_alive=-1 (router never unloads; see ENGINEERING_HARNESS.md Â§8)
   - temperature=0 for routing/JSON, 0.1 for code, per SPECIALIST_TEMPS
-  - Ollama's native `format` schema param for structured output —
+  - Ollama's native `format` schema param for structured output â€”
     this is the PRIMARY mechanism, not a library. json_repair is the
     fallback when schema enforcement still produces something invalid
     (rare, but happens under quantization-induced glitches).
-  - num_ctx=8192 default — drop to 4096 if you observe swapping
-    (see harness §8, "num_ctx tradeoffs").
+  - num_ctx=8192 default â€” drop to 4096 if you observe swapping
+    (see harness Â§8, "num_ctx tradeoffs").
 
-This file does NOT manage model loading/unloading lifecycle yet —
+This file does NOT manage model loading/unloading lifecycle yet â€”
 that's the Day 8 ModelManager work (see WEEK3_PLAN.md Day 8, Dev B).
 For Day 1-3 scaffolding, run_specialist() always targets the model
 named in OLLAMA_MODELS[specialist] and trusts Ollama's own keep_alive
@@ -23,24 +23,26 @@ import asyncio
 import json
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from urllib.parse import urlparse
 
 import httpx
 from json_repair import repair_json
 
 from shamsu.interfaces import ILLMManager
+from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
+from pathlib import Path
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
-# Model assignment — see SHAMSU_model_architecture.md for full rationale.
+# Model assignment â€” see SHAMSU_model_architecture.md for full rationale.
 OLLAMA_MODELS = SPECIALIST_MODELS
 
-# Temperature per specialist — see ENGINEERING_HARNESS.md §1.
+# Temperature per specialist â€” see ENGINEERING_HARNESS.md Â§1.
 SPECIALIST_TEMPS = {
     "router": 0.0, "planner": 0.1, "coder": 0.1,
     "bugfix": 0.1, "bugfixer": 0.1, "reviewer": 0.2,
@@ -210,8 +212,8 @@ class LLMManager(ILLMManager):
     async def route(self, prompt: str, project_summary: str) -> RoutingDecision:
         """
         Router stays loaded the whole session (keep_alive='-1' would be set
-        at the Ollama Modelfile / env level — see ENGINEERING_HARNESS.md
-        §8). temperature=0, schema-constrained — this is the harness's
+        at the Ollama Modelfile / env level â€” see ENGINEERING_HARNESS.md
+        Â§8). temperature=0, schema-constrained â€” this is the harness's
         primary defense against malformed routing JSON, not a try/except.
         """
         started = time.perf_counter()
@@ -233,7 +235,7 @@ class LLMManager(ILLMManager):
             self._log_route_decision(decision, started, retry_count=0)
             return decision
 
-        # One retry with explicit correction, per harness §4 retry phrasing.
+        # One retry with explicit correction, per harness Â§4 retry phrasing.
         retry_prompt = (
             f"Your previous output failed JSON validation. "
             f"Output ONLY corrected JSON matching the schema. "
@@ -248,7 +250,7 @@ class LLMManager(ILLMManager):
             self._log_route_decision(decision, started, retry_count=1)
             return decision
 
-        # Safe fallback — never crash the conversation on a routing failure.
+        # Safe fallback â€” never crash the conversation on a routing failure.
         if self.session_logger:
             self.session_logger.log(
                 "llm.error",
@@ -289,6 +291,7 @@ class LLMManager(ILLMManager):
         model_name = model_for_role(specialist)
         await self._ensure_model(model_name)
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
+        pack = self._with_long_term_memory(pack, specialist)
         prompt = self._format_pack(pack)
         started = time.perf_counter()
         if self.session_logger:
@@ -378,6 +381,7 @@ class LLMManager(ILLMManager):
         model_name = model_for_role(specialist)
         await self._ensure_model(model_name)
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
+        pack = self._with_long_term_memory(pack, specialist)
         prompt = self._format_pack(pack)
         started = time.perf_counter()
         if self.session_logger:
@@ -420,6 +424,28 @@ class LLMManager(ILLMManager):
             )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
 
+    def _with_long_term_memory(self, pack: ContextPack, specialist: str) -> ContextPack:
+        if not self.session_logger:
+            return pack
+        try:
+            workspace = self.session_logger.metadata.workspace
+            memory_context = MemoryService(Path(workspace)).render_relevant(
+                pack.user_request,
+                task_type=specialist,
+                limit=8,
+            )
+        except Exception:
+            return pack
+        if not memory_context:
+            return pack
+        prd_context = f"{memory_context}\n\n{pack.prd_context}" if pack.prd_context else memory_context
+        self.session_logger.log(
+            "memory.retrieved",
+            {"specialist": specialist, "has_memory": True},
+            "Retrieved relevant Graphiti memories",
+            workflow_id=pack.task_id,
+        )
+        return replace(pack, prd_context=prd_context)
     def _log_route_decision(
         self,
         decision: RoutingDecision,
@@ -447,9 +473,9 @@ class LLMManager(ILLMManager):
             f"# File: {s.file_path} (lines {s.line_start}-{s.line_end})\n{s.content}"
             for s in pack.snippets
         )
-        # Task restated at the very end — exploits the recency side of the
+        # Task restated at the very end â€” exploits the recency side of the
         # "Lost in the Middle" U-curve (Liu et al., TACL 2024). See
-        # ENGINEERING_HARNESS.md §1.
+        # ENGINEERING_HARNESS.md Â§1.
         return f"""## Relevant code
 {snippets_text}
 
@@ -473,3 +499,6 @@ def _validate_local_llm_url(base_url: str) -> None:
             "SHAMSU only supports local Ollama endpoints. "
             f"Refusing non-local LLM URL: {base_url}"
         )
+
+
+

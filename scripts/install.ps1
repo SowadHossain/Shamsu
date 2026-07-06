@@ -1,8 +1,9 @@
-param(
+﻿param(
     [string]$Python = "python",
     [switch]$Yes,
     [switch]$SkipOllamaInstall,
     [switch]$SkipCodebaseMemoryInstall,
+    [switch]$SkipGraphitiInstall,
     [switch]$SkipModels,
     [switch]$PrefetchModels,
     [switch]$SkipCommandInstall,
@@ -334,6 +335,27 @@ try {
         }
     }
 
+    if (-not $SkipGraphitiInstall) {
+        $MemoryStatusJson = & $VenvPython -m shamsu.memory.cli status --workspace $RepoRoot --json
+        $MemoryStatus = $MemoryStatusJson | ConvertFrom-Json
+        if (-not $MemoryStatus.health.available) {
+            $InstallGraphiti = $Yes
+            if (-not $InstallGraphiti) {
+                $Answer = Read-Host "Install required local Graphiti memory tool? [y/N]"
+                $InstallGraphiti = $Answer.ToLowerInvariant() -in @("y", "yes")
+            }
+            if ($InstallGraphiti) {
+                & $VenvPython -m shamsu.memory.cli setup --workspace $RepoRoot
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warning "Graphiti setup failed. Run '/memory setup' or 'shamsu doctor' later to retry."
+                }
+            }
+            else {
+                Write-Warning "Skipping Graphiti install. SHAMSU normal agent mode will not run until '/memory setup' completes."
+            }
+        }
+    }
+
     if (-not $SkipCommandInstall) {
         Install-ShamsuLauncher -BinDir $BinDir -RunScript $RunScript -WillUpdatePath (-not $SkipPathUpdate)
         if (-not $SkipPathUpdate) {
@@ -360,3 +382,4 @@ try {
 finally {
     Pop-Location
 }
+

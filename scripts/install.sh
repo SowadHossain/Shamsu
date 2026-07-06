@@ -8,6 +8,7 @@ SKIP_MODELS=0
 PREFETCH_MODELS=0
 SKIP_COMMAND_INSTALL=0
 SKIP_CODEBASE_MEMORY_INSTALL=0
+SKIP_GRAPHITI_INSTALL=0
 BIN_DIR="${HOME}/.local/bin"
 MODELS_PATH=""
 export PYTHONUTF8="${PYTHONUTF8:-1}"
@@ -36,6 +37,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-codebase-memory-install)
       SKIP_CODEBASE_MEMORY_INSTALL=1
+      shift
+      ;;
+    --skip-graphiti-install)
+      SKIP_GRAPHITI_INSTALL=1
       shift
       ;;
     --bin-dir)
@@ -160,6 +165,23 @@ if [[ "${SKIP_CODEBASE_MEMORY_INSTALL}" -eq 0 ]] && ! "${VENV_PYTHON}" -m shamsu
   fi
 fi
 
+if [[ "${SKIP_GRAPHITI_INSTALL}" -eq 0 ]] && ! "${VENV_PYTHON}" -m shamsu.memory.cli status --workspace "${REPO_ROOT}" --json | grep -q '"available": true'; then
+  INSTALL_GRAPHITI="${YES}"
+  if [[ "${INSTALL_GRAPHITI}" -eq 0 ]]; then
+    read -r -p "Install required local Graphiti memory tool? [y/N] " ANSWER
+    if [[ "${ANSWER,,}" == "y" || "${ANSWER,,}" == "yes" ]]; then
+      INSTALL_GRAPHITI=1
+    fi
+  fi
+  if [[ "${INSTALL_GRAPHITI}" -eq 1 ]]; then
+    if ! "${VENV_PYTHON}" -m shamsu.memory.cli setup --workspace "${REPO_ROOT}"; then
+      echo "Warning: Graphiti setup failed. Run '/memory setup' or 'shamsu doctor' later to retry." >&2
+    fi
+  else
+    echo "Warning: Skipping Graphiti install. SHAMSU normal agent mode will not run until '/memory setup' completes." >&2
+  fi
+fi
+
 if [[ "${SKIP_COMMAND_INSTALL}" -eq 0 ]]; then
   mkdir -p "${BIN_DIR}"
   LAUNCHER="${BIN_DIR}/shamsu"
@@ -210,3 +232,5 @@ if [[ "${SKIP_COMMAND_INSTALL}" -eq 0 ]]; then
 else
   echo "  ${REPO_ROOT}/scripts/run-shamsu.sh"
 fi
+
+

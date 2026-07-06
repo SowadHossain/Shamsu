@@ -1,4 +1,4 @@
-"""Stateful ReAct chat loop using Ollama's native tool calling."""
+﻿"""Stateful ReAct chat loop using Ollama's native tool calling."""
 from __future__ import annotations
 
 import json
@@ -13,13 +13,14 @@ import ollama
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.llm.manager import OLLAMA_BASE_URL, _validate_local_llm_url
+from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import model_for_role
 from shamsu.safety.clarify import ask_clarifying_question
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.ui.progress import ProgressReporter, summarize_tool_args, summarize_tool_result
 
-# Circuit-breaker ceiling used only in long-running mode — a backstop, not
+# Circuit-breaker ceiling used only in long-running mode â€” a backstop, not
 # the normal stop condition (the repetition guard is what actually catches
 # a stuck loop; this just bounds worst-case cost on a local machine).
 DEFAULT_MAX_TOOL_ROUNDS = 8
@@ -39,7 +40,7 @@ Rules:
 - If the user asks you to create, write, save, generate, add, edit, or update a file,
   your next action must be a write_file tool call or a clarification question.
 - To create OR change a file, call write_file with the COMPLETE new file content. It
-  overwrites, so never send a partial file or a diff — send the whole file every time.
+  overwrites, so never send a partial file or a diff â€” send the whole file every time.
 - A file change only counts if the write_file tool result says ok. If a tool result shows
   an error, the change did NOT happen: do not assume success, read the file if needed and
   call write_file again with the full corrected content.
@@ -99,11 +100,12 @@ class AgentChatLoop:
         self.long_running = long_running
         self.max_tool_rounds = LONG_RUNNING_MAX_TOOL_ROUNDS if long_running else max_tool_rounds
         # Only used when long_running=True; None disables the clarifying
-        # question (falls back to a plain stop message) — useful for tests.
+        # question (falls back to a plain stop message) â€” useful for tests.
         self.clarify_prompt = clarify_prompt if long_running else None
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
     async def run(self, user_input: str) -> AgentLoopResult:
+        user_input = self._append_long_term_memory(user_input)
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
@@ -186,8 +188,27 @@ class AgentChatLoop:
         self.state.append_assistant(final)
         return AgentLoopResult(final=final, tool_rounds=self.max_tool_rounds, stopped=True)
 
+    def _append_long_term_memory(self, user_input: str) -> str:
+        try:
+            memory_context = MemoryService(self.workspace_root).render_relevant(
+                user_input,
+                task_type="agent-chat",
+                limit=8,
+            )
+        except Exception:
+            return user_input
+        if not memory_context:
+            return user_input
+        if self.session_logger:
+            self.session_logger.log(
+                "memory.retrieved",
+                {"specialist": "agent-chat", "has_memory": True},
+                "Retrieved relevant Graphiti memories",
+                workflow_id="agent-chat",
+            )
+        return f"{user_input}\n\n{memory_context}"
     def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
-        """The same tool call repeated past the limit despite corrections — stop
+        """The same tool call repeated past the limit despite corrections â€” stop
         cleanly rather than burn rounds. No clarifying question, no filler."""
         final = (
             f"I stopped because the same {tool_name} call kept repeating without meaningful progress. "
@@ -385,3 +406,4 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(key, default)
     return getattr(value, key, default)
+

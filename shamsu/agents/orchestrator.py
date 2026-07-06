@@ -1,4 +1,4 @@
-"""Thin agent orchestration layer before model routing."""
+﻿"""Thin agent orchestration layer before model routing."""
 from __future__ import annotations
 
 import re
@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from shamsu.abstract.service import AbstractService
+from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
 from shamsu.tools.workspace import MentionContext, MentionResolver, WorkspaceTool, render_mention_context
@@ -28,12 +29,14 @@ class AgentOrchestrator:
         workspace_root: Path,
         session_logger: SessionLogger | None = None,
         abstract_service: AbstractService | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
         self.workspace_tool = WorkspaceTool(self.workspace_root)
         self.mention_resolver = MentionResolver(self.workspace_root)
         self.abstract_service = abstract_service or AbstractService(self.workspace_root)
+        self.memory_service = memory_service or MemoryService(self.workspace_root)
 
     def run(self, user_input: str) -> AgentResult:
         memory = ConversationMemory.from_session(self.session_logger)
@@ -93,6 +96,17 @@ class AgentOrchestrator:
                 message="Which location should I check the weather for?",
                 effective_input=effective_input,
                 action="web.needs_location",
+            )
+        memory_gate = self.memory_service.ensure_ready()
+        if not memory_gate.allowed:
+            return AgentResult(
+                handled=True,
+                title="Graphiti Memory Required",
+                message=memory_gate.reason or REQUIRED_MEMORY_MESSAGE,
+                effective_input=effective_input,
+                context=context,
+                mentions=mentions,
+                action="memory.blocked",
             )
         gate = self.abstract_service.ensure_ready()
         if not gate.allowed:
@@ -235,3 +249,5 @@ def _asks_weather_without_location(text: str) -> bool:
         r"\b(in|for|at)\s+[a-z][a-z\s,.-]{2,}(?:\s+(today|now|tomorrow))?\??$",
         lowered,
     )
+
+

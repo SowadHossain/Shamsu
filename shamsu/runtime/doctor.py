@@ -1,7 +1,7 @@
-"""
+﻿"""
 Read-only environment diagnostics for SHAMSU.
 
-`doctor` never installs, deletes, or repairs anything — it only reports.
+`doctor` never installs, deletes, or repairs anything â€” it only reports.
 It exists so "something feels broken" no longer defaults to wiping the
 venv and reinstalling; run doctor first and see what it actually finds.
 """
@@ -17,6 +17,7 @@ from pathlib import Path
 from shamsu.runtime.ollama import RuntimeStatus, collect_status, repo_root_from_runtime
 from shamsu.runtime.models import allowed_model_names, is_allowed_model
 from shamsu.abstract.service import AbstractService
+from shamsu.memory.service import MemoryService
 
 IGNORED_DIR_NAMES = {".venv", ".git", "node_modules", "__pycache__"}
 
@@ -96,6 +97,21 @@ def check_cookbook(status: RuntimeStatus | None = None) -> DoctorCheck:
         "Remove larger models manually if they are causing memory pressure.",
     )
 
+
+def check_graphiti_memory(workspace: Path, service: MemoryService | None = None) -> DoctorCheck:
+    status = (service or MemoryService(workspace)).status()
+    if status.normal_mode_allowed:
+        return DoctorCheck(
+            "graphiti_memory",
+            True,
+            f"Graphiti memory is healthy. {status.health.message}",
+        )
+    return DoctorCheck(
+        "graphiti_memory",
+        False,
+        status.health.message,
+        "Run `/memory setup` or `/memory repair`.",
+    )
 
 def check_codebase_memory(workspace: Path, service: AbstractService | None = None) -> DoctorCheck:
     status = (service or AbstractService(workspace)).status()
@@ -236,6 +252,7 @@ def run_doctor(
     ollama_status: RuntimeStatus | None = None,
     bin_dir: Path | None = None,
     codebase_memory_service: AbstractService | None = None,
+    graphiti_memory_service: MemoryService | None = None,
 ) -> DoctorReport:
     resolved_repo_root = (repo_root or repo_root_from_runtime()).resolve()
     resolved_workspace = (workspace or resolved_repo_root).resolve()
@@ -246,6 +263,7 @@ def run_doctor(
         check_nested_workspaces(resolved_workspace),
         check_ancestor_workspace(resolved_workspace),
         check_path_manifest(bin_dir),
+        check_graphiti_memory(resolved_workspace, graphiti_memory_service),
         check_codebase_memory(resolved_workspace, codebase_memory_service),
     )
     return DoctorReport(checks=checks)
@@ -286,3 +304,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Minimal REPL shell.
 
 The selected workspace is the sandbox boundary for project reads and indexes.
@@ -45,6 +45,7 @@ from shamsu.agents.task_harness import append_task_handoff, build_task_plan, pla
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
 from shamsu.llm.manager import LLMManager, ModelPullProgress
+from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.state import create_generation_state, save_generation_state
@@ -133,6 +134,14 @@ SYSTEM_COMMANDS = (
     "/abstract symbols ",
     "/abstract who-uses ",
     "/abstract impact ",
+    "/memory status",
+    "/memory setup",
+    "/memory repair",
+    "/memory remember ",
+    "/memory search ",
+    "/memory recent",
+    "/memory forget ",
+    "/memory summarize-session ",
     "/parse-prd ",
     "/plan-prd ",
     "/generate-django ",
@@ -262,6 +271,12 @@ def _print_help(console: Console) -> None:
                     "  /abstract symbols <name-or-file>",
                     "  /abstract who-uses <symbol>   Callers/importers of a symbol",
                     "  /abstract impact <symbol>     Edit impact / blast radius",
+                    "  /memory status           Show Graphiti long-term memory health",
+                    "  /memory setup            Install/configure local Graphiti memory",
+                    "  /memory repair           Re-check and repair Graphiti config",
+                    "  /memory remember <text>  Store explicit durable memory",
+                    "  /memory search <query>   Search Graphiti memory",
+                    "  /memory forget <query>   Forget/mark memory via Graphiti adapter",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  /plan-prd <file>          Preview and approve a project plan",
                     "  /generate-django <file>   Generate deterministic Django backend files",
@@ -738,6 +753,111 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
     )
 
 
+def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None:
+    try:
+        service = MemoryService(workspace)
+        gate = service.ensure_ready()
+        if gate.allowed:
+            console.print("[dim]Graphiti memory: ready[/dim]")
+        else:
+            console.print(f"[yellow]{REQUIRED_MEMORY_MESSAGE}[/yellow]")
+    except Exception as exc:
+        console.print(f"[yellow]Graphiti memory: startup check failed ({exc}). Run /memory repair or /doctor.[/yellow]")
+
+
+def _memory_command_allowed(normalized_input: str) -> bool:
+    lowered = normalized_input.lower()
+    return (
+        lowered in {"help", "doctor", "exit", "quit"}
+        or lowered.startswith("memory")
+    )
+
+
+def _handle_memory(user_input: str, workspace: Path, console: Console) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else "status"
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    service = MemoryService(workspace)
+
+    if subcommand == "status":
+        status = service.status()
+        console.print(f"Available: {status.health.available} ({status.health.message})")
+        console.print(f"Config: {status.health.config_path or service._config_path()}")
+        console.print(f"Workspace memory path: {status.memory_path}")
+        console.print(f"Normal agent mode allowed: {status.normal_mode_allowed}")
+        return
+    if subcommand == "setup":
+        result = service.setup()
+        console.print("[green]Graphiti setup complete.[/green]" if result.get("ok") else f"[red]Graphiti setup failed: {result.get('error') or result.get('message') or result}[/red]")
+        return
+    if subcommand == "repair":
+        result = service.repair()
+        console.print("[green]Graphiti repair complete.[/green]" if result.get("ok") else f"[red]Graphiti repair failed: {result.get('message') or result.get('error') or result}[/red]")
+        return
+    if subcommand == "remember":
+        if not argument:
+            console.print("[red]Usage: /memory remember <text>[/red]")
+            return
+        result = service.remember(argument)
+        if result.get("ok"):
+            console.print("[green]Memory stored.[/green]" if not result.get("deduped") else "[green]Memory already existed.[/green]")
+        else:
+            console.print(f"[yellow]Memory not stored: {result.get('reason') or result.get('error') or result}[/yellow]")
+        return
+    if subcommand in {"search", "recent"}:
+        query = argument or "recent durable SHAMSU memory"
+        result = service.search(query, limit=8)
+        if not result.get("ok"):
+            console.print(f"[red]Memory search failed: {result.get('error') or result}[/red]")
+            return
+        rows = result.get("results", [])
+        if not rows:
+            console.print("[dim]No Graphiti memories found.[/dim]")
+            return
+        table = Table(title="Graphiti Memory")
+        table.add_column("ID")
+        table.add_column("Memory")
+        for item in rows[:8]:
+            table.add_row(str(item.get("id") or item.get("uuid") or ""), str(item.get("text") or item.get("fact") or item)[:240])
+        console.print(table)
+        return
+    if subcommand == "forget":
+        if not argument:
+            console.print("[red]Usage: /memory forget <memory-id-or-query>[/red]")
+            return
+        result = service.forget(argument)
+        console.print("[green]Forget request completed.[/green]" if result.get("ok") else f"[yellow]Forget request not completed: {result.get('error') or result}[/yellow]")
+        return
+    if subcommand == "summarize-session":
+        if not argument:
+            console.print("[red]Usage: /memory summarize-session <session-id>[/red]")
+            return
+        result = service.summarize_session(argument)
+        console.print("[green]Session summary stored.[/green]" if result.get("ok") else f"[yellow]Session summary not stored: {result.get('error') or result}[/yellow]")
+        return
+    console.print("[red]Usage: /memory status|setup|repair|remember|search|recent|forget|summarize-session[/red]")
+
+
+def _record_task_memory(
+    workspace: Path,
+    text: str,
+    kind: str = "task_summary",
+    session_logger: SessionLogger | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    try:
+        result = MemoryService(workspace).remember(text, kind, metadata)
+    except Exception as exc:
+        _log_event(session_logger, "memory.write_failed", {"error": str(exc)}, "Graphiti memory write failed", workflow_id="memory")
+        return
+    _log_event(
+        session_logger,
+        "memory.write",
+        {"ok": bool(result.get("ok")), "kind": kind, "skipped": bool(result.get("skipped")), "deduped": bool(result.get("deduped"))},
+        "Graphiti memory write evaluated",
+        workflow_id="memory",
+    )
 def _handle_permissions(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1580,6 +1700,14 @@ async def _handle_request(
             {"intent": decision.intent},
             f"Workflow finished: {decision.intent}",
             workflow_id=decision.intent,
+        )
+        memory_kind = "bug_lesson" if decision.intent == "bug_fix" else "task_summary"
+        _record_task_memory(
+            workspace,
+            f"Task summary: {decision.intent} completed for request: {effective_input[:700]}",
+            memory_kind,
+            session_logger,
+            {"intent": decision.intent},
         )
     except Exception as exc:
         message = str(exc)
@@ -3130,6 +3258,13 @@ async def _run_agent_chat(
         progress.done("Agent finished")
     console.print(Panel(_agent_display_summary(body, activities), title="Agent"))
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
+    _record_task_memory(
+        workspace,
+        f"Task summary: agent-chat completed for request: {user_input[:500]}",
+        "task_summary",
+        session_logger,
+        {"workflow": "agent-chat"},
+    )
 
 
 def _should_show_context_preview() -> bool:
@@ -3878,6 +4013,7 @@ def main(argv: list[str] | None = None) -> None:
     atexit.register(shutdown_if_last_session, session_pid)
 
     _print_startup_banner(workspace, console)
+    _ensure_graphiti_ready_at_startup(workspace, console)
     _ensure_code_memory_ready_at_startup(workspace, console)
     ancestor_workspace = find_ancestor_workspace(workspace)
     if ancestor_workspace is not None:
@@ -3941,6 +4077,11 @@ def main(argv: list[str] | None = None) -> None:
         else:
             normalized_input = _normalize_command_input(user_input)
         lowered_input = normalized_input.lower()
+        if not _memory_command_allowed(lowered_input):
+            memory_gate = MemoryService(workspace).ensure_ready()
+            if not memory_gate.allowed:
+                console.print(Panel(memory_gate.reason or REQUIRED_MEMORY_MESSAGE, title="Graphiti Memory Required", border_style="red"))
+                continue
         if lowered_input in {"exit", "quit"}:
             print("Goodbye.")
             break
@@ -3949,6 +4090,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input == "doctor":
             _handle_doctor(workspace, console)
+            continue
+        if lowered_input.startswith("memory"):
+            _handle_memory(normalized_input, workspace, console)
             continue
         if lowered_input.startswith("abstract"):
             _handle_abstract(normalized_input, workspace, console)
@@ -4024,3 +4168,7 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
