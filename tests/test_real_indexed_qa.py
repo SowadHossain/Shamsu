@@ -93,6 +93,26 @@ def test_repl_request_uses_codebase_memory_context_when_healthy(monkeypatch, tmp
             {"node": "charge_card", "file": "payments.py", "start_line": 1, "end_line": 3}
         ],
     )
+    class FakeLLM:
+        def __init__(self, session_logger=None, model_pull_progress=None):
+            self.session_logger = session_logger
+
+        async def route(self, prompt: str, project_summary: str):
+            from shamsu.types import RoutingDecision
+
+            return RoutingDecision(
+                intent="qa",
+                complexity="single",
+                steps=[{"id": 1, "specialist": "qa", "task": prompt}],
+                needs_tools=["search"],
+                confidence=0.9,
+            )
+
+        async def run_specialist(self, specialist, pack):
+            snippet_text = "\n".join(snippet.content for snippet in pack.snippets)
+            return LLMResponse(raw=f"{pack.prd_context}\n{snippet_text}", model_used="fake-qwen")
+
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
 
@@ -190,7 +210,7 @@ def test_repl_workspace_location_question_reports_workspace(tmp_path):
     rendered = output.getvalue()
     assert "Current Workspace" in rendered
     assert str(tmp_path) in rendered
-    assert "I don’t have a current working directory" not in rendered
+    assert "have a current working directory" not in rendered
 
 
 def test_repl_weather_question_without_location_asks_location(monkeypatch, tmp_path):

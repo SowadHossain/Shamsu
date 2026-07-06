@@ -173,7 +173,7 @@ async def test_error_feedback_loop_runs_fix_and_retests_until_success(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_error_feedback_loop_stops_after_three_failed_iterations(tmp_path: Path):
+async def test_error_feedback_loop_stops_when_failures_do_not_improve(tmp_path: Path):
     failing = ShamsuTestRunResult(passed=0, failed=1, raw_output="FAILED (errors=1)")
     tests = SequenceTestRunner([failing])
     bugfix = FakeBugFixWorkflow(applied=True)
@@ -187,8 +187,8 @@ async def test_error_feedback_loop_stops_after_three_failed_iterations(tmp_path:
     ).run(tmp_path)
 
     assert result.success is False
-    assert len(result.iterations) == 3
-    assert "still failing" in result.error
+    assert len(result.iterations) == 1
+    assert "no improvement" in result.error
 
 
 @pytest.mark.asyncio
