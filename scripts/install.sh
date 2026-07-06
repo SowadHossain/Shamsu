@@ -136,8 +136,9 @@ if [[ "${PREFETCH_MODELS}" -eq 1 && "${SKIP_MODELS}" -eq 0 ]] && ! "${VENV_PYTHO
 elif "${VENV_PYTHON}" -m shamsu.runtime.ollama status --json | grep -q '"ollama_path": "";'; then
   echo "Ollama is still missing. SHAMSU installed, but local inference needs 'models repair' after Ollama is installed." >&2
 else
-  echo "Skipping upfront model downloads. SHAMSU pulls each model automatically the first time it's actually needed."
-  echo "Pass --prefetch-models to this script to download all required models now instead."
+  echo "Skipping model downloads here. The first time you run 'shamsu' in a workspace it will"
+  echo "ask which model tier to use (light/default/heavy) and download that tier's models then."
+  echo "Pass --prefetch-models to this script to download the default tier's models now instead."
 fi
 
 "${VENV_PYTHON}" -m shamsu.runtime.ollama write-config

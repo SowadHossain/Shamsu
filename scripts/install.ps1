@@ -306,8 +306,9 @@ try {
         Write-Warning "Ollama is still missing. SHAMSU installed, but local inference needs `models repair` after Ollama is installed."
     }
     else {
-        Write-Host "Skipping upfront model downloads. SHAMSU pulls each model automatically the first time it's actually needed."
-        Write-Host "Pass -PrefetchModels to this script to download all required models now instead."
+        Write-Host "Skipping model downloads here. The first time you run 'shamsu' in a workspace it will"
+        Write-Host "ask which model tier to use (light/default/heavy) and download that tier's models then."
+        Write-Host "Pass -PrefetchModels to this script to download the default tier's models now instead."
     }
 
     & $VenvPython -m shamsu.runtime.ollama write-config

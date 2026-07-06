@@ -132,6 +132,13 @@ def _tier_config_path(workspace: Path) -> Path:
     return workspace / ".shamsu" / TIER_FILENAME
 
 
+def tier_ever_configured(workspace: Path) -> bool:
+    """True once a tier has been explicitly chosen/persisted for `workspace`
+    (via set_model_tier - the /models tier command or the first-run prompt).
+    Used to decide whether to show the first-run tier picker."""
+    return _tier_config_path(workspace).exists()
+
+
 def _read_persisted_tier(workspace: Path) -> ModelTier | None:
     path = _tier_config_path(workspace)
     if not path.exists():

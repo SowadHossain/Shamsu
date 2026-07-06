@@ -113,6 +113,53 @@ def ask_approval(request: ApprovalRequest, console: Console | None = None) -> bo
     return approved
 
 
+_TIER_ANSWERS = {"1": "light", "2": "default", "3": "heavy"}
+
+
+def ask_tier_choice(console: Console | None = None) -> str | None:
+    """First-run model tier picker (light/default/heavy).
+
+    Returns the chosen tier name, or None if no interactive answer could be
+    obtained (piped/non-interactive stdin, closed input, or repeated
+    unrecognized answers) - the caller should silently fall back to the
+    default tier rather than blocking startup."""
+    console = console or Console()
+    console.print(
+        Panel(
+            "  1. light   - ~3B models, runs on 8GB RAM with no GPU\n"
+            "  2. default - ~7-8B models, the original 8GB cookbook (recommended)\n"
+            "  3. heavy   - up to 14B models, needs 16GB+ RAM\n\n"
+            "You can change this later with `/models tier light|default|heavy`.",
+            title="Choose a Model Tier",
+            border_style="cyan",
+        )
+    )
+    if not console.is_terminal:
+        return None
+    console.print("Which tier? [1/2/3]")
+    _pause_console_live(console)
+    empty_reads = 0
+    while True:
+        answer = _prompt_toolkit_answer()
+        if answer is None:
+            try:
+                answer = input("> ").strip().lower()
+            except EOFError:
+                console.print("[yellow]No input available. Defaulting to the default tier.[/yellow]")
+                return None
+        if answer in _TIER_ANSWERS:
+            return _TIER_ANSWERS[answer]
+        if answer in {"light", "default", "heavy"}:
+            return answer
+        if not answer:
+            empty_reads += 1
+            if empty_reads >= _MAX_EMPTY_TTY_READS:
+                console.print("[yellow]No answer received. Defaulting to the default tier.[/yellow]")
+                return None
+            continue
+        console.print("[yellow]Please choose 1, 2, or 3.[/yellow]")
+
+
 def ask_remember_choice(action_type: str, console: Console | None = None) -> str:
     """Ask whether to auto-approve future actions of this type.
 

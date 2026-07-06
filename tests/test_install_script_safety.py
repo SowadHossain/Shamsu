@@ -58,10 +58,10 @@ def test_install_scripts_default_to_lazy_model_downloads():
     sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
 
     assert "if ($PrefetchModels -and -not $SkipModels -and $RuntimeStatus.ollama_path)" in ps1
-    assert "pulls each model automatically the first time it's actually needed" in ps1
+    assert "ask which model tier to use" in ps1
 
     assert 'if [[ "${PREFETCH_MODELS}" -eq 1 && "${SKIP_MODELS}" -eq 0 ]]' in sh
-    assert "pulls each model automatically the first time it's actually needed" in sh
+    assert "ask which model tier to use" in sh
 
 
 def test_install_scripts_install_playwright_browser_support():

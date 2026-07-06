@@ -63,11 +63,13 @@ from shamsu.tasks.state import (
 )
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
 from shamsu.runtime.models import (
+    DEFAULT_TIER,
     ModelTier,
     active_tier,
     initialize_model_tier,
     model_for_role,
     set_model_tier,
+    tier_ever_configured,
     tier_model_specs,
 )
 from shamsu.runtime.ollama import (
@@ -80,7 +82,7 @@ from shamsu.runtime.ollama import (
     wait_until_running,
 )
 from shamsu.runtime.session_registry import claim_ollama_ownership, register_session
-from shamsu.safety.approval import ask_approval, ask_approval_menu
+from shamsu.safety.approval import ask_approval, ask_approval_menu, ask_tier_choice
 from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.permission_store import PermissionMemory
@@ -976,16 +978,53 @@ def _handle_models_tier(tier_arg: str, console: Console, workspace: Path | None)
         return
     set_model_tier(workspace, requested)
     console.print(f"[green]Switched to {requested.value} tier.[/green]")
+    _pull_missing_models_for_active_tier(console)
+
+
+def _pull_missing_models_for_active_tier(console: Console) -> None:
+    """Download whatever the currently active tier is missing, starting the
+    local Ollama server first if needed. Shared by `/models tier <name>` and
+    the first-run tier prompt - typing/answering either is the consent to
+    download directly, no second approval gate."""
     status = collect_status()
-    if status.ollama_found and status.server_running and status.missing_models:
-        console.print(
-            "[cyan]Downloading missing local model(s) for this tier:[/cyan] "
-            + ", ".join(status.missing_models)
-        )
-        results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
-        _print_model_pull_results(results, console)
+    if not status.ollama_found:
+        console.print("[yellow]Ollama was not found. Run `models repair` once Ollama is installed.[/yellow]")
+        return
+    if not status.server_running:
+        console.print("[yellow]Starting local Ollama...[/yellow]")
+        serve_pid = start_ollama(Path(status.ollama_path))
+        if serve_pid:
+            claim_ollama_ownership(serve_pid)
+        wait_until_running()
         status = collect_status(Path(status.ollama_path))
+    if not status.missing_models:
+        console.print("[green]All models for this tier are already installed.[/green]")
+        _print_runtime_status(console, status=status)
+        return
+    console.print(
+        f"[cyan]Downloading {status.tier} tier model(s):[/cyan] " + ", ".join(status.missing_models)
+    )
+    results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
+    _print_model_pull_results(results, console)
+    status = collect_status(Path(status.ollama_path))
     _print_runtime_status(console, status=status)
+
+
+def _maybe_prompt_first_run_tier(workspace: Path, console: Console) -> None:
+    """Ask which model tier to use the first time SHAMSU runs in a workspace,
+    then download that tier's models with visible progress - installers never
+    download models themselves; this is the one proactive download, and only
+    once per workspace. Skipped entirely once a tier has been chosen before,
+    or when SHAMSU_MODEL_TIER already pins one explicitly."""
+    if tier_ever_configured(workspace):
+        return
+    if os.environ.get("SHAMSU_MODEL_TIER", "").strip():
+        return
+    tier_name = ask_tier_choice(console)
+    tier = ModelTier(tier_name) if tier_name else DEFAULT_TIER
+    set_model_tier(workspace, tier)
+    console.print(f"[green]Using {tier.value} tier.[/green] (change anytime with /models tier)")
+    _pull_missing_models_for_active_tier(console)
 
 
 def _handle_web(
@@ -3828,6 +3867,9 @@ def main(argv: list[str] | None = None) -> None:
     # Resolve the active model tier (env var > persisted workspace choice >
     # default) before anything reads model_for_role(), including the banner.
     initialize_model_tier(workspace)
+    # First run in this workspace: ask which tier, then download it here (with
+    # progress) rather than at install time or silently mid-conversation.
+    _maybe_prompt_first_run_tier(workspace, console)
 
     # Track this session so the last one to exit can free SHAMSU's Ollama
     # footprint (stop a SHAMSU-started server, or unload SHAMSU's models - incl.
