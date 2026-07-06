@@ -788,11 +788,19 @@ def _handle_memory(user_input: str, workspace: Path, console: Console) -> None:
         return
     if subcommand == "setup":
         result = service.setup()
-        console.print("[green]Graphiti setup complete.[/green]" if result.get("ok") else f"[red]Graphiti setup failed: {result.get('error') or result.get('message') or result}[/red]")
+        if result.get("ok"):
+            console.print("[green]Graphiti setup complete.[/green]")
+        else:
+            reason = result.get("error") or result.get("manual_steps") or result.get("message") or result
+            console.print(f"[red]Graphiti setup failed: {reason}[/red]")
         return
     if subcommand == "repair":
         result = service.repair()
-        console.print("[green]Graphiti repair complete.[/green]" if result.get("ok") else f"[red]Graphiti repair failed: {result.get('message') or result.get('error') or result}[/red]")
+        if result.get("ok"):
+            console.print("[green]Graphiti repair complete.[/green]")
+        else:
+            reason = result.get("manual_steps") or result.get("message") or result.get("error") or result
+            console.print(f"[red]Graphiti repair failed: {reason}[/red]")
         return
     if subcommand == "remember":
         if not argument:

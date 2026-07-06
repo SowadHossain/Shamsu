@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.as_json:
         print(json.dumps(result, indent=2))
     else:
-        print(result.get("message") or result.get("error") or result)
+        print(result.get("error") or result.get("manual_steps") or result.get("message") or result)
     return 0 if result.get("ok") else 1
 
 

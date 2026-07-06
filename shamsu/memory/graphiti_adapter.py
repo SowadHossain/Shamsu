@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -21,7 +23,26 @@ from shamsu.memory.types import GraphitiHealth, LongTermMemory, MemoryKind
 INSTALL_TIMEOUT_SECONDS = 600
 CALL_TIMEOUT_SECONDS = 120
 VERSION_TIMEOUT_SECONDS = 10
+DOCKER_TIMEOUT_SECONDS = 60
+DOCKER_DAEMON_TIMEOUT_SECONDS = 90
 _LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
+
+# Documented upstream quickstart: https://github.com/getzep/graphiti
+# `docker run -p 6379:6379 -p 3000:3000 -it --rm falkordb/falkordb:latest`
+# Run detached and named so `/memory setup`/`repair` can find and reuse it.
+FALKORDB_CONTAINER_NAME = "shamsu-graphiti-falkordb"
+FALKORDB_IMAGE = "falkordb/falkordb:latest"
+
+# Same winget package id / flags used by scripts/install.ps1 for Ollama.
+DOCKER_WINGET_ID = "Docker.DockerDesktop"
+
+# Fallback lookup used the same way find_ollama_executable() falls back to
+# known install paths: a winget install doesn't refresh this process's PATH,
+# so `shutil.which` alone can miss a Docker CLI installed moments ago.
+_KNOWN_DOCKER_CLI_PATHS: list[Path] = [
+    Path(r"C:\Program Files\Docker\Docker\resources\bin\docker.exe"),
+]
+_DOCKER_DESKTOP_APP = Path(r"C:\Program Files\Docker\Docker\Docker Desktop.exe")
 
 
 def default_tool_dir() -> Path:
@@ -57,6 +78,25 @@ def _no_window_flags() -> int:
     if sys.platform != "win32":
         return 0
     return subprocess.CREATE_NO_WINDOW
+
+
+def _is_default_falkordb_uri(uri: str) -> bool:
+    parsed = urlparse(str(uri))
+    return (
+        parsed.scheme == "falkor"
+        and (parsed.hostname or "").lower() in _LOCAL_HOSTS - {""}
+        and (parsed.port or 6379) == 6379
+    )
+
+
+def _find_docker_executable() -> str | None:
+    found = shutil.which("docker")
+    if found:
+        return found
+    for candidate in _KNOWN_DOCKER_CLI_PATHS:
+        if candidate.exists():
+            return str(candidate)
+    return None
 
 
 class GraphitiAdapter:
@@ -209,8 +249,14 @@ class GraphitiAdapter:
                 "config_path": str(config_path),
                 "manual_steps": "Install graphiti-core[falkordb] into the managed venv or set SHAMSU_GRAPHITI_CMD to a local Python with graphiti-core installed.",
             }
+        backend_result = self._ensure_local_backend(workspace)
         health = self.healthcheck(workspace)
-        return {"ok": health.ok, "path": str(python), "config_path": str(config_path), "message": health.message}
+        result: dict[str, Any] = {"ok": health.ok, "path": str(python), "config_path": str(config_path), "message": health.message}
+        if backend_result is not None:
+            result["backend"] = backend_result
+            if not health.ok and not backend_result.get("ok"):
+                result["manual_steps"] = backend_result.get("error", "")
+        return result
 
     def repair(self, workspace: Path) -> dict[str, Any]:
         if not self.config_path(workspace).exists():
@@ -218,7 +264,146 @@ class GraphitiAdapter:
         health = self.healthcheck(workspace)
         if health.ok:
             return {"ok": True, "message": health.message, "path": health.tool_path}
-        return {"ok": False, "message": health.message, "manual_steps": "Run /memory setup, ensure Ollama is running locally, and start local FalkorDB on localhost:6379 or configure a local Neo4j URI."}
+        backend_result = self._ensure_local_backend(workspace)
+        if backend_result is not None and backend_result.get("ok"):
+            health = self.healthcheck(workspace)
+            if health.ok:
+                return {"ok": True, "message": health.message, "path": health.tool_path, "backend": backend_result}
+        manual_steps = "Run /memory setup, ensure Ollama is running locally, and start local FalkorDB on localhost:6379 or configure a local Neo4j URI."
+        if backend_result is not None and not backend_result.get("ok"):
+            manual_steps = backend_result.get("error", manual_steps)
+        return {"ok": False, "message": health.message, "manual_steps": manual_steps}
+
+    def _ensure_local_backend(self, workspace: Path) -> dict[str, Any] | None:
+        """Best-effort local FalkorDB start via the documented upstream Docker
+        quickstart. Only touches the default local falkor://<host>:6379
+        backend; a custom/non-default URI (e.g. a local Neo4j install) is left
+        for the user to manage, since there's no single documented command
+        for it. Returns None when there's nothing to do here."""
+        config = {**self.default_config(workspace), **self._read_config(workspace)}
+        uri = str(config.get("graph_backend_uri", ""))
+        if not _is_default_falkordb_uri(uri):
+            return None
+        if not self._check_backend(uri):
+            return {"ok": True, "message": "FalkorDB backend already reachable."}
+        return self._start_local_falkordb()
+
+    def _start_local_falkordb(self) -> dict[str, Any]:
+        docker = _find_docker_executable()
+        if not docker:
+            install_result = self._install_docker_desktop()
+            if not install_result.get("ok"):
+                return install_result
+            docker = _find_docker_executable()
+            if not docker:
+                return {
+                    "ok": False,
+                    "error": (
+                        "Docker Desktop was installed but its CLI isn't visible to this SHAMSU process yet. "
+                        "Close and reopen SHAMSU (or open a new terminal) so it picks up the updated PATH, "
+                        "then run /memory repair."
+                    ),
+                }
+        if not self._docker_daemon_ready(docker):
+            if not self._start_docker_desktop_app(docker):
+                return {
+                    "ok": False,
+                    "error": (
+                        "Docker is installed but its daemon isn't running and SHAMSU could not start it "
+                        "automatically. Start Docker Desktop yourself, then run /memory repair."
+                    ),
+                }
+        try:
+            inspect = subprocess.run(
+                [docker, "inspect", "-f", "{{.State.Running}}", FALKORDB_CONTAINER_NAME],
+                capture_output=True, text=True, timeout=15, creationflags=_no_window_flags(),
+            )
+            if inspect.returncode == 0:
+                if inspect.stdout.strip() == "true":
+                    return {"ok": True, "message": "FalkorDB container already running."}
+                started = subprocess.run(
+                    [docker, "start", FALKORDB_CONTAINER_NAME],
+                    capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS, creationflags=_no_window_flags(),
+                )
+                if started.returncode != 0:
+                    return {"ok": False, "error": (started.stderr or started.stdout or "docker start failed").strip()}
+                self._wait_for_local_port(6379, timeout=10.0)
+                return {"ok": True, "message": "Started existing local FalkorDB container."}
+            run = subprocess.run(
+                [docker, "run", "-d", "--name", FALKORDB_CONTAINER_NAME, "-p", "6379:6379", "-p", "3000:3000", FALKORDB_IMAGE],
+                capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS, creationflags=_no_window_flags(),
+            )
+            if run.returncode != 0:
+                return {"ok": False, "error": (run.stderr or run.stdout or "docker run failed").strip()}
+            self._wait_for_local_port(6379, timeout=10.0)
+            return {"ok": True, "message": "Started local FalkorDB container on localhost:6379."}
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {
+                "ok": False,
+                "error": f"Docker is installed but not usable ({exc}). Start Docker Desktop and run /memory repair.",
+            }
+
+    def _wait_for_local_port(self, port: int, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                    return True
+            except OSError:
+                time.sleep(0.5)
+        return False
+
+    def _install_docker_desktop(self) -> dict[str, Any]:
+        """Same winget-install pattern scripts/install.ps1 already uses for
+        Ollama: `winget install --id <pkg> -e --accept-*-agreements`."""
+        if sys.platform != "win32":
+            return {
+                "ok": False,
+                "error": "Automatic Docker install is only wired up for Windows via winget. Install Docker for your OS, then run /memory repair.",
+            }
+        winget = shutil.which("winget")
+        if not winget:
+            return {
+                "ok": False,
+                "error": "winget was not found, so Docker Desktop could not be installed automatically. Install it from https://www.docker.com/products/docker-desktop/, then run /memory repair.",
+            }
+        try:
+            result = subprocess.run(
+                [winget, "install", "--id", DOCKER_WINGET_ID, "-e", "--accept-package-agreements", "--accept-source-agreements"],
+                capture_output=True, text=True, timeout=INSTALL_TIMEOUT_SECONDS, creationflags=_no_window_flags(),
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"ok": False, "error": f"Docker Desktop install via winget failed: {exc}"}
+        if result.returncode != 0:
+            return {"ok": False, "error": (result.stderr or result.stdout or "winget install failed").strip()}
+        return {"ok": True, "message": "Installed Docker Desktop via winget."}
+
+    def _docker_daemon_ready(self, docker: str) -> bool:
+        try:
+            result = subprocess.run(
+                [docker, "info"], capture_output=True, text=True, timeout=10, creationflags=_no_window_flags(),
+            )
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _start_docker_desktop_app(self, docker: str) -> bool:
+        if sys.platform != "win32" or not _DOCKER_DESKTOP_APP.exists():
+            return False
+        try:
+            subprocess.Popen(
+                [str(_DOCKER_DESKTOP_APP)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=_no_window_flags(),
+            )
+        except OSError:
+            return False
+        deadline = time.monotonic() + DOCKER_DAEMON_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if self._docker_daemon_ready(docker):
+                return True
+            time.sleep(3)
+        return False
 
     def add_episode(self, workspace: Path, text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._run_graphiti_call(workspace, "add_episode", {"text": text, "metadata": metadata or {}})

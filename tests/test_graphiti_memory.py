@@ -1,9 +1,11 @@
 ﻿from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from shamsu.agents.orchestrator import AgentOrchestrator
-from shamsu.memory.graphiti_adapter import GraphitiAdapter, is_local_uri
+from shamsu.memory.graphiti_adapter import FALKORDB_IMAGE, GraphitiAdapter, is_local_uri
 from shamsu.memory.policy import MemoryPolicy
 from shamsu.memory.service import REQUIRED_MEMORY_MESSAGE, MemoryService
 from shamsu.memory.types import GraphitiHealth, LongTermMemory
@@ -163,3 +165,132 @@ def test_no_fake_success_when_graphiti_tool_missing(tmp_path):
 
     assert gate.allowed is False
     assert gate.reason == REQUIRED_MEMORY_MESSAGE
+
+
+def test_ensure_local_backend_skips_non_default_uri(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+    adapter._write_config(tmp_path, {**adapter.default_config(tmp_path), "graph_backend_uri": "bolt://localhost:7687"})
+
+    assert adapter._ensure_local_backend(tmp_path) is None
+
+
+def test_ensure_local_backend_noop_when_already_reachable(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+
+    with patch.object(GraphitiAdapter, "_check_backend", return_value=""), patch(
+        "shamsu.memory.graphiti_adapter.shutil.which"
+    ) as which:
+        result = adapter._ensure_local_backend(tmp_path)
+
+    assert result == {"ok": True, "message": "FalkorDB backend already reachable."}
+    which.assert_not_called()
+
+
+def test_start_local_falkordb_reports_missing_docker_and_winget(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+
+    with patch("shamsu.memory.graphiti_adapter._KNOWN_DOCKER_CLI_PATHS", []), patch(
+        "shamsu.memory.graphiti_adapter.shutil.which", return_value=None
+    ):
+        result = adapter._start_local_falkordb()
+
+    assert result["ok"] is False
+    assert "winget was not found" in result["error"]
+
+
+def test_start_local_falkordb_installs_docker_via_winget_when_missing(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+    install_calls: list[list[str]] = []
+
+    def fake_which(name):
+        return "winget" if name == "winget" else None
+
+    def fake_run(cmd, **kwargs):
+        install_calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "installed", "")
+
+    with patch("shamsu.memory.graphiti_adapter._KNOWN_DOCKER_CLI_PATHS", []), patch(
+        "shamsu.memory.graphiti_adapter.shutil.which", side_effect=fake_which
+    ), patch("shamsu.memory.graphiti_adapter.subprocess.run", side_effect=fake_run):
+        result = adapter._start_local_falkordb()
+
+    assert result["ok"] is False
+    assert "isn't visible to this SHAMSU process yet" in result["error"]
+    winget_call = next(cmd for cmd in install_calls if cmd[0] == "winget")
+    assert winget_call[:4] == ["winget", "install", "--id", "Docker.DockerDesktop"]
+
+
+def test_start_local_falkordb_starts_docker_desktop_when_daemon_down(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(cmd, 1, "", "no such container")
+        return subprocess.CompletedProcess(cmd, 0, "container-id", "")
+
+    with patch("shamsu.memory.graphiti_adapter.shutil.which", return_value="docker"), patch(
+        "shamsu.memory.graphiti_adapter.subprocess.run", side_effect=fake_run
+    ), patch.object(GraphitiAdapter, "_docker_daemon_ready", return_value=False), patch.object(
+        GraphitiAdapter, "_start_docker_desktop_app", return_value=True
+    ) as start_app, patch.object(GraphitiAdapter, "_wait_for_local_port", return_value=True):
+        result = adapter._start_local_falkordb()
+
+    assert result["ok"] is True
+    start_app.assert_called_once()
+
+
+def test_start_local_falkordb_fails_when_daemon_wont_start(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+
+    with patch("shamsu.memory.graphiti_adapter.shutil.which", return_value="docker"), patch.object(
+        GraphitiAdapter, "_docker_daemon_ready", return_value=False
+    ), patch.object(GraphitiAdapter, "_start_docker_desktop_app", return_value=False):
+        result = adapter._start_local_falkordb()
+
+    assert result["ok"] is False
+    assert "daemon isn't running" in result["error"]
+
+
+def test_start_local_falkordb_uses_documented_docker_run_command(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(cmd, 1, "", "no such container")
+        return subprocess.CompletedProcess(cmd, 0, "container-id", "")
+
+    with patch("shamsu.memory.graphiti_adapter.shutil.which", return_value="docker"), patch(
+        "shamsu.memory.graphiti_adapter.subprocess.run", side_effect=fake_run
+    ), patch.object(GraphitiAdapter, "_wait_for_local_port", return_value=True):
+        result = adapter._start_local_falkordb()
+
+    assert result["ok"] is True
+    run_call = next(cmd for cmd in calls if cmd[1] == "run")
+    assert run_call == [
+        "docker", "run", "-d", "--name", "shamsu-graphiti-falkordb",
+        "-p", "6379:6379", "-p", "3000:3000", FALKORDB_IMAGE,
+    ]
+
+
+def test_start_local_falkordb_reuses_existing_stopped_container(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1] == "inspect":
+            return subprocess.CompletedProcess(cmd, 0, "false\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    with patch("shamsu.memory.graphiti_adapter.shutil.which", return_value="docker"), patch(
+        "shamsu.memory.graphiti_adapter.subprocess.run", side_effect=fake_run
+    ), patch.object(GraphitiAdapter, "_wait_for_local_port", return_value=True):
+        result = adapter._start_local_falkordb()
+
+    assert result["ok"] is True
+    assert any(cmd[1] == "start" for cmd in calls)
+    assert not any(cmd[1] == "run" for cmd in calls)
