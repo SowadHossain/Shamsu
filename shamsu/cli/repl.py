@@ -62,7 +62,14 @@ from shamsu.tasks.state import (
     save_task,
 )
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
-from shamsu.runtime.models import model_for_role
+from shamsu.runtime.models import (
+    ModelTier,
+    active_tier,
+    initialize_model_tier,
+    model_for_role,
+    set_model_tier,
+    tier_model_specs,
+)
 from shamsu.runtime.ollama import (
     collect_status,
     pull_model_streaming,
@@ -131,6 +138,10 @@ SYSTEM_COMMANDS = (
     "/models status",
     "/models pull",
     "/models repair",
+    "/models tier",
+    "/models tier light",
+    "/models tier default",
+    "/models tier heavy",
     "/web search ",
     "/web open ",
     "/web summarize ",
@@ -259,6 +270,7 @@ def _print_help(console: Console) -> None:
                     "  /models status            Show local Ollama/model status",
                     "  /models pull              Pull missing local models",
                     "  /models repair            Start Ollama and pull missing models",
+                    "  /models tier [light|default|heavy]  Show or switch model tier",
                     "  /web search <query>       Search the web with approval",
                     "  /web open <url>           Fetch and summarize a web page",
                     "  /web summarize <url>      Alias for /web open",
@@ -879,11 +891,16 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
 def _handle_models(
     user_input: str,
     console: Console,
+    workspace: Path | None = None,
 ) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "status"
     if command == "status":
         _print_runtime_status(console)
+        return
+    if command == "tier" or command.startswith("tier "):
+        tier_arg = command[len("tier"):].strip()
+        _handle_models_tier(tier_arg, console, workspace)
         return
     if command == "pull":
         status = collect_status()
@@ -931,7 +948,44 @@ def _handle_models(
             status = collect_status(Path(status.ollama_path))
         _print_runtime_status(console, status=status)
         return
-    console.print("[red]Usage: models status|pull|repair[/red]")
+    console.print("[red]Usage: models status|pull|repair|tier[/red]")
+
+
+def _handle_models_tier(tier_arg: str, console: Console, workspace: Path | None) -> None:
+    if not tier_arg:
+        current = active_tier()
+        console.print(f"[cyan]Active tier:[/cyan] {current.value}")
+        for tier in ModelTier:
+            specs = tier_model_specs(tier)
+            marker = "*" if tier is current else " "
+            models = ", ".join(spec.name for spec in specs)
+            console.print(f"  {marker} {tier.value:8} {models}")
+        console.print("Usage: /models tier light|default|heavy")
+        return
+    try:
+        requested = ModelTier(tier_arg)
+    except ValueError:
+        console.print(
+            f"[red]Unknown tier: {tier_arg}. Choose one of: "
+            + ", ".join(tier.value for tier in ModelTier)
+            + "[/red]"
+        )
+        return
+    if workspace is None:
+        console.print("[red]No workspace available to persist the tier choice.[/red]")
+        return
+    set_model_tier(workspace, requested)
+    console.print(f"[green]Switched to {requested.value} tier.[/green]")
+    status = collect_status()
+    if status.ollama_found and status.server_running and status.missing_models:
+        console.print(
+            "[cyan]Downloading missing local model(s) for this tier:[/cyan] "
+            + ", ".join(status.missing_models)
+        )
+        results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
+        _print_model_pull_results(results, console)
+        status = collect_status(Path(status.ollama_path))
+    _print_runtime_status(console, status=status)
 
 
 def _handle_web(
@@ -1186,6 +1240,7 @@ def _print_runtime_status(console: Console, status=None) -> None:
     table.add_column("Item")
     table.add_column("Value")
     table.add_row("Inference", "local-only Ollama")
+    table.add_row("Tier", status.tier)
     table.add_row("Endpoint", status.base_url)
     table.add_row("Ollama", status.ollama_path or "not found")
     table.add_row("Server", "running" if status.server_running else "not running")
@@ -1497,7 +1552,7 @@ async def _handle_request(
                     border_style="red",
                 )
             )
-            _handle_models("models repair", console)
+            _handle_models("models repair", console, workspace)
             return
         _log_event(
             session_logger,
@@ -3664,6 +3719,7 @@ def _install_console_status_tracker(console: Console) -> None:
 
 def _print_startup_banner(workspace: Path, console: Console) -> None:
     model = model_for_role("qa")
+    tier = active_tier().value
     autonomy = "on" if is_long_running_enabled(workspace) else "off"
     runtime = status_text(collect_status())
     body = Text()
@@ -3673,6 +3729,7 @@ def _print_startup_banner(workspace: Path, console: Console) -> None:
     body.append(f"{workspace}\n")
     body.append("Model: ", style="dim")
     body.append(f"{model}", style="cyan")
+    body.append(f"  ({tier} tier)", style="dim")
     body.append("  |  Autonomy: ", style="dim")
     body.append(autonomy, style=("green" if autonomy == "on" else "yellow"))
     body.append("\nRuntime: ", style="dim")
@@ -3767,6 +3824,10 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(2)
+
+    # Resolve the active model tier (env var > persisted workspace choice >
+    # default) before anything reads model_for_role(), including the banner.
+    initialize_model_tier(workspace)
 
     # Track this session so the last one to exit can free SHAMSU's Ollama
     # footprint (stop a SHAMSU-started server, or unload SHAMSU's models - incl.
@@ -3864,7 +3925,7 @@ def main(argv: list[str] | None = None) -> None:
             asyncio.run(_handle_generate_prd(normalized_input, workspace, console, session_logger))
             continue
         if lowered_input.startswith("models"):
-            _handle_models(normalized_input, console)
+            _handle_models(normalized_input, console, workspace)
             continue
         if lowered_input.startswith("web "):
             _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console))

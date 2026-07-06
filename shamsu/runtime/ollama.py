@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from shamsu.llm.manager import OLLAMA_BASE_URL
-from shamsu.runtime.models import MODEL_SPECS, is_allowed_model, required_model_names
+from shamsu.runtime.models import ALL_MODEL_SPECS, active_tier, is_allowed_model, required_model_names
 from shamsu.runtime.session_registry import (
     clear_ollama_ownership,
     live_session_pids,
@@ -26,7 +26,9 @@ from shamsu.runtime.session_registry import (
     unregister_session,
 )
 
-_KNOWN_MODEL_NAMES = frozenset(spec.name for spec in MODEL_SPECS)
+# Every tier's models - so switching tiers doesn't leave the previous tier's
+# models un-manageable by unload_shamsu_models().
+_KNOWN_MODEL_NAMES = frozenset(spec.name for spec in ALL_MODEL_SPECS)
 
 HEALTH_TIMEOUT_SECONDS = 2
 
@@ -40,6 +42,7 @@ class RuntimeStatus:
     required_models: list[str] = field(default_factory=required_model_names)
     base_url: str = OLLAMA_BASE_URL
     message: str = ""
+    tier: str = field(default_factory=lambda: active_tier().value)
 
     @property
     def ollama_found(self) -> bool:
@@ -371,11 +374,16 @@ def repo_root_from_runtime() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from shamsu.runtime.models import initialize_model_tier
+
     parser = argparse.ArgumentParser(prog="python -m shamsu.runtime.ollama")
     parser.add_argument("command", choices=["status", "pull", "repair", "write-config"])
     parser.add_argument("--json", action="store_true", dest="as_json")
     parser.add_argument("--skip-models", action="store_true")
+    parser.add_argument("--workspace", default=str(Path.cwd()))
     args = parser.parse_args(argv)
+
+    initialize_model_tier(Path(args.workspace))
 
     if args.command == "repair":
         status = repair_runtime(pull_models=not args.skip_models)

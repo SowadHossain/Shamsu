@@ -56,8 +56,18 @@ def test_single_model_mode_routes_all_roles_to_qwen3(monkeypatch):
     assert model_for_role("bugfix") == "qwen3:8b"
 
 
-def test_model_cookbook_allows_only_v2_2_anchor_models():
-    assert allowed_model_names() == ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
+def test_model_cookbook_allows_anchor_models_across_all_tiers():
+    # is_allowed_model()/allowed_model_names() cover every tier's models (not
+    # just the currently-active one) so a workspace that tried more than one
+    # tier never gets an "off-cookbook" false alarm for a model it legitimately
+    # pulled under a different tier.
+    allowed = allowed_model_names()
+    assert "qwen3:8b" in allowed
+    assert "qwen2.5-coder:7b-instruct" in allowed
+    assert "qwen2.5:3b-instruct" in allowed
+    assert "qwen2.5-coder:3b-instruct" in allowed
+    assert "mistral-nemo:12b" in allowed
+    assert "qwen2.5-coder:14b" in allowed
     assert is_allowed_model("qwen3:8b") is True
     assert is_allowed_model("mistral:7b-instruct-q4_K_M") is False
 

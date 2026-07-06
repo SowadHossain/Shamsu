@@ -43,3 +43,14 @@ def _codebase_memory_binary_not_ambient(monkeypatch, tmp_path_factory):
 
     empty_dir = tmp_path_factory.mktemp("no-codebase-memory-mcp")
     monkeypatch.setattr(codebase_memory_module, "default_tool_dir", lambda: empty_dir)
+
+
+@pytest.fixture(autouse=True)
+def _model_tier_reset(monkeypatch):
+    """The active model tier is process-global state (model_for_role() is
+    called from many places with no workspace argument - see
+    shamsu/runtime/models.py). Reset it to the default tier for every test so
+    one test's /models tier switch can't leak into the next."""
+    import shamsu.runtime.models as models_module
+
+    monkeypatch.setattr(models_module, "_ACTIVE_TIER", models_module.DEFAULT_TIER)

@@ -127,4 +127,53 @@ def test_models_pull_downloads_with_progress_when_approved(monkeypatch, tmp_path
 def test_runtime_errors_point_to_models_repair():
     assert repl._looks_like_runtime_error("Could not connect to localhost:11434")
     assert repl._looks_like_runtime_error("model not found")
+
+
+def test_models_tier_with_no_argument_shows_active_tier_and_options(tmp_path):
+    console, output = _console_output()
+
+    repl._handle_models("models tier", console, tmp_path)
+
+    rendered = output.getvalue()
+    assert "Active tier: default" in rendered
+    assert "light" in rendered
+    assert "heavy" in rendered
+
+
+def test_models_tier_switches_and_persists_choice(monkeypatch, tmp_path):
+    console, output = _console_output()
+    monkeypatch.setattr(
+        repl,
+        "collect_status",
+        lambda *args, **kwargs: RuntimeStatus(
+            ollama_path=str(tmp_path / "ollama.exe"),
+            server_running=True,
+            missing_models=[],
+        ),
+    )
+
+    repl._handle_models("models tier light", console, tmp_path)
+
+    rendered = output.getvalue()
+    assert "Switched to light tier" in rendered
+    assert (tmp_path / ".shamsu" / "model_tier.json").exists()
+    from shamsu.runtime.models import active_tier, ModelTier
+
+    assert active_tier() is ModelTier.LIGHT
+
+
+def test_models_tier_rejects_unknown_tier_name(tmp_path):
+    console, output = _console_output()
+
+    repl._handle_models("models tier ultra-mega", console, tmp_path)
+
+    assert "Unknown tier" in output.getvalue()
+
+
+def test_models_tier_without_workspace_reports_error():
+    console, output = _console_output()
+
+    repl._handle_models("models tier heavy", console, None)
+
+    assert "No workspace available" in output.getvalue()
     assert not repl._looks_like_runtime_error("ordinary validation issue")
