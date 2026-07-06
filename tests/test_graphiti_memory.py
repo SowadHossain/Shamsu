@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import subprocess
 from pathlib import Path
@@ -189,9 +189,9 @@ def test_ensure_local_backend_noop_when_already_reachable(tmp_path):
 def test_start_local_falkordb_reports_missing_docker_and_winget(tmp_path):
     adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
 
-    with patch("shamsu.memory.graphiti_adapter._KNOWN_DOCKER_CLI_PATHS", []), patch(
-        "shamsu.memory.graphiti_adapter.shutil.which", return_value=None
-    ):
+    with patch("shamsu.memory.graphiti_adapter.sys.platform", "win32"), patch(
+        "shamsu.memory.graphiti_adapter._KNOWN_DOCKER_CLI_PATHS", []
+    ), patch("shamsu.memory.graphiti_adapter.shutil.which", return_value=None):
         result = adapter._start_local_falkordb()
 
     assert result["ok"] is False
@@ -209,8 +209,10 @@ def test_start_local_falkordb_installs_docker_via_winget_when_missing(tmp_path):
         install_calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 0, "installed", "")
 
-    with patch("shamsu.memory.graphiti_adapter._KNOWN_DOCKER_CLI_PATHS", []), patch(
-        "shamsu.memory.graphiti_adapter.shutil.which", side_effect=fake_which
+    with patch("shamsu.memory.graphiti_adapter.sys.platform", "win32"), patch(
+        "shamsu.memory.graphiti_adapter._KNOWN_DOCKER_CLI_PATHS", []
+    ), patch("shamsu.memory.graphiti_adapter.shutil.which", side_effect=fake_which), patch(
+        "shamsu.memory.graphiti_adapter._no_window_flags", return_value=0
     ), patch("shamsu.memory.graphiti_adapter.subprocess.run", side_effect=fake_run):
         result = adapter._start_local_falkordb()
 
