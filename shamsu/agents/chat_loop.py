@@ -50,13 +50,28 @@ Rules:
 - Use tools for file reads, file writes, searches, and commands.
 - Never claim you created, edited, deleted, searched, read, or ran anything unless a tool result confirms it.
 - Read relevant files before editing.
+
+File tools:
+- read_file reads a file. If it says "Not a file" / returns candidates, the file was NOT read:
+  do not claim any knowledge of its contents.
+- When read_file returns candidates, your NEXT response must call read_file on one candidate,
+  or call find_file/grep_files - not prose. Never say "I will read X next" without emitting a
+  read_file tool call in that SAME response.
+- A path copied from a build/compile error or traceback may not be the real workspace path
+  (a build can report `src/App.tsx` when the file is at `client/src/App.tsx`, or `index.html`
+  when it is under `client/`). read_file auto-resolves a unique match; if it cannot, call
+  find_file with the file's BASENAME as the query, or list_files, to locate the real path
+  before editing. Never call grep_files with an empty query.
+- Use find_file when you are unsure of a path (search by name). Use grep_files when you know a
+  symbol or text but not the file. Use file_info to check a path before editing it.
+- Use edit_file for small, targeted changes: pass the exact old_string and new_string. It must
+  match exactly once (or set replace_all=true).
+- Use write_file only to create a new file or fully rewrite one, passing the COMPLETE content.
 - If the user asks you to create, write, save, generate, add, edit, or update a file,
-  your next action must be a write_file tool call or a clarification question.
-- To create OR change a file, call write_file with the COMPLETE new file content. It
-  overwrites, so never send a partial file or a diff â€" send the whole file every time.
-- A file change only counts if the write_file tool result says ok. If a tool result shows
-  an error, the change did NOT happen: do not assume success, read the file if needed and
-  call write_file again with the full corrected content.
+  your next action must be an edit_file/write_file tool call or a clarification question.
+- A file change only counts if the edit_file/write_file tool result says ok. If a tool result
+  shows an error, the change did NOT happen: do not assume success, read the file if needed and
+  call the tool again with the corrected content.
 - Never reply with conversational filler like "noted" or "ask me to continue". Either call a
   tool to make progress or state the concrete result. Do not repeat an identical tool call.
 - If you need to run code/tests, call run_command.
@@ -71,6 +86,33 @@ Rules:
 
 # How many times the exact same tool call may repeat before we stop the loop.
 _MAX_REPEATED_CALLS = 3
+
+# Read/discovery tools whose failures get an explicit recovery instruction so the
+# model reaches for a candidate/find_file/grep_files instead of stalling.
+_READ_TOOLS = {"read_file", "file_info", "find_file", "grep_files"}
+
+# Prose that signals the model is *promising* to read a file rather than actually
+# calling the tool ("I will read entities.ts next") - the exact stall this loop
+# guards against after a failed read.
+_READ_STALL_PHRASES = (
+    "i will read",
+    "i'll read",
+    "let me read",
+    "i will now read",
+    "next i will",
+    "i will try",
+    "i'll try",
+    "let me try",
+    "let's correct",
+    "let me check the file",
+    "i will check the file",
+    "i will open",
+    "let me open",
+)
+
+# Cap on prose-only stall recoveries after a failed read, so a model that keeps
+# refusing to call a tool cannot spin the loop forever.
+_MAX_READ_RECOVERIES = 3
 
 
 @dataclass(frozen=True)
@@ -131,6 +173,10 @@ class AgentChatLoop:
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
+        # The most recent read_file failure that has not yet been recovered from,
+        # plus a cap on prose-only "I'll read X next" stalls after such a failure.
+        last_failed_read: dict[str, Any] | None = None
+        read_recovery_attempts = 0
         for round_index in range(self.max_tool_rounds):
             # Show context-window usage before each model call.
             if self.budget_manager:
@@ -187,6 +233,24 @@ class AgentChatLoop:
                             fallback.tool_result.to_json() if fallback.tool_result else fallback.summary,
                         )
                     continue
+                # A read just failed and the model answered with a bare promise
+                # ("I will read entities.ts next") instead of a tool call - the
+                # exact stall that used to end the loop on a hollow statement.
+                # Push one more recovery round rather than returning the promise.
+                if last_failed_read is not None and _looks_like_read_stall(content):
+                    if read_recovery_attempts < _MAX_READ_RECOVERIES:
+                        read_recovery_attempts += 1
+                        self.state.append_user(
+                            _read_failure_correction(
+                                str(last_failed_read.get("filepath", "the file")),
+                                str(last_failed_read.get("message", "Not a file.")),
+                                list(last_failed_read.get("candidates", [])),
+                            )
+                        )
+                        continue
+                    final = _read_blocked_final(last_failed_read)
+                    self.state.append_assistant(final)
+                    return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
                 if unconfirmed_failed_writes:
                     final = _failed_write_final(unconfirmed_failed_writes)
                     self.state.append_assistant(final)
@@ -216,6 +280,59 @@ class AgentChatLoop:
                 if self.on_activity and not result.ok:
                     self.on_activity(f"failed: {result.message}")
                 self.state.append_tool(_tool_call_id(call, name), name, result.to_json())
+                if name == "read_file":
+                    if result.ok:
+                        # A successful read (including an auto-resolved candidate)
+                        # clears the outstanding failure so the stall guard resets.
+                        last_failed_read = None
+                    else:
+                        candidates = (
+                            result.data.get("candidates", []) if isinstance(result.data, dict) else []
+                        )
+                        last_failed_read = {
+                            "filepath": str(arguments.get("filepath", "the file")),
+                            "message": result.message,
+                            "candidates": list(candidates or []),
+                        }
+                        # Make the failed read loud and prescriptive so the model
+                        # recovers with a real tool call instead of a bare promise.
+                        self.state.append_user(
+                            _read_failure_correction(
+                                last_failed_read["filepath"],
+                                last_failed_read["message"],
+                                last_failed_read["candidates"],
+                            )
+                        )
+                if name == "run_command" and not result.ok and self.session_logger is not None:
+                    # Persist the failing command + parsed errors so a later
+                    # bug-fix request with no explicit target can reuse it.
+                    data = result.data if isinstance(result.data, dict) else {}
+                    errors = str(
+                        data.get("diagnostics")
+                        or data.get("stderr")
+                        or data.get("stdout")
+                        or result.message
+                    )
+                    try:
+                        self.session_logger.set_last_failure(
+                            str(arguments.get("command", "")),
+                            errors,
+                            int(data.get("exit_code", 1) or 1),
+                        )
+                    except Exception:
+                        pass
+                if name in {"find_file", "grep_files"} and not result.ok:
+                    # A discovery tool that failed (usually an empty query) burns a
+                    # round; steer the model to a concrete query, reusing the
+                    # basename of a file a preceding read could not locate.
+                    hint_name = (
+                        _basename(str(last_failed_read.get("filepath", "")))
+                        if last_failed_read
+                        else ""
+                    )
+                    self.state.append_user(
+                        _discovery_failure_correction(name, result.message, hint_name)
+                    )
                 if name == "write_file":
                     filepath = str(arguments.get("filepath", "the file"))
                     if result.ok:
@@ -364,6 +481,76 @@ def _write_failure_correction(filepath: str, message: str) -> str:
         f"Do not assume the fix was applied and do not move on. Call write_file again for "
         f"{filepath} with the ENTIRE corrected file content."
     )
+
+
+def _basename(filepath: str) -> str:
+    return filepath.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or filepath
+
+
+def _read_failure_correction(filepath: str, message: str, candidates: list[str]) -> str:
+    if candidates:
+        cand_text = ", ".join(candidates[:6])
+        instruction = (
+            f"The file was NOT read. Candidates: {cand_text}. Your NEXT response MUST call "
+            "read_file with one of those candidate paths (or call find_file/grep_files to locate "
+            "the right file)."
+        )
+    else:
+        # No candidates: hand the model a concrete, ready-to-run discovery call so
+        # it doesn't stall or reach for grep_files with an empty query.
+        basename = _basename(filepath)
+        instruction = (
+            "The file was NOT read and no similar files were found. Your NEXT response MUST call "
+            f'find_file with query="{basename}" (find_file searches by file name), or list_files '
+            'with path="." to inspect the tree. Do NOT call grep_files without a concrete text '
+            "query, and do NOT invent a path."
+        )
+    return (
+        f'Your read_file call for "{filepath}" failed: {message} {instruction} '
+        'Do NOT say "I will read..." or "let me read..." without emitting a read_file tool call in '
+        "the SAME response, and do NOT claim you read or know the contents of that file."
+    )
+
+
+def _discovery_failure_correction(tool_name: str, message: str, hint_name: str) -> str:
+    """A discovery tool (find_file/grep_files) failed - most often called with an
+    empty query, which burns a loop round. Steer the model to a concrete query,
+    preferring the basename of the file a preceding read_file could not find."""
+    lowered = message.lower()
+    if "missing query" in lowered or "query" in lowered:
+        if hint_name:
+            return (
+                f"Your {tool_name} call failed: {message} You must pass a non-empty query. To find "
+                f'the missing file, your NEXT response MUST call find_file with query="{hint_name}" '
+                f"(find_file searches by file name). Do not repeat {tool_name} with an empty query."
+            )
+        return (
+            f"Your {tool_name} call failed: {message} Pass a non-empty query - a file name for "
+            "find_file, or a symbol/text string for grep_files - and try again."
+        )
+    return (
+        f"Your {tool_name} call failed: {message} Adjust the arguments and try a different query or "
+        "path, or state plainly that you are blocked."
+    )
+
+
+def _read_blocked_final(failed_read: dict[str, Any]) -> str:
+    filepath = failed_read.get("filepath", "the file")
+    candidates = failed_read.get("candidates") or []
+    if candidates:
+        return (
+            f"I could not read {filepath}: it does not exist at that path. Closest matches in the "
+            f"workspace: {', '.join(candidates[:6])}. Tell me which one to use and I'll read it."
+        )
+    return (
+        f"I could not read {filepath}: it does not exist in the workspace and no similar files were "
+        "found. Please double-check the path."
+    )
+
+
+def _looks_like_read_stall(content: str) -> bool:
+    lowered = (content or "").lower()
+    return any(phrase in lowered for phrase in _READ_STALL_PHRASES)
 
 
 def _failed_write_final(failed_writes: dict[str, str]) -> str:

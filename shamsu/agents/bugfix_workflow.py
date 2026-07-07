@@ -16,6 +16,7 @@ from shamsu.memory.service import MemoryService
 from shamsu.patch.engine import PatchEngine, parse_file_patches, parse_unified_diff, _apply_hunks
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.tools.agent_tools import AgentToolRegistry
+from shamsu.tools.path_resolve import remap_diff_paths, resolve_reported_path
 from shamsu.types import ContextPack, SearchResult
 
 BUGFIX_INSTRUCTIONS = """You are SHAMSU's bug fixer.
@@ -24,7 +25,16 @@ Do not include prose, markdown fences, explanations, or commands.
 Use --- a/path and +++ b/path headers.
 Make the smallest targeted fix for the reported bug.
 Do not refactor unrelated code.
-Read the current file context. Preserve existing imports, exports, and public APIs."""
+Read the current file context. Preserve existing imports, exports, and public APIs.
+
+Repair checklist (follow in order):
+1. Identify the single root error and the exact file it points at.
+2. Use the REAL workspace path shown in the provided file context, not the path
+   copied verbatim from the error - a build may report `src/App.tsx` when the
+   file actually lives at `client/src/App.tsx`.
+3. Base every hunk on the current file content given to you; match the existing
+   lines exactly so the patch applies cleanly.
+4. Change only what the root error requires."""
 
 TRACEBACK_FILE_RE = re.compile(r'File "([^"]+)", line (\d+)')
 PLAIN_LOCATION_RE = re.compile(r"(?P<path>[\w./\\-]+\.(?:py|ts|tsx|js|jsx|html|css)):(?P<line>\d+)(?::\d+)?")
@@ -70,6 +80,9 @@ class BugFixResult:
     verification_status: str = "Change applied, not yet verified."
     test_suggestion: str = "Re-run the failing test or command that produced the bug report."
     plan: str = ""
+    # (reported_path, resolved_path) pairs where the model/error used a path that
+    # did not exist and we remapped it to the real workspace file before applying.
+    remapped_paths: list[tuple[str, str]] = field(default_factory=list)
 
 
 class BugFixWorkflow:
@@ -94,6 +107,11 @@ class BugFixWorkflow:
         import_error = parse_import_export_error(report)
         if import_error and not locations:
             locations = _locations_for_import_error(self.workspace_root, report, import_error)
+        # Map every reported path to the real workspace path BEFORE reading files
+        # or asking the model, so the pack is built from actual file content and
+        # the model never fixes a file it cannot see (e.g. src/App.tsx that really
+        # lives at client/src/App.tsx).
+        locations = self._resolve_locations(locations)
         pack, searched_paths, plan_text = await self._build_pack(report, locations)
         target_paths = [location.file_path for location in locations]
         if should_convene_council(target_paths=target_paths):
@@ -102,7 +120,8 @@ class BugFixWorkflow:
         else:
             response = await self.llm.run_specialist("bugfix", pack)
 
-        diff_text = _clean_diff(response.raw)
+        remaps: dict[str, str] = {}
+        diff_text = self._prepare_diff(response.raw, remaps)
         ok, error = self.patch_engine.validate_diff(diff_text)
         repair_attempts = 0
         max_repair_attempts = 4 if "autonomy" in report.lower() else 2
@@ -112,8 +131,9 @@ class BugFixWorkflow:
                 report, diff_text, error or "Diff validation failed.", locations, searched_paths, plan_text,
             )
             repair_response = await self.llm.run_specialist("bugfix", repair_pack)
-            diff_text = _clean_diff(repair_response.raw)
+            diff_text = self._prepare_diff(repair_response.raw, remaps)
             ok, error = self.patch_engine.validate_diff(diff_text)
+        remapped_paths = list(remaps.items())
 
         if ok:
             changed_files = _changed_files(diff_text)
@@ -127,6 +147,7 @@ class BugFixWorkflow:
                     error=contract_error,
                     verification_status="No file was changed.",
                     plan=plan_text,
+                    remapped_paths=remapped_paths,
                 )
             applied = self.patch_engine.apply(diff_text, self.workspace_root)
             return BugFixResult(
@@ -139,6 +160,7 @@ class BugFixWorkflow:
                 error="" if applied else "Patch was not applied.",
                 verification_status="Change applied, not yet verified." if applied else "No file was changed.",
                 plan=plan_text,
+                remapped_paths=remapped_paths,
             )
 
         fallback = _parse_search_replace(response.raw)
@@ -154,6 +176,7 @@ class BugFixWorkflow:
                     applied=True,
                     verification_status="Change applied, not yet verified.",
                     plan=plan_text,
+                    remapped_paths=remapped_paths,
                 )
             return BugFixResult(
                 request=report,
@@ -163,8 +186,14 @@ class BugFixWorkflow:
                 error=f"Invalid diff: {error}; targeted edit fallback refused: {fallback_error}",
                 verification_status="No file was changed.",
                 plan=plan_text,
+                remapped_paths=remapped_paths,
             )
-        fallback_targets = lenient_diff_target_paths(diff_text) or target_paths or searched_paths
+        # Resolve fallback targets to real workspace paths so the full-file
+        # rewrite edits the existing file instead of creating a wrong-path
+        # duplicate (src/App.tsx as a NEW file next to the real client/src/App.tsx).
+        fallback_targets = self._resolve_paths(
+            lenient_diff_target_paths(diff_text) or target_paths or searched_paths
+        )
         rewritten = await rewrite_files_fully(
             llm=self.llm,
             context_builder=self.context_builder,
@@ -186,6 +215,7 @@ class BugFixWorkflow:
                 used_full_rewrite=True,
                 verification_status="Change applied, not yet verified.",
                 plan=plan_text,
+                remapped_paths=remapped_paths,
             )
         return BugFixResult(
             request=report,
@@ -195,7 +225,37 @@ class BugFixWorkflow:
             error=f"Invalid diff: {error}. Targeted files: {', '.join(fallback_targets) or 'unknown'}. No file was changed.",
             verification_status="No file was changed.",
             plan=plan_text,
+            remapped_paths=remapped_paths,
         )
+
+    def _resolve_locations(self, locations: list[TracebackLocation]) -> list[TracebackLocation]:
+        """Rewrite each location's path to the real workspace file when it can be
+        resolved unambiguously; keep the original path otherwise (search still
+        uses it as a query). Deduplicates on (resolved_path, line)."""
+        resolved: list[TracebackLocation] = []
+        seen: set[tuple[str, int]] = set()
+        for location in locations:
+            real = resolve_reported_path(self.workspace_root, location.file_path) or location.file_path
+            key = (real, location.line)
+            if key in seen:
+                continue
+            seen.add(key)
+            resolved.append(TracebackLocation(file_path=real, line=location.line))
+        return resolved
+
+    def _resolve_paths(self, paths: list[str]) -> list[str]:
+        return _dedupe_strings(
+            [resolve_reported_path(self.workspace_root, path) or path for path in paths]
+        )
+
+    def _prepare_diff(self, raw: str, remaps: dict[str, str]) -> str:
+        """Clean fences off a model diff, then remap any header path that does not
+        exist to the real workspace file. Accumulates remaps across repair
+        attempts so the caller can report exactly which paths were corrected."""
+        diff_text, applied = remap_diff_paths(self.workspace_root, _clean_diff(raw))
+        for reported, resolved in applied:
+            remaps.setdefault(reported, resolved)
+        return diff_text
 
     async def _build_pack(
         self, report: str, locations: list[TracebackLocation],

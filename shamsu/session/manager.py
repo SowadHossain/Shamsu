@@ -466,6 +466,34 @@ class SessionLogger:
         plan = self.read_state().get("last_tool_plan")
         return plan if isinstance(plan, list) else []
 
+    def set_last_failure(self, command: str, errors: str, exit_code: int = 1) -> None:
+        """Remember the most recent failing command and its error output so a
+        later bug-fix request with no explicit target can reuse it (e.g. after a
+        build fails, the user just says "fix it")."""
+        state = self.read_state()
+        state["last_failure"] = {
+            "command": _clip(str(command or ""), 500),
+            "errors": _clip(str(errors or ""), 6000),
+            "exit_code": int(exit_code),
+            "timestamp": _now(),
+        }
+        self.write_state(state)
+        self.log(
+            "session.failure.recorded",
+            {"command": _clip(str(command or ""), 200), "exit_code": int(exit_code)},
+            "Recorded last failing command",
+            workflow_id="session",
+        )
+
+    def get_last_failure(self) -> dict[str, Any]:
+        failure = self.read_state().get("last_failure")
+        return failure if isinstance(failure, dict) else {}
+
+    def clear_last_failure(self) -> None:
+        state = self.read_state()
+        if state.pop("last_failure", None) is not None:
+            self.write_state(state)
+
     def set_last_user_intent(self, intent: str) -> None:
         state = self.read_state()
         state["last_user_intent"] = str(intent or "")

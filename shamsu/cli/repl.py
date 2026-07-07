@@ -3256,15 +3256,25 @@ async def _handle_request(
             else:
                 await _run_code_edit(harness_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
+            bugfix_input = harness_input
             if not _bugfix_request_has_actionable_target(effective_input):
-                message = (
-                    "Tell me what to fix first: include a file path, traceback, failing command, "
-                    "or the exact error message. Example: /fix tests/test_app.py fails with AssertionError ..."
+                # No explicit target - reuse the most recent failing command +
+                # errors from session memory (e.g. after `/autonomy on` a build
+                # failed and the user just says "fix it") instead of re-asking.
+                reused = _bugfix_report_from_last_failure(effective_input, session_logger)
+                if reused is None:
+                    message = (
+                        "Tell me what to fix first: include a file path, traceback, failing command, "
+                        "or the exact error message. Example: /fix tests/test_app.py fails with AssertionError ..."
+                    )
+                    console.print(Panel(message, title="Bug Fix Needs Target", border_style="yellow"))
+                    _log_assistant_message(session_logger, message, workflow_id="bug_fix")
+                    return
+                bugfix_input, reused_command = reused
+                console.print(
+                    f"[dim]Reusing the last failing command from this session: {reused_command}[/dim]"
                 )
-                console.print(Panel(message, title="Bug Fix Needs Target", border_style="yellow"))
-                _log_assistant_message(session_logger, message, workflow_id="bug_fix")
-                return
-            await _run_bug_fix(harness_input, workspace, search, console, llm, session_logger)
+            await _run_bug_fix(bugfix_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
             await _run_audit(harness_input, search, console, llm)
         elif decision.intent == "test_gen":
@@ -4065,6 +4075,33 @@ def _bugfix_request_has_actionable_target(user_input: str) -> bool:
             "exception",
         )
     )
+
+
+def _bugfix_report_from_last_failure(
+    user_input: str, session_logger: SessionLogger | None
+) -> tuple[str, str] | None:
+    """Build a bug-fix report from the last failing command + errors stored in
+    session memory, or None if there is nothing to reuse. Returns (report,
+    command) so the caller can tell the user which command it reused."""
+    if session_logger is None:
+        return None
+    try:
+        failure = session_logger.get_last_failure()
+    except Exception:
+        return None
+    command = str(failure.get("command", "")).strip()
+    errors = str(failure.get("errors", "")).strip()
+    if not errors and not command:
+        return None
+    exit_code = failure.get("exit_code", "")
+    intent = _strip_forced_prefix(user_input, "fix").strip() or "Repair the reported build/test failure."
+    report = (
+        f"{intent}\n\n"
+        f"Last failing command: {command or '(unknown)'}\n"
+        f"Exit code: {exit_code}\n\n"
+        f"Errors / output from that command:\n{errors or '(no captured output)'}"
+    )
+    return report, command or "(unknown)"
 
 _FILE_WRITE_VERBS = {
     "create", "write", "save", "generate", "make", "add", "edit", "update",
@@ -5661,6 +5698,12 @@ async def _run_bug_fix(
     result = await BugFixWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "fix")
     )
+    remapped = getattr(result, "remapped_paths", []) or []
+    if remapped:
+        lines = "\n".join(f"- {reported} -> {resolved}" for reported, resolved in remapped)
+        console.print(
+            f"[dim]The reported path(s) didn't exist; I edited the real workspace file(s):\n{lines}[/dim]"
+        )
     if getattr(result, "used_full_rewrite", False):
         console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
     message = _print_patch_result(
