@@ -110,7 +110,14 @@ from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.dev_server import DevServerManager, extract_dev_command_from_sentence, infer_dev_command, is_dev_server_command
-from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
+from shamsu.tools.web import (
+    WebFetchResult,
+    WebSearchFetchResult,
+    WebSearchResult,
+    WebServiceManager,
+    WebTool,
+    build_evidence_answer_prompt,
+)
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
@@ -184,6 +191,11 @@ SYSTEM_COMMANDS = (
     "/models tier default",
     "/models tier heavy",
     "/web search ",
+    "/web setup",
+    "/web status",
+    "/web start",
+    "/web stop",
+    "/web restart",
     "/web open ",
     "/web summarize ",
     "/browse open ",
@@ -2298,12 +2310,28 @@ def _handle_web(
     parts = user_input.split(maxsplit=2)
     command = parts[1].strip().lower() if len(parts) > 1 else ""
     argument = parts[2].strip() if len(parts) > 2 else ""
+    service = getattr(web_tool, "service_manager", WebServiceManager(Path.cwd()))
+    if command == "setup":
+        _print_web_service_status(service.setup(), console)
+        return
+    if command == "status":
+        _print_web_service_status(service.status(), console)
+        return
+    if command == "start":
+        _print_web_service_status(service.start(), console)
+        return
+    if command == "stop":
+        _print_web_service_status(service.stop(), console)
+        return
+    if command == "restart":
+        _print_web_service_status(service.restart(), console)
+        return
     if command == "search":
         if not argument:
             console.print("[red]Usage: web search <query>[/red]")
             return
-        result = web_tool.search(argument, reason="User explicitly requested a web search.")
-        asyncio.run(_print_web_answer(argument, result, [], console, llm))
+        result = web_tool.search_and_fetch(argument, reason="User explicitly requested a sourced web search.")
+        asyncio.run(_print_web_answer(argument, result, result.pages, console, llm))
         return
     if command in {"open", "summarize"}:
         if not argument:
@@ -2312,7 +2340,13 @@ def _handle_web(
         fetch = web_tool.fetch(argument, reason="User explicitly requested a web page fetch.")
         _print_web_fetch(fetch, console)
         return
-    console.print("[red]Usage: web search <query>|open <url>|summarize <url>[/red]")
+    console.print("[red]Usage: web setup|status|start|stop|restart|search <query>|open <url>|summarize <url>[/red]")
+
+
+def _print_web_service_status(status, console: Console) -> None:
+    style = "green" if status.ok else "yellow"
+    running = "running" if getattr(status, "running", False) else "not running"
+    console.print(Panel(f"{status.message}\nStatus: {running}", title="Web Search Service", border_style=style))
 
 
 def _handle_browse(
@@ -4719,11 +4753,36 @@ async def _run_web_assist(
     web_tool: WebTool,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    if hasattr(web_tool, "search_and_fetch"):
+        combined = web_tool.search_and_fetch(
+            user_input,
+            reason="SHAMSU thinks this request needs current or external information from the web.",
+        )
+        if not combined.approved:
+            await _run_general_chat(
+                user_input,
+                console,
+                llm,
+                extra_context=(
+                    "External web access was denied. Answer with general knowledge only and mention that current details may be stale."
+                ),
+            )
+            return
+        if combined.error:
+            console.print(f"[yellow]Web search failed: {combined.error}[/yellow]")
+            await _run_general_chat(
+                user_input,
+                console,
+                llm,
+                extra_context="Web lookup failed. Answer locally and mention that external lookup was unavailable.",
+            )
+            return
+        await _print_web_answer(user_input, combined, combined.pages, console, llm, session_logger=session_logger)
+        return
+
     result = web_tool.search(
         user_input,
-        reason=(
-            "SHAMSU thinks this request needs current or external information from the web."
-        ),
+        reason="SHAMSU thinks this request needs current or external information from the web.",
     )
     fetches: list[WebFetchResult] = []
     if not result.approved:
@@ -4823,7 +4882,7 @@ async def _run_browser_assist(
 
 async def _print_web_answer(
     query: str,
-    result: WebSearchResult,
+    result: WebSearchResult | WebSearchFetchResult,
     fetches: list[WebFetchResult],
     console: Console,
     llm: LLMManager,
@@ -4835,7 +4894,28 @@ async def _print_web_answer(
     if not result.hits:
         console.print("[yellow]No web results found.[/yellow]")
         return
-    if fetches:
+    if isinstance(result, WebSearchFetchResult):
+        if not fetches:
+            sources = "\n".join(f"- {hit.title}: {hit.url}" for hit in result.hits[:5])
+            message = (
+                "I found search results, but I could not fetch readable page evidence. "
+                "I cannot verify the answer from snippets alone.\n\n"
+                f"Sources searched:\n{sources}"
+            )
+            console.print(Panel(message, title="Web Answer"))
+            _log_assistant_message(session_logger, message, workflow_id="web")
+            return
+        prompt = build_evidence_answer_prompt(query, result)
+        pack = ContextPack(
+            task_id="web-qa",
+            step_id=1,
+            specialist="qa",
+            user_request=query,
+            prd_context=prompt,
+        )
+        response = await llm.run_specialist("qa", pack)
+        body = response.raw.strip()
+    elif fetches:
         context = "\n\n".join(
             f"Source: {item.url}\nTitle: {item.title}\n{item.text[:2500]}"
             for item in fetches
@@ -4873,7 +4953,10 @@ async def _print_web_answer(
         response = await llm.run_specialist("qa", pack)
         body = response.raw.strip() or "I found sources, but could not synthesize an answer from the snippets."
     sources = "\n".join(f"- {hit.title}: {hit.url}" for hit in result.hits[:5])
-    message = f"{body}\n\nSources:\n{sources}"
+    provider_note = ""
+    if getattr(result, "fallback_used", False):
+        provider_note = "\n\nNote: SearXNG was unavailable, so SHAMSU fell back to DuckDuckGo."
+    message = f"{body}{provider_note}\n\nSources:\n{sources}"
     console.print(Panel(message, title="Web Answer"))
     _log_assistant_message(session_logger, message, workflow_id="web")
 
@@ -5438,6 +5521,7 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(2)
     console.print("[dim]Type a prompt, or `/help` for commands.[/dim]\n")
     web_tool = WebTool(
+        workspace=workspace,
         session_logger=session_logger,
         approval_manager=_make_approval_manager(workspace, session_logger, console),
     )
