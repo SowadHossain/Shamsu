@@ -106,6 +106,7 @@ from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
 from shamsu.session.manager import SessionLogger, SessionManager
+from shamsu.session.memory import is_affirmative, is_negative
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
@@ -213,6 +214,10 @@ SYSTEM_COMMANDS = (
     "/sessions rename ",
     "/sessions close",
     "/sessions export ",
+    "/sessions trace",
+    "/sessions summary",
+    "/sessions memory",
+    "/sessions search ",
     "/permissions list",
     "/permissions clear",
     "/milestones list",
@@ -321,7 +326,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--new-session",
         nargs="?",
-        const="SHAMSU Session",
+        const="Untitled Session",
         default=None,
         help="Create a new session with an optional title.",
     )
@@ -404,6 +409,10 @@ def _print_help(console: Console) -> None:
                     "  /sessions rename <id> <title>",
                     "  /sessions close [id]      Close a session",
                     "  /sessions export <id>     Export redacted session bundle",
+                    "  /sessions trace [id]      Show structured action log (no hidden reasoning)",
+                    "  /sessions summary [id]    Show the session summary",
+                    "  /sessions memory [id]     Show local session memory records",
+                    "  /sessions search <query>  Search titles, summaries, messages, memory",
                     "  /permissions list         Show remembered 'always allow' decisions",
                     "  /permissions clear        Forget all remembered approval decisions",
                     "  /milestones list          List tracked internal multi-step milestones",
@@ -1009,7 +1018,12 @@ def _memory_command_allowed(normalized_input: str) -> bool:
     )
 
 
-def _handle_memory(user_input: str, workspace: Path, console: Console) -> None:
+def _handle_memory(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
     _, _, rest = user_input.partition(" ")
     parts = rest.strip().split(maxsplit=1)
     subcommand = parts[0].lower() if parts else "status"
@@ -1042,6 +1056,18 @@ def _handle_memory(user_input: str, workspace: Path, console: Console) -> None:
     if subcommand == "remember":
         if not argument:
             console.print("[red]Usage: /memory remember <text>[/red]")
+            return
+        # When there's an active session, route through the session bridge so the
+        # explicit memory is also recorded in the session's local memory.jsonl.
+        if session_logger is not None:
+            bridge = session_logger.save_long_term_memory("user_preference", argument, {"reason": "explicit_remember"})
+            outcome = bridge.get("long_term") or {}
+            if outcome.get("ok"):
+                console.print("[green]Memory stored.[/green]" if not outcome.get("deduped") else "[green]Memory already existed.[/green]")
+            elif bridge.get("local"):
+                console.print("[green]Saved to session memory (long-term backend unavailable).[/green]")
+            else:
+                console.print(f"[yellow]Memory not stored: {outcome.get('reason') or outcome.get('error') or 'skipped'}[/yellow]")
             return
         result = service.remember(argument)
         if result.get("ok"):
@@ -2712,6 +2738,9 @@ def _handle_sessions(
 ) -> SessionLogger:
     parts = user_input.split(maxsplit=3)
     command = parts[1].lower() if len(parts) > 1 else "list"
+    # The rest after the subcommand, kept intact for multi-word queries.
+    _, _, after_command = user_input.partition(" ")
+    argument = after_command.partition(" ")[2].strip() if " " in after_command.strip() else ""
     try:
         if command == "list":
             table = Table(title="Sessions")
@@ -2736,7 +2765,7 @@ def _handle_sessions(
             return resumed
         if command == "rename" and len(parts) >= 4:
             renamed = manager.rename_session(parts[2], parts[3])
-            console.print(f"[green]Renamed session {renamed.session_id}[/green]")
+            console.print(f"[green]Renamed session {renamed.session_id} to \"{renamed.title}\"[/green]")
             if renamed.session_id == current.session_id:
                 return SessionLogger(manager, renamed)
             return current
@@ -2745,17 +2774,151 @@ def _handle_sessions(
             closed = manager.close_session(target)
             console.print(f"[yellow]Closed session {closed.session_id}[/yellow]")
             if closed.session_id == current.session_id:
-                return manager.create_session("SHAMSU Session")
+                return manager.create_session()
             return current
         if command == "export" and len(parts) >= 3:
             path = manager.export_session(parts[2])
             console.print(f"[green]Exported session bundle: {path}[/green]")
             return current
+        if command == "trace":
+            logger = manager.logger_for(parts[2]) if len(parts) >= 3 else current
+            _print_session_trace(logger, console)
+            return current
+        if command == "summary":
+            logger = manager.logger_for(parts[2]) if len(parts) >= 3 else current
+            _print_session_summary(logger, console)
+            return current
+        if command == "memory":
+            logger = manager.logger_for(parts[2]) if len(parts) >= 3 else current
+            _print_session_memory(logger, console)
+            return current
+        if command == "search":
+            if not argument:
+                console.print("[red]Usage: /sessions search <query>[/red]")
+                return current
+            _print_session_search(manager, argument, console)
+            return current
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return current
-    console.print("[red]Usage: sessions list|current|show|resume|rename|close|export[/red]")
+    console.print(
+        "[red]Usage: sessions list|current|show|resume|rename|close|export|trace|summary|memory|search[/red]"
+    )
     return current
+
+
+# Structured action events safe to surface in `/sessions trace`. Deliberately
+# excludes raw model turns and planner output (chat.message, planner.plan,
+# llm.request/response, user.prompt) so no hidden chain-of-thought leaks.
+_TRACE_ALLOW_PREFIXES = (
+    "router.", "route.", "workflow.", "agent.tool", "agent.run", "agent.stuck",
+    "command.", "patch.", "tool.", "web.", "browser.", "approval.",
+    "context.pack", "memory.write", "memory.long_term", "memory.local",
+    "memory.retrieved", "session.route", "session.pending_action",
+    "session.started", "session.resumed", "session.closed", "session.auto_titled",
+    "assistant.message",
+)
+
+
+def _is_trace_event(event_type: str) -> bool:
+    return any(event_type.startswith(prefix) for prefix in _TRACE_ALLOW_PREFIXES)
+
+
+def _trace_line(event: dict[str, Any]) -> str:
+    event_type = str(event.get("event_type", ""))
+    payload = event.get("payload", {}) or {}
+    summary = str(event.get("summary", "")).strip()
+    if event_type == "router.decision":
+        return f"Route: {payload.get('intent') or payload.get('route') or summary}"
+    if event_type == "session.route.updated":
+        return f"Route: {payload.get('route') or '-'}"
+    if event_type.startswith("workflow."):
+        label = event_type.split(".", 1)[1]
+        return f"Workflow {label}: {summary or payload.get('intent', '')}".strip()
+    if event_type == "agent.tool_call":
+        return f"Tool call: {payload.get('tool_name', '?')}"
+    if event_type == "agent.tool_result":
+        ok = "ok" if payload.get("ok") else "failed"
+        return f"Tool: {payload.get('tool_name', '?')} {ok}"
+    if event_type.startswith("command."):
+        return f"Command {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("patch."):
+        return f"Patch {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("browser."):
+        return f"Browser {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("web."):
+        return f"Web {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("approval."):
+        return f"Approval {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("memory."):
+        return f"Memory: {summary or event_type}"
+    if event_type == "assistant.message":
+        return f"Final: {summary or _clip_text(str(payload.get('message', '')), 100)}"
+    return f"{event_type}: {summary}"
+
+
+def _print_session_trace(logger: SessionLogger, console: Console) -> None:
+    events = [event for event in logger.tail(400) if _is_trace_event(str(event.get("event_type", "")))]
+    if not events:
+        console.print("[dim]No structured trace events for this session yet.[/dim]")
+        return
+    table = Table(title=f"Trace — {logger.metadata.title}")
+    table.add_column("Time")
+    table.add_column("Action")
+    for event in events[-60:]:
+        table.add_row(str(event.get("timestamp", ""))[11:19], _trace_line(event))
+    console.print(table)
+
+
+def _print_session_summary(logger: SessionLogger, console: Console) -> None:
+    summary = logger.read_summary()
+    if not summary.strip():
+        # No summary persisted yet: generate a deterministic one on demand.
+        summary = logger.update_summary_from_events()
+    console.print(Panel(summary.strip() or "No summary available.", title=f"Summary — {logger.metadata.title}"))
+
+
+def _print_session_memory(logger: SessionLogger, console: Console) -> None:
+    records = logger.read_local_memory()
+    if not records:
+        console.print("[dim]No local session memory recorded yet.[/dim]")
+        return
+    table = Table(title=f"Session Memory — {logger.metadata.title}")
+    table.add_column("Kind")
+    table.add_column("Memory")
+    table.add_column("When")
+    for record in records[-40:]:
+        table.add_row(
+            str(record.get("kind", "")),
+            _clip_text(str(record.get("text", "")), 200),
+            str(record.get("timestamp", ""))[:19],
+        )
+    console.print(table)
+
+
+def _print_session_search(manager: SessionManager, query: str, console: Console) -> None:
+    matches = manager.search_sessions(query)
+    if not matches:
+        console.print(f"[dim]No sessions matched: {query}[/dim]")
+        return
+    table = Table(title=f"Search — {query}")
+    table.add_column("Session")
+    table.add_column("Title")
+    table.add_column("Source")
+    table.add_column("Snippet")
+    for match in matches:
+        table.add_row(
+            str(match.get("session_id", ""))[:19],
+            _clip_text(str(match.get("title", "")), 24),
+            f"{match.get('source', '')}/{match.get('role', '')}".rstrip("/-"),
+            _clip_text(str(match.get("snippet", "")), 70),
+        )
+    console.print(table)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
 def _print_session(metadata, console: Console) -> None:
@@ -2811,10 +2974,40 @@ def _log_assistant_message(
             "Assistant responded",
             workflow_id=workflow_id,
         )
+        # Keep the resumable state's "last answer" in sync so a resumed session
+        # can show where it left off without replaying events.
+        try:
+            session_logger.set_last_assistant_summary(message)
+        except Exception:
+            pass
     ledger = get_current_run()
     if ledger and message:
         ledger.log_task_classified(workflow_id or "unknown")
         ledger.finish(message, status="success")
+
+
+def _finalize_session_work(
+    session_logger: SessionLogger | None,
+    workflow: str,
+    request_text: str,
+) -> None:
+    """On meaningful workflow completion: refresh the deterministic session
+    summary and save a durable task summary (local + best-effort long-term).
+    Every step is best-effort so it never breaks the user-facing flow."""
+    if not session_logger:
+        return
+    try:
+        session_logger.update_summary_from_events()
+    except Exception:
+        pass
+    try:
+        session_logger.save_long_term_memory(
+            "task_summary",
+            f"Task summary ({workflow}): {request_text.strip()[:500]}",
+            {"workflow": workflow},
+        )
+    except Exception:
+        pass
 
 
 def _finish_current_run(workspace: Path, ledger: ActionLedger) -> None:
@@ -2833,6 +3026,29 @@ def _append_agent_context(user_input: str, agent_context: str) -> str:
     return f"{user_input}\n\nAdditional SHAMSU context:\n{agent_context}"
 
 
+def _classify_route_label(effective_input: str, workspace: Path) -> str:
+    """Coarse, read-only route label mirroring the branch order in
+    `_handle_request` — used only to record `last_route` in session state, so a
+    missed/added branch degrades to `agent-chat` rather than breaking anything."""
+    if is_git_request(effective_input):
+        return "git"
+    if _looks_like_workspace_location_prompt(effective_input):
+        return "workspace.location"
+    if _looks_like_workspace_files_prompt(effective_input):
+        return "workspace.files"
+    if _looks_like_prd_build_request(effective_input, workspace):
+        return "prd.build"
+    if _looks_like_file_write_request(effective_input):
+        return "file.write"
+    if _looks_like_browser_needed_prompt(effective_input):
+        return "browser"
+    if _looks_like_web_needed_prompt(effective_input):
+        return "web"
+    if _looks_like_react_prompt(effective_input):
+        return "agent-chat"
+    return "qa"
+
+
 async def _handle_request(
     user_input: str,
     workspace: Path,
@@ -2848,6 +3064,17 @@ async def _handle_request(
     if session_logger is None:
         effective_input = _expand_followup_prompt(effective_input, previous_user_prompt)
     agent_context = agent_result.context
+    # Record the routing decision in session state so `/sessions trace` and a
+    # resumed session can see how the last prompt was dispatched.
+    if session_logger is not None:
+        try:
+            route_label = (
+                agent_result.action if agent_result.handled
+                else _classify_route_label(effective_input, workspace)
+            )
+            session_logger.set_last_route({"route": route_label or "agent-chat", "handled": agent_result.handled})
+        except Exception:
+            pass
     if agent_result.handled:
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
@@ -4984,13 +5211,10 @@ async def _run_agent_chat(
         progress.done("Agent finished")
     console.print(Panel(_agent_display_summary(body, activities), title="Agent"))
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
-    _record_task_memory(
-        workspace,
-        f"Task summary: agent-chat completed for request: {user_input[:500]}",
-        "task_summary",
-        session_logger,
-        {"workflow": "agent-chat"},
-    )
+    # Update the session summary and durable memory only when the agent actually
+    # finished the work (a stopped/looping run is not a completed task).
+    if not result.stopped:
+        _finalize_session_work(session_logger, "agent-chat", user_input)
 
 
 def _should_show_context_preview() -> bool:
@@ -5851,6 +6075,10 @@ def main(argv: list[str] | None = None) -> None:
             "User submitted prompt",
             workflow_id="repl",
         )
+        # Auto-name a still-placeholder session from its first meaningful,
+        # natural-language prompt (slash commands never name a session).
+        if not user_input.startswith("/"):
+            session_manager.maybe_auto_title(session_logger, user_input)
         if user_input.startswith("/"):
             route = command_router.route(user_input)
             if not route.valid:
@@ -5877,7 +6105,7 @@ def main(argv: list[str] | None = None) -> None:
             _handle_doctor(workspace, console)
             continue
         if lowered_input.startswith("memory"):
-            _handle_memory(normalized_input, workspace, console)
+            _handle_memory(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("abstract"):
             _handle_abstract(normalized_input, workspace, console)
@@ -6005,13 +6233,32 @@ def main(argv: list[str] | None = None) -> None:
             _handle_run(normalized_input, workspace, console)
             continue
 
-        ledger = start_run(workspace, user_input)
+        # Follow-up resolution against a stored pending action: a bare
+        # "yes"/"no"/"do it" resolves the prior action instead of entering the
+        # model/tool loop as a fresh, context-free prompt. Dispatching a
+        # confirmed action still passes through the normal approval gates, so
+        # this never bypasses safety.
+        dispatch_input = user_input
+        pending_action = session_logger.get_pending_action()
+        if pending_action:
+            if is_negative(user_input):
+                session_logger.clear_pending_action()
+                console.print("[yellow]Cancelled the pending action.[/yellow]")
+                continue
+            if is_affirmative(user_input) and pending_action.get("awaiting") == "confirmation":
+                origin = str(pending_action.get("created_from_prompt", "")).strip()
+                session_logger.clear_pending_action()
+                if origin:
+                    dispatch_input = f"{origin}\n\n[User confirmed: proceed with this request.]"
+                console.print("[dim]Resolving your confirmation against the pending action.[/dim]")
+
+        ledger = start_run(workspace, dispatch_input)
         set_current_run(ledger)
         try:
             with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
                 asyncio.run(
                     _handle_request(
-                        user_input,
+                        dispatch_input,
                         workspace,
                         console,
                         web_tool,

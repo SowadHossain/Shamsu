@@ -287,6 +287,12 @@ class AgentChatLoop:
                 "Planner produced a plan for this request",
                 workflow_id="agent-chat",
             )
+            # Persist the plan as the session's last tool/workflow plan so a
+            # resumed session knows what the current request was working toward.
+            try:
+                self.session_logger.set_last_tool_plan([{"type": "plan", "text": plan.text}])
+            except Exception:
+                pass
         return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
 
     def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
