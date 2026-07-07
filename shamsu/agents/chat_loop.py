@@ -16,6 +16,7 @@ from shamsu.agents.chat_state import ChatState
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.agents.planner import create_plan
 from shamsu.context.builder import ContextBuilder
+from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
 from shamsu.memory.service import MemoryService
@@ -97,6 +98,7 @@ class AgentChatLoop:
         action_ledger: ActionLedger | None = None,
         llm: ILLMManager | None = None,
         context_builder: IContextBuilder | None = None,
+        budget_manager: ContextBudgetManager | None = None,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -111,6 +113,7 @@ class AgentChatLoop:
         # to the REPL while the loop runs. None keeps the loop silent (tests).
         self.on_activity = on_activity
         self.progress = progress
+        self.budget_manager = budget_manager
         self.state = state or ChatState(
             _system_prompt(self.workspace_root),
             session_logger=session_logger,
@@ -129,6 +132,12 @@ class AgentChatLoop:
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
         for round_index in range(self.max_tool_rounds):
+            # Show context-window usage before each model call.
+            if self.budget_manager:
+                _messages = self.state.messages()
+                _msg_text = "\n".join(str(m.get("content", "")) for m in _messages)
+                _budget = self.budget_manager.compute(self.model_name, "chat", _msg_text)
+                self.budget_manager.show_indicator(_budget)
             try:
                 response = await asyncio.wait_for(
                     self.client.chat(

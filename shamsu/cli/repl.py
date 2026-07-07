@@ -256,6 +256,10 @@ SYSTEM_COMMANDS = (
     "/run diff ",
     "/run export ",
     "/run clean",
+    "/context status",
+    "/context budget",
+    "/context inspect",
+    "/context compact",
     "/edit ",
     "/fix ",
     "/test-gen ",
@@ -363,6 +367,10 @@ def _print_help(console: Console) -> None:
                     "  /django setup [dir]       Install generated deps and run migrations",
                     "  /django test [dir]        Run generated Django tests",
                     "  /django fix-tests [dir]   Run tests and apply bug-fix loop",
+                    "  /context status           Show model context windows and calibration",
+                    "  /context budget           Show last model call's token budget",
+                    "  /context inspect          Detailed budget breakdown",
+                    "  /context compact          Show auto-compact threshold and last status",
                     "  /models status            Show local Ollama/model status",
                     "  /models pull              Pull missing local models",
                     "  /models repair            Start Ollama and pull missing models",
@@ -2398,12 +2406,105 @@ class _LazyModelPullProgress:
         return ModelPullProgress(on_start=self.on_start, on_chunk=self.on_chunk, on_finish=self.on_finish)
 
 
-def _make_llm_manager(session_logger: SessionLogger | None, console: Console) -> LLMManager:
+_BUDGET_MANAGER_CACHE: dict[Path, "ContextBudgetManager"] = {}
+
+
+def _get_budget_manager(workspace: Path, console: Console) -> "ContextBudgetManager":
+    from shamsu.context.manager import ContextBudgetManager
+
+    resolved = workspace.resolve()
+    mgr = _BUDGET_MANAGER_CACHE.get(resolved)
+    if mgr is None:
+        mgr = ContextBudgetManager(print_fn=console.print, workspace=resolved)
+        _BUDGET_MANAGER_CACHE[resolved] = mgr
+    else:
+        mgr._print_fn = console.print
+    return mgr
+
+
+def _handle_context(
+    normalized_input: str,
+    workspace: Path,
+    console: Console,
+) -> None:
+    from shamsu.context.budget import MODEL_CONTEXT_WINDOWS, SAFE_FALLBACK_CTX_WINDOW
+    from shamsu.runtime.models import active_tier, tier_model_specs
+
+    parts = normalized_input.split(maxsplit=2)
+    sub = parts[1].lower() if len(parts) > 1 else ""
+    mgr = _get_budget_manager(workspace, console)
+
+    if sub == "status":
+        tier = active_tier()
+        rows: list[str] = [f"Active tier: {tier.value}", ""]
+        for spec in tier_model_specs(tier):
+            ctx = MODEL_CONTEXT_WINDOWS.get(spec.name, SAFE_FALLBACK_CTX_WINDOW)
+            rows.append(f"  {spec.name:<35}  ctx {ctx // 1024}k  roles: {', '.join(spec.roles[:4])}")
+        rows.append("")
+        calib = mgr._calibration
+        if calib:
+            rows.append("Calibration corrections (actual/estimated EMA):")
+            for model, factor in calib.items():
+                rows.append(f"  {model:<35}  ×{factor:.3f}")
+        else:
+            rows.append("No calibration data yet (accumulates after first model call).")
+        console.print(Panel("\n".join(rows), title="Context Status", border_style="cyan"))
+
+    elif sub in ("budget", "inspect"):
+        result = mgr.last_result
+        if result is None:
+            console.print("[dim]No model calls made yet this session.[/dim]")
+            return
+        lines = [
+            mgr.format_indicator(result),
+            "",
+            f"  model        : {result.model_name}",
+            f"  specialist   : {result.specialist}",
+            f"  estimated    : {result.estimated_tokens:,} tokens",
+            f"  context window: {result.context_window:,} tokens",
+            f"  usable       : {result.usable_tokens:,} tokens",
+            f"  reserve      : {result.reserve_tokens:,} tokens",
+            f"  usage        : {result.usage_pct}%",
+            f"  compacted    : {result.compacted}",
+        ]
+        console.print(Panel("\n".join(lines), title="Context Budget", border_style="cyan"))
+
+    elif sub == "compact":
+        result = mgr.last_result
+        threshold_pct = round(mgr._compact_threshold * 100)
+        if result is None:
+            console.print(
+                f"[dim]Auto-compact threshold: {threshold_pct}%. "
+                "No model calls made yet this session.[/dim]"
+            )
+        else:
+            status = "triggered" if result.usage_pct >= threshold_pct else "not triggered"
+            console.print(
+                f"Auto-compact threshold: {threshold_pct}%  |  "
+                f"Last call: {result.usage_pct}% used  |  "
+                f"Status: {status}"
+            )
+            console.print(
+                "[dim]Compaction runs automatically before each planner/coder call "
+                "when usage exceeds the threshold. "
+                "Exact code snippets, file paths, error codes, and imports are always preserved.[/dim]"
+            )
+    else:
+        console.print("[red]Usage: /context status|budget|inspect|compact[/red]")
+
+
+def _make_llm_manager(
+    session_logger: SessionLogger | None,
+    console: Console,
+    workspace: Path | None = None,
+) -> LLMManager:
     lazy_progress = _LazyModelPullProgress(console)
+    budget_manager = _get_budget_manager(workspace, console) if workspace is not None else None
     return LLMManager(
         session_logger=session_logger,
         model_pull_progress=lazy_progress.as_model_pull_progress(),
         action_ledger=get_current_run(),
+        budget_manager=budget_manager,
     )
 
 
@@ -2749,13 +2850,13 @@ async def _handle_request(
         _log_assistant_message(session_logger, message, workflow_id="prd.context_question")
         return
     if _looks_like_browser_needed_prompt(effective_input):
-        await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console), browser_tool=browser_tool)
+        await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console, workspace), browser_tool=browser_tool)
         return
     if _looks_like_web_needed_prompt(effective_input):
         await _run_web_assist(
             effective_input,
             console,
-            llm=_make_llm_manager(session_logger, console),
+            llm=_make_llm_manager(session_logger, console, workspace),
             web_tool=web_tool,
             session_logger=session_logger,
         )
@@ -2772,7 +2873,7 @@ async def _handle_request(
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
     search, uses_real_index = _build_search_agent(workspace, session_logger)
-    llm = _make_llm_manager(session_logger, console)
+    llm = _make_llm_manager(session_logger, console, workspace)
     if not uses_real_index:
         decision = _keyword_decision(effective_input)
         if decision.intent in {"qa", "explain"}:
@@ -4533,6 +4634,7 @@ async def _run_agent_chat(
         on_activity=on_activity,
         progress=progress,
         action_ledger=action_ledger,
+        budget_manager=_get_budget_manager(workspace, console),
     ).run(user_input)
     body = result.final.strip() or "No response returned."
     if result.stopped:
@@ -5409,7 +5511,7 @@ def main(argv: list[str] | None = None) -> None:
             _handle_models(normalized_input, console, workspace)
             continue
         if lowered_input.startswith("web "):
-            _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console))
+            _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console, workspace))
             continue
         if lowered_input.startswith("browse "):
             _handle_browse(normalized_input, console, browser_tool)
@@ -5450,11 +5552,14 @@ def main(argv: list[str] | None = None) -> None:
             _finish_current_run(workspace, ledger)
             clear_current_run()
             continue
+        if lowered_input.startswith("context"):
+            _handle_context(normalized_input, workspace, console)
+            continue
         if lowered_input == "tasks" or lowered_input.startswith("tasks "):
             _tasks_tokens = lowered_input.split(maxsplit=2)
             if len(_tasks_tokens) > 1 and _tasks_tokens[1] in {"execute", "continue"}:
                 search, _ = _build_search_agent(workspace, session_logger)
-                llm = _make_llm_manager(session_logger, console)
+                llm = _make_llm_manager(session_logger, console, workspace)
                 # Task execution goes through model calls, Codebase-Memory
                 # queries, and PatchEngine mutations just like the natural-
                 # language fallback path below - it needs the same active

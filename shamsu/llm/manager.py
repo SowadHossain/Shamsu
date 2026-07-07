@@ -1,4 +1,4 @@
-﻿"""
+"""
 shamsu/llm/manager.py â€” Dev B owns this file.
 
 Implements ILLMManager. Encodes the harness defaults directly:
@@ -30,6 +30,7 @@ import httpx
 from json_repair import repair_json
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import ILLMManager
 from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role
@@ -133,6 +134,7 @@ class LLMManager(ILLMManager):
         session_logger: SessionLogger | None = None,
         model_pull_progress: ModelPullProgress | None = None,
         action_ledger: ActionLedger | None = None,
+        budget_manager: ContextBudgetManager | None = None,
     ):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
@@ -140,6 +142,7 @@ class LLMManager(ILLMManager):
         self.session_logger = session_logger
         self.action_ledger = action_ledger
         self.model_pull_progress = model_pull_progress
+        self.budget_manager = budget_manager
 
     async def _ensure_model(self, model_name: str) -> None:
         """Lazily pull `model_name` the first time it's actually needed."""
@@ -191,6 +194,7 @@ class LLMManager(ILLMManager):
         self, model: str, system: str, prompt: str,
         temperature: float = 0.1, json_schema: dict | None = None,
         keep_alive: str = "10m", num_ctx: int = 8192,
+        _estimated_tokens: int = 0,
     ) -> str:
         payload = {
             "model": model,
@@ -210,7 +214,16 @@ class LLMManager(ILLMManager):
         async with httpx.AsyncClient(timeout=120) as client:
             r = await client.post(f"{self.base_url}/api/generate", json=payload)
             r.raise_for_status()
-            return r.json().get("response", "")
+            data = r.json()
+            raw = data.get("response", "")
+            # Calibrate future token estimates with Ollama's ground-truth count.
+            if self.budget_manager and _estimated_tokens > 0:
+                prompt_eval_count = data.get("prompt_eval_count", 0)
+                if prompt_eval_count:
+                    self.budget_manager.calibrate_from_response(
+                        model, prompt_eval_count, _estimated_tokens
+                    )
+            return raw
 
     async def route(self, prompt: str, project_summary: str) -> RoutingDecision:
         """
@@ -318,6 +331,19 @@ class LLMManager(ILLMManager):
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
         pack = self._with_long_term_memory(pack, specialist)
         prompt = self._format_pack(pack)
+
+        # Budget check: estimate tokens, compact if near the limit, show indicator.
+        estimated_tokens = 0
+        if self.budget_manager:
+            budget = self.budget_manager.compute(model_name, specialist, prompt)
+            if self.budget_manager.should_compact(budget):
+                pack = self.budget_manager.compact_pack(pack, budget)
+                prompt = self._format_pack(pack)
+                budget = self.budget_manager.compute(model_name, specialist, prompt)
+                budget = replace(budget, compacted=True)
+            self.budget_manager.show_indicator(budget)
+            estimated_tokens = budget.estimated_tokens
+
         started = time.perf_counter()
         if self.session_logger:
             self.session_logger.log_context_pack(pack, workflow_id=pack.task_id)
@@ -336,7 +362,10 @@ class LLMManager(ILLMManager):
             self.action_ledger.log_context_preview(_context_preview(pack))
             self.action_ledger.log_model_call_started(specialist, model_name, prompt)
         try:
-            raw = await self._generate(model_name, "", prompt, temperature=temp)
+            raw = await self._generate(
+                model_name, "", prompt, temperature=temp,
+                _estimated_tokens=estimated_tokens,
+            )
         except Exception as exc:
             if self.session_logger:
                 self.session_logger.log(
