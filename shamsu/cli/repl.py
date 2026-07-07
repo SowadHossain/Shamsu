@@ -9,6 +9,7 @@ import argparse
 import asyncio
 import atexit
 import difflib
+import inspect
 import json
 import os
 import re
@@ -48,6 +49,7 @@ from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.cli.command_router import CommandRouter
+from shamsu.context.manager import ContextBudgetManager
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
 from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
 from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
@@ -2406,12 +2408,10 @@ class _LazyModelPullProgress:
         return ModelPullProgress(on_start=self.on_start, on_chunk=self.on_chunk, on_finish=self.on_finish)
 
 
-_BUDGET_MANAGER_CACHE: dict[Path, "ContextBudgetManager"] = {}
+_BUDGET_MANAGER_CACHE: dict[Path, ContextBudgetManager] = {}
 
 
-def _get_budget_manager(workspace: Path, console: Console) -> "ContextBudgetManager":
-    from shamsu.context.manager import ContextBudgetManager
-
+def _get_budget_manager(workspace: Path, console: Console) -> ContextBudgetManager:
     resolved = workspace.resolve()
     mgr = _BUDGET_MANAGER_CACHE.get(resolved)
     if mgr is None:
@@ -2493,6 +2493,16 @@ def _handle_context(
         console.print("[red]Usage: /context status|budget|inspect|compact[/red]")
 
 
+def _call_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
+    try:
+        signature = inspect.signature(callable_obj)
+    except (TypeError, ValueError):
+        return True
+    return any(
+        param.kind is inspect.Parameter.VAR_KEYWORD or name == keyword
+        for name, param in signature.parameters.items()
+    )
+
 def _make_llm_manager(
     session_logger: SessionLogger | None,
     console: Console,
@@ -2500,12 +2510,14 @@ def _make_llm_manager(
 ) -> LLMManager:
     lazy_progress = _LazyModelPullProgress(console)
     budget_manager = _get_budget_manager(workspace, console) if workspace is not None else None
-    return LLMManager(
-        session_logger=session_logger,
-        model_pull_progress=lazy_progress.as_model_pull_progress(),
-        action_ledger=get_current_run(),
-        budget_manager=budget_manager,
-    )
+    kwargs: dict[str, Any] = {
+        "session_logger": session_logger,
+        "model_pull_progress": lazy_progress.as_model_pull_progress(),
+        "action_ledger": get_current_run(),
+    }
+    if budget_manager is not None and _call_accepts_keyword(LLMManager, "budget_manager"):
+        kwargs["budget_manager"] = budget_manager
+    return LLMManager(**kwargs)
 
 
 # One PermissionMemory per workspace per process, so "always allow" choices
@@ -3331,7 +3343,7 @@ def _find_workspace_prd_files(workspace: Path) -> list[Path]:
     for path in workspace.rglob("*"):
         if not path.is_file():
             continue
-        if not is_prd_filename(path.name):
+        if not (is_prd_filename(path.name) or path.name.lower() == "requirements.md"):
             continue
         try:
             candidates.append(path.relative_to(workspace))
@@ -4626,16 +4638,17 @@ async def _run_agent_chat(
         activities.append(msg)
         progress.step(msg)
 
-    result = await AgentChatLoop(
-        workspace,
-        session_logger=session_logger,
-        tools=tools,
-        long_running=long_running,
-        on_activity=on_activity,
-        progress=progress,
-        action_ledger=action_ledger,
-        budget_manager=_get_budget_manager(workspace, console),
-    ).run(user_input)
+    chat_kwargs: dict[str, Any] = {
+        "session_logger": session_logger,
+        "tools": tools,
+        "long_running": long_running,
+        "on_activity": on_activity,
+        "progress": progress,
+        "action_ledger": action_ledger,
+    }
+    if _call_accepts_keyword(AgentChatLoop, "budget_manager"):
+        chat_kwargs["budget_manager"] = _get_budget_manager(workspace, console)
+    result = await AgentChatLoop(workspace, **chat_kwargs).run(user_input)
     body = result.final.strip() or "No response returned."
     if result.stopped:
         progress.warning("Agent stopped before completing all requested work")

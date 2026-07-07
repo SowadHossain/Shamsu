@@ -3,7 +3,7 @@ from __future__ import annotations
 from rich.console import Console
 
 from shamsu.cli.repl import _ensure_code_memory_ready_at_startup
-from shamsu.abstract.service import REQUIRED_TOOL_MESSAGE, AbstractService
+from shamsu.abstract.service import AbstractService
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 
 
