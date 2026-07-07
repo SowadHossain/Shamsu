@@ -24,7 +24,7 @@ from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.web import WebTool
-from shamsu.types import ContextPack
+from shamsu.types import ContextPack, LLMResponse
 
 PASS_CMD = f'"{sys.executable}" -c "print(1)"'
 
@@ -54,20 +54,36 @@ class FakeOllamaClient:
         return self._responses.pop(0)
 
 
+class FakePlannerLLM:
+    """Stands in for AgentChatLoop's `llm` (the planner call) so this test
+    never hits a real local model - `client`/`FakeOllamaClient` above remains
+    the stand-in for the separate tool-calling client."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
+        self.calls.append(specialist)
+        return LLMResponse(raw="List the current directory contents.", model_used="fake")
+
+
 @pytest.mark.asyncio
 async def test_agent_chat_loop_logs_tool_calls_into_action_ledger(tmp_path: Path):
     ledger = start_run(tmp_path, "list the files here")
     tools = AgentToolRegistry(tmp_path, action_ledger=ledger)
+    llm = FakePlannerLLM()
     loop = AgentChatLoop(
         tmp_path,
         client=FakeOllamaClient(),
         tools=tools,
         action_ledger=ledger,
+        llm=llm,
     )
 
     result = await loop.run("list the files here")
 
     assert result.final == "Done listing files."
+    assert llm.calls == ["planner"]
     types = [event["type"] for event in _events(ledger)]
     assert "tool_called" in types
     assert "tool_finished" in types

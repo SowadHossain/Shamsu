@@ -16,6 +16,7 @@ from shamsu.interfaces import (
     ISearchAgent,
 )
 from shamsu.llm.manager import LLMManager
+from shamsu.memory.service import MemoryService
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import ContextPack, SearchResult, TestRunResult
@@ -51,6 +52,7 @@ class TestGenerationWorkflow:
         patch_engine: IPatchEngine | None = None,
         context_builder: IContextBuilder | None = None,
         command_runner: ICommandRunner | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.search = search
@@ -58,6 +60,7 @@ class TestGenerationWorkflow:
         self.patch_engine = patch_engine or PatchEngine(self.workspace_root)
         self.context_builder = context_builder or ContextBuilder()
         self.command_runner = command_runner
+        self.memory_service = memory_service or MemoryService(self.workspace_root)
 
     async def run(self, request: str, run_after_apply: bool = False) -> TestGenerationResult:
         pack, plan_text = await self._build_pack(request)
@@ -102,10 +105,15 @@ class TestGenerationWorkflow:
 
     async def _build_pack(self, request: str) -> tuple[ContextPack, str]:
         results = _dedupe_results(self._search_test_context(request))
+        graphiti_brief = self.memory_service.render_relevant(request)
         plan = await create_plan(self.llm, self.context_builder, results, goal=request, task_id="test-gen-plan")
         pack = self.context_builder.pack(
             results=results,
-            request=f"{TEST_GEN_INSTRUCTIONS}\n\nPlan from planner model:\n{plan.text}\n\nTest request: {request}",
+            request=(
+                f"{TEST_GEN_INSTRUCTIONS}\n\n"
+                + (f"{graphiti_brief}\n\n" if graphiti_brief else "")
+                + f"Plan from planner model:\n{plan.text}\n\nTest request: {request}"
+            ),
             task_id="test-generation",
             step_id=2,
             specialist="test_gen",

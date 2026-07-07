@@ -13,7 +13,10 @@ import ollama
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
-from shamsu.llm.manager import OLLAMA_BASE_URL, _validate_local_llm_url
+from shamsu.agents.planner import create_plan
+from shamsu.context.builder import ContextBuilder
+from shamsu.interfaces import IContextBuilder, ILLMManager
+from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
 from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import model_for_role
 from shamsu.safety.clarify import ask_clarifying_question
@@ -84,12 +87,16 @@ class AgentChatLoop:
         on_activity: Callable[[str], None] | None = None,
         progress: ProgressReporter | None = None,
         action_ledger: ActionLedger | None = None,
+        llm: ILLMManager | None = None,
+        context_builder: IContextBuilder | None = None,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
         self.action_ledger = action_ledger
         self.model_name = model_name or model_for_role("qa")
+        self.llm = llm or LLMManager(session_logger=session_logger, action_ledger=action_ledger)
+        self.context_builder = context_builder or ContextBuilder()
         self.client = client or ollama.AsyncClient(host=base_url)
         self.tools = tools or AgentToolRegistry(self.workspace_root, session_logger=session_logger)
         # Optional hook to surface live tool activity (e.g. "Writing game.js")
@@ -109,6 +116,7 @@ class AgentChatLoop:
 
     async def run(self, user_input: str) -> AgentLoopResult:
         user_input = self._append_long_term_memory(user_input)
+        user_input = await self._append_plan(user_input)
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
@@ -217,6 +225,28 @@ class AgentChatLoop:
         if self.action_ledger:
             self.action_ledger.log_graphiti_retrieved(has_memory=True)
         return f"{user_input}\n\n{memory_context}"
+
+    async def _append_plan(self, user_input: str) -> str:
+        """One planner call per top-level request (not per tool round),
+        mirroring CodeEditWorkflow/BugFixWorkflow - see shamsu/agents/planner.py.
+        Best-effort: a planner failure must never block the chat loop itself."""
+        try:
+            plan = await create_plan(
+                self.llm, self.context_builder, results=[], goal=user_input, task_id="agent-chat-plan",
+            )
+        except Exception:
+            return user_input
+        if not plan.text:
+            return user_input
+        if self.session_logger:
+            self.session_logger.log(
+                "planner.plan",
+                {"plan": plan.text},
+                "Planner produced a plan for this request",
+                workflow_id="agent-chat",
+            )
+        return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
+
     def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
         """The same tool call repeated past the limit despite corrections â€” stop
         cleanly rather than burn rounds. No clarifying question, no filler."""

@@ -13,6 +13,7 @@ from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
+from shamsu.memory.service import MemoryService
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.templates.frontend import frontend_prompt_rules
 from shamsu.types import ContextPack, SearchResult
@@ -45,12 +46,14 @@ class CodeEditWorkflow:
         llm: ILLMManager | None = None,
         patch_engine: IPatchEngine | None = None,
         context_builder: IContextBuilder | None = None,
+        memory_service: MemoryService | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.search = search
         self.llm = llm or LLMManager()
         self.patch_engine = patch_engine or PatchEngine(self.workspace_root)
         self.context_builder = context_builder or ContextBuilder()
+        self.memory_service = memory_service or MemoryService(self.workspace_root)
 
     async def run(self, request: str) -> CodeEditResult:
         pack, target_paths, plan_text = await self._build_pack(request)
@@ -111,11 +114,13 @@ class CodeEditWorkflow:
         results = self.search.search(request, top_k=8)
         target_paths = _target_paths(results)
         memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
+        graphiti_brief = self.memory_service.render_relevant(request)
         plan = await create_plan(self.llm, self.context_builder, results, goal=request, task_id="code-edit-plan")
         prompt_request = (
             f"{CODE_EDIT_INSTRUCTIONS}\n\n"
             f"{frontend_prompt_rules()}\n\n"
             + (f"{memory_brief}\n\n" if memory_brief else "")
+            + (f"{graphiti_brief}\n\n" if graphiti_brief else "")
             + f"Plan from planner model:\n{plan.text}\n\n"
             + f"User request: {request}"
         )
