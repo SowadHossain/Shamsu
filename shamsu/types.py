@@ -226,6 +226,61 @@ class RoutingDecision:
     confidence: float = 1.0
 
 
+@dataclass(frozen=True)
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    required: list[str] = field(default_factory=list)
+
+    def to_ollama_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": self.parameters,
+                    "required": self.required,
+                },
+            },
+        }
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    ok: bool
+    message: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        import json
+
+        return json.dumps(
+            {"ok": self.ok, "message": self.message, "data": self.data},
+            ensure_ascii=True,
+            default=str,
+        )
+
+
+class RunStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Safety
 # ─────────────────────────────────────────────────────────────────────────
