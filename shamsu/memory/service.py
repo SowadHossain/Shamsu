@@ -113,6 +113,20 @@ class MemoryService:
         self.status()
         return result
 
+    def ensure_backend_started(self) -> dict[str, Any] | None:
+        """Start this session's local FalkorDB container if memory is already
+        configured but the backend isn't running yet. Returns None (no-op) when
+        memory has not been set up, so we never auto-provision for users who
+        haven't run `/memory setup`. Best-effort and idempotent — safe to call
+        on every session start; the last session to exit stops the container via
+        `stop_local_falkordb` in the shutdown path."""
+        if not self.adapter.config_path(self.workspace).exists():
+            return None
+        result = self.adapter.ensure_backend_running(self.workspace)
+        if result is not None:
+            self._log_event("backend_start", {"ok": bool(result.get("ok")), "error": result.get("error", "")})
+        return result
+
     def add_episode(self, text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         result = self.adapter.add_episode(self.workspace, text, metadata)
         self._log_event("add_episode", {"ok": bool(result.get("ok")), "error": result.get("error", "")})

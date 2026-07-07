@@ -206,26 +206,44 @@ def stop_server(serve_pid: int) -> bool:
             return False
 
 
+def _default_graphiti_stopper() -> bool:
+    """Lazy import keeps this module dependency-light (see module docstring in
+    session_registry); the memory package is only touched on the last exit."""
+    try:
+        from shamsu.memory.graphiti_adapter import stop_local_falkordb
+
+        return stop_local_falkordb()
+    except Exception:
+        return False
+
+
 def shutdown_if_last_session(
     self_pid: int | None = None,
     *,
     base_url: str = OLLAMA_BASE_URL,
     server_stopper: Callable[[int], bool] | None = None,
     model_unloader: Callable[[str], list[str]] | None = None,
+    graphiti_stopper: Callable[[], bool] | None = None,
 ) -> str:
     """Free SHAMSU's Ollama footprint when the *last* session exits.
 
     Deregisters this session, then — only if no other live SHAMSU session
-    remains — stops the server when SHAMSU started it, otherwise unloads
-    SHAMSU's own models so the ``keep_alive=-1`` router does not stay pinned in
-    RAM. Returns a short tag for logging/tests: ``not-last``, ``stopped-server``,
-    ``unloaded`` or ``noop``. Best-effort: never raises.
+    remains — stops SHAMSU's local FalkorDB memory container (best-effort;
+    ``docker stop``, data preserved), then stops the Ollama server when SHAMSU
+    started it, otherwise unloads SHAMSU's own models so the ``keep_alive=-1``
+    router does not stay pinned in RAM. Returns a short tag for logging/tests:
+    ``not-last``, ``stopped-server``, ``unloaded`` or ``noop`` (the tag reflects
+    the Ollama action; the FalkorDB stop is a side-effect). Best-effort: never
+    raises.
     """
     self_pid = self_pid or os.getpid()
     try:
         unregister_session(self_pid)
         if live_session_pids(exclude=self_pid):
             return "not-last"
+        # Last session: stop SHAMSU's local FalkorDB memory container. Uses
+        # `docker stop` (not `rm`), so the graph data survives to the next start.
+        (graphiti_stopper or _default_graphiti_stopper)()
         owner = read_ollama_owner()
         serve_pid = int(owner.get("serve_pid", 0)) if owner else 0
         if serve_pid and pid_alive(serve_pid):

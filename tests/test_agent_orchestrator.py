@@ -26,6 +26,17 @@ def test_orchestrator_reports_workspace_location_before_model(tmp_path):
     assert str(tmp_path) in result.message
 
 
+def test_capabilities_question_answered_from_real_registry(tmp_path):
+    # "what tools can you use?" must be handled deterministically (not routed to
+    # the tool-less QA brain) and list the tools SHAMSU can actually call.
+    result = AgentOrchestrator(tmp_path).run("what tools can you use?")
+
+    assert result.handled
+    assert result.action == "capabilities"
+    for tool_name in ("read_file", "write_file", "run_command", "find_file", "ask_user"):
+        assert tool_name in result.message
+
+
 def test_conversation_memory_resolves_web_followup_from_prior_turn(tmp_path):
     logger = SessionManager(tmp_path).create_session("Memory")
     logger.log("user.prompt", {"prompt": "what is the weather in Dhaka today?"}, "User")

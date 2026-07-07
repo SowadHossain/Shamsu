@@ -476,6 +476,54 @@ class AgentToolRegistry:
                         "default": "false",
                     },
                 },
+            _tool_schema(
+                "find_file",
+                "Find files whose path or name matches a query, to resolve a wrong or "
+                "ambiguous path before reading. Returns matching relative paths.",
+                {"query": {"type": "string", "description": "File name or path fragment to look for."}},
+                required=["query"],
+            ),
+            _tool_schema(
+                "grep_files",
+                "Search file contents inside the workspace for a literal string and return "
+                "matching file:line locations. Use this to locate code before editing.",
+                {
+                    "query": {"type": "string", "description": "Literal text to search for."},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative folder to search inside.",
+                        "default": ".",
+                    },
+                },
+                required=["query"],
+            ),
+            _tool_schema(
+                "ask_user",
+                "Ask the user a clarifying question when required input is missing and you "
+                "cannot safely infer it with read-only tools. Calling this ends your turn "
+                "and waits for the user's answer. Prefer find_file/grep_files/list_files "
+                "first; only ask when genuinely blocked or when choosing between "
+                "ambiguous/destructive options.",
+                {
+                    "question": {"type": "string", "description": "The question to ask the user."},
+                    "options": {
+                        "type": "array",
+                        "description": "Optional list of choices, each {label, description}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                        },
+                    },
+                    "allow_free_text": {
+                        "type": "boolean",
+                        "description": "Whether the user may answer in free text instead of a listed option.",
+                        "default": True,
+                    },
+                },
+                required=["question"],
             ),
         ]
 
@@ -662,6 +710,19 @@ class AgentToolRegistry:
                     )
                 )
 
+            if name == "find_file":
+                return self.find_file(str(arguments.get("query") or ""))
+            if name == "grep_files":
+                return self.grep_files(
+                    str(arguments.get("query") or ""),
+                    str(arguments.get("path") or "."),
+                )
+            if name == "ask_user":
+                return self.ask_user(
+                    str(arguments.get("question") or ""),
+                    arguments.get("options"),
+                    bool(arguments.get("allow_free_text", True)),
+                )
             return ToolResult(False, f"Unknown tool: {name}", {"tool": name})
         except Exception as exc:
             return ToolResult(False, str(exc), {"tool": name})
@@ -1196,6 +1257,86 @@ def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except ValueError:
         number = default
     return max(minimum, min(number, maximum))
+    def find_file(self, query: str) -> ToolResult:
+        if not query.strip():
+            return ToolResult(False, "Missing query.", {})
+        matches = self.workspace_tool.find_files(query, limit=20)
+        candidates = [path.relative_to(self.workspace_root).as_posix() for path in matches]
+        return ToolResult(
+            True,
+            f"Found {len(candidates)} matching path(s) for {query!r}.",
+            {"query": query, "candidates": candidates},
+        )
+
+    def grep_files(self, query: str, path: str = ".") -> ToolResult:
+        if not query.strip():
+            return ToolResult(False, "Missing query.", {})
+        try:
+            root = self.sandbox.validate(path)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"query": query, "path": path})
+        if not root.exists():
+            return ToolResult(False, f"Not found: {path}", {"query": query, "path": path})
+        base = root if root.is_dir() else root.parent
+        matches: list[dict[str, Any]] = []
+        needle = query
+        for candidate in sorted(base.rglob("*")):
+            if len(matches) >= 50:
+                break
+            if not candidate.is_file():
+                continue
+            rel = candidate.relative_to(self.workspace_root).as_posix()
+            if any(part in _GREP_IGNORED for part in candidate.relative_to(self.workspace_root).parts):
+                continue
+            try:
+                if candidate.stat().st_size > 1_000_000:
+                    continue
+                text = candidate.read_text(encoding="utf-8", errors="ignore")
+            except (OSError, ValueError):
+                continue
+            for line_number, line in enumerate(text.splitlines(), start=1):
+                if needle in line:
+                    matches.append({"file": rel, "line": line_number, "text": line.strip()[:200]})
+                    if len(matches) >= 50:
+                        break
+        return ToolResult(
+            True,
+            f"Found {len(matches)} match(es) for {query!r}.",
+            {"query": query, "path": path, "matches": matches},
+        )
+
+    def ask_user(
+        self,
+        question: str,
+        options: Any = None,
+        allow_free_text: bool = True,
+    ) -> ToolResult:
+        """Signal that the agent needs input. This does not block: it returns a
+        structured pending question the chat loop stores in session state and
+        surfaces to the user, ending the turn."""
+        if not question.strip():
+            return ToolResult(False, "ask_user needs a non-empty question.", {})
+        from shamsu.agents.clarification import build_pending_question
+
+        normalized_options: list[dict[str, str]] = []
+        if isinstance(options, list):
+            normalized_options = [
+                item if isinstance(item, dict) else {"label": str(item), "description": ""}
+                for item in options
+            ]
+        pending = build_pending_question(
+            question,
+            normalized_options,
+            allow_free_text=allow_free_text,
+        )
+        return ToolResult(
+            True,
+            question.strip(),
+            {"ask_user": True, "pending_question": pending},
+        )
+
+
+_GREP_IGNORED = {".git", ".shamsu", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}
 
 
 def _mark_code_memory_stale(workspace_root: Path) -> None:
