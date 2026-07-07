@@ -26,6 +26,7 @@ CATEGORY_PRIORITY = {
     "import_export_mismatch": 0,
     "runtime_missing_export": 0,
     "module_not_found": 0,
+    "import_error": 0,
     "syntax_error": 1,
     "type_error": 2,
     "compiler_error": 2,
@@ -39,7 +40,13 @@ CATEGORY_PRIORITY = {
 # Categories that, when present, are the root cause of everything else -
 # an import/export mismatch typically cascades into many downstream
 # type/symbol errors that are just noise once the real cause is known.
-ROOT_CAUSE_CATEGORIES = {"missing_export", "import_export_mismatch", "runtime_missing_export", "module_not_found"}
+ROOT_CAUSE_CATEGORIES = {
+    "missing_export",
+    "import_export_mismatch",
+    "runtime_missing_export",
+    "module_not_found",
+    "import_error",
+}
 
 
 def is_vendor_path(path: str) -> bool:
