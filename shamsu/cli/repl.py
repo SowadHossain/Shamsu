@@ -992,6 +992,10 @@ def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
 def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None:
     try:
         service = MemoryService(workspace)
+        # Bind the FalkorDB container to session lifetime: start it for this
+        # session (no-op if memory isn't set up yet or it's already running);
+        # the last session to exit stops it via shutdown_if_last_session.
+        service.ensure_backend_started()
         gate = service.ensure_ready()
         if gate.allowed:
             console.print("[dim]Graphiti memory: ready[/dim]")

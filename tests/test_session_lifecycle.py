@@ -122,3 +122,39 @@ def test_unload_shamsu_models_only_touches_known_models(monkeypatch):
 
     assert result == ["qwen3:8b"]
     assert unloaded == ["qwen3:8b"]  # the unrelated model was left alone
+
+
+def test_shutdown_stops_falkordb_on_last_exit(monkeypatch, tmp_path):
+    _use_tmp(monkeypatch, tmp_path)
+    registry.register_session(111)
+    _fake_alive(monkeypatch, {111})  # last session standing
+    stopped = {"falkordb": 0}
+
+    result = ollama.shutdown_if_last_session(
+        111,
+        server_stopper=lambda pid: True,
+        model_unloader=lambda url: ["qwen3:8b"],
+        graphiti_stopper=lambda: stopped.__setitem__("falkordb", stopped["falkordb"] + 1) or True,
+    )
+
+    # Ollama tag unchanged; FalkorDB stop is a side-effect that still fired.
+    assert result == "unloaded"
+    assert stopped["falkordb"] == 1
+
+
+def test_shutdown_leaves_falkordb_running_when_another_session_live(monkeypatch, tmp_path):
+    _use_tmp(monkeypatch, tmp_path)
+    registry.register_session(111)
+    registry.register_session(222)
+    _fake_alive(monkeypatch, {111, 222})
+    stopped = {"falkordb": 0}
+
+    result = ollama.shutdown_if_last_session(
+        111,
+        server_stopper=lambda pid: True,
+        model_unloader=lambda url: ["x"],
+        graphiti_stopper=lambda: stopped.__setitem__("falkordb", stopped["falkordb"] + 1) or True,
+    )
+
+    assert result == "not-last"
+    assert stopped["falkordb"] == 0  # shared container stays up for session 222

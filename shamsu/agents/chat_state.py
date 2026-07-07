@@ -1,6 +1,7 @@
 """Stateful chat message history for SHAMSU's ReAct loop."""
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,6 +38,11 @@ class ChatState:
         self.system_prompt = system_prompt
         self.session_logger = session_logger
         self._messages: list[ChatMessage] = [ChatMessage("system", system_prompt)]
+        # Rolling summary of turns evicted by budget-aware trimming, and the
+        # absolute index in _messages up to which history has been folded in
+        # (1 == nothing summarized yet; index 0 is the system prompt).
+        self._rolling_summary: str = ""
+        self._summarized_upto: int = 1
         if hydrate:
             self._hydrate_from_session()
 
@@ -53,6 +59,65 @@ class ChatState:
         system = self._messages[0]
         tail = self._messages[1:][-max(max_messages - 1, 1):]
         return [system.to_ollama(), *[message.to_ollama() for message in tail]]
+
+    def select_for_budget(
+        self, max_tokens: int, token_counter: Callable[[str], int]
+    ) -> tuple[list[ChatMessage], int]:
+        """Pick the largest recent suffix of history whose content fits in
+        *max_tokens*, always keeping at least the most recent message. Returns
+        ``(tail, start_abs)`` where ``start_abs`` is the absolute index in
+        ``_messages`` at which the kept suffix begins (1 == nothing evicted).
+        The start is snapped forward to a user-message boundary when that still
+        leaves a non-empty tail, so assistant/tool-call sequences stay intact.
+        This is the token-aware replacement for the flat ``messages(30)`` cap."""
+        history = self._messages[1:]
+        if not history:
+            return [], 1
+        used = 0
+        start_rel = len(history)
+        for i in range(len(history) - 1, -1, -1):
+            cost = token_counter(history[i].content)
+            if start_rel != len(history) and used + cost > max_tokens:
+                break
+            used += cost
+            start_rel = i
+        snapped = start_rel
+        while snapped < len(history) and history[snapped].role != "user":
+            snapped += 1
+        if snapped < len(history):
+            start_rel = snapped
+        start_abs = start_rel + 1
+        return self._messages[start_abs:], start_abs
+
+    def newly_evicted(self, start_abs: int) -> list[ChatMessage]:
+        """History messages being dropped this round that haven't yet been
+        folded into the rolling summary: ``_messages[_summarized_upto:start_abs]``."""
+        lower = max(1, self._summarized_upto)
+        return self._messages[lower:start_abs]
+
+    def update_rolling_summary(self, summary: str, start_abs: int) -> None:
+        self._rolling_summary = summary
+        self._summarized_upto = max(self._summarized_upto, start_abs)
+
+    @property
+    def rolling_summary(self) -> str:
+        return self._rolling_summary
+
+    def build_ollama_messages(
+        self, tail: list[ChatMessage], include_summary: bool
+    ) -> list[dict[str, Any]]:
+        """Assemble the final message list: system prompt, an optional rolling
+        summary of older turns, then the recent tail."""
+        messages = [self._messages[0].to_ollama()]
+        if include_summary and self._rolling_summary.strip():
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"Summary of earlier conversation:\n{self._rolling_summary}",
+                }
+            )
+        messages.extend(message.to_ollama() for message in tail)
+        return messages
 
     @property
     def all_messages(self) -> list[ChatMessage]:

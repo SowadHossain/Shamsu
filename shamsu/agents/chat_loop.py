@@ -18,6 +18,12 @@ from shamsu.agents.chat_state import ChatState
 from shamsu.agents.clarification import format_question
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.agents.planner import create_plan
+from shamsu.context.budget import (
+    RESERVE_OUTPUT_TOKENS,
+    SAFETY_MARGIN_TOKENS,
+    count_tokens,
+    ctx_window_for_model,
+)
 from shamsu.context.builder import ContextBuilder
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import IContextBuilder, ILLMManager
@@ -40,6 +46,14 @@ LONG_RUNNING_MAX_TOOL_ROUNDS = 50
 # bound the worst-case wall-clock cost on a developer machine.
 # Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
 _MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
+
+# Interactive-chat context window. The budget module targets 8GB machines, so we
+# don't hand a 131k-window model (e.g. mistral-nemo) its full context by default;
+# a 32k cap already gives ~4x the previous hard-coded 8192. Override with
+# SHAMSU_CHAT_MAX_CTX. The rolling-summary budget is carved out of the usable
+# window to carry a compressed synopsis of turns evicted by budget-aware trimming.
+_CHAT_MAX_CTX: int = int(_os.environ.get("SHAMSU_CHAT_MAX_CTX", "32768"))
+_CHAT_SUMMARY_BUDGET_TOKENS = 512
 
 AGENT_SYSTEM_PROMPT = """You are SHAMSU, a local-first coding agent running inside one workspace.
 
@@ -160,6 +174,66 @@ class AgentChatLoop:
         self.clarify_prompt = clarify_prompt if long_running else None
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
+    async def _messages_within_budget(self, num_ctx: int) -> list[dict[str, Any]]:
+        """Budget-aware replacement for the flat 30-message cap: keep the system
+        prompt plus the largest recent suffix of the conversation that fits the
+        model's window, folding older evicted turns into a compact rolling
+        summary instead of silently dropping them."""
+        reserve = RESERVE_OUTPUT_TOKENS + SAFETY_MARGIN_TOKENS
+        usable = max(1, num_ctx - reserve)
+        history_budget = max(1, usable - _CHAT_SUMMARY_BUDGET_TOKENS)
+        tail, start_abs = self.state.select_for_budget(history_budget, count_tokens)
+        if start_abs > 1:
+            pending = self.state.newly_evicted(start_abs)
+            if pending:
+                summary = await self._summarize_evicted(
+                    self.state.rolling_summary, pending, _CHAT_SUMMARY_BUDGET_TOKENS
+                )
+                self.state.update_rolling_summary(summary, start_abs)
+        return self.state.build_ollama_messages(tail, include_summary=start_abs > 1)
+
+    async def _summarize_evicted(
+        self, prior_summary: str, evicted: list[Any], budget_tokens: int
+    ) -> str:
+        """Fold newly-dropped turns into a compact rolling summary so long chats
+        compress instead of forgetting. Best-effort: returns *prior_summary* on
+        any failure so the loop never breaks."""
+        transcript = "\n".join(
+            f"{message.role}: {message.content}" for message in evicted if str(message.content).strip()
+        )
+        if not transcript.strip():
+            return prior_summary
+        approx_words = max(40, budget_tokens // 2)
+        system = (
+            "You maintain a running summary of a coding-assistant conversation. "
+            f"Rewrite it in under ~{approx_words} words, preserving decisions, file "
+            "paths, unresolved tasks, and key facts; drop small talk. Output only the summary."
+        )
+        user = ""
+        if prior_summary.strip():
+            user += f"Summary so far:\n{prior_summary}\n\n"
+        user += f"New conversation to fold in:\n{transcript}"
+        try:
+            response = await asyncio.wait_for(
+                self.client.chat(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    stream=False,
+                    options={
+                        "temperature": 0.1,
+                        "num_ctx": min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX),
+                    },
+                ),
+                timeout=_MODEL_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            return prior_summary
+        message = _message_from_response(response)
+        return str(_get(message, "content", "") or "").strip() or prior_summary
+
     async def run(self, user_input: str) -> AgentLoopResult:
         original_input = user_input
         user_input = self._append_long_term_memory(user_input)
@@ -169,20 +243,21 @@ class AgentChatLoop:
         unconfirmed_failed_writes: dict[str, str] = {}
         prose_corrections = 0
         for round_index in range(self.max_tool_rounds):
+            num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
+            messages = await self._messages_within_budget(num_ctx)
             # Show context-window usage before each model call.
             if self.budget_manager:
-                _messages = self.state.messages()
-                _msg_text = "\n".join(str(m.get("content", "")) for m in _messages)
+                _msg_text = "\n".join(str(m.get("content", "")) for m in messages)
                 _budget = self.budget_manager.compute(self.model_name, "chat", _msg_text)
                 self.budget_manager.show_indicator(_budget)
             try:
                 response = await asyncio.wait_for(
                     self.client.chat(
                         model=self.model_name,
-                        messages=self.state.messages(),
+                        messages=messages,
                         tools=self.tools.tool_schemas(),
                         stream=False,
-                        options={"temperature": 0.1, "num_ctx": 8192},
+                        options={"temperature": 0.1, "num_ctx": num_ctx},
                     ),
                     timeout=_MODEL_CALL_TIMEOUT_SECONDS,
                 )

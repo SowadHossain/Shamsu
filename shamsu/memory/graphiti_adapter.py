@@ -111,6 +111,27 @@ def _find_docker_executable() -> str | None:
     return None
 
 
+def stop_local_falkordb() -> bool:
+    """Best-effort ``docker stop`` of SHAMSU's FalkorDB container on the last
+    session exit. Uses ``stop`` (never ``rm``) so the graph data survives into
+    the next session, which restarts it via ``docker start`` in
+    :meth:`GraphitiAdapter._start_local_falkordb`. Never raises: a missing
+    Docker CLI, a stopped/absent container, or any failure returns ``False``.
+    Returns ``True`` only when the container was actually stopped."""
+    docker = _find_docker_executable()
+    if not docker:
+        return False
+    try:
+        result = subprocess.run(
+            [docker, "stop", FALKORDB_CONTAINER_NAME],
+            capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS,
+            creationflags=_no_window_flags(),
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 class GraphitiAdapter:
     def __init__(self, tool_dir: Path | None = None) -> None:
         self.tool_dir = (tool_dir or default_tool_dir()).resolve()
@@ -285,6 +306,17 @@ class GraphitiAdapter:
         if backend_result is not None and not backend_result.get("ok"):
             manual_steps = backend_result.get("error", manual_steps)
         return {"ok": False, "message": health.message, "manual_steps": manual_steps}
+
+    def ensure_backend_running(self, workspace: Path) -> dict[str, Any] | None:
+        """Start the local FalkorDB container for this session if it isn't
+        already running. Idempotent and best-effort: delegates to
+        :meth:`_ensure_local_backend`, which reuses a running container,
+        ``docker start``s a stopped one, or ``docker run``s a new one. Returns
+        None when there's nothing to manage (non-default/remote backend)."""
+        try:
+            return self._ensure_local_backend(workspace)
+        except Exception as exc:  # never let backend management break startup
+            return {"ok": False, "error": str(exc)}
 
     def _ensure_local_backend(self, workspace: Path) -> dict[str, Any] | None:
         """Best-effort local FalkorDB start via the documented upstream Docker
