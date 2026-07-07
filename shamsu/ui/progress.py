@@ -122,6 +122,12 @@ def summarize_tool_args(tool_name: str, arguments: dict[str, Any]) -> str:
         return f"query={arguments.get('query', '?')}"
     if tool_name == "list_files":
         return f"path={arguments.get('path', '.')}"
+    if tool_name == "find_file":
+        return f"query={arguments.get('query', '?')}"
+    if tool_name == "grep_files":
+        return f"query={arguments.get('query', '?')}, path={arguments.get('path', '.')}"
+    if tool_name == "ask_user":
+        return f"question={_truncate(str(arguments.get('question', '?')), 80)}"
     return ", ".join(f"{key}={_truncate(str(value), 80)}" for key, value in arguments.items())
 
 
@@ -137,6 +143,12 @@ def summarize_tool_result(result: Any) -> str:
             return f"{message} ({len(str(data.get('content', '')).splitlines())} lines)"
         if "results" in data:
             return f"{message} ({len(data.get('results') or [])} results)"
+        if "candidates" in data:
+            candidates = data.get("candidates") or []
+            preview = ", ".join(str(item) for item in candidates[:3])
+            return f"{message}{(' - ' + preview) if preview else ''}"
+        if "matches" in data:
+            return f"{message} ({len(data.get('matches') or [])} matches)"
         if "listing" in data:
             return f"{message}"
     return message or ("ok" if ok else "failed")

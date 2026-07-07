@@ -214,6 +214,40 @@ def test_session_paths_are_workspace_local(tmp_path: Path):
     assert logger.events_path.is_relative_to(tmp_path)
 
 
+def test_pending_question_set_get_answer_and_clear(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("Pending")
+    question = {
+        "question": "Which file should I read?",
+        "options": [{"label": "client/src/App.tsx", "description": "frontend"}],
+        "created_from_prompt": "read App.tsx",
+        "awaiting": "user_input",
+    }
+
+    logger.set_pending_question(question)
+    stored = logger.get_pending_question()
+
+    assert stored["question"] == "Which file should I read?"
+    assert stored["options"][0]["label"] == "client/src/App.tsx"
+    assert (tmp_path / ".shamsu" / "sessions" / logger.session_id / "pending.json").exists()
+
+    logger.clear_pending_question(answered=True, answer="client/src/App.tsx")
+
+    assert logger.get_pending_question() == {}
+    event_types = [event["event_type"] for event in logger.tail(10)]
+    assert "session.pending_question.set" in event_types
+    assert "session.pending_question.answered" in event_types
+
+
+def test_pending_question_cleared_event_when_not_answered(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("Pending")
+    logger.set_pending_question({"question": "Pick one"})
+
+    logger.clear_pending_question()
+
+    assert logger.get_pending_question() == {}
+    assert "session.pending_question.cleared" in [event["event_type"] for event in logger.tail(10)]
+
+
 def test_project_spec_helper_still_has_generation_order():
     spec = build_project_spec(
         parse_prd_text(

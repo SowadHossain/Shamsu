@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os as _os
+import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ import ollama
 
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
+from shamsu.agents.clarification import format_question
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.agents.planner import create_plan
 from shamsu.context.builder import ContextBuilder
@@ -67,10 +69,40 @@ Rules:
 - File writes and risky commands require approval.
 - Do not reveal private reasoning. Give brief explanations and action summaries only.
 - After tool results, summarize exactly what happened and what remains.
+
+## Clarification rules
+- Ask the user a clear question (call ask_user) when required input is missing and tools cannot safely infer it.
+- Do not guess between multiple destructive or ambiguous choices.
+- Use read-only tools (find_file, grep_files, list_files, read_file) to gather missing context before asking.
+- For multiple file candidates, call ask_user with the candidates as options so the user can choose.
+- Ask for a commit message, branch/remote, or a specific target when those are required and ambiguous.
+
+## Visible process rules
+- Do not expose hidden chain-of-thought.
+- Do show concise action summaries: what tool you used, its result, and what remains.
+- Never say "I will use/read/run..." without making the corresponding tool call in the same turn.
+- If blocked, say exactly what input is needed, or call ask_user.
 """
 
 # How many times the exact same tool call may repeat before we stop the loop.
 _MAX_REPEATED_CALLS = 3
+
+# How many times we correct a prose-only "I will read X next" reply that did not
+# actually call a tool, before giving up (a backstop against a chatty model).
+_MAX_PROSE_CORRECTIONS = 2
+
+# Phrases that signal the assistant *promised* a tool action but did not call
+# one. Used only when there are no tool calls in the reply.
+_DEFERRED_ACTION_PATTERNS = (
+    r"\bi('?ll| will| am going to| am gonna| shall)\b.*\b(read|open|write|edit|run|check|look|search|fix|create|update|inspect|try)\b",
+    r"\blet me\b.*\b(read|open|write|edit|run|check|look|search|fix|create|update|inspect|try)\b",
+    r"\bnext(,| i)\b.*\b(read|open|write|edit|run|check|look|search|fix|will)\b",
+    r"\bi('?ll| will)\b\s+(correct|retry|redo|do that|handle)\b",
+)
+
+# Callback used to surface structured trace events (route/plan/blockers/etc.)
+# to the REPL. None keeps the loop silent (tests, non-interactive callers).
+TraceCallback = Callable[[str, str, "dict[str, Any] | None", str], None]
 
 
 @dataclass(frozen=True)
@@ -78,6 +110,7 @@ class AgentLoopResult:
     final: str
     tool_rounds: int = 0
     stopped: bool = False
+    awaiting_user: bool = False
 
 
 class AgentChatLoop:
@@ -94,6 +127,7 @@ class AgentChatLoop:
         long_running: bool = False,
         clarify_prompt: Callable[[str], str] | None = ask_clarifying_question,
         on_activity: Callable[[str], None] | None = None,
+        on_trace: TraceCallback | None = None,
         progress: ProgressReporter | None = None,
         action_ledger: ActionLedger | None = None,
         llm: ILLMManager | None = None,
@@ -112,6 +146,7 @@ class AgentChatLoop:
         # Optional hook to surface live tool activity (e.g. "Writing game.js")
         # to the REPL while the loop runs. None keeps the loop silent (tests).
         self.on_activity = on_activity
+        self.on_trace = on_trace
         self.progress = progress
         self.budget_manager = budget_manager
         self.state = state or ChatState(
@@ -126,11 +161,13 @@ class AgentChatLoop:
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
     async def run(self, user_input: str) -> AgentLoopResult:
+        original_input = user_input
         user_input = self._append_long_term_memory(user_input)
         user_input = await self._append_plan(user_input)
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
+        prose_corrections = 0
         for round_index in range(self.max_tool_rounds):
             # Show context-window usage before each model call.
             if self.budget_manager:
@@ -187,6 +224,19 @@ class AgentChatLoop:
                             fallback.tool_result.to_json() if fallback.tool_result else fallback.summary,
                         )
                     continue
+                if _looks_like_deferred_action(content) and prose_corrections < _MAX_PROSE_CORRECTIONS:
+                    # The model said it would take a tool action ("I will read X
+                    # next") but did not call a tool. Do not end the turn on an
+                    # empty promise: demand a real tool call, an ask_user, or an
+                    # explicit "I am blocked" and give it one more round.
+                    prose_corrections += 1
+                    self.state.append_user(_PROSE_ONLY_CORRECTION)
+                    self._emit_trace(
+                        "workflow.blocked",
+                        "Assistant promised a tool action without calling one; asking it to act or ask.",
+                        {"attempt": prose_corrections},
+                    )
+                    continue
                 if unconfirmed_failed_writes:
                     final = _failed_write_final(unconfirmed_failed_writes)
                     self.state.append_assistant(final)
@@ -216,6 +266,26 @@ class AgentChatLoop:
                 if self.on_activity and not result.ok:
                     self.on_activity(f"failed: {result.message}")
                 self.state.append_tool(_tool_call_id(call, name), name, result.to_json())
+                if name == "ask_user" and result.ok and isinstance(result.data, dict) and result.data.get("ask_user"):
+                    # ask_user ends the turn: store the pending question and hand
+                    # control back to the user (resolved on their next reply).
+                    return self._handle_ask_user(
+                        result.data.get("pending_question", {}), original_input, round_index
+                    )
+                if name == "read_file" and not result.ok:
+                    # A wrong/ambiguous path is the #1 reason SHAMSU used to say
+                    # "I'll read X next" and then stall. Turn the failure into a
+                    # concrete next step: read the one strong candidate, ask the
+                    # user to choose between several, or discover the path.
+                    correction = self._read_failure_correction(
+                        str(arguments.get("filepath", "")), result.message
+                    )
+                    self.state.append_user(correction)
+                    self._emit_trace(
+                        "tool.failed",
+                        f"read_file {arguments.get('filepath', '')} failed: {result.message}",
+                        {"filepath": str(arguments.get("filepath", ""))},
+                    )
                 if name == "write_file":
                     filepath = str(arguments.get("filepath", "the file"))
                     if result.ok:
@@ -287,7 +357,71 @@ class AgentChatLoop:
                 "Planner produced a plan for this request",
                 workflow_id="agent-chat",
             )
+        # Surface the plan as a visible trace event (never the hidden reasoning
+        # behind it - just the short, action-focused plan text).
+        self._emit_trace("plan.created", plan.text)
         return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
+
+    def _emit_trace(
+        self,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+        level: str = "normal",
+    ) -> None:
+        if self.on_trace is None:
+            return
+        try:
+            self.on_trace(event_type, message, payload, level)
+        except Exception:
+            # Trace output is cosmetic; never let it break the agent loop.
+            pass
+
+    def _handle_ask_user(
+        self, pending: dict[str, Any], original_input: str, round_index: int
+    ) -> AgentLoopResult:
+        pending = dict(pending or {})
+        pending.setdefault("awaiting", "user_input")
+        pending["created_from_prompt"] = original_input
+        if self.session_logger:
+            self.session_logger.set_pending_question(pending)
+        final = format_question(pending)
+        self.state.append_assistant(final)
+        self._emit_trace(
+            "clarification.needed",
+            str(pending.get("question", "")),
+            {"options": [str(option.get("label", "")) for option in pending.get("options", [])]},
+        )
+        return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True, awaiting_user=True)
+
+    def _read_failure_correction(self, filepath: str, message: str) -> str:
+        candidates: list[str] = []
+        query = Path(filepath).name or filepath
+        if query.strip():
+            try:
+                find_result = self.tools.find_file(query)
+                if find_result.ok:
+                    candidates = list(find_result.data.get("candidates", []))
+            except Exception:
+                candidates = []
+        # Drop an exact self-match so we don't suggest the very path that failed.
+        candidates = [candidate for candidate in candidates if candidate != filepath]
+        if len(candidates) == 1:
+            return (
+                f"read_file {filepath} failed ({message}). The closest matching file is "
+                f"{candidates[0]}. Call read_file with that exact path now - do not claim you read it yet."
+            )
+        if len(candidates) > 1:
+            listed = "; ".join(candidates[:8])
+            return (
+                f"read_file {filepath} failed ({message}) and several files match: {listed}. "
+                "Call ask_user with these as options so the user can choose, or read_file the correct "
+                "one. Do NOT guess between them."
+            )
+        return (
+            f"read_file {filepath} failed ({message}) and no candidate path matched. Use find_file or "
+            "grep_files to locate the right file, or call ask_user for the correct path. Do not claim you read it."
+        )
 
     def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
         """The same tool call repeated past the limit despite corrections â€" stop
@@ -331,6 +465,22 @@ class AgentChatLoop:
             f"Agent tool result: {name}",
             workflow_id="agent-chat",
         )
+
+
+_PROSE_ONLY_CORRECTION = (
+    "You just said you will take another tool action, but you did not call a tool. "
+    "Either call the tool now, ask the user a clear question with ask_user, or state "
+    "plainly that you are blocked and what input you need. Do not reply with an "
+    "intention alone."
+)
+
+
+def _looks_like_deferred_action(content: str) -> bool:
+    """True when a tool-less reply merely *promises* a tool action."""
+    text = " ".join(content.strip().lower().split())
+    if not text:
+        return False
+    return any(re.search(pattern, text) for pattern in _DEFERRED_ACTION_PATTERNS)
 
 
 def _repetition_correction(tool_name: str) -> str:
@@ -380,6 +530,12 @@ def _describe_tool_call(name: str, arguments: dict[str, Any]) -> str:
         return f"Listing {arguments.get('path', '.')}"
     if name == "search_index":
         return f"Searching: {arguments.get('query', '?')}"
+    if name == "find_file":
+        return f"Finding file: {arguments.get('query', '?')}"
+    if name == "grep_files":
+        return f"Searching files for: {arguments.get('query', '?')}"
+    if name == "ask_user":
+        return "Asking you a question"
     return f"Tool: {name}"
 
 

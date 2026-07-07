@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -124,6 +125,8 @@ from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
 from shamsu.tools.workspace import MentionResolver, WorkspaceTool
 from shamsu.ui.progress import ProgressReporter
+from shamsu.ui.trace import emit_trace, read_trace_mode, write_trace_mode
+from shamsu.agents.clarification import classify_reply, resolve_answer
 from shamsu.types import (
     ApprovalRequest,
     ContextPack,
@@ -1090,18 +1093,30 @@ def _record_task_memory(
     session_logger: SessionLogger | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    try:
-        result = MemoryService(workspace).remember(text, kind, metadata)
-    except Exception as exc:
-        _log_event(session_logger, "memory.write_failed", {"error": str(exc)}, "Graphiti memory write failed", workflow_id="memory")
-        return
-    _log_event(
-        session_logger,
-        "memory.write",
-        {"ok": bool(result.get("ok")), "kind": kind, "skipped": bool(result.get("skipped")), "deduped": bool(result.get("deduped"))},
-        "Graphiti memory write evaluated",
-        workflow_id="memory",
-    )
+    """Persist a durable task lesson without blocking the REPL.
+
+    `MemoryService.remember` can fire up to three Graphiti subprocesses
+    (healthcheck, dedup lookup, write) with timeouts measured in minutes. Doing
+    that inline is what made SHAMSU appear to hang at the prompt right after
+    printing an answer. The write is best-effort, so we hand it to a daemon
+    thread and return immediately; failures are logged, never surfaced.
+    """
+
+    def _write() -> None:
+        try:
+            result = MemoryService(workspace).remember(text, kind, metadata)
+        except Exception as exc:
+            _log_event(session_logger, "memory.write_failed", {"error": str(exc)}, "Graphiti memory write failed", workflow_id="memory")
+            return
+        _log_event(
+            session_logger,
+            "memory.write",
+            {"ok": bool(result.get("ok")), "kind": kind, "skipped": bool(result.get("skipped")), "deduped": bool(result.get("deduped"))},
+            "Graphiti memory write evaluated",
+            workflow_id="memory",
+        )
+
+    threading.Thread(target=_write, name="shamsu-memory-write", daemon=True).start()
 def _handle_permissions(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1170,26 +1185,81 @@ def _handle_autonomy(user_input: str, workspace: Path, console: Console) -> None
     console.print("[red]Usage: autonomy status|on|off[/red]")
 
 
-def _trace_config_path(workspace: Path) -> Path:
-    return Sandbox(workspace).validate(Path(".shamsu") / "trace.json")
-
-
+# Trace mode is owned by shamsu.ui.trace (single source of truth, shared with
+# the chat loop). These thin wrappers keep the existing REPL call sites stable.
 def _trace_mode(workspace: Path) -> str:
-    path = _trace_config_path(workspace)
-    if not path.exists():
-        return "normal"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return "normal"
-    mode = str(data.get("mode", "normal")).lower()
-    return mode if mode in {"quiet", "normal", "verbose"} else "normal"
+    return read_trace_mode(workspace)
 
 
 def _set_trace_mode(workspace: Path, mode: str) -> None:
-    path = _trace_config_path(workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"mode": mode}, indent=2), encoding="utf-8")
+    write_trace_mode(workspace, mode)
+
+
+def _make_trace_emitter(
+    console: Console,
+    workspace: Path,
+    session_logger: SessionLogger | None,
+) -> Callable[[str, str, dict | None, str], None]:
+    """Bind emit_trace to this workspace/console so the chat loop can surface
+    structured trace events (route/plan/blockers/clarification) without knowing
+    about the console or the persisted trace mode."""
+
+    def _emit(event_type: str, message: str, payload: dict | None = None, level: str = "normal") -> None:
+        emit_trace(console, session_logger, workspace, event_type, message, payload, level)
+
+    return _emit
+
+
+def _resolve_pending_question(
+    pending: dict[str, Any],
+    reply: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger,
+) -> str | None:
+    """Interpret `reply` as the answer to a stored pending question.
+
+    Returns a rewritten prompt to dispatch (original request + resolved answer),
+    or None when nothing further should run (cancel / decline). The pending
+    question is always cleared here so a stale question never lingers.
+    """
+    answer = resolve_answer(pending, reply)
+    resolved_value = answer.value or reply
+    session_logger.clear_pending_question(answered=True, answer=resolved_value)
+    emit_trace(
+        console,
+        session_logger,
+        workspace,
+        "clarification.answered",
+        resolved_value,
+        {"kind": answer.kind},
+        level="normal",
+    )
+    if answer.kind == "cancel":
+        console.print("[yellow]Cancelled. What would you like to do next?[/yellow]")
+        return None
+    if answer.kind == "negative":
+        console.print("[yellow]Understood - I won't proceed with that. Tell me how you'd like to continue.[/yellow]")
+        return None
+    if not answer.resolved:
+        console.print("[yellow]I couldn't match that to the question. Let's continue normally.[/yellow]")
+        return None
+    created_from = str(pending.get("created_from_prompt", "")).strip()
+    question = str(pending.get("question", "")).strip()
+    if created_from:
+        return (
+            f"{created_from}\n\n(Answering the earlier question \"{question}\": {resolved_value})"
+        )
+    return resolved_value
+
+
+def _continuation_clarification(user_input: str, previous_prompt: str) -> str | None:
+    """A bare 'yes'/'continue' with no pending question and nothing prior to
+    continue should not invent a task - ask what to continue instead."""
+    kind = classify_reply(user_input)
+    if kind in {"affirmative", "continue"} and not previous_prompt.strip():
+        return "There's nothing pending to continue. What would you like me to do?"
+    return None
 
 
 def _handle_trace(user_input: str, workspace: Path, console: Console) -> None:
@@ -2950,7 +3020,16 @@ async def _handle_request(
             "[yellow]Codebase-Memory MCP is not ready. Run `/abstract setup` for project-specific QA.[/yellow]"
         )
     decision = await _route_prompt(effective_input, llm)
-    _print_decision(decision, console)
+    _print_decision(decision, console, verbose=_trace_mode(workspace) == "verbose")
+    emit_trace(
+        console,
+        session_logger,
+        workspace,
+        "route.detected",
+        decision.intent,
+        {"confidence": f"{decision.confidence:.2f}"},
+        level="normal",
+    )
     task_plan = build_task_plan(decision, effective_input)
     harness_input = append_task_handoff(effective_input, task_plan, agent_context)
 
@@ -3017,14 +3096,19 @@ async def _handle_request(
             f"Workflow finished: {decision.intent}",
             workflow_id=decision.intent,
         )
-        memory_kind = "bug_lesson" if decision.intent == "bug_fix" else "task_summary"
-        _record_task_memory(
-            workspace,
-            f"Task summary: {decision.intent} completed for request: {effective_input[:700]}",
-            memory_kind,
-            session_logger,
-            {"intent": decision.intent},
-        )
+        # Read-only Q&A produces no durable lesson worth persisting, so skip the
+        # long-term memory write for plain questions - it is pure post-answer
+        # overhead there. Workflows that actually change the project (edits, bug
+        # fixes, tests, docs) still record a summary, now off the hot path.
+        if decision.intent not in {"qa", "explain"}:
+            memory_kind = "bug_lesson" if decision.intent == "bug_fix" else "task_summary"
+            _record_task_memory(
+                workspace,
+                f"Task summary: {decision.intent} completed for request: {effective_input[:700]}",
+                memory_kind,
+                session_logger,
+                {"intent": decision.intent},
+            )
     except Exception as exc:
         message = str(exc)
         if _looks_like_runtime_error(message):
@@ -3180,6 +3264,43 @@ def _looks_like_workspace_files_prompt(user_input: str) -> bool:
     )
 
 
+# Questions about SHAMSU's own tools/capabilities. These must be answered
+# deterministically from the real tool registry - never routed to the tool-less
+# QA brain, which would guess from stale session context (old file names, prior
+# commits) and list tools that do not exist.
+_CAPABILITY_QUESTION_PHRASES = (
+    "what tools",
+    "which tools",
+    "what tool can you",
+    "tools can you use",
+    "tools do you use",
+    "tools do you have",
+    "tools are available",
+    "tools you have",
+    "your tools",
+    "list your tools",
+    "list the tools",
+    "available tools",
+    "what can you do",
+    "what are you able to do",
+    "what are you capable of",
+    "your capabilities",
+    "what are your capabilities",
+    "what commands can you",
+    "your abilities",
+    "what abilities",
+    "how can you help",
+)
+
+
+def _looks_like_capabilities_question(user_input: str) -> bool:
+    """Only used for the 'Checking which tools I actually have...' status line;
+    the real answer is produced deterministically by AgentOrchestrator (see
+    `_asks_capabilities` there), before the memory gate and model routing."""
+    text = user_input.lower()
+    return any(phrase in text for phrase in _CAPABILITY_QUESTION_PHRASES)
+
+
 def _looks_like_django_generation_request(user_input: str) -> bool:
     text = user_input.lower()
     return (
@@ -3320,10 +3441,30 @@ def _expand_followup_prompt(user_input: str, previous_user_prompt: str) -> str:
     return user_input
 
 
-def _print_decision(decision: RoutingDecision, console: Console) -> None:
-    console.print(
-        f"[dim]intent={decision.intent} confidence={decision.confidence:.2f}[/dim]"
-    )
+# What SHAMSU says it is about to do, keyed by routed intent. Stating the plan
+# in plain language reads far more naturally than the old `intent=qa
+# confidence=0.35` dump, which leaked internal routing jargon at the user.
+_INTENT_ACTIVITY = {
+    "qa": "Looking through the workspace to answer that.",
+    "explain": "Reading the relevant code to explain that.",
+    "code_edit": "Planning the change - I'll show a diff before applying anything.",
+    "bug_fix": "Tracing the error to find and fix the root cause.",
+    "test_gen": "Working out what to cover and writing the tests.",
+    "audit": "Auditing the project for issues.",
+    "doc_gen": "Updating the documentation.",
+    "generate": "Planning the project from the PRD before generating files.",
+}
+
+
+def _print_decision(decision: RoutingDecision, console: Console, verbose: bool = False) -> None:
+    activity = _INTENT_ACTIVITY.get(decision.intent, f"Working on this as a {decision.intent} task.")
+    console.print(f"[cyan]{activity}[/cyan]")
+    # Keep the raw routing signal available for debugging, but only when the
+    # user has explicitly opted into verbose trace output.
+    if verbose:
+        console.print(
+            f"[dim]intent={decision.intent} confidence={decision.confidence:.2f}[/dim]"
+        )
 
 
 def _print_workspace_location(workspace: Path, console: Console) -> str:
@@ -4714,10 +4855,21 @@ async def _run_agent_chat(
         "progress": progress,
         "action_ledger": action_ledger,
     }
+    # Guard optional kwargs so test doubles that patch AgentChatLoop with a
+    # narrower signature keep working (same pattern as budget_manager).
+    if _call_accepts_keyword(AgentChatLoop, "on_trace"):
+        chat_kwargs["on_trace"] = _make_trace_emitter(console, workspace, session_logger)
     if _call_accepts_keyword(AgentChatLoop, "budget_manager"):
         chat_kwargs["budget_manager"] = _get_budget_manager(workspace, console)
     result = await AgentChatLoop(workspace, **chat_kwargs).run(user_input)
     body = result.final.strip() or "No response returned."
+    if getattr(result, "awaiting_user", False):
+        # SHAMSU asked the user something and stored the pending question. Print
+        # it clearly and stop - the next reply is resolved against it. Do not
+        # record a "task completed" memory: nothing finished yet.
+        console.print(Panel(body, title="Need Input", border_style="cyan"))
+        _log_assistant_message(session_logger, body, workflow_id="clarification")
+        return
     if result.stopped:
         progress.warning("Agent stopped before completing all requested work")
     else:
@@ -5366,6 +5518,8 @@ def _normalize_command_input(user_input: str) -> str:
 
 def _thinking_status_for_input(user_input: str) -> str:
     normalized = _normalize_command_input(user_input).lower()
+    if _looks_like_capabilities_question(user_input):
+        return "[dim]Checking which tools I actually have...[/dim]"
     if normalized.startswith("parse-prd ") or "prd" in normalized:
         return "[dim]Checking workspace PRD files...[/dim]"
     if normalized.startswith("web ") or _looks_like_web_needed_prompt(user_input):
@@ -5553,6 +5707,7 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
         sys.exit(2)
+    console.print(f"[dim]Trace: {read_trace_mode(workspace)}[/dim]")
     console.print("[dim]Type a prompt, or `/help` for commands.[/dim]\n")
     web_tool = WebTool(
         workspace=workspace,
@@ -5591,6 +5746,27 @@ def main(argv: list[str] | None = None) -> None:
             "User submitted prompt",
             workflow_id="repl",
         )
+        # A pending clarification question takes priority: interpret this reply
+        # as its answer instead of routing it as a brand-new prompt. A slash
+        # command clearly changes topic, so we let it clear the question below.
+        if not user_input.startswith("/"):
+            pending_question = session_logger.get_pending_question()
+            if pending_question.get("question"):
+                rewritten = _resolve_pending_question(
+                    pending_question, user_input, workspace, console, session_logger
+                )
+                if rewritten is None:
+                    continue
+                user_input = rewritten
+            else:
+                continuation_message = _continuation_clarification(user_input, previous_user_prompt)
+                if continuation_message is not None:
+                    console.print(f"[yellow]{continuation_message}[/yellow]")
+                    _log_assistant_message(session_logger, continuation_message, workflow_id="clarification")
+                    continue
+        elif session_logger.get_pending_question().get("question"):
+            # Topic change via slash command: drop the stale pending question.
+            session_logger.clear_pending_question()
         if user_input.startswith("/"):
             route = command_router.route(user_input)
             if not route.valid:

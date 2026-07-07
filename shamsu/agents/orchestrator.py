@@ -62,6 +62,17 @@ class AgentOrchestrator:
                 effective_input=effective_input,
                 action="workspace.files",
             )
+        if _asks_capabilities(effective_input):
+            # Answer from the live tool registry, deterministically, before the
+            # memory gate and model routing. Otherwise this reaches the tool-less
+            # QA brain, which invents tools/files from stale session context.
+            return AgentResult(
+                handled=True,
+                title="SHAMSU Tools",
+                message=_render_capabilities(self.workspace_root),
+                effective_input=effective_input,
+                action="capabilities",
+            )
         if _asks_prd_files(effective_input):
             prds = self.workspace_tool.find_prds()
             if not prds:
@@ -208,6 +219,65 @@ def _asks_workspace_files(text: str) -> bool:
             "what files are in this workspace",
         )
     )
+
+
+_CAPABILITY_PHRASES = (
+    "what tools",
+    "which tools",
+    "what tool can you",
+    "tools can you use",
+    "tools do you use",
+    "tools do you have",
+    "tools are available",
+    "tools you have",
+    "your tools",
+    "list your tools",
+    "list the tools",
+    "available tools",
+    "what can you do",
+    "what are you able to do",
+    "what are you capable of",
+    "your capabilities",
+    "what are your capabilities",
+    "what commands can you",
+    "your abilities",
+    "what abilities",
+    "how can you help",
+)
+
+
+def _asks_capabilities(text: str) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in _CAPABILITY_PHRASES)
+
+
+def _render_capabilities(workspace_root: Path) -> str:
+    """Human-readable capability answer built from the real tool registry so the
+    list always matches what SHAMSU can actually call."""
+    from shamsu.tools.agent_tools import AgentToolRegistry
+
+    schemas = AgentToolRegistry(workspace_root).tool_schemas()
+    lines = ["Tools I can call directly:"]
+    for schema in schemas:
+        fn = schema.get("function", {})
+        name = str(fn.get("name", ""))
+        # First sentence only - some descriptions carry multi-sentence usage notes.
+        description = str(fn.get("description", "")).split(". ", 1)[0].strip().rstrip(".")
+        lines.append(f"- {name}: {description}")
+    lines.append("")
+    lines.append("Higher-level workflows:")
+    for item in (
+        "Answer questions about this workspace's indexed code",
+        "Edit code and apply reviewed diffs (with your approval)",
+        "Fix bugs from a traceback, failing command, or error message",
+        "Generate tests, write docs, and audit the project",
+        "Parse a PRD and generate a Django project",
+        "Search the web and inspect local apps in a browser (with approval)",
+    ):
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("Run /help for the full command list.")
+    return "\n".join(lines)
 
 
 def _asks_prd_files(text: str) -> bool:

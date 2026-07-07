@@ -176,6 +176,56 @@ class SessionLogger:
             Path(".shamsu") / "sessions" / self.session_id / "events.jsonl"
         )
 
+    @property
+    def pending_path(self) -> Path:
+        return self.manager.sandbox.validate(
+            Path(".shamsu") / "sessions" / self.session_id / "pending.json"
+        )
+
+    def set_pending_question(self, question: dict[str, Any]) -> None:
+        """Persist a clarification question SHAMSU is waiting on. The next user
+        reply is interpreted as its answer (see shamsu/agents/clarification.py)."""
+        payload = sanitize_payload(question or {})
+        self.pending_path.parent.mkdir(parents=True, exist_ok=True)
+        self.pending_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        self.log(
+            "session.pending_question.set",
+            {"question": str(payload.get("question", "")), "options": payload.get("options", [])},
+            "Pending clarification question set",
+            workflow_id="clarification",
+        )
+
+    def get_pending_question(self) -> dict[str, Any]:
+        if not self.pending_path.exists():
+            return {}
+        try:
+            data = json.loads(self.pending_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def clear_pending_question(self, answered: bool = False, answer: str = "") -> None:
+        existed = self.pending_path.exists()
+        if existed:
+            try:
+                self.pending_path.unlink()
+            except OSError:
+                pass
+        if answered:
+            self.log(
+                "session.pending_question.answered",
+                {"answer": answer},
+                "Pending clarification question answered",
+                workflow_id="clarification",
+            )
+        elif existed:
+            self.log(
+                "session.pending_question.cleared",
+                {},
+                "Pending clarification question cleared",
+                workflow_id="clarification",
+            )
+
     def log(
         self,
         event_type: str,
