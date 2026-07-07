@@ -1,9 +1,10 @@
 """Tool registry exposed to the local ReAct chat loop."""
 from __future__ import annotations
 
+import difflib
 import json
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
@@ -14,8 +15,56 @@ from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
-from shamsu.tools.workspace import WorkspaceTool
+from shamsu.tools.git import GitCommandResult, GitTool
+from shamsu.tools.path_resolve import (
+    _FRONTEND_ROOTS,
+    _HEAVY_DIRS,
+    _MAX_WORKSPACE_SCAN,
+    _find_files_by_query,
+    _find_path_candidates,
+    _format_path_candidates,
+    _normalize_workspace_path,
+    _path_exists_case_insensitive,
+    _strong_path_candidates,
+    _walk_workspace_files,
+)
+from shamsu.tools.workspace import TEXT_EXTENSIONS, WorkspaceTool
 from shamsu.types import ApprovalRequest
+
+# Extensions the read tools will return as text (a superset of WorkspaceTool's
+# TEXT_EXTENSIONS so common source files like .jsx/.vue/.go are readable).
+_READABLE_TEXT_EXTENSIONS = frozenset(
+    TEXT_EXTENSIONS
+    | {
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".vue",
+        ".svelte",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".rb",
+        ".c",
+        ".h",
+        ".cpp",
+        ".hpp",
+        ".cc",
+        ".cs",
+        ".php",
+        ".sql",
+        ".xml",
+        ".svg",
+        ".gradle",
+        ".graphql",
+        ".proto",
+    }
+)
+_READABLE_FILENAMES = frozenset({"Dockerfile", "Makefile", ".gitignore", ".env", ".dockerignore"})
+
+# Max characters returned for a whole-file read before truncation kicks in.
+MAX_READ_CHARS = 6000
 
 
 @dataclass(frozen=True)
@@ -56,6 +105,10 @@ class AgentToolRegistry:
         self.session_logger = session_logger
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
 
+        # Git commands run through the same CommandRunner so command safety,
+        # approval, logging, timeout handling, and diagnostics still apply.
+        self.git_tool = GitTool(self.workspace_root, command_runner=self.command_runner)
+
     def tool_schemas(self) -> list[dict[str, Any]]:
         return [
             _tool_schema(
@@ -71,15 +124,94 @@ class AgentToolRegistry:
             ),
             _tool_schema(
                 "read_file",
-                "Read a text file inside the workspace.",
+                "Read a text file inside the workspace. If the path is wrong it returns "
+                "'candidates' (close matches) instead of failing blindly; when exactly one "
+                "candidate matches it reads that file and reports resolved_filepath. Pass "
+                "start_line/end_line to read only part of a large file.",
+                {
+                    "filepath": {"type": "string", "description": "Relative file path."},
+                    "start_line": {
+                        "type": "string",
+                        "description": "Optional 1-based first line to read.",
+                        "default": "",
+                    },
+                    "end_line": {
+                        "type": "string",
+                        "description": "Optional 1-based last line to read.",
+                        "default": "",
+                    },
+                },
+                required=["filepath"],
+            ),
+            _tool_schema(
+                "file_info",
+                "Check whether a path is a file, directory, or missing before acting on it. "
+                "Returns kind, size, and candidates for a missing path. Use before editing an "
+                "uncertain path.",
                 {"filepath": {"type": "string", "description": "Relative file path."}},
                 required=["filepath"],
             ),
             _tool_schema(
+                "find_file",
+                "Find files by name or partial path when an expected path is missing. Use right "
+                "after read_file says 'Not a file'. Example: find_file query=App.tsx.",
+                {
+                    "query": {"type": "string", "description": "File name or partial path to search for."},
+                    "limit": {
+                        "type": "string",
+                        "description": "Max results. Default 20, max 100.",
+                        "default": "20",
+                    },
+                },
+                required=["query"],
+            ),
+            _tool_schema(
+                "grep_files",
+                "Search file contents for a symbol or text when you know what to look for but not "
+                "which file. Returns filepath, line number, and the matching line.",
+                {
+                    "query": {"type": "string", "description": "Exact text/symbol to search for."},
+                    "path": {
+                        "type": "string",
+                        "description": "Relative folder to search under. Default '.'.",
+                        "default": ".",
+                    },
+                    "extensions": {
+                        "type": "string",
+                        "description": "Optional comma-separated extension filter, e.g. '.ts,.tsx,.js'.",
+                        "default": "",
+                    },
+                    "limit": {
+                        "type": "string",
+                        "description": "Max matches. Default 50, max 200.",
+                        "default": "50",
+                    },
+                },
+                required=["query"],
+            ),
+            _tool_schema(
+                "edit_file",
+                "Safely replace exact text in an EXISTING file (with approval + rollback backup). "
+                "Prefer this for small, targeted changes. old_string must match exactly once "
+                "unless replace_all=true. Use write_file only for new files or full rewrites.",
+                {
+                    "filepath": {"type": "string", "description": "Relative file path (must exist)."},
+                    "old_string": {"type": "string", "description": "Exact text to replace."},
+                    "new_string": {"type": "string", "description": "Replacement text."},
+                    "replace_all": {
+                        "type": "string",
+                        "description": "Use true to replace every occurrence. Default false.",
+                        "default": "false",
+                    },
+                },
+                required=["filepath", "old_string", "new_string"],
+            ),
+            _tool_schema(
                 "write_file",
-                "Create or update a file inside the workspace. If the file exists it is "
-                "overwritten with the content you provide, so always pass the COMPLETE new "
-                "file content. Use this for every file change.",
+                "Create a new file or fully rewrite an existing one. Always pass the COMPLETE new "
+                "file content (it overwrites). For a small change to an existing file, prefer "
+                "edit_file. If a matching file already exists at a different path this refuses and "
+                "returns candidates rather than creating a duplicate.",
                 {
                     "filepath": {"type": "string", "description": "Relative file path."},
                     "content": {"type": "string", "description": "Complete file content."},
@@ -105,6 +237,245 @@ class AgentToolRegistry:
                 {"query": {"type": "string", "description": "Search query."}},
                 required=["query"],
             ),
+
+            # -----------------------------------------------------------------
+            # Git read tools
+            # -----------------------------------------------------------------
+            _tool_schema(
+                "git_status",
+                "Show short git status for the workspace. Use before committing or pushing.",
+                {},
+            ),
+            _tool_schema(
+                "git_status_full",
+                "Show full git status for the workspace.",
+                {},
+            ),
+            _tool_schema(
+                "git_diff",
+                "Show unstaged git diff for the workspace.",
+                {},
+            ),
+            _tool_schema(
+                "git_diff_staged",
+                "Show staged git diff for the workspace.",
+                {},
+            ),
+            _tool_schema(
+                "git_diff_file",
+                "Show git diff for one file.",
+                {"filepath": {"type": "string", "description": "Relative file path."}},
+                required=["filepath"],
+            ),
+            _tool_schema(
+                "git_branch",
+                "Show the current git branch.",
+                {},
+            ),
+            _tool_schema(
+                "git_branches",
+                "List git branches.",
+                {
+                    "all_branches": {
+                        "type": "string",
+                        "description": "Use true to include remote branches.",
+                        "default": "false",
+                    }
+                },
+            ),
+            _tool_schema(
+                "git_remote",
+                "Show configured git remotes.",
+                {},
+            ),
+            _tool_schema(
+                "git_log",
+                "Show recent git commits.",
+                {
+                    "limit": {
+                        "type": "string",
+                        "description": "Number of commits to show. Default 10, max 100.",
+                        "default": "10",
+                    }
+                },
+            ),
+            _tool_schema(
+                "git_unpushed_commits",
+                "Show commits that exist locally but not on the remote branch. Use before pushing.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If omitted, current branch is used.",
+                        "default": "",
+                    },
+                    "limit": {
+                        "type": "string",
+                        "description": "Number of commits to show. Default 20, max 100.",
+                        "default": "20",
+                    },
+                },
+            ),
+
+            # -----------------------------------------------------------------
+            # Git mutation tools
+            # -----------------------------------------------------------------
+            _tool_schema(
+                "git_add",
+                "Stage specific files for commit. Always inspect git_status and git_diff first.",
+                {
+                    "paths": {
+                        "type": "string",
+                        "description": "Comma-separated relative file paths to stage.",
+                    }
+                },
+                required=["paths"],
+            ),
+            _tool_schema(
+                "git_add_all",
+                "Stage all workspace changes. Use only when the user clearly wants all changes staged.",
+                {},
+            ),
+            _tool_schema(
+                "git_commit",
+                "Create a git commit with a message. Always inspect git_status and git_diff or git_diff_staged first.",
+                {
+                    "message": {
+                        "type": "string",
+                        "description": "Commit message.",
+                    }
+                },
+                required=["message"],
+            ),
+            _tool_schema(
+                "git_create_branch",
+                "Create a new git branch. Optionally check it out.",
+                {
+                    "branch": {
+                        "type": "string",
+                        "description": "New branch name.",
+                    },
+                    "checkout": {
+                        "type": "string",
+                        "description": "Use true to switch to the new branch. Default true.",
+                        "default": "true",
+                    },
+                },
+                required=["branch"],
+            ),
+            _tool_schema(
+                "git_checkout",
+                "Switch to an existing git branch.",
+                {
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name.",
+                    }
+                },
+                required=["branch"],
+            ),
+            _tool_schema(
+                "git_restore",
+                "Restore file changes. This may discard local edits. Use only when the user explicitly asks.",
+                {
+                    "paths": {
+                        "type": "string",
+                        "description": "Comma-separated relative file paths to restore.",
+                    },
+                    "staged": {
+                        "type": "string",
+                        "description": "Use true to unstage instead of restoring working tree changes.",
+                        "default": "false",
+                    },
+                },
+                required=["paths"],
+            ),
+            _tool_schema(
+                "git_stash_push",
+                "Create a git stash. Use when the user wants to save local changes temporarily.",
+                {
+                    "message": {
+                        "type": "string",
+                        "description": "Optional stash message.",
+                        "default": "",
+                    },
+                    "include_untracked": {
+                        "type": "string",
+                        "description": "Use true to include untracked files.",
+                        "default": "false",
+                    },
+                },
+            ),
+            _tool_schema(
+                "git_stash_list",
+                "List git stashes.",
+                {},
+            ),
+            _tool_schema(
+                "git_stash_pop",
+                "Apply and remove the latest git stash. This can modify files.",
+                {},
+            ),
+
+            # -----------------------------------------------------------------
+            # Git remote/network tools
+            # -----------------------------------------------------------------
+            _tool_schema(
+                "git_fetch",
+                "Fetch from a git remote.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "prune": {
+                        "type": "string",
+                        "description": "Use true to prune deleted remote branches.",
+                        "default": "false",
+                    },
+                },
+            ),
+            _tool_schema(
+                "git_pull",
+                "Pull from a git remote. Use with care if the workspace has local changes.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If omitted, git decides based on tracking branch.",
+                        "default": "",
+                    },
+                },
+            ),
+            _tool_schema(
+                "git_push",
+                "Push the current or specified branch to a remote. Use only when the user explicitly asks to push.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If omitted, current branch is used.",
+                        "default": "",
+                    },
+                    "set_upstream": {
+                        "type": "string",
+                        "description": "Use true to push with -u and set upstream.",
+                        "default": "false",
+                    },
+                },
             _tool_schema(
                 "find_file",
                 "Find files whose path or name matches a query, to resolve a wrong or "
@@ -161,7 +532,32 @@ class AgentToolRegistry:
             if name == "list_files":
                 return self.list_files(str(arguments.get("path") or "."))
             if name == "read_file":
-                return self.read_file(str(arguments.get("filepath") or ""))
+                return self.read_file(
+                    str(arguments.get("filepath") or ""),
+                    start_line=arguments.get("start_line"),
+                    end_line=arguments.get("end_line"),
+                )
+            if name == "file_info":
+                return self.file_info(str(arguments.get("filepath") or ""))
+            if name == "find_file":
+                return self.find_file(
+                    str(arguments.get("query") or ""),
+                    limit=_as_int(arguments.get("limit"), default=20, minimum=1, maximum=100),
+                )
+            if name == "grep_files":
+                return self.grep_files(
+                    str(arguments.get("query") or ""),
+                    str(arguments.get("path") or "."),
+                    str(arguments.get("extensions") or ""),
+                    limit=_as_int(arguments.get("limit"), default=50, minimum=1, maximum=200),
+                )
+            if name == "edit_file":
+                return self.edit_file(
+                    str(arguments.get("filepath") or ""),
+                    str(arguments.get("old_string") or ""),
+                    str(arguments.get("new_string") or ""),
+                    replace_all=_as_bool(arguments.get("replace_all")),
+                )
             if name == "write_file":
                 # The model-facing tool always overwrites: small models forget an
                 # overwrite flag, get blocked, and then hallucinate success. The
@@ -178,6 +574,142 @@ class AgentToolRegistry:
                 )
             if name == "search_index":
                 return self.search_index(str(arguments.get("query") or ""))
+
+            # -----------------------------------------------------------------
+            # Git read tools
+            # -----------------------------------------------------------------
+            if name == "git_status":
+                status = self.git_tool.status()
+                return ToolResult(
+                    True,
+                    "Read git status.",
+                    {
+                        "is_git_repo": status.is_git_repo,
+                        "is_dirty": status.is_dirty,
+                        "changed_files": status.changed_files,
+                        "raw_output": status.raw_output,
+                        "error": status.error,
+                    },
+                )
+
+            if name == "git_status_full":
+                return _git_tool_result(self.git_tool.status_full())
+
+            if name == "git_diff":
+                return _git_tool_result(self.git_tool.diff_result())
+
+            if name == "git_diff_staged":
+                return _git_tool_result(self.git_tool.diff_staged())
+
+            if name == "git_diff_file":
+                return _git_tool_result(self.git_tool.diff_file(str(arguments.get("filepath") or "")))
+
+            if name == "git_branch":
+                return _git_tool_result(self.git_tool.branch())
+
+            if name == "git_branches":
+                return _git_tool_result(
+                    self.git_tool.branches(
+                        all_branches=_as_bool(arguments.get("all_branches")),
+                    )
+                )
+
+            if name == "git_remote":
+                return _git_tool_result(self.git_tool.remote())
+
+            if name == "git_log":
+                return _git_tool_result(
+                    self.git_tool.log(
+                        limit=_as_int(arguments.get("limit"), default=10, minimum=1, maximum=100),
+                    )
+                )
+
+            if name == "git_unpushed_commits":
+                return _git_tool_result(
+                    self.git_tool.unpushed_commits(
+                        remote=str(arguments.get("remote") or "origin"),
+                        branch=str(arguments.get("branch") or ""),
+                        limit=_as_int(arguments.get("limit"), default=20, minimum=1, maximum=100),
+                    )
+                )
+
+            # -----------------------------------------------------------------
+            # Git mutation tools
+            # -----------------------------------------------------------------
+            if name == "git_add":
+                return _git_tool_result(
+                    self.git_tool.add(
+                        _split_csv(arguments.get("paths")),
+                    )
+                )
+
+            if name == "git_add_all":
+                return _git_tool_result(self.git_tool.add_all())
+
+            if name == "git_commit":
+                return _git_tool_result(self.git_tool.commit(str(arguments.get("message") or "")))
+
+            if name == "git_create_branch":
+                return _git_tool_result(
+                    self.git_tool.create_branch(
+                        branch=str(arguments.get("branch") or ""),
+                        checkout=_as_bool(arguments.get("checkout"), default=True),
+                    )
+                )
+
+            if name == "git_checkout":
+                return _git_tool_result(self.git_tool.checkout(str(arguments.get("branch") or "")))
+
+            if name == "git_restore":
+                return _git_tool_result(
+                    self.git_tool.restore(
+                        paths=_split_csv(arguments.get("paths")),
+                        staged=_as_bool(arguments.get("staged")),
+                    )
+                )
+
+            if name == "git_stash_push":
+                return _git_tool_result(
+                    self.git_tool.stash_push(
+                        message=str(arguments.get("message") or ""),
+                        include_untracked=_as_bool(arguments.get("include_untracked")),
+                    )
+                )
+
+            if name == "git_stash_list":
+                return _git_tool_result(self.git_tool.stash_list())
+
+            if name == "git_stash_pop":
+                return _git_tool_result(self.git_tool.stash_pop())
+
+            # -----------------------------------------------------------------
+            # Git remote/network tools
+            # -----------------------------------------------------------------
+            if name == "git_fetch":
+                return _git_tool_result(
+                    self.git_tool.fetch(
+                        remote=str(arguments.get("remote") or "origin"),
+                        prune=_as_bool(arguments.get("prune")),
+                    )
+                )
+
+            if name == "git_pull":
+                return _git_tool_result(
+                    self.git_tool.pull(
+                        remote=str(arguments.get("remote") or "origin"),
+                        branch=str(arguments.get("branch") or ""),
+                    )
+                )
+
+            if name == "git_push":
+                return _git_tool_result(
+                    self.git_tool.push(
+                        remote=str(arguments.get("remote") or "origin"),
+                        branch=str(arguments.get("branch") or ""),
+                        set_upstream=_as_bool(arguments.get("set_upstream")),
+                    )
+                )
+
             if name == "find_file":
                 return self.find_file(str(arguments.get("query") or ""))
             if name == "grep_files":
@@ -202,63 +734,454 @@ class AgentToolRegistry:
         listing = WorkspaceTool(target).list_files().render()
         return ToolResult(True, "Listed files.", {"path": path, "listing": listing})
 
-    def read_file(self, filepath: str) -> ToolResult:
-        if Path(filepath).suffix.lower() == ".pdf":
-            target = self.sandbox.validate(filepath)
-            if not target.is_file():
-                return ToolResult(False, f"Not a file: {filepath}", {"filepath": filepath})
-            from shamsu.prd.input import parse_prd_file
+    def read_file(
+        self,
+        filepath: str,
+        start_line: Any = None,
+        end_line: Any = None,
+    ) -> ToolResult:
+        normalized = _normalize_workspace_path(filepath)
+        if not normalized:
+            return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
 
-            content = parse_prd_file(target).raw_text
-            if len(content) > 6000:
-                content = f"{content[:6000]}\n... [truncated {len(content) - 6000} chars]"
-            return ToolResult(True, "Read file.", {"filepath": filepath, "content": content})
-        content = self.workspace_tool.read_file(filepath)
-        return ToolResult(True, "Read file.", {"filepath": filepath, "content": content})
+        if PurePosixPath(normalized).suffix.lower() == ".pdf":
+            return self._read_pdf(normalized)
+
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
+
+        if target.is_dir():
+            listing = WorkspaceTool(target).list_files().render()
+            return ToolResult(
+                False,
+                f"Not a file: {normalized} is a directory. Pass a file path inside it.",
+                {"filepath": normalized, "kind": "directory", "listing": listing, "candidates": []},
+            )
+
+        if target.is_file():
+            return self._read_existing_file(normalized, normalized, target, start_line, end_line)
+
+        # Missing: try a case-insensitive resolution first, then candidates.
+        ci = _path_exists_case_insensitive(self.workspace_root, normalized)
+        if ci is not None and ci.is_file():
+            resolved = ci.relative_to(self.workspace_root).as_posix()
+            return self._read_existing_file(normalized, resolved, ci, start_line, end_line)
+
+        candidates = _find_path_candidates(self.workspace_root, normalized)
+        # Auto-resolve ONLY when there is exactly one candidate. This is a
+        # read-only operation, so guessing is cheap and reversible; with two or
+        # more matches we never silently pick one (see acceptance criteria).
+        if len(candidates) == 1:
+            try:
+                cand_target = self.sandbox.validate(candidates[0])
+            except SecurityError:
+                cand_target = None
+            if cand_target is not None and cand_target.is_file():
+                return self._read_existing_file(normalized, candidates[0], cand_target, start_line, end_line)
+
+        message = f"Not a file: {normalized}."
+        if candidates:
+            message += f" Candidates: {_format_path_candidates(candidates)}"
+        else:
+            message += " No similar files found. Use find_file or grep_files to locate it."
+        return ToolResult(False, message, {"filepath": normalized, "candidates": candidates})
+
+    def _read_pdf(self, normalized: str) -> ToolResult:
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
+        if not target.is_file():
+            candidates = _find_path_candidates(self.workspace_root, normalized)
+            message = f"Not a file: {normalized}."
+            if candidates:
+                message += f" Candidates: {_format_path_candidates(candidates)}"
+            return ToolResult(False, message, {"filepath": normalized, "candidates": candidates})
+        from shamsu.prd.input import parse_prd_file
+
+        content = parse_prd_file(target).raw_text
+        if len(content) > MAX_READ_CHARS:
+            content = f"{content[:MAX_READ_CHARS]}\n... [truncated {len(content) - MAX_READ_CHARS} chars]"
+        return ToolResult(
+            True,
+            "Read file.",
+            {"filepath": normalized, "resolved_filepath": normalized, "content": content, "candidates": []},
+        )
+
+    def _read_existing_file(
+        self,
+        asked: str,
+        resolved: str,
+        target: Path,
+        start_line: Any,
+        end_line: Any,
+    ) -> ToolResult:
+        if not _is_readable_text(target):
+            return ToolResult(
+                False,
+                f"Not a supported text file: {resolved}",
+                {"filepath": asked, "resolved_filepath": resolved, "candidates": []},
+            )
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return ToolResult(
+                False,
+                f"Could not read {resolved}: {exc}",
+                {"filepath": asked, "resolved_filepath": resolved, "candidates": []},
+            )
+
+        lines = text.splitlines()
+        total_lines = len(lines)
+        data: dict[str, Any] = {
+            "filepath": asked,
+            "resolved_filepath": resolved,
+            "total_lines": total_lines,
+            "candidates": [],
+        }
+
+        start = _coerce_optional_int(start_line)
+        end = _coerce_optional_int(end_line)
+        if start is not None or end is not None:
+            start = max(1, start if start is not None else 1)
+            end = end if end is not None else total_lines
+            end = min(total_lines, max(end, start))
+            selected = lines[start - 1 : end]
+            content = "\n".join(selected)
+            if len(content) > MAX_READ_CHARS:
+                content = f"{content[:MAX_READ_CHARS]}\n... [truncated {len(content) - MAX_READ_CHARS} chars]"
+            data["start_line"] = start
+            data["end_line"] = end
+            data["truncated"] = start > 1 or end < total_lines
+        else:
+            content = text
+            if len(content) > MAX_READ_CHARS:
+                content = f"{content[:MAX_READ_CHARS]}\n... [truncated {len(content) - MAX_READ_CHARS} chars]"
+                data["truncated"] = True
+                data["hint"] = "File is large; pass start_line/end_line to read a specific range."
+            else:
+                data["truncated"] = False
+        data["content"] = content
+
+        if resolved != asked:
+            message = f"Read file (resolved '{asked}' -> '{resolved}')."
+        else:
+            message = "Read file."
+        return ToolResult(True, message, data)
+
+    def file_info(self, filepath: str) -> ToolResult:
+        normalized = _normalize_workspace_path(filepath)
+        if not normalized:
+            return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
+
+        if target.is_file():
+            stat = target.stat()
+            return ToolResult(
+                True,
+                f"{normalized} is a file ({stat.st_size} bytes).",
+                {
+                    "exists": True,
+                    "kind": "file",
+                    "filepath": normalized,
+                    "resolved_filepath": normalized,
+                    "size_bytes": stat.st_size,
+                    "extension": target.suffix,
+                    "candidates": [],
+                },
+            )
+        if target.is_dir():
+            return ToolResult(
+                True,
+                f"{normalized} is a directory.",
+                {
+                    "exists": True,
+                    "kind": "directory",
+                    "filepath": normalized,
+                    "resolved_filepath": normalized,
+                    "extension": "",
+                    "candidates": [],
+                },
+            )
+
+        ci = _path_exists_case_insensitive(self.workspace_root, normalized)
+        resolved = ci.relative_to(self.workspace_root).as_posix() if ci is not None else ""
+        candidates = _find_path_candidates(self.workspace_root, normalized)
+        message = f"No file or directory at {normalized}."
+        if resolved:
+            message += f" A case-insensitive match exists: {resolved}."
+        elif candidates:
+            message += f" Candidates: {_format_path_candidates(candidates)}"
+        return ToolResult(
+            True,
+            message,
+            {
+                "exists": False,
+                "kind": "missing",
+                "filepath": normalized,
+                "resolved_filepath": resolved,
+                "extension": PurePosixPath(normalized).suffix,
+                "candidates": candidates,
+            },
+        )
+
+    def find_file(self, query: str, limit: int = 20) -> ToolResult:
+        normalized = _normalize_workspace_path(query)
+        if not normalized:
+            return ToolResult(False, "Missing query.", {"query": query, "matches": []})
+        matches = _find_files_by_query(self.workspace_root, normalized, limit)
+        message = (
+            f"Found {len(matches)} file(s) matching '{normalized}'."
+            if matches
+            else f"No files matched '{normalized}'. Try a shorter query or grep_files."
+        )
+        return ToolResult(True, message, {"query": normalized, "matches": matches, "count": len(matches)})
+
+    def grep_files(
+        self,
+        query: str,
+        path: str = ".",
+        extensions: str = "",
+        limit: int = 50,
+    ) -> ToolResult:
+        if not query.strip():
+            return ToolResult(False, "Missing query.", {"query": query, "matches": []})
+        try:
+            base = self.sandbox.validate(_normalize_workspace_path(path) or ".")
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"query": query, "matches": []})
+        if not base.exists():
+            return ToolResult(False, f"Search path not found: {path}", {"query": query, "matches": []})
+        base = base if base.is_dir() else base.parent
+
+        ext_filter = _parse_extensions(extensions)
+        matches: list[dict[str, Any]] = []
+        files_scanned = 0
+        truncated = False
+        for rel in _walk_workspace_files(base):
+            full = base / rel
+            if ext_filter and full.suffix.lower() not in ext_filter:
+                continue
+            if not _is_readable_text(full):
+                continue
+            files_scanned += 1
+            try:
+                with full.open("r", encoding="utf-8", errors="ignore") as handle:
+                    for lineno, line in enumerate(handle, start=1):
+                        if query in line:
+                            matches.append(
+                                {
+                                    "filepath": full.relative_to(self.workspace_root).as_posix(),
+                                    "line": lineno,
+                                    "text": line.rstrip("\n")[:200],
+                                }
+                            )
+                            if len(matches) >= limit:
+                                truncated = True
+                                break
+            except OSError:
+                continue
+            if truncated:
+                break
+
+        message = f"Found {len(matches)} match(es) for '{query}' across {files_scanned} file(s)."
+        if truncated:
+            message += f" Output capped at {limit} matches; narrow the query or set extensions."
+        return ToolResult(
+            True,
+            message,
+            {"query": query, "matches": matches, "count": len(matches), "truncated": truncated},
+        )
+
+    def edit_file(
+        self,
+        filepath: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,
+    ) -> ToolResult:
+        normalized = _normalize_workspace_path(filepath)
+        if not normalized:
+            return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
+        if old_string == "":
+            return ToolResult(
+                False,
+                "Missing old_string. Provide the exact text to replace (use write_file to create a new file).",
+                {"filepath": normalized, "candidates": []},
+            )
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
+
+        # Edits never auto-resolve to a different file: show candidates, fail safe.
+        if not target.is_file():
+            candidates = _find_path_candidates(self.workspace_root, normalized)
+            message = f"Cannot edit: file does not exist: {normalized}."
+            if candidates:
+                message += (
+                    f" Candidates: {_format_path_candidates(candidates)}. "
+                    "Confirm the real path, then call edit_file on it."
+                )
+            else:
+                message += " Use find_file to locate it, or write_file to create it."
+            return ToolResult(False, message, {"filepath": normalized, "candidates": candidates})
+
+        try:
+            content = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return ToolResult(False, f"Could not read {normalized}: {exc}", {"filepath": normalized})
+
+        count = content.count(old_string)
+        if count == 0:
+            hint = _nearby_edit_hint(content, old_string)
+            return ToolResult(
+                False,
+                f"old_string not found in {normalized}. The file was NOT changed. {hint}",
+                {"filepath": normalized, "matches": 0},
+            )
+        if count > 1 and not replace_all:
+            return ToolResult(
+                False,
+                f"old_string appears {count} times in {normalized}. Add more surrounding context to "
+                "make it unique, or set replace_all=true. The file was NOT changed.",
+                {"filepath": normalized, "matches": count},
+            )
+        if old_string == new_string:
+            return ToolResult(
+                False,
+                "old_string and new_string are identical; nothing to change.",
+                {"filepath": normalized, "matches": count},
+            )
+
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+            replacements = count
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            replacements = 1
+
+        request = ApprovalRequest(
+            action_type="file_edit",
+            description=f"Edit file: {normalized} ({replacements} replacement(s))",
+            risk_level="medium",
+            preview=_edit_preview(normalized, old_string, new_string),
+            working_dir=str(self.workspace_root),
+            reason="The agent requested a targeted file edit.",
+        )
+        if not self.approval_manager.ask(request):
+            return ToolResult(False, "File edit denied by user.", {"filepath": normalized})
+
+        transaction_id = self.transactions.begin(
+            reason=f"Agent edit_file: {normalized}",
+            operations=[{"op": "edit_file", "path": normalized, "dest_path": "", "reason": ""}],
+            destructive=False,
+        )
+        self.transactions.backup_file(transaction_id, normalized)
+        target.write_text(new_content, encoding="utf-8")
+        self.transactions.record_after(transaction_id, normalized)
+        self.transactions.finalize(transaction_id, "applied")
+        _mark_code_memory_stale(self.workspace_root)
+        return ToolResult(
+            True,
+            f"Edited {normalized} ({replacements} replacement(s)).",
+            {
+                "filepath": normalized,
+                "resolved_filepath": normalized,
+                "replacements": replacements,
+                "bytes_written": len(new_content.encode("utf-8")),
+                "transaction_id": transaction_id,
+            },
+        )
 
     def write_file(self, filepath: str, content: str, overwrite: bool = False) -> ToolResult:
-        if not filepath.strip():
+        normalized = _normalize_workspace_path(filepath)
+        if not normalized:
             return ToolResult(False, "Missing filepath.", {})
         try:
-            target = self.sandbox.validate(filepath)
+            target = self.sandbox.validate(normalized)
         except SecurityError as exc:
-            return ToolResult(False, str(exc), {"filepath": filepath})
+            return ToolResult(False, str(exc), {"filepath": normalized})
+
         exists = target.exists()
+        if exists and target.is_dir():
+            return ToolResult(
+                False,
+                f"{normalized} is a directory, not a file.",
+                {"filepath": normalized, "candidates": []},
+            )
+
+        # Guard against creating a wrong-path duplicate: if the requested file
+        # does not exist but the SAME relative file exists at a different root
+        # (e.g. write src/App.tsx while client/src/App.tsx exists), refuse and
+        # surface candidates instead of silently scattering a second copy.
+        if not exists:
+            strong = _strong_path_candidates(self.workspace_root, normalized)
+            if strong:
+                return ToolResult(
+                    False,
+                    f"Refusing to create {normalized}: a matching file already exists at a different "
+                    f"path. Candidates: {_format_path_candidates(strong)}. Edit the existing file "
+                    "(edit_file/write_file) or pass the correct path.",
+                    {"filepath": normalized, "candidates": strong},
+                )
+
         if exists and not overwrite:
             return ToolResult(
                 False,
                 "File already exists. Set overwrite=true if overwriting is intended.",
-                {"filepath": filepath},
+                {"filepath": normalized, "candidates": []},
             )
+
         request = ApprovalRequest(
             action_type="file_edit" if exists else "file_write",
-            description=f"{'Overwrite' if exists else 'Create'} file: {filepath}",
+            description=f"{'Overwrite' if exists else 'Create'} file: {normalized}",
             risk_level="medium",
             preview=content[:4000],
             working_dir=str(self.workspace_root),
             reason="The agent requested a workspace file write.",
         )
         if not self.approval_manager.ask(request):
-            return ToolResult(False, "File write denied by user.", {"filepath": filepath})
+            return ToolResult(False, "File write denied by user.", {"filepath": normalized})
+
         # Every model-driven write goes through a transaction (backup + hash)
         # even for this simple full-overwrite path, so it can be rolled back
         # via /patch rollback like any other mutation - the model never gets
         # to overwrite a file with no safety net.
         transaction_id = self.transactions.begin(
-            reason=f"Agent write_file: {filepath}",
-            operations=[{"op": "edit_file" if exists else "create_file", "path": filepath, "dest_path": "", "reason": ""}],
+            reason=f"Agent write_file: {normalized}",
+            operations=[
+                {
+                    "op": "edit_file" if exists else "create_file",
+                    "path": normalized,
+                    "dest_path": "",
+                    "reason": "",
+                }
+            ],
             destructive=False,
         )
-        self.transactions.backup_file(transaction_id, filepath)
+        self.transactions.backup_file(transaction_id, normalized)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        self.transactions.record_after(transaction_id, filepath)
+        self.transactions.record_after(transaction_id, normalized)
         self.transactions.finalize(transaction_id, "applied")
         _mark_code_memory_stale(self.workspace_root)
         return ToolResult(
             True,
-            f"Wrote {filepath}.",
-            {"filepath": filepath, "bytes_written": len(content.encode("utf-8")), "transaction_id": transaction_id},
+            f"Wrote {normalized}.",
+            {
+                "filepath": normalized,
+                "resolved_filepath": normalized,
+                "bytes_written": len(content.encode("utf-8")),
+                "transaction_id": transaction_id,
+                "created": not exists,
+                "overwrote": exists,
+            },
         )
 
     def run_command(self, command: str, cwd: str = ".") -> ToolResult:
@@ -266,12 +1189,14 @@ class AgentToolRegistry:
             return ToolResult(False, "Missing command.", {})
         code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
         data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
+
         # DiagnosticDigest already parsed this command's output into a compact
         # ErrorPacket (see CommandRunner._run_diagnostics) - surface that to
         # the model on failure instead of leaving it unread on the command
         # runner, per pipeline.md: "parse errors before giving logs to model."
         if code != 0 and self.command_runner.last_error_packet is not None:
             data["diagnostics"] = self.command_runner.last_error_packet.to_model_context()
+
         return ToolResult(code == 0, f"Command exited with {code}.", data)
 
     def search_index(self, query: str) -> ToolResult:
@@ -279,6 +1204,7 @@ class AgentToolRegistry:
 
         if not AbstractService(self.workspace_root).ensure_ready().allowed:
             return ToolResult(False, "Codebase-Memory MCP is not ready. Run /abstract setup.", {"query": query})
+
         results = SearchAgent(self.workspace_root).search(query, top_k=5)
         return ToolResult(
             True,
@@ -299,6 +1225,38 @@ class AgentToolRegistry:
         )
 
 
+def _git_tool_result(result: GitCommandResult) -> ToolResult:
+    return ToolResult(
+        result.ok,
+        result.message or ("Git command completed." if result.ok else "Git command failed."),
+        {
+            "command": result.command,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        },
+    )
+
+
+def _split_csv(value: Any) -> list[str]:
+    text = str(value or "")
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(str(value or default))
+    except ValueError:
+        number = default
+    return max(minimum, min(number, maximum))
     def find_file(self, query: str) -> ToolResult:
         if not query.strip():
             return ToolResult(False, "Missing query.", {})
@@ -414,18 +1372,24 @@ def _tool_schema(
 def _compact_value(value: Any, limit: int = 6000) -> Any:
     if isinstance(value, str):
         return _truncate_text(value, limit)
+
     if isinstance(value, list):
         compacted = [_compact_value(item, max(limit // 4, 500)) for item in value[:20]]
         if len(value) > 20:
             compacted.append(f"... [truncated {len(value) - 20} item(s)]")
         return compacted
+
     if isinstance(value, dict):
         items = list(value.items())[:40]
         per_item_limit = max(limit // max(len(items), 1), 500)
-        compacted = {str(key): _compact_value(item, per_item_limit) for key, item in items}
+        compacted = {
+            str(key): _compact_value(item, per_item_limit)
+            for key, item in items
+        }
         if len(value) > len(items):
             compacted["..."] = f"truncated {len(value) - len(items)} key(s)"
         return compacted
+
     return value
 
 
@@ -433,3 +1397,67 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n... [truncated {len(text) - limit} chars]"
+
+
+# ---------------------------------------------------------------------------
+# Path resolution + file discovery helpers
+#
+# Small models routinely ask for a plausible-but-wrong path (e.g. `src/App.tsx`
+# when the file lives at `client/src/App.tsx`). These helpers turn a "not a
+# file" dead-end into an actionable set of candidates so the read tools can
+# recover instead of stalling the agent loop.
+# ---------------------------------------------------------------------------
+
+
+def _is_readable_text(target: Path) -> bool:
+    return target.suffix.lower() in _READABLE_TEXT_EXTENSIONS or target.name in _READABLE_FILENAMES
+
+
+def _parse_extensions(value: Any) -> set[str]:
+    exts: set[str] = set()
+    for item in str(value or "").replace(" ", "").split(","):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if not item.startswith("."):
+            item = "." + item
+        exts.add(item)
+    return exts
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+def _nearby_edit_hint(content: str, old_string: str) -> str:
+    """When edit_file's old_string is not found, point at the closest existing
+    line so the model can fix whitespace/exact-text instead of guessing again."""
+    probe_lines = [line.strip() for line in old_string.splitlines() if line.strip()]
+    if not probe_lines:
+        return "Read the file (optionally with start_line/end_line) to copy the exact text."
+    probe = probe_lines[0]
+    file_lines = content.splitlines()
+    stripped = [line.strip() for line in file_lines]
+    close = difflib.get_close_matches(probe, stripped, n=1, cutoff=0.6)
+    if not close:
+        return "Read the file (optionally with start_line/end_line) to copy the exact text, including whitespace."
+    for idx, line in enumerate(file_lines, start=1):
+        if line.strip() == close[0]:
+            return (
+                f"Nearest similar line is line {idx}: {close[0][:120]!r}. "
+                "Match the exact text and whitespace (read a line range first if unsure)."
+            )
+    return "Read the file to copy the exact text, including whitespace."
+
+
+def _edit_preview(filepath: str, old_string: str, new_string: str) -> str:
+    return (
+        f"edit {filepath}\n"
+        f"--- old\n{old_string[:1500]}\n"
+        f"+++ new\n{new_string[:1500]}"
+    )

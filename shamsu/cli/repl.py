@@ -107,6 +107,7 @@ from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
 from shamsu.session.manager import SessionLogger, SessionManager
+from shamsu.session.memory import is_affirmative, is_negative
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
@@ -216,6 +217,10 @@ SYSTEM_COMMANDS = (
     "/sessions rename ",
     "/sessions close",
     "/sessions export ",
+    "/sessions trace",
+    "/sessions summary",
+    "/sessions memory",
+    "/sessions search ",
     "/permissions list",
     "/permissions clear",
     "/milestones list",
@@ -324,7 +329,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--new-session",
         nargs="?",
-        const="SHAMSU Session",
+        const="Untitled Session",
         default=None,
         help="Create a new session with an optional title.",
     )
@@ -407,6 +412,10 @@ def _print_help(console: Console) -> None:
                     "  /sessions rename <id> <title>",
                     "  /sessions close [id]      Close a session",
                     "  /sessions export <id>     Export redacted session bundle",
+                    "  /sessions trace [id]      Show structured action log (no hidden reasoning)",
+                    "  /sessions summary [id]    Show the session summary",
+                    "  /sessions memory [id]     Show local session memory records",
+                    "  /sessions search <query>  Search titles, summaries, messages, memory",
                     "  /permissions list         Show remembered 'always allow' decisions",
                     "  /permissions clear        Forget all remembered approval decisions",
                     "  /milestones list          List tracked internal multi-step milestones",
@@ -1016,7 +1025,12 @@ def _memory_command_allowed(normalized_input: str) -> bool:
     )
 
 
-def _handle_memory(user_input: str, workspace: Path, console: Console) -> None:
+def _handle_memory(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
     _, _, rest = user_input.partition(" ")
     parts = rest.strip().split(maxsplit=1)
     subcommand = parts[0].lower() if parts else "status"
@@ -1049,6 +1063,18 @@ def _handle_memory(user_input: str, workspace: Path, console: Console) -> None:
     if subcommand == "remember":
         if not argument:
             console.print("[red]Usage: /memory remember <text>[/red]")
+            return
+        # When there's an active session, route through the session bridge so the
+        # explicit memory is also recorded in the session's local memory.jsonl.
+        if session_logger is not None:
+            bridge = session_logger.save_long_term_memory("user_preference", argument, {"reason": "explicit_remember"})
+            outcome = bridge.get("long_term") or {}
+            if outcome.get("ok"):
+                console.print("[green]Memory stored.[/green]" if not outcome.get("deduped") else "[green]Memory already existed.[/green]")
+            elif bridge.get("local"):
+                console.print("[green]Saved to session memory (long-term backend unavailable).[/green]")
+            else:
+                console.print(f"[yellow]Memory not stored: {outcome.get('reason') or outcome.get('error') or 'skipped'}[/yellow]")
             return
         result = service.remember(argument)
         if result.get("ok"):
@@ -2786,6 +2812,9 @@ def _handle_sessions(
 ) -> SessionLogger:
     parts = user_input.split(maxsplit=3)
     command = parts[1].lower() if len(parts) > 1 else "list"
+    # The rest after the subcommand, kept intact for multi-word queries.
+    _, _, after_command = user_input.partition(" ")
+    argument = after_command.partition(" ")[2].strip() if " " in after_command.strip() else ""
     try:
         if command == "list":
             table = Table(title="Sessions")
@@ -2810,7 +2839,7 @@ def _handle_sessions(
             return resumed
         if command == "rename" and len(parts) >= 4:
             renamed = manager.rename_session(parts[2], parts[3])
-            console.print(f"[green]Renamed session {renamed.session_id}[/green]")
+            console.print(f"[green]Renamed session {renamed.session_id} to \"{renamed.title}\"[/green]")
             if renamed.session_id == current.session_id:
                 return SessionLogger(manager, renamed)
             return current
@@ -2819,17 +2848,151 @@ def _handle_sessions(
             closed = manager.close_session(target)
             console.print(f"[yellow]Closed session {closed.session_id}[/yellow]")
             if closed.session_id == current.session_id:
-                return manager.create_session("SHAMSU Session")
+                return manager.create_session()
             return current
         if command == "export" and len(parts) >= 3:
             path = manager.export_session(parts[2])
             console.print(f"[green]Exported session bundle: {path}[/green]")
             return current
+        if command == "trace":
+            logger = manager.logger_for(parts[2]) if len(parts) >= 3 else current
+            _print_session_trace(logger, console)
+            return current
+        if command == "summary":
+            logger = manager.logger_for(parts[2]) if len(parts) >= 3 else current
+            _print_session_summary(logger, console)
+            return current
+        if command == "memory":
+            logger = manager.logger_for(parts[2]) if len(parts) >= 3 else current
+            _print_session_memory(logger, console)
+            return current
+        if command == "search":
+            if not argument:
+                console.print("[red]Usage: /sessions search <query>[/red]")
+                return current
+            _print_session_search(manager, argument, console)
+            return current
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
         return current
-    console.print("[red]Usage: sessions list|current|show|resume|rename|close|export[/red]")
+    console.print(
+        "[red]Usage: sessions list|current|show|resume|rename|close|export|trace|summary|memory|search[/red]"
+    )
     return current
+
+
+# Structured action events safe to surface in `/sessions trace`. Deliberately
+# excludes raw model turns and planner output (chat.message, planner.plan,
+# llm.request/response, user.prompt) so no hidden chain-of-thought leaks.
+_TRACE_ALLOW_PREFIXES = (
+    "router.", "route.", "workflow.", "agent.tool", "agent.run", "agent.stuck",
+    "command.", "patch.", "tool.", "web.", "browser.", "approval.",
+    "context.pack", "memory.write", "memory.long_term", "memory.local",
+    "memory.retrieved", "session.route", "session.pending_action",
+    "session.started", "session.resumed", "session.closed", "session.auto_titled",
+    "assistant.message",
+)
+
+
+def _is_trace_event(event_type: str) -> bool:
+    return any(event_type.startswith(prefix) for prefix in _TRACE_ALLOW_PREFIXES)
+
+
+def _trace_line(event: dict[str, Any]) -> str:
+    event_type = str(event.get("event_type", ""))
+    payload = event.get("payload", {}) or {}
+    summary = str(event.get("summary", "")).strip()
+    if event_type == "router.decision":
+        return f"Route: {payload.get('intent') or payload.get('route') or summary}"
+    if event_type == "session.route.updated":
+        return f"Route: {payload.get('route') or '-'}"
+    if event_type.startswith("workflow."):
+        label = event_type.split(".", 1)[1]
+        return f"Workflow {label}: {summary or payload.get('intent', '')}".strip()
+    if event_type == "agent.tool_call":
+        return f"Tool call: {payload.get('tool_name', '?')}"
+    if event_type == "agent.tool_result":
+        ok = "ok" if payload.get("ok") else "failed"
+        return f"Tool: {payload.get('tool_name', '?')} {ok}"
+    if event_type.startswith("command."):
+        return f"Command {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("patch."):
+        return f"Patch {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("browser."):
+        return f"Browser {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("web."):
+        return f"Web {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("approval."):
+        return f"Approval {event_type.split('.', 1)[1]}: {summary}"
+    if event_type.startswith("memory."):
+        return f"Memory: {summary or event_type}"
+    if event_type == "assistant.message":
+        return f"Final: {summary or _clip_text(str(payload.get('message', '')), 100)}"
+    return f"{event_type}: {summary}"
+
+
+def _print_session_trace(logger: SessionLogger, console: Console) -> None:
+    events = [event for event in logger.tail(400) if _is_trace_event(str(event.get("event_type", "")))]
+    if not events:
+        console.print("[dim]No structured trace events for this session yet.[/dim]")
+        return
+    table = Table(title=f"Trace — {logger.metadata.title}")
+    table.add_column("Time")
+    table.add_column("Action")
+    for event in events[-60:]:
+        table.add_row(str(event.get("timestamp", ""))[11:19], _trace_line(event))
+    console.print(table)
+
+
+def _print_session_summary(logger: SessionLogger, console: Console) -> None:
+    summary = logger.read_summary()
+    if not summary.strip():
+        # No summary persisted yet: generate a deterministic one on demand.
+        summary = logger.update_summary_from_events()
+    console.print(Panel(summary.strip() or "No summary available.", title=f"Summary — {logger.metadata.title}"))
+
+
+def _print_session_memory(logger: SessionLogger, console: Console) -> None:
+    records = logger.read_local_memory()
+    if not records:
+        console.print("[dim]No local session memory recorded yet.[/dim]")
+        return
+    table = Table(title=f"Session Memory — {logger.metadata.title}")
+    table.add_column("Kind")
+    table.add_column("Memory")
+    table.add_column("When")
+    for record in records[-40:]:
+        table.add_row(
+            str(record.get("kind", "")),
+            _clip_text(str(record.get("text", "")), 200),
+            str(record.get("timestamp", ""))[:19],
+        )
+    console.print(table)
+
+
+def _print_session_search(manager: SessionManager, query: str, console: Console) -> None:
+    matches = manager.search_sessions(query)
+    if not matches:
+        console.print(f"[dim]No sessions matched: {query}[/dim]")
+        return
+    table = Table(title=f"Search — {query}")
+    table.add_column("Session")
+    table.add_column("Title")
+    table.add_column("Source")
+    table.add_column("Snippet")
+    for match in matches:
+        table.add_row(
+            str(match.get("session_id", ""))[:19],
+            _clip_text(str(match.get("title", "")), 24),
+            f"{match.get('source', '')}/{match.get('role', '')}".rstrip("/-"),
+            _clip_text(str(match.get("snippet", "")), 70),
+        )
+    console.print(table)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
 def _print_session(metadata, console: Console) -> None:
@@ -2885,10 +3048,40 @@ def _log_assistant_message(
             "Assistant responded",
             workflow_id=workflow_id,
         )
+        # Keep the resumable state's "last answer" in sync so a resumed session
+        # can show where it left off without replaying events.
+        try:
+            session_logger.set_last_assistant_summary(message)
+        except Exception:
+            pass
     ledger = get_current_run()
     if ledger and message:
         ledger.log_task_classified(workflow_id or "unknown")
         ledger.finish(message, status="success")
+
+
+def _finalize_session_work(
+    session_logger: SessionLogger | None,
+    workflow: str,
+    request_text: str,
+) -> None:
+    """On meaningful workflow completion: refresh the deterministic session
+    summary and save a durable task summary (local + best-effort long-term).
+    Every step is best-effort so it never breaks the user-facing flow."""
+    if not session_logger:
+        return
+    try:
+        session_logger.update_summary_from_events()
+    except Exception:
+        pass
+    try:
+        session_logger.save_long_term_memory(
+            "task_summary",
+            f"Task summary ({workflow}): {request_text.strip()[:500]}",
+            {"workflow": workflow},
+        )
+    except Exception:
+        pass
 
 
 def _finish_current_run(workspace: Path, ledger: ActionLedger) -> None:
@@ -2907,6 +3100,29 @@ def _append_agent_context(user_input: str, agent_context: str) -> str:
     return f"{user_input}\n\nAdditional SHAMSU context:\n{agent_context}"
 
 
+def _classify_route_label(effective_input: str, workspace: Path) -> str:
+    """Coarse, read-only route label mirroring the branch order in
+    `_handle_request` — used only to record `last_route` in session state, so a
+    missed/added branch degrades to `agent-chat` rather than breaking anything."""
+    if is_git_request(effective_input):
+        return "git"
+    if _looks_like_workspace_location_prompt(effective_input):
+        return "workspace.location"
+    if _looks_like_workspace_files_prompt(effective_input):
+        return "workspace.files"
+    if _looks_like_prd_build_request(effective_input, workspace):
+        return "prd.build"
+    if _looks_like_file_write_request(effective_input):
+        return "file.write"
+    if _looks_like_browser_needed_prompt(effective_input):
+        return "browser"
+    if _looks_like_web_needed_prompt(effective_input):
+        return "web"
+    if _looks_like_react_prompt(effective_input):
+        return "agent-chat"
+    return "qa"
+
+
 async def _handle_request(
     user_input: str,
     workspace: Path,
@@ -2922,9 +3138,33 @@ async def _handle_request(
     if session_logger is None:
         effective_input = _expand_followup_prompt(effective_input, previous_user_prompt)
     agent_context = agent_result.context
+    # Record the routing decision in session state so `/sessions trace` and a
+    # resumed session can see how the last prompt was dispatched.
+    if session_logger is not None:
+        try:
+            route_label = (
+                agent_result.action if agent_result.handled
+                else _classify_route_label(effective_input, workspace)
+            )
+            session_logger.set_last_route({"route": route_label or "agent-chat", "handled": agent_result.handled})
+        except Exception:
+            pass
     if agent_result.handled:
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
+        return
+    # Git/repo requests are classified first, before web-search, QA, and
+    # code-edit routing (see is_git_request): otherwise "commit the current
+    # changes" trips the web keyword, "stage the files" falls into weak QA, and
+    # "what are the unstaged changes" trips the code-edit heuristic.
+    if is_git_request(effective_input):
+        await _handle_git_request(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+            agent_context=agent_context,
+        )
         return
     if _looks_like_workspace_location_prompt(effective_input):
         message = _print_workspace_location(workspace, console)
@@ -3074,17 +3314,50 @@ async def _handle_request(
             else:
                 await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger, thinking_status=thinking_status)
         elif decision.intent == "code_edit":
-            await _run_code_edit(harness_input, workspace, search, console, llm, session_logger)
-        elif decision.intent == "bug_fix":
-            if not _bugfix_request_has_actionable_target(effective_input):
-                message = (
-                    "Tell me what to fix first: include a file path, traceback, failing command, "
-                    "or the exact error message. Example: /fix tests/test_app.py fails with AssertionError ..."
+            # Hard safety guard: a read-only Git question ("what are the
+            # unstaged changes?") must never enter the patch/coder workflow,
+            # even if the classifier mislabeled it as code_edit. Answer it as a
+            # read-only Git request instead.
+            if _is_read_only_git_question(effective_input):
+                _log_event(
+                    session_logger,
+                    "routing.git_override",
+                    {"route": "git_read", "reason": "code_edit_blocked", "read_only": True, "mutation": False},
+                    "Blocked code-edit for read-only Git question",
+                    workflow_id="git",
                 )
-                console.print(Panel(message, title="Bug Fix Needs Target", border_style="yellow"))
-                _log_assistant_message(session_logger, message, workflow_id="bug_fix")
-                return
-            await _run_bug_fix(harness_input, workspace, search, console, llm, session_logger)
+                if _trace_mode(workspace) != "quiet":
+                    console.print("[dim]patch_workflow=blocked reason=read_only_git_question[/dim]")
+                    console.print("[dim]route=git_read selected_workflow=git_read_only[/dim]")
+                _run_git_read_only(
+                    effective_input,
+                    workspace,
+                    console,
+                    session_logger,
+                    lambda line: console.print(f"[dim]{line}[/dim]") if _trace_mode(workspace) != "quiet" else None,
+                )
+            else:
+                await _run_code_edit(harness_input, workspace, search, console, llm, session_logger)
+        elif decision.intent == "bug_fix":
+            bugfix_input = harness_input
+            if not _bugfix_request_has_actionable_target(effective_input):
+                # No explicit target - reuse the most recent failing command +
+                # errors from session memory (e.g. after `/autonomy on` a build
+                # failed and the user just says "fix it") instead of re-asking.
+                reused = _bugfix_report_from_last_failure(effective_input, session_logger)
+                if reused is None:
+                    message = (
+                        "Tell me what to fix first: include a file path, traceback, failing command, "
+                        "or the exact error message. Example: /fix tests/test_app.py fails with AssertionError ..."
+                    )
+                    console.print(Panel(message, title="Bug Fix Needs Target", border_style="yellow"))
+                    _log_assistant_message(session_logger, message, workflow_id="bug_fix")
+                    return
+                bugfix_input, reused_command = reused
+                console.print(
+                    f"[dim]Reusing the last failing command from this session: {reused_command}[/dim]"
+                )
+            await _run_bug_fix(bugfix_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
             await _run_audit(harness_input, search, console, llm)
         elif decision.intent == "test_gen":
@@ -3329,6 +3602,230 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
         return True
     return False
+
+
+# -- Git request routing override -------------------------------------------
+# Git/repo requests must be classified BEFORE web-search, QA, and code-edit
+# routing. Otherwise phrasing like "commit the current changes" trips the
+# web-search keyword ("current "), "can you stage the files?" falls into
+# low-confidence QA, and "what are the unstaged changes" trips the code-edit
+# heuristic ("change"). These deterministic helpers give a Git prompt a hard
+# override so it always reaches the Git tools instead.
+
+_GIT_READ_ONLY_PHRASES = (
+    "git status", "git diff", "git branch", "git branches", "git remote",
+    "git log", "git show", "unstaged change", "staged change",
+    "uncommitted change", "unpushed commit", "current branch", "what changed",
+    "what has changed", "what are the changes", "what are the change",
+    "show changes", "show me the changes", "repo status", "repository status",
+    "status of the repo", "status of this repo", "what's changed",
+    "whats changed", "diff of the repo", "working tree",
+)
+
+_GIT_MUTATION_PHRASES = (
+    "stage the file", "stage files", "stage the change", "stage changes",
+    "stage all", "stage everything", "git add", "commit", "git push",
+    "push this", "push to", "push it", "push the", "git pull", "pull from",
+    "pull the latest", "git fetch", "fetch from", "checkout", "create branch",
+    "create a branch", "new branch", "switch branch", "stash", "git restore",
+    "restore the file", "amend",
+)
+
+# A generic Git anchor: a prompt that clearly talks about git/repo work is a
+# Git request even without one of the phrases above.
+_GIT_ANCHOR_PHRASES = (
+    "git ", "the repo", "this repo", "the repository", "in git",
+    "to github", "on github",
+)
+
+
+def is_read_only_git_request(text: str) -> bool:
+    """True for Git prompts that only inspect the repo (status/diff/log/...)."""
+    low = text.lower()
+    return any(phrase in low for phrase in _GIT_READ_ONLY_PHRASES)
+
+
+def is_git_mutation_request(text: str) -> bool:
+    """True for Git prompts that change repo state (stage/commit/push/...)."""
+    low = text.lower()
+    return any(phrase in low for phrase in _GIT_MUTATION_PHRASES)
+
+
+def is_git_request(text: str) -> bool:
+    """True for any Git/repo request (read-only or mutation)."""
+    if is_read_only_git_request(text) or is_git_mutation_request(text):
+        return True
+    low = text.lower()
+    if not any(anchor in low for anchor in _GIT_ANCHOR_PHRASES):
+        return False
+    # A bare git/repo mention still needs a git-shaped verb/noun to qualify, so
+    # unrelated sentences that merely contain "the repo" don't get hijacked.
+    return any(
+        word in low
+        for word in (
+            "status", "diff", "commit", "branch", "stage", "staged",
+            "unstaged", "push", "pull", "fetch", "checkout", "stash",
+            "remote", "log", "changes",
+        )
+    )
+
+
+def _is_read_only_git_question(text: str) -> bool:
+    """Hard guard for the code-edit path: a read-only Git *question* (starts
+    with what/show/list/... and asks about repo status/diff/changes) must never
+    enter the patch/coder workflow."""
+    low = text.strip().lower()
+    starts_read_only = any(
+        low.startswith(prefix)
+        for prefix in (
+            "what", "show", "list", "describe", "tell me", "explain",
+            "which", "where", "why", "how",
+        )
+    )
+    return (
+        starts_read_only
+        and is_read_only_git_request(text)
+        and not is_git_mutation_request(text)
+    )
+
+
+def _git_inspection_guidance(user_input: str) -> str:
+    """Tell the tool agent to inspect the repo before mutating it.
+
+    The agent still chooses and runs the typed Git tools itself (and every
+    mutation still passes through the existing command-safety/approval system);
+    this only nudges the read-before-write ordering the task requires and bans
+    destructive shortcuts."""
+    low = user_input.lower()
+    lines = [
+        "This is a Git/repo request. Use the typed git_* tools only; do not run",
+        "raw shell git or invent commands. Inspect before you mutate:",
+    ]
+    if any(p in low for p in ("commit",)):
+        lines.append(
+            "- Before committing: call git_status, git_diff, then git_add_all "
+            "(or git_add), then git_diff_staged, then git_commit."
+        )
+    elif is_git_mutation_request(user_input) and any(
+        p in low for p in ("stage", "add")
+    ):
+        lines.append("- Before staging: call git_status (and git_diff), then git_add_all or git_add, then git_status again.")
+    if any(p in low for p in ("push",)):
+        lines.append(
+            "- Before pushing: call git_branch, git_remote, and "
+            "git_unpushed_commits, then git_push only after that. Never "
+            "force-push and never reset."
+        )
+    lines.append(
+        "- Read-only inspection tools are safe to run first without asking. "
+        "Do not use reset --hard, force-push, or any destructive operation."
+    )
+    return "\n".join(lines)
+
+
+def _format_git_read_result(tool_name: str, result: "ToolResult") -> str:
+    label = {"git_status": "git status", "git_diff": "git diff"}.get(tool_name, tool_name)
+    if not result.ok:
+        detail = result.data.get("stderr") or result.data.get("error") or result.message
+        return f"$ {label}\n{detail}".strip()
+    data = result.data
+    if tool_name == "git_status":
+        if not data.get("is_git_repo", True):
+            return "$ git status\nThis workspace is not a git repository."
+        raw = (data.get("raw_output") or "").strip()
+        if not data.get("is_dirty"):
+            return "$ git status\nWorking tree clean (no changes)."
+        changed = data.get("changed_files") or []
+        body = raw or "\n".join(changed)
+        return f"$ git status\n{body}".strip()
+    # git_diff and other GitCommandResult-backed tools
+    output = (data.get("stdout") or "").strip()
+    if not output:
+        return f"$ {label}\n(no output)"
+    if len(output) > 4000:
+        output = output[:4000] + "\n... [diff truncated]"
+    return f"$ {label}\n{output}"
+
+
+def _run_git_read_only(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    trace: Callable[[str], None],
+) -> None:
+    """Answer a read-only Git request deterministically (no LLM): run the read
+    tools through the same registry/command-safety stack and summarize."""
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=get_current_run(),
+    )
+    sections: list[str] = []
+    for tool_name in ("git_status", "git_diff"):
+        trace(f"tool={tool_name} args={{}}")
+        result = registry.execute(tool_name, {})
+        _log_event(
+            session_logger,
+            "tool.git_read",
+            {"tool": tool_name, "ok": result.ok},
+            f"Git read tool {tool_name}",
+            workflow_id="git",
+        )
+        sections.append(_format_git_read_result(tool_name, result))
+    body = "\n\n".join(section for section in sections if section).strip() or "No git output."
+    console.print(Panel(body, title="Git"))
+    _log_assistant_message(session_logger, body, workflow_id="git-read")
+
+
+async def _handle_git_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+    agent_context: str = "",
+) -> None:
+    """Route a Git/repo request to the Git tools.
+
+    Classified before web-search / QA / code-edit routing. Read-only requests
+    are answered deterministically; mutation (or mixed) requests go to the tool
+    agent, which is told to inspect the repo first and still runs every write
+    through the existing command-safety/approval system."""
+    mutation = is_git_mutation_request(user_input)
+    read_only = is_read_only_git_request(user_input)
+    route = "git_write" if mutation else "git_read"
+    trace_mode = _trace_mode(workspace)
+
+    def trace(line: str) -> None:
+        if trace_mode != "quiet":
+            console.print(f"[dim]{line}[/dim]")
+
+    trace(f"route={route} confidence=0.95 reason=git_override")
+    _log_event(
+        session_logger,
+        "routing.git_override",
+        {"route": route, "reason": "git_override", "read_only": read_only, "mutation": mutation},
+        f"Git override routed to {route}",
+        workflow_id="git",
+    )
+
+    if not mutation and read_only:
+        trace("selected_workflow=git_read_only")
+        _run_git_read_only(user_input, workspace, console, session_logger, trace)
+        return
+
+    trace("selected_workflow=agent_tools")
+    guidance = _git_inspection_guidance(user_input)
+    harness_input = _append_agent_context(user_input, guidance)
+    if agent_context:
+        harness_input = _append_agent_context(harness_input, agent_context)
+    await _run_agent_chat(
+        harness_input,
+        workspace,
+        console,
+        session_logger=session_logger,
+    )
 
 
 _PRD_CONTEXT_QUESTION_PHRASES = (
@@ -3723,6 +4220,33 @@ def _bugfix_request_has_actionable_target(user_input: str) -> bool:
             "exception",
         )
     )
+
+
+def _bugfix_report_from_last_failure(
+    user_input: str, session_logger: SessionLogger | None
+) -> tuple[str, str] | None:
+    """Build a bug-fix report from the last failing command + errors stored in
+    session memory, or None if there is nothing to reuse. Returns (report,
+    command) so the caller can tell the user which command it reused."""
+    if session_logger is None:
+        return None
+    try:
+        failure = session_logger.get_last_failure()
+    except Exception:
+        return None
+    command = str(failure.get("command", "")).strip()
+    errors = str(failure.get("errors", "")).strip()
+    if not errors and not command:
+        return None
+    exit_code = failure.get("exit_code", "")
+    intent = _strip_forced_prefix(user_input, "fix").strip() or "Repair the reported build/test failure."
+    report = (
+        f"{intent}\n\n"
+        f"Last failing command: {command or '(unknown)'}\n"
+        f"Exit code: {exit_code}\n\n"
+        f"Errors / output from that command:\n{errors or '(no captured output)'}"
+    )
+    return report, command or "(unknown)"
 
 _FILE_WRITE_VERBS = {
     "create", "write", "save", "generate", "make", "add", "edit", "update",
@@ -4880,13 +5404,10 @@ async def _run_agent_chat(
         progress.done("Agent finished")
     console.print(Panel(_agent_display_summary(body, activities), title="Agent"))
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
-    _record_task_memory(
-        workspace,
-        f"Task summary: agent-chat completed for request: {user_input[:500]}",
-        "task_summary",
-        session_logger,
-        {"workflow": "agent-chat"},
-    )
+    # Update the session summary and durable memory only when the agent actually
+    # finished the work (a stopped/looping run is not a completed task).
+    if not result.stopped:
+        _finalize_session_work(session_logger, "agent-chat", user_input)
 
 
 def _should_show_context_preview() -> bool:
@@ -5333,6 +5854,12 @@ async def _run_bug_fix(
     result = await BugFixWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "fix")
     )
+    remapped = getattr(result, "remapped_paths", []) or []
+    if remapped:
+        lines = "\n".join(f"- {reported} -> {resolved}" for reported, resolved in remapped)
+        console.print(
+            f"[dim]The reported path(s) didn't exist; I edited the real workspace file(s):\n{lines}[/dim]"
+        )
     if getattr(result, "used_full_rewrite", False):
         console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
     message = _print_patch_result(
@@ -5750,6 +6277,10 @@ def main(argv: list[str] | None = None) -> None:
             "User submitted prompt",
             workflow_id="repl",
         )
+        # Auto-name a still-placeholder session from its first meaningful,
+        # natural-language prompt (slash commands never name a session).
+        if not user_input.startswith("/"):
+            session_manager.maybe_auto_title(session_logger, user_input)
         # A pending clarification question takes priority: interpret this reply
         # as its answer instead of routing it as a brand-new prompt. A slash
         # command clearly changes topic, so we let it clear the question below.
@@ -5797,7 +6328,7 @@ def main(argv: list[str] | None = None) -> None:
             _handle_doctor(workspace, console)
             continue
         if lowered_input.startswith("memory"):
-            _handle_memory(normalized_input, workspace, console)
+            _handle_memory(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("abstract"):
             _handle_abstract(normalized_input, workspace, console)
@@ -5925,13 +6456,32 @@ def main(argv: list[str] | None = None) -> None:
             _handle_run(normalized_input, workspace, console)
             continue
 
-        ledger = start_run(workspace, user_input)
+        # Follow-up resolution against a stored pending action: a bare
+        # "yes"/"no"/"do it" resolves the prior action instead of entering the
+        # model/tool loop as a fresh, context-free prompt. Dispatching a
+        # confirmed action still passes through the normal approval gates, so
+        # this never bypasses safety.
+        dispatch_input = user_input
+        pending_action = session_logger.get_pending_action()
+        if pending_action:
+            if is_negative(user_input):
+                session_logger.clear_pending_action()
+                console.print("[yellow]Cancelled the pending action.[/yellow]")
+                continue
+            if is_affirmative(user_input) and pending_action.get("awaiting") == "confirmation":
+                origin = str(pending_action.get("created_from_prompt", "")).strip()
+                session_logger.clear_pending_action()
+                if origin:
+                    dispatch_input = f"{origin}\n\n[User confirmed: proceed with this request.]"
+                console.print("[dim]Resolving your confirmation against the pending action.[/dim]")
+
+        ledger = start_run(workspace, dispatch_input)
         set_current_run(ledger)
         try:
             with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
                 asyncio.run(
                     _handle_request(
-                        user_input,
+                        dispatch_input,
                         workspace,
                         console,
                         web_tool,

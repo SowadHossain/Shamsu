@@ -7,6 +7,11 @@ from typing import Any
 
 from shamsu.session.manager import SessionLogger
 
+# Compaction: hydrate only the most recent N transcript turns. The session
+# summary and long-term memory carry older context separately, so we never
+# replay the entire history into the model.
+HYDRATE_MAX_MESSAGES = 80
+
 
 @dataclass
 class ChatMessage:
@@ -126,6 +131,9 @@ class ChatState:
     def _append(self, message: ChatMessage, persist: bool) -> None:
         self._messages.append(message)
         if persist and self.session_logger:
+            # Two sinks: the rich `chat.message` event (kept for the trace/audit
+            # timeline and backward compatibility) and the compact, redacted
+            # `messages.jsonl` transcript that hydration prefers.
             self.session_logger.log(
                 "chat.message",
                 {
@@ -138,26 +146,45 @@ class ChatState:
                 f"Chat message appended: {message.role}",
                 workflow_id="chat",
             )
+            self.session_logger.append_message(
+                message.role,
+                message.content,
+                tool_call_id=message.tool_call_id,
+                name=message.name,
+                tool_calls=message.tool_calls,
+            )
 
     def _hydrate_from_session(self) -> None:
         if not self.session_logger:
             return
-        for event in self.session_logger.tail(80):
-            payload = event.get("payload", {})
-            if event.get("event_type") == "chat.message":
-                role = str(payload.get("role", "")).strip()
-                content = str(payload.get("content", ""))
-                if role in {"user", "assistant", "tool"} and _should_hydrate_chat_message(role, content):
-                    self._append(
-                        ChatMessage(
-                            role=role,
-                            content=content,
-                            tool_call_id=str(payload.get("tool_call_id", "")),
-                            name=str(payload.get("name", "")),
-                            tool_calls=_list_of_dicts(payload.get("tool_calls", [])),
-                        ),
-                        persist=False,
-                    )
+        # Prefer the clean transcript; only fall back to scanning events.jsonl
+        # for chat.message when no transcript exists (older sessions).
+        if self.session_logger.messages_path.exists():
+            records = self.session_logger.read_messages(HYDRATE_MAX_MESSAGES)
+            self._hydrate_records(records, key_content="content")
+            return
+        events = [
+            event.get("payload", {})
+            for event in self.session_logger.tail(HYDRATE_MAX_MESSAGES)
+            if event.get("event_type") == "chat.message"
+        ]
+        self._hydrate_records(events, key_content="content")
+
+    def _hydrate_records(self, records: list[dict[str, Any]], key_content: str) -> None:
+        for payload in records:
+            role = str(payload.get("role", "")).strip()
+            content = str(payload.get(key_content, ""))
+            if role in {"user", "assistant", "tool"} and _should_hydrate_chat_message(role, content):
+                self._append(
+                    ChatMessage(
+                        role=role,
+                        content=content,
+                        tool_call_id=str(payload.get("tool_call_id", "")),
+                        name=str(payload.get("name", "")),
+                        tool_calls=_list_of_dicts(payload.get("tool_calls", [])),
+                    ),
+                    persist=False,
+                )
 
 def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):

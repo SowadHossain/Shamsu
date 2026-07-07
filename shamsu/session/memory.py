@@ -1,6 +1,7 @@
 """Compact conversation memory built from workspace-local session logs."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from shamsu.session.manager import SessionLogger
@@ -29,6 +30,34 @@ FOLLOWUP_GENERIC = {
     "continue",
 }
 
+# Affirmative / negative replies that resolve a stored pending action instead of
+# entering the model/tool loop as a fresh, context-free prompt.
+AFFIRMATIVE_REPLIES = {
+    "yes", "yep", "yeah", "yup", "sure", "ok", "okay", "k", "do it", "go ahead",
+    "proceed", "continue", "confirm", "confirmed", "please do", "go for it",
+    "sounds good", "affirmative", "y",
+}
+NEGATIVE_REPLIES = {
+    "no", "nope", "nah", "cancel", "stop", "don't", "dont", "do not",
+    "abort", "never mind", "nevermind", "forget it", "n",
+}
+
+
+def _normalize_reply(text: str) -> str:
+    return re.sub(r"[^a-z0-9' ]", "", text.lower()).strip()
+
+
+def is_affirmative(text: str) -> bool:
+    """True for a bare yes/continue/do-it style confirmation (not a sentence)."""
+    normalized = _normalize_reply(text)
+    return normalized in AFFIRMATIVE_REPLIES
+
+
+def is_negative(text: str) -> bool:
+    """True for a bare no/cancel/stop style rejection (not a sentence)."""
+    normalized = _normalize_reply(text)
+    return normalized in NEGATIVE_REPLIES
+
 
 @dataclass(frozen=True)
 class ConversationTurn:
@@ -48,7 +77,15 @@ class ConversationMemory:
         for event in logger.tail(max_events):
             event_type = event.get("event_type", "")
             payload = event.get("payload", {})
-            if event_type == "user.prompt":
+            if event_type == "chat.message":
+                # The ReAct loop writes user/assistant/tool as chat.message.
+                # Tool turns are machine output, not natural-language context
+                # for follow-up resolution, so they are skipped here.
+                role = str(payload.get("role", "")).strip()
+                content = str(payload.get("content", "")).strip()
+                if role in {"user", "assistant"} and content:
+                    turns.append(ConversationTurn(role, content))
+            elif event_type == "user.prompt":
                 prompt = str(payload.get("prompt", "")).strip()
                 if prompt:
                     turns.append(ConversationTurn("user", prompt))
