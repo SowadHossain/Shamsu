@@ -14,6 +14,7 @@ from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
+from shamsu.tools.git import GitCommandResult, GitTool
 from shamsu.tools.workspace import WorkspaceTool
 from shamsu.types import ApprovalRequest
 
@@ -55,6 +56,10 @@ class AgentToolRegistry:
         self.approval_func = approval_func
         self.session_logger = session_logger
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
+
+        # Git commands run through the same CommandRunner so command safety,
+        # approval, logging, timeout handling, and diagnostics still apply.
+        self.git_tool = GitTool(self.workspace_root, command_runner=self.command_runner)
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         return [
@@ -105,6 +110,246 @@ class AgentToolRegistry:
                 {"query": {"type": "string", "description": "Search query."}},
                 required=["query"],
             ),
+
+            # -----------------------------------------------------------------
+            # Git read tools
+            # -----------------------------------------------------------------
+            _tool_schema(
+                "git_status",
+                "Show short git status for the workspace. Use before committing or pushing.",
+                {},
+            ),
+            _tool_schema(
+                "git_status_full",
+                "Show full git status for the workspace.",
+                {},
+            ),
+            _tool_schema(
+                "git_diff",
+                "Show unstaged git diff for the workspace.",
+                {},
+            ),
+            _tool_schema(
+                "git_diff_staged",
+                "Show staged git diff for the workspace.",
+                {},
+            ),
+            _tool_schema(
+                "git_diff_file",
+                "Show git diff for one file.",
+                {"filepath": {"type": "string", "description": "Relative file path."}},
+                required=["filepath"],
+            ),
+            _tool_schema(
+                "git_branch",
+                "Show the current git branch.",
+                {},
+            ),
+            _tool_schema(
+                "git_branches",
+                "List git branches.",
+                {
+                    "all_branches": {
+                        "type": "string",
+                        "description": "Use true to include remote branches.",
+                        "default": "false",
+                    }
+                },
+            ),
+            _tool_schema(
+                "git_remote",
+                "Show configured git remotes.",
+                {},
+            ),
+            _tool_schema(
+                "git_log",
+                "Show recent git commits.",
+                {
+                    "limit": {
+                        "type": "string",
+                        "description": "Number of commits to show. Default 10, max 100.",
+                        "default": "10",
+                    }
+                },
+            ),
+            _tool_schema(
+                "git_unpushed_commits",
+                "Show commits that exist locally but not on the remote branch. Use before pushing.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If omitted, current branch is used.",
+                        "default": "",
+                    },
+                    "limit": {
+                        "type": "string",
+                        "description": "Number of commits to show. Default 20, max 100.",
+                        "default": "20",
+                    },
+                },
+            ),
+
+            # -----------------------------------------------------------------
+            # Git mutation tools
+            # -----------------------------------------------------------------
+            _tool_schema(
+                "git_add",
+                "Stage specific files for commit. Always inspect git_status and git_diff first.",
+                {
+                    "paths": {
+                        "type": "string",
+                        "description": "Comma-separated relative file paths to stage.",
+                    }
+                },
+                required=["paths"],
+            ),
+            _tool_schema(
+                "git_add_all",
+                "Stage all workspace changes. Use only when the user clearly wants all changes staged.",
+                {},
+            ),
+            _tool_schema(
+                "git_commit",
+                "Create a git commit with a message. Always inspect git_status and git_diff or git_diff_staged first.",
+                {
+                    "message": {
+                        "type": "string",
+                        "description": "Commit message.",
+                    }
+                },
+                required=["message"],
+            ),
+            _tool_schema(
+                "git_create_branch",
+                "Create a new git branch. Optionally check it out.",
+                {
+                    "branch": {
+                        "type": "string",
+                        "description": "New branch name.",
+                    },
+                    "checkout": {
+                        "type": "string",
+                        "description": "Use true to switch to the new branch. Default true.",
+                        "default": "true",
+                    },
+                },
+                required=["branch"],
+            ),
+            _tool_schema(
+                "git_checkout",
+                "Switch to an existing git branch.",
+                {
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name.",
+                    }
+                },
+                required=["branch"],
+            ),
+            _tool_schema(
+                "git_restore",
+                "Restore file changes. This may discard local edits. Use only when the user explicitly asks.",
+                {
+                    "paths": {
+                        "type": "string",
+                        "description": "Comma-separated relative file paths to restore.",
+                    },
+                    "staged": {
+                        "type": "string",
+                        "description": "Use true to unstage instead of restoring working tree changes.",
+                        "default": "false",
+                    },
+                },
+                required=["paths"],
+            ),
+            _tool_schema(
+                "git_stash_push",
+                "Create a git stash. Use when the user wants to save local changes temporarily.",
+                {
+                    "message": {
+                        "type": "string",
+                        "description": "Optional stash message.",
+                        "default": "",
+                    },
+                    "include_untracked": {
+                        "type": "string",
+                        "description": "Use true to include untracked files.",
+                        "default": "false",
+                    },
+                },
+            ),
+            _tool_schema(
+                "git_stash_list",
+                "List git stashes.",
+                {},
+            ),
+            _tool_schema(
+                "git_stash_pop",
+                "Apply and remove the latest git stash. This can modify files.",
+                {},
+            ),
+
+            # -----------------------------------------------------------------
+            # Git remote/network tools
+            # -----------------------------------------------------------------
+            _tool_schema(
+                "git_fetch",
+                "Fetch from a git remote.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "prune": {
+                        "type": "string",
+                        "description": "Use true to prune deleted remote branches.",
+                        "default": "false",
+                    },
+                },
+            ),
+            _tool_schema(
+                "git_pull",
+                "Pull from a git remote. Use with care if the workspace has local changes.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If omitted, git decides based on tracking branch.",
+                        "default": "",
+                    },
+                },
+            ),
+            _tool_schema(
+                "git_push",
+                "Push the current or specified branch to a remote. Use only when the user explicitly asks to push.",
+                {
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name. Default origin.",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch name. If omitted, current branch is used.",
+                        "default": "",
+                    },
+                    "set_upstream": {
+                        "type": "string",
+                        "description": "Use true to push with -u and set upstream.",
+                        "default": "false",
+                    },
+                },
+            ),
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -129,6 +374,143 @@ class AgentToolRegistry:
                 )
             if name == "search_index":
                 return self.search_index(str(arguments.get("query") or ""))
+
+            # -----------------------------------------------------------------
+            # Git read tools
+            # -----------------------------------------------------------------
+            if name == "git_status":
+                status = self.git_tool.status()
+                return ToolResult(
+                    True,
+                    "Read git status.",
+                    {
+                        "is_git_repo": status.is_git_repo,
+                        "is_dirty": status.is_dirty,
+                        "changed_files": status.changed_files,
+                        "raw_output": status.raw_output,
+                        "error": status.error,
+                    },
+                )
+
+            if name == "git_status_full":
+                return _git_tool_result(self.git_tool.status_full())
+
+            if name == "git_diff":
+                result = self.git_tool.diff_result()
+                return _git_tool_result(result)
+
+            if name == "git_diff_staged":
+                return _git_tool_result(self.git_tool.diff_staged())
+
+            if name == "git_diff_file":
+                return _git_tool_result(self.git_tool.diff_file(str(arguments.get("filepath") or "")))
+
+            if name == "git_branch":
+                return _git_tool_result(self.git_tool.branch())
+
+            if name == "git_branches":
+                return _git_tool_result(
+                    self.git_tool.branches(
+                        all_branches=_as_bool(arguments.get("all_branches")),
+                    )
+                )
+
+            if name == "git_remote":
+                return _git_tool_result(self.git_tool.remote())
+
+            if name == "git_log":
+                return _git_tool_result(
+                    self.git_tool.log(
+                        limit=_as_int(arguments.get("limit"), default=10, minimum=1, maximum=100),
+                    )
+                )
+
+            if name == "git_unpushed_commits":
+                return _git_tool_result(
+                    self.git_tool.unpushed_commits(
+                        remote=str(arguments.get("remote") or "origin"),
+                        branch=str(arguments.get("branch") or ""),
+                        limit=_as_int(arguments.get("limit"), default=20, minimum=1, maximum=100),
+                    )
+                )
+
+            # -----------------------------------------------------------------
+            # Git mutation tools
+            # -----------------------------------------------------------------
+            if name == "git_add":
+                return _git_tool_result(
+                    self.git_tool.add(
+                        _split_csv(arguments.get("paths")),
+                    )
+                )
+
+            if name == "git_add_all":
+                return _git_tool_result(self.git_tool.add_all())
+
+            if name == "git_commit":
+                return _git_tool_result(self.git_tool.commit(str(arguments.get("message") or "")))
+
+            if name == "git_create_branch":
+                return _git_tool_result(
+                    self.git_tool.create_branch(
+                        branch=str(arguments.get("branch") or ""),
+                        checkout=_as_bool(arguments.get("checkout"), default=True),
+                    )
+                )
+
+            if name == "git_checkout":
+                return _git_tool_result(self.git_tool.checkout(str(arguments.get("branch") or "")))
+
+            if name == "git_restore":
+                return _git_tool_result(
+                    self.git_tool.restore(
+                        paths=_split_csv(arguments.get("paths")),
+                        staged=_as_bool(arguments.get("staged")),
+                    )
+                )
+
+            if name == "git_stash_push":
+                return _git_tool_result(
+                    self.git_tool.stash_push(
+                        message=str(arguments.get("message") or ""),
+                        include_untracked=_as_bool(arguments.get("include_untracked")),
+                    )
+                )
+
+            if name == "git_stash_list":
+                return _git_tool_result(self.git_tool.stash_list())
+
+            if name == "git_stash_pop":
+                return _git_tool_result(self.git_tool.stash_pop())
+
+            # -----------------------------------------------------------------
+            # Git remote/network tools
+            # -----------------------------------------------------------------
+            if name == "git_fetch":
+                return _git_tool_result(
+                    self.git_tool.fetch(
+                        remote=str(arguments.get("remote") or "origin"),
+                        prune=_as_bool(arguments.get("prune")),
+                    )
+                )
+
+            if name == "git_pull":
+                return _git_tool_result(
+                    self.git_tool.pull(
+                        remote=str(arguments.get("remote") or "origin"),
+                        branch=str(arguments.get("branch") or ""),
+                    )
+                )
+
+            if name == "git_push":
+                return _git_tool_result(
+                    self.git_tool.push(
+                        remote=str(arguments.get("remote") or "origin"),
+                        branch=str(arguments.get("branch") or ""),
+                        set_upstream=_as_bool(arguments.get("set_upstream")),
+                    )
+                )
+
             return ToolResult(False, f"Unknown tool: {name}", {"tool": name})
         except Exception as exc:
             return ToolResult(False, str(exc), {"tool": name})
@@ -184,7 +566,14 @@ class AgentToolRegistry:
         # to overwrite a file with no safety net.
         transaction_id = self.transactions.begin(
             reason=f"Agent write_file: {filepath}",
-            operations=[{"op": "edit_file" if exists else "create_file", "path": filepath, "dest_path": "", "reason": ""}],
+            operations=[
+                {
+                    "op": "edit_file" if exists else "create_file",
+                    "path": filepath,
+                    "dest_path": "",
+                    "reason": "",
+                }
+            ],
             destructive=False,
         )
         self.transactions.backup_file(transaction_id, filepath)
@@ -237,6 +626,40 @@ class AgentToolRegistry:
         )
 
 
+def _git_tool_result(result: GitCommandResult) -> ToolResult:
+    return ToolResult(
+        result.ok,
+        result.message or ("Git command completed." if result.ok else "Git command failed."),
+        {
+            "command": result.command,
+            "exit_code": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        },
+    )
+
+
+def _split_csv(value: Any) -> list[str]:
+    text = str(value or "")
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(str(value or default))
+    except ValueError:
+        number = default
+    return max(minimum, min(number, maximum))
+
+
 def _mark_code_memory_stale(workspace_root: Path) -> None:
     """Best-effort: never let code-memory bookkeeping break a successful write."""
     try:
@@ -278,7 +701,7 @@ def _compact_value(value: Any, limit: int = 6000) -> Any:
     if isinstance(value, dict):
         items = list(value.items())[:40]
         per_item_limit = max(limit // max(len(items), 1), 500)
-        compacted = {str(key): _compact_value(item, per_item_limit) for key, item in items}
+        compacted = {str(key): _compact_value(item, per_item_limit) for item in items}
         if len(value) > len(items):
             compacted["..."] = f"truncated {len(value) - len(items)} key(s)"
         return compacted
