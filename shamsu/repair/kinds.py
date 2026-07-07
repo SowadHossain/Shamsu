@@ -58,12 +58,17 @@ _TS_CODE_KIND: dict[str, ErrorKind] = {
     "TS2724": ErrorKind.EXPORT_ERROR,     # has no exported member named 'X'
     "TS6142": ErrorKind.JSX_ERROR,
     "TS17004": ErrorKind.JSX_ERROR,
+    "TS17002": ErrorKind.JSX_ERROR,       # Expected corresponding JSX closing tag
+    "TS2657": ErrorKind.JSX_ERROR,        # JSX expressions must have one parent
+    "TS2604": ErrorKind.JSX_ERROR,
+    "TS2786": ErrorKind.JSX_ERROR,
     "TS7006": ErrorKind.TYPE_ERROR,       # parameter implicitly 'any'
     "TS7031": ErrorKind.TYPE_ERROR,
 }
 
 _CATEGORY_KIND: dict[str, ErrorKind] = {
     "syntax_error": ErrorKind.SYNTAX_ERROR,
+    "jsx_error": ErrorKind.JSX_ERROR,
     "import_error": ErrorKind.IMPORT_ERROR,
     "module_not_found": ErrorKind.MODULE_NOT_FOUND,
     "missing_export": ErrorKind.EXPORT_ERROR,
@@ -71,6 +76,7 @@ _CATEGORY_KIND: dict[str, ErrorKind] = {
     "runtime_missing_export": ErrorKind.EXPORT_ERROR,
     "type_error": ErrorKind.TYPE_ERROR,
     "compiler_error": ErrorKind.TYPE_ERROR,
+    "npm_error": ErrorKind.UNKNOWN,
 }
 
 

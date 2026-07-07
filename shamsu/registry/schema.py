@@ -8,6 +8,7 @@ from pathlib import Path
 
 class Category(str, Enum):
     MULTIPLAYER_GAME = "multiplayer-game"
+    GAME_2D = "game-2d"
     PORTFOLIO_SITE = "portfolio-site"
     MULTI_TENANT_ADMIN = "multi-tenant-admin"
     ECOMMERCE = "ecommerce"

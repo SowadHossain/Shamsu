@@ -7,6 +7,9 @@ runner: "node smoke/dod.mjs"
 items:
   - id: build.succeeds
     description: "Client and server build with no errors."
+    check: build_succeeds
+    args:
+      command: "npm install && npm run build"
     severity: required
   - id: menu.renders
     description: "Main menu is visible on load."

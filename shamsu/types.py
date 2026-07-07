@@ -197,6 +197,11 @@ class ProjectSpec:
     manifest_path: str = ""
     dod_path: str = ""
     feature_requests: list[str] = field(default_factory=list)
+    # Populated by build_project_spec: the structured PRD (source of truth) and
+    # the chosen generation strategy. Typed as Any to avoid importing the prd/
+    # registry dataclasses into this base types module.
+    prd_contract: Any = None            # shamsu.prd.contract.PRDContract
+    suitability: Any = None             # shamsu.registry.suitability.TemplateSuitability
 
 
 # ─────────────────────────────────────────────────────────────────────────

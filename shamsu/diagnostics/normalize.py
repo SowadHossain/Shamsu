@@ -14,6 +14,9 @@ _TOOL_HINTS: list[tuple[str, str, str]] = [
     ("npm run build", "npm build", "javascript"),
     ("npm run dev", "npm dev", "javascript"),
     ("npm test", "npm test", "javascript"),
+    # Generic npm (install/ci/...) - keep AFTER the specific npm scripts so they
+    # win; also matches "npm ERR!"/"npm error" in output for bare commands.
+    ("npm", "npm", "javascript"),
     ("pytest", "pytest", "python"),
     ("ruff", "ruff", "python"),
     ("manage.py test", "django test", "python"),

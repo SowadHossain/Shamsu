@@ -28,6 +28,8 @@ CATEGORY_PRIORITY = {
     "module_not_found": 0,
     "import_error": 0,
     "syntax_error": 1,
+    "jsx_error": 1,
+    "npm_error": 2,
     "type_error": 2,
     "compiler_error": 2,
     "exception": 2,

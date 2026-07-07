@@ -4,11 +4,13 @@ from __future__ import annotations
 import re
 
 from shamsu.prd.classifier import classify_archetype
+from shamsu.prd.contract import extract_contract
 from shamsu.prd.extractor import extract_entities
 from shamsu.registry import load_registry_entry
 from shamsu.registry.categories import CATEGORY_TO_ARCHETYPE
 from shamsu.registry.detector import detect_category
 from shamsu.registry.schema import Category
+from shamsu.registry.suitability import assess
 from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
 
@@ -31,6 +33,12 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
     )
     master_prompt, manifest_path, dod_path = _registry_metadata(category)
 
+    # Source-of-truth PRD contract + generation strategy. Suitability decides
+    # whether a template fits (and which) or whether to generate template-free;
+    # it does not mutate `category` (kept as the raw detected category).
+    contract = extract_contract(parsed)
+    suitability = assess(contract, category, selected_archetype)
+
     return ProjectSpec(
         project_name=project_name,
         app_name=app_name,
@@ -51,6 +59,8 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         manifest_path=manifest_path,
         dod_path=dod_path,
         feature_requests=_feature_requests(parsed),
+        prd_contract=contract,
+        suitability=suitability,
     )
 
 

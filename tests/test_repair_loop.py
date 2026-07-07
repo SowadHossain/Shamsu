@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.repair.comparator import ErrorComparator, RepairOutcome
@@ -13,11 +14,13 @@ from shamsu.repair.kinds import (
     select_primary_error,
 )
 from shamsu.repair.loop import RepairLoop, VerifyRun
+from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.prompt import (
     contains_unverified_success_claim,
     enforce_final_response,
 )
 from shamsu.repair.types import DebugContext, RepairPlan
+from shamsu.repair.verifiers import CommandVerifier
 
 
 # --- fakes --------------------------------------------------------------------
@@ -78,6 +81,48 @@ def test_vite_import_error_parsed_and_classified(tmp_path: Path):
     assert primary.kind is ErrorKind.IMPORT_ERROR
     assert primary.file == "src/ui/index.ts"
     assert primary.module == "./ui/Hud"
+
+
+def test_jsx_error_classified_and_carries_location(tmp_path: Path):
+    log = "src/ui/App.tsx(12,7): error TS17004: Cannot use JSX unless the '--jsx' flag is provided."
+    packet = DiagnosticDigest(tmp_path).run("tsc", tmp_path, 2, log, "")
+    errors = repair_errors_from_packet(packet)
+    assert errors
+    assert errors[0].kind is ErrorKind.JSX_ERROR
+    assert errors[0].file == "src/ui/App.tsx"
+    assert errors[0].line == 12
+
+
+def test_npm_missing_script_parsed(tmp_path: Path):
+    log = 'npm ERR! Missing script: "build"\nnpm ERR! code ELIFECYCLE'
+    packet = DiagnosticDigest(tmp_path).run("npm run build", tmp_path, 1, log, "")
+    errors = repair_errors_from_packet(packet)
+    assert errors
+    primary = errors[0]
+    assert primary.tool == "npm"
+    assert "build" in primary.symbol or "build" in primary.message
+
+
+def test_npm_missing_package_is_module_not_found(tmp_path: Path):
+    log = "npm ERR! code E404\nnpm ERR! 404 Not Found - GET https://registry.npmjs.org/nope - 'nope@1.0.0'"
+    packet = DiagnosticDigest(tmp_path).run("npm install", tmp_path, 1, log, "")
+    errors = repair_errors_from_packet(packet)
+    kinds = {e.kind for e in errors}
+    assert ErrorKind.MODULE_NOT_FOUND in kinds
+
+
+def test_tsc_error_beats_npm_lifecycle_as_root(tmp_path: Path):
+    # The real compiler error must be the root cause, not the npm wrapper noise.
+    log = (
+        "src/app.ts(10,4): error TS2305: Module './util' has no exported member 'foo'.\n"
+        "npm ERR! code ELIFECYCLE\nnpm ERR! Exit status 2"
+    )
+    packet = DiagnosticDigest(tmp_path).run("npm run build", tmp_path, 1, log, "")
+    errors = repair_errors_from_packet(packet)
+    primary = select_primary_error(errors)
+    assert primary is not None
+    assert primary.kind is ErrorKind.EXPORT_ERROR
+    assert primary.file == "src/app.ts"
 
 
 def test_primary_selector_prefers_syntax_then_import(tmp_path: Path):
@@ -248,3 +293,144 @@ def test_loop_debug_context_carries_import_suggestion(tmp_path: Path):
     assert proposer.seen  # propose was called
     assert "./Hud" in proposer.seen[0].import_suggestion
     assert result.success is True
+
+
+# --- Phase 0: CommandVerifier + LLMProposer adapters --------------------------
+
+class FakeRunner:
+    """Stands in for CommandRunner: returns queued (exit, out, err) per run."""
+
+    def __init__(self, runs: list[tuple[int, str, str]]) -> None:
+        self._runs = runs
+        self.calls: list[tuple[str, str]] = []
+
+    def run(self, command: str, cwd) -> tuple[int, str, str]:
+        idx = min(len(self.calls), len(self._runs) - 1)
+        self.calls.append((command, str(cwd)))
+        return self._runs[idx]
+
+
+def test_command_verifier_maps_exit_and_output(tmp_path: Path):
+    runner = FakeRunner([(2, "TS error here", "stderr line")])
+    verifier = CommandVerifier("tsc --noEmit", runner, tmp_path)
+    run = verifier.run()
+    assert verifier.command == "tsc --noEmit"
+    assert run.exit_code == 2
+    assert run.stdout == "TS error here"
+    assert run.stderr == "stderr line"
+    assert runner.calls == [("tsc --noEmit", str(tmp_path))]
+
+
+def test_command_verifier_drives_loop_to_solved(tmp_path: Path):
+    _write_ts_project(tmp_path)
+    runner = FakeRunner([(2, TSC_ERR, ""), (0, "", "")])  # fail then pass
+    verifier = CommandVerifier("tsc --noEmit", runner, tmp_path)
+    plan = RepairPlan(root_cause="missing export", target_file="src/app.ts",
+                      full_content="export const foo = 1;\n")
+    loop = RepairLoop(tmp_path, verifier, ScriptedProposer([plan]), max_attempts=3)
+    result = loop.run()
+    assert result.success is True
+    assert result.exit_code == 0
+
+
+def test_llm_proposer_parses_json_plan():
+    def generate(system: str, user: str, schema: dict) -> str:
+        assert "STRICT DEBUG MODE" in system
+        return (
+            '{"root_cause": "missing export", "target_file": "src/app.ts", '
+            '"search": "const foo", "replace": "export const foo"}'
+        )
+
+    proposer = LLMProposer(generate)
+    context = _debug_context()
+    plan = proposer.propose(context)
+    assert plan is not None
+    assert plan.target_file == "src/app.ts"
+    assert plan.search == "const foo"
+    assert plan.replace == "export const foo"
+
+
+def test_llm_proposer_repairs_malformed_json():
+    # Trailing prose + missing brace: json_repair should still recover it.
+    def generate(system: str, user: str, schema: dict) -> str:
+        return 'Here is the fix: {"root_cause": "x", "target_file": "a.ts", "full_content": "y"'
+
+    plan = LLMProposer(generate).propose(_debug_context())
+    assert plan is not None
+    assert plan.target_file == "a.ts"
+    assert plan.full_content == "y"
+
+
+def test_llm_proposer_returns_none_on_empty_output():
+    assert LLMProposer(lambda system, user, schema: "").propose(_debug_context()) is None
+    assert LLMProposer(lambda system, user, schema: "   ").propose(_debug_context()) is None
+
+
+def test_llm_proposer_returns_none_without_edit():
+    # A plan with neither search nor full_content is not actionable.
+    def generate(system: str, user: str, schema: dict) -> str:
+        return '{"root_cause": "x", "target_file": "a.ts"}'
+
+    assert LLMProposer(generate).propose(_debug_context()) is None
+
+
+def test_llm_proposer_survives_generate_exception():
+    def generate(system: str, user: str, schema: dict) -> str:
+        raise RuntimeError("model transport failed")
+
+    assert LLMProposer(generate).propose(_debug_context()) is None
+
+
+def _debug_context() -> DebugContext:
+    err = RepairError("tsc", 2, "tsc", ErrorKind.EXPORT_ERROR, "src/app.ts", 10, 4,
+                      "TS2305", "foo", "./util", "no exported member", "", "error")
+    return DebugContext(primary_error=err, verify_command="tsc --noEmit")
+
+
+# --- Phase 6: DjangoTestVerifier drives the general RepairLoop ----------------
+
+class ScriptedDjangoRunner:
+    """Django-style test runner: queued (failed, raw_output) per run."""
+
+    def __init__(self, runs: list[tuple[int, str]]) -> None:
+        self._runs = runs
+        self.calls = 0
+
+    def run(self, project_cwd="."):
+        idx = min(self.calls, len(self._runs) - 1)
+        self.calls += 1
+        failed, output = self._runs[idx]
+        return SimpleNamespace(failed=failed, raw_output=output)
+
+
+DJANGO_FAIL = (
+    "Traceback (most recent call last):\n"
+    '  File "app/models.py", line 2, in <module>\n'
+    "    x = broken(\n"
+    "SyntaxError: invalid syntax"
+)
+
+
+def test_django_test_verifier_maps_failed_to_exit_code(tmp_path: Path):
+    from shamsu.repair.verifiers import DjangoTestVerifier
+
+    failing = DjangoTestVerifier("python manage.py test", ScriptedDjangoRunner([(2, "boom")]), tmp_path)
+    run = failing.run()
+    assert run.exit_code == 1 and run.stdout == "boom"
+
+    passing = DjangoTestVerifier("python manage.py test", ScriptedDjangoRunner([(0, "OK")]), tmp_path)
+    assert passing.run().exit_code == 0
+
+
+def test_django_path_solves_on_repair_loop(tmp_path: Path):
+    from shamsu.repair.verifiers import DjangoTestVerifier
+
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "models.py").write_text("x = broken(\n")
+    runner = ScriptedDjangoRunner([(1, DJANGO_FAIL), (0, "OK")])
+    verifier = DjangoTestVerifier("python manage.py test --verbosity=2", runner, tmp_path)
+    plan = RepairPlan(root_cause="syntax", target_file="app/models.py", full_content="x = 1\n")
+    loop = RepairLoop(tmp_path, verifier, ScriptedProposer([plan]), max_attempts=3)
+    result = loop.run()
+    assert result.success is True
+    assert result.exit_code == 0

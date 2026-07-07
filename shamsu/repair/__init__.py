@@ -18,12 +18,15 @@ from shamsu.repair.kinds import (
     select_primary_error,
 )
 from shamsu.repair.loop import Applier, FileApplier, Proposer, RepairLoop, Verifier, VerifyRun
+from shamsu.repair.plan_schema import REPAIR_PLAN_JSON_SCHEMA
+from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.prompt import (
     build_debug_prompt,
     build_final_message,
     contains_unverified_success_claim,
     enforce_final_response,
 )
+from shamsu.repair.verifiers import CommandVerifier, DjangoTestVerifier
 from shamsu.repair.types import (
     DebugContext,
     InspectedSnippet,
@@ -35,14 +38,18 @@ from shamsu.repair.types import (
 
 __all__ = [
     "Applier",
+    "CommandVerifier",
     "DebugContext",
+    "DjangoTestVerifier",
     "ErrorComparator",
     "ErrorKind",
     "FileApplier",
     "ImportFix",
     "InspectedSnippet",
+    "LLMProposer",
     "PreviousAttempt",
     "Proposer",
+    "REPAIR_PLAN_JSON_SCHEMA",
     "RepairAttemptRecord",
     "RepairError",
     "RepairLoop",

@@ -8,6 +8,7 @@ from typing import Any
 
 from shamsu.memory.graphiti_adapter import GraphitiAdapter
 from shamsu.memory.policy import MemoryPolicy
+from shamsu.memory.sqlite_store import SQLiteMemoryStore
 from shamsu.memory.types import GraphitiHealth, LongTermMemory, MemoryGate, MemoryKind, MemoryStatus
 
 REQUIRED_MEMORY_MESSAGE = (
@@ -15,6 +16,11 @@ REQUIRED_MEMORY_MESSAGE = (
     "Run: /memory setup\n\n"
     "or: shamsu doctor\n\n"
     "SHAMSU will not start normal agent mode until local Graphiti memory is ready."
+)
+
+DEGRADED_MEMORY_MESSAGE = (
+    "Graphiti is not available; using local SQLite memory (degraded). Long-term "
+    "recall still works. Run `/memory setup` to enable the richer Graphiti backend."
 )
 
 
@@ -29,6 +35,17 @@ class MemoryService:
         self.adapter = adapter or GraphitiAdapter()
         self.policy = policy or MemoryPolicy()
         self.memory_dir = self.workspace / ".shamsu" / "memory"
+        self._fallback: SQLiteMemoryStore | None = None
+
+    @property
+    def fallback(self) -> SQLiteMemoryStore:
+        """Lazily-created local SQLite store, used whenever Graphiti is down."""
+        if self._fallback is None:
+            self._fallback = SQLiteMemoryStore(self.memory_dir / "memory.db")
+        return self._fallback
+
+    def _use_fallback(self) -> bool:
+        return not self.healthcheck().ok
 
     def _status_path(self) -> Path:
         return self.memory_dir / "status.json"
@@ -75,6 +92,15 @@ class MemoryService:
             return MemoryGate(False, REQUIRED_MEMORY_MESSAGE, status)
         return MemoryGate(True, status=status)
 
+    def ensure_ready_degraded(self) -> MemoryGate:
+        """Non-blocking readiness: allowed via Graphiti when healthy, otherwise
+        allowed via the always-available local SQLite store (degraded). This is
+        what lets SHAMSU run without Graphiti instead of hard-blocking startup."""
+        status = self.status()
+        if status.health.ok:
+            return MemoryGate(True, status=status)
+        return MemoryGate(True, DEGRADED_MEMORY_MESSAGE, status)
+
     def setup(self) -> dict[str, Any]:
         result = self.adapter.setup(self.workspace)
         self._log_event("setup", result)
@@ -98,6 +124,10 @@ class MemoryService:
             result = {"ok": False, "skipped": True, "reason": decision.reason}
             self._log_event("remember_skipped", result)
             return result
+        if self._use_fallback():
+            result = self.fallback.remember(decision.text, decision.kind, metadata)
+            self._log_event("remember_sqlite", {"ok": bool(result.get("ok")), "kind": decision.kind})
+            return result
         existing = self.get_relevant(decision.text, limit=5)
         if any(memory.kind == decision.kind and _norm(memory.text) == _norm(decision.text) for memory in existing):
             result = {"ok": True, "deduped": True, "message": "memory already exists"}
@@ -110,14 +140,17 @@ class MemoryService:
         return result
 
     def search(self, query: str, limit: int = 8, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self._use_fallback():
+            memories = self.fallback.search(query, limit)
+            return {"ok": True, "degraded": True, "results": [m.text for m in memories]}
         result = self.adapter.search(self.workspace, query, limit, filters)
         self._log_event("search", {"ok": bool(result.get("ok")), "limit": limit, "error": result.get("error", "")})
         return result
 
     def get_relevant(self, user_prompt: str, task_type: str | None = None, limit: int = 8) -> list[LongTermMemory]:
-        gate = self.ensure_ready()
-        if not gate.allowed:
-            return []
+        if self._use_fallback():
+            # Graphiti down: recall from the local SQLite store instead of empty.
+            return _dedupe_memories(self.fallback.get_relevant(user_prompt, task_type, limit))[:limit]
         memories = self.adapter.get_relevant(self.workspace, user_prompt, task_type, limit)
         return _dedupe_memories(memories)[:limit]
 
@@ -131,6 +164,8 @@ class MemoryService:
         return "\n".join(lines)
 
     def forget(self, memory_id_or_query: str) -> dict[str, Any]:
+        if self._use_fallback():
+            return self.fallback.forget(memory_id_or_query)
         result = self.adapter.forget(self.workspace, memory_id_or_query)
         self._log_event("forget", {"ok": bool(result.get("ok")), "query": memory_id_or_query, "error": result.get("error", "")})
         return result

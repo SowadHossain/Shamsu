@@ -1,0 +1,59 @@
+category: game-2d
+stack:
+  runtime: node
+  framework: vite-ts
+  render: canvas-2d
+  input: keyboard
+entry: src/main.ts
+build_cmd: "npm install && npm run build"
+run_cmd: "npm run dev"
+preview_url: "http://localhost:5173"
+# A minimal but working single/local 2D canvas game. The loop, input plumbing,
+# renderer, and HUD are pre-built with a placeholder "bouncing box". The model
+# fills the marked holes with the PRD's real game from the PRD contract. Each
+# hole is the region between `// HOLE:<id>` and `// END:<id>`; keep the markers
+# and every export the rest of the app imports. GameState is a numeric bag
+# (add any fields you need) so new state never breaks the TypeScript build.
+holes:
+  - id: entity
+    target_file: src/game/state.ts
+    marker: "// HOLE:entity"
+    kind: schema
+    signature: "add the PRD's entities as numeric fields on the GameState bag inside createState()"
+    description: "Initial game entities/state (paddles, ball, positions, velocities, ...) as numbers."
+    depends_on: []
+  - id: input
+    target_file: src/game/input.ts
+    marker: "// HOLE:input"
+    kind: function
+    signature: "map raw key codes on `input` to named boolean actions on `actions`"
+    description: "Bind the PRD's controls (keys) to named game actions."
+    depends_on: []
+  - id: update
+    target_file: src/game/update.ts
+    marker: "// HOLE:update"
+    kind: function
+    signature: "update(state, actions, dt): void"
+    description: "Per-tick logic: move entities from actions, collisions, call scorePoints on a score event."
+    depends_on: [entity, input]
+  - id: score
+    target_file: src/game/update.ts
+    marker: "// HOLE:score"
+    kind: function
+    signature: "scorePoints(): number"
+    description: "How many points one scoring event is worth."
+    depends_on: [update]
+  - id: win
+    target_file: src/game/update.ts
+    marker: "// HOLE:win"
+    kind: function
+    signature: "checkWin(state): boolean"
+    description: "The end condition (e.g. first to 11)."
+    depends_on: [update]
+  - id: render
+    target_file: src/game/render.ts
+    marker: "// HOLE:render"
+    kind: function
+    signature: "draw the PRD's entities to the 2D context"
+    description: "Render the real entities (paddles, ball, ...) instead of the placeholder box."
+    depends_on: [entity]
