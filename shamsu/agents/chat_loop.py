@@ -456,6 +456,7 @@ class AgentChatLoop:
                     )
                     self.state.append_user(
                         _discovery_failure_correction(name, result.message, hint_name)
+                    )
                 if name == "ask_user" and result.ok and isinstance(result.data, dict) and result.data.get("ask_user"):
                     # ask_user ends the turn: store the pending question and hand
                     # control back to the user (resolved on their next reply).

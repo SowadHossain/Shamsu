@@ -476,6 +476,7 @@ class AgentToolRegistry:
                         "default": "false",
                     },
                 },
+            ),
             _tool_schema(
                 "find_file",
                 "Find files whose path or name matches a query, to resolve a wrong or "
