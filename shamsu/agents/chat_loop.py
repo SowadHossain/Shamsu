@@ -10,6 +10,7 @@ from typing import Any
 
 import ollama
 
+from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.llm.manager import OLLAMA_BASE_URL, _validate_local_llm_url
@@ -82,10 +83,12 @@ class AgentChatLoop:
         clarify_prompt: Callable[[str], str] | None = ask_clarifying_question,
         on_activity: Callable[[str], None] | None = None,
         progress: ProgressReporter | None = None,
+        action_ledger: ActionLedger | None = None,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
+        self.action_ledger = action_ledger
         self.model_name = model_name or model_for_role("qa")
         self.client = client or ollama.AsyncClient(host=base_url)
         self.tools = tools or AgentToolRegistry(self.workspace_root, session_logger=session_logger)
@@ -164,8 +167,13 @@ class AgentChatLoop:
                 if self.progress:
                     self.progress.tool_start(name, summarize_tool_args(name, arguments))
                 self._log_tool_call(name, arguments)
+                ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
                 result = self.tools.execute(name, arguments)
                 self._log_tool_result(name, result)
+                if self.action_ledger:
+                    self.action_ledger.log_tool_result(
+                        ledger_call_id, name, bool(result.ok), result.message, result.data
+                    )
                 if self.progress:
                     self.progress.tool_result(name, summarize_tool_result(result), ok=result.ok)
                 if self.on_activity and not result.ok:
@@ -206,6 +214,8 @@ class AgentChatLoop:
                 "Retrieved relevant Graphiti memories",
                 workflow_id="agent-chat",
             )
+        if self.action_ledger:
+            self.action_ledger.log_graphiti_retrieved(has_memory=True)
         return f"{user_input}\n\n{memory_context}"
     def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
         """The same tool call repeated past the limit despite corrections â€” stop

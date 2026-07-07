@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from shamsu.abstract.context import _names as _names_from
+from shamsu.action_ledger.context import get_current_run
 from shamsu.diagnostics import compact, normalize, root_cause
 from shamsu.diagnostics.adapters import native_json, reviewdog_errorformat, sarif
 from shamsu.diagnostics.parsers import (
@@ -156,6 +157,9 @@ class DiagnosticDigest:
             if exporter_path:
                 exports = self.memory_adapter.get_exports(self.workspace_root, exporter_path)
                 names = _names_from(exports)
+                ledger = get_current_run()
+                if ledger:
+                    ledger.log_code_memory_queried("get_exports", exporter_path, len(names))
                 if names:
                     facts.append(f"{exporter_path} exports: {', '.join(names[:12])}")
                     if record.symbol and record.symbol not in names:
@@ -168,6 +172,9 @@ class DiagnosticDigest:
             if record.file:
                 imports = self.memory_adapter.get_imports(self.workspace_root, record.file)
                 names = _names_from(imports)
+                ledger = get_current_run()
+                if ledger:
+                    ledger.log_code_memory_queried("get_imports", record.file, len(names))
                 if names:
                     facts.append(f"{record.file} imports: {', '.join(names[:12])}")
         return facts

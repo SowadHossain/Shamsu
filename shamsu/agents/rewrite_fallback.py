@@ -65,8 +65,14 @@ async def rewrite_files_fully(
     target_paths: list[str],
     specialist: str,
     max_files: int = 3,
+    plan_text: str = "",
 ) -> list[str]:
-    """Ask for full file content and apply it through PatchEngine."""
+    """Ask for full file content and apply it through PatchEngine.
+
+    This is a format-correction retry on the plan the first attempt already
+    had, not a new planning opportunity - `plan_text` (if given) is folded
+    into the prompt as-is rather than calling the planner model again.
+    """
     changed: list[str] = []
     for rel in target_paths[:max_files]:
         abs_path = _safe_target(workspace_root, rel)
@@ -78,7 +84,8 @@ async def rewrite_files_fully(
         prompt = (
             f"{FULL_REWRITE_INSTRUCTIONS}\n\n"
             f"File: {rel}\n\n"
-            f"Task:\n{request}\n\n"
+            + (f"Plan from planner model:\n{plan_text}\n\n" if plan_text.strip() else "")
+            + f"Task:\n{request}\n\n"
             f"Current content of {rel} (empty if this is a new file):\n{current}"
         )
         pack = context_builder.pack(

@@ -99,6 +99,41 @@ async def test_test_generation_workflow_applies_valid_diff_and_can_run_tests(tmp
     assert "pytest-compatible tests" in llm.pack.user_request
 
 
+class FakeSpecialistAwareLLM:
+    """Returns a different canned response per specialist, so the planner's
+    output can be distinguished from the test_gen specialist's own response."""
+
+    def __init__(self, responses: dict[str, str]) -> None:
+        self.responses = responses
+        self.requests: dict[str, list[str]] = {}
+
+    async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
+        self.requests.setdefault(specialist, []).append(pack.user_request)
+        return LLMResponse(raw=self.responses[specialist], format="diff", model_used="fake")
+
+
+@pytest.mark.asyncio
+async def test_test_generation_workflow_folds_the_plan_into_the_test_gen_request(tmp_path: Path):
+    diff = """--- /dev/null
++++ b/tests/test_app.py
+@@ -0,0 +1,2 @@
++def test_placeholder():
++    assert True
+"""
+    llm = FakeSpecialistAwareLLM({"planner": "Write a test covering add().", "test_gen": diff})
+
+    result = await TestGenerationWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    ).run("write tests for add")
+
+    assert result.applied is True
+    assert result.plan == "Write a test covering add()."
+    assert "Write a test covering add()." in llm.requests["test_gen"][0]
+
+
 @pytest.mark.asyncio
 async def test_test_generation_workflow_rejects_malformed_output(tmp_path: Path):
     result = await TestGenerationWorkflow(

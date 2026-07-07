@@ -106,15 +106,20 @@ class _FakeSearch:
 
 
 class _BrokenDiffLLM:
-    """Emits a diff whose hunk counts are wrong (what an 8B model does), then a
-    clean full-file rewrite on the fallback call."""
+    """Emits a diff whose hunk counts are wrong (what an 8B model does) on its
+    first "coder" call, then a clean full-file rewrite on the fallback call.
+    Planner calls (CodeEditWorkflow now makes one before "coder") are answered
+    with a harmless plan string and don't count toward the coder call index -
+    this fake is about the coder's diff-repair fallback, not planning."""
 
     def __init__(self) -> None:
-        self.calls = 0
+        self.coder_calls = 0
 
     async def run_specialist(self, specialist, pack):
-        self.calls += 1
-        if self.calls == 1:
+        if specialist == "planner":
+            return LLMResponse(raw="Edit app.py to set new = 2.", model_used="fake")
+        self.coder_calls += 1
+        if self.coder_calls == 1:
             broken = (
                 "--- a/app.py\n"
                 "+++ b/app.py\n"
@@ -144,3 +149,60 @@ def test_code_edit_falls_back_to_full_rewrite_on_bad_diff(tmp_path):
     assert result.used_full_rewrite is True
     assert result.changed_files == ["app.py"]
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "new = 2\n"
+    assert result.plan == "Edit app.py to set new = 2."
+
+
+class _RecordingLLM:
+    """Records the pack.user_request seen for each specialist name, so tests
+    can confirm the planner's output actually reaches later prompts instead
+    of just not-crashing."""
+
+    def __init__(self, responses: dict[str, str]) -> None:
+        self.responses = responses
+        self.requests: dict[str, list[str]] = {}
+
+    async def run_specialist(self, specialist, pack):
+        self.requests.setdefault(specialist, []).append(pack.user_request)
+        return LLMResponse(raw=self.responses.get(specialist, ""), model_used="fake")
+
+
+def test_rewrite_files_fully_folds_plan_text_into_its_prompt(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("old = 1\n", encoding="utf-8")
+    llm = _RecordingLLM({"coder": "new = 2\n"})
+
+    changed = asyncio.run(
+        rewrite_files_fully(
+            llm=llm,
+            context_builder=ContextBuilder(),
+            patch_engine=_AllowPatchEngine(),
+            workspace_root=tmp_path,
+            request="make it new",
+            target_paths=["app.py"],
+            specialist="coder",
+            plan_text="Change the assignment on line 1 to new = 2.",
+        )
+    )
+
+    assert changed == ["app.py"]
+    assert "Change the assignment on line 1 to new = 2." in llm.requests["coder"][0]
+
+
+def test_code_edit_plan_reaches_the_coder_pack(tmp_path):
+    (tmp_path / "app.py").write_text("old = 1\n", encoding="utf-8")
+    llm = _RecordingLLM({
+        "planner": "Update app.py: set new = 2.",
+        "coder": "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-old = 1\n+new = 2\n",
+    })
+    workflow = CodeEditWorkflow(
+        tmp_path,
+        search=_FakeSearch(),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+    )
+
+    result = asyncio.run(workflow.run("rename old to new"))
+
+    assert result.applied is True
+    assert result.plan == "Update app.py: set new = 2."
+    assert "Update app.py: set new = 2." in llm.requests["coder"][0]

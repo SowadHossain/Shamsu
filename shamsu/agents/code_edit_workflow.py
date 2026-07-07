@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from shamsu.abstract.context import build_codebase_memory_brief
+from shamsu.agents.planner import create_plan
 from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
@@ -33,6 +34,7 @@ class CodeEditResult:
     error: str = ""
     used_full_rewrite: bool = False
     test_suggestion: str = "Run the relevant project tests after reviewing the patch."
+    plan: str = ""
 
 
 class CodeEditWorkflow:
@@ -51,7 +53,7 @@ class CodeEditWorkflow:
         self.context_builder = context_builder or ContextBuilder()
 
     async def run(self, request: str) -> CodeEditResult:
-        pack, target_paths = self._build_pack(request)
+        pack, target_paths, plan_text = await self._build_pack(request)
         if should_convene_council(target_paths=target_paths):
             council_result = await run_council(self.llm, pack, specialist="coder")
             response = council_result.final
@@ -70,6 +72,7 @@ class CodeEditWorkflow:
                 changed_files=changed_files,
                 applied=applied,
                 error="" if applied else "Patch was not applied.",
+                plan=plan_text,
             )
 
         # The diff was malformed (a formatting failure — common with small
@@ -84,6 +87,7 @@ class CodeEditWorkflow:
             request=request,
             target_paths=targets,
             specialist="coder",
+            plan_text=plan_text,
         )
         if rewritten:
             return CodeEditResult(
@@ -93,32 +97,36 @@ class CodeEditWorkflow:
                 changed_files=rewritten,
                 applied=True,
                 used_full_rewrite=True,
+                plan=plan_text,
             )
         return CodeEditResult(
             request=request,
             pack=pack,
             diff_text=diff_text,
             error=f"Invalid diff: {error}",
+            plan=plan_text,
         )
 
-    def _build_pack(self, request: str) -> tuple[ContextPack, list[str]]:
+    async def _build_pack(self, request: str) -> tuple[ContextPack, list[str], str]:
         results = self.search.search(request, top_k=8)
         target_paths = _target_paths(results)
         memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
+        plan = await create_plan(self.llm, self.context_builder, results, goal=request, task_id="code-edit-plan")
         prompt_request = (
             f"{CODE_EDIT_INSTRUCTIONS}\n\n"
             f"{frontend_prompt_rules()}\n\n"
             + (f"{memory_brief}\n\n" if memory_brief else "")
+            + f"Plan from planner model:\n{plan.text}\n\n"
             + f"User request: {request}"
         )
         pack = self.context_builder.pack(
             results=results,
             request=prompt_request,
             task_id="code-edit",
-            step_id=1,
+            step_id=2,
             specialist="coder",
         )
-        return pack, target_paths
+        return pack, target_paths, plan.text
 
 
 def _clean_diff(raw: str) -> str:

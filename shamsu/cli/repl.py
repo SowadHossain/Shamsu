@@ -31,6 +31,10 @@ from rich.table import Table
 from rich.text import Text
 
 from shamsu.abstract.service import REQUIRED_TOOL_MESSAGE, AbstractService
+from shamsu.action_ledger import store as action_ledger_store
+from shamsu.action_ledger.config import load_config as load_action_ledger_config
+from shamsu.action_ledger.context import clear_current_run, get_current_run, set_current_run
+from shamsu.action_ledger.ledger import ActionLedger, start_run
 from shamsu.agents.audit_workflow import AuditWorkflow
 from shamsu.diagnostics import doctor as diagnostics_doctor
 from shamsu.diagnostics import setup as diagnostics_setup
@@ -46,6 +50,7 @@ from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.cli.command_router import CommandRouter
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
 from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
+from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
 from shamsu.llm.manager import LLMManager, ModelPullProgress
@@ -66,6 +71,8 @@ from shamsu.tasks.state import (
     mark_step_running,
     save_task,
 )
+from shamsu.taskmaster.service import TaskmasterService
+from shamsu.taskmaster.types import TaskmasterTask
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
 from shamsu.runtime.models import (
     DEFAULT_TIER,
@@ -125,6 +132,13 @@ else:
 DEFAULT_ASK_APPROVAL = ask_approval
 
 EmptySearchAgent = NullSearchAgent
+
+# Subcommands that claim the bare word "run" in the REPL dispatcher (see the
+# main loop below) - anything else starting with "run" (e.g. "run the tests")
+# is ordinary English and falls through to the normal agent request path.
+_RUN_SUBCOMMANDS = frozenset(
+    {"last", "show", "timeline", "decisions", "tools", "commands", "context", "diff", "export", "clean"}
+)
 
 
 SYSTEM_COMMANDS = (
@@ -187,8 +201,25 @@ SYSTEM_COMMANDS = (
     "/sessions export ",
     "/permissions list",
     "/permissions clear",
+    "/milestones list",
+    "/milestones show ",
+    "/taskmaster status",
+    "/taskmaster setup",
+    "/taskmaster repair",
+    "/prd parse ",
+    "/prd status",
+    "/prd reparse",
+    "/tasks",
     "/tasks list",
+    "/tasks next",
     "/tasks show ",
+    "/tasks execute ",
+    "/tasks continue",
+    "/tasks mark-done ",
+    "/tasks mark-blocked ",
+    "/tasks mark-failed ",
+    "/tasks dependencies ",
+    "/tasks plan",
     "/autonomy status",
     "/autonomy on",
     "/autonomy off",
@@ -214,6 +245,17 @@ SYSTEM_COMMANDS = (
     "/patch clean-trash",
     "/log",
     "/log tail",
+    "/runs",
+    "/run last",
+    "/run show ",
+    "/run timeline ",
+    "/run decisions ",
+    "/run tools ",
+    "/run commands ",
+    "/run context ",
+    "/run diff ",
+    "/run export ",
+    "/run clean",
     "/edit ",
     "/fix ",
     "/test-gen ",
@@ -342,8 +384,23 @@ def _print_help(console: Console) -> None:
                     "  /sessions export <id>     Export redacted session bundle",
                     "  /permissions list         Show remembered 'always allow' decisions",
                     "  /permissions clear        Forget all remembered approval decisions",
-                    "  /tasks list               List tracked multi-step tasks",
-                    "  /tasks show <id>          Show a task's steps, phase, and blockers",
+                    "  /milestones list          List tracked internal multi-step milestones",
+                    "  /milestones show <id>     Show a milestone's steps, phase, and blockers",
+                    "  /taskmaster status        Show Taskmaster install/provider health",
+                    "  /taskmaster setup         Install/configure local Taskmaster (Ollama-only)",
+                    "  /taskmaster repair        Re-check and repair Taskmaster config",
+                    "  /prd parse <file>         Parse a PRD into a Taskmaster task graph",
+                    "  /prd status               Show last-parsed PRD and task graph summary",
+                    "  /prd reparse [file]       Force Taskmaster to reparse the PRD",
+                    "  /tasks                    List Taskmaster tasks (status/priority/deps)",
+                    "  /tasks next               Show the next unblocked Taskmaster task",
+                    "  /tasks show <id>          Show one Taskmaster task's detail",
+                    "  /tasks continue [--all] [--verify \"<cmd>\"]  Run the next task through SHAMSU",
+                    "  /tasks mark-done <id>     Explicitly accept a task without verification",
+                    "  /tasks mark-blocked <id> <reason>",
+                    "  /tasks mark-failed <id> <reason>",
+                    "  /tasks dependencies <id>  Show a task's dependencies and their status",
+                    "  /tasks plan               Show the task order / dependency graph",
                     "  /autonomy status          Show whether long-running mode is on",
                     "  /autonomy on|off          Toggle long-running autonomous mode for this workspace",
                     "  /diagnostics status       Show diagnostic helper availability (Drain3, etc.)",
@@ -363,6 +420,17 @@ def _print_help(console: Console) -> None:
                     "  /patch trash              List files moved to .shamsu/trash",
                     "  /patch clean-trash        Permanently delete everything in trash (with approval)",
                     "  /log tail                 Show recent session events",
+                    "  /runs [n]                 List recent ActionLedger runs (local debug/audit log)",
+                    "  /run last                 Show the latest run's summary",
+                    "  /run show <run-id>        Show a run's manifest and summary",
+                    "  /run timeline <run-id>    Show a run's chronological events",
+                    "  /run decisions <run-id>   Show a run's decision summaries",
+                    "  /run tools <run-id>       Show a run's tool calls and outcomes",
+                    "  /run commands <run-id>    Show a run's commands, exit codes, log paths",
+                    "  /run context <run-id>     Show a run's safe context preview",
+                    "  /run diff <run-id>        Show a run's patch/mutation references",
+                    "  /run export <run-id>      Export a run to a redacted zip + markdown report",
+                    "  /run clean                Delete runs older than the retention window (asks for approval)",
                     "  /edit <request>           Force code-edit workflow",
                     "  /fix <bug/traceback>      Force bug-fix workflow",
                     "  /test-gen <request>       Force test-generation workflow",
@@ -915,6 +983,7 @@ def _memory_command_allowed(normalized_input: str) -> bool:
         or lowered.startswith("memory")
         or lowered.startswith("diagnostics")
         or lowered.startswith("patch")
+        or lowered.startswith("taskmaster")
     )
 
 
@@ -1122,6 +1191,232 @@ def _handle_trace(user_input: str, workspace: Path, console: Console) -> None:
     console.print("[red]Usage: trace status|on|off|verbose[/red]")
 
 
+# -- ActionLedger CLI (/runs, /run): local human-facing debug/audit trail. --
+# See agent context/prompts/audit_log.md. This inspects <workspace>/.shamsu/runs/
+# only - never Graphiti, never Codebase-Memory MCP, never fed back into a model.
+
+def _handle_runs(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=1)
+    limit = 20
+    if len(parts) > 1 and parts[1].strip().isdigit():
+        limit = int(parts[1].strip())
+    runs = action_ledger_store.list_runs(workspace, limit=limit)
+    if not runs:
+        console.print("[dim]No runs recorded yet.[/dim]")
+        return
+    table = Table(title="ActionLedger Runs")
+    table.add_column("Run ID")
+    table.add_column("Started")
+    table.add_column("Status")
+    table.add_column("Prompt")
+    for item in runs:
+        table.add_row(item.run_id, item.started_at, item.status, item.prompt_preview[:80])
+    console.print(table)
+
+
+def _resolve_run_or_print_error(workspace: Path, query: str, console: Console) -> str | None:
+    run_id = action_ledger_store.resolve_run_id(workspace, query)
+    if not run_id:
+        console.print(f"[red]No run found for: {query or 'last'}[/red]")
+        return None
+    return run_id
+
+
+def _print_run_summary(workspace: Path, run_id: str, console: Console) -> None:
+    manifest = action_ledger_store.load_manifest(workspace, run_id) or {}
+    summary = action_ledger_store.load_summary(workspace, run_id) or {}
+    lines = [
+        f"Run: {run_id}",
+        f"Status: {manifest.get('status', 'unknown')}",
+        f"Started: {manifest.get('started_at', '-')}",
+        f"Finished: {manifest.get('finished_at', '-')}",
+        f"Prompt: {manifest.get('prompt_preview', '-')}",
+        f"Events: {summary.get('event_count', '-')}",
+        f"Decisions: {summary.get('decision_count', '-')}",
+        f"Tool calls: {summary.get('tool_call_count', '-')}",
+        f"Commands: {summary.get('command_count', '-')}",
+    ]
+    console.print(Panel("\n".join(lines), title=f"Run {run_id}"))
+
+
+def _handle_run(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else "last"
+    argument = parts[1].strip() if len(parts) > 1 else ""
+
+    if subcommand == "last":
+        run_id = action_ledger_store.resolve_run_id(workspace, "last")
+        if not run_id:
+            console.print("[dim]No runs recorded yet.[/dim]")
+            return
+        _print_run_summary(workspace, run_id, console)
+        return
+
+    if subcommand == "show":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        _print_run_summary(workspace, run_id, console)
+        return
+
+    if subcommand == "timeline":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        events = action_ledger_store.load_events(workspace, run_id)
+        if not events:
+            console.print("[dim]No events recorded for this run.[/dim]")
+            return
+        table = Table(title=f"Run Timeline: {run_id}")
+        table.add_column("Time")
+        table.add_column("Event")
+        table.add_column("Detail")
+        for event in events:
+            detail = {k: v for k, v in event.items() if k not in {"event_id", "run_id", "type", "timestamp"}}
+            table.add_row(event.get("timestamp", ""), event.get("type", ""), json.dumps(detail, default=str)[:100])
+        console.print(table)
+        return
+
+    if subcommand == "decisions":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        decisions = action_ledger_store.load_decisions(workspace, run_id)
+        if not decisions:
+            console.print("[dim]No decisions recorded for this run.[/dim]")
+            return
+        table = Table(title=f"Run Decisions: {run_id}")
+        table.add_column("Decision")
+        table.add_column("Reason")
+        table.add_column("Chosen Action")
+        table.add_column("Outcome")
+        for decision in decisions:
+            table.add_row(
+                decision.get("decision", ""),
+                decision.get("reason_summary", ""),
+                decision.get("chosen_action", ""),
+                str(decision.get("outcome", "")),
+            )
+        console.print(table)
+        return
+
+    if subcommand == "tools":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        tool_calls = action_ledger_store.load_tool_calls(workspace, run_id)
+        if not tool_calls:
+            console.print("[dim]No tool calls recorded for this run.[/dim]")
+            return
+        table = Table(title=f"Run Tool Calls: {run_id}")
+        table.add_column("Tool")
+        table.add_column("Phase")
+        table.add_column("Outcome")
+        for call in tool_calls:
+            outcome = "ok" if call.get("ok") else ("failed" if call.get("phase") == "finished" else "")
+            table.add_row(call.get("tool", ""), call.get("phase", ""), outcome)
+        console.print(table)
+        return
+
+    if subcommand == "commands":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        events = action_ledger_store.command_events(workspace, run_id)
+        finished = [event for event in events if event.get("type") == "command_finished"]
+        if not finished:
+            console.print("[dim]No commands recorded for this run.[/dim]")
+            return
+        table = Table(title=f"Run Commands: {run_id}")
+        table.add_column("Command")
+        table.add_column("Exit")
+        table.add_column("Stdout")
+        table.add_column("Stderr")
+        for event in finished:
+            table.add_row(
+                str(event.get("command", ""))[:60],
+                str(event.get("exit_code", "")),
+                event.get("stdout_path", ""),
+                event.get("stderr_path", ""),
+            )
+        console.print(table)
+        return
+
+    if subcommand == "context":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        preview = action_ledger_store.load_context_preview(workspace, run_id)
+        if not preview:
+            console.print("[dim]No context preview recorded for this run.[/dim]")
+            return
+        console.print(Panel(json.dumps(preview, indent=2, default=str), title=f"Context Preview: {run_id}"))
+        return
+
+    if subcommand == "diff":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        mutations = action_ledger_store.load_mutations(workspace, run_id)
+        if not mutations:
+            console.print("[dim]No patches/mutations recorded for this run.[/dim]")
+            return
+        table = Table(title=f"Run Mutations: {run_id}")
+        table.add_column("Transaction")
+        table.add_column("Status")
+        table.add_column("Files")
+        table.add_column("Rollback")
+        for mutation in mutations:
+            table.add_row(
+                mutation.get("transaction_id", ""),
+                mutation.get("status", ""),
+                str(len(mutation.get("touched_files", []))),
+                str(mutation.get("rollback_available", False)),
+            )
+        console.print(table)
+        return
+
+    if subcommand == "export":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        zip_path = action_ledger_store.export_run(workspace, run_id)
+        console.print(f"[green]Exported run to {zip_path}[/green]")
+        return
+
+    if subcommand == "clean":
+        config = load_action_ledger_config(workspace)
+        retention_days = int(config.get("retention_days", 30))
+        stale = action_ledger_store.runs_older_than(workspace, retention_days)
+        if not stale:
+            console.print(f"[dim]No runs older than {retention_days} day(s).[/dim]")
+            return
+        request = ApprovalRequest(
+            action_type="file_delete",
+            description=f"Delete {len(stale)} ActionLedger run(s) older than {retention_days} day(s).",
+            risk_level="medium",
+            preview="\n".join(stale[:20]),
+            working_dir=str(workspace),
+            reason="Run folders under .shamsu/runs/ older than the retention window are being cleaned up.",
+        )
+        if not approval_func(request):
+            console.print("[yellow]Clean cancelled; no runs were deleted.[/yellow]")
+            return
+        removed = action_ledger_store.clean_runs(workspace, retention_days)
+        console.print(f"[green]Removed {len(removed)} run(s) older than {retention_days} day(s).[/green]")
+        return
+
+    console.print(
+        "[red]Usage: /run last|show|timeline|decisions|tools|commands|context|diff|export|clean [run-id][/red]"
+    )
+
+
 _ROOT_CAUSE_EXPLANATIONS = {
     "missing_export": "an import/export mismatch was found; these are treated as the root cause because they typically cascade into many downstream type/symbol errors.",
     "import_export_mismatch": "an import/export mismatch was found; these are treated as the root cause because they typically cascade into many downstream type/symbol errors.",
@@ -1235,6 +1530,7 @@ def _handle_patch(
         workspace,
         session_logger=session_logger,
         approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=get_current_run(),
     )
 
     if subcommand == "status":
@@ -1432,15 +1728,15 @@ def _patch_apply(argument: str, workspace: Path, console: Console, engine: "Patc
         console.print(Panel(detail, title=f"Patch Rejected ({result.transaction_id or 'no transaction'})", border_style="red"))
 
 
-def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
+def _handle_milestones(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=2)
     command = parts[1].strip().lower() if len(parts) > 1 else "list"
     if command == "list":
         task_ids = list_task_ids(workspace)
         if not task_ids:
-            console.print("[dim]No tracked tasks for this workspace.[/dim]")
+            console.print("[dim]No tracked milestones for this workspace.[/dim]")
             return
-        table = Table(title="Tasks")
+        table = Table(title="Milestones")
         table.add_column("ID")
         table.add_column("Phase")
         table.add_column("Pending")
@@ -1461,7 +1757,7 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
         return
     if command == "show":
         if len(parts) < 3:
-            console.print("[red]Usage: tasks show <id>[/red]")
+            console.print("[red]Usage: milestones show <id>[/red]")
             return
         try:
             task = load_task(workspace, parts[2].strip())
@@ -1470,7 +1766,380 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
             return
         _print_task(task, console)
         return
-    console.print("[red]Usage: tasks list|show <id>[/red]")
+    console.print("[red]Usage: milestones list|show <id>[/red]")
+
+
+def _print_tasks_table(service: "TaskmasterService", console: Console) -> None:
+    listing = service.list_tasks()
+    if not listing.get("ok"):
+        console.print(f"[red]{listing.get('error') or 'Could not list Taskmaster tasks.'}[/red]")
+        return
+    tasks = listing.get("tasks", [])
+    if not tasks:
+        console.print("[dim]No Taskmaster tasks yet. Run /prd parse <file> first.[/dim]")
+        return
+    table = Table(title="Taskmaster Tasks")
+    table.add_column("ID")
+    table.add_column("Title")
+    table.add_column("Status")
+    table.add_column("Priority")
+    table.add_column("Dependencies")
+    for task in tasks:
+        table.add_row(task.id, task.title, task.status, task.priority or "-", ", ".join(task.dependencies) or "-")
+    console.print(table)
+
+
+def _print_task_detail(task: "TaskmasterTask", console: Console) -> None:
+    lines = [
+        f"Title: {task.title}",
+        f"Status: {task.status}",
+        f"Priority: {task.priority or 'n/a'}",
+        f"Dependencies: {', '.join(task.dependencies) or 'none'}",
+    ]
+    if task.description:
+        lines.append(f"Description: {task.description}")
+    if task.details:
+        lines.append(f"Details: {task.details}")
+    if task.test_strategy:
+        lines.append(f"Test strategy: {task.test_strategy}")
+    console.print(Panel("\n".join(lines), title=f"Task {task.id}"))
+
+
+def _print_prd_task_summary(result: dict, console: Console) -> None:
+    if not result.get("ok"):
+        console.print(f"[red]PRD parse failed: {result.get('error') or 'unknown error'}[/red]")
+        return
+    if result.get("reused_cache"):
+        console.print("[dim]PRD unchanged - reusing the cached Taskmaster task graph (no reparse).[/dim]")
+    _print_tasks_table_from_list(result.get("tasks", []), console)
+
+
+def _print_tasks_table_from_list(tasks: list, console: Console) -> None:
+    if not tasks:
+        console.print("[yellow]No tasks were generated.[/yellow]")
+        return
+    table = Table(title="Taskmaster Tasks")
+    table.add_column("ID")
+    table.add_column("Title")
+    table.add_column("Status")
+    table.add_column("Priority")
+    table.add_column("Dependencies")
+    for task in tasks:
+        table.add_row(task.id, task.title, task.status, task.priority or "-", ", ".join(task.dependencies) or "-")
+    console.print(table)
+
+
+def _handle_taskmaster(user_input: str, workspace: Path, console: Console) -> None:
+    _, _, rest = user_input.partition(" ")
+    subcommand = rest.strip().split(maxsplit=1)[0].lower() if rest.strip() else "status"
+    service = TaskmasterService(workspace)
+
+    if subcommand == "status":
+        status = service.status()
+        console.print(f"Available: {status.health.available} ({status.health.message})")
+        console.print(f"Node: {status.health.node_path or 'not found'}")
+        console.print(f"Taskmaster CLI: {status.health.cli_path or 'not installed'}")
+        console.print(f"Managed tool path: {service.adapter.tool_dir}")
+        console.print(f"Workspace initialized: {status.initialized}")
+        if status.initialized:
+            console.print(f"Tasks: {status.task_count} {status.status_counts or ''}")
+        console.print("Cloud model providers: rejected by default (Ollama-only).")
+        return
+    if subcommand == "setup":
+        result = service.setup()
+        if result.get("ok"):
+            console.print("[green]Taskmaster setup complete (local Ollama provider configured).[/green]")
+        else:
+            reason = result.get("error") or result.get("manual_steps") or result
+            console.print(f"[red]Taskmaster setup failed: {reason}[/red]")
+        return
+    if subcommand == "repair":
+        result = service.repair()
+        if result.get("ok"):
+            console.print("[green]Taskmaster repair complete.[/green]")
+        else:
+            reason = result.get("manual_steps") or result.get("message") or result
+            console.print(f"[red]Taskmaster repair failed: {reason}[/red]")
+        return
+    console.print("[red]Usage: /taskmaster status|setup|repair[/red]")
+
+
+def _handle_prd_command(user_input: str, workspace: Path, console: Console) -> None:
+    _, _, rest = user_input.partition(" ")
+    parts = rest.strip().split(maxsplit=1)
+    subcommand = parts[0].lower() if parts else ""
+    argument = parts[1].strip() if len(parts) > 1 else ""
+    service = TaskmasterService(workspace)
+
+    if subcommand != "status":
+        ready, reason = service.ensure_ready()
+        if not ready:
+            console.print(Panel(reason, title="Taskmaster Required", border_style="red"))
+            return
+
+    if subcommand == "parse":
+        if not argument:
+            console.print("[red]Usage: /prd parse <file>[/red]")
+            return
+        try:
+            prd_path = _resolve_workspace_file(argument, workspace)
+        except SecurityError as exc:
+            console.print(f"[red]{exc}[/red]", soft_wrap=True)
+            return
+        if not prd_path.exists() or not prd_path.is_file():
+            console.print(f"[red]File not found: {prd_path}[/red]")
+            return
+        result = service.parse_prd(prd_path)
+        _log_prd_parse_result(prd_path, result)
+        _print_prd_task_summary(result, console)
+        _log_assistant_message(None, _prd_parse_summary_message(result), workflow_id="prd_parse")
+        return
+    if subcommand == "reparse":
+        cached = service.last_prd_info()
+        prd_path_str = argument or cached.get("prd_path", "")
+        if not prd_path_str:
+            console.print("[red]No previously parsed PRD to reparse. Usage: /prd reparse [file][/red]")
+            return
+        result = service.parse_prd(Path(prd_path_str), force=True)
+        _log_prd_parse_result(Path(prd_path_str), result)
+        _print_prd_task_summary(result, console)
+        _log_assistant_message(None, _prd_parse_summary_message(result), workflow_id="prd_reparse")
+        return
+    if subcommand == "status":
+        status = service.status()
+        cached = service.last_prd_info()
+        console.print(f"Taskmaster available: {status.health.available} ({status.health.message})")
+        console.print(f"Last parsed PRD: {cached.get('prd_path', 'none')}")
+        console.print(f"Tasks: {status.task_count} {status.status_counts or ''}")
+        return
+    console.print("[red]Usage: /prd parse <file>|status|reparse [file][/red]")
+
+
+def _prd_parse_summary_message(result: dict) -> str:
+    if not result.get("ok"):
+        return f"PRD parse failed: {result.get('error') or 'unknown error'}"
+    if result.get("reused_cache"):
+        return "PRD unchanged; reused the cached Taskmaster task graph."
+    return f"Parsed PRD into {len(result.get('tasks', []))} Taskmaster task(s)."
+
+
+def _log_prd_parse_result(prd_path: Path, result: dict) -> None:
+    ledger = get_current_run()
+    if not ledger:
+        return
+    ledger.log_event("prd.parsed", prd_path=str(prd_path), ok=bool(result.get("ok")), reused_cache=bool(result.get("reused_cache")))
+    if result.get("ok") and not result.get("reused_cache"):
+        ledger.log_event("tasks.created", count=len(result.get("tasks", [])))
+
+
+def _parse_task_execute_args(rest: str) -> tuple[str, str, bool]:
+    """Pull `--verify "<command>"` and `--all` out of the raw argument text,
+    leaving whatever's left as the task id (only meaningful for `execute`)."""
+    verify_command = ""
+    match = re.search(r'--verify[= ]"([^"]*)"', rest)
+    if match:
+        verify_command = match.group(1)
+        rest = rest[: match.start()] + rest[match.end():]
+    batch = "--all" in rest
+    rest = rest.replace("--all", "").strip()
+    task_id = rest.split()[0] if rest.split() else ""
+    return task_id, verify_command, batch
+
+
+def _print_task_execution_result(result: "TaskExecutionResult", console: Console) -> None:
+    border = {
+        "done": "green", "blocked": "yellow", "applied_unverified": "yellow",
+        "failed": "red", "error": "red",
+    }.get(result.status, "white")
+    body = result.message or result.error or f"Task {result.task_id}: {result.status}"
+    if result.changed_files:
+        body += "\n\nChanged files:\n" + "\n".join(f"- {path}" for path in result.changed_files)
+    if result.verification is not None and result.verification.ran:
+        body += f"\n\nVerification: `{result.verification.command}` exit {result.verification.exit_code}"
+    console.print(Panel(body, title=f"Task {result.task_id}: {result.status}", border_style=border))
+
+
+async def _handle_tasks_execute(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    search: SearchAgent | EmptySearchAgent,
+    llm: LLMManager,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    parts = user_input.split(maxsplit=2)
+    command = parts[1].strip().lower()
+    rest = parts[2] if len(parts) > 2 else ""
+    task_id_arg, verify_command, batch = _parse_task_execute_args(rest)
+
+    service = TaskmasterService(workspace)
+    ready, reason = service.ensure_ready()
+    if not ready:
+        console.print(Panel(reason, title="Taskmaster Required", border_style="red"))
+        return
+
+    if command == "execute" and not task_id_arg:
+        console.print('[red]Usage: /tasks execute <id> [--verify "<command>"][/red]')
+        return
+    if batch and not is_long_running_enabled(workspace):
+        console.print(
+            "[red]Batch execution requires explicit approval. Run /autonomy on first, "
+            "or use /tasks continue (without --all) to execute one task at a time.[/red]"
+        )
+        return
+
+    _warn_if_dirty_before_edit(workspace, console)
+    approval_manager = _make_approval_manager(workspace, session_logger, console)
+    action_ledger = get_current_run()
+    patch_engine = PatchEngine(
+        workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger,
+    )
+    command_runner = CommandRunner(
+        workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger,
+    )
+    workflow = TaskExecutionWorkflow(
+        workspace,
+        search=search,
+        service=service,
+        memory_service=MemoryService(workspace),
+        abstract_service=AbstractService(workspace),
+        code_edit_workflow=CodeEditWorkflow(workspace, search=search, llm=llm, patch_engine=patch_engine),
+        command_runner=command_runner,
+    )
+
+    summaries: list[str] = []
+    while True:
+        if command == "execute":
+            current_id = task_id_arg
+        else:
+            next_result = service.next_task()
+            if not next_result.get("ok"):
+                console.print(f"[red]{next_result.get('error')}[/red]")
+                break
+            next_task = next_result.get("task")
+            if next_task is None:
+                if not summaries:
+                    console.print("[dim]No unblocked Taskmaster task available.[/dim]")
+                break
+            current_id = next_task.id
+
+        console.print(f"[dim]Executing task {current_id}...[/dim]")
+        if action_ledger:
+            action_ledger.log_event("task.selected", task_id=current_id)
+        result = await workflow.run(current_id, verify_command=verify_command)
+        if action_ledger:
+            action_ledger.log_event("task.execution_finished", task_id=current_id, status=result.status)
+        _print_task_execution_result(result, console)
+        summaries.append(f"Task {current_id}: {result.status}")
+
+        if command == "execute" or not batch:
+            break
+        if result.status != "done":
+            console.print("[yellow]Stopping batch execution: task did not complete successfully.[/yellow]")
+            break
+
+    if summaries:
+        _log_assistant_message(session_logger, "; ".join(summaries), workflow_id="tasks_execute")
+
+
+def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
+    parts = user_input.split(maxsplit=2)
+    command = parts[1].strip().lower() if len(parts) > 1 else "list"
+    service = TaskmasterService(workspace)
+    ready, reason = service.ensure_ready()
+    if not ready:
+        console.print(Panel(reason, title="Taskmaster Required", border_style="red"))
+        return
+
+    if command in {"list", ""}:
+        _print_tasks_table(service, console)
+        return
+    if command == "next":
+        result = service.next_task()
+        if not result.get("ok"):
+            console.print(f"[red]{result.get('error')}[/red]")
+            return
+        task = result.get("task")
+        if task is None:
+            console.print("[dim]No unblocked task available.[/dim]")
+            return
+        _print_task_detail(task, console)
+        return
+    if command == "show":
+        if len(parts) < 3:
+            console.print("[red]Usage: /tasks show <id>[/red]")
+            return
+        result = service.show_task(parts[2].strip())
+        if not result.get("ok"):
+            console.print(f"[red]{result.get('error')}[/red]")
+            return
+        _print_task_detail(result["task"], console)
+        return
+    if command == "dependencies":
+        if len(parts) < 3:
+            console.print("[red]Usage: /tasks dependencies <id>[/red]")
+            return
+        result = service.dependencies(parts[2].strip())
+        if not result.get("ok"):
+            console.print(f"[red]{result.get('error')}[/red]")
+            return
+        deps = result.get("dependencies", [])
+        if not deps:
+            console.print("[dim]No dependencies.[/dim]")
+            return
+        for dep in deps:
+            console.print(f"- {dep['id']}: {dep['status']}")
+        return
+    if command == "plan":
+        result = service.plan()
+        if not result.get("ok"):
+            console.print(f"[red]{result.get('error')}[/red]")
+            return
+        table = Table(title="Execution Plan")
+        table.add_column("ID")
+        table.add_column("Title")
+        table.add_column("Status")
+        table.add_column("Blocked By")
+        table.add_column("Executable")
+        for row in result["tasks"]:
+            table.add_row(
+                row["id"], row["title"], row["status"],
+                ", ".join(row["blocked_by"]) or "-", "yes" if row["executable"] else "no",
+            )
+        console.print(table)
+        return
+    if command == "mark-done":
+        if len(parts) < 3:
+            console.print("[red]Usage: /tasks mark-done <id>[/red]")
+            return
+        result = service.mark_done(parts[2].strip(), note="Explicitly accepted by user.")
+        console.print("[green]Marked done.[/green]" if result.get("ok") else f"[red]{result.get('error')}[/red]")
+        return
+    if command == "mark-blocked":
+        rest = parts[2] if len(parts) > 2 else ""
+        task_id, _, reason_text = rest.partition(" ")
+        if not task_id.strip() or not reason_text.strip():
+            console.print("[red]Usage: /tasks mark-blocked <id> <reason>[/red]")
+            return
+        result = service.mark_blocked(task_id.strip(), reason_text.strip())
+        console.print("[yellow]Marked blocked.[/yellow]" if result.get("ok") else f"[red]{result.get('error')}[/red]")
+        return
+    if command == "mark-failed":
+        rest = parts[2] if len(parts) > 2 else ""
+        task_id, _, reason_text = rest.partition(" ")
+        if not task_id.strip() or not reason_text.strip():
+            console.print("[red]Usage: /tasks mark-failed <id> <reason>[/red]")
+            return
+        result = service.mark_failed(task_id.strip(), reason_text.strip())
+        if result.get("ok"):
+            console.print(f"[yellow]Marked failed (retry {result.get('retry_count')}; now {result.get('next_status')}).[/yellow]")
+        else:
+            console.print(f"[red]{result.get('error')}[/red]")
+        return
+    console.print(
+        "[red]Usage: /tasks [list|next|show <id>|execute <id>|continue|mark-done <id>|"
+        "mark-blocked <id> <reason>|mark-failed <id> <reason>|dependencies <id>|plan][/red]"
+    )
 
 
 def _handle_models(
@@ -1734,6 +2403,7 @@ def _make_llm_manager(session_logger: SessionLogger | None, console: Console) ->
     return LLMManager(
         session_logger=session_logger,
         model_pull_progress=lazy_progress.as_model_pull_progress(),
+        action_ledger=get_current_run(),
     )
 
 
@@ -1990,6 +2660,20 @@ def _log_assistant_message(
             "Assistant responded",
             workflow_id=workflow_id,
         )
+    ledger = get_current_run()
+    if ledger and message:
+        ledger.log_task_classified(workflow_id or "unknown")
+        ledger.finish(message, status="success")
+
+
+def _finish_current_run(workspace: Path, ledger: ActionLedger) -> None:
+    """Fallback for request branches that never produced a final assistant
+    message through _log_assistant_message (e.g. workspace-info shortcuts,
+    dev-server launches) - still closes out the run so /runs and /run show
+    a finished status instead of "running" forever."""
+    manifest = action_ledger_store.load_manifest(workspace, ledger.run_id)
+    if manifest and manifest.get("status") == "running":
+        ledger.finish("", status="success")
 
 
 def _append_agent_context(user_input: str, agent_context: str) -> str:
@@ -2018,10 +2702,12 @@ async def _handle_request(
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
         return
     if _looks_like_workspace_location_prompt(effective_input):
-        _print_workspace_location(workspace, console)
+        message = _print_workspace_location(workspace, console)
+        _log_assistant_message(session_logger, message, workflow_id="workspace.location")
         return
     if _looks_like_workspace_files_prompt(effective_input):
-        _print_workspace_files(workspace, console)
+        message = _print_workspace_files(workspace, console)
+        _log_assistant_message(session_logger, message, workflow_id="workspace.files")
         return
     if _looks_like_prd_build_request(effective_input, workspace):
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
@@ -2036,7 +2722,8 @@ async def _handle_request(
         )
         return
     if _looks_like_workspace_prd_request(effective_input):
-        _handle_workspace_prd_request(workspace, console)
+        message = _handle_workspace_prd_request(workspace, console)
+        _log_assistant_message(session_logger, message, workflow_id="workspace.prds")
         return
     if _looks_like_affirmative_continue(effective_input) and _multiplayer_template_present(workspace):
         await _run_agent_chat(
@@ -2436,16 +3123,13 @@ def _print_decision(decision: RoutingDecision, console: Console) -> None:
     )
 
 
-def _print_workspace_location(workspace: Path, console: Console) -> None:
-    console.print(
-        Panel(
-            f"I am working in:\n{workspace}",
-            title="Current Workspace",
-        )
-    )
+def _print_workspace_location(workspace: Path, console: Console) -> str:
+    message = f"I am working in:\n{workspace}"
+    console.print(Panel(message, title="Current Workspace"))
+    return message
 
 
-def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -> None:
+def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -> str:
     entries = sorted(
         [
             path for path in workspace.iterdir()
@@ -2454,8 +3138,9 @@ def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -
         key=lambda path: (not path.is_dir(), path.name.lower()),
     )
     if not entries:
-        console.print(Panel(f"{workspace}\n\nThis workspace is empty.", title="Workspace Files"))
-        return
+        message = f"{workspace}\n\nThis workspace is empty."
+        console.print(Panel(message, title="Workspace Files"))
+        return message
     shown = entries[:limit]
     body = "\n".join(
         f"[dir]  {item.name}" if item.is_dir() else f"[file] {item.name}"
@@ -2463,12 +3148,9 @@ def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -
     )
     if len(entries) > limit:
         body = f"{body}\n... {len(entries) - limit} more"
-    console.print(
-        Panel(
-            f"Workspace: {workspace}\n\n{body}",
-            title="Workspace Files",
-        )
-    )
+    message = f"Workspace: {workspace}\n\n{body}"
+    console.print(Panel(message, title="Workspace Files"))
+    return message
 
 
 def _looks_like_code_edit_request(user_input: str) -> bool:
@@ -2513,38 +3195,43 @@ def _find_workspace_prd_files(workspace: Path) -> list[Path]:
     return sorted(candidates)
 
 
-def _handle_workspace_prd_request(workspace: Path, console: Console) -> None:
+def _handle_workspace_prd_request(workspace: Path, console: Console) -> str:
     candidates = _find_workspace_prd_files(workspace)
     if not candidates:
-        console.print(
-            "[yellow]I couldn't find a PRD file in this workspace yet.[/yellow] "
+        message = (
+            "I couldn't find a PRD file in this workspace yet. "
             "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or `Product Requirements*`), "
             "then ask again or run `/parse-prd <file>`."
         )
-        return
+        console.print(f"[yellow]{message}[/yellow]")
+        return message
     if len(candidates) > 1:
+        listing = "\n".join(f"- {path}" for path in candidates[:10])
+        message = (
+            f"I found multiple PRD files in this workspace:\n{listing}\n\n"
+            "Tell me which one to open, or run `/parse-prd <file>` or `/plan-prd <file>`."
+        )
         console.print("[yellow]I found multiple PRD files in this workspace:[/yellow]")
         for path in candidates[:10]:
             console.print(f"- {path}")
         console.print("Tell me which one to open, or run `/parse-prd <file>` or `/plan-prd <file>`.")
-        return
+        return message
     relative_path = candidates[0]
     absolute_path = workspace / relative_path
     try:
         parsed = parse_prd_file(absolute_path)
     except PRDParseError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
-        return
+        return str(exc)
     section_names = ", ".join(parsed.sections.keys()) or "none"
-    console.print(
-        Panel(
-            f"File: {relative_path}\n"
-            f"Title: {parsed.title}\n"
-            f"Sections: {section_names}\n\n"
-            f"Use `/plan-prd \"{relative_path}\"` if you want me to turn it into a project plan.",
-            title="PRD Found",
-        )
+    message = (
+        f"File: {relative_path}\n"
+        f"Title: {parsed.title}\n"
+        f"Sections: {section_names}\n\n"
+        f"Use `/plan-prd \"{relative_path}\"` if you want me to turn it into a project plan."
     )
+    console.print(Panel(message, title="PRD Found"))
+    return message
 
 
 _PRD_BUILD_VERBS = ("build", "finish", "implement", "generate", "make", "create", "develop")
@@ -3685,10 +4372,12 @@ async def _run_agent_chat(
     # and verification commands during that build run without further prompts
     # (this also sidesteps the fragile mid-flow input() approval on Windows).
     approval_func = (lambda _request: True) if auto_approve else ask_approval
+    action_ledger = get_current_run()
     tools = AgentToolRegistry(
         workspace,
         session_logger=session_logger,
         approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
+        action_ledger=action_ledger,
     )
     long_running = force_long_running or is_long_running_enabled(workspace)
     activities: list[str] = []
@@ -3713,6 +4402,7 @@ async def _run_agent_chat(
         long_running=long_running,
         on_activity=on_activity,
         progress=progress,
+        action_ledger=action_ledger,
     ).run(user_input)
     body = result.final.strip() or "No response returned."
     if result.stopped:
@@ -4094,13 +4784,15 @@ async def _run_code_edit(
             workspace,
             session_logger=session_logger,
             approval_manager=_make_approval_manager(workspace, session_logger, console),
+            action_ledger=get_current_run(),
         )
     result = await CodeEditWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "edit")
     )
     if getattr(result, "used_full_rewrite", False):
         console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
-    _print_patch_result("Code Edit", result.applied, result.changed_files, result.error, console)
+    message = _print_patch_result("Code Edit", result.applied, result.changed_files, result.error, console)
+    _log_assistant_message(session_logger, message, workflow_id="code_edit")
 
 
 async def _run_bug_fix(
@@ -4118,13 +4810,14 @@ async def _run_bug_fix(
             workspace,
             session_logger=session_logger,
             approval_manager=_make_approval_manager(workspace, session_logger, console),
+            action_ledger=get_current_run(),
         )
     result = await BugFixWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "fix")
     )
     if getattr(result, "used_full_rewrite", False):
         console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
-    _print_patch_result(
+    message = _print_patch_result(
         "Bug Fix",
         result.applied,
         result.changed_files,
@@ -4132,6 +4825,7 @@ async def _run_bug_fix(
         console,
         verification_status=getattr(result, "verification_status", ""),
     )
+    _log_assistant_message(session_logger, message, workflow_id="bug_fix")
 
 
 async def _run_audit(
@@ -4173,22 +4867,24 @@ async def _run_test_generation(
     kwargs = {}
     if session_logger:
         approval_manager = _make_approval_manager(workspace, session_logger, console)
+        action_ledger = get_current_run()
         kwargs["patch_engine"] = PatchEngine(
-            workspace, session_logger=session_logger, approval_manager=approval_manager
+            workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger
         )
         kwargs["command_runner"] = CommandRunner(
-            workspace, session_logger=session_logger, approval_manager=approval_manager
+            workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger
         )
     result = await TestGenerationWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "test-gen")
     )
-    _print_patch_result(
+    message = _print_patch_result(
         "Test Generation",
         result.applied,
         result.changed_files,
         result.error,
         console,
     )
+    _log_assistant_message(session_logger, message, workflow_id="test_gen")
 
 
 async def _run_docs(
@@ -4210,19 +4906,21 @@ async def _run_docs(
                     workspace,
                     session_logger=session_logger,
                     approval_manager=_make_approval_manager(workspace, session_logger, console),
+                    action_ledger=get_current_run(),
                 )
             }
             if session_logger
             else {}
         ),
     ).apply_readme_update(request=_strip_forced_prefix(user_input, "docs"))
-    _print_patch_result(
+    message = _print_patch_result(
         "Documentation",
         result.applied,
         result.changed_files,
         result.error,
         console,
     )
+    _log_assistant_message(session_logger, message, workflow_id="doc_gen")
 
 
 def _warn_if_dirty_before_edit(workspace: Path, console: Console) -> None:
@@ -4249,6 +4947,7 @@ async def _handle_django_fix_tests(
             workspace,
             session_logger=session_logger,
             approval_manager=_make_approval_manager(workspace, session_logger, console),
+            action_ledger=get_current_run(),
         ),
         session_logger=session_logger,
         long_running=is_long_running_enabled(workspace),
@@ -4267,17 +4966,17 @@ def _print_patch_result(
     error: str,
     console: Console,
     verification_status: str = "",
-) -> None:
+) -> str:
     if applied:
         files = "\n".join(f"- {path}" for path in changed_files) or "No files reported."
         body = files
         if verification_status:
             body = f"Applied changes:\n{files}\n\nVerified results:\n{verification_status}"
         console.print(Panel(body, title=f"{title} Applied", border_style="green"))
-        return
-    console.print(
-        Panel(error or "No changes applied.", title=f"{title} Not Applied", border_style="yellow")
-    )
+        return f"{title} applied.\n{body}"
+    message = error or "No changes applied."
+    console.print(Panel(message, title=f"{title} Not Applied", border_style="yellow"))
+    return f"{title} not applied.\n{message}"
 
 
 def _looks_like_runtime_error(message: str) -> bool:
@@ -4600,8 +5299,53 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input.startswith("permissions"):
             _handle_permissions(normalized_input, workspace, console)
             continue
-        if lowered_input.startswith("tasks"):
-            _handle_tasks(normalized_input, workspace, console)
+        if lowered_input.startswith("milestones"):
+            _handle_milestones(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("taskmaster"):
+            _handle_taskmaster(normalized_input, workspace, console)
+            continue
+        if lowered_input.startswith("prd "):
+            # Parsing/reparsing calls Taskmaster and the local model, so it
+            # gets its own ActionLedger run - same reasoning as /tasks
+            # execute|continue below (Taskmaster.md section 12).
+            ledger = start_run(workspace, user_input)
+            set_current_run(ledger)
+            try:
+                _handle_prd_command(normalized_input, workspace, console)
+            except Exception as exc:
+                ledger.fail(str(exc))
+                clear_current_run()
+                raise
+            _finish_current_run(workspace, ledger)
+            clear_current_run()
+            continue
+        if lowered_input == "tasks" or lowered_input.startswith("tasks "):
+            _tasks_tokens = lowered_input.split(maxsplit=2)
+            if len(_tasks_tokens) > 1 and _tasks_tokens[1] in {"execute", "continue"}:
+                search, _ = _build_search_agent(workspace, session_logger)
+                llm = _make_llm_manager(session_logger, console)
+                # Task execution goes through model calls, Codebase-Memory
+                # queries, and PatchEngine mutations just like the natural-
+                # language fallback path below - it needs the same active
+                # ActionLedger run so those get recorded (see Taskmaster.md
+                # section 12), not just its own `.shamsu/taskmaster/` bookkeeping.
+                ledger = start_run(workspace, user_input)
+                set_current_run(ledger)
+                try:
+                    asyncio.run(
+                        _handle_tasks_execute(
+                            normalized_input, workspace, console, search, llm, session_logger=session_logger,
+                        )
+                    )
+                except Exception as exc:
+                    ledger.fail(str(exc))
+                    clear_current_run()
+                    raise
+                _finish_current_run(workspace, ledger)
+                clear_current_run()
+            else:
+                _handle_tasks(normalized_input, workspace, console)
             continue
         if lowered_input.startswith("autonomy"):
             _handle_autonomy(normalized_input, workspace, console)
@@ -4620,20 +5364,43 @@ def main(argv: list[str] | None = None) -> None:
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
                 _handle_log(normalized_input, session_logger, console)
             continue
+        if lowered_input == "runs" or lowered_input.startswith("runs "):
+            _handle_runs(normalized_input, workspace, console)
+            continue
+        _run_tokens = lowered_input.split(maxsplit=2)
+        if lowered_input == "run" or (
+            lowered_input.startswith("run ")
+            and len(_run_tokens) > 1
+            and _run_tokens[1] in _RUN_SUBCOMMANDS
+        ):
+            # "run" is also an ordinary English verb ("run the tests"), so only
+            # claim it here when the next token is a recognized /run subcommand -
+            # everything else falls through to the normal agent request path.
+            _handle_run(normalized_input, workspace, console)
+            continue
 
-        with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
-            asyncio.run(
-                _handle_request(
-                    user_input,
-                    workspace,
-                    console,
-                    web_tool,
-                    browser_tool,
-                    previous_user_prompt=previous_user_prompt,
-                    session_logger=session_logger,
-                    thinking_status=thinking,
+        ledger = start_run(workspace, user_input)
+        set_current_run(ledger)
+        try:
+            with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
+                asyncio.run(
+                    _handle_request(
+                        user_input,
+                        workspace,
+                        console,
+                        web_tool,
+                        browser_tool,
+                        previous_user_prompt=previous_user_prompt,
+                        session_logger=session_logger,
+                        thinking_status=thinking,
+                    )
                 )
-            )
+        except Exception as exc:
+            ledger.fail(str(exc))
+            clear_current_run()
+            raise
+        _finish_current_run(workspace, ledger)
+        clear_current_run()
 
     browser_tool.close()
 

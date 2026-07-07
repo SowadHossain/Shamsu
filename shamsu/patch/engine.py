@@ -9,6 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
+from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.interfaces import IPatchEngine
 from shamsu.patch import git_apply
 from shamsu.patch.file_mutations import FileMutationOps
@@ -114,12 +115,14 @@ class PatchEngine(IPatchEngine):
         approval_manager: ApprovalManager | None = None,
         command_runner: CommandRunner | None = None,
         memory_adapter: CodebaseMemoryAdapter | None = None,
+        action_ledger: ActionLedger | None = None,
     ) -> None:
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
+        self.action_ledger = action_ledger
         self.audit_logger = AuditLogger(self.workspace_root)
         self.memory_adapter = memory_adapter
         self.command_runner = command_runner or CommandRunner(
@@ -127,6 +130,7 @@ class PatchEngine(IPatchEngine):
             approval_func=approval_func,
             session_logger=session_logger,
             approval_manager=self.approval_manager,
+            action_ledger=action_ledger,
         )
         self.transactions = TransactionWorkspace(self.workspace_root)
         self.trash = TrashWorkspace(self.workspace_root)
@@ -162,6 +166,8 @@ class PatchEngine(IPatchEngine):
             reason="Patch application modifies files inside the selected workspace.",
         )
         self._log("patch.preview", {"files": [patch.display_path for patch in patches]}, request.description)
+        if self.action_ledger:
+            self.action_ledger.log_patch_planned(_patch_paths(patches))
         self.approval_manager.session_logger = self.session_logger
         if not self.approval_manager.ask(request):
             self._log("patch.denied", {"files": [patch.display_path for patch in patches]}, "Patch denied")
@@ -196,6 +202,8 @@ class PatchEngine(IPatchEngine):
         _queue_code_memory_refresh(self.workspace_root)
         self._log("patch.applied", {"files": [patch.display_path for patch in patches]}, "Patch applied")
         self.audit_logger.log("patch_apply", "success", affected_paths=_patch_paths(patches))
+        if self.action_ledger:
+            self.action_ledger.log_patch_applied(_patch_paths(patches))
         return True
 
     def rollback(self, file_path: Path) -> bool:
@@ -205,9 +213,13 @@ class PatchEngine(IPatchEngine):
             return False
         backup = _backup_path(target)
         if not backup.exists():
+            if self.action_ledger:
+                self.action_ledger.log_rollback(str(file_path), False, "No backup available")
             return False
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(backup), str(target))
+        if self.action_ledger:
+            self.action_ledger.log_rollback(str(file_path), True)
         return True
 
     # -- structured model contract: transaction + verification pipeline ---------
@@ -261,6 +273,8 @@ class PatchEngine(IPatchEngine):
             [op.to_dict() for op in change_plan.operations],
             change_plan.destructive,
         )
+        if self.action_ledger:
+            self.action_ledger.log_mutation_started(transaction_id, change_plan.reason)
         mutation_ops = FileMutationOps(
             self.workspace_root, self.transactions, self.trash, memory_adapter=self.memory_adapter
         )
@@ -300,6 +314,11 @@ class PatchEngine(IPatchEngine):
         except (DiffValidationError, MutationSafetyError, OSError) as exc:
             manifest = self.transactions.finalize(transaction_id, "failed", error=str(exc))
             self.audit_logger.log("patch_apply", "error", affected_paths=manifest.get("touched_files", []))
+            if self.action_ledger:
+                self.action_ledger.log_mutation_finished(
+                    transaction_id, "failed", manifest.get("touched_files", []),
+                    rollback_available=True, error=str(exc),
+                )
             return MutationResult(
                 ok=False, transaction_id=transaction_id, reason=change_plan.reason,
                 touched_files=manifest.get("touched_files", []),
@@ -329,6 +348,10 @@ class PatchEngine(IPatchEngine):
         if verification_ok:
             _queue_code_memory_refresh(self.workspace_root)
             self._log("patch.applied", {"transaction_id": transaction_id, "files": touched_files}, "Change applied and verified.")
+            if self.action_ledger:
+                self.action_ledger.log_mutation_finished(
+                    transaction_id, "applied", manifest.get("touched_files", []), rollback_available=True
+                )
             return MutationResult(
                 ok=True, transaction_id=transaction_id, reason=change_plan.reason,
                 touched_files=manifest.get("touched_files", []), verification=verification,
@@ -336,6 +359,11 @@ class PatchEngine(IPatchEngine):
             )
 
         self._log("patch.failed", {"transaction_id": transaction_id, "files": touched_files}, "Verification failed.")
+        if self.action_ledger:
+            self.action_ledger.log_mutation_finished(
+                transaction_id, "verification_failed", manifest.get("touched_files", []),
+                rollback_available=True, error="Verification failed.",
+            )
         return MutationResult(
             ok=False, transaction_id=transaction_id, reason=change_plan.reason,
             touched_files=manifest.get("touched_files", []),
@@ -346,7 +374,10 @@ class PatchEngine(IPatchEngine):
     def rollback_transaction(self, transaction_id: str) -> tuple[bool, str]:
         from shamsu.patch.rollback import rollback_transaction
 
-        return rollback_transaction(self.workspace_root, transaction_id)
+        ok, message = rollback_transaction(self.workspace_root, transaction_id)
+        if self.action_ledger:
+            self.action_ledger.log_rollback(transaction_id, ok, message)
+        return ok, message
 
     def _run_file_operation(self, mutation_ops: FileMutationOps, transaction_id: str, op: Operation):
         if op.op == "create_file":

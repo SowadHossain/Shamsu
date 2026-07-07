@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.agents.planner import create_plan
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import (
     ICommandRunner,
@@ -36,6 +37,7 @@ class TestGenerationResult:
     applied: bool = False
     test_result: TestRunResult | None = None
     error: str = ""
+    plan: str = ""
 
 
 class TestGenerationWorkflow:
@@ -58,7 +60,7 @@ class TestGenerationWorkflow:
         self.command_runner = command_runner
 
     async def run(self, request: str, run_after_apply: bool = False) -> TestGenerationResult:
-        pack = self._build_pack(request)
+        pack, plan_text = await self._build_pack(request)
         response = await self.llm.run_specialist("test_gen", pack)
         diff_text = _clean_diff(response.raw)
         ok, error = self.patch_engine.validate_diff(diff_text)
@@ -68,6 +70,7 @@ class TestGenerationWorkflow:
                 pack=pack,
                 diff_text=diff_text,
                 error=f"Invalid diff: {error}",
+                plan=plan_text,
             )
 
         changed_files = _changed_files(diff_text)
@@ -79,6 +82,7 @@ class TestGenerationWorkflow:
                 diff_text=diff_text,
                 changed_files=changed_files,
                 error="Patch was not applied.",
+                plan=plan_text,
             )
 
         test_result = None
@@ -93,17 +97,20 @@ class TestGenerationWorkflow:
             changed_files=changed_files,
             applied=True,
             test_result=test_result,
+            plan=plan_text,
         )
 
-    def _build_pack(self, request: str) -> ContextPack:
+    async def _build_pack(self, request: str) -> tuple[ContextPack, str]:
         results = _dedupe_results(self._search_test_context(request))
-        return self.context_builder.pack(
+        plan = await create_plan(self.llm, self.context_builder, results, goal=request, task_id="test-gen-plan")
+        pack = self.context_builder.pack(
             results=results,
-            request=f"{TEST_GEN_INSTRUCTIONS}\n\nTest request: {request}",
+            request=f"{TEST_GEN_INSTRUCTIONS}\n\nPlan from planner model:\n{plan.text}\n\nTest request: {request}",
             task_id="test-generation",
-            step_id=1,
+            step_id=2,
             specialist="test_gen",
         )
+        return pack, plan.text
 
     def _search_test_context(self, request: str) -> list[SearchResult]:
         results: list[SearchResult] = []

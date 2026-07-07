@@ -41,6 +41,7 @@ SECRET_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",                      # AWS key
     r"sk-[a-zA-Z0-9]{32,}",                   # OpenAI-style key
     r"ghp_[a-zA-Z0-9]{36}",                   # GitHub token
+    r"-----BEGIN.*PRIVATE KEY[^-]*-----[\s\S]+?-----END.*PRIVATE KEY[^-]*-----",
     r"-----BEGIN.*PRIVATE KEY",
     r"password\s*=\s*['\"][^'\"]+",
     r'"password"\s*:\s*"[^"]+"',
@@ -48,10 +49,15 @@ SECRET_PATTERNS = [
     r'"api_key"\s*:\s*"[^"]+"',
     r"secret\s*=\s*['\"][^'\"]+",
     r'"secret"\s*:\s*"[^"]+"',
+    r"token\s*=\s*['\"][^'\"]+",
+    r'"token"\s*:\s*"[^"]+"',
     r"SECRET_KEY\s*=\s*['\"][^'\"]+",         # Django-specific
     r'"SECRET_KEY"\s*:\s*"[^"]+"',             # Django-specific JSON logs
+    r"[Aa]uthorization\s*:\s*(Bearer|Basic|Token)\s+\S+",  # HTTP auth headers
+    r'"[Aa]uthorization"\s*:\s*"[^"]+"',
     r"postgresql://[^@]*:[^@]*@",
     r"mysql://[^@]*:[^@]*@",
+    r"mongodb(\+srv)?://[^@]*:[^@]*@",
 ]
 
 

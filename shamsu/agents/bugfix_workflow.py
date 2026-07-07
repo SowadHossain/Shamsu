@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from shamsu.abstract.context import build_codebase_memory_brief
+from shamsu.agents.planner import create_plan
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -66,6 +67,7 @@ class BugFixResult:
     used_full_rewrite: bool = False
     verification_status: str = "Change applied, not yet verified."
     test_suggestion: str = "Re-run the failing test or command that produced the bug report."
+    plan: str = ""
 
 
 class BugFixWorkflow:
@@ -88,7 +90,7 @@ class BugFixWorkflow:
         import_error = parse_import_export_error(report)
         if import_error and not locations:
             locations = _locations_for_import_error(self.workspace_root, report, import_error)
-        pack, searched_paths = self._build_pack(report, locations)
+        pack, searched_paths, plan_text = await self._build_pack(report, locations)
         target_paths = [location.file_path for location in locations]
         if should_convene_council(target_paths=target_paths):
             council_result = await run_council(self.llm, pack, specialist="bugfix")
@@ -102,7 +104,9 @@ class BugFixWorkflow:
         max_repair_attempts = 4 if "autonomy" in report.lower() else 2
         while not ok and repair_attempts < max_repair_attempts:
             repair_attempts += 1
-            repair_pack = self._build_repair_pack(report, diff_text, error or "Diff validation failed.", locations, searched_paths)
+            repair_pack = self._build_repair_pack(
+                report, diff_text, error or "Diff validation failed.", locations, searched_paths, plan_text,
+            )
             repair_response = await self.llm.run_specialist("bugfix", repair_pack)
             diff_text = _clean_diff(repair_response.raw)
             ok, error = self.patch_engine.validate_diff(diff_text)
@@ -118,6 +122,7 @@ class BugFixWorkflow:
                     diff_text=diff_text,
                     error=contract_error,
                     verification_status="No file was changed.",
+                    plan=plan_text,
                 )
             applied = self.patch_engine.apply(diff_text, self.workspace_root)
             return BugFixResult(
@@ -129,6 +134,7 @@ class BugFixWorkflow:
                 applied=applied,
                 error="" if applied else "Patch was not applied.",
                 verification_status="Change applied, not yet verified." if applied else "No file was changed.",
+                plan=plan_text,
             )
 
         fallback = _parse_search_replace(response.raw)
@@ -143,6 +149,7 @@ class BugFixWorkflow:
                     changed_files=[rewritten],
                     applied=True,
                     verification_status="Change applied, not yet verified.",
+                    plan=plan_text,
                 )
             return BugFixResult(
                 request=report,
@@ -151,6 +158,7 @@ class BugFixWorkflow:
                 diff_text=diff_text,
                 error=f"Invalid diff: {error}; targeted edit fallback refused: {fallback_error}",
                 verification_status="No file was changed.",
+                plan=plan_text,
             )
         return BugFixResult(
             request=report,
@@ -159,19 +167,24 @@ class BugFixWorkflow:
             diff_text=diff_text,
             error=f"Invalid diff: {error}. Targeted files: {', '.join(target_paths or searched_paths) or 'unknown'}. No file was changed.",
             verification_status="No file was changed.",
+            plan=plan_text,
         )
 
-    def _build_pack(self, report: str, locations: list[TracebackLocation]) -> tuple[ContextPack, list[str]]:
+    async def _build_pack(
+        self, report: str, locations: list[TracebackLocation],
+    ) -> tuple[ContextPack, list[str], str]:
         results = _dedupe_results(self._search_bug_context(report, locations))
         target_paths = _target_paths(results)
         memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
+        plan = await create_plan(self.llm, self.context_builder, results, goal=report, task_id="bugfix-plan")
         request = (
             f"{BUGFIX_INSTRUCTIONS}\n\n"
             + (f"{memory_brief}\n\n" if memory_brief else "")
+            + f"Plan from planner model:\n{plan.text}\n\n"
             + f"Bug report, traceback, or failing test output:\n{report.strip()}"
         )
-        pack = self.context_builder.pack(results=results, request=request, task_id="bug-fix", step_id=1, specialist="bugfix")
-        return pack, target_paths
+        pack = self.context_builder.pack(results=results, request=request, task_id="bug-fix", step_id=2, specialist="bugfix")
+        return pack, target_paths, plan.text
 
     def _build_repair_pack(
         self,
@@ -180,18 +193,20 @@ class BugFixWorkflow:
         validation_error: str,
         locations: list[TracebackLocation],
         searched_paths: list[str],
+        plan_text: str = "",
     ) -> ContextPack:
         paths = _dedupe_strings([location.file_path for location in locations] + searched_paths)
         results = _full_file_results(self.workspace_root, paths)
         request = (
             f"{BUGFIX_INSTRUCTIONS}\n\n"
-            "The previous unified diff was rejected by PatchEngine.\n"
+            + (f"Plan from planner model:\n{plan_text}\n\n" if plan_text.strip() else "")
+            + "The previous unified diff was rejected by PatchEngine.\n"
             f"Patch validation error: {validation_error}\n\n"
             f"Original bug report:\n{report.strip()}\n\n"
             f"Rejected diff:\n{bad_diff.strip()}\n\n"
             "Return a corrected unified diff only."
         )
-        return self.context_builder.pack(results=results, request=request, task_id="bug-fix-diff-repair", step_id=2, specialist="bugfix")
+        return self.context_builder.pack(results=results, request=request, task_id="bug-fix-diff-repair", step_id=3, specialist="bugfix")
 
     def _search_bug_context(self, report: str, locations: list[TracebackLocation]) -> list[SearchResult]:
         boost_paths = [location.file_path for location in locations]

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from shamsu.action_ledger.context import get_current_run
 from shamsu.interfaces import ISearchAgent
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.types import SearchResult
@@ -100,6 +101,9 @@ class SearchAgent(ISearchAgent):
 
     def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         result = self.adapter.search_code(self.workspace_root, query, limit=top_k)
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_code_memory_queried("search_code", query, len((result or {}).get("results") or []))
         if not result.get("ok"):
             return []
         matches = result.get("results") or []
@@ -126,6 +130,9 @@ class SearchAgent(ISearchAgent):
 
     def symbol_lookup(self, name: str) -> list[SearchResult]:
         result = self.adapter.get_symbols(self.workspace_root, name)
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_code_memory_queried("get_symbols", name, len((result or {}).get("results") or []))
         if not result.get("ok"):
             return []
         rows = result.get("results") or []

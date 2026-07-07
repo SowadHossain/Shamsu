@@ -29,6 +29,7 @@ from urllib.parse import urlparse
 import httpx
 from json_repair import repair_json
 
+from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.interfaces import ILLMManager
 from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role
@@ -131,11 +132,13 @@ class LLMManager(ILLMManager):
         base_url: str = OLLAMA_BASE_URL,
         session_logger: SessionLogger | None = None,
         model_pull_progress: ModelPullProgress | None = None,
+        action_ledger: ActionLedger | None = None,
     ):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
         self.router_model = model_for_role("router")
         self.session_logger = session_logger
+        self.action_ledger = action_ledger
         self.model_pull_progress = model_pull_progress
 
     async def _ensure_model(self, model_name: str) -> None:
@@ -226,10 +229,16 @@ class LLMManager(ILLMManager):
                 "Routing request sent to local model",
                 workflow_id="router",
             )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_started("router", self.router_model, user_msg)
         raw = await self._generate(
             self.router_model, ROUTER_SYSTEM_PROMPT, user_msg,
             temperature=0.0, json_schema=ROUTING_JSON_SCHEMA, keep_alive="-1",
         )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_finished(
+                "router", self.router_model, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2)
+            )
         decision = self._parse_routing(raw)
         if decision is not None:
             self._log_route_decision(decision, started, retry_count=0)
@@ -241,10 +250,17 @@ class LLMManager(ILLMManager):
             f"Output ONLY corrected JSON matching the schema. "
             f"Do not include any prose, markdown, or code fences.\n\n{user_msg}"
         )
+        retry_started = time.perf_counter()
+        if self.action_ledger:
+            self.action_ledger.log_model_call_started("router", self.router_model, retry_prompt)
         raw2 = await self._generate(
             self.router_model, ROUTER_SYSTEM_PROMPT, retry_prompt,
             temperature=0.0, json_schema=ROUTING_JSON_SCHEMA, keep_alive="-1",
         )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_finished(
+                "router", self.router_model, raw2, duration_ms=round((time.perf_counter() - retry_started) * 1000, 2)
+            )
         decision = self._parse_routing(raw2)
         if decision is not None:
             self._log_route_decision(decision, started, retry_count=1)
@@ -257,6 +273,15 @@ class LLMManager(ILLMManager):
                 {"specialist": "router", "model": self.router_model, "retry_count": 1},
                 "Router output could not be parsed; falling back to QA",
                 workflow_id="router",
+            )
+        if self.action_ledger:
+            self.action_ledger.log_decision(
+                "router_fallback_to_qa",
+                reason_summary="Router output failed JSON validation twice; falling back to a safe QA routing.",
+                evidence=[f"router_model: {self.router_model}"],
+                chosen_action="route_as_qa",
+                confidence=0.3,
+                outcome="fallback",
             )
         return RoutingDecision(
             intent="qa", complexity="single",
@@ -307,6 +332,9 @@ class LLMManager(ILLMManager):
                 f"Specialist request sent to {specialist}",
                 workflow_id=pack.task_id,
             )
+        if self.action_ledger:
+            self.action_ledger.log_context_preview(_context_preview(pack))
+            self.action_ledger.log_model_call_started(specialist, model_name, prompt)
         try:
             raw = await self._generate(model_name, "", prompt, temperature=temp)
         except Exception as exc:
@@ -330,6 +358,10 @@ class LLMManager(ILLMManager):
                 },
                 f"Specialist {specialist} returned a response",
                 workflow_id=pack.task_id,
+            )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_finished(
+                specialist, model_name, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2)
             )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
 
@@ -398,6 +430,9 @@ class LLMManager(ILLMManager):
                 f"Specialist request sent to {specialist} (streaming)",
                 workflow_id=pack.task_id,
             )
+        if self.action_ledger:
+            self.action_ledger.log_context_preview(_context_preview(pack))
+            self.action_ledger.log_model_call_started(specialist, model_name, prompt)
         try:
             raw = await self._generate_stream(model_name, "", prompt, on_token, temperature=temp)
         except Exception as exc:
@@ -421,6 +456,10 @@ class LLMManager(ILLMManager):
                 },
                 f"Specialist {specialist} returned a streamed response",
                 workflow_id=pack.task_id,
+            )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_finished(
+                specialist, model_name, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2)
             )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
 
@@ -452,20 +491,29 @@ class LLMManager(ILLMManager):
         started: float,
         retry_count: int,
     ) -> None:
-        if not self.session_logger:
-            return
-        self.session_logger.log(
-            "router.decision",
-            {
-                "intent": decision.intent,
-                "complexity": decision.complexity,
-                "confidence": decision.confidence,
-                "retry_count": retry_count,
-                "duration_ms": round((time.perf_counter() - started) * 1000, 2),
-            },
-            f"Routed prompt as {decision.intent}",
-            workflow_id="router",
-        )
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        if self.session_logger:
+            self.session_logger.log(
+                "router.decision",
+                {
+                    "intent": decision.intent,
+                    "complexity": decision.complexity,
+                    "confidence": decision.confidence,
+                    "retry_count": retry_count,
+                    "duration_ms": duration_ms,
+                },
+                f"Routed prompt as {decision.intent}",
+                workflow_id="router",
+            )
+        if self.action_ledger:
+            self.action_ledger.log_decision(
+                f"route_prompt_as_{decision.intent}",
+                reason_summary=f"Router model selected intent '{decision.intent}' with complexity '{decision.complexity}'.",
+                evidence=[f"router_model: {self.router_model}", f"retry_count: {retry_count}"],
+                chosen_action=f"route as {decision.intent}",
+                confidence=decision.confidence,
+                outcome="routed",
+            )
 
     @staticmethod
     def _format_pack(pack: ContextPack) -> str:
@@ -488,6 +536,27 @@ class LLMManager(ILLMManager):
 ## Task (read this carefully)
 {pack.user_request}
 """
+
+
+def _context_preview(pack: ContextPack) -> dict:
+    """Safe, human-inspectable summary of a ContextPack for ActionLedger -
+    never fed back into a model, see shamsu/action_ledger/ledger.py."""
+    return {
+        "task_id": pack.task_id,
+        "step_id": pack.step_id,
+        "specialist": pack.specialist,
+        "token_estimate": pack.token_estimate,
+        "prompt_preview": pack.user_request[:500],
+        "snippets": [
+            {
+                "file_path": item.file_path,
+                "line_start": item.line_start,
+                "line_end": item.line_end,
+                "symbol_name": item.symbol_name,
+            }
+            for item in pack.snippets
+        ],
+    }
 
 
 def _validate_local_llm_url(base_url: str) -> None:

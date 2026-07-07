@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from shamsu.abstract.service import AbstractService
+from shamsu.action_ledger.context import get_current_run
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
@@ -98,6 +99,9 @@ class AgentOrchestrator:
                 action="web.needs_location",
             )
         memory_gate = self.memory_service.ensure_ready()
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_memory_status_checked(memory_gate.allowed, memory_gate.reason or "")
         if not memory_gate.allowed:
             return AgentResult(
                 handled=True,

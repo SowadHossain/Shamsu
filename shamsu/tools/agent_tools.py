@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
@@ -37,16 +38,19 @@ class AgentToolRegistry:
         approval_func=ask_approval,
         session_logger: SessionLogger | None = None,
         approval_manager: ApprovalManager | None = None,
+        action_ledger: ActionLedger | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.workspace_tool = WorkspaceTool(self.workspace_root)
         self.transactions = TransactionWorkspace(self.workspace_root)
+        self.action_ledger = action_ledger
         self.command_runner = CommandRunner(
             self.workspace_root,
             approval_func=approval_func,
             session_logger=session_logger,
             approval_manager=approval_manager,
+            action_ledger=action_ledger,
         )
         self.approval_func = approval_func
         self.session_logger = session_logger
@@ -199,11 +203,14 @@ class AgentToolRegistry:
         if not command.strip():
             return ToolResult(False, "Missing command.", {})
         code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
-        return ToolResult(
-            code == 0,
-            f"Command exited with {code}.",
-            {"exit_code": code, "stdout": stdout, "stderr": stderr},
-        )
+        data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
+        # DiagnosticDigest already parsed this command's output into a compact
+        # ErrorPacket (see CommandRunner._run_diagnostics) - surface that to
+        # the model on failure instead of leaving it unread on the command
+        # runner, per pipeline.md: "parse errors before giving logs to model."
+        if code != 0 and self.command_runner.last_error_packet is not None:
+            data["diagnostics"] = self.command_runner.last_error_packet.to_model_context()
+        return ToolResult(code == 0, f"Command exited with {code}.", data)
 
     def search_index(self, query: str) -> ToolResult:
         from shamsu.abstract.service import AbstractService

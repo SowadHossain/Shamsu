@@ -94,7 +94,7 @@ def test_repl_request_uses_codebase_memory_context_when_healthy(monkeypatch, tmp
         ],
     )
     class FakeLLM:
-        def __init__(self, session_logger=None, model_pull_progress=None):
+        def __init__(self, session_logger=None, model_pull_progress=None, action_ledger=None):
             self.session_logger = session_logger
 
         async def route(self, prompt: str, project_summary: str):
@@ -129,7 +129,7 @@ def test_repl_greeting_uses_agent_chat_when_codebase_memory_is_unavailable(monke
     web_tool, browser_tool = _tools(tmp_path)
 
     class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None, progress=None):
+        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None, progress=None, action_ledger=None):
             assert workspace == tmp_path
 
         async def run(self, user_input):
@@ -152,7 +152,7 @@ def test_repl_general_chat_uses_agent_loop_when_codebase_memory_is_unavailable(m
     web_tool, browser_tool = _tools(tmp_path)
 
     class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None, progress=None):
+        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None, progress=None, action_ledger=None):
             assert workspace == tmp_path
             self.session_logger = session_logger
 
@@ -234,7 +234,7 @@ def test_repl_weather_question_without_location_asks_location(monkeypatch, tmp_p
             )()
 
     class FakeLLM:
-        def __init__(self, session_logger=None, model_pull_progress=None):
+        def __init__(self, session_logger=None, model_pull_progress=None, action_ledger=None):
             self.session_logger = session_logger
 
         async def run_specialist(self, specialist, pack):
@@ -277,7 +277,7 @@ def test_repl_weather_question_with_location_uses_web_tool(monkeypatch, tmp_path
             )()
 
     class FakeLLM:
-        def __init__(self, session_logger=None, model_pull_progress=None):
+        def __init__(self, session_logger=None, model_pull_progress=None, action_ledger=None):
             self.session_logger = session_logger
 
         async def run_specialist(self, specialist, pack):
@@ -314,7 +314,7 @@ def test_repl_followup_web_request_uses_previous_prompt(monkeypatch, tmp_path):
             raise AssertionError("fetch should not be called")
 
     class FakeLLM:
-        def __init__(self, session_logger=None, model_pull_progress=None):
+        def __init__(self, session_logger=None, model_pull_progress=None, action_ledger=None):
             self.session_logger = session_logger
 
         async def run_specialist(self, specialist, pack):
