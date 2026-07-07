@@ -8,6 +8,7 @@ import socket
 import sqlite3
 import subprocess
 import time
+import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import unescape
@@ -300,14 +301,45 @@ class WebServiceManager:
     def compose_path(self) -> Path:
         return self.web_dir / "docker-compose.yml"
 
+    def _ensure_valid_settings(self) -> None:
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if self.settings_path.exists():
+            try:
+                data = yaml.safe_load(self.settings_path.read_text(encoding="utf-8")) or {}
+            except Exception:
+                data = {}
+
+        if not isinstance(data, dict):
+            data = {}
+
+        server = data.get("server")
+        if not isinstance(server, dict):
+            server = {}
+            data["server"] = server
+
+        if not isinstance(server.get("secret_key"), str) or not server["secret_key"].strip():
+            server["secret_key"] = secrets.token_urlsafe(48)
+
+        server.setdefault("bind_address", "0.0.0.0")
+        server.setdefault("port", 8080)
+
+        search = data.get("search")
+        if not isinstance(search, dict):
+            search = {}
+            data["search"] = search
+        search["formats"] = ["html", "json"]
+
+        data.setdefault("use_default_settings", True)
+
+        self.settings_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+    
     @property
     def settings_path(self) -> Path:
         return self.web_dir / "searxng" / "settings.yml"
 
     def setup(self) -> WebServiceStatus:
-        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings = {"search": {"formats": ["html", "json"]}}
-        self.settings_path.write_text(yaml.safe_dump(settings, sort_keys=False), encoding="utf-8")
+        self._ensure_valid_settings()
         compose = {
             "services": {
                 "searxng": {
@@ -331,6 +363,8 @@ class WebServiceManager:
         if not self.compose_path.exists():
             setup = self.setup()
             setup_message = f"{setup.message}\n"
+        else:
+            self._ensure_valid_settings()
         preflight = self._preflight_start()
         if preflight is not None:
             return WebServiceStatus(ok=False, message=f"{setup_message}{preflight.message}".strip(), running=False, state=preflight.state)
