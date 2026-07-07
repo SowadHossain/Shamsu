@@ -19,6 +19,10 @@ class DoDCheckResult:
     severity: str
     detail: str
     suggested_fix_context: str = ""
+    # False when the item has no inline check and could only be confirmed by an
+    # external smoke runner: it is NOT passed (so it can't be mistaken for PRD
+    # completion) and NOT counted as a hard failure (we simply did not verify it).
+    verified: bool = True
 
 
 @dataclass(frozen=True)
@@ -30,8 +34,12 @@ class DoDRunResult:
     def required_failures(self) -> list[DoDCheckResult]:
         return [
             result for result in self.results
-            if not result.passed and result.severity == "required"
+            if not result.passed and result.severity == "required" and result.verified
         ]
+
+    @property
+    def unverified(self) -> list[DoDCheckResult]:
+        return [result for result in self.results if not result.verified]
 
     @property
     def ok(self) -> bool:
@@ -50,7 +58,7 @@ def run_dod(
     results: list[DoDCheckResult] = []
     runner = command_runner or CommandRunner(workspace, approval_func=lambda _request: True)
     for item in entry.dod.items:
-        passed, detail = _run_item(item, target, runner)
+        passed, detail, verified = _run_item(item, target, runner)
         result = DoDCheckResult(
             item_id=item.id,
             description=item.description,
@@ -58,6 +66,7 @@ def run_dod(
             severity=item.severity,
             detail=detail,
             suggested_fix_context=_suggestion(item, detail),
+            verified=verified,
         )
         results.append(result)
         if session_logger:
@@ -92,19 +101,20 @@ def dod_failures(result: DoDRunResult) -> list[DoDCheckResult]:
     return result.required_failures
 
 
-def _run_item(item: DoDItem, target: Path, runner: CommandRunner) -> tuple[bool, str]:
+def _run_item(item: DoDItem, target: Path, runner: CommandRunner) -> tuple[bool, str, bool]:
     if not item.check:
-        # No inline check: this item is verified by the template's own external
-        # smoke runner (see the template's dod.yaml `runner`). Treat as passed
-        # here so scaffolding is not blocked by checks it cannot run inline.
-        return True, "verified by the template smoke runner"
+        # No inline check: only the template's external smoke runner can confirm
+        # this. Report it as UNVERIFIED (not passed) so a green scaffold is never
+        # mistaken for PRD completion, but do not hard-fail on it either.
+        return False, "not verified inline (needs the template smoke runner)", False
     fn = CHECKS.get(item.check)
     if fn is None:
-        return False, f"Unknown DoD check: {item.check}"
+        return False, f"Unknown DoD check: {item.check}", True
     try:
-        return fn(target, runner=runner, **item.args)
+        passed, detail = fn(target, runner=runner, **item.args)
+        return passed, detail, True
     except Exception as exc:
-        return False, f"{item.check} failed: {exc}"
+        return False, f"{item.check} failed: {exc}", True
 
 
 def _suggestion(item: DoDItem, detail: str) -> str:

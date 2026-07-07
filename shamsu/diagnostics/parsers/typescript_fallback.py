@@ -44,10 +44,57 @@ BROWSER_RUNTIME_RE = re.compile(
     r"does not provide an export named\s+['\"](?P<name>[A-Za-z_$][\w$]*)['\"]",
 )
 
+# Vite import-analysis: Failed to resolve import "./ui/Hud" from "src/ui/index.ts".
+# Also matches the plugin-prefixed shape Vite prints in the dev-server log:
+#   [plugin:vite:import-analysis] Failed to resolve import "./ui/Hud" from "src/ui/index.ts"
+VITE_IMPORT_RE = re.compile(
+    r"Failed to resolve import\s+['\"](?P<module>[^'\"]+)['\"]\s+from\s+['\"](?P<file>[^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+
+# npm lifecycle failures (npm v6 "npm ERR!" and npm v9+ "npm error"):
+#   npm ERR! Missing script: "build"
+#   npm ERR! 404 Not Found - GET https://registry.npmjs.org/nope - 'nope@1.0.0'
+#   npm ERR! code ELIFECYCLE
+NPM_MISSING_SCRIPT_RE = re.compile(
+    r"npm (?:ERR!|error)\s+Missing script:\s+['\"](?P<script>[^'\"]+)['\"]", re.IGNORECASE
+)
+NPM_404_RE = re.compile(
+    r"npm (?:ERR!|error)\s+404\b.*?['\"](?P<pkg>[^'\"]+)['\"]", re.IGNORECASE
+)
+NPM_CODE_RE = re.compile(r"npm (?:ERR!|error)\s+code\s+(?P<code>[A-Z][A-Z0-9]+)", re.IGNORECASE)
+
+# TS codes that are JSX/component errors (the located line carries file+line).
+_JSX_CODES = {"TS17004", "TS17002", "TS6142", "TS2657", "TS2604", "TS2786"}
+
 
 def _syntax_category(message: str) -> str:
     lowered = message.lower()
     return "syntax_error" if any(hint in lowered for hint in SYNTAX_ERROR_HINTS) else "type_error"
+
+
+# TS codes that are really import/export failures. A *located* tsc line for one
+# of these carries the file+line the repair loop needs, so it must be enriched
+# here (category + symbol + module) rather than left to the file-less
+# `parse_missing_export` fallback.
+_MISSING_EXPORT_CODES = {"TS2305", "TS2614", "TS2724"}
+_MODULE_NOT_FOUND_CODES = {"TS2307"}
+
+
+def _categorize_tsc(code: str, message: str) -> tuple[str, str, str]:
+    """Return (category, symbol, module) for a located tsc diagnostic."""
+    export_match = MISSING_EXPORT_RE.search(message)
+    module_match = MODULE_PATH_RE.search(message)
+    module = ""
+    if module_match:
+        module = module_match.group("module") or module_match.group("requested") or ""
+    if code in _JSX_CODES or ("jsx" in message.lower()):
+        return "jsx_error", "", module
+    if code in _MISSING_EXPORT_CODES or (export_match and code not in _MODULE_NOT_FOUND_CODES):
+        return "missing_export", (export_match.group("name") if export_match else ""), module
+    if code in _MODULE_NOT_FOUND_CODES or "cannot find module" in message.lower():
+        return "module_not_found", "", module
+    return _syntax_category(message), "", module
 
 
 def parse_tsc_errors(text: str) -> list[DiagnosticRecord]:
@@ -57,17 +104,23 @@ def parse_tsc_errors(text: str) -> list[DiagnosticRecord]:
         if not match:
             continue
         message = match.group("message").strip()
+        code = match.group("code")
+        category, symbol, module = _categorize_tsc(code, message)
+        suggestion = DID_YOU_MEAN_RE.search(message)
         records.append(
             DiagnosticRecord(
                 tool="tsc",
                 language="typescript",
                 severity=match.group("severity"),
-                code=match.group("code"),
-                category=_syntax_category(message),
+                code=code,
+                category=category,
                 message=message,
                 file=match.group("file"),
                 line=int(match.group("line")),
                 column=int(match.group("column")),
+                symbol=symbol,
+                module=module,
+                related_locations=[suggestion.group("suggestion")] if suggestion else [],
                 raw_excerpt=line.strip(),
                 parser_name="typescript_fallback",
                 confidence=0.9,
@@ -80,6 +133,11 @@ def parse_missing_export(text: str) -> list[DiagnosticRecord]:
     records: list[DiagnosticRecord] = []
     for line in text.splitlines():
         stripped = line.strip()
+        # A located tsc line (file(line,col): error TSxxxx: ...) is already
+        # parsed - with its file/line - by parse_tsc_errors. Skipping it here
+        # avoids emitting a second, file-less record for the same error.
+        if TSC_LOCATION_RE.match(stripped):
+            continue
         missing = MISSING_EXPORT_RE.search(stripped)
         if not missing:
             continue
@@ -131,5 +189,87 @@ def parse_browser_missing_export(text: str) -> list[DiagnosticRecord]:
     return records
 
 
+def parse_vite_import_errors(text: str) -> list[DiagnosticRecord]:
+    """Vite import-analysis failures ('Failed to resolve import ... from ...').
+
+    The unresolved specifier is stored in `module` and the importer file in
+    `file`, which is exactly what the deterministic import resolver needs to
+    suggest a corrected relative path before any model is asked to edit."""
+    records: list[DiagnosticRecord] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        match = VITE_IMPORT_RE.search(stripped)
+        if not match:
+            continue
+        records.append(
+            DiagnosticRecord(
+                tool="vite",
+                language="typescript",
+                severity="error",
+                category="import_error",
+                message=stripped,
+                file=match.group("file"),
+                module=match.group("module"),
+                raw_excerpt=stripped,
+                parser_name="typescript_fallback",
+                confidence=0.85,
+            )
+        )
+    return records
+
+
+def parse_npm_lifecycle_errors(text: str) -> list[DiagnosticRecord]:
+    """npm lifecycle failures: a missing script, a 404 package, or a lifecycle
+    error code (ELIFECYCLE/ENOENT/...). These are the root cause when npm itself
+    fails before the compiler runs; when a real tsc/vite error is also present,
+    root-cause selection keeps this as secondary."""
+    records: list[DiagnosticRecord] = []
+    seen: set[str] = set()
+
+    def add(category: str, message: str, *, symbol: str = "", module: str = "", code: str = "") -> None:
+        key = f"{category}:{code}:{symbol}:{module}:{message}"
+        if key in seen:
+            return
+        seen.add(key)
+        records.append(
+            DiagnosticRecord(
+                tool="npm",
+                language="javascript",
+                severity="error",
+                code=code,
+                category=category,
+                message=message,
+                symbol=symbol,
+                module=module,
+                raw_excerpt=message,
+                parser_name="typescript_fallback",
+                confidence=0.8,
+            )
+        )
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        script = NPM_MISSING_SCRIPT_RE.search(stripped)
+        if script:
+            add("npm_error", f'Missing npm script: "{script.group("script")}"',
+                symbol=script.group("script"), code="MISSING_SCRIPT")
+            continue
+        pkg = NPM_404_RE.search(stripped)
+        if pkg:
+            add("module_not_found", f'npm could not find package {pkg.group("pkg")}',
+                module=pkg.group("pkg"), code="E404")
+            continue
+        code_match = NPM_CODE_RE.search(stripped)
+        if code_match:
+            add("npm_error", stripped, code=code_match.group("code").upper())
+    return records
+
+
 def parse(text: str) -> list[DiagnosticRecord]:
-    return parse_tsc_errors(text) + parse_missing_export(text) + parse_browser_missing_export(text)
+    return (
+        parse_tsc_errors(text)
+        + parse_missing_export(text)
+        + parse_browser_missing_export(text)
+        + parse_vite_import_errors(text)
+        + parse_npm_lifecycle_errors(text)
+    )
