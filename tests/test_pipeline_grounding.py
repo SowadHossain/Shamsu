@@ -21,6 +21,7 @@ from shamsu.cli.repl import (
     _extract_dev_command,
     _looks_like_dev_server_failure,
     _looks_like_dev_server_prompt,
+    _bugfix_request_has_actionable_target,
     _looks_like_prd_build_request,
     _looks_like_prd_context_question,
 )
@@ -42,6 +43,12 @@ def test_prd_build_request_detected_with_pdf_mention(tmp_path):
 
 def test_prd_build_request_not_triggered_without_prd(tmp_path):
     assert not _looks_like_prd_build_request("build the navbar", tmp_path)
+
+
+def test_prd_build_request_does_not_hijack_unrelated_game_request_with_single_prd(tmp_path):
+    prd = tmp_path / "REQUIREMENTS.md"
+    prd.write_text("# SHAMSU Requirements\n", encoding="utf-8")
+    assert not _looks_like_prd_build_request("build a pong game in java", tmp_path)
 
 
 def test_prd_context_question_about_game_with_prd_routes_to_prd(tmp_path):
@@ -245,3 +252,9 @@ def test_prd_parse_happens_before_template_build(tmp_path, monkeypatch):
 
     assert parse_calls, "parse_prd_file was never called before scaffold"
     assert parse_calls[0] == str(prd)
+
+
+def test_bugfix_request_requires_concrete_target_before_workflow():
+    assert not _bugfix_request_has_actionable_target("fix a code for me")
+    assert _bugfix_request_has_actionable_target("fix app.py")
+    assert _bugfix_request_has_actionable_target("fix this traceback: TypeError: bad value")

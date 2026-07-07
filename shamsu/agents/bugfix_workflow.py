@@ -7,6 +7,7 @@ from pathlib import Path
 
 from shamsu.abstract.context import build_codebase_memory_brief
 from shamsu.agents.planner import create_plan
+from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -163,12 +164,35 @@ class BugFixWorkflow:
                 verification_status="No file was changed.",
                 plan=plan_text,
             )
+        fallback_targets = lenient_diff_target_paths(diff_text) or target_paths or searched_paths
+        rewritten = await rewrite_files_fully(
+            llm=self.llm,
+            context_builder=self.context_builder,
+            patch_engine=self.patch_engine,
+            workspace_root=self.workspace_root,
+            request=report,
+            target_paths=fallback_targets,
+            specialist="bugfix",
+            plan_text=plan_text,
+        )
+        if rewritten:
+            return BugFixResult(
+                request=report,
+                pack=pack,
+                locations=locations,
+                diff_text=diff_text,
+                changed_files=rewritten,
+                applied=True,
+                used_full_rewrite=True,
+                verification_status="Change applied, not yet verified.",
+                plan=plan_text,
+            )
         return BugFixResult(
             request=report,
             pack=pack,
             locations=locations,
             diff_text=diff_text,
-            error=f"Invalid diff: {error}. Targeted files: {', '.join(target_paths or searched_paths) or 'unknown'}. No file was changed.",
+            error=f"Invalid diff: {error}. Targeted files: {', '.join(fallback_targets) or 'unknown'}. No file was changed.",
             verification_status="No file was changed.",
             plan=plan_text,
         )
