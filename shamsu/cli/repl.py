@@ -2330,7 +2330,11 @@ def _handle_web(
         if not argument:
             console.print("[red]Usage: web search <query>[/red]")
             return
-        result = web_tool.search_and_fetch(argument, reason="User explicitly requested a sourced web search.")
+        result = web_tool.search_and_fetch(
+            argument,
+            reason="User explicitly requested a sourced web search.",
+            require_local_service=True,
+        )
         asyncio.run(_print_web_answer(argument, result, result.pages, console, llm))
         return
     if command in {"open", "summarize"}:
@@ -2345,8 +2349,8 @@ def _handle_web(
 
 def _print_web_service_status(status, console: Console) -> None:
     style = "green" if status.ok else "yellow"
-    running = "running" if getattr(status, "running", False) else "not running"
-    console.print(Panel(f"{status.message}\nStatus: {running}", title="Web Search Service", border_style=style))
+    state = getattr(status, "state", "") or ("running" if getattr(status, "running", False) else "not_running")
+    console.print(Panel(f"{status.message}\nStatus: {state}", title="Web Search Service", border_style=style))
 
 
 def _handle_browse(

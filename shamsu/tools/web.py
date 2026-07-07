@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import socket
 import sqlite3
 import subprocess
 import time
@@ -276,6 +278,7 @@ class WebServiceStatus:
     ok: bool
     message: str
     running: bool = False
+    state: str = "unknown"
 
 
 class WebServiceManager:
@@ -318,16 +321,27 @@ class WebServiceManager:
             }
         }
         self.compose_path.write_text(yaml.safe_dump(compose, sort_keys=False), encoding="utf-8")
-        return WebServiceStatus(ok=True, message=f"Wrote SearXNG files to {self.web_dir}")
+        return WebServiceStatus(ok=True, message=f"Wrote SearXNG files to {self.web_dir}", state="configured")
 
     def start(self) -> WebServiceStatus:
+        current = self.status()
+        if current.running:
+            return current
+        setup_message = ""
         if not self.compose_path.exists():
-            self.setup()
+            setup = self.setup()
+            setup_message = f"{setup.message}\n"
+        preflight = self._preflight_start()
+        if preflight is not None:
+            return WebServiceStatus(ok=False, message=f"{setup_message}{preflight.message}".strip(), running=False, state=preflight.state)
         try:
-            self.runner(["docker", "compose", "-p", self.project_name, "-f", str(self.compose_path), "up", "-d"])
+            result = self.runner(["docker", "compose", "-p", self.project_name, "-f", str(self.compose_path), "up", "-d"])
+            failure = self._process_failure(result)
+            if failure:
+                return WebServiceStatus(ok=False, message=f"{setup_message}{failure}".strip(), running=False, state="failed")
         except Exception as exc:
-            return WebServiceStatus(ok=False, message=f"Docker unavailable or failed: {exc}")
-        return self.status()
+            return WebServiceStatus(ok=False, message=f"{setup_message}{self._format_process_exception('Docker Compose start failed', exc)}".strip(), running=False, state="failed")
+        return self._wait_until_reachable(setup_message=setup_message)
 
     def stop(self) -> WebServiceStatus:
         if not self._is_managed_container():
@@ -339,7 +353,7 @@ class WebServiceManager:
             self.runner(["docker", "compose", "-p", self.project_name, "-f", str(self.compose_path), "down"])
         except Exception as exc:
             return WebServiceStatus(ok=False, message=f"Docker stop failed: {exc}")
-        return WebServiceStatus(ok=True, message="Stopped SHAMSU-managed SearXNG.", running=False)
+        return WebServiceStatus(ok=True, message="Stopped SHAMSU-managed SearXNG.", running=False, state="stopped")
 
     def restart(self) -> WebServiceStatus:
         stopped = self.stop()
@@ -348,13 +362,36 @@ class WebServiceManager:
         return self.start()
 
     def status(self) -> WebServiceStatus:
+        if not self.compose_path.exists():
+            return WebServiceStatus(
+                ok=False,
+                message=f"SearXNG is not configured. Run /web setup or /web start to create {self.web_dir}.",
+                running=False,
+                state="not_configured",
+            )
+        health_error = ""
         try:
             response = httpx.get(f"{self.searxng_url.rstrip('/')}/search", params={"q": "shamsu", "format": "json"}, timeout=3)
             if response.status_code < 500:
-                return WebServiceStatus(ok=True, message="SearXNG is reachable.", running=True)
-        except Exception:
-            pass
-        return WebServiceStatus(ok=False, message="SearXNG is not reachable.", running=False)
+                return WebServiceStatus(ok=True, message="SearXNG is reachable.", running=True, state="running")
+            health_error = f"Health check returned HTTP {response.status_code}."
+        except Exception as exc:
+            health_error = f"Health check failed: {exc}"
+
+        container = self._container_status()
+        if container:
+            return WebServiceStatus(
+                ok=False,
+                message=f"SearXNG is not reachable. {container} {health_error}",
+                running=False,
+                state=self._state_from_container_status(container),
+            )
+        return WebServiceStatus(
+            ok=False,
+            message=f"SearXNG is configured but not reachable. {health_error} Run /web start for startup diagnostics.",
+            running=False,
+            state="configured",
+        )
 
     def _is_managed_container(self) -> bool:
         try:
@@ -370,6 +407,152 @@ class WebServiceManager:
         except Exception:
             return False
         return result.stdout.strip().lower() == "true"
+
+    def _preflight_start(self) -> WebServiceStatus | None:
+        if not shutil.which("docker"):
+            return WebServiceStatus(
+                ok=False,
+                message=(
+                    "Docker is not installed or is not on PATH. Install Docker Desktop, start it, "
+                    "then run /web start again."
+                ),
+                state="missing_docker",
+            )
+        compose = self._run_checked(["docker", "compose", "version"], "Docker Compose is not available")
+        if compose:
+            return WebServiceStatus(ok=False, message=compose, state="missing_compose")
+        daemon = self._run_checked(["docker", "info"], "Docker is installed but the daemon is not running")
+        if daemon:
+            return WebServiceStatus(
+                ok=False,
+                message=f"{daemon}\nStart Docker Desktop, then run /web start again.",
+                state="docker_not_running",
+            )
+        port_conflict = self._port_conflict_message()
+        if port_conflict:
+            return WebServiceStatus(ok=False, message=port_conflict, state="port_conflict")
+        return None
+
+    def _run_checked(self, command: list[str], description: str) -> str:
+        try:
+            result = self.runner(command)
+        except Exception as exc:
+            return self._format_process_exception(description, exc)
+        failure = self._process_failure(result)
+        return f"{description}: {failure}" if failure else ""
+
+    def _process_failure(self, result: Any) -> str:
+        returncode = getattr(result, "returncode", 0)
+        if returncode in (0, None):
+            return ""
+        output = "\n".join(
+            part.strip()
+            for part in (getattr(result, "stderr", ""), getattr(result, "stdout", ""))
+            if str(part or "").strip()
+        )
+        if output:
+            return self._classify_docker_error(output)
+        return f"command exited with code {returncode}"
+
+    def _format_process_exception(self, description: str, exc: Exception) -> str:
+        if isinstance(exc, subprocess.CalledProcessError):
+            output = "\n".join(
+                part.strip()
+                for part in (exc.stderr, exc.stdout)
+                if str(part or "").strip()
+            )
+            return f"{description}: {self._classify_docker_error(output or str(exc))}"
+        if isinstance(exc, FileNotFoundError):
+            return f"{description}: docker executable was not found. Install Docker Desktop and ensure docker is on PATH."
+        return f"{description}: {exc}"
+
+    def _classify_docker_error(self, output: str) -> str:
+        lowered = output.lower()
+        if "port is already allocated" in lowered or "bind" in lowered and "8095" in lowered:
+            return f"port conflict on {self.searxng_url}; Docker could not bind the SearXNG port.\n{output}"
+        if "cannot connect to the docker daemon" in lowered or "docker daemon" in lowered:
+            return f"Docker daemon is not running.\n{output}"
+        if "compose" in lowered and ("not a docker command" in lowered or "unknown command" in lowered):
+            return f"Docker Compose is not available.\n{output}"
+        return output
+
+    def _wait_until_reachable(self, setup_message: str = "") -> WebServiceStatus:
+        deadline = time.monotonic() + 20
+        last = self.status()
+        while time.monotonic() < deadline:
+            last = self.status()
+            if last.running:
+                message = f"{setup_message}{last.message}".strip()
+                return WebServiceStatus(ok=True, message=message, running=True, state="running")
+            time.sleep(1)
+        diagnostic = self._container_status() or "Container status was unavailable."
+        logs = self._recent_logs()
+        message = (
+            f"{setup_message}Started Docker Compose, but SearXNG did not become healthy at {self.searxng_url}.\n"
+            f"{last.message}\n"
+            f"Container: {diagnostic}"
+        ).strip()
+        if logs:
+            message = f"{message}\nRecent logs:\n{logs}"
+        return WebServiceStatus(ok=False, message=message, running=False, state="healthcheck_failed")
+
+    def _container_status(self) -> str:
+        try:
+            result = self.runner(
+                [
+                    "docker",
+                    "inspect",
+                    self.container_name,
+                    "--format",
+                    "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.State.Error}}",
+                ]
+            )
+        except Exception:
+            return ""
+        if self._process_failure(result):
+            return ""
+        return " ".join(getattr(result, "stdout", "").split())
+
+    def _state_from_container_status(self, status: str) -> str:
+        lowered = status.lower()
+        if "running" in lowered and "healthy" in lowered:
+            return "healthcheck_failed"
+        if "running" in lowered:
+            return "starting"
+        if "exited" in lowered or "dead" in lowered:
+            return "failed"
+        if "created" in lowered:
+            return "stopped"
+        return "configured"
+
+    def _recent_logs(self) -> str:
+        try:
+            result = self.runner(["docker", "logs", "--tail", "40", self.container_name])
+        except Exception:
+            return ""
+        if self._process_failure(result):
+            return ""
+        text = "\n".join(
+            part.strip()
+            for part in (getattr(result, "stderr", ""), getattr(result, "stdout", ""))
+            if str(part or "").strip()
+        )
+        return text[-4000:]
+
+    def _port_conflict_message(self) -> str:
+        parsed = urlparse(self.searxng_url)
+        host = parsed.hostname or "localhost"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if host not in {"localhost", "127.0.0.1", "::1"}:
+            return ""
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                return (
+                    f"Port {port} on {host} is already accepting connections, but the SearXNG health check failed. "
+                    "Stop the conflicting service or change SHAMSU_SEARXNG_URL/compose port, then run /web start again."
+                )
+        except OSError:
+            return ""
 
     def _run(self, command: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(command, cwd=self.web_dir, text=True, capture_output=True, check=True)
@@ -504,6 +687,7 @@ class WebTool:
         reason: str = "",
         search_top_k: int | None = None,
         fetch_top_k: int | None = None,
+        require_local_service: bool = False,
     ) -> WebSearchFetchResult:
         if not self.config.enabled:
             return WebSearchFetchResult(
@@ -530,6 +714,14 @@ class WebTool:
         if not self.approval_manager.ask(request):
             self._log("web.search_and_fetch.denied", {"query": query}, f"Denied web evidence search: {query}")
             return WebSearchFetchResult(approved=False, query=query, error="Web search denied by user.", query_type=query_type)
+
+        if require_local_service:
+            try:
+                self._ensure_searxng_ready()
+            except Exception as exc:
+                message = str(exc)
+                self._log("web.search_and_fetch.failed", {"query": query, "error": message}, f"Failed web evidence search: {query}")
+                return WebSearchFetchResult(approved=True, query=query, error=message, query_type=query_type)
 
         try:
             hits, provider, fallback_used = self._run_provider_search(query, search_top_k)

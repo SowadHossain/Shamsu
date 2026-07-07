@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -315,6 +316,67 @@ def test_web_service_setup_writes_json_enabled_settings(tmp_path):
     compose = manager.compose_path.read_text(encoding="utf-8")
     assert "shamsu.managed=true" in compose
     assert "8095:8080" in compose
+
+
+def test_web_service_start_sets_up_and_reports_missing_docker(tmp_path, monkeypatch):
+    monkeypatch.setattr("shamsu.tools.web.shutil.which", lambda _name: None)
+    manager = WebServiceManager(tmp_path)
+
+    status = manager.start()
+
+    assert not status.ok
+    assert status.state == "missing_docker"
+    assert manager.compose_path.exists()
+    assert "Docker is not installed" in status.message
+
+
+def test_web_service_start_surfaces_compose_failure(tmp_path, monkeypatch):
+    commands = []
+
+    def fake_runner(command):
+        commands.append(command)
+        if command[:3] == ["docker", "compose", "version"] or command[:2] == ["docker", "info"]:
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+        if command[:3] == ["docker", "compose", "-p"]:
+            return subprocess.CompletedProcess(command, 1, "", "port is already allocated: 8095")
+        return subprocess.CompletedProcess(command, 1, "", "not found")
+
+    monkeypatch.setattr("shamsu.tools.web.shutil.which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "shamsu.tools.web.socket.create_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()),
+    )
+    manager = WebServiceManager(tmp_path, runner=fake_runner)
+
+    status = manager.start()
+
+    assert not status.ok
+    assert status.state == "failed"
+    assert "port conflict" in status.message
+    assert any(command[:3] == ["docker", "compose", "-p"] for command in commands)
+
+
+def test_explicit_web_search_requires_local_searxng_after_approval(tmp_path, monkeypatch):
+    class FakeService:
+        def status(self):
+            return SimpleNamespace(running=False)
+
+        def start(self):
+            return SimpleNamespace(ok=False, message="Docker is not installed")
+
+    tool = WebTool(
+        approval_func=lambda _request: True,
+        workspace=tmp_path,
+        config=WebConfig(provider="auto", cache_enabled=False),
+    )
+    tool.service_manager = FakeService()
+    monkeypatch.setattr(tool, "_client", lambda: (_ for _ in ()).throw(AssertionError("search should not fall back")))
+
+    result = tool.search_and_fetch("weather", require_local_service=True)
+
+    assert result.approved
+    assert result.error == "Docker is not installed"
+    assert not result.hits
 
 
 def test_web_answer_uses_snippet_fallback_when_fetches_empty():
