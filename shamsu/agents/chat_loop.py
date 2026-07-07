@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os as _os
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -36,7 +37,6 @@ LONG_RUNNING_MAX_TOOL_ROUNDS = 50
 # indefinitely when the model is swapping or the GPU is saturated; these caps
 # bound the worst-case wall-clock cost on a developer machine.
 # Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
-import os as _os
 _MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
 
 AGENT_SYSTEM_PROMPT = """You are SHAMSU, a local-first coding agent running inside one workspace.
@@ -497,4 +497,3 @@ def _get(value: Any, key: str, default: Any = None) -> Any:
     if isinstance(value, dict):
         return value.get(key, default)
     return getattr(value, key, default)
-

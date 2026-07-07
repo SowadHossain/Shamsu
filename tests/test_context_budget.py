@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import MagicMock
 
 from shamsu.context import budget
 from shamsu.context.budget import (
