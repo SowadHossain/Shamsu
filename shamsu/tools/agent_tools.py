@@ -396,8 +396,7 @@ class AgentToolRegistry:
                 return _git_tool_result(self.git_tool.status_full())
 
             if name == "git_diff":
-                result = self.git_tool.diff_result()
-                return _git_tool_result(result)
+                return _git_tool_result(self.git_tool.diff_result())
 
             if name == "git_diff_staged":
                 return _git_tool_result(self.git_tool.diff_staged())
@@ -533,6 +532,7 @@ class AgentToolRegistry:
             if len(content) > 6000:
                 content = f"{content[:6000]}\n... [truncated {len(content) - 6000} chars]"
             return ToolResult(True, "Read file.", {"filepath": filepath, "content": content})
+
         content = self.workspace_tool.read_file(filepath)
         return ToolResult(True, "Read file.", {"filepath": filepath, "content": content})
 
@@ -543,6 +543,7 @@ class AgentToolRegistry:
             target = self.sandbox.validate(filepath)
         except SecurityError as exc:
             return ToolResult(False, str(exc), {"filepath": filepath})
+
         exists = target.exists()
         if exists and not overwrite:
             return ToolResult(
@@ -550,6 +551,7 @@ class AgentToolRegistry:
                 "File already exists. Set overwrite=true if overwriting is intended.",
                 {"filepath": filepath},
             )
+
         request = ApprovalRequest(
             action_type="file_edit" if exists else "file_write",
             description=f"{'Overwrite' if exists else 'Create'} file: {filepath}",
@@ -560,6 +562,7 @@ class AgentToolRegistry:
         )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "File write denied by user.", {"filepath": filepath})
+
         # Every model-driven write goes through a transaction (backup + hash)
         # even for this simple full-overwrite path, so it can be rolled back
         # via /patch rollback like any other mutation - the model never gets
@@ -593,12 +596,14 @@ class AgentToolRegistry:
             return ToolResult(False, "Missing command.", {})
         code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
         data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
+
         # DiagnosticDigest already parsed this command's output into a compact
         # ErrorPacket (see CommandRunner._run_diagnostics) - surface that to
         # the model on failure instead of leaving it unread on the command
         # runner, per pipeline.md: "parse errors before giving logs to model."
         if code != 0 and self.command_runner.last_error_packet is not None:
             data["diagnostics"] = self.command_runner.last_error_packet.to_model_context()
+
         return ToolResult(code == 0, f"Command exited with {code}.", data)
 
     def search_index(self, query: str) -> ToolResult:
@@ -606,6 +611,7 @@ class AgentToolRegistry:
 
         if not AbstractService(self.workspace_root).ensure_ready().allowed:
             return ToolResult(False, "Codebase-Memory MCP is not ready. Run /abstract setup.", {"query": query})
+
         results = SearchAgent(self.workspace_root).search(query, top_k=5)
         return ToolResult(
             True,
@@ -693,18 +699,24 @@ def _tool_schema(
 def _compact_value(value: Any, limit: int = 6000) -> Any:
     if isinstance(value, str):
         return _truncate_text(value, limit)
+
     if isinstance(value, list):
         compacted = [_compact_value(item, max(limit // 4, 500)) for item in value[:20]]
         if len(value) > 20:
             compacted.append(f"... [truncated {len(value) - 20} item(s)]")
         return compacted
+
     if isinstance(value, dict):
         items = list(value.items())[:40]
         per_item_limit = max(limit // max(len(items), 1), 500)
-        compacted = {str(key): _compact_value(item, per_item_limit) for item in items}
+        compacted = {
+            str(key): _compact_value(item, per_item_limit)
+            for key, item in items
+        }
         if len(value) > len(items):
             compacted["..."] = f"truncated {len(value) - len(items)} key(s)"
         return compacted
+
     return value
 
 
