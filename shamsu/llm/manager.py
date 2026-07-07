@@ -297,6 +297,17 @@ class LLMManager(ILLMManager):
                 meta={"tool_count": len(tools or [])},
             )
         return data
+    async def generate_structured(
+        self, role: str, system: str, prompt: str, schema: dict, *, temperature: float = 0.1
+    ) -> str:
+        """Schema-constrained generation for a given role's model. Public seam
+        used by the scaffold/freeform hole-fill and the strict repair proposer.
+        Does not manage model pulls (the session ensures models at startup), so
+        it is safe to call from a fresh event loop in a worker thread."""
+        model = model_for_role(role)
+        return await self._generate(
+            model, system, prompt, temperature=temperature, json_schema=schema
+        )
 
     async def route(self, prompt: str, project_summary: str) -> RoutingDecision:
         """

@@ -1,0 +1,28 @@
+category: game-2d
+# Unlike a smoke-only template, every item here has an inline `check` so the DoD
+# actually runs (no auto-pass). build.succeeds runs the real TypeScript build.
+items:
+  - id: build.succeeds
+    description: "The game builds with no TypeScript errors."
+    check: build_succeeds
+    args:
+      command: "npm run build"
+    severity: required
+  - id: entry.exists
+    description: "The game entry file exists."
+    check: file_exists
+    args:
+      path: "src/main.ts"
+    severity: required
+  - id: loop.present
+    description: "A game loop / state update drives the game."
+    check: state_advances
+    args:
+      file: "src/game/update.ts"
+    severity: required
+  - id: end.condition
+    description: "The game has a reachable end/win condition."
+    check: end_state_reachable
+    args:
+      file: "src/game/update.ts"
+    severity: required

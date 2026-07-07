@@ -1,18 +1,34 @@
-"""Full PRD-to-Django pipeline orchestration."""
+"""Full PRD-to-project pipeline orchestration.
+
+Routes each PRD by its generation strategy (see registry/suitability.py):
+  SCAFFOLD -> copy a template + fill holes from the PRD + verify/repair,
+  DJANGO   -> the deterministic Django writer (CRUD/REST),
+  FREEFORM -> generate from the PRD with no template (any bespoke project).
+Templates are accelerators, never mandatory: a PRD that fits no template is
+still built, from the PRD.
+"""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop, ErrorFeedbackResult
+from shamsu.agents.freeform_generator import FreeformGenerator, FreeformRunResult
+from shamsu.agents.scaffold_pipeline import ScaffoldPipeline, ScaffoldRunResult
+from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.interfaces import ISearchAgent
 from shamsu.prd.input import parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.registry import load_registry_entry
 from shamsu.registry.scaffold import scaffold_template
 from shamsu.registry.schema import Category
+from shamsu.registry.suitability import GenerationStrategy
+from shamsu.repair.loop import RepairLoop
+from shamsu.repair.proposer_llm import LLMProposer
+from shamsu.repair.verifiers import DjangoTestVerifier
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
@@ -21,7 +37,7 @@ from shamsu.templates.django.docs import render_pipeline_summary
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.types import ProjectSpec, TestRunResult
-from shamsu.verify import DoDRunResult, run_dod
+from shamsu.verify import DoDRunResult, build_prd_checklist, run_dod
 
 
 class SetupRunnerLike(Protocol):
@@ -50,6 +66,7 @@ class FullPipelineResult:
     preview_url: str = ""
     success: bool = False
     error: str = ""
+    prd_checklist: list | None = None
 
 
 class FullDjangoPipeline:
@@ -63,6 +80,8 @@ class FullDjangoPipeline:
         test_runner: TestRunnerLike | None = None,
         feedback_loop: FeedbackLoopLike | None = None,
         long_running: bool = False,
+        generate: Callable[[str, str, dict], str] | None = None,
+        strict_django_repair: bool = False,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -73,6 +92,14 @@ class FullDjangoPipeline:
         self.test_runner = test_runner
         self.feedback_loop = feedback_loop
         self.long_running = long_running
+        # Synchronous (system, user, schema) -> raw JSON model call used by the
+        # scaffold/freeform paths for hole-fill and strict repair. None keeps
+        # those paths deterministic (scaffold + verify + DoD, no model).
+        self.generate = generate
+        # Opt-in: drive the Django test-fix step with the strict RepairLoop
+        # (rollback, one-error-at-a-time) instead of ErrorFeedbackLoop. Default
+        # off so the proven Django flow and its tests are unchanged.
+        self.strict_django_repair = strict_django_repair
 
     async def run(self, prd_path: Path | str, target_dir: Path | str | None = None) -> FullPipelineResult:
         try:
@@ -80,10 +107,15 @@ class FullDjangoPipeline:
             validated_target = self.sandbox.validate(target_dir or ".")
             parsed = parse_prd_file(validated_prd)
             project = build_project_spec(parsed)
-            self._log("workflow.started", {"prd_path": str(validated_prd)}, "Full Django pipeline started")
+            self._log("workflow.started", {"prd_path": str(validated_prd)}, "Full pipeline started")
 
-            if project.category == Category.MULTIPLAYER_GAME.value:
-                return self._run_registry_pipeline(validated_prd, validated_target, project)
+            strategy = self._strategy(project)
+            if strategy is GenerationStrategy.SCAFFOLD:
+                return await self._run_scaffold_strategy(validated_prd, validated_target, project)
+            if strategy is GenerationStrategy.FREEFORM and self.generate is not None:
+                # No template fits: build it from the PRD. With no model wired we
+                # fall through to the deterministic writer (keeps old behavior).
+                return await self._run_freeform_strategy(validated_prd, validated_target, project)
 
             writer = DjangoProjectWriter(
                 self.workspace_root,
@@ -142,6 +174,12 @@ class FullDjangoPipeline:
                     success=True,
                 )
 
+            if self.strict_django_repair and self.generate is not None and self.feedback_loop is None:
+                return await self._run_django_strict_repair(
+                    validated_prd, validated_target, project, written_files,
+                    diagnostics, setup_result, test_result,
+                )
+
             feedback_result = await (self.feedback_loop or ErrorFeedbackLoop(
                 self.workspace_root,
                 search=self.search,
@@ -170,6 +208,150 @@ class FullDjangoPipeline:
         if not path.exists() or not path.is_file():
             raise ValueError(f"PRD file not found: {path}")
         return path
+
+    def _strategy(self, project: ProjectSpec) -> GenerationStrategy:
+        suitability = getattr(project, "suitability", None)
+        if suitability is not None:
+            return suitability.strategy
+        # Back-compat when a ProjectSpec predates suitability: the old rule was
+        # "multiplayer-game category -> scaffold, everything else -> Django".
+        if project.category == Category.MULTIPLAYER_GAME.value:
+            return GenerationStrategy.SCAFFOLD
+        return GenerationStrategy.DJANGO
+
+    async def _run_scaffold_strategy(
+        self,
+        prd_path: Path,
+        target_dir: Path,
+        project: ProjectSpec,
+    ) -> FullPipelineResult:
+        """Scaffold a template, fill its holes from the PRD, then verify + repair.
+
+        Runs the (blocking, build-driving) ScaffoldPipeline in a worker thread so
+        the injected sync `generate` can call the model with a plain asyncio.run.
+        """
+        pipeline = ScaffoldPipeline(
+            self.workspace_root,
+            generate=self.generate,
+            approval_func=self.approval_func,
+            session_logger=self.session_logger,
+        )
+        outcome: ScaffoldRunResult = await asyncio.to_thread(pipeline.run, project, target_dir)
+        written = list(outcome.copied_files)
+        if outcome.fill_result:
+            written += [f for f in outcome.fill_result.changed_files if f not in written]
+        result = FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=outcome.target_dir,
+            project=project,
+            written_files=written,
+            diagnostics=[],
+            dod_result=outcome.dod_result,
+            preview_url=outcome.preview_url,
+            success=outcome.success,
+            error=outcome.error,
+            prd_checklist=build_prd_checklist(getattr(project, "prd_contract", None), outcome.target_dir),
+        )
+        event_type = "workflow.finished" if result.success else "workflow.failed"
+        self._log(
+            event_type,
+            {
+                "project": project.project_name,
+                "strategy": "scaffold",
+                "template": outcome.candidate,
+                "target_dir": str(outcome.target_dir),
+                "filled_holes": outcome.fill_result.filled if outcome.fill_result else [],
+                "exit_code": outcome.exit_code,
+                "success": result.success,
+                "error": result.error,
+            },
+            "Scaffold pipeline finished" if result.success else "Scaffold pipeline stopped",
+        )
+        self._write_summary(result)
+        return result
+
+    async def _run_django_strict_repair(
+        self,
+        prd_path: Path,
+        target_dir: Path,
+        project: ProjectSpec,
+        written_files: list[str],
+        diagnostics,
+        setup_result: DjangoSetupResult,
+        test_result: TestRunResult,
+    ) -> FullPipelineResult:
+        """Drive the Django test-fix step with the strict RepairLoop (rollback,
+        one-error-at-a-time, no false success) instead of ErrorFeedbackLoop."""
+        from shamsu.tools.django import DJANGO_TEST_COMMAND
+
+        runner = self.test_runner or DjangoTestRunner(
+            self.workspace_root, session_logger=self.session_logger
+        )
+        verifier = DjangoTestVerifier(DJANGO_TEST_COMMAND, runner, target_dir)
+        loop = RepairLoop(
+            target_dir,
+            verifier,
+            LLMProposer(self.generate),
+            max_attempts=4,
+            session_logger=self.session_logger,
+            digest=DiagnosticDigest(target_dir),
+        )
+        outcome = await asyncio.to_thread(loop.run)
+        final_test = self.test_runner or runner
+        return self._result(
+            prd_path,
+            target_dir,
+            project,
+            written_files,
+            diagnostics,
+            setup_result=setup_result,
+            test_result=final_test.run(target_dir),
+            success=outcome.success,
+            error="" if outcome.success else outcome.final_message,
+        )
+
+    async def _run_freeform_strategy(
+        self,
+        prd_path: Path,
+        target_dir: Path,
+        project: ProjectSpec,
+    ) -> FullPipelineResult:
+        """Template-free build: derive a file plan from the PRD, generate each
+        file, then verify + strict-repair. Runs in a worker thread so the sync
+        `generate` can drive the model."""
+        generator = FreeformGenerator(
+            self.workspace_root, self.generate, session_logger=self.session_logger
+        )
+        outcome: FreeformRunResult = await asyncio.to_thread(generator.run, project, target_dir)
+        result = FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=outcome.target_dir,
+            project=project,
+            written_files=outcome.written_files,
+            diagnostics=[],
+            success=outcome.success,
+            error=outcome.error,
+            prd_checklist=build_prd_checklist(getattr(project, "prd_contract", None), outcome.target_dir),
+        )
+        event_type = "workflow.finished" if result.success else "workflow.failed"
+        self._log(
+            event_type,
+            {
+                "project": project.project_name,
+                "strategy": "freeform",
+                "stack": outcome.stack,
+                "target_dir": str(outcome.target_dir),
+                "written_files": outcome.written_files,
+                "verify_command": outcome.verify_command,
+                "exit_code": outcome.exit_code,
+                "verified": outcome.verified,
+                "success": result.success,
+                "error": result.error,
+            },
+            "Freeform pipeline finished" if result.success else "Freeform pipeline stopped",
+        )
+        self._write_summary(result)
+        return result
 
     async def _retry_setup_via_bugfix(
         self,

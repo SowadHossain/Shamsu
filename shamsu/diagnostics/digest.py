@@ -34,7 +34,7 @@ from shamsu.diagnostics.parsers import (
 from shamsu.diagnostics.types import DiagnosticRecord, ErrorPacket
 from shamsu.safety.commands import redact
 
-_TS_TOOLS = {"tsc", "vite", "npm build", "npm dev", "npm test", "eslint"}
+_TS_TOOLS = {"tsc", "vite", "npm", "npm build", "npm dev", "npm test", "eslint"}
 
 
 class DiagnosticDigest:

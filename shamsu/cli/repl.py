@@ -2993,6 +2993,14 @@ async def _handle_request(
         elif decision.intent == "code_edit":
             await _run_code_edit(harness_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "bug_fix":
+            if not _bugfix_request_has_actionable_target(effective_input):
+                message = (
+                    "Tell me what to fix first: include a file path, traceback, failing command, "
+                    "or the exact error message. Example: /fix tests/test_app.py fails with AssertionError ..."
+                )
+                console.print(Panel(message, title="Bug Fix Needs Target", border_style="yellow"))
+                _log_assistant_message(session_logger, message, workflow_id="bug_fix")
+                return
             await _run_bug_fix(harness_input, workspace, search, console, llm, session_logger)
         elif decision.intent == "audit":
             await _run_audit(harness_input, search, console, llm)
@@ -3546,6 +3554,30 @@ def _looks_like_trouble_report(user_input: str) -> bool:
     low = user_input.lower()
     return any(s in low for s in _TROUBLE_SIGNALS) or any(s in low for s in _ERROR_LOG_SIGNALS)
 
+def _bugfix_request_has_actionable_target(user_input: str) -> bool:
+    """Bug-fix workflows need a concrete file, traceback, command, or error.
+
+    Vague prompts like "fix a code for me" make small local models guess and
+    often end in an empty workflow error. Ask for the missing target instead.
+    """
+    normalized = _strip_forced_prefix(user_input, "fix")
+    text = normalized.lower()
+    if _FILELIKE_RE.search(normalized):
+        return True
+    if _looks_like_trouble_report(normalized):
+        return True
+    return any(
+        signal in text
+        for signal in (
+            "failing command",
+            "failing test",
+            "test failed",
+            "tests failed",
+            "exit code",
+            "assertionerror",
+            "exception",
+        )
+    )
 
 _FILE_WRITE_VERBS = {
     "create", "write", "save", "generate", "make", "add", "edit", "update",
@@ -3969,9 +4001,7 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     if not (has_build_verb and has_product_noun):
         return False
     if "prd" in text or "product requirements" in text or "requirements document" in text:
-        return True
-    if _resolve_build_prd(user_input, workspace) is not None:
-        return True
+        return _resolve_build_prd(user_input, workspace) is not None
     return False
 
 
