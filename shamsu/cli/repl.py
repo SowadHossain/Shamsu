@@ -107,7 +107,7 @@ from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
-from shamsu.tools.dev_server import DevServerManager, infer_dev_command, is_dev_server_command
+from shamsu.tools.dev_server import DevServerManager, extract_dev_command_from_sentence, infer_dev_command, is_dev_server_command
 from shamsu.tools.web import WebFetchResult, WebSearchResult, WebTool
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
@@ -2738,8 +2738,15 @@ async def _handle_request(
     if _looks_like_run_game_request(effective_input):
         await _handle_run_game(workspace, console, session_logger=session_logger)
         return
+    if _looks_like_dev_server_failure(effective_input):
+        _handle_dev_server_recovery(workspace, console, session_logger=session_logger)
+        return
     if _looks_like_dev_server_prompt(effective_input):
         _handle_dev_server(effective_input, workspace, console, session_logger=session_logger)
+        return
+    if _looks_like_prd_context_question(effective_input, workspace):
+        message = _handle_workspace_prd_request(workspace, console)
+        _log_assistant_message(session_logger, message, workflow_id="prd.context_question")
         return
     if _looks_like_browser_needed_prompt(effective_input):
         await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console), browser_tool=browser_tool)
@@ -3038,6 +3045,43 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
         return True
     return False
+
+
+_PRD_CONTEXT_QUESTION_PHRASES = (
+    "what is this game about",
+    "what's this game about",
+    "what is the game about",
+    "what is this app about",
+    "what's this app about",
+    "what is the app about",
+    "what is this project about",
+    "what's this project about",
+    "what is the project about",
+    "what is this product about",
+    "what's this product about",
+    "tell me about the game",
+    "describe the game",
+    "describe the project",
+    "describe the product",
+    "what does this game do",
+    "what does the game do",
+    "summarize the prd",
+    "what does the prd say",
+    "what's in the prd",
+    "what is in the prd",
+)
+
+
+def _looks_like_prd_context_question(user_input: str, workspace: Path) -> bool:
+    """Detect questions about the game/project that should be answered from the PRD.
+
+    Only triggers when a PRD actually exists in the workspace - otherwise
+    there is nothing to read and the question should go through normal routing.
+    """
+    text = user_input.lower()
+    if not any(phrase in text for phrase in _PRD_CONTEXT_QUESTION_PHRASES):
+        return False
+    return bool(_find_workspace_prd_files(workspace))
 
 
 _WEB_FUZZY_KEYWORDS = ("weather", "forecast", "temperature")
@@ -3394,6 +3438,77 @@ def _looks_like_run_game_request(user_input: str) -> bool:
     return has_run and has_game
 
 
+_DEV_SERVER_FAIL_PHRASES = (
+    "didnt run", "didn't run", "did not run",
+    "didnt start", "didn't start", "did not start",
+    "failed to start", "wont start", "won't start",
+    "not starting", "not running yet",
+    "dev server failed", "server failed",
+)
+
+
+def _looks_like_dev_server_failure(user_input: str) -> bool:
+    """Detect follow-up messages indicating the last dev-server launch failed.
+
+    Examples:
+      "it didnt run btw"  -> True
+      "it didn't start"   -> True
+      "the dev server failed to start" -> True
+    """
+    text = user_input.lower()
+    if not any(phrase in text for phrase in _DEV_SERVER_FAIL_PHRASES):
+        return False
+    # Short follow-up OR explicitly mentions a dev/run concept.
+    dev_words = ("run", "server", "dev", "launch", "start", "npm", "vite", "node")
+    return len(user_input.split()) <= 12 or any(word in text for word in dev_words)
+
+
+def _handle_dev_server_recovery(
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Re-attempt the last/inferred dev-server command after a reported failure."""
+    manager = DevServerManager(
+        workspace,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        session_logger=session_logger,
+    )
+    active = manager.status()
+    if active:
+        for server in active:
+            console.print(f"[dim]Previously launched: {server.command} (PID {server.pid})[/dim]")
+    command = infer_dev_command(workspace)
+    console.print(f"[dim]Attempting to (re)launch dev server: {command}[/dim]")
+    result = manager.start(command)
+    if result.launched:
+        console.print(
+            Panel(
+                f"Command: {result.command}\nURL: {result.url}",
+                title="Dev Server Recovery - Started",
+                border_style="green",
+            )
+        )
+    elif result.duplicate:
+        console.print(
+            Panel(
+                f"The dev server appears to already be running.\n"
+                f"Command: {result.command}\nURL: {result.url}",
+                title="Dev Server - Already Running",
+                border_style="yellow",
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                f"Command attempted: {command}\nReason: {result.message}\n\n"
+                "Check that no process is holding open the port and that dependencies are installed.",
+                title="Dev Server Recovery - Failed",
+                border_style="red",
+            )
+        )
+
+
 def _looks_like_dev_server_prompt(user_input: str) -> bool:
     normalized = _normalize_command_input(user_input).strip()
     text = normalized.lower()
@@ -3432,7 +3547,18 @@ def _looks_like_command_like_prompt(user_input: str) -> bool:
 
 
 def _extract_dev_command(user_input: str, workspace: Path) -> str:
+    """Extract the actual shell command from user input.
+
+    Handles natural-language sentences like
+    "can you run npm run dev in a new terminal window" -> "npm run dev".
+    Falls back to inferring from workspace package.json when no command found.
+    """
     normalized = _normalize_command_input(user_input).strip()
+    # Try to extract a command embedded in a natural-language sentence first.
+    extracted = extract_dev_command_from_sentence(normalized)
+    if extracted:
+        return extracted
+    # If the normalized input IS a bare command (no extra words), use it directly.
     if is_dev_server_command(normalized):
         return normalized
     return infer_dev_command(workspace)
@@ -4052,7 +4178,11 @@ async def _handle_prd_build_request(
             if not result.success:
                 return
             console.print(
-                "[green]Template is ready. Now filling the game requirements from the PRD.[/green]"
+                "[dim]Note: the Definition of Done above verified the scaffold template only, "
+                "NOT the PRD requirements. PRD implementation begins now.[/dim]"
+            )
+            console.print(
+                "[green]Template scaffold ready. Now implementing game requirements from the PRD.[/green]"
             )
         else:
             # Setup is already done in this workspace (the template files exist),

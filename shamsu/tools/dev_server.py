@@ -156,6 +156,22 @@ def is_dev_server_command(command: str) -> bool:
     return any(re.search(pattern, normalized) for pattern in DEV_COMMAND_PATTERNS)
 
 
+def extract_dev_command_from_sentence(user_input: str) -> str | None:
+    """Pull the actual shell command out of a natural-language sentence.
+
+    E.g. "can you run npm run dev in a new terminal window" -> "npm run dev"
+         "run npm --workspace client run dev please" -> "npm --workspace client run dev"
+
+    Returns None when no recognized dev-server command is found in the text.
+    """
+    normalized = " ".join(user_input.strip().lower().split())
+    for pattern in DEV_COMMAND_PATTERNS:
+        m = re.search(pattern, normalized)
+        if m:
+            return m.group(0).strip()
+    return None
+
+
 def infer_dev_command(workspace_root: Path) -> str:
     if (workspace_root / "client" / "package.json").exists():
         return "npm --workspace client run dev"
@@ -179,8 +195,12 @@ def infer_dev_url(command: str) -> str:
 
 def _launch_detached(command: str, cwd: Path) -> subprocess.Popen:
     if sys.platform == "win32":
+        # CREATE_NEW_CONSOLE opens a new visible window for this process.
+        # cmd /k runs the command and keeps the window open after exit so
+        # crash output stays readable.  The returned PID (cmd.exe) stays
+        # alive while the server is running, so duplicate-detection works.
         return subprocess.Popen(
-            ["cmd.exe", "/c", "start", "SHAMSU Dev Server", "cmd", "/k", command],
+            ["cmd.exe", "/k", command],
             cwd=cwd,
             creationflags=subprocess.CREATE_NEW_CONSOLE,
         )

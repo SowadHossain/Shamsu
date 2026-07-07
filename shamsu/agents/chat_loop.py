@@ -1,6 +1,7 @@
-﻿"""Stateful ReAct chat loop using Ollama's native tool calling."""
+"""Stateful ReAct chat loop using Ollama's native tool calling."""
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import Counter
 from collections.abc import Callable
@@ -24,11 +25,18 @@ from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.ui.progress import ProgressReporter, summarize_tool_args, summarize_tool_result
 
-# Circuit-breaker ceiling used only in long-running mode â€” a backstop, not
+# Circuit-breaker ceiling used only in long-running mode — a backstop, not
 # the normal stop condition (the repetition guard is what actually catches
 # a stuck loop; this just bounds worst-case cost on a local machine).
 DEFAULT_MAX_TOOL_ROUNDS = 8
 LONG_RUNNING_MAX_TOOL_ROUNDS = 50
+
+# Guard against a local model that never responds.  Local inference can stall
+# indefinitely when the model is swapping or the GPU is saturated; these caps
+# bound the worst-case wall-clock cost on a developer machine.
+# Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
+import os as _os
+_MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
 
 AGENT_SYSTEM_PROMPT = """You are SHAMSU, a local-first coding agent running inside one workspace.
 
@@ -44,7 +52,7 @@ Rules:
 - If the user asks you to create, write, save, generate, add, edit, or update a file,
   your next action must be a write_file tool call or a clarification question.
 - To create OR change a file, call write_file with the COMPLETE new file content. It
-  overwrites, so never send a partial file or a diff â€” send the whole file every time.
+  overwrites, so never send a partial file or a diff â€" send the whole file every time.
 - A file change only counts if the write_file tool result says ok. If a tool result shows
   an error, the change did NOT happen: do not assume success, read the file if needed and
   call write_file again with the full corrected content.
@@ -110,7 +118,7 @@ class AgentChatLoop:
         self.long_running = long_running
         self.max_tool_rounds = LONG_RUNNING_MAX_TOOL_ROUNDS if long_running else max_tool_rounds
         # Only used when long_running=True; None disables the clarifying
-        # question (falls back to a plain stop message) â€” useful for tests.
+        # question (falls back to a plain stop message) â€" useful for tests.
         self.clarify_prompt = clarify_prompt if long_running else None
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
@@ -122,13 +130,25 @@ class AgentChatLoop:
         unconfirmed_failed_writes: dict[str, str] = {}
         for round_index in range(self.max_tool_rounds):
             try:
-                response = await self.client.chat(
-                    model=self.model_name,
-                    messages=self.state.messages(),
-                    tools=self.tools.tool_schemas(),
-                    stream=False,
-                    options={"temperature": 0.1, "num_ctx": 8192},
+                response = await asyncio.wait_for(
+                    self.client.chat(
+                        model=self.model_name,
+                        messages=self.state.messages(),
+                        tools=self.tools.tool_schemas(),
+                        stream=False,
+                        options={"temperature": 0.1, "num_ctx": 8192},
+                    ),
+                    timeout=_MODEL_CALL_TIMEOUT_SECONDS,
                 )
+            except asyncio.TimeoutError:
+                final = (
+                    f"The model did not respond within {_MODEL_CALL_TIMEOUT_SECONDS}s. "
+                    "This usually means local inference is stalled (GPU saturated, model swapping, "
+                    "or the context is too large). "
+                    "Try a lighter model with `/models tier light`, reduce context, or restart Ollama."
+                )
+                self.state.append_assistant(final)
+                return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
             except Exception as exc:
                 final = _friendly_ollama_error(exc)
                 self.state.append_assistant(final)
@@ -197,9 +217,22 @@ class AgentChatLoop:
                     # A write that did not land is the #1 cause of the model
                     # "hallucinating success" and then compiling half-written
                     # files. Make the failure loud and demand a full re-write.
-                    self.state.append_user(
-                        _write_failure_correction(str(arguments.get("filepath", "the file")), result.message)
+                    correction = _write_failure_correction(
+                        str(arguments.get("filepath", "the file")), result.message
                     )
+                    self.state.append_user(correction)
+                    # WinError 32 (file locked) cannot be fixed by retrying the
+                    # same write: stop the loop immediately so the user is told
+                    # to close the locking process instead of watching it spin.
+                    lowered_msg = result.message.lower()
+                    if (
+                        "winerror 32" in lowered_msg
+                        or "being used by another process" in lowered_msg
+                        or "sharing violation" in lowered_msg
+                    ):
+                        final = correction
+                        self.state.append_assistant(final)
+                        return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
         final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
         self.state.append_assistant(final)
         return AgentLoopResult(final=final, tool_rounds=self.max_tool_rounds, stopped=True)
@@ -248,7 +281,7 @@ class AgentChatLoop:
         return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
 
     def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
-        """The same tool call repeated past the limit despite corrections â€” stop
+        """The same tool call repeated past the limit despite corrections â€" stop
         cleanly rather than burn rounds. No clarifying question, no filler."""
         final = (
             f"I stopped because the same {tool_name} call kept repeating without meaningful progress. "
@@ -302,8 +335,17 @@ def _repetition_correction(tool_name: str) -> str:
 
 
 def _write_failure_correction(filepath: str, message: str) -> str:
+    lowered = message.lower()
+    if "winerror 32" in lowered or "being used by another process" in lowered or "sharing violation" in lowered:
+        extra = (
+            " The file is locked by another process (WinError 32 / sharing violation). "
+            "Close the dev server, file watcher, or any editor that may be holding the file open, "
+            "then try writing again. Do NOT continue or claim success until the write is confirmed."
+        )
+    else:
+        extra = ""
     return (
-        f"Your write_file to {filepath} did NOT succeed: {message}. The file was NOT changed. "
+        f"Your write_file to {filepath} did NOT succeed: {message}.{extra} The file was NOT changed. "
         f"Do not assume the fix was applied and do not move on. Call write_file again for "
         f"{filepath} with the ENTIRE corrected file content."
     )
