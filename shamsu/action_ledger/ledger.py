@@ -439,6 +439,15 @@ class ActionLedger:
     def log_code_memory_queried(self, query_type: str, query: str, result_count: int) -> None:
         self.log_event("code_memory_queried", query_type=query_type, query=_preview(query, 300), result_count=result_count)
 
+    def log_feedback_added(self, text: str) -> None:
+        self.log_event("feedback_added", feedback_preview=_preview(text, 500))
+
+    def log_cancel_requested(self) -> None:
+        self.log_event("run_cancel_requested")
+
+    def log_run_cancelled(self) -> None:
+        self.log_event("run_cancelled")
+
     # -- internal: id sequencing --------------------------------------------
 
     def _next_id(self, attr: str, prefix: str, width: int) -> str:

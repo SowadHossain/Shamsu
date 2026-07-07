@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import subprocess
 from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
 
 from rich.console import Console
 
 from shamsu.cli import repl
 from shamsu.session.manager import SessionManager
 from shamsu.tools.browser import BrowserTool
-from shamsu.tools.web import SearchHit, WebFetchResult, WebSearchResult, WebTool
+from shamsu.tools.web import (
+    SearchHit,
+    SearxngProvider,
+    WebConfig,
+    WebFetchResult,
+    WebSearchFetchResult,
+    WebSearchResult,
+    WebServiceManager,
+    WebTool,
+    build_evidence_answer_prompt,
+    _extract_readable_text,
+)
 
 
 def test_web_tool_denied_search_skips_network(tmp_path, monkeypatch):
@@ -63,7 +76,7 @@ def test_web_tool_search_parses_results(monkeypatch):
         def get(self, *_args, **_kwargs):
             return FakeResponse()
 
-    tool = WebTool(approval_func=lambda _request: True)
+    tool = WebTool(approval_func=lambda _request: True, config=WebConfig(provider="duckduckgo"))
     monkeypatch.setattr(tool, "_client", lambda: FakeClient())
 
     result = tool.search("django auth docs")
@@ -91,7 +104,7 @@ def test_web_tool_decodes_duckduckgo_redirect_href(monkeypatch):
         def get(self, *_args, **_kwargs):
             return FakeResponse()
 
-    tool = WebTool(approval_func=lambda _request: True)
+    tool = WebTool(approval_func=lambda _request: True, config=WebConfig(provider="duckduckgo"))
     monkeypatch.setattr(tool, "_client", lambda: FakeClient())
 
     result = tool.search("dhaka weather")
@@ -120,6 +133,250 @@ def test_web_tool_fetch_can_skip_per_url_approval(monkeypatch):
 
     assert result.approved
     assert approvals == []
+
+
+def test_searxng_provider_parses_json_results():
+    class FakeResponse:
+        def json(self):
+            return {
+                "results": [
+                    {
+                        "title": "Python Docs",
+                        "url": "https://docs.python.org/3/",
+                        "content": "Official language docs",
+                    }
+                ]
+            }
+
+        def raise_for_status(self):
+            return None
+
+    class FakeClient:
+        def get(self, url, params=None, headers=None):
+            assert url == "http://localhost:8095/search"
+            assert params["format"] == "json"
+            return FakeResponse()
+
+    hits = SearxngProvider(client_factory=lambda: FakeClient()).search("python docs")
+
+    assert hits == [
+        SearchHit(
+            title="Python Docs",
+            url="https://docs.python.org/3/",
+            snippet="Official language docs",
+            source_provider="searxng",
+        )
+    ]
+
+
+def test_auto_provider_falls_back_to_duckduckgo(monkeypatch, tmp_path):
+    html = """
+    <html><body>
+    <a class="result__a" href="https://example.com/docs">Fallback docs</a>
+    <a class="result__snippet">Fallback snippet</a>
+    </body></html>
+    """
+
+    class FakeResponse:
+        text = html
+
+        def raise_for_status(self):
+            return None
+
+    class FakeService:
+        def status(self):
+            return SimpleNamespace(running=False)
+
+        def start(self):
+            return SimpleNamespace(ok=False, message="docker missing")
+
+    class FakeClient:
+        def get(self, *_args, **_kwargs):
+            return FakeResponse()
+
+    tool = WebTool(
+        approval_func=lambda _request: True,
+        workspace=tmp_path,
+        config=WebConfig(provider="auto", auto_start=True),
+    )
+    tool.service_manager = FakeService()
+    monkeypatch.setattr(tool, "_client", lambda: FakeClient())
+
+    result = tool.search("docs")
+
+    assert result.provider == "duckduckgo"
+    assert result.fallback_used is True
+    assert result.hits[0].title == "Fallback docs"
+
+
+def test_search_and_fetch_fetches_top_results_once(monkeypatch, tmp_path):
+    approvals = []
+    fetched = []
+    tool = WebTool(
+        approval_func=lambda request: approvals.append(request.description) or True,
+        workspace=tmp_path,
+        config=WebConfig(provider="duckduckgo", cache_enabled=False),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_run_provider_search",
+        lambda query, top_k: (
+            [
+                SearchHit("One", "https://example.com/1", "first"),
+                SearchHit("Two", "https://example.com/2", "second"),
+            ],
+            "duckduckgo",
+            False,
+        ),
+    )
+
+    def fake_fetch(url, reason="", require_approval=True):
+        fetched.append((url, require_approval))
+        return WebFetchResult(
+            approved=True,
+            url=url,
+            final_url=url,
+            title=url,
+            text="useful evidence about python docs " * 20,
+            extraction_method="visible_text",
+        )
+
+    monkeypatch.setattr(tool, "fetch", fake_fetch)
+
+    result = tool.search_and_fetch("python docs", search_top_k=2, fetch_top_k=2)
+
+    assert result.approved
+    assert approvals == ["Search the web and fetch the top results."]
+    assert fetched == [("https://example.com/1", False), ("https://example.com/2", False)]
+    assert len(result.pages) == 2
+    assert result.evidence
+
+
+def test_extraction_returns_method_and_fallback(monkeypatch):
+    monkeypatch.setattr("shamsu.tools.web.trafilatura", None)
+
+    extracted, method = _extract_readable_text("<html><body>Hello</body></html>", "https://example.com")
+
+    assert extracted is None
+    assert method == "none"
+
+
+def test_evidence_answer_prompt_is_evidence_only():
+    result = WebSearchFetchResult(
+        approved=True,
+        query="next fifa game in utc time",
+        hits=[SearchHit("Fixtures", "https://example.com/fixtures", "snippet says maybe")],
+        pages=[
+            WebFetchResult(
+                approved=True,
+                url="https://example.com/fixtures",
+                final_url="https://example.com/fixtures",
+                title="Fixtures",
+                text="FIFA fixture table kickoff 20:00 UTC",
+                extraction_method="trafilatura_markdown",
+            )
+        ],
+        provider="duckduckgo",
+        query_type="schedule_time",
+    )
+
+    prompt = build_evidence_answer_prompt("next fifa game in utc time", result)
+
+    assert "Answer only from fetched evidence" in prompt
+    assert "Do not guess" in prompt
+    assert "FIFA fixture table kickoff 20:00 UTC" in prompt
+    assert "Sources fetched" in prompt
+
+
+def test_web_service_manager_refuses_to_stop_unmanaged_container(tmp_path):
+    commands = []
+
+    def fake_runner(command):
+        commands.append(command)
+        if command[:2] == ["docker", "inspect"]:
+            return SimpleNamespace(stdout="false\n")
+        raise AssertionError("stop should not be called for unmanaged containers")
+
+    manager = WebServiceManager(tmp_path, runner=fake_runner)
+
+    status = manager.stop()
+
+    assert not status.ok
+    assert "Refusing" in status.message
+    assert len(commands) == 1
+
+
+def test_web_service_setup_writes_json_enabled_settings(tmp_path):
+    manager = WebServiceManager(tmp_path)
+
+    status = manager.setup()
+
+    assert status.ok
+    assert "json" in manager.settings_path.read_text(encoding="utf-8")
+    compose = manager.compose_path.read_text(encoding="utf-8")
+    assert "shamsu.managed=true" in compose
+    assert "8095:8080" in compose
+
+
+def test_web_service_start_sets_up_and_reports_missing_docker(tmp_path, monkeypatch):
+    monkeypatch.setattr("shamsu.tools.web.shutil.which", lambda _name: None)
+    manager = WebServiceManager(tmp_path)
+
+    status = manager.start()
+
+    assert not status.ok
+    assert status.state == "missing_docker"
+    assert manager.compose_path.exists()
+    assert "Docker is not installed" in status.message
+
+
+def test_web_service_start_surfaces_compose_failure(tmp_path, monkeypatch):
+    commands = []
+
+    def fake_runner(command):
+        commands.append(command)
+        if command[:3] == ["docker", "compose", "version"] or command[:2] == ["docker", "info"]:
+            return subprocess.CompletedProcess(command, 0, "ok", "")
+        if command[:3] == ["docker", "compose", "-p"]:
+            return subprocess.CompletedProcess(command, 1, "", "port is already allocated: 8095")
+        return subprocess.CompletedProcess(command, 1, "", "not found")
+
+    monkeypatch.setattr("shamsu.tools.web.shutil.which", lambda _name: "docker")
+    monkeypatch.setattr(
+        "shamsu.tools.web.socket.create_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()),
+    )
+    manager = WebServiceManager(tmp_path, runner=fake_runner)
+
+    status = manager.start()
+
+    assert not status.ok
+    assert status.state == "failed"
+    assert "port conflict" in status.message
+    assert any(command[:3] == ["docker", "compose", "-p"] for command in commands)
+
+
+def test_explicit_web_search_requires_local_searxng_after_approval(tmp_path, monkeypatch):
+    class FakeService:
+        def status(self):
+            return SimpleNamespace(running=False)
+
+        def start(self):
+            return SimpleNamespace(ok=False, message="Docker is not installed")
+
+    tool = WebTool(
+        approval_func=lambda _request: True,
+        workspace=tmp_path,
+        config=WebConfig(provider="auto", cache_enabled=False),
+    )
+    tool.service_manager = FakeService()
+    monkeypatch.setattr(tool, "_client", lambda: (_ for _ in ()).throw(AssertionError("search should not fall back")))
+
+    result = tool.search_and_fetch("weather", require_local_service=True)
+
+    assert result.approved
+    assert result.error == "Docker is not installed"
+    assert not result.hits
 
 
 def test_web_answer_uses_snippet_fallback_when_fetches_empty():
@@ -158,15 +415,15 @@ def test_web_assist_uses_single_followup_fetch_approval(monkeypatch, tmp_path):
         def __init__(self):
             super().__init__(approval_func=lambda request: approvals.append(request.description) or True)
 
-        def search(self, query: str, reason: str = "", top_k: int = 5):
+        def search_and_fetch(self, query: str, reason: str = "", search_top_k: int = 8, fetch_top_k: int = 4):
             request = repl.ApprovalRequest(
                 action_type="web_search",
-                description="Search the web for current or external information.",
+                description="Search the web and fetch the top results.",
                 risk_level="medium",
                 preview=query,
             )
             assert self.approval_manager.ask(request)
-            return WebSearchResult(
+            return WebSearchFetchResult(
                 approved=True,
                 query=query,
                 hits=[
@@ -174,19 +431,22 @@ def test_web_assist_uses_single_followup_fetch_approval(monkeypatch, tmp_path):
                     SearchHit("Two", "https://example.com/2", "Snippet two"),
                     SearchHit("Three", "https://example.com/3", "Snippet three"),
                 ],
-            )
-
-        def fetch(self, url: str, reason: str = "", require_approval: bool = True):
-            assert require_approval is False
-            return WebFetchResult(
-                approved=True,
-                url=url,
-                title=url,
-                text="Useful web result content " * 20,
+                pages=[
+                    WebFetchResult(
+                        approved=True,
+                        url="https://example.com/1",
+                        final_url="https://example.com/1",
+                        title="One",
+                        text="Useful web result content " * 20,
+                        extraction_method="visible_text",
+                    )
+                ],
+                provider="duckduckgo",
             )
 
     class FakeLLM:
         async def run_specialist(self, specialist, pack):
+            assert "Answer only from fetched evidence" in pack.prd_context
             return type("Response", (), {"raw": "Synthesized answer."})()
 
     console_file = StringIO()
@@ -194,10 +454,7 @@ def test_web_assist_uses_single_followup_fetch_approval(monkeypatch, tmp_path):
 
     asyncio.run(repl._run_web_assist("query", console, FakeLLM(), FakeWebTool()))
 
-    assert approvals == [
-        "Search the web for current or external information.",
-        "Fetch and read the top web search results.",
-    ]
+    assert approvals == ["Search the web and fetch the top results."]
     assert "Synthesized answer." in console_file.getvalue()
 
 

@@ -225,6 +225,78 @@ class LLMManager(ILLMManager):
                     )
             return raw
 
+    async def chat_with_tools(
+        self,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float = 0.1,
+        keep_alive: str = "10m",
+        num_ctx: int = 8192,
+        role: str = "agent-chat-tools",
+        workflow_id: str = "agent-chat-tools",
+    ) -> dict:
+        """Call Ollama's native chat endpoint with optional tool schemas."""
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": num_ctx,
+                "top_p": 0.9,
+                "repeat_penalty": 1.0,
+            },
+            "keep_alive": keep_alive,
+        }
+        if tools:
+            payload["tools"] = tools
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.request",
+                {
+                    "specialist": role,
+                    "model": model,
+                    "endpoint": f"{self.base_url}/api/chat",
+                    "tool_count": len(tools or []),
+                },
+                "Chat tool request sent to local model",
+                workflow_id=workflow_id,
+            )
+        prompt_preview = "\n".join(str(item.get("content", "")) for item in messages[-8:])
+        if self.action_ledger:
+            self.action_ledger.log_model_call_started(role, model, prompt_preview)
+        started = time.perf_counter()
+        async with httpx.AsyncClient(timeout=120) as client:
+            response = await client.post(f"{self.base_url}/api/chat", json=payload)
+            response.raise_for_status()
+            data = response.json()
+        content = ""
+        message = data.get("message")
+        if isinstance(message, dict):
+            content = str(message.get("content") or "")
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.response",
+                {
+                    "specialist": role,
+                    "model": model,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "response_chars": len(content),
+                    "has_tool_calls": bool((message or {}).get("tool_calls") if isinstance(message, dict) else False),
+                },
+                "Chat tool response returned",
+                workflow_id=workflow_id,
+            )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_finished(
+                role,
+                model,
+                content,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                meta={"tool_count": len(tools or [])},
+            )
+        return data
     async def generate_structured(
         self, role: str, system: str, prompt: str, schema: dict, *, temperature: float = 0.1
     ) -> str:
