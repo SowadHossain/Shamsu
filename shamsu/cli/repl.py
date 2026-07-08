@@ -2802,6 +2802,11 @@ def _handle_context(
         console.print("[red]Usage: /context status|budget|inspect|compact[/red]")
 
 
+def _os_env_flag(name: str) -> bool:
+    """True when an environment variable is set to a truthy value."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _call_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
     try:
         signature = inspect.signature(callable_obj)
@@ -3275,6 +3280,8 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
     """Coarse, read-only route label mirroring the branch order in
     `_handle_request` — used only to record `last_route` in session state, so a
     missed/added branch degrades to `agent-chat` rather than breaking anything."""
+    if _looks_like_prd_summary_request(effective_input, workspace):
+        return "prd_summary"
     if is_git_request(effective_input):
         return "git"
     if _looks_like_workspace_location_prompt(effective_input):
@@ -3313,18 +3320,42 @@ async def _handle_request(
     agent_context = agent_result.context
     # Record the routing decision in session state so `/sessions trace` and a
     # resumed session can see how the last prompt was dispatched.
+    route_label = (
+        agent_result.action if agent_result.handled
+        else _classify_route_label(effective_input, workspace)
+    ) or "agent-chat"
     if session_logger is not None:
         try:
-            route_label = (
-                agent_result.action if agent_result.handled
-                else _classify_route_label(effective_input, workspace)
-            )
-            session_logger.set_last_route({"route": route_label or "agent-chat", "handled": agent_result.handled})
+            session_logger.set_last_route({"route": route_label, "handled": agent_result.handled})
         except Exception:
             pass
+    # Audit EVERY prompt (not just tool-loop runs): one prompt+route entry per
+    # request under .shamsu/audit, so the trail covers PRD summaries, git, QA and
+    # direct-code answers too. Downstream paths add their own step-level detail.
+    try:
+        _audit = SessionAuditLog(
+            workspace, session_logger.session_id if session_logger is not None else None
+        )
+        _audit.log_prompt(effective_input)
+        _audit.log_route(route_label, workflow=route_label)
+    except Exception:
+        pass
     if agent_result.handled:
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
+        return
+    # A "read/summarize the PRD" question is answered from the PRD text before
+    # anything else - otherwise "checkout the prd" trips git and "what is it
+    # about" falls into the tool loop and stalls.
+    if _looks_like_prd_summary_request(effective_input, workspace):
+        await _handle_prd_summary_request(
+            effective_input,
+            workspace,
+            console,
+            _make_llm_manager(session_logger, console, workspace),
+            session_logger=session_logger,
+            thinking_status=thinking_status,
+        )
         return
     # Git/repo requests are classified first, before web-search, QA, and
     # code-edit routing (see is_git_request): otherwise "commit the current
@@ -3824,9 +3855,14 @@ _GIT_MUTATION_PHRASES = (
     "stage the file", "stage files", "stage the change", "stage changes",
     "stage all", "stage everything", "git add", "commit", "git push",
     "push this", "push to", "push it", "push the", "git pull", "pull from",
-    "pull the latest", "git fetch", "fetch from", "checkout", "create branch",
+    "pull the latest", "git fetch", "fetch from", "create branch",
     "create a branch", "new branch", "switch branch", "stash", "git restore",
     "restore the file", "amend",
+    # "checkout" only counts when it clearly means the git verb. Bare "checkout"
+    # is colloquial ("checkout the prd" = "look at the prd") and must NOT be
+    # treated as a git request.
+    "git checkout", "checkout branch", "checkout the branch", "check out branch",
+    "checkout main", "checkout master", "switch to branch",
 )
 
 # A generic Git anchor: a prompt that clearly talks about git/repo work is a
@@ -3846,12 +3882,17 @@ def is_read_only_git_request(text: str) -> bool:
 def is_git_mutation_request(text: str) -> bool:
     """True for Git prompts that change repo state (stage/commit/push/...)."""
     low = text.lower()
-    return any(phrase in low for phrase in _GIT_MUTATION_PHRASES)
+    if any(phrase in low for phrase in _GIT_MUTATION_PHRASES):
+        return True
+    # "checkout ... branch" is a git branch switch; bare "checkout the prd" is not.
+    return "checkout" in low and "branch" in low
 
 
 def is_git_request(text: str) -> bool:
     """True for any Git/repo request (read-only or mutation)."""
     if is_read_only_git_request(text) or is_git_mutation_request(text):
+        return True
+    if _looks_like_git_init_request(text):
         return True
     low = text.lower()
     if not any(anchor in low for anchor in _GIT_ANCHOR_PHRASES):
@@ -3977,6 +4018,70 @@ def _run_git_read_only(
     _log_assistant_message(session_logger, body, workflow_id="git-read")
 
 
+_GIT_INIT_PHRASES = (
+    "git init", "initialize git", "initialise git", "init the repo", "init a repo",
+    "initialize the repo", "initialise the repo", "initialize a git", "initialise a git",
+    "initialize this repo", "create a git repo", "create a repo", "make this a git repo",
+    "make it a git repo", "make this a repo", "set up git", "setup git", "start a git repo",
+    "turn this into a git repo",
+)
+
+
+def _looks_like_git_init_request(text: str) -> bool:
+    low = text.lower()
+    return any(phrase in low for phrase in _GIT_INIT_PHRASES)
+
+
+def _ensure_shamsu_gitignore(workspace: Path) -> None:
+    """Make sure `.shamsu/` (audit logs, sessions, internal state) is git-ignored
+    so a commit never sweeps SHAMSU's own working files into the user's repo."""
+    gitignore = workspace / ".gitignore"
+    try:
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        if any(line.strip().rstrip("/") == ".shamsu" for line in existing.splitlines()):
+            return
+        prefix = "" if (not existing or existing.endswith("\n")) else "\n"
+        gitignore.write_text(existing + prefix + ".shamsu/\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _run_git_init(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    trace: Callable[[str], None],
+) -> None:
+    """Deterministically initialize a git repository (git init + git_status)."""
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=get_current_run(),
+    )
+    status = registry.execute("git_status", {})
+    if status.ok and isinstance(status.data, dict) and status.data.get("is_git_repo"):
+        console.print(Panel("This workspace is already a git repository.", title="Git"))
+        _log_assistant_message(session_logger, "Already a git repository.", workflow_id="git-init")
+        return
+    trace("tool=git_init args={}")
+    result = registry.execute("git_init", {})
+    if not result.ok:
+        msg = f"git init failed: {result.message}"
+        console.print(Panel(msg, title="Git", border_style="red"))
+        _log_assistant_message(session_logger, msg, workflow_id="git-init")
+        return
+    _ensure_shamsu_gitignore(workspace)
+    after = registry.execute("git_status", {})
+    body = "Initialized an empty git repository."
+    if after.ok and isinstance(after.data, dict) and after.data.get("changed_files"):
+        files = after.data["changed_files"]
+        body += f"\n{len(files)} untracked file(s). Say \"add and commit\" to make the first commit."
+    console.print(Panel(body, title="Git Init"))
+    _log_assistant_message(session_logger, body, workflow_id="git-init")
+
+
 def _looks_like_git_add_commit_request(text: str) -> bool:
     """A common, deterministic mutation: "add [all] files and commit".
 
@@ -4028,9 +4133,18 @@ def _run_git_add_commit(
     trace("tool=git_status args={}")
     status = registry.execute("git_status", {})
     if not status.ok or (isinstance(status.data, dict) and not status.data.get("is_git_repo", True)):
-        console.print(Panel("This workspace is not a git repository.", title="Git"))
-        _log_assistant_message(session_logger, "This workspace is not a git repository.", workflow_id="git-commit")
-        return
+        # Not a repo yet - initialize it so "add and commit" actually works
+        # instead of dead-ending. git init is safe and local.
+        trace("tool=git_init args={}")
+        init_result = registry.execute("git_init", {})
+        if not init_result.ok:
+            msg = f"This workspace is not a git repository and `git init` failed: {init_result.message}"
+            console.print(Panel(msg, title="Git"))
+            _log_assistant_message(session_logger, msg, workflow_id="git-commit")
+            return
+        _ensure_shamsu_gitignore(workspace)
+        console.print("[dim]Initialized a new git repository.[/dim]")
+        status = registry.execute("git_status", {})
     if isinstance(status.data, dict) and not status.data.get("is_dirty", True):
         console.print(Panel("Nothing to commit - the working tree is clean.", title="Git"))
         _log_assistant_message(session_logger, "Nothing to commit - the working tree is clean.", workflow_id="git-commit")
@@ -4092,7 +4206,8 @@ async def _handle_git_request(
     are answered deterministically; mutation (or mixed) requests go to the tool
     agent, which is told to inspect the repo first and still runs every write
     through the existing command-safety/approval system."""
-    mutation = is_git_mutation_request(user_input)
+    init_request = _looks_like_git_init_request(user_input)
+    mutation = is_git_mutation_request(user_input) or init_request
     read_only = is_read_only_git_request(user_input)
     route = "git_write" if mutation else "git_read"
     trace_mode = _trace_mode(workspace)
@@ -4100,6 +4215,12 @@ async def _handle_git_request(
     def trace(line: str) -> None:
         if trace_mode != "quiet":
             console.print(f"[dim]{line}[/dim]")
+
+    # A pure "initialize git" request (no commit) just inits the repo.
+    if init_request and not _looks_like_git_add_commit_request(user_input):
+        trace("route=git_write selected_workflow=git_init")
+        _run_git_init(user_input, workspace, console, session_logger, trace)
+        return
 
     trace(f"route={route} confidence=0.95 reason=git_override")
     _log_event(
@@ -4157,6 +4278,116 @@ _PRD_CONTEXT_QUESTION_PHRASES = (
     "what's in the prd",
     "what is in the prd",
 )
+
+
+# Read/summarize-the-PRD requests: "what is the project about", "checkout the
+# prd and tell me what it is", "summarize the prd". These must read the actual
+# PRD text and summarize it - never route to git (checkout) or the tool loop.
+_PRD_SUMMARY_TRIGGERS = (
+    "what is the prd about", "what's the prd about", "whats the prd about",
+    "what is this prd about", "what is the project about", "what's the project about",
+    "whats the project about", "what is this project about", "what is this app about",
+    "what is this product about", "what is this about", "what's this about",
+    "tell me what is the project", "tell me what the project", "tell me about the prd",
+    "tell me about the project", "tell me about this project", "summarize the prd",
+    "summarise the prd", "what does the prd say", "what's in the prd", "what is in the prd",
+    "read the prd", "check the prd", "checkout the prd", "check out the prd",
+    "look at the prd", "review the prd", "explain the prd", "describe the project",
+    "describe the prd", "what is the app about",
+)
+
+
+def _looks_like_prd_summary_request(user_input: str, workspace: Path) -> bool:
+    text = user_input.lower()
+    if not any(trigger in text for trigger in _PRD_SUMMARY_TRIGGERS):
+        return False
+    # A build verb ("build/implement the prd") is a build request, not a read.
+    if any(verb in text for verb in ("build ", "implement ", "generate ", "scaffold ")):
+        return False
+    return bool(_find_workspace_prd_files(workspace))
+
+
+async def _handle_prd_summary_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    llm: LLMManager,
+    session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
+) -> None:
+    """Read the workspace PRD (incl. PDF text) and summarize what the project is
+    about in one model call - no tools, no git, no stall."""
+    prd_path = _resolve_build_prd(user_input, workspace)
+    if prd_path is None:
+        candidates = _find_workspace_prd_files(workspace)
+        if len(candidates) > 1:
+            console.print("[yellow]I found multiple PRD files - which one?[/yellow]")
+            for path in candidates[:10]:
+                console.print(f"- {path.as_posix()}")
+            return
+        if not candidates:
+            console.print("[yellow]I couldn't find a PRD file in this workspace.[/yellow]")
+            return
+        prd_path = workspace / candidates[0]
+
+    try:
+        parsed = parse_prd_file(prd_path)
+    except PRDParseError as exc:
+        # Extraction failed (image-only/encrypted PDF, etc). Be honest instead of
+        # guessing - do not hallucinate a summary.
+        console.print(
+            Panel(
+                f"Low-confidence PRD extraction: {exc}\n\n"
+                "I could not reliably read the PRD text, so I won't guess what it's about. "
+                "Try a text/Markdown PRD, or an unencrypted, text-based PDF.",
+                title="PRD",
+                border_style="yellow",
+            )
+        )
+        return
+
+    try:
+        relative_path = prd_path.relative_to(workspace).as_posix()
+    except ValueError:
+        relative_path = prd_path.name
+    prd_text = (parsed.raw_text or _render_sections(parsed)).strip()
+    if not prd_text:
+        console.print("[yellow]The PRD appears to be empty.[/yellow]")
+        return
+
+    _log_event(
+        session_logger,
+        "prd.summary.requested",
+        {"path": str(prd_path), "title": parsed.title},
+        f"Summarizing PRD {prd_path.name}",
+        workflow_id="prd-summary",
+    )
+    pack = ContextPack(
+        task_id="prd-summary",
+        step_id=1,
+        specialist="qa",
+        user_request=(
+            f"Summarize what this project/PRD is about. File: {relative_path}. "
+            "Give: (1) one-line purpose, (2) the main features/requirements, "
+            "(3) any stated tech stack or constraints. Be concise and only use the PRD text below."
+        ),
+        prd_context=f"PRD content ({relative_path}):\n\n{prd_text[:12000]}",
+    )
+    if hasattr(llm, "run_specialist_stream"):
+        try:
+            streamed, _text = await _stream_answer(
+                console, llm, pack, "PRD Summary", session_logger, "prd-summary", thinking_status
+            )
+        except Exception:
+            streamed = False
+        if streamed:
+            _audit_simple_turn(workspace, session_logger, "prd_summary", user_input, _text)
+            return
+    response = await llm.run_specialist("qa", pack)
+    body = response.raw.strip() or "No summary produced."
+    console.print(Panel(body, title=f"PRD Summary - {parsed.title}"))
+    _log_assistant_message(session_logger, body, workflow_id="prd-summary")
+    _audit_simple_turn(workspace, session_logger, "prd_summary", user_input, body)
 
 
 def _looks_like_prd_context_question(user_input: str, workspace: Path) -> bool:
@@ -6781,11 +7012,14 @@ def main(argv: list[str] | None = None) -> None:
     # progress) rather than at install time or silently mid-conversation.
     _maybe_prompt_first_run_tier(workspace, console)
 
-    # Track this session so the last one to exit can free SHAMSU's Ollama
-    # footprint (stop a SHAMSU-started server, or unload SHAMSU's models - incl.
-    # the keep_alive=-1 router - from a shared/tray-app server). Best-effort.
+    # Track this session so the last one to exit *can* free SHAMSU's Ollama
+    # footprint. By default we now KEEP Ollama and its loaded models warm across
+    # exits - repeatedly unloading/reloading an 8B model is what made the next
+    # session stall for a long time on first use. Opt back into shutdown with
+    # SHAMSU_SHUTDOWN_OLLAMA_ON_EXIT=1.
     session_pid = register_session()
-    atexit.register(shutdown_if_last_session, session_pid)
+    if _os_env_flag("SHAMSU_SHUTDOWN_OLLAMA_ON_EXIT"):
+        atexit.register(shutdown_if_last_session, session_pid)
 
     _print_startup_banner(workspace, console)
     _ensure_graphiti_ready_at_startup(workspace, console)

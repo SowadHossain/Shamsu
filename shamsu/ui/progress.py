@@ -139,8 +139,12 @@ def summarize_tool_result(result: Any) -> str:
         if "exit_code" in data:
             stdout = str(data.get("stdout") or data.get("stderr") or "")
             return f"exit={data.get('exit_code')}, {message}; {_important_excerpt(stdout)}"
+        if "lines_added" in data or "lines_removed" in data:
+            # write_file / edit_file already put "+A -B lines (lines X-Y)" in the
+            # message; surface it verbatim rather than duplicating the counts.
+            return message
         if "content" in data:
-            return f"{message} ({len(str(data.get('content', '')).splitlines())} lines)"
+            return f"{message} (read {len(str(data.get('content', '')).splitlines())} lines)"
         if "results" in data:
             return f"{message} ({len(data.get('results') or [])} results)"
         if "candidates" in data:

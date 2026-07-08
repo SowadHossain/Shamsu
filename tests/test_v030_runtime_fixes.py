@@ -338,3 +338,161 @@ def test_audit_log_records_everything(tmp_path):
     assert file_event["diff"].strip() != ""
     final_event = next(e for e in events if e["event_type"] == "assistant.final")
     assert "hello.py" in final_event["final"]
+
+
+# --- Round 2: real-run regressions from the CLI transcript ------------------
+
+
+def test_checkout_prd_is_not_git_but_is_a_prd_summary(tmp_path):
+    prompt = "can you checkout the prd and tell me what is the project about?"
+    # "checkout" here is colloquial ("look at"), not a git branch switch.
+    assert not repl.is_git_request(prompt)
+    assert not repl.is_git_mutation_request(prompt)
+    # A real git branch checkout is still routed to git.
+    assert repl.is_git_mutation_request("checkout the feature branch")
+    assert repl.is_git_request("git checkout main")
+    # With a PRD present, the prompt is a PRD-summary request.
+    (tmp_path / "Product Requirements Document.md").write_text("# App\nHTML CSS JS app.\n", encoding="utf-8")
+    assert repl._looks_like_prd_summary_request(prompt, tmp_path)
+    assert repl._classify_route_label(prompt, tmp_path) == "prd_summary"
+
+
+class _SummaryLLM:
+    def __init__(self) -> None:
+        self.calls: list = []
+
+    async def run_specialist(self, specialist, pack):
+        self.calls.append(pack)
+        return LLMResponse(raw="This project is a notes app built with HTML, CSS and JS.", model_used="fake")
+
+
+def test_prd_summary_reads_and_summarizes(tmp_path):
+    (tmp_path / "prd.md").write_text(
+        "# Notes App\nBuild a notes app with HTML, CSS and vanilla JavaScript.\n", encoding="utf-8"
+    )
+    llm = _SummaryLLM()
+    console = _quiet_console()
+
+    asyncio.run(
+        repl._handle_prd_summary_request("what is the project about?", tmp_path, console, llm)
+    )
+
+    # Exactly one summarization call, fed the actual PRD text.
+    assert len(llm.calls) == 1
+    assert "notes app" in llm.calls[0].prd_context.lower()
+    assert "notes app" in console.file.getvalue().lower()
+
+
+def test_agent_loop_runs_on_coder_model(tmp_path):
+    from shamsu.runtime.models import model_for_role
+
+    loop = _loop(tmp_path, ScriptedClient([_message(content="hi")]))
+    # The tool loop must not run on the slow thinking model.
+    assert loop.model_name == model_for_role("coder")
+    assert loop.model_name != model_for_role("qa")
+
+
+def test_bugfix_diff_tolerates_fences_and_prose():
+    from shamsu.agents.bugfix_workflow import _clean_diff
+
+    raw = (
+        "Here is the fix:\n```diff\n--- a/budgetracker.py\n+++ b/budgetracker.py\n"
+        "@@ -1,2 +1,2 @@\n-bad\n+good\n```"
+    )
+    cleaned = _clean_diff(raw)
+    assert "```" not in cleaned
+    assert cleaned.startswith("--- a/budgetracker.py")
+    assert cleaned.rstrip().endswith("+good")
+
+
+def test_git_init_and_commit_flow_end_to_end(tmp_path):
+    """The agent can initialize a repo and commit even with no git identity set
+    (the fresh-machine "please tell me who you are" failure)."""
+    import subprocess
+
+    registry = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    (tmp_path / "a.txt").write_text("hello\n", encoding="utf-8")
+
+    # Not a repo yet.
+    assert registry.execute("git_status", {}).data.get("is_git_repo") is False
+    # git_init tool exists and works.
+    assert registry.execute("git_init", {}).ok is True
+    assert registry.execute("git_status", {}).data.get("is_git_repo") is True
+
+    # Force an unset identity locally so we exercise the ensure_identity path.
+    subprocess.run("git config --local --unset-all user.name", shell=True, cwd=tmp_path, capture_output=True)
+    subprocess.run("git config --local --unset-all user.email", shell=True, cwd=tmp_path, capture_output=True)
+
+    assert registry.execute("git_add_all", {}).ok is True
+    commit = registry.execute("git_commit", {"message": "first commit"})
+    assert commit.ok is True
+
+    log = subprocess.run("git log --oneline", shell=True, cwd=tmp_path, capture_output=True, text=True)
+    assert "first commit" in log.stdout
+
+
+def test_git_init_tool_is_exposed_and_not_duplicated(tmp_path):
+    from collections import Counter
+
+    registry = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    names = [schema["function"]["name"] for schema in registry.tool_schemas()]
+    assert "git_init" in names
+    # No tool is listed twice (find_file/grep_files used to be duplicated,
+    # bloating the schema every 7B model call).
+    duplicates = [name for name, count in Counter(names).items() if count > 1]
+    assert duplicates == []
+
+
+def test_git_init_request_routing(tmp_path):
+    assert repl.is_git_request("initialize a git repo here")
+    assert repl._looks_like_git_init_request("please git init this folder")
+    assert not repl._looks_like_git_init_request("what is the project about")
+
+
+def test_write_and_edit_report_line_changes(tmp_path):
+    registry = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+
+    created = registry.execute("write_file", {"filepath": "a.py", "content": "a\nb\nc\n"})
+    assert created.data["lines_added"] == 3
+    assert created.data["line_count"] == 3
+    assert "+3 lines" in created.message
+
+    edited = registry.execute("edit_file", {"filepath": "a.py", "old_string": "b", "new_string": "B\nB2"})
+    assert edited.data["lines_added"] == 2
+    assert edited.data["lines_removed"] == 1
+    assert edited.data["start_line"] == 2
+    assert "lines 2-2" in edited.message
+
+    overwrote = registry.execute("write_file", {"filepath": "a.py", "content": "a\nc\n"})
+    assert overwrote.data["overwrote"] is True
+    assert "-" in overwrote.message and overwrote.data["lines_removed"] >= 1
+
+
+def test_trace_shows_context_sent_and_raw_model_content(tmp_path):
+    events: list[tuple[str, str]] = []
+
+    def on_trace(event_type, message, payload=None, level="normal"):
+        events.append((event_type, level))
+
+    client = ScriptedClient([_message(content="hello there")])
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    loop = AgentChatLoop(tmp_path, client=client, tools=tools, llm=NoPlanLLM(), on_trace=on_trace)
+
+    asyncio.run(loop.run("hi"))
+
+    # The context sent to the model is traced (verbose), and the model's visible
+    # content is traced (raw) so the user can see what it said.
+    assert any(t == "context.sent" and level == "verbose" for t, level in events)
+    assert any(t == "assistant.content" and level == "raw" for t, level in events)
+
+
+def test_empty_model_response_retries_then_reports(tmp_path):
+    client = ScriptedClient([_message(content=""), _message(content=""), _message(content="")])
+    loop = _loop(tmp_path, client)
+
+    result = asyncio.run(loop.run("do something"))
+
+    assert result.stopped is True
+    assert "empty response" in result.final.lower()
+    # It retried (nudged) rather than returning blank on the first empty reply.
+    assert len(client.messages_seen) >= 2

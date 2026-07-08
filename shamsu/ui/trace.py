@@ -128,6 +128,9 @@ def emit_trace(
 _EVENT_LABELS = {
     "route.detected": "Route",
     "plan.created": "Plan",
+    "assistant.content": "Model",
+    "context.sent": "Context",
+    "llm.timeout": "Timeout",
     "step.started": "Step",
     "tool.started": "Tool",
     "tool.finished": "Result",

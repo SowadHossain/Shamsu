@@ -49,6 +49,10 @@ LONG_RUNNING_MAX_TOOL_ROUNDS = 50
 # Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
 _MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
 
+# How often to emit a "still waiting for the model" heartbeat during a long model
+# call, so a slow local model reads as working rather than a frozen prompt.
+_HEARTBEAT_INTERVAL_SECONDS: int = int(_os.environ.get("SHAMSU_HEARTBEAT_SECONDS", "15"))
+
 # Interactive-chat context window. The budget module targets 8GB machines, so we
 # don't hand a 131k-window model (e.g. mistral-nemo) its full context by default;
 # a 32k cap already gives ~4x the previous hard-coded 8192. Override with
@@ -56,6 +60,18 @@ _MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SEC
 # window to carry a compressed synopsis of turns evicted by budget-aware trimming.
 _CHAT_MAX_CTX: int = int(_os.environ.get("SHAMSU_CHAT_MAX_CTX", "32768"))
 _CHAT_SUMMARY_BUDGET_TOKENS = 512
+
+# The interactive agent tool loop does real tool-calling/file work, so it runs on
+# the CODER model by default (fast, tool-friendly) rather than the "thinking"
+# qa/router model, whose long reasoning traces stalled the executor mid-run.
+# Override the executor role via SHAMSU_CHAT_ROLE.
+_CHAT_EXECUTOR_ROLE = _os.environ.get("SHAMSU_CHAT_ROLE", "coder").strip() or "coder"
+# The per-turn planner is on by default, but can be disabled (SHAMSU_CHAT_PLANNER=0)
+# on very small machines where the extra planner-model round-trip + model swap
+# adds too much latency.
+_CHAT_PLANNER_ENABLED = _os.environ.get("SHAMSU_CHAT_PLANNER", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
 
 AGENT_SYSTEM_PROMPT = """You are SHAMSU, a local-first coding agent running inside one workspace.
 
@@ -147,6 +163,14 @@ _MAX_READ_RECOVERIES = 3
 # How many times we correct a prose-only "I will read X next" reply that did not
 # actually call a tool, before giving up (a backstop against a chatty model).
 _MAX_PROSE_CORRECTIONS = 2
+# How many empty model replies (no content, no tool call) to nudge past before
+# giving up with a clear message instead of a blank "No response returned".
+_MAX_EMPTY_RESPONSES = 2
+
+_EMPTY_RESPONSE_CORRECTION = (
+    "You returned an empty response. Do not return nothing. Either call a tool to make "
+    "progress, or write the answer/code directly, or state plainly what input you need."
+)
 
 # Phrases that signal the assistant *promised* a tool action but did not call
 # one. Used only when there are no tool calls in the reply.
@@ -207,7 +231,7 @@ class AgentChatLoop:
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
         self.action_ledger = action_ledger
-        self.model_name = model_name or model_for_role("qa")
+        self.model_name = model_name or model_for_role(_CHAT_EXECUTOR_ROLE)
         self.llm = llm or LLMManager(session_logger=session_logger, action_ledger=action_ledger)
         self.context_builder = context_builder or ContextBuilder()
         self.client = client or ollama.AsyncClient(host=base_url)
@@ -290,6 +314,33 @@ class AgentChatLoop:
         message = _message_from_response(response)
         return str(_get(message, "content", "") or "").strip() or prior_summary
 
+    async def _chat_with_heartbeat(self, messages: list[dict[str, Any]], num_ctx: int) -> Any:
+        """Call the model, emitting a periodic 'still waiting' heartbeat so a slow
+        local model reads as working, not frozen. The timeout is unchanged."""
+
+        async def _beat() -> None:
+            elapsed = 0
+            while True:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
+                elapsed += _HEARTBEAT_INTERVAL_SECONDS
+                if self.on_activity:
+                    self.on_activity(f"still waiting for the model... {elapsed}s")
+
+        beat = asyncio.ensure_future(_beat())
+        try:
+            return await asyncio.wait_for(
+                self.client.chat(
+                    model=self.model_name,
+                    messages=messages,
+                    tools=self.tools.tool_schemas(),
+                    stream=False,
+                    options={"temperature": 0.1, "num_ctx": num_ctx},
+                ),
+                timeout=_MODEL_CALL_TIMEOUT_SECONDS,
+            )
+        finally:
+            beat.cancel()
+
     def _audit_final(self, final: str) -> None:
         if self.audit:
             self.audit.log_final(final)
@@ -328,7 +379,8 @@ class AgentChatLoop:
             self.audit.log_prompt(original_input)
         user_input = self._append_long_term_memory(user_input)
         self._produced_plan = False
-        user_input = await self._append_plan(user_input)
+        if self.long_running or _CHAT_PLANNER_ENABLED:
+            user_input = await self._append_plan(user_input)
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
@@ -337,6 +389,7 @@ class AgentChatLoop:
         last_failed_read: dict[str, Any] | None = None
         read_recovery_attempts = 0
         prose_corrections = 0
+        empty_responses = 0
         # Whether any tool has actually executed yet - used to tell a genuine LLM
         # timeout apart from an executor stall when a model call times out.
         ran_any_tool = False
@@ -348,17 +401,17 @@ class AgentChatLoop:
                 _msg_text = "\n".join(str(m.get("content", "")) for m in messages)
                 _budget = self.budget_manager.compute(self.model_name, "chat", _msg_text)
                 self.budget_manager.show_indicator(_budget)
-            try:
-                response = await asyncio.wait_for(
-                    self.client.chat(
-                        model=self.model_name,
-                        messages=messages,
-                        tools=self.tools.tool_schemas(),
-                        stream=False,
-                        options={"temperature": 0.1, "num_ctx": num_ctx},
-                    ),
-                    timeout=_MODEL_CALL_TIMEOUT_SECONDS,
+            # Surface what context is going to the model (verbose/raw trace).
+            if self.on_trace is not None:
+                approx_chars = sum(len(str(m.get("content", ""))) for m in messages)
+                self._emit_trace(
+                    "context.sent",
+                    f"Sending {len(messages)} messages (~{approx_chars // 4} tokens) to {self.model_name}",
+                    {"messages": len(messages), "model": self.model_name, "round": round_index},
+                    level="verbose",
                 )
+            try:
+                response = await self._chat_with_heartbeat(messages, num_ctx)
             except asyncio.TimeoutError:
                 category = self._timeout_category(round_index, ran_any_tool)
                 final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
@@ -391,11 +444,33 @@ class AgentChatLoop:
             message = _message_from_response(response)
             content = str(_get(message, "content", "") or "")
             tool_calls = _tool_calls_from_message(message)
+            # Surface the model's visible message in `/trace raw` (debug) so the
+            # user can see what the model actually said each round - not hidden
+            # chain-of-thought, just the model-visible content.
+            if content.strip():
+                self._emit_trace("assistant.content", content, {"round": round_index}, level="raw")
             self.state.append_assistant(content, tool_calls=tool_calls)
             if not tool_calls:
                 json_action_call = _json_action_tool_call(content)
                 if json_action_call:
                     tool_calls = [json_action_call]
+            if not tool_calls and not content.strip():
+                # An empty model reply (no content, no tool call) is the "No
+                # response returned" the user saw. Retry with a nudge rather than
+                # ending the turn on nothing.
+                if empty_responses < _MAX_EMPTY_RESPONSES:
+                    empty_responses += 1
+                    self.state.append_user(_EMPTY_RESPONSE_CORRECTION)
+                    self._emit_trace(
+                        "workflow.blocked",
+                        "Model returned an empty response; asking it to act or answer.",
+                        {"attempt": empty_responses},
+                    )
+                    continue
+                final = _empty_response_final()
+                self.state.append_assistant(final)
+                self._audit_final(final)
+                return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
             if not tool_calls:
                 fallback = self.markdown_fallback.maybe_write(user_input, content)
                 if fallback.handled:
@@ -818,6 +893,14 @@ def _timeout_message(category: str, seconds: int) -> str:
         f"{base} The first model response never arrived. Local inference may be stalled "
         "(GPU saturated, model swapping, or the context is too large). "
         "Try `/models tier light`, reduce context, or restart Ollama."
+    )
+
+
+def _empty_response_final() -> str:
+    return (
+        "The local model returned an empty response, even after being asked to act or answer. "
+        "This usually means the model is too small/loaded for this request or its context is "
+        "too large. Try `/models tier light` or a shorter, more specific prompt."
     )
 
 

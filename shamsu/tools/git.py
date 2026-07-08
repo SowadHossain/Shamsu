@@ -200,7 +200,31 @@ class GitTool:
         message = message.strip()
         if not message:
             return _failed_result("git commit -m <message>", "Commit message is required.")
+        # A fresh machine often has no git identity, so `git commit` fails with
+        # "Please tell me who you are". Set a local identity first so the commit
+        # actually lands instead of erroring out.
+        self.ensure_identity(cwd)
         return self._run_git(["commit", "-m", message], cwd)
+
+    def init(self, cwd: Path | None = None) -> GitCommandResult:
+        """Initialize a git repository in the workspace (idempotent - git init on
+        an existing repo is a no-op)."""
+        return self._run_git(["init"], cwd)
+
+    def ensure_identity(self, cwd: Path | None = None) -> None:
+        """Ensure a git user.name/user.email exists so commits don't fail with
+        'Please tell me who you are'. Only sets a *local* default when nothing is
+        configured; never overrides an existing identity. Best-effort."""
+        working_dir = cwd or self.workspace_root
+        try:
+            name_code, name_out, _ = self.command_runner.run("git config user.name", working_dir)
+            if name_code != 0 or not name_out.strip():
+                self.command_runner.run('git config user.name "SHAMSU"', working_dir)
+            email_code, email_out, _ = self.command_runner.run("git config user.email", working_dir)
+            if email_code != 0 or not email_out.strip():
+                self.command_runner.run('git config user.email "shamsu@localhost"', working_dir)
+        except Exception:
+            pass
 
     def create_branch(self, branch: str, checkout: bool = True, cwd: Path | None = None) -> GitCommandResult:
         branch = branch.strip()

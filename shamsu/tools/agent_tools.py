@@ -336,6 +336,11 @@ class AgentToolRegistry:
                 required=["paths"],
             ),
             _tool_schema(
+                "git_init",
+                "Initialize a new git repository in the workspace. Use when git_status reports this is not a git repository.",
+                {},
+            ),
+            _tool_schema(
                 "git_add_all",
                 "Stage all workspace changes. Use only when the user clearly wants all changes staged.",
                 {},
@@ -476,27 +481,6 @@ class AgentToolRegistry:
                         "default": "false",
                     },
                 },
-            ),
-            _tool_schema(
-                "find_file",
-                "Find files whose path or name matches a query, to resolve a wrong or "
-                "ambiguous path before reading. Returns matching relative paths.",
-                {"query": {"type": "string", "description": "File name or path fragment to look for."}},
-                required=["query"],
-            ),
-            _tool_schema(
-                "grep_files",
-                "Search file contents inside the workspace for a literal string and return "
-                "matching file:line locations. Use this to locate code before editing.",
-                {
-                    "query": {"type": "string", "description": "Literal text to search for."},
-                    "path": {
-                        "type": "string",
-                        "description": "Relative folder to search inside.",
-                        "default": ".",
-                    },
-                },
-                required=["query"],
             ),
             _tool_schema(
                 "ask_user",
@@ -643,6 +627,9 @@ class AgentToolRegistry:
                         _split_csv(arguments.get("paths")),
                     )
                 )
+
+            if name == "git_init":
+                return _git_tool_result(self.git_tool.init())
 
             if name == "git_add_all":
                 return _git_tool_result(self.git_tool.add_all())
@@ -1106,15 +1093,24 @@ class AgentToolRegistry:
         self.transactions.record_after(transaction_id, normalized)
         self.transactions.finalize(transaction_id, "applied")
         _mark_code_memory_stale(self.workspace_root)
+        added, removed = _line_change_counts(old_string, new_string)
+        first_index = content.find(old_string)
+        start_line = content.count("\n", 0, first_index) + 1
+        end_line = start_line + old_string.count("\n")
         return ToolResult(
             True,
-            f"Edited {normalized} ({replacements} replacement(s)).",
+            f"Edited {normalized}: +{added} -{removed} lines "
+            f"(lines {start_line}-{end_line}, {replacements} replacement(s)).",
             {
                 "filepath": normalized,
                 "resolved_filepath": normalized,
                 "replacements": replacements,
                 "bytes_written": len(new_content.encode("utf-8")),
                 "transaction_id": transaction_id,
+                "lines_added": added,
+                "lines_removed": removed,
+                "start_line": start_line,
+                "end_line": end_line,
             },
         )
 
@@ -1157,6 +1153,15 @@ class AgentToolRegistry:
                 {"filepath": normalized, "candidates": []},
             )
 
+        # Capture the prior content BEFORE writing so we can report +added/-removed
+        # lines (a bare "Wrote X" hides how much actually changed on overwrite).
+        old_content = ""
+        if exists:
+            try:
+                old_content = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                old_content = ""
+
         request = ApprovalRequest(
             action_type="file_edit" if exists else "file_write",
             description=f"{'Overwrite' if exists else 'Create'} file: {normalized}",
@@ -1190,9 +1195,15 @@ class AgentToolRegistry:
         self.transactions.record_after(transaction_id, normalized)
         self.transactions.finalize(transaction_id, "applied")
         _mark_code_memory_stale(self.workspace_root)
+        added, removed = _line_change_counts(old_content, content)
+        line_count = len(content.splitlines())
+        if exists:
+            change = f"+{added} -{removed} lines"
+        else:
+            change = f"+{added} lines"
         return ToolResult(
             True,
-            f"Wrote {normalized}.",
+            f"{'Overwrote' if exists else 'Created'} {normalized} ({change}, {line_count} total).",
             {
                 "filepath": normalized,
                 "resolved_filepath": normalized,
@@ -1200,6 +1211,9 @@ class AgentToolRegistry:
                 "transaction_id": transaction_id,
                 "created": not exists,
                 "overwrote": exists,
+                "lines_added": added,
+                "lines_removed": removed,
+                "line_count": line_count,
             },
         )
 
@@ -1321,6 +1335,24 @@ _PLACEHOLDER_QUERY_TOKENS = frozenset(
         "your_query", "your query", "example", "filename", "file",
     }
 )
+
+
+def _line_change_counts(old: str, new: str) -> tuple[int, int]:
+    """(added, removed) line counts between two texts, for tool result summaries
+    like '+12 -3 lines'."""
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+    added = removed = 0
+    matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "replace":
+            removed += i2 - i1
+            added += j2 - j1
+        elif tag == "delete":
+            removed += i2 - i1
+        elif tag == "insert":
+            added += j2 - j1
+    return added, removed
 
 
 def _is_placeholder_query(query: str) -> bool:

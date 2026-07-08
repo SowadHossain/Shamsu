@@ -375,14 +375,25 @@ def _last_error_line(report: str) -> str:
 
 
 def _clean_diff(raw: str) -> str:
+    """Extract a unified diff from a model reply, tolerating markdown fences and
+    prose. Models often wrap the diff in ```diff ... ``` (sometimes after a
+    sentence of explanation), which used to fail with 'Invalid hunk line marker:
+    ```'. We take the first fenced block if present, drop any stray fence lines,
+    and trim leading prose before the diff header."""
     text = raw.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
+    # Prefer the contents of the first fenced code block, wherever it appears.
+    fenced = re.search(r"```[a-zA-Z0-9_+-]*\n(.*?)```", text, re.S)
+    if fenced:
+        text = fenced.group(1).strip()
+    # Drop any surviving fence lines (unbalanced/nested fences).
+    lines = [line for line in text.splitlines() if not line.strip().startswith("```")]
+    # Trim any leading prose before the real diff starts.
+    diff_starts = ("--- ", "+++ ", "diff --git", "*** ", "Index: ", "@@")
+    for index, line in enumerate(lines):
+        if line.startswith(diff_starts):
+            lines = lines[index:]
+            break
+    text = "\n".join(lines).strip()
     return text + "\n" if text else ""
 
 
