@@ -10,6 +10,7 @@ Trace modes:
   quiet   - print nothing (only final answers / approvals, handled elsewhere)
   normal  - print route, plan summary, tool start/result summaries, blockers
   verbose - additionally print sanitized args, candidates, workflow ids, etc.
+  raw     - like verbose, plus raw model-visible content / tool payloads (debug)
 
 `emit_trace` both logs the event to the session (always, for the audit trail)
 and prints it to the console when the current mode allows the event's level.
@@ -26,12 +27,13 @@ from shamsu.safety.commands import redact
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 
-TRACE_MODES = ("quiet", "normal", "verbose")
+TRACE_MODES = ("quiet", "normal", "verbose", "raw")
 DEFAULT_TRACE_MODE = "normal"
 
-# Higher number = more detail required before it prints.
-_MODE_RANK = {"quiet": 0, "normal": 1, "verbose": 2}
-_LEVEL_RANK = {"quiet": 0, "normal": 1, "verbose": 2}
+# Higher number = more detail required before it prints. "raw" is the most
+# verbose debug mode (shows raw model-visible content / tool payloads).
+_MODE_RANK = {"quiet": 0, "normal": 1, "verbose": 2, "raw": 3}
+_LEVEL_RANK = {"quiet": 0, "normal": 1, "verbose": 2, "raw": 3}
 
 # Keep any single trace value short; the trace is a glanceable process view,
 # not a place to dump file contents or full tool payloads.
@@ -84,7 +86,7 @@ def format_trace_line(event_type: str, message: str, payload: dict[str, Any] | N
     label = _EVENT_LABELS.get(event_type, event_type)
     safe_message = _truncate(redact(message), _MAX_MESSAGE_CHARS)
     line = f"{label}: {safe_message}" if safe_message else label
-    if level == "verbose" and payload:
+    if level in ("verbose", "raw") and payload:
         safe = sanitize_payload(payload)
         if safe:
             extras = " ".join(f"{key}={value}" for key, value in safe.items())

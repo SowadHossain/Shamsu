@@ -14,7 +14,92 @@ from shamsu.registry.suitability import assess
 from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
 
+# Explicit signals that a PRD asks for a static HTML/CSS/JS frontend, so the
+# planner must NOT fall back to a generic Django project (manage.py / settings /
+# login / register / dashboard). Grounded: we only take this branch when the PRD
+# text itself says so.
+_STATIC_FRONTEND_PHRASES = (
+    "static site", "static website", "static web app", "static web page",
+    "vanilla javascript", "vanilla js", "plain html", "plain javascript",
+    "no backend", "without a backend", "frontend only", "front-end only",
+    "client-side only", "client side only", "browser only",
+)
+# Backend/framework signals that disqualify the static-frontend branch: if the
+# PRD really needs a server, keep the normal (possibly Django) planning path.
+_BACKEND_FRAMEWORK_PHRASES = (
+    "django", "flask", "fastapi", "express", "rails", "spring", "laravel",
+    "node backend", "node.js backend", "backend service", "server-side",
+    "server side", "microservice", "rest api", "graphql",
+    "postgres", "postgresql", "mysql", "sqlite", "mongodb", "database",
+    " sql ", "orm", "authentication service", "oauth",
+)
+
+
+def _mentions_html_css_js(text: str) -> bool:
+    return "html" in text and ("css" in text or "javascript" in text or " js" in text or "js." in text)
+
+
+def is_static_frontend_prd(parsed: ParsedPRD) -> bool:
+    """True when the PRD explicitly asks for a static HTML/CSS/JS frontend and
+    shows no backend/framework/database signals. Used to stop the planner from
+    defaulting to a generic Django CRUD project on a small frontend PRD."""
+    text = f"{parsed.title}\n{parsed.raw_text}".lower()
+    signal = _mentions_html_css_js(text) or any(phrase in text for phrase in _STATIC_FRONTEND_PHRASES)
+    if not signal:
+        return False
+    return not any(phrase in text for phrase in _BACKEND_FRAMEWORK_PHRASES)
+
+
+def _frontend_generation_order() -> list[DjangoFileSpec]:
+    """Deterministic static-frontend file set - the three files a 'build with
+    HTML/CSS/JS' PRD expects, plus a README. Never manage.py/settings/login."""
+    return [
+        DjangoFileSpec("index.html", "frontend_template", "coder"),
+        DjangoFileSpec("style.css", "frontend_template", "coder"),
+        DjangoFileSpec("script.js", "frontend_template", "coder"),
+        DjangoFileSpec("README.md", "generic_docs", "doc_agent"),
+    ]
+
+
+def _build_static_frontend_spec(parsed: ParsedPRD) -> ProjectSpec:
+    project_name = _to_snake_case(parsed.title)
+    app_name = _default_app_name(project_name)
+    entities = extract_entities(parsed)
+    # Only pages the PRD explicitly lists - never an inferred Dashboard/CRUD set.
+    pages = _extract_pages(parsed)
+    theme = _select_theme(parsed.raw_text)
+    contract = extract_contract(parsed)
+    category = Category.GENERAL_WEB
+    return ProjectSpec(
+        project_name=project_name,
+        app_name=app_name,
+        entities=entities,
+        endpoints=[],
+        pages=pages,
+        theme=theme,
+        generation_order=_frontend_generation_order(),
+        archetype=Archetype.GENERIC_WEB,
+        archetype_confidence=0.9,
+        archetype_spec={
+            "reason": "PRD explicitly requests a static HTML/CSS/JS frontend; no backend signals.",
+            "category_reason": "static-frontend override",
+            "category_scores": {},
+        },
+        category=category.value,
+        master_prompt="",
+        manifest_path="",
+        dod_path="",
+        feature_requests=_feature_requests(parsed),
+        prd_contract=contract,
+        suitability=assess(contract, category, Archetype.GENERIC_WEB),
+    )
+
+
 def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
+    # Grounding gate: a PRD that explicitly asks for static HTML/CSS/JS (and
+    # shows no backend signals) must not become a generic Django CRUD project.
+    if is_static_frontend_prd(parsed):
+        return _build_static_frontend_spec(parsed)
     project_name = _to_snake_case(parsed.title)
     app_name = _default_app_name(project_name)
     entities = extract_entities(parsed)

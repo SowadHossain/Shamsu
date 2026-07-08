@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os as _os
 import re
@@ -14,6 +15,7 @@ from typing import Any
 import ollama
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.audit import SessionAuditLog
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.clarification import format_question
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
@@ -160,12 +162,23 @@ _DEFERRED_ACTION_PATTERNS = (
 TraceCallback = Callable[[str, str, "dict[str, Any] | None", str], None]
 
 
+# Timeout / stall categories, so the CLI and logs can distinguish a genuine LLM
+# timeout from an agent-loop stall (the model already answered but no valid tool
+# call followed) instead of always blaming the GPU. See run().
+TIMEOUT_LLM_NO_FIRST_TOKEN = "llm_no_first_token_timeout"
+TIMEOUT_LLM_GENERATION = "llm_generation_timeout"
+TIMEOUT_PLANNER_STALL = "planner_returned_but_executor_stalled"
+TIMEOUT_TOOL_EXECUTION = "tool_execution_timeout"
+TIMEOUT_TOOL_MISSING_AFTER_PROMISE = "tool_call_missing_after_promise"
+
+
 @dataclass(frozen=True)
 class AgentLoopResult:
     final: str
     tool_rounds: int = 0
     stopped: bool = False
     awaiting_user: bool = False
+    timeout_category: str | None = None
 
 
 class AgentChatLoop:
@@ -188,6 +201,7 @@ class AgentChatLoop:
         llm: ILLMManager | None = None,
         context_builder: IContextBuilder | None = None,
         budget_manager: ContextBudgetManager | None = None,
+        audit: SessionAuditLog | None = None,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -204,6 +218,7 @@ class AgentChatLoop:
         self.on_trace = on_trace
         self.progress = progress
         self.budget_manager = budget_manager
+        self.audit = audit
         self.state = state or ChatState(
             _system_prompt(self.workspace_root),
             session_logger=session_logger,
@@ -275,9 +290,44 @@ class AgentChatLoop:
         message = _message_from_response(response)
         return str(_get(message, "content", "") or "").strip() or prior_summary
 
+    def _audit_final(self, final: str) -> None:
+        if self.audit:
+            self.audit.log_final(final)
+
+    def _audit_file_change(self, name: str, arguments: dict[str, Any], result: Any) -> None:
+        """Record write_file/edit_file changes (content + diff + rollback id)."""
+        if not self.audit or name not in {"write_file", "edit_file"} or not getattr(result, "ok", False):
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        filepath = str(arguments.get("filepath", ""))
+        if name == "write_file":
+            content = str(arguments.get("content") or "")
+            diff = "\n".join(f"+{line}" for line in content.splitlines())
+            action = "create" if data.get("created") else "overwrite"
+        else:  # edit_file
+            old = str(arguments.get("old_string") or "")
+            new = str(arguments.get("new_string") or "")
+            content = new
+            diff = "\n".join(
+                difflib.unified_diff(
+                    old.splitlines(), new.splitlines(), fromfile=filepath, tofile=filepath, lineterm=""
+                )
+            )
+            action = "edit"
+        self.audit.log_file_change(
+            action=action,
+            filepath=filepath,
+            content=content,
+            diff=diff,
+            transaction_id=str(data.get("transaction_id", "")),
+        )
+
     async def run(self, user_input: str) -> AgentLoopResult:
         original_input = user_input
+        if self.audit:
+            self.audit.log_prompt(original_input)
         user_input = self._append_long_term_memory(user_input)
+        self._produced_plan = False
         user_input = await self._append_plan(user_input)
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
@@ -287,6 +337,9 @@ class AgentChatLoop:
         last_failed_read: dict[str, Any] | None = None
         read_recovery_attempts = 0
         prose_corrections = 0
+        # Whether any tool has actually executed yet - used to tell a genuine LLM
+        # timeout apart from an executor stall when a model call times out.
+        ran_any_tool = False
         for round_index in range(self.max_tool_rounds):
             num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
             messages = await self._messages_within_budget(num_ctx)
@@ -307,17 +360,33 @@ class AgentChatLoop:
                     timeout=_MODEL_CALL_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                final = (
-                    f"The model did not respond within {_MODEL_CALL_TIMEOUT_SECONDS}s. "
-                    "This usually means local inference is stalled (GPU saturated, model swapping, "
-                    "or the context is too large). "
-                    "Try a lighter model with `/models tier light`, reduce context, or restart Ollama."
-                )
+                category = self._timeout_category(round_index, ran_any_tool)
+                final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
                 self.state.append_assistant(final)
-                return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+                self._emit_trace(
+                    "llm.timeout",
+                    f"Model call timed out (category: {category}).",
+                    {"category": category, "round": round_index, "seconds": _MODEL_CALL_TIMEOUT_SECONDS},
+                )
+                if self.session_logger:
+                    self.session_logger.log(
+                        "llm.timeout",
+                        {"category": category, "round": round_index, "produced_plan": self._produced_plan},
+                        f"Model call timed out: {category}",
+                        workflow_id="agent-chat",
+                    )
+                if self.audit:
+                    self.audit.log_error(category, final)
+                self._audit_final(final)
+                return AgentLoopResult(
+                    final=final, tool_rounds=round_index, stopped=True, timeout_category=category
+                )
             except Exception as exc:
                 final = _friendly_ollama_error(exc)
                 self.state.append_assistant(final)
+                if self.audit:
+                    self.audit.log_error("llm_error", str(exc))
+                self._audit_final(final)
                 return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
             message = _message_from_response(response)
             content = str(_get(message, "content", "") or "")
@@ -362,23 +431,44 @@ class AgentChatLoop:
                     final = _read_blocked_final(last_failed_read)
                     self.state.append_assistant(final)
                     return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
-                if _looks_like_deferred_action(content) and prose_corrections < _MAX_PROSE_CORRECTIONS:
+                if _looks_like_deferred_action(content):
                     # The model said it would take a tool action ("I will read X
                     # next") but did not call a tool. Do not end the turn on an
                     # empty promise: demand a real tool call, an ask_user, or an
                     # explicit "I am blocked" and give it one more round.
-                    prose_corrections += 1
-                    self.state.append_user(_PROSE_ONLY_CORRECTION)
+                    if prose_corrections < _MAX_PROSE_CORRECTIONS:
+                        prose_corrections += 1
+                        self.state.append_user(_PROSE_ONLY_CORRECTION)
+                        self._emit_trace(
+                            "workflow.blocked",
+                            "Assistant promised a tool action without calling one; asking it to act or ask.",
+                            {"attempt": prose_corrections, "category": "tool_call_missing_after_promise"},
+                        )
+                        continue
+                    # Corrections exhausted: the model kept promising a tool
+                    # action without calling one. A bare promise is NOT a valid
+                    # final answer, so return an explicit "blocked" message
+                    # instead of surfacing the hollow prose.
+                    final = _prose_blocked_final()
+                    self.state.append_assistant(final)
                     self._emit_trace(
                         "workflow.blocked",
-                        "Assistant promised a tool action without calling one; asking it to act or ask.",
-                        {"attempt": prose_corrections},
+                        "Assistant kept promising tool actions without calling one.",
+                        {"category": "tool_call_missing_after_promise"},
                     )
-                    continue
+                    self._audit_final(final)
+                    return AgentLoopResult(
+                        final=final,
+                        tool_rounds=round_index,
+                        stopped=True,
+                        timeout_category=TIMEOUT_TOOL_MISSING_AFTER_PROMISE,
+                    )
                 if unconfirmed_failed_writes:
                     final = _failed_write_final(unconfirmed_failed_writes)
                     self.state.append_assistant(final)
+                    self._audit_final(final)
                     return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+                self._audit_final(content)
                 return AgentLoopResult(final=content, tool_rounds=round_index)
             for call in tool_calls:
                 name = _tool_call_name(call)
@@ -392,9 +482,25 @@ class AgentChatLoop:
                 if self.progress:
                     self.progress.tool_start(name, summarize_tool_args(name, arguments))
                 self._log_tool_call(name, arguments)
+                if self.audit:
+                    self.audit.log_tool_call(name, arguments)
                 ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
                 result = self.tools.execute(name, arguments)
+                ran_any_tool = True
                 self._log_tool_result(name, result)
+                if self.audit:
+                    self.audit.log_tool_result(
+                        name, bool(result.ok), result.message, _compact_value(result.data, limit=4000)
+                    )
+                    self._audit_file_change(name, arguments, result)
+                    if name == "run_command":
+                        _data = result.data if isinstance(result.data, dict) else {}
+                        self.audit.log_command(
+                            str(arguments.get("command", "")),
+                            int(_data.get("exit_code", 0) or 0),
+                            str(_data.get("stdout", "")),
+                            str(_data.get("stderr", "")),
+                        )
                 if self.action_ledger:
                     self.action_ledger.log_tool_result(
                         ledger_call_id, name, bool(result.ok), result.message, result.data
@@ -505,6 +611,7 @@ class AgentChatLoop:
                         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
         final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
         self.state.append_assistant(final)
+        self._audit_final(final)
         return AgentLoopResult(final=final, tool_rounds=self.max_tool_rounds, stopped=True)
 
     def _append_long_term_memory(self, user_input: str) -> str:
@@ -541,6 +648,9 @@ class AgentChatLoop:
             return user_input
         if not plan.text:
             return user_input
+        self._produced_plan = True
+        if self.audit:
+            self.audit.log_planner(plan.text)
         if self.session_logger:
             self.session_logger.log(
                 "planner.plan",
@@ -558,6 +668,20 @@ class AgentChatLoop:
         # behind it - just the short, action-focused plan text).
         self._emit_trace("plan.created", plan.text)
         return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
+
+    def _timeout_category(self, round_index: int, ran_any_tool: bool) -> str:
+        """Classify a model-call timeout so the CLI/logs stop blaming the GPU
+        when the model already produced a plan or the loop already ran tools.
+
+        - First model call, no plan, no tools  -> genuine no-first-token stall.
+        - First model call but a plan returned  -> planner worked, executor stalled.
+        - Any later round (tools already ran)   -> mid-run generation timeout.
+        """
+        if round_index == 0 and not ran_any_tool:
+            if getattr(self, "_produced_plan", False):
+                return TIMEOUT_PLANNER_STALL
+            return TIMEOUT_LLM_NO_FIRST_TOKEN
+        return TIMEOUT_LLM_GENERATION
 
     def _emit_trace(
         self,
@@ -584,6 +708,7 @@ class AgentChatLoop:
             self.session_logger.set_pending_question(pending)
         final = format_question(pending)
         self.state.append_assistant(final)
+        self._audit_final(final)
         self._emit_trace(
             "clarification.needed",
             str(pending.get("question", "")),
@@ -636,6 +761,7 @@ class AgentChatLoop:
                 "Stopped after repeated identical tool calls",
                 workflow_id="agent-chat",
             )
+        self._audit_final(final)
         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
 
     def _log_tool_call(self, name: str, arguments: dict[str, Any]) -> None:
@@ -670,6 +796,39 @@ _PROSE_ONLY_CORRECTION = (
     "plainly that you are blocked and what input you need. Do not reply with an "
     "intention alone."
 )
+
+
+def _timeout_message(category: str, seconds: int) -> str:
+    """Human-facing timeout message that names the real category instead of
+    always attributing the stall to a saturated GPU."""
+    base = f"The model call timed out after {seconds}s (category: {category})."
+    if category == TIMEOUT_PLANNER_STALL:
+        return (
+            f"{base} The planner already returned a plan, so this is an agent-loop / executor "
+            "stall waiting on the next model response - not necessarily a GPU problem. "
+            "Retry, reduce context, or try `/models tier light`."
+        )
+    if category == TIMEOUT_LLM_GENERATION:
+        return (
+            f"{base} Generation stalled part-way through the run. "
+            "Try a lighter model with `/models tier light`, or reduce context."
+        )
+    # TIMEOUT_LLM_NO_FIRST_TOKEN
+    return (
+        f"{base} The first model response never arrived. Local inference may be stalled "
+        "(GPU saturated, model swapping, or the context is too large). "
+        "Try `/models tier light`, reduce context, or restart Ollama."
+    )
+
+
+def _prose_blocked_final() -> str:
+    """Final message when the model kept promising a tool action but never called
+    one. Never surface the empty promise itself as the answer."""
+    return (
+        "I said I would take an action (read/open/edit/run something) but did not actually "
+        "call a tool to do it, and could not after retrying. This is a tool-contract stall, "
+        "not a finished task. Tell me the exact file path or command to use and I'll run it."
+    )
 
 
 def _looks_like_deferred_action(content: str) -> bool:

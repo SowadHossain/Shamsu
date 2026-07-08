@@ -932,6 +932,12 @@ class AgentToolRegistry:
         )
 
     def find_file(self, query: str, limit: int = 20) -> ToolResult:
+        if _is_placeholder_query(query):
+            return ToolResult(
+                False,
+                f'Missing or placeholder query "{str(query).strip()}". Pass a real file name to find_file.',
+                {"query": query, "matches": []},
+            )
         normalized = _normalize_workspace_path(query)
         if not normalized:
             return ToolResult(False, "Missing query.", {"query": query, "matches": []})
@@ -941,7 +947,13 @@ class AgentToolRegistry:
             if matches
             else f"No files matched '{normalized}'. Try a shorter query or grep_files."
         )
-        return ToolResult(True, message, {"query": normalized, "matches": matches, "count": len(matches)})
+        # "candidates" is the key the chat loop's read-failure recovery reads to
+        # suggest the real path; "matches" is kept for backward compatibility.
+        return ToolResult(
+            True,
+            message,
+            {"query": normalized, "candidates": matches, "matches": matches, "count": len(matches)},
+        )
 
     def grep_files(
         self,
@@ -950,8 +962,12 @@ class AgentToolRegistry:
         extensions: str = "",
         limit: int = 50,
     ) -> ToolResult:
-        if not query.strip():
-            return ToolResult(False, "Missing query.", {"query": query, "matches": []})
+        if _is_placeholder_query(query):
+            return ToolResult(
+                False,
+                f'Missing or placeholder query "{str(query).strip()}". Pass a concrete symbol or text string to grep_files.',
+                {"query": query, "matches": []},
+            )
         try:
             base = self.sandbox.validate(_normalize_workspace_path(path) or ".")
         except SecurityError as exc:
@@ -975,9 +991,11 @@ class AgentToolRegistry:
                 with full.open("r", encoding="utf-8", errors="ignore") as handle:
                     for lineno, line in enumerate(handle, start=1):
                         if query in line:
+                            rel_path = full.relative_to(self.workspace_root).as_posix()
                             matches.append(
                                 {
-                                    "filepath": full.relative_to(self.workspace_root).as_posix(),
+                                    "file": rel_path,
+                                    "filepath": rel_path,
                                     "line": lineno,
                                     "text": line.rstrip("\n")[:200],
                                 }
@@ -1225,6 +1243,36 @@ class AgentToolRegistry:
             },
         )
 
+    def ask_user(
+        self,
+        question: str,
+        options: Any = None,
+        allow_free_text: bool = True,
+    ) -> ToolResult:
+        """Signal that the agent needs input. This does not block: it returns a
+        structured pending question the chat loop stores in session state and
+        surfaces to the user, ending the turn."""
+        if not question.strip():
+            return ToolResult(False, "ask_user needs a non-empty question.", {})
+        from shamsu.agents.clarification import build_pending_question
+
+        normalized_options: list[dict[str, str]] = []
+        if isinstance(options, list):
+            normalized_options = [
+                item if isinstance(item, dict) else {"label": str(item), "description": ""}
+                for item in options
+            ]
+        pending = build_pending_question(
+            question,
+            normalized_options,
+            allow_free_text=allow_free_text,
+        )
+        return ToolResult(
+            True,
+            question.strip(),
+            {"ask_user": True, "pending_question": pending},
+        )
+
 
 def _git_tool_result(result: GitCommandResult) -> ToolResult:
     return ToolResult(
@@ -1258,83 +1306,29 @@ def _as_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except ValueError:
         number = default
     return max(minimum, min(number, maximum))
-    def find_file(self, query: str) -> ToolResult:
-        if not query.strip():
-            return ToolResult(False, "Missing query.", {})
-        matches = self.workspace_tool.find_files(query, limit=20)
-        candidates = [path.relative_to(self.workspace_root).as_posix() for path in matches]
-        return ToolResult(
-            True,
-            f"Found {len(candidates)} matching path(s) for {query!r}.",
-            {"query": query, "candidates": candidates},
-        )
 
-    def grep_files(self, query: str, path: str = ".") -> ToolResult:
-        if not query.strip():
-            return ToolResult(False, "Missing query.", {})
-        try:
-            root = self.sandbox.validate(path)
-        except SecurityError as exc:
-            return ToolResult(False, str(exc), {"query": query, "path": path})
-        if not root.exists():
-            return ToolResult(False, f"Not found: {path}", {"query": query, "path": path})
-        base = root if root.is_dir() else root.parent
-        matches: list[dict[str, Any]] = []
-        needle = query
-        for candidate in sorted(base.rglob("*")):
-            if len(matches) >= 50:
-                break
-            if not candidate.is_file():
-                continue
-            rel = candidate.relative_to(self.workspace_root).as_posix()
-            if any(part in _GREP_IGNORED for part in candidate.relative_to(self.workspace_root).parts):
-                continue
-            try:
-                if candidate.stat().st_size > 1_000_000:
-                    continue
-                text = candidate.read_text(encoding="utf-8", errors="ignore")
-            except (OSError, ValueError):
-                continue
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                if needle in line:
-                    matches.append({"file": rel, "line": line_number, "text": line.strip()[:200]})
-                    if len(matches) >= 50:
-                        break
-        return ToolResult(
-            True,
-            f"Found {len(matches)} match(es) for {query!r}.",
-            {"query": query, "path": path, "matches": matches},
-        )
 
-    def ask_user(
-        self,
-        question: str,
-        options: Any = None,
-        allow_free_text: bool = True,
-    ) -> ToolResult:
-        """Signal that the agent needs input. This does not block: it returns a
-        structured pending question the chat loop stores in session state and
-        surfaces to the user, ending the turn."""
-        if not question.strip():
-            return ToolResult(False, "ask_user needs a non-empty question.", {})
-        from shamsu.agents.clarification import build_pending_question
+# Placeholder "queries" a model emits when it has not decided what to search for
+# yet (e.g. grep_files query="?"). Executing these scans the whole tree for
+# nonsense and burns a loop round, so the tools reject them up front and the
+# chat loop turns the rejection into a concrete correction.
+_PLACEHOLDER_QUERY_TOKENS = frozenset(
+    {
+        "?", "??", "???", "...", "…", "*", "**",
+        "<query>", "<text>", "<pattern>", "<symbol>", "<term>", "<file>", "<name>",
+        "query", "search", "text", "pattern", "symbol", "term", "keyword",
+        "todo", "tbd", "xxx", "n/a", "na", "none", "null", "placeholder",
+        "your_query", "your query", "example", "filename", "file",
+    }
+)
 
-        normalized_options: list[dict[str, str]] = []
-        if isinstance(options, list):
-            normalized_options = [
-                item if isinstance(item, dict) else {"label": str(item), "description": ""}
-                for item in options
-            ]
-        pending = build_pending_question(
-            question,
-            normalized_options,
-            allow_free_text=allow_free_text,
-        )
-        return ToolResult(
-            True,
-            question.strip(),
-            {"ask_user": True, "pending_question": pending},
-        )
+
+def _is_placeholder_query(query: str) -> bool:
+    """True for an empty or placeholder search term (see `_PLACEHOLDER_QUERY_TOKENS`)."""
+    stripped = str(query or "").strip()
+    if not stripped:
+        return True
+    return stripped.lower() in _PLACEHOLDER_QUERY_TOKENS
 
 
 _GREP_IGNORED = {".git", ".shamsu", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".mypy_cache"}

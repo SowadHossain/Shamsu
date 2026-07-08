@@ -59,7 +59,7 @@ from shamsu.core.coordinator import Coordinator
 from shamsu.llm.manager import LLMManager, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
-from shamsu.prd.project import build_project_spec
+from shamsu.prd.project import build_project_spec, is_static_frontend_prd
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.registry.schema import Category
 from shamsu.retriever.search import NullSearchAgent, SearchAgent
@@ -106,6 +106,7 @@ from shamsu.patch import git_apply as patch_git_apply
 from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
+from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.session.memory import is_affirmative, is_negative
 from shamsu.templates.django.writer import DjangoProjectWriter
@@ -248,7 +249,17 @@ SYSTEM_COMMANDS = (
     "/trace status",
     "/trace on",
     "/trace off",
+    "/trace normal",
     "/trace verbose",
+    "/trace raw",
+    "/debug on",
+    "/debug off",
+    "/debug status",
+    "/audit-log tail",
+    "/audit-log show ",
+    "/audit-log grep ",
+    "/audit-log export",
+    "/audit-log open",
     "/diagnostics setup",
     "/diagnostics repair",
     "/diagnostics status",
@@ -453,7 +464,14 @@ def _print_help(console: Console) -> None:
                     "  /patch diff <id>          Show the diff applied by a transaction",
                     "  /patch trash              List files moved to .shamsu/trash",
                     "  /patch clean-trash        Permanently delete everything in trash (with approval)",
+                    "  /trace on|off|verbose|raw Set the visible working trace (raw = debug: route, plan, tool calls/outputs, raw content)",
+                    "  /debug on|off             Toggle a rich debug trace (route, model, plan, tool calls, tool outputs, file changes)",
                     "  /log tail                 Show recent session events",
+                    "  /audit-log tail [n]       Tail the detailed per-step audit trail (.shamsu/audit)",
+                    "  /audit-log show <session> Show one session's full audit trail",
+                    "  /audit-log grep <query>   Search the audit trail",
+                    "  /audit-log export [path]  Export the audit trail to JSONL",
+                    "  /audit-log open           Show the audit log locations",
                     "  /runs [n]                 List recent ActionLedger runs (local debug/audit log)",
                     "  /run last                 Show the latest run's summary",
                     "  /run show <run-id>        Show a run's manifest and summary",
@@ -1307,10 +1325,163 @@ def _handle_trace(user_input: str, workspace: Path, console: Console) -> None:
         _set_trace_mode(workspace, "verbose")
         console.print("[green]Trace mode is verbose.[/green]")
         return
+    if command == "raw":
+        _set_trace_mode(workspace, "raw")
+        console.print(
+            "[green]Trace mode is raw - shows route, plan, tool calls/args, tool outputs, "
+            "and raw model-visible content.[/green]"
+        )
+        return
+    if command == "normal":
+        _set_trace_mode(workspace, "normal")
+        console.print("[green]Trace mode is normal.[/green]")
+        return
     if command == "status":
         console.print(f"Trace mode: [bold]{_trace_mode(workspace)}[/bold]")
         return
-    console.print("[red]Usage: trace status|on|off|verbose[/red]")
+    console.print("[red]Usage: trace status|on|off|normal|verbose|raw[/red]")
+
+
+def _handle_debug(user_input: str, workspace: Path, console: Console) -> None:
+    """`/debug on|off` toggles a rich trace (verbose) on or off - a friendly
+    alias over the trace mode so users don't have to remember trace levels."""
+    parts = user_input.split(maxsplit=1)
+    command = parts[1].strip().lower() if len(parts) > 1 else "status"
+    if command == "on":
+        _set_trace_mode(workspace, "verbose")
+        console.print(
+            "[green]Debug on: route, model, plan, tool calls, tool outputs, and file "
+            "changes will be shown. Use `/trace raw` for raw model content.[/green]"
+        )
+        return
+    if command == "off":
+        _set_trace_mode(workspace, "normal")
+        console.print("[yellow]Debug off (trace mode: normal).[/yellow]")
+        return
+    if command == "status":
+        console.print(f"Trace mode: [bold]{_trace_mode(workspace)}[/bold]")
+        return
+    console.print("[red]Usage: debug on|off|status[/red]")
+
+
+def _audit_root(workspace: Path) -> Path:
+    return workspace / ".shamsu" / "audit"
+
+
+def _read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return []
+    if limit is not None:
+        return records[-limit:]
+    return records
+
+
+def _format_audit_event(event: dict[str, Any]) -> str:
+    ts = str(event.get("timestamp", ""))[:19]
+    etype = str(event.get("event_type", "?"))
+    message = str(event.get("message", "")).strip()
+    extras = ""
+    if etype == "tool.call":
+        extras = f" {event.get('tool', '')} {json.dumps(event.get('arguments', {}), default=str)[:200]}"
+    elif etype == "tool.result":
+        extras = f" {event.get('tool', '')} ok={event.get('ok')}"
+    elif etype == "file.change":
+        extras = f" {event.get('action', '')} {event.get('filepath', '')}"
+    elif etype == "route.selected":
+        extras = f" {event.get('route', '')}"
+    return f"[dim]{ts}[/dim] [cyan]{etype}[/cyan] {message}{extras}".rstrip()
+
+
+def _handle_audit_log(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Inspect the detailed per-step audit trail under .shamsu/audit/.
+
+    Subcommands: tail [n], show <session-id>, grep <query>, export [path], open.
+    """
+    parts = user_input.split(maxsplit=2)
+    sub = parts[1].strip().lower() if len(parts) > 1 else "tail"
+    arg = parts[2].strip() if len(parts) > 2 else ""
+    root = _audit_root(workspace)
+    events_path = root / "events.jsonl"
+
+    if sub == "tail":
+        limit = int(arg) if arg.isdigit() else 40
+        events = _read_jsonl(events_path, limit=limit)
+        if not events:
+            console.print("[dim]No audit events recorded yet.[/dim]")
+            return
+        for event in events:
+            console.print(_format_audit_event(event))
+        return
+
+    if sub == "show":
+        if not arg:
+            console.print("[red]Usage: audit-log show <session-id>[/red]")
+            return
+        session_path = root / "sessions" / f"{arg}.jsonl"
+        events = _read_jsonl(session_path)
+        if not events:
+            console.print(f"[yellow]No audit events for session {arg}.[/yellow]")
+            return
+        for event in events:
+            console.print(_format_audit_event(event))
+        return
+
+    if sub == "grep":
+        if not arg:
+            console.print("[red]Usage: audit-log grep <query>[/red]")
+            return
+        needle = arg.lower()
+        matches = [
+            event for event in _read_jsonl(events_path)
+            if needle in json.dumps(event, default=str).lower()
+        ]
+        if not matches:
+            console.print(f"[dim]No audit events matched '{arg}'.[/dim]")
+            return
+        for event in matches[-100:]:
+            console.print(_format_audit_event(event))
+        return
+
+    if sub == "export":
+        target = Path(arg) if arg else (workspace / "audit-export.jsonl")
+        events = _read_jsonl(events_path)
+        try:
+            target.write_text(
+                "\n".join(json.dumps(event, default=str) for event in events) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            console.print(f"[red]Could not export audit log: {exc}[/red]")
+            return
+        console.print(f"[green]Exported {len(events)} audit event(s) to {target}[/green]")
+        return
+
+    if sub == "open":
+        console.print(f"Audit log directory: [bold]{root}[/bold]")
+        console.print(f"  events:   {events_path}")
+        console.print(f"  sessions: {root / 'sessions'}")
+        console.print(f"  artifacts:{root / 'artifacts'}")
+        console.print(f"  context:  {root / 'context-packs'}")
+        return
+
+    console.print("[red]Usage: audit-log tail [n] | show <session-id> | grep <query> | export [path] | open[/red]")
 
 
 # -- ActionLedger CLI (/runs, /run): local human-facing debug/audit trail. --
@@ -3114,6 +3285,8 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
         return "prd.build"
     if _looks_like_file_write_request(effective_input):
         return "file.write"
+    if _looks_like_direct_code_request(effective_input):
+        return "direct_code"
     if _looks_like_browser_needed_prompt(effective_input):
         return "browser"
     if _looks_like_web_needed_prompt(effective_input):
@@ -3185,6 +3358,27 @@ async def _handle_request(
             session_logger=session_logger,
             auto_approve=is_long_running_enabled(workspace),
         )
+        return
+    # A self-contained coding question ("write python for the first 100 primes")
+    # is answered directly by the model - no planner, no tool loop, no timeout.
+    if _looks_like_direct_code_request(effective_input):
+        emit_trace(
+            console,
+            session_logger,
+            workspace,
+            "route.detected",
+            "direct_code",
+            {"reason": "self_contained_coding_question"},
+            level="normal",
+        )
+        await _run_direct_code_answer(
+            effective_input,
+            console,
+            _make_llm_manager(session_logger, console, workspace),
+            session_logger=session_logger,
+            thinking_status=thinking_status,
+        )
+        _audit_simple_turn(workspace, session_logger, "direct_code", effective_input, "")
         return
     if _looks_like_workspace_prd_request(effective_input):
         message = _handle_workspace_prd_request(workspace, console)
@@ -3620,6 +3814,10 @@ _GIT_READ_ONLY_PHRASES = (
     "show changes", "show me the changes", "repo status", "repository status",
     "status of the repo", "status of this repo", "what's changed",
     "whats changed", "diff of the repo", "working tree",
+    # Untracked files are a pure git/status concept: any mention must reach
+    # git_status, never find_file (which used to search for a file literally
+    # named "untracked").
+    "untracked", "untracked file", "untracked files", "untracked change",
 )
 
 _GIT_MUTATION_PHRASES = (
@@ -3664,8 +3862,8 @@ def is_git_request(text: str) -> bool:
         word in low
         for word in (
             "status", "diff", "commit", "branch", "stage", "staged",
-            "unstaged", "push", "pull", "fetch", "checkout", "stash",
-            "remote", "log", "changes",
+            "unstaged", "untracked", "push", "pull", "fetch", "checkout",
+            "stash", "remote", "log", "changes",
         )
     )
 
@@ -3779,6 +3977,108 @@ def _run_git_read_only(
     _log_assistant_message(session_logger, body, workflow_id="git-read")
 
 
+def _looks_like_git_add_commit_request(text: str) -> bool:
+    """A common, deterministic mutation: "add [all] files and commit".
+
+    Detected so it runs through a fixed git_status -> git_add_all -> git_commit
+    sequence instead of the LLM tool loop, which used to wander off (e.g. search
+    for a file literally named "untracked" before committing)."""
+    low = text.lower()
+    if "commit" not in low:
+        return False
+    words = set(re.sub(r"[^\w\s]", " ", low).split())
+    return bool({"add", "stage"} & words) or "stage all" in low or "add all" in low
+
+
+def _extract_commit_message(user_input: str) -> str:
+    """Pull an explicit commit message out of the prompt, if the user gave one."""
+    quoted = re.search(r"""['"]([^'"]{3,200})['"]""", user_input)
+    if quoted:
+        return quoted.group(1).strip()
+    labelled = re.search(
+        r"(?:message|msg|-m|commit message)\s*[:=]?\s*(.+)$",
+        user_input,
+        re.IGNORECASE,
+    )
+    if labelled:
+        return labelled.group(1).strip().strip("\"'")
+    return ""
+
+
+def _run_git_add_commit(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    trace: Callable[[str], None],
+) -> None:
+    """Deterministic "stage everything and commit" flow.
+
+    Runs git_status -> git_add_all -> git_commit through the typed git tools,
+    gated behind a single approval. Never searches the filesystem (the old bug
+    reached for find_file query="untracked")."""
+    approval_manager = _make_approval_manager(workspace, session_logger, console)
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=approval_manager,
+        action_ledger=get_current_run(),
+    )
+
+    trace("tool=git_status args={}")
+    status = registry.execute("git_status", {})
+    if not status.ok or (isinstance(status.data, dict) and not status.data.get("is_git_repo", True)):
+        console.print(Panel("This workspace is not a git repository.", title="Git"))
+        _log_assistant_message(session_logger, "This workspace is not a git repository.", workflow_id="git-commit")
+        return
+    if isinstance(status.data, dict) and not status.data.get("is_dirty", True):
+        console.print(Panel("Nothing to commit - the working tree is clean.", title="Git"))
+        _log_assistant_message(session_logger, "Nothing to commit - the working tree is clean.", workflow_id="git-commit")
+        return
+
+    message = _extract_commit_message(user_input)
+    if not message:
+        message = "Update files"
+
+    changed = status.data.get("changed_files", []) if isinstance(status.data, dict) else []
+    preview = "\n".join(str(item) for item in changed[:20]) or "(all changes)"
+    approved = True
+    if approval_manager is not None:
+        approved = approval_manager.ask(
+            ApprovalRequest(
+                action_type="run_command",
+                description=f'Stage all changes and commit with message: "{message}"',
+                risk_level="medium",
+                preview=preview,
+                working_dir=str(workspace),
+                reason="Deterministic git add + commit requested by the user.",
+            )
+        )
+    if not approved:
+        console.print("[yellow]Commit cancelled - nothing was staged or committed.[/yellow]")
+        _log_assistant_message(session_logger, "Commit cancelled by user.", workflow_id="git-commit")
+        return
+
+    trace("tool=git_add_all args={}")
+    add_result = registry.execute("git_add_all", {})
+    trace(f'tool=git_commit args={{"message": "{message}"}}')
+    commit_result = registry.execute("git_commit", {"message": message})
+
+    lines = [_format_git_read_result("git_status", status)]
+    if not add_result.ok:
+        lines.append(f"git add failed: {add_result.message}")
+    if commit_result.ok:
+        lines.append(f"Committed with message: {message}")
+        commit_out = commit_result.data.get("stdout", "") if isinstance(commit_result.data, dict) else ""
+        if commit_out:
+            lines.append(commit_out.strip())
+    else:
+        lines.append(f"git commit failed: {commit_result.message}")
+    body = "\n\n".join(section for section in lines if section).strip()
+    console.print(Panel(body, title="Git Commit"))
+    _log_assistant_message(session_logger, body, workflow_id="git-commit")
+
+
 async def _handle_git_request(
     user_input: str,
     workspace: Path,
@@ -3813,6 +4113,12 @@ async def _handle_git_request(
     if not mutation and read_only:
         trace("selected_workflow=git_read_only")
         _run_git_read_only(user_input, workspace, console, session_logger, trace)
+        return
+
+    # A plain "add and commit" is deterministic: never hand it to the LLM loop.
+    if mutation and _looks_like_git_add_commit_request(user_input):
+        trace("selected_workflow=git_add_commit")
+        _run_git_add_commit(user_input, workspace, console, session_logger, trace)
         return
 
     trace("selected_workflow=agent_tools")
@@ -4281,6 +4587,106 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     if _FILELIKE_RE.search(user_input):
         return True
     return bool(words & _FILE_HINT_WORDS)
+
+
+# Self-contained "write me some code" asks that need no workspace context.
+# These must answer directly from the model (fast) instead of entering the
+# planner + tool loop, which used to only produce a plan and then time out on a
+# trivial "print the first 100 primes" request.
+_DIRECT_CODE_NOUNS = (
+    "code", "function", "snippet", "script", "program", "programme", "regex",
+    "one-liner", "oneliner", "algorithm", "class", "method", "loop",
+)
+_DIRECT_CODE_PRODUCE_VERBS = (
+    "write", "give me", "show me", "generate", "create", "print", "implement",
+    "make", "provide", "produce", "code for", "how do i write", "how to write",
+)
+# Signals the ask is actually about the workspace/files, so it must NOT be a
+# direct answer (it needs the tool loop instead).
+_DIRECT_CODE_WORKSPACE_SIGNALS = (
+    "save", "to a file", "into a file", "in a file", "create a file", "write a file",
+    "in the workspace", "in my workspace", "in this project", "in the project",
+    "to the repo", "add to", "run it", "run this", "run the", "execute",
+    "test it", "edit ", " open ", "commit", "existing", "this file", "that file",
+)
+
+
+def _looks_like_direct_code_request(user_input: str) -> bool:
+    """A self-contained coding question ("write python to print the first 100
+    primes") that should be answered directly by the model, without the planner
+    or the file/tool loop. File-writing and workspace requests are excluded."""
+    text = user_input.strip().lower()
+    if not text:
+        return False
+    # Explicit file writes / workspace ops are handled by the tool loop.
+    if _looks_like_file_write_request(user_input):
+        return False
+    if _FILELIKE_RE.search(user_input):
+        return False
+    if any(signal in text for signal in _DIRECT_CODE_WORKSPACE_SIGNALS):
+        return False
+    produce = any(verb in text for verb in _DIRECT_CODE_PRODUCE_VERBS)
+    code_noun = any(noun in text for noun in _DIRECT_CODE_NOUNS)
+    return produce and code_noun
+
+
+async def _run_direct_code_answer(
+    user_input: str,
+    console: Console,
+    llm: LLMManager,
+    session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
+) -> None:
+    """Answer a self-contained coding question in one model call - no planner,
+    no tool loop. Streams when the manager supports it so the code appears
+    immediately instead of after a full agent run."""
+    pack = ContextPack(
+        task_id="direct-code",
+        step_id=1,
+        specialist="qa",
+        user_request=user_input,
+        prd_context=(
+            "The user asked a self-contained coding question that needs no access to their "
+            "workspace or files. Answer directly: provide a complete, correct, runnable code "
+            "solution in a single fenced code block, with a one or two sentence explanation. "
+            "Do not claim to have created, saved, or run any files - just return the code. "
+            + NO_LIVE_TOOLS_NOTICE
+        ),
+    )
+    if hasattr(llm, "run_specialist_stream"):
+        try:
+            streamed, _text = await _stream_answer(
+                console, llm, pack, "Code", session_logger, "direct-code", thinking_status
+            )
+        except Exception:
+            streamed = False
+        if streamed:
+            return
+    response = await llm.run_specialist("qa", pack)
+    body = response.raw.strip() or "No response returned."
+    title = f"Code ({response.model_used})" if response.model_used else "Code"
+    console.print(Panel(body, title=title))
+    _log_assistant_message(session_logger, body, workflow_id="direct-code")
+
+
+def _audit_simple_turn(
+    workspace: Path,
+    session_logger: SessionLogger | None,
+    route: str,
+    prompt: str,
+    final: str,
+) -> None:
+    """Record a non-tool-loop turn (direct code, git read, etc.) in the detailed
+    audit trail so `.shamsu/audit` has an entry for every prompt, not just agent
+    runs. Best-effort: never let auditing break a response."""
+    try:
+        session_id = session_logger.session_id if session_logger is not None else None
+        audit = SessionAuditLog(workspace, session_id)
+        audit.log_prompt(prompt)
+        audit.log_route(route, workflow=route)
+        audit.log_final(final)
+    except Exception:
+        pass
 
 
 def _looks_like_run_game_request(user_input: str) -> bool:
@@ -4969,6 +5375,135 @@ async def _verify_and_repair_frontend(
     return False
 
 
+# File extensions that mean "this workspace already has an app" - so a greenfield
+# PRD build should EXTEND, not scaffold from scratch.
+_APP_SOURCE_EXTENSIONS = {
+    ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".py", ".vue", ".svelte", ".go", ".rs", ".rb", ".php", ".java",
+}
+_SCAFFOLD_IGNORED_DIRS = {".git", ".shamsu", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+_SCAFFOLD_IGNORED_FILES = {".gitignore", "readme.md", "readme", "license", "license.md", "license.txt"}
+
+
+def _looks_like_frontend_build_request(user_input: str) -> bool:
+    """True when the user explicitly asks to build with HTML/CSS/JS."""
+    low = user_input.lower()
+    return "html" in low and ("css" in low or "javascript" in low or " js" in low or "/js" in low)
+
+
+def _workspace_has_app_files(workspace: Path) -> bool:
+    """True if the workspace already contains real source files (so we should
+    extend, not scaffold). PRDs, .gitignore, README/LICENSE and tooling dirs do
+    not count."""
+    for path in workspace.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            parts = path.relative_to(workspace).parts
+        except ValueError:
+            continue
+        if any(part in _SCAFFOLD_IGNORED_DIRS for part in parts):
+            continue
+        if is_prd_filename(path.name) or path.name.lower() in _SCAFFOLD_IGNORED_FILES:
+            continue
+        if path.suffix.lower() in _APP_SOURCE_EXTENSIONS:
+            return True
+    return False
+
+
+def _starter_index_html(title: str) -> str:
+    safe = title.strip() or "App"
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '  <meta charset="UTF-8" />\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
+        f"  <title>{safe}</title>\n"
+        '  <link rel="stylesheet" href="style.css" />\n'
+        "</head>\n"
+        "<body>\n"
+        f"  <main id=\"app\">\n    <h1>{safe}</h1>\n  </main>\n"
+        '  <script src="script.js"></script>\n'
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def _starter_style_css() -> str:
+    return (
+        ":root { color-scheme: light dark; }\n"
+        "* { box-sizing: border-box; }\n"
+        "body { margin: 0; font-family: system-ui, sans-serif; }\n"
+        "#app { max-width: 720px; margin: 2rem auto; padding: 0 1rem; }\n"
+    )
+
+
+def _starter_script_js(title: str) -> str:
+    safe = title.strip() or "App"
+    return (
+        f"// {safe} - entry point\n"
+        '"use strict";\n\n'
+        "document.addEventListener(\"DOMContentLoaded\", () => {\n"
+        "  // App logic goes here.\n"
+        "});\n"
+    )
+
+
+def _scaffold_frontend_from_prd(
+    parsed,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> list[str]:
+    """Deterministically create the index.html/style.css/script.js a greenfield
+    "build with HTML/CSS/JS" PRD needs, so the agent EXTENDS real files instead
+    of trying to read a missing index.html first. Existing files are left alone."""
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console, lambda _request: True),
+        action_ledger=get_current_run(),
+    )
+    title = getattr(parsed, "title", "") or "App"
+    files = {
+        "index.html": _starter_index_html(title),
+        "style.css": _starter_style_css(),
+        "script.js": _starter_script_js(title),
+    }
+    created: list[str] = []
+    for name, content in files.items():
+        if (workspace / name).exists():
+            continue
+        result = registry.execute("write_file", {"filepath": name, "content": content})
+        if result.ok:
+            created.append(name)
+    if created:
+        console.print(
+            Panel("Created starter files: " + ", ".join(created), title="Frontend Scaffold")
+        )
+        _log_event(
+            session_logger,
+            "prd.build.scaffold",
+            {"created": created},
+            "Scaffolded greenfield frontend files",
+            workflow_id="prd-build",
+        )
+    return created
+
+
+def _build_frontend_fill_request(parsed, relative_path: Path) -> str:
+    return (
+        f"{PRD_BUILD_FRAMING}\n\n"
+        "The workspace now contains starter index.html, style.css, and script.js. "
+        "Implement the product described by the PRD by reading and EXTENDING those three "
+        "files - do not assume any other files exist, and do not create a backend. "
+        "index.html must link style.css and load script.js; keep all logic in script.js.\n\n"
+        f"=== PRD: {relative_path.as_posix()} ===\n"
+        f"{parsed.raw_text or _render_sections(parsed)}"
+    )
+
+
 async def _handle_prd_build_request(
     user_input: str,
     workspace: Path,
@@ -5003,6 +5538,27 @@ async def _handle_prd_build_request(
         relative_path = prd_path
 
     _ensure_git_repo(workspace, console, session_logger)
+
+    # Greenfield static frontend: the user asked to build with HTML/CSS/JS (or
+    # the PRD explicitly says static frontend) and the workspace has no app
+    # files yet. Create the three files deterministically FIRST so the agent
+    # extends real files instead of trying to read a missing index.html.
+    if (
+        _looks_like_frontend_build_request(user_input) or is_static_frontend_prd(parsed)
+    ) and not _workspace_has_app_files(workspace):
+        _scaffold_frontend_from_prd(parsed, workspace, console, session_logger=session_logger)
+        console.print(
+            "[green]Starter files created. Implementing the PRD on top of them now.[/green]"
+        )
+        await _run_agent_chat(
+            _build_frontend_fill_request(parsed, relative_path),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+        return
 
     project = build_project_spec(parsed)
     if project.category == Category.MULTIPLAYER_GAME.value:
@@ -5389,6 +5945,16 @@ async def _run_agent_chat(
         chat_kwargs["on_trace"] = _make_trace_emitter(console, workspace, session_logger)
     if _call_accepts_keyword(AgentChatLoop, "budget_manager"):
         chat_kwargs["budget_manager"] = _get_budget_manager(workspace, console)
+    if _call_accepts_keyword(AgentChatLoop, "audit"):
+        session_id = session_logger.session_id if session_logger is not None else None
+        audit = SessionAuditLog(workspace, session_id)
+        audit.log_route(
+            "agent-chat",
+            workflow="agent-chat",
+            model=model_for_role("qa"),
+            tier=str(getattr(active_tier(), "value", active_tier())),
+        )
+        chat_kwargs["audit"] = audit
     result = await AgentChatLoop(workspace, **chat_kwargs).run(user_input)
     body = result.final.strip() or "No response returned."
     if getattr(result, "awaiting_user", False):
@@ -6430,6 +6996,12 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("trace"):
             _handle_trace(normalized_input, workspace, console)
+            continue
+        if lowered_input == "debug" or lowered_input.startswith("debug "):
+            _handle_debug(normalized_input, workspace, console)
+            continue
+        if lowered_input == "audit-log" or lowered_input.startswith("audit-log "):
+            _handle_audit_log(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("diagnostics"):
             _handle_diagnostics(normalized_input, workspace, console)
