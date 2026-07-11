@@ -53,16 +53,18 @@ class FakeGraphitiAdapter:
         return {"ok": True, "forgot": memory_id_or_query}
 
 
-def test_startup_blocks_normal_agent_mode_when_graphiti_unavailable(tmp_path):
+def test_agent_mode_proceeds_degraded_when_graphiti_unavailable(tmp_path):
+    """A workspace with no Graphiti (fresh checkout, PRD-build target, ...) must
+    NOT be bricked: the orchestrator runs in degraded mode on the local SQLite
+    fallback instead of hard-blocking behind '/memory setup'."""
     memory = MemoryService(tmp_path, adapter=FakeGraphitiAdapter(available=False))
     abstract = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=True))
 
     result = AgentOrchestrator(tmp_path, abstract_service=abstract, memory_service=memory).run("explain auth")
 
-    assert result.handled is True
-    assert result.action == "memory.blocked"
-    assert "Graphiti memory backend is required" in result.message
-    assert "/memory setup" in result.message
+    # Proceeds to normal routing (not handled by a memory block).
+    assert result.handled is False
+    assert result.action != "memory.blocked"
 
 
 def test_startup_enters_normal_mode_when_graphiti_healthy(tmp_path):
@@ -184,6 +186,44 @@ def test_ensure_local_backend_noop_when_already_reachable(tmp_path):
 
     assert result == {"ok": True, "message": "FalkorDB backend already reachable."}
     which.assert_not_called()
+
+
+def test_check_llm_endpoint_reports_unreachable_ollama(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+
+    with patch("shamsu.memory.graphiti_adapter.socket.create_connection", side_effect=OSError("refused")):
+        message = adapter._check_llm_endpoint("http://localhost:11434/v1")
+
+    assert "Ollama" in message
+    assert "not reachable" in message
+
+
+def test_check_llm_endpoint_ok_when_reachable(tmp_path):
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+
+    with patch("shamsu.memory.graphiti_adapter.socket.create_connection"):
+        message = adapter._check_llm_endpoint("http://localhost:11434/v1")
+
+    assert message == ""
+
+
+def test_healthcheck_fails_when_llm_endpoint_unreachable(tmp_path):
+    """Regression test: a reachable FalkorDB used to be enough for `healthcheck()`
+    to report Graphiti as ready even when Ollama (the actual LLM/embedding
+    backend behind every read and write) was down. `healthcheck()` must
+    consult `_check_llm_endpoint` and fail when it does."""
+    adapter = GraphitiAdapter(tool_dir=tmp_path / "tools" / "graphiti")
+    adapter._write_config(tmp_path, adapter.default_config(tmp_path))
+
+    with patch.object(GraphitiAdapter, "resolve_python", return_value=Path("fake-python")), patch.object(
+        GraphitiAdapter, "_graphiti_version", return_value="0.29.2"
+    ), patch.object(GraphitiAdapter, "_check_backend", return_value=""), patch.object(
+        GraphitiAdapter, "_check_llm_endpoint", return_value="Ollama unreachable"
+    ):
+        health = adapter.healthcheck(tmp_path)
+
+    assert health.ok is False
+    assert health.message == "Ollama unreachable"
 
 
 def test_start_local_falkordb_reports_missing_docker_and_winget(tmp_path):

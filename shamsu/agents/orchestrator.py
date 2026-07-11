@@ -109,7 +109,14 @@ class AgentOrchestrator:
                 effective_input=effective_input,
                 action="web.needs_location",
             )
-        memory_gate = self.memory_service.ensure_ready()
+        # Degraded, not hard-blocking: a workspace that has never run
+        # `/memory setup` (a fresh checkout, a PRD-build target directory, ...)
+        # must still be able to edit code and answer questions. When Graphiti
+        # is unavailable, MemoryService transparently falls back to the local
+        # SQLite store, so agent work proceeds instead of bricking the whole
+        # session behind a "run /memory setup" wall. Only a hard rejection
+        # (e.g. a rejected non-local URI) still blocks.
+        memory_gate = self.memory_service.ensure_ready_degraded()
         ledger = get_current_run()
         if ledger:
             ledger.log_memory_status_checked(memory_gate.allowed, memory_gate.reason or "")

@@ -2,9 +2,63 @@
 from __future__ import annotations
 
 import difflib
+import re
 from pathlib import Path
 
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine
+from shamsu.types import SearchResult
+
+# Filename-ish token: has an extension of 1-6 word chars. Used to spot files a
+# user named in free text ("fix multiply in calc.py") so we can ground on them.
+_FILE_TOKEN_RE = re.compile(r"[\w./\\-]+\.\w{1,6}")
+
+
+def mentioned_workspace_files(workspace_root: Path, text: str, limit: int = 5) -> list[str]:
+    """Return workspace-relative paths for files explicitly named in *text* that
+    actually exist in the workspace. Grounds edits on the file the user pointed
+    at even when there's no traceback and the code search misses it - the exact
+    'fix X in calc.py' case a local model otherwise hallucinates. Uses the
+    ignore-aware FileWalker for basename matches so it never walks node_modules
+    or .git."""
+    workspace_root = Path(workspace_root).resolve()
+    tokens = [
+        t.strip().replace("\\", "/").strip("/") for t in _FILE_TOKEN_RE.findall(text or "")
+    ]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return []
+    found: list[str] = []
+    walker_files: list[Path] | None = None
+    for token in tokens:
+        # 1) Direct path relative to the workspace root.
+        candidate = (workspace_root / token).resolve()
+        rel: str | None = None
+        try:
+            if candidate.is_file():
+                rel = candidate.relative_to(workspace_root).as_posix()
+        except (OSError, ValueError):
+            rel = None
+        # 2) Basename match via the ignore-aware walker (lazily; only if needed).
+        if rel is None:
+            base = token.rsplit("/", 1)[-1].lower()
+            if walker_files is None:
+                from shamsu.indexer.walker import FileWalker
+                try:
+                    walker_files = FileWalker(workspace_root).discover()
+                except Exception:
+                    walker_files = []
+            for match in walker_files:
+                if match.name.lower() == base:
+                    try:
+                        rel = match.relative_to(workspace_root).as_posix()
+                    except ValueError:
+                        continue
+                    break
+        if rel and rel not in found:
+            found.append(rel)
+        if len(found) >= limit:
+            break
+    return found
 
 FULL_REWRITE_INSTRUCTIONS = (
     "Your previous unified diff could not be applied because of a formatting error. "
@@ -13,6 +67,45 @@ FULL_REWRITE_INSTRUCTIONS = (
     "code fences, no explanation, no diff markers (no ---, +++, @@, leading +/-). "
     "Output only the raw file content."
 )
+
+# Cap per-file grounding so a huge file doesn't blow the prompt budget; above
+# this the search snippets still cover the relevant regions and the model works
+# from those. ~24k chars ~= 6k tokens, comfortably inside an 8B ctx window.
+MAX_GROUNDING_BYTES = 24_000
+
+
+def full_file_results(workspace_root: Path, paths: list[str]) -> list[SearchResult]:
+    """Read the real, current content of the target files as high-priority
+    SearchResults so the model edits against ground truth instead of guessing
+    from partial/stale index snippets. This is what stops a local model from
+    inventing lines (e.g. an @@ header past EOF) that were never in the file.
+    Files above MAX_GROUNDING_BYTES are skipped (snippets still apply)."""
+    workspace_root = Path(workspace_root).resolve()
+    seen: set[str] = set()
+    results: list[SearchResult] = []
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        target = (workspace_root / path).resolve()
+        try:
+            target.relative_to(workspace_root)
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        if len(content.encode("utf-8")) > MAX_GROUNDING_BYTES:
+            continue
+        results.append(
+            SearchResult(
+                file_path=path,
+                language=target.suffix.lstrip(".") or "text",
+                line_start=1,
+                line_end=max(1, len(content.splitlines())),
+                content=content,
+                score=20.0,   # outranks search snippets so it leads the pack
+            )
+        )
+    return results
 
 
 def lenient_diff_target_paths(diff_text: str) -> list[str]:

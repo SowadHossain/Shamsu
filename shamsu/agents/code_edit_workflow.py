@@ -8,7 +8,12 @@ from pathlib import Path
 
 from shamsu.abstract.context import build_codebase_memory_brief
 from shamsu.agents.planner import create_plan
-from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
+from shamsu.agents.rewrite_fallback import (
+    full_file_results,
+    lenient_diff_target_paths,
+    mentioned_workspace_files,
+    rewrite_files_fully,
+)
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -113,6 +118,16 @@ class CodeEditWorkflow:
     async def _build_pack(self, request: str) -> tuple[ContextPack, list[str], str]:
         results = self.search.search(request, top_k=8)
         target_paths = _target_paths(results)
+        # Ground the model in the REAL current content of the files it's about
+        # to edit (not just index snippets), so it can't invent lines that
+        # aren't there. Include files the user named explicitly ("edit calc.py")
+        # even when search misses them. Full files lead; ContextBuilder dedupes
+        # the overlapping snippets. First-attempt version of what the repair
+        # path already did only after a failure.
+        grounding_paths = _dedupe_strings(
+            mentioned_workspace_files(self.workspace_root, request) + target_paths
+        )
+        results = full_file_results(self.workspace_root, grounding_paths) + results
         memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
         graphiti_brief = self.memory_service.render_relevant(request)
         plan = await create_plan(self.llm, self.context_builder, results, goal=request, task_id="code-edit-plan")
@@ -156,3 +171,13 @@ def _target_paths(results: list[SearchResult]) -> list[str]:
         if result.file_path not in paths:
             paths.append(result.file_path)
     return paths
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out

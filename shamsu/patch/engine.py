@@ -551,8 +551,6 @@ def _parse_hunk(lines: list[str], start_index: int) -> tuple[HunkPatch, int]:
     if not match:
         raise DiffValidationError(f"Malformed hunk header: {header}")
 
-    old_count = _count_from_header(match.group("old_count"))
-    new_count = _count_from_header(match.group("new_count"))
     old_seen = 0
     new_seen = 0
     additions = 0
@@ -584,18 +582,19 @@ def _parse_hunk(lines: list[str], start_index: int) -> tuple[HunkPatch, int]:
         hunk_lines.append(line)
         index += 1
 
-    if old_seen != old_count or new_seen != new_count:
-        raise DiffValidationError(
-            f"Hunk line count mismatch: expected -{old_count}/+{new_count}, "
-            f"got -{old_seen}/+{new_seen}."
-        )
-
+    # Trust the body, not the @@ header counts. Local models routinely emit a
+    # wrong line count (e.g. "@@ -3,7 +3,7 @@" for a one-line change), and
+    # rejecting on that threw away otherwise-correct patches - it was a leading
+    # cause of the "invalid diff / diff not match" failures. Recompute the
+    # counts from the lines actually present (what `git apply --recount` does)
+    # and keep only the declared start positions, which _apply_hunks anyway
+    # re-locates by context.
     return (
         HunkPatch(
             old_start=int(match.group("old_start")),
-            old_count=old_count,
+            old_count=old_seen,
             new_start=int(match.group("new_start")),
-            new_count=new_count,
+            new_count=new_seen,
             lines=hunk_lines,
         ),
         index,
@@ -650,22 +649,31 @@ def _apply_hunks(original_lines: list[str], hunks: list[HunkPatch]) -> list[str]
     output: list[str] = []
     cursor = 0
     for hunk in hunks:
-        hunk_start = max(hunk.old_start - 1, 0)
-        if hunk_start < cursor or hunk_start > len(original_lines):
-            raise DiffValidationError("Hunk location is outside target file.")
-        output.extend(original_lines[cursor:hunk_start])
-        cursor = hunk_start
+        # The "old side" of the hunk: context and deleted lines, in order. This
+        # is what must be found in the file - the +lines are new and aren't
+        # matched against anything.
+        old_block = [
+            line[1:] if line and line[0] in {" ", "-"} else ""
+            for line in hunk.lines
+            if not line.startswith("\\") and (line == "" or line[0] in {" ", "-"})
+        ]
+        start = _locate_hunk(original_lines, old_block, hunk.old_start - 1, cursor)
+        if start is None:
+            raise DiffValidationError("Patch context does not match target file.")
+        output.extend(original_lines[cursor:start])
+        cursor = start
         for line in hunk.lines:
             if line.startswith("\\"):
                 continue
             marker = " " if line == "" else line[0]
             content = "" if line == "" else line[1:]
             if marker == " ":
-                _assert_source_line(original_lines, cursor, content)
-                output.append(content)
+                # Emit the file's own line, not the diff's copy of it, so a
+                # context line that differed only in trailing whitespace keeps
+                # the real bytes instead of being rewritten by the patch.
+                output.append(original_lines[cursor] if cursor < len(original_lines) else content)
                 cursor += 1
             elif marker == "-":
-                _assert_source_line(original_lines, cursor, content)
                 cursor += 1
             elif marker == "+":
                 output.append(content)
@@ -675,9 +683,35 @@ def _apply_hunks(original_lines: list[str], hunks: list[HunkPatch]) -> list[str]
     return output
 
 
-def _assert_source_line(lines: list[str], index: int, expected: str) -> None:
-    if index >= len(lines) or lines[index] != expected:
-        raise DiffValidationError("Patch context does not match target file.")
+def _locate_hunk(
+    original_lines: list[str], old_block: list[str], hint: int, min_start: int
+) -> int | None:
+    """Find where a hunk's old side sits in the file.
+
+    LLM-produced diffs routinely carry wrong ``@@`` line numbers and slight
+    trailing-whitespace drift on context lines, which made a strict
+    anchor-at-old_start applier reject otherwise-correct patches. Instead we
+    search the file (at or after ``min_start`` so hunks stay ordered) for the
+    block, comparing on ``rstrip()`` so trailing-whitespace/line-ending drift
+    is tolerated, and pick the occurrence closest to the declared position.
+    Leading indentation is still matched exactly, so a patch is never applied
+    at a location whose code merely looks similar. Returns None when there is
+    no match, which makes the caller reject the patch (and roll back)."""
+    span = len(old_block)
+    anchor = max(hint, min_start)
+    if span == 0:
+        # Pure insertion: nothing to match, anchor at the declared position
+        # (clamped into the still-unconsumed region of the file).
+        return min(max(anchor, min_start), len(original_lines))
+    target = [line.rstrip() for line in old_block]
+    candidates = [
+        start
+        for start in range(min_start, len(original_lines) - span + 1)
+        if [line.rstrip() for line in original_lines[start:start + span]] == target
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda start: abs(start - anchor))
 
 
 def _backup_file(target: Path, backups: dict[Path, Path]) -> None:

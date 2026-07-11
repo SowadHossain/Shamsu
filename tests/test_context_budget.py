@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
+import pytest
+
 from shamsu.context import budget
 from shamsu.context.budget import (
     MODEL_CONTEXT_WINDOWS,
@@ -23,6 +25,7 @@ from shamsu.types import ContextPack, SearchResult
 # ─── Existing tokenizer tests ────────────────────────────────────────────────
 
 def test_count_tokens_uses_vendored_tokenizer_when_available():
+    pytest.importorskip("tokenizers")
     budget._load_tokenizer.cache_clear()
 
     text = "def add(a,b): return a+b"
@@ -49,6 +52,7 @@ def test_tokenizer_asset_is_vendored_under_context_assets():
 # ─── Context window constants ─────────────────────────────────────────────────
 
 def test_known_model_returns_correct_window():
+    assert ctx_window_for_model("deepseek-r1:7b") == 32_768
     assert ctx_window_for_model("qwen2.5-coder:7b-instruct") == 32_768
     assert ctx_window_for_model("mistral-nemo:12b") == 131_072
 
@@ -60,7 +64,7 @@ def test_unknown_model_returns_safe_fallback():
 
 def test_planner_and_coder_can_have_different_windows():
     # planner uses a thinking model; coder uses a coding model
-    planner_model = "qwen3:8b"
+    planner_model = "deepseek-r1:7b"
     coder_model = "qwen2.5-coder:14b"
     assert planner_model in MODEL_CONTEXT_WINDOWS
     assert coder_model in MODEL_CONTEXT_WINDOWS

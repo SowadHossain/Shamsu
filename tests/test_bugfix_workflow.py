@@ -92,7 +92,9 @@ def test_bugfix_repair_loop_reuses_the_plan_without_a_second_planner_call(tmp_pa
     assert "Fix app.py line 1." in repair_pack.user_request
 
 
-def test_bugfix_falls_back_to_full_rewrite_when_light_model_diff_has_bad_hunk_counts(tmp_path):
+def test_bugfix_applies_diff_with_bad_hunk_counts_without_full_rewrite(tmp_path):
+    """A light model's wrong @@ counts now recount-and-apply directly, so the
+    fix lands on the first diff instead of burning retries + a full rewrite."""
     (tmp_path / "app.py").write_text("bug = 1\n", encoding="utf-8")
     bad_diff = (
         "--- a/app.py\n"
@@ -103,12 +105,12 @@ def test_bugfix_falls_back_to_full_rewrite_when_light_model_diff_has_bad_hunk_co
     )
     llm = _FakeLLM(
         plan_text="Fix app.py line 1.",
-        bugfix_responses=[bad_diff, bad_diff, bad_diff, "bug = 2\n"],
+        bugfix_responses=[bad_diff],
     )
 
     result = asyncio.run(_workflow(tmp_path, llm, search=_EmptySearch()).run("AssertionError: bug should be 2"))
 
     assert result.applied is True
-    assert result.used_full_rewrite is True
+    assert result.used_full_rewrite is False   # applied straight from the diff now
     assert result.changed_files == ["app.py"]
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "bug = 2\n"

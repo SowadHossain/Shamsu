@@ -118,8 +118,9 @@ class MemoryService:
         configured but the backend isn't running yet. Returns None (no-op) when
         memory has not been set up, so we never auto-provision for users who
         haven't run `/memory setup`. Best-effort and idempotent — safe to call
-        on every session start; the last session to exit stops the container via
-        `stop_local_falkordb` in the shutdown path."""
+        on every session start. SHAMSU never auto-stops this container on its
+        own (see `shamsu.runtime.ollama.shutdown_if_last_session`) - once
+        started it stays running until stopped manually via `docker stop`."""
         if not self.adapter.config_path(self.workspace).exists():
             return None
         result = self.adapter.ensure_backend_running(self.workspace)

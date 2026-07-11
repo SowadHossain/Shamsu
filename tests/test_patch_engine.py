@@ -73,19 +73,25 @@ def test_malformed_hunk_header_fails(tmp_path):
     assert "Malformed hunk header" in error
 
 
-def test_hunk_line_count_mismatch_fails(tmp_path):
+def test_hunk_count_mismatch_is_recounted_not_rejected(tmp_path):
+    """A wrong @@ line count (declared 1,2/1,2 for a one-line change) is a
+    routine local-model mistake - it must be recounted from the body and
+    applied, not rejected. Regression guard for the 'invalid diff' failures."""
+    target = tmp_path / "app" / "models.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("old\n", encoding="utf-8")
     diff = """--- a/app/models.py
 +++ b/app/models.py
 @@ -1,2 +1,2 @@
 -old
 +new
 """
-    engine = PatchEngine(tmp_path)
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
 
     ok, error = engine.validate_diff(diff)
-
-    assert ok is False
-    assert "line count mismatch" in error
+    assert ok is True, error
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8") == "new\n"
 
 
 def test_path_escape_fails(tmp_path):
@@ -191,6 +197,44 @@ def test_apply_modifies_file_and_creates_backup_after_approval(tmp_path):
     assert engine.apply(diff, tmp_path) is True
     assert target.read_text(encoding="utf-8") == "value = 2\n"
     assert (tmp_path / "app.py.bak").read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_apply_tolerates_wrong_hunk_line_numbers(tmp_path):
+    """Regression: a diff whose @@ header points at the wrong line (very common
+    from local models) must still apply by locating the context, not reject."""
+    target = tmp_path / "app.py"
+    target.write_text("import os\n\n\ndef foo():\n    return 1\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -99,2 +99,2 @@
+ def foo():
+-    return 1
++    return 42
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8") == "import os\n\n\ndef foo():\n    return 42\n"
+
+
+def test_apply_tolerates_trailing_whitespace_in_context(tmp_path):
+    """Regression: trailing-whitespace drift on a context line must not reject
+    the patch, and the file's real bytes on untouched lines are preserved."""
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    x = 1   \n    return x\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1,3 +1,3 @@
+ def foo():
+     x = 1
+-    return x
++    return x + 1
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    # The untouched 'x = 1' line keeps its original trailing spaces.
+    assert target.read_text(encoding="utf-8") == "def foo():\n    x = 1   \n    return x + 1\n"
 
 
 def test_rollback_restores_backup(tmp_path):

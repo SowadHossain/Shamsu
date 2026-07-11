@@ -39,7 +39,7 @@ def test_llm_manager_rejects_remote_urls():
 def test_model_defaults_are_shared_by_runtime_and_llm_manager():
     required = required_model_names()
 
-    assert required == ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
+    assert required == ["deepseek-r1:7b", "qwen2.5-coder:7b-instruct"]
     assert SPECIALIST_MODELS["router"] in required
     assert SPECIALIST_MODELS["coder"] in required
     assert SPECIALIST_MODELS["bugfix"] in required
@@ -48,12 +48,14 @@ def test_model_defaults_are_shared_by_runtime_and_llm_manager():
     assert SPECIALIST_MODELS["reviewer"] == SPECIALIST_MODELS["router"]
 
 
-def test_single_model_mode_routes_all_roles_to_qwen3(monkeypatch):
+def test_single_model_mode_routes_all_roles_to_thinking_anchor(monkeypatch):
     monkeypatch.setenv("SHAMSU_SINGLE_MODEL_MODE", "1")
 
-    assert required_model_names() == ["qwen3:8b"]
-    assert model_for_role("coder") == "qwen3:8b"
-    assert model_for_role("bugfix") == "qwen3:8b"
+    # Single-model mode collapses every role onto the tier's thinking anchor,
+    # which is DeepSeek R1 Distill Qwen 7B on the default tier.
+    assert required_model_names() == ["deepseek-r1:7b"]
+    assert model_for_role("coder") == "deepseek-r1:7b"
+    assert model_for_role("bugfix") == "deepseek-r1:7b"
 
 
 def test_model_cookbook_allows_anchor_models_across_all_tiers():
@@ -62,12 +64,15 @@ def test_model_cookbook_allows_anchor_models_across_all_tiers():
     # tier never gets an "off-cookbook" false alarm for a model it legitimately
     # pulled under a different tier.
     allowed = allowed_model_names()
+    assert "deepseek-r1:7b" in allowed
     assert "qwen3:8b" in allowed
+    assert "gemma3:4b" in allowed
     assert "qwen2.5-coder:7b-instruct" in allowed
     assert "qwen2.5:3b-instruct" in allowed
     assert "qwen2.5-coder:3b-instruct" in allowed
     assert "mistral-nemo:12b" in allowed
     assert "qwen2.5-coder:14b" in allowed
+    assert is_allowed_model("deepseek-r1:7b") is True
     assert is_allowed_model("qwen3:8b") is True
     assert is_allowed_model("mistral:7b-instruct-q4_K_M") is False
 

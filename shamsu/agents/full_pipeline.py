@@ -25,7 +25,7 @@ from shamsu.prd.project import build_project_spec
 from shamsu.registry import load_registry_entry
 from shamsu.registry.scaffold import scaffold_template
 from shamsu.registry.schema import Category
-from shamsu.registry.suitability import GenerationStrategy
+from shamsu.registry.suitability import GenerationStrategy, templates_enabled
 from shamsu.repair.loop import RepairLoop
 from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.verifiers import DjangoTestVerifier
@@ -116,6 +116,10 @@ class FullDjangoPipeline:
                 # No template fits: build it from the PRD. With no model wired we
                 # fall through to the deterministic writer (keeps old behavior).
                 return await self._run_freeform_strategy(validated_prd, validated_target, project)
+            if strategy is GenerationStrategy.FREEFORM and not templates_enabled():
+                # Templates are disabled and no generator is wired: report that
+                # honestly rather than silently copying/writing a template.
+                return self._templates_disabled_result(validated_prd, validated_target, project)
 
             writer = DjangoProjectWriter(
                 self.workspace_root,
@@ -210,6 +214,15 @@ class FullDjangoPipeline:
         return path
 
     def _strategy(self, project: ProjectSpec) -> GenerationStrategy:
+        strategy = self._raw_strategy(project)
+        # Templates disabled: build scaffold-eligible projects (games, etc.) from
+        # the PRD via the freeform generator instead of copying boilerplate. The
+        # deterministic Django writer (DJANGO strategy) is intentionally kept.
+        if strategy is GenerationStrategy.SCAFFOLD and not templates_enabled():
+            return GenerationStrategy.FREEFORM
+        return strategy
+
+    def _raw_strategy(self, project: ProjectSpec) -> GenerationStrategy:
         suitability = getattr(project, "suitability", None)
         if suitability is not None:
             return suitability.strategy
@@ -218,6 +231,30 @@ class FullDjangoPipeline:
         if project.category == Category.MULTIPLAYER_GAME.value:
             return GenerationStrategy.SCAFFOLD
         return GenerationStrategy.DJANGO
+
+    def _templates_disabled_result(
+        self, prd_path: Path, target_dir: Path, project: ProjectSpec
+    ) -> FullPipelineResult:
+        """Templates are off and no code generator is wired, so there is nothing
+        to build from - never silently fall back to a template. Honest failure."""
+        error = (
+            "Templates are disabled (SHAMSU_ENABLE_TEMPLATES is not set) and no code "
+            "generator is wired, so this project cannot be built from a template. Run the "
+            "PRD build from the interactive REPL (which builds from scratch), or set "
+            "SHAMSU_ENABLE_TEMPLATES=1 to restore template scaffolding."
+        )
+        self._log(
+            "workflow.failed",
+            {"project": project.project_name, "strategy": "freeform", "reason": "templates_disabled"},
+            "Template routing disabled and no generator wired",
+        )
+        return FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=target_dir,
+            project=project,
+            success=False,
+            error=error,
+        )
 
     async def _run_scaffold_strategy(
         self,

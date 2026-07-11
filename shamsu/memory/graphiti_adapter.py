@@ -111,27 +111,6 @@ def _find_docker_executable() -> str | None:
     return None
 
 
-def stop_local_falkordb() -> bool:
-    """Best-effort ``docker stop`` of SHAMSU's FalkorDB container on the last
-    session exit. Uses ``stop`` (never ``rm``) so the graph data survives into
-    the next session, which restarts it via ``docker start`` in
-    :meth:`GraphitiAdapter._start_local_falkordb`. Never raises: a missing
-    Docker CLI, a stopped/absent container, or any failure returns ``False``.
-    Returns ``True`` only when the container was actually stopped."""
-    docker = _find_docker_executable()
-    if not docker:
-        return False
-    try:
-        result = subprocess.run(
-            [docker, "stop", FALKORDB_CONTAINER_NAME],
-            capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS,
-            creationflags=_no_window_flags(),
-        )
-        return result.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
 class GraphitiAdapter:
     def __init__(self, tool_dir: Path | None = None) -> None:
         self.tool_dir = (tool_dir or default_tool_dir()).resolve()
@@ -213,6 +192,9 @@ class GraphitiAdapter:
         backend_message = self._check_backend(config.get("graph_backend_uri", ""))
         if backend_message:
             return GraphitiHealth(False, str(python), str(config_path), version, backend_message)
+        llm_message = self._check_llm_endpoint(config.get("llm_base_url", ""))
+        if llm_message:
+            return GraphitiHealth(False, str(python), str(config_path), version, llm_message)
         return GraphitiHealth(True, str(python), str(config_path), version, "Graphiti is ready.")
 
     def _graphiti_version(self, python: Path) -> str:
@@ -241,6 +223,22 @@ class GraphitiAdapter:
                 return ""
         except OSError as exc:
             return f"Graphiti local backend is not reachable at {uri}: {exc}. Start the local Neo4j/FalkorDB backend or run /memory repair."
+
+    def _check_llm_endpoint(self, uri: str) -> str:
+        """Graphiti's actual read/write path (entity extraction, embeddings)
+        goes through this endpoint, not the graph backend — a reachable
+        FalkorDB with an unreachable Ollama is still a broken memory system,
+        so this must be checked independently rather than assumed healthy."""
+        parsed = urlparse(str(uri))
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            return f"Graphiti LLM/embedding endpoint URI is incomplete: {uri}"
+        try:
+            with socket.create_connection((host, port), timeout=1.5):
+                return ""
+        except OSError as exc:
+            return f"Graphiti's local LLM/embedding endpoint (Ollama) is not reachable at {uri}: {exc}. Start Ollama (ollama serve, or /models repair) and run /memory repair."
 
     def status(self, workspace: Path) -> dict[str, Any]:
         health = self.healthcheck(workspace)
@@ -528,19 +526,25 @@ async def main():
     embedder = OpenAIEmbedder(config=OpenAIEmbedderConfig(api_key="ollama", embedding_model=cfg["embedding_model"], embedding_dim=int(cfg.get("embedding_dim", 768)), base_url=cfg["llm_base_url"]))
     cross = OpenAIRerankerClient(client=llm_client, config=llm_config)
     uri = cfg["graph_backend_uri"]
+    group_id = cfg.get("group_id", "shamsu")
     # falkor:// is a SHAMSU-local convention, not a driver scheme Graphiti/Neo4j
     # understands; the falkordb backend needs its own FalkorDriver instance,
     # not a bare uri/user/password triple (which always builds a Neo4jDriver).
     if cfg.get("backend", "falkordb") == "falkordb":
         from graphiti_core.driver.falkordb_driver import FalkorDriver
         parsed = urlparse(uri)
-        driver = FalkorDriver(host=parsed.hostname or "localhost", port=parsed.port or 6379)
+        # database=group_id is required, not optional: FalkorDriver.execute_query()
+        # always targets self._database (defaults to "default_db") regardless of the
+        # group_ids passed to individual calls - only session()-based writes honor an
+        # explicit database. Without this, add_episode() writes land in the group_id-
+        # named graph correctly, but every search()/_search() call silently queries
+        # the unrelated, empty "default_db" graph instead and returns zero results.
+        driver = FalkorDriver(host=parsed.hostname or "localhost", port=parsed.port or 6379, database=group_id)
         graphiti = Graphiti(graph_driver=driver, llm_client=llm_client, embedder=embedder, cross_encoder=cross)
     else:
         graphiti = Graphiti(uri, "neo4j", "password", llm_client=llm_client, embedder=embedder, cross_encoder=cross)
     action = req["action"]
     payload = req["payload"]
-    group_id = cfg.get("group_id", "shamsu")
     if action in {"add_episode", "remember"}:
         text = payload["text"]
         metadata = payload.get("metadata") or {}

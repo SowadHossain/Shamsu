@@ -15,12 +15,28 @@ PRD it does not fit - which is exactly how a Pong PRD became a snake-like game.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 
 from shamsu.prd.contract import PRDContract
 from shamsu.registry.schema import Category
 from shamsu.types import Archetype
+
+# Master switch for the copy-paste template scaffolds (game-2d, the 3D
+# multiplayer monorepo). Disabled by default: SHAMSU builds every scaffold-
+# eligible project from the PRD via the freeform generator instead of copying
+# boilerplate a small model then can't reconcile (e.g. a 2D Pong request that
+# became a 39-file 3D scaffold). The deterministic Django writer is unaffected.
+# Nothing is deleted - set SHAMSU_ENABLE_TEMPLATES=1 to restore the old routing.
+_ENABLE_TEMPLATES_ENV = "SHAMSU_ENABLE_TEMPLATES"
+
+
+def templates_enabled() -> bool:
+    """True only when SHAMSU_ENABLE_TEMPLATES is explicitly truthy. Consulted at
+    the generation-strategy decision points (full_pipeline, the CLI build flow);
+    `assess()` itself stays pure so its unit tests keep exercising real fit logic."""
+    return os.environ.get(_ENABLE_TEMPLATES_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 # Simple/local 2D game types the 2D-canvas scaffold fits well.
 _SIMPLE_2D_GAMES = {

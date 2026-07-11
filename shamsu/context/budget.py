@@ -21,6 +21,8 @@ TOKENIZER_ASSET = Path(__file__).resolve().parent / "assets" / "qwen3-tokenizer.
 # These are reference caps; the actual limit per call is determined by num_ctx
 # in the generate options.  Unknown models fall back to SAFE_FALLBACK_CTX_WINDOW.
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "gemma3:4b":                 131_072,
+    "deepseek-r1:7b":             32_768,
     "qwen3:8b":                   32_768,
     "qwen2.5:3b-instruct":        32_768,
     "qwen2.5-coder:7b-instruct":  32_768,

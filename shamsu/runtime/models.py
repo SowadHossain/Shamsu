@@ -5,7 +5,7 @@ Three hardware tiers, same role contract (router/qa/planner/... -> a
 "thinking" model; coder/bugfix/tests/... -> a "coding" model):
 
   light   - 8GB RAM, no GPU. Tiny models, CPU-friendly.
-  default - the original 8GB cookbook (qwen3:8b + qwen2.5-coder:7b-instruct).
+  default - the 8GB cookbook (deepseek-r1:7b + qwen2.5-coder:7b-instruct).
   heavy   - 16GB+ RAM machines. Coder is allowed to 14B since there is no
             dedicated ~12B code model; the thinking anchor stays at 12B.
 
@@ -77,10 +77,12 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
     ),
     ModelTier.DEFAULT: (
         ModelSpec(
-            "qwen3:8b",
+            "deepseek-r1:7b",
             _THINKING_ROLES,
             max_vram_gb=8.0,
-            notes="Thinking/text anchor for routing, planning, review, docs, and chat.",
+            notes="Thinking/text anchor for routing, planning, review, docs, and chat. "
+            "Ollama tag for DeepSeek-R1-Distill-Qwen-7B; the coder anchor stays "
+            "a qwen2.5-coder.",
         ),
         ModelSpec(
             "qwen2.5-coder:7b-instruct",
@@ -115,13 +117,25 @@ DEFAULT_TIER = ModelTier.DEFAULT
 # default tier's specs.
 MODEL_SPECS: tuple[ModelSpec, ...] = TIER_MODEL_SPECS[ModelTier.DEFAULT]
 
-# Union across every tier - used for cookbook membership (is_allowed_model)
-# and for identifying "models SHAMSU itself might have pulled" regardless of
-# which tier is currently active (e.g. unload_shamsu_models after a tier
-# switch, or a workspace that tried more than one tier).
+# Recognized-but-not-anchor models: allowed (doctor won't flag them) and
+# manageable (unload_shamsu_models knows them), but never auto-pulled and not a
+# role anchor for any tier. Older default thinking anchors live here so they
+# stay first-class known models for anyone who kept them installed.
+_ALLOWED_EXTRA_SPECS: tuple[ModelSpec, ...] = (
+    ModelSpec("qwen3:8b", roles=(), required=False, max_vram_gb=8.0,
+              notes="Former default thinking anchor; kept allowed for existing installs."),
+    ModelSpec("gemma3:4b", roles=(), required=False, max_vram_gb=4.0,
+              notes="Former default thinking anchor; kept allowed for existing installs."),
+)
+
+# Union across every tier + allowed extras - used for cookbook membership
+# (is_allowed_model) and for identifying "models SHAMSU itself might have
+# pulled" regardless of which tier is currently active (e.g.
+# unload_shamsu_models after a tier switch, or a workspace that tried more than
+# one tier).
 ALL_MODEL_SPECS: tuple[ModelSpec, ...] = tuple(
     spec for specs in TIER_MODEL_SPECS.values() for spec in specs
-)
+) + _ALLOWED_EXTRA_SPECS
 MODEL_COOKBOOK: dict[str, ModelSpec] = {spec.name: spec for spec in ALL_MODEL_SPECS}
 
 TIER_FILENAME = "model_tier.json"

@@ -1045,6 +1045,16 @@ class AgentToolRegistry:
 
         count = content.count(old_string)
         if count == 0:
+            # Exact match missed - retry tolerating trailing-whitespace / line-
+            # ending drift (the most common reason a local model's edit block
+            # doesn't match byte-for-byte) before giving up. On a unique fuzzy
+            # hit, adopt the file's own text as old_string so the replacement
+            # keeps real whitespace; ambiguous/no match still fails safe below.
+            fuzzy = _fuzzy_match_block(content, old_string)
+            if fuzzy is not None and fuzzy != new_string:
+                old_string = fuzzy
+                count = content.count(old_string)
+        if count == 0:
             hint = _nearby_edit_hint(content, old_string)
             return ToolResult(
                 False,
@@ -1459,6 +1469,39 @@ def _coerce_optional_int(value: Any) -> int | None:
         return int(str(value).strip())
     except (ValueError, TypeError):
         return None
+
+
+def _fuzzy_match_block(content: str, old_string: str) -> str | None:
+    """Return the exact substring of ``content`` that matches ``old_string``
+    ignoring per-line trailing whitespace and line-ending style, but only when
+    that match is unique.
+
+    Local models routinely reproduce an edit block with the right text but
+    slightly different trailing whitespace, a stray CRLF, or a reflowed blank
+    line - which makes the exact ``content.count(old_string)`` check miss and
+    the whole edit fail. Matching on line-by-line ``rstrip()`` recovers those
+    cases while staying safe: leading indentation (tabs vs spaces, nesting
+    depth) is compared exactly, so we never silently re-indent code, and we
+    return the file's own bytes so the surviving context keeps its real
+    whitespace. Ambiguous (>1) matches return None and fall through to the
+    normal "add more context" error rather than editing the wrong place."""
+    if not old_string:
+        return None
+    file_lines = content.split("\n")
+    old_lines = old_string.split("\n")
+    span = len(old_lines)
+    if span == 0 or span > len(file_lines):
+        return None
+    target = [line.rstrip() for line in old_lines]
+    matches = [
+        start
+        for start in range(len(file_lines) - span + 1)
+        if [line.rstrip() for line in file_lines[start:start + span]] == target
+    ]
+    if len(matches) != 1:
+        return None
+    start = matches[0]
+    return "\n".join(file_lines[start:start + span])
 
 
 def _nearby_edit_hint(content: str, old_string: str) -> str:

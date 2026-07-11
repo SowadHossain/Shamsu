@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -40,6 +41,49 @@ from pathlib import Path
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _timeout_env(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "").strip())
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Timeouts are split so slow hardware isn't cut off mid-answer while a genuine
+# deadlock still fails instead of hanging forever:
+#  - connect: short, so a dead Ollama fails fast instead of burning the budget.
+#  - idle (streaming read): max SILENCE between streamed tokens. As long as the
+#    model keeps emitting tokens the call continues no matter how long the whole
+#    generation takes (slow CPU box is fine); if it goes quiet for this long we
+#    treat it as stalled/deadlocked and abort. Tunable via SHAMSU_LLM_IDLE_TIMEOUT.
+#  - total (non-streaming): a bounded overall cap for the one non-streamed path
+#    (tool calls), generous for slow HW but never "wait all day". SHAMSU_LLM_TIMEOUT.
+LLM_CONNECT_TIMEOUT_SECONDS = _timeout_env("SHAMSU_LLM_CONNECT_TIMEOUT", 15.0)
+LLM_IDLE_TIMEOUT_SECONDS = _timeout_env("SHAMSU_LLM_IDLE_TIMEOUT", 180.0)
+LLM_TOTAL_TIMEOUT_SECONDS = _timeout_env("SHAMSU_LLM_TIMEOUT", 600.0)
+
+
+def _streaming_timeout() -> httpx.Timeout:
+    """No total cap - progress (any token within the idle window) keeps it alive;
+    silence past the idle window trips ReadTimeout = stalled/deadlocked."""
+    return httpx.Timeout(
+        connect=LLM_CONNECT_TIMEOUT_SECONDS,
+        read=LLM_IDLE_TIMEOUT_SECONDS,
+        write=LLM_CONNECT_TIMEOUT_SECONDS,
+        pool=LLM_CONNECT_TIMEOUT_SECONDS,
+    )
+
+
+def _blocking_timeout() -> httpx.Timeout:
+    """Bounded overall cap for the non-streamed path, short connect to fail fast."""
+    return httpx.Timeout(LLM_TOTAL_TIMEOUT_SECONDS, connect=LLM_CONNECT_TIMEOUT_SECONDS)
+
+
+class LLMStalledError(RuntimeError):
+    """Raised when a local model produces no output for the idle window - a
+    likely deadlock/stall, surfaced clearly instead of a raw httpx timeout."""
 
 # Model assignment â€” see SHAMSU_model_architecture.md for full rationale.
 OLLAMA_MODELS = SPECIALIST_MODELS
@@ -196,11 +240,14 @@ class LLMManager(ILLMManager):
         keep_alive: str = "10m", num_ctx: int = 8192,
         _estimated_tokens: int = 0,
     ) -> str:
+        # Stream internally (even though callers want the whole string): it lets
+        # the idle-timeout catch a stalled model instead of blocking on one big
+        # non-streaming read that can't tell "slow" from "deadlocked".
         payload = {
             "model": model,
             "prompt": prompt,
             "system": system,
-            "stream": False,
+            "stream": True,
             "options": {
                 "temperature": temperature,
                 "num_ctx": num_ctx,
@@ -211,19 +258,62 @@ class LLMManager(ILLMManager):
         }
         if json_schema is not None:
             payload["format"] = json_schema   # Ollama-native structured output
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(f"{self.base_url}/api/generate", json=payload)
-            r.raise_for_status()
-            data = r.json()
-            raw = data.get("response", "")
-            # Calibrate future token estimates with Ollama's ground-truth count.
-            if self.budget_manager and _estimated_tokens > 0:
-                prompt_eval_count = data.get("prompt_eval_count", 0)
-                if prompt_eval_count:
-                    self.budget_manager.calibrate_from_response(
-                        model, prompt_eval_count, _estimated_tokens
-                    )
-            return raw
+        chunks: list[str] = []
+        thinking_chunks: list[str] = []
+        prompt_eval_count = 0
+        try:
+            async with httpx.AsyncClient(timeout=_streaming_timeout()) as client:
+                async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        token = data.get("response", "")
+                        if token:
+                            chunks.append(token)
+                        # Reasoning models (qwen3, ...) stream their chain-of-
+                        # thought in a separate "thinking" field, not "response".
+                        thinking_token = data.get("thinking", "")
+                        if thinking_token:
+                            thinking_chunks.append(thinking_token)
+                        if data.get("done"):
+                            prompt_eval_count = data.get("prompt_eval_count", 0)
+                            break
+        except httpx.ReadTimeout as exc:
+            raise LLMStalledError(
+                f"{model} produced no output for {LLM_IDLE_TIMEOUT_SECONDS:.0f}s "
+                "(stalled or deadlocked). Set SHAMSU_LLM_IDLE_TIMEOUT to allow longer "
+                "silences on slow hardware."
+            ) from exc
+        # Capture the reasoning trace (logged, kept out of the returned text).
+        self._log_thinking(model, "".join(thinking_chunks))
+        # Calibrate future token estimates with Ollama's ground-truth count.
+        if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
+            self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
+        return "".join(chunks)
+
+    def _log_thinking(self, model: str, thinking: str) -> None:
+        """Record a reasoning model's chain-of-thought trace if it produced one.
+
+        Kept out of the returned text on purpose (answers/diffs must stay clean),
+        but logged so `reasoning not working` is diagnosable instead of a black
+        box. Best-effort - never breaks a generation on a logging failure."""
+        thinking = (thinking or "").strip()
+        if not thinking or not self.session_logger:
+            return
+        try:
+            self.session_logger.log(
+                "llm.thinking",
+                {"model": model, "thinking_chars": len(thinking), "thinking": thinking[:4000]},
+                "Model reasoning trace",
+                workflow_id="reasoning",
+            )
+        except Exception:
+            pass
 
     async def chat_with_tools(
         self,
@@ -267,7 +357,7 @@ class LLMManager(ILLMManager):
         if self.action_ledger:
             self.action_ledger.log_model_call_started(role, model, prompt_preview)
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=_blocking_timeout()) as client:
             response = await client.post(f"{self.base_url}/api/chat", json=payload)
             response.raise_for_status()
             data = response.json()
@@ -482,6 +572,7 @@ class LLMManager(ILLMManager):
         self, model: str, system: str, prompt: str,
         on_token: Callable[[str], None],
         temperature: float = 0.1, keep_alive: str = "10m", num_ctx: int = 8192,
+        _estimated_tokens: int = 0,
     ) -> str:
         payload = {
             "model": model,
@@ -497,22 +588,42 @@ class LLMManager(ILLMManager):
             "keep_alive": keep_alive,
         }
         chunks: list[str] = []
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.strip():
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    token = data.get("response", "")
-                    if token:
-                        chunks.append(token)
-                        on_token(token)
-                    if data.get("done"):
-                        break
+        thinking_chunks: list[str] = []
+        prompt_eval_count = 0
+        try:
+            async with httpx.AsyncClient(timeout=_streaming_timeout()) as client:
+                async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
+                    response.raise_for_status()
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        token = data.get("response", "")
+                        if token:
+                            chunks.append(token)
+                            on_token(token)
+                        # Reasoning trace streams in a separate "thinking" field -
+                        # accumulate it but keep it out of the visible answer tokens.
+                        thinking_token = data.get("thinking", "")
+                        if thinking_token:
+                            thinking_chunks.append(thinking_token)
+                        if data.get("done"):
+                            prompt_eval_count = data.get("prompt_eval_count", 0)
+                            break
+        except httpx.ReadTimeout as exc:
+            raise LLMStalledError(
+                f"{model} produced no output for {LLM_IDLE_TIMEOUT_SECONDS:.0f}s "
+                "(stalled or deadlocked). Set SHAMSU_LLM_IDLE_TIMEOUT to allow longer "
+                "silences on slow hardware."
+            ) from exc
+        self._log_thinking(model, "".join(thinking_chunks))
+        # Same calibration as the non-streaming path (see _generate) - the
+        # final streamed chunk carries the same ground-truth prompt_eval_count.
+        if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
+            self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
         return "".join(chunks)
 
     async def run_specialist_stream(
@@ -528,6 +639,23 @@ class LLMManager(ILLMManager):
         temp = SPECIALIST_TEMPS.get(specialist, 0.2)
         pack = self._with_long_term_memory(pack, specialist)
         prompt = self._format_pack(pack)
+
+        # Budget check: estimate tokens, compact if near the limit, show
+        # indicator. Mirrors run_specialist - streaming must not skip this,
+        # otherwise the context/token indicator never renders for the
+        # streaming path (QA, PRD summaries, ...) and an over-budget pack is
+        # never compacted before being sent.
+        estimated_tokens = 0
+        if self.budget_manager:
+            budget = self.budget_manager.compute(model_name, specialist, prompt)
+            if self.budget_manager.should_compact(budget):
+                pack = self.budget_manager.compact_pack(pack, budget)
+                prompt = self._format_pack(pack)
+                budget = self.budget_manager.compute(model_name, specialist, prompt)
+                budget = replace(budget, compacted=True)
+            self.budget_manager.show_indicator(budget)
+            estimated_tokens = budget.estimated_tokens
+
         started = time.perf_counter()
         if self.session_logger:
             self.session_logger.log_context_pack(pack, workflow_id=pack.task_id)
@@ -547,7 +675,10 @@ class LLMManager(ILLMManager):
             self.action_ledger.log_context_preview(_context_preview(pack))
             self.action_ledger.log_model_call_started(specialist, model_name, prompt)
         try:
-            raw = await self._generate_stream(model_name, "", prompt, on_token, temperature=temp)
+            raw = await self._generate_stream(
+                model_name, "", prompt, on_token, temperature=temp,
+                _estimated_tokens=estimated_tokens,
+            )
         except Exception as exc:
             if self.session_logger:
                 self.session_logger.log(
@@ -630,25 +761,26 @@ class LLMManager(ILLMManager):
 
     @staticmethod
     def _format_pack(pack: ContextPack) -> str:
-        snippets_text = "\n\n".join(
-            f"# File: {s.file_path} (lines {s.line_start}-{s.line_end})\n{s.content}"
-            for s in pack.snippets
-        )
-        # Task restated at the very end â€” exploits the recency side of the
+        # Only emit a section when it actually has content. A small local model
+        # fed empty "## Relevant code" / "## Errors" scaffolding on every plain
+        # question wastes context and can hallucinate references to code that
+        # isn't there; omitting empty sections keeps the prompt honest.
+        sections: list[str] = []
+        if pack.snippets:
+            snippets_text = "\n\n".join(
+                f"# File: {s.file_path} (lines {s.line_start}-{s.line_end})\n{s.content}"
+                for s in pack.snippets
+            )
+            sections.append(f"## Relevant code\n{snippets_text}")
+        if pack.prd_context and pack.prd_context.strip():
+            sections.append(f"## Context\n{pack.prd_context.strip()}")
+        if pack.error_context and pack.error_context.strip():
+            sections.append(f"## Errors / test output\n{pack.error_context.strip()}")
+        # Task restated at the very end - exploits the recency side of the
         # "Lost in the Middle" U-curve (Liu et al., TACL 2024). See
-        # ENGINEERING_HARNESS.md Â§1.
-        return f"""## Relevant code
-{snippets_text}
-
-## Context
-{pack.prd_context}
-
-## Errors / test output
-{pack.error_context}
-
-## Task (read this carefully)
-{pack.user_request}
-"""
+        # ENGINEERING_HARNESS.md section 1.
+        sections.append(f"## Task (read this carefully)\n{pack.user_request}")
+        return "\n\n".join(sections) + "\n"
 
 
 def _context_preview(pack: ContextPack) -> dict:

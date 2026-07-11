@@ -134,7 +134,10 @@ class _BrokenDiffLLM:
         raise RuntimeError("offline")
 
 
-def test_code_edit_falls_back_to_full_rewrite_on_bad_diff(tmp_path):
+def test_code_edit_applies_bad_count_diff_without_full_rewrite(tmp_path):
+    """A wrong-@@-count diff (what an 8B model emits) now recounts and applies
+    on the first coder call, so no full-rewrite fallback is needed. The
+    fallback still exists for genuinely unappliable diffs (context mismatch)."""
     (tmp_path / "app.py").write_text("old = 1\n", encoding="utf-8")
     workflow = CodeEditWorkflow(
         tmp_path,
@@ -146,7 +149,7 @@ def test_code_edit_falls_back_to_full_rewrite_on_bad_diff(tmp_path):
     result = asyncio.run(workflow.run("rename old to new"))
 
     assert result.applied is True
-    assert result.used_full_rewrite is True
+    assert result.used_full_rewrite is False   # applied straight from the recounted diff
     assert result.changed_files == ["app.py"]
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "new = 2\n"
     assert result.plan == "Edit app.py to set new = 2."

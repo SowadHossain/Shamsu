@@ -124,37 +124,28 @@ def test_unload_shamsu_models_only_touches_known_models(monkeypatch):
     assert unloaded == ["qwen3:8b"]  # the unrelated model was left alone
 
 
-def test_shutdown_stops_falkordb_on_last_exit(monkeypatch, tmp_path):
+def test_shutdown_never_stops_falkordb_on_last_exit(monkeypatch, tmp_path):
+    """FalkorDB used to be auto-stopped here on the last session's exit, which
+    meant memory silently went cold between ordinary REPL sessions. It's the
+    user's container to stop via `docker stop` - shutdown must never touch it,
+    last session or not."""
     _use_tmp(monkeypatch, tmp_path)
     registry.register_session(111)
     _fake_alive(monkeypatch, {111})  # last session standing
-    stopped = {"falkordb": 0}
 
     result = ollama.shutdown_if_last_session(
         111,
         server_stopper=lambda pid: True,
         model_unloader=lambda url: ["qwen3:8b"],
-        graphiti_stopper=lambda: stopped.__setitem__("falkordb", stopped["falkordb"] + 1) or True,
     )
 
-    # Ollama tag unchanged; FalkorDB stop is a side-effect that still fired.
     assert result == "unloaded"
-    assert stopped["falkordb"] == 1
 
 
-def test_shutdown_leaves_falkordb_running_when_another_session_live(monkeypatch, tmp_path):
-    _use_tmp(monkeypatch, tmp_path)
-    registry.register_session(111)
-    registry.register_session(222)
-    _fake_alive(monkeypatch, {111, 222})
-    stopped = {"falkordb": 0}
+def test_shutdown_accepts_no_graphiti_stopper_kwarg(monkeypatch, tmp_path):
+    """Regression guard: the removed `graphiti_stopper` parameter must not
+    reappear as a required/accepted kwarg by accident."""
+    import inspect
 
-    result = ollama.shutdown_if_last_session(
-        111,
-        server_stopper=lambda pid: True,
-        model_unloader=lambda url: ["x"],
-        graphiti_stopper=lambda: stopped.__setitem__("falkordb", stopped["falkordb"] + 1) or True,
-    )
-
-    assert result == "not-last"
-    assert stopped["falkordb"] == 0  # shared container stays up for session 222
+    params = inspect.signature(ollama.shutdown_if_last_session).parameters
+    assert "graphiti_stopper" not in params

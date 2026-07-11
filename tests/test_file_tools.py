@@ -212,6 +212,43 @@ def test_edit_file_fails_when_old_string_absent(tmp_path: Path):
     assert (tmp_path / "greet.py").read_text(encoding="utf-8") == "print('hello')\n"
 
 
+def test_edit_file_tolerates_trailing_whitespace_drift(tmp_path: Path):
+    """Regression: a local model reproducing the block without the file's
+    trailing whitespace used to fail with 'old_string not found'. It must now
+    succeed, and the untouched context line must keep its real bytes."""
+    _write(tmp_path, "app.py", "def greet(name):\n    msg = 'hi'   \n    return msg\n")
+    registry = _registry(tmp_path)
+
+    result = registry.edit_file(
+        "app.py",
+        "def greet(name):\n    msg = 'hi'\n    return msg",   # no trailing spaces
+        "def greet(name):\n    msg = 'hello'\n    return msg",
+    )
+
+    assert result.ok is True
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == (
+        "def greet(name):\n    msg = 'hello'\n    return msg\n"
+    )
+
+
+def test_edit_file_does_not_fuzzy_match_on_leading_indent_change(tmp_path: Path):
+    """Safety: leading-indentation differences are NOT auto-fixed (that could
+    silently re-indent code), so a dedented old_string still fails cleanly."""
+    _write(tmp_path, "app.py", "class C:\n    def m(self):\n        return 1\n")
+    registry = _registry(tmp_path)
+
+    result = registry.edit_file(
+        "app.py",
+        "def m(self):\n    return 1",   # dedented vs the file's real indentation
+        "def m(self):\n    return 2",
+    )
+
+    assert result.ok is False
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == (
+        "class C:\n    def m(self):\n        return 1\n"
+    )
+
+
 def test_edit_file_fails_on_multiple_matches_without_replace_all(tmp_path: Path):
     _write(tmp_path, "nums.py", "a = 1\nb = 1\nc = 1\n")
     registry = _registry(tmp_path)

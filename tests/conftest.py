@@ -26,6 +26,9 @@ class _AlwaysOpenMemoryService:
     def ensure_ready(self) -> MemoryGate:
         return MemoryGate(allowed=True)
 
+    def ensure_ready_degraded(self) -> MemoryGate:
+        return MemoryGate(allowed=True)
+
     def render_relevant(self, *_args, **_kwargs) -> str:
         return ""
 

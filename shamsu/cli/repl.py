@@ -62,6 +62,7 @@ from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec, is_static_frontend_prd
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.registry.schema import Category
+from shamsu.registry.suitability import templates_enabled
 from shamsu.retriever.search import NullSearchAgent, SearchAgent
 from shamsu.tasks.state import (
     MilestoneTask,
@@ -700,8 +701,25 @@ async def _handle_generate_prd(
         session_logger=session_logger,
         approval_func=lambda request: ask_approval(request, console=console),
         long_running=is_long_running_enabled(workspace),
+        generate=_pipeline_generate(session_logger),
     ).run(prd_path, target_dir=output_dir)
     _print_full_pipeline_result(result, console)
+
+
+def _pipeline_generate(session_logger: SessionLogger | None):
+    """A blocking (system, user, schema) -> raw-JSON generator backed by the coder
+    model, so the freeform/scaffold pipeline can drive generation from its worker
+    thread. Without this the FREEFORM strategy has no model wired and cannot build
+    - the reason the template scaffolds used to be the only working path."""
+
+    def _generate(system: str, user: str, schema: dict) -> str:
+        return asyncio.run(
+            LLMManager(session_logger=session_logger).generate_structured(
+                "coder", system, user, schema
+            )
+        )
+
+    return _generate
 
 
 def _parse_generate_prd_args(user_input: str) -> tuple[str, str]:
@@ -1019,15 +1037,20 @@ def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
 def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None:
     try:
         service = MemoryService(workspace)
-        # Bind the FalkorDB container to session lifetime: start it for this
-        # session (no-op if memory isn't set up yet or it's already running);
-        # the last session to exit stops it via shutdown_if_last_session.
+        # Start the FalkorDB container if memory is set up but it isn't running
+        # yet (no-op otherwise). SHAMSU never stops it again on its own - once
+        # started it stays up across sessions until `docker stop`ped manually.
         service.ensure_backend_started()
-        gate = service.ensure_ready()
-        if gate.allowed:
+        # Report status without hard-blocking: agent work now runs in degraded
+        # mode (local SQLite fallback) when Graphiti isn't set up, so the banner
+        # must not claim "SHAMSU will not start" - that's no longer true.
+        if service.healthcheck().ok:
             console.print("[dim]Graphiti memory: ready[/dim]")
         else:
-            console.print(f"[yellow]{REQUIRED_MEMORY_MESSAGE}[/yellow]")
+            console.print(
+                "[yellow]Graphiti memory: not set up - using local SQLite memory "
+                "(degraded). Run /memory setup for the richer Graphiti backend.[/yellow]"
+            )
     except Exception as exc:
         console.print(f"[yellow]Graphiti memory: startup check failed ({exc}). Run /memory repair or /doctor.[/yellow]")
 
@@ -2855,11 +2878,21 @@ def _make_approval_manager(
     console: Console,
     approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
 ) -> ApprovalManager:
-    # Only use the interactive single-menu (yes / yes+remember / no) when this
-    # is the real interactive prompt. Callers (mainly tests) that inject their
-    # own approval_func get memory-gated auto-approval but keep their own
-    # approval behavior, so a substituted approval_func isn't silently
-    # overridden here.
+    # Autonomy on: apply workspace edits hands-free, so the patch-based
+    # workflows (bug fix, code edit, docs, tests) match the agent chat loop,
+    # which already auto-approves when is_long_running_enabled. Without this,
+    # `/autonomy on` still stopped every diff at a Yes/No prompt - not seamless.
+    # Only kicks in for the real interactive default; an injected approval_func
+    # (tests, custom callers) is never silently overridden.
+    if approval_func is DEFAULT_ASK_APPROVAL and is_long_running_enabled(workspace):
+        return ApprovalManager(
+            approval_func=lambda _request: True,
+            session_logger=session_logger,
+            memory=_get_permission_memory(workspace),
+        )
+    # Otherwise use the interactive single-menu (yes / yes+remember / no) when
+    # this is the real interactive prompt. Callers (mainly tests) that inject
+    # their own approval_func keep their own approval behavior.
     menu_prompt = (
         (lambda request, offer: ask_approval_menu(request, offer_remember=offer, console=console))
         if approval_func is DEFAULT_ASK_APPROVAL
@@ -5792,7 +5825,10 @@ async def _handle_prd_build_request(
         return
 
     project = build_project_spec(parsed)
-    if project.category == Category.MULTIPLAYER_GAME.value:
+    # Templates disabled by default: a game PRD is built from scratch via the
+    # agent below (the generic build path), never by copying the 3D multiplayer
+    # boilerplate. Set SHAMSU_ENABLE_TEMPLATES=1 to restore the template build.
+    if templates_enabled() and project.category == Category.MULTIPLAYER_GAME.value:
         if not _multiplayer_template_present(workspace):
             console.print(
                 Panel(
@@ -5810,6 +5846,7 @@ async def _handle_prd_build_request(
                 session_logger=session_logger,
                 approval_func=lambda _request: True,
                 long_running=is_long_running_enabled(workspace),
+                generate=_pipeline_generate(session_logger),
             ).run(prd_path, target_dir=".")
             _print_full_pipeline_result(result, console)
             if not result.success:
@@ -7114,7 +7151,12 @@ def main(argv: list[str] | None = None) -> None:
             normalized_input = _normalize_command_input(user_input)
         lowered_input = normalized_input.lower()
         if not _memory_command_allowed(lowered_input):
-            memory_gate = MemoryService(workspace).ensure_ready()
+            # Degraded, not hard-blocking: when Graphiti isn't set up for this
+            # workspace, fall back to the local SQLite memory store so editing,
+            # QA, and PRD builds still work instead of every prompt hitting a
+            # "run /memory setup" wall. The startup banner already warned once;
+            # only a hard rejection (e.g. a non-local URI) still stops here.
+            memory_gate = MemoryService(workspace).ensure_ready_degraded()
             if not memory_gate.allowed:
                 console.print(Panel(memory_gate.reason or REQUIRED_MEMORY_MESSAGE, title="Graphiti Memory Required", border_style="red"))
                 continue

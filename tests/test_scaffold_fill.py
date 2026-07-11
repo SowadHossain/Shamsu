@@ -160,6 +160,10 @@ async def test_full_pipeline_routes_pong_to_2d_scaffold(tmp_path: Path, monkeypa
     from shamsu.agents import scaffold_pipeline as sp_mod
     from shamsu.agents.full_pipeline import FullDjangoPipeline
 
+    # Template scaffolds are opt-in now (disabled by default); this test exercises
+    # the enabled path, so turn them on explicitly.
+    monkeypatch.setenv("SHAMSU_ENABLE_TEMPLATES", "1")
+
     prd = tmp_path / "pong.md"
     prd.write_text(PONG_PRD)
     captured: dict = {}
@@ -187,3 +191,45 @@ async def test_full_pipeline_routes_pong_to_2d_scaffold(tmp_path: Path, monkeypa
     assert captured["candidate"] == "game-2d"
     assert result.success is True
     assert result.preview_url == "http://localhost:5173"
+
+
+@pytest.mark.asyncio
+async def test_templates_disabled_routes_scaffold_prd_to_freeform(tmp_path: Path, monkeypatch):
+    """With templates disabled (the default), a scaffold-eligible PRD (a 2D game)
+    is built from scratch via the freeform generator, never the copy-paste
+    scaffold. assess() still reports SCAFFOLD; the pipeline reroutes it."""
+    from shamsu.agents import freeform_generator as ff_mod
+    from shamsu.agents.freeform_generator import FreeformRunResult
+    from shamsu.agents.full_pipeline import FullDjangoPipeline
+
+    monkeypatch.delenv("SHAMSU_ENABLE_TEMPLATES", raising=False)
+
+    prd = tmp_path / "pong.md"
+    prd.write_text(PONG_PRD)
+
+    # assess() is pure: it still ranks the 2D scaffold as the best fit.
+    project = build_project_spec(parse_prd_text(PONG_PRD))
+    assert project.suitability.strategy is GenerationStrategy.SCAFFOLD
+
+    captured: dict = {}
+
+    def fake_run(self, project, target_dir):
+        captured["ran_freeform"] = True
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        return FreeformRunResult(
+            target_dir=target, stack="node", written_files=["index.html"],
+            verified=True, success=True, exit_code=0,
+            final_message="Verifier passed (exit code 0).",
+        )
+
+    monkeypatch.setattr(ff_mod.FreeformGenerator, "run", fake_run)
+
+    result = await FullDjangoPipeline(
+        tmp_path, search=_DummySearch(), approval_func=lambda _r: True,
+        generate=lambda s, u, sc: "",
+    ).run(prd, tmp_path / "game")
+
+    assert captured.get("ran_freeform") is True
+    assert result.success is True
+    assert result.written_files == ["index.html"]

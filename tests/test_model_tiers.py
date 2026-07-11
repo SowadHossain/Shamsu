@@ -12,9 +12,12 @@ from shamsu.runtime.models import (
 )
 
 
-def test_default_tier_matches_the_original_8gb_cookbook():
+def test_default_tier_uses_deepseek_r1_for_thinking_and_qwen_coder_for_code():
     assert active_tier() is DEFAULT_TIER
-    assert model_for_role("router") == "qwen3:8b"
+    # Thinking/router/qa/planner roles run on DeepSeek R1 Distill Qwen 7B;
+    # coding stays qwen2.5-coder.
+    assert model_for_role("router") == "deepseek-r1:7b"
+    assert model_for_role("qa") == "deepseek-r1:7b"
     assert model_for_role("coder") == "qwen2.5-coder:7b-instruct"
 
 

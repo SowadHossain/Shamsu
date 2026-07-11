@@ -7,7 +7,12 @@ from pathlib import Path
 
 from shamsu.abstract.context import build_codebase_memory_brief
 from shamsu.agents.planner import create_plan
-from shamsu.agents.rewrite_fallback import lenient_diff_target_paths, rewrite_files_fully
+from shamsu.agents.rewrite_fallback import (
+    full_file_results,
+    lenient_diff_target_paths,
+    mentioned_workspace_files,
+    rewrite_files_fully,
+)
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
@@ -262,6 +267,17 @@ class BugFixWorkflow:
     ) -> tuple[ContextPack, list[str], str]:
         results = _dedupe_results(self._search_bug_context(report, locations))
         target_paths = _target_paths(results)
+        # Ground the first attempt in the real, full content of the files being
+        # fixed (traceback targets + searched files), so the model edits against
+        # ground truth instead of inventing lines. Previously only the repair
+        # pass (after a rejected diff) saw full files; doing it up front prevents
+        # the hallucinated-diff failure in the first place.
+        grounding_paths = _dedupe_strings(
+            [loc.file_path for loc in locations]
+            + mentioned_workspace_files(self.workspace_root, report)
+            + target_paths
+        )
+        results = full_file_results(self.workspace_root, grounding_paths) + results
         memory_brief = build_codebase_memory_brief(self.workspace_root, target_paths)
         graphiti_brief = self.memory_service.render_relevant(report)
         plan = await create_plan(self.llm, self.context_builder, results, goal=report, task_id="bugfix-plan")
