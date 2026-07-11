@@ -17,9 +17,6 @@ from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitCommandResult, GitTool
 from shamsu.tools.path_resolve import (
-    _FRONTEND_ROOTS,
-    _HEAVY_DIRS,
-    _MAX_WORKSPACE_SCAN,
     _find_files_by_query,
     _find_path_candidates,
     _format_path_candidates,
