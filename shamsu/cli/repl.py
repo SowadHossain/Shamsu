@@ -49,6 +49,7 @@ from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
+from shamsu.agents.plan_mode import PlanningWorkflow
 from shamsu.cli.command_router import CommandRouter
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
@@ -63,6 +64,7 @@ from shamsu.prd.project import build_project_spec, is_static_frontend_prd
 from shamsu.prd.state import create_generation_state, save_generation_state
 from shamsu.registry.schema import Category
 from shamsu.registry.suitability import templates_enabled
+from shamsu.plans.store import parse_plan_steps, read_plan
 from shamsu.retriever.search import NullSearchAgent, SearchAgent
 from shamsu.tasks.state import (
     MilestoneTask,
@@ -186,6 +188,8 @@ SYSTEM_COMMANDS = (
     "/memory forget ",
     "/memory summarize-session ",
     "/parse-prd ",
+    "/plan ",
+    "/proceed",
     "/plan-prd ",
     "/generate-django ",
     "/generate-prd ",
@@ -369,6 +373,7 @@ def _print_help(console: Console) -> None:
                     "  write tests for the parser",
                     "  audit this project for security issues",
                     "  update the README",
+                    "  plan a dark-mode toggle    (make a plan first, review, then `proceed`)",
                     "",
                     "Commands:",
                     "  /doctor                   Diagnose install/workspace health (read-only)",
@@ -395,6 +400,8 @@ def _print_help(console: Console) -> None:
                     "  /memory search <query>   Search Graphiti memory",
                     "  /memory forget <query>   Forget/mark memory via Graphiti adapter",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
+                    "  /plan <task>              Plan any task first; review .shamsu/plans/*.md",
+                    "  /proceed                  Execute the last plan you approved",
                     "  /plan-prd <file>          Preview and approve a project plan",
                     "  /generate-django <file>   Generate deterministic Django backend files",
                     "  /generate-prd <file> --output <dir>",
@@ -6035,6 +6042,210 @@ def _create_prd_build_task(user_request: str, title: str, milestones: list[str])
     return create_task(user_request=user_request, steps=steps, phase="milestone-1")
 
 
+# --- Plan mode: plan -> review -> proceed -------------------------------------
+
+_FOLLOW_PLAN_PHRASES = (
+    "follow the plan", "proceed with the plan", "execute the plan", "run the plan",
+    "do the plan", "go with the plan", "start the plan", "implement the plan",
+    "build the plan", "let's proceed", "lets proceed",
+)
+
+
+def _looks_like_follow_plan(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(phrase in lowered for phrase in _FOLLOW_PLAN_PHRASES)
+
+
+async def _resolve_plan_route(task: str, workspace: Path, llm: LLMManager) -> str:
+    """Classify the task the same way _handle_request routes it, so the plan (and
+    later its execution) fit the kind of work: a PRD build, a code edit, a bugfix, etc."""
+    if _looks_like_prd_build_request(task, workspace):
+        return "prd_build"
+    try:
+        decision = await _route_prompt(task, llm)
+        return decision.intent or "code_edit"
+    except Exception:
+        return "code_edit"
+
+
+async def _handle_plan(
+    task: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Produce a reviewable plan for `task`, save it under .shamsu/plans/, and store
+    it as a pending action so a later `proceed` executes it step by step."""
+    task = task.strip()
+    if not task:
+        console.print("[yellow]Usage: plan <what you want built, changed, or fixed>[/yellow]")
+        return
+    llm = _make_llm_manager(session_logger, console, workspace)
+    route = await _resolve_plan_route(task, workspace, llm)
+    search, _uses_real_index = _build_search_agent(workspace, session_logger)
+    workflow = PlanningWorkflow(workspace, llm=llm, search=search, session_logger=session_logger)
+    try:
+        plan = await workflow.run(task, route=route)
+    except Exception as exc:
+        console.print(f"[red]Could not build a plan: {exc}[/red]")
+        return
+    console.print(Panel(plan.markdown, title=f"Plan ({route}) - {len(plan.steps)} step(s)"))
+    try:
+        rel = plan.path.relative_to(workspace).as_posix()
+    except ValueError:
+        rel = str(plan.path)
+    console.print(
+        f"[dim]Saved to {rel} - edit it if you like, then reply `proceed` "
+        "(or run /proceed) to execute it, or `no` to discard.[/dim]"
+    )
+    if session_logger is not None:
+        session_logger.set_pending_action(
+            {
+                "type": "plan",
+                "awaiting": "plan_approval",
+                "plan_id": plan.plan_id,
+                "route": route,
+                "created_from_prompt": task,
+            }
+        )
+
+
+async def _execute_pending_plan(
+    pending_action: dict[str, Any],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    plan_id = str(pending_action.get("plan_id", ""))
+    route = str(pending_action.get("route", "code_edit"))
+    task = str(pending_action.get("created_from_prompt", ""))
+    try:
+        markdown = read_plan(workspace, plan_id)
+    except Exception:
+        console.print(
+            "[red]Could not read the approved plan file - it may have been moved or deleted. "
+            "Make a new plan with `plan <task>`.[/red]"
+        )
+        return
+    steps = parse_plan_steps(markdown)
+    await _execute_plan(task, route, markdown, steps, workspace, console, session_logger)
+
+
+async def _execute_plan(
+    task: str,
+    route: str,
+    plan_markdown: str,
+    steps: list[str],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Execute an approved plan. Each step runs as its own agent pass with the plan
+    as authoritative context, tracked as a MilestoneTask (visible via `tasks`)."""
+    if not steps:
+        console.print(
+            "[cyan]No discrete steps found in the plan - executing it in a single pass.[/cyan]"
+        )
+        await _run_agent_chat(
+            _plan_single_request(task, plan_markdown),
+            workspace,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+        )
+        return
+
+    task_obj = _create_plan_task(task, steps)
+    save_task(task_obj, workspace)
+    console.print(
+        f"[green]Executing the approved plan - {len(steps)} step(s). Tracking task {task_obj.task_id}.[/green]"
+    )
+    for index, step_text in enumerate(steps):
+        step = task_obj.steps[index]
+        task_obj = mark_step_running(task_obj, step.id)
+        save_task(task_obj, workspace)
+        console.print(f"[cyan]  -> Step {index + 1}/{len(steps)}: {step_text}[/cyan]")
+        try:
+            await _run_agent_chat(
+                _plan_step_request(task, plan_markdown, step_text, index + 1, len(steps)),
+                workspace,
+                console,
+                session_logger=session_logger,
+                force_long_running=True,
+                auto_approve=True,
+            )
+        except Exception as exc:
+            task_obj = mark_step_failed(task_obj, step.id, str(exc))
+            save_task(task_obj, workspace)
+            raise
+        task_obj = mark_step_done(task_obj, step.id, "Agent completed this plan step.")
+        save_task(task_obj, workspace)
+    console.print(f"[green]Plan execution complete. Task: {task_obj.task_id}[/green]")
+
+
+def _create_plan_task(task: str, steps: list[str]) -> MilestoneTask:
+    task_steps = [
+        TaskStep(
+            id=index + 1,
+            description=step,
+            type="file_edit",
+            specialist="coder",
+            phase=f"step-{index + 1}",
+            depends_on=[index] if index else [],
+        )
+        for index, step in enumerate(steps)
+    ]
+    return create_task(user_request=task, steps=task_steps, phase="step-1")
+
+
+def _plan_single_request(task: str, plan_markdown: str) -> str:
+    return (
+        "Execute the following approved plan in this workspace. Read the relevant files first, "
+        "then make the changes with write_file/edit_file and verify with run_command when possible. "
+        "Do not claim work you did not do.\n\n"
+        f"## Original task\n{task}\n\n## Approved plan\n{plan_markdown}"
+    )
+
+
+def _plan_step_request(
+    task: str, plan_markdown: str, step_text: str, index: int, count: int
+) -> str:
+    return (
+        f"You are executing an approved plan, step {index} of {count}.\n\n"
+        "Read any files you need first, then implement ONLY this step by editing/creating files "
+        "with write_file/edit_file. Keep earlier steps' work intact and the project runnable. "
+        "Verify with run_command when possible. Do not claim work you did not do.\n\n"
+        f"## This step\n{step_text}\n\n"
+        f"## Original task\n{task}\n\n"
+        f"## Full approved plan (for context)\n{plan_markdown}"
+    )
+
+
+def _resolve_proceed(
+    workspace: Path, console: Console, session_logger: SessionLogger | None
+) -> bool:
+    """Run the pending approved plan (the /proceed command). Returns False when
+    there is no plan awaiting approval so the caller can tell the user."""
+    if session_logger is None:
+        return False
+    pending = session_logger.get_pending_action()
+    if pending.get("awaiting") != "plan_approval":
+        return False
+    session_logger.clear_pending_action()
+    ledger = start_run(workspace, "proceed")
+    set_current_run(ledger)
+    try:
+        asyncio.run(_execute_pending_plan(pending, workspace, console, session_logger))
+    except Exception as exc:
+        ledger.fail(str(exc))
+        clear_current_run()
+        raise
+    _finish_current_run(workspace, ledger)
+    clear_current_run()
+    return True
+
+
 def _render_sections(parsed) -> str:
     parts = []
     for name, lines in parsed.sections.items():
@@ -7185,6 +7396,30 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input.startswith("plan-prd "):
             _handle_plan_prd(normalized_input, workspace, console, session_logger=session_logger)
             continue
+        if lowered_input == "proceed":
+            if not _resolve_proceed(workspace, console, session_logger):
+                console.print(
+                    "[yellow]Nothing to proceed - make a plan first with `plan <task>`.[/yellow]"
+                )
+            continue
+        if lowered_input == "plan" or lowered_input.startswith("plan "):
+            # Catches both `/plan <task>` and a natural "plan <task>". Produces a
+            # reviewable plan and stores it; `proceed` executes it step by step.
+            _, _, plan_task = normalized_input.partition(" ")
+            ledger = start_run(workspace, user_input)
+            set_current_run(ledger)
+            try:
+                with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+                    asyncio.run(
+                        _handle_plan(plan_task, workspace, console, session_logger=session_logger)
+                    )
+            except Exception as exc:
+                ledger.fail(str(exc))
+                clear_current_run()
+                raise
+            _finish_current_run(workspace, ledger)
+            clear_current_run()
+            continue
         if lowered_input.startswith("generate-django "):
             _handle_generate_django(normalized_input, workspace, console, session_logger=session_logger)
             continue
@@ -7311,6 +7546,32 @@ def main(argv: list[str] | None = None) -> None:
         # this never bypasses safety.
         dispatch_input = user_input
         pending_action = session_logger.get_pending_action()
+        if pending_action.get("awaiting") == "plan_approval":
+            # A plan is awaiting the user's go-ahead: "proceed"/"follow the plan"
+            # executes it step by step; "no" discards it (the file is kept).
+            if is_negative(user_input):
+                session_logger.clear_pending_action()
+                console.print(
+                    "[yellow]Discarded the pending plan. The plan file is kept under .shamsu/plans/.[/yellow]"
+                )
+                continue
+            if is_affirmative(user_input) or _looks_like_follow_plan(user_input):
+                session_logger.clear_pending_action()
+                ledger = start_run(workspace, user_input)
+                set_current_run(ledger)
+                try:
+                    asyncio.run(
+                        _execute_pending_plan(pending_action, workspace, console, session_logger)
+                    )
+                except Exception as exc:
+                    ledger.fail(str(exc))
+                    clear_current_run()
+                    raise
+                _finish_current_run(workspace, ledger)
+                clear_current_run()
+                continue
+            # Neither approval nor rejection: leave the plan pending and answer the
+            # message normally (the user may be asking something else meanwhile).
         if pending_action:
             if is_negative(user_input):
                 session_logger.clear_pending_action()
