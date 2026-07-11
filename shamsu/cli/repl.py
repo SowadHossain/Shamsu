@@ -402,7 +402,7 @@ def _print_help(console: Console) -> None:
                     "  /memory forget <query>   Forget/mark memory via Graphiti adapter",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  /plan <task>              Plan any task first; review .shamsu/plans/*.md",
-                    "  /proceed                  Execute the last plan you approved",
+                    "  /proceed                  Run the last plan you approved",
                     "  /plan-prd <file>          Preview and approve a project plan",
                     "  /generate-django <file>   Generate deterministic Django backend files",
                     "  /generate-prd <file> --output <dir>",
