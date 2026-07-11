@@ -139,6 +139,7 @@ from shamsu.types import (
     RoutingDecision,
     TaskStep,
     TaskStepStatus,
+    ToolResult,
 )
 
 if sys.platform == "win32":

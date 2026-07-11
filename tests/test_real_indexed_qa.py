@@ -171,6 +171,30 @@ def test_repl_general_chat_uses_agent_loop_when_codebase_memory_is_unavailable(m
     assert "intent=qa" not in rendered
 
 
+def test_repl_standalone_code_sample_uses_direct_code_route(monkeypatch, tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+    calls: list[str] = []
+
+    async def fake_direct_code(user_input, console, llm, session_logger=None, thinking_status=None):
+        calls.append(user_input)
+        console.print("C++ sample")
+
+    class ForbiddenAgentChatLoop:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("standalone code samples should not enter the workspace agent loop")
+
+    monkeypatch.setattr(repl, "_run_direct_code_answer", fake_direct_code)
+    monkeypatch.setattr(repl, "AgentChatLoop", ForbiddenAgentChatLoop)
+
+    asyncio.run(_handle_request("make a bouncing ball game code in c++", tmp_path, console, web_tool, browser_tool))
+
+    rendered = output.getvalue()
+    assert "C++ sample" in rendered
+    assert calls == ["make a bouncing ball game code in c++"]
+    assert "Codebase-Memory MCP is not ready" not in rendered
+
+
 def test_repl_workspace_prd_request_finds_single_prd_without_routing(tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
