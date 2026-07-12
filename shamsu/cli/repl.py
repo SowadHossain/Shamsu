@@ -3331,6 +3331,8 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
         return "workspace.files"
     if _looks_like_prd_build_request(effective_input, workspace):
         return "prd.build"
+    if _looks_like_file_read_request(effective_input):
+        return "file.read"
     if _looks_like_file_write_request(effective_input):
         return "file.write"
     if _looks_like_direct_code_request(effective_input):
@@ -3421,6 +3423,14 @@ async def _handle_request(
         return
     if _looks_like_prd_build_request(effective_input, workspace):
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
+        return
+    if _looks_like_file_read_request(effective_input):
+        await _run_agent_chat(
+            _append_agent_context(effective_input, agent_context),
+            workspace,
+            console,
+            session_logger=session_logger,
+        )
         return
     if _looks_like_file_write_request(effective_input):
         await _run_agent_chat(
@@ -4859,6 +4869,32 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     if _FILELIKE_RE.search(user_input):
         return True
     return bool(words & _FILE_HINT_WORDS)
+
+
+def _looks_like_file_read_request(user_input: str) -> bool:
+    """Route explicit file-reading/extraction prompts to the tool loop.
+
+    Without this guard, prompts like "read input_files/foo.docx and solve it"
+    can fall into workspace QA, where the model may answer from context instead
+    of actually calling read_file.
+    """
+    raw = user_input.strip().lower()
+    if not raw:
+        return False
+    if not _FILELIKE_RE.search(user_input):
+        return False
+    words = set(re.sub(r"[^\w\s]", " ", raw).split())
+    read_verbs = {
+        "read",
+        "open",
+        "extract",
+        "summarize",
+        "summarise",
+        "solve",
+        "answer",
+        "parse",
+    }
+    return bool(words & read_verbs) or "read_file" in raw
 
 
 # Self-contained "write me some code" asks that need no workspace context.

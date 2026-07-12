@@ -195,6 +195,48 @@ def test_repl_standalone_code_sample_uses_direct_code_route(monkeypatch, tmp_pat
     assert "Codebase-Memory MCP is not ready" not in rendered
 
 
+def test_repl_docx_read_prompt_uses_agent_tool_loop(monkeypatch, tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+    calls: list[str] = []
+
+    class FakeAgentChatLoop:
+        def __init__(
+            self,
+            workspace,
+            session_logger=None,
+            tools=None,
+            long_running=False,
+            on_activity=None,
+            progress=None,
+            action_ledger=None,
+            **kwargs,
+        ):
+            assert workspace == tmp_path
+
+        async def run(self, user_input):
+            calls.append(user_input)
+            return type("Result", (), {"final": "Read and solved from DOCX.", "stopped": False})()
+
+    monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
+
+    asyncio.run(
+        _handle_request(
+            "read input_files/Practice01_FA.docx and solve the problems",
+            tmp_path,
+            console,
+            web_tool,
+            browser_tool,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Read and solved from DOCX." in rendered
+    assert calls
+    assert "input_files/Practice01_FA.docx" in calls[0]
+    assert "Codebase-Memory MCP is not ready" not in rendered
+
+
 def test_repl_workspace_prd_request_finds_single_prd_without_routing(tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)

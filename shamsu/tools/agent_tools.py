@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import difflib
 import json
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+from xml.etree import ElementTree
 
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.patch.transactions import TransactionWorkspace
@@ -731,6 +733,8 @@ class AgentToolRegistry:
 
         if PurePosixPath(normalized).suffix.lower() == ".pdf":
             return self._read_pdf(normalized)
+        if PurePosixPath(normalized).suffix.lower() == ".docx":
+            return self._read_docx(normalized)
 
         try:
             target = self.sandbox.validate(normalized)
@@ -792,6 +796,39 @@ class AgentToolRegistry:
         return ToolResult(
             True,
             "Read file.",
+            {"filepath": normalized, "resolved_filepath": normalized, "content": content, "candidates": []},
+        )
+
+    def _read_docx(self, normalized: str) -> ToolResult:
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
+        if not target.is_file():
+            candidates = _find_path_candidates(self.workspace_root, normalized)
+            message = f"Not a file: {normalized}."
+            if candidates:
+                message += f" Candidates: {_format_path_candidates(candidates)}"
+            return ToolResult(False, message, {"filepath": normalized, "candidates": candidates})
+        try:
+            content = _extract_docx_text(target)
+        except (OSError, KeyError, ElementTree.ParseError, zipfile.BadZipFile) as exc:
+            return ToolResult(
+                False,
+                f"Could not read DOCX {normalized}: {exc}",
+                {"filepath": normalized, "resolved_filepath": normalized, "candidates": []},
+            )
+        if not content.strip():
+            return ToolResult(
+                False,
+                f"Could not extract text from DOCX {normalized}.",
+                {"filepath": normalized, "resolved_filepath": normalized, "candidates": []},
+            )
+        if len(content) > MAX_READ_CHARS:
+            content = f"{content[:MAX_READ_CHARS]}\n... [truncated {len(content) - MAX_READ_CHARS} chars]"
+        return ToolResult(
+            True,
+            "Read DOCX file.",
             {"filepath": normalized, "resolved_filepath": normalized, "content": content, "candidates": []},
         )
 
@@ -1445,6 +1482,29 @@ def _truncate_text(text: str, limit: int) -> str:
 
 def _is_readable_text(target: Path) -> bool:
     return target.suffix.lower() in _READABLE_TEXT_EXTENSIONS or target.name in _READABLE_FILENAMES
+
+
+def _extract_docx_text(target: Path) -> str:
+    """Extract visible paragraph text from a DOCX without external services."""
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    with zipfile.ZipFile(target) as archive:
+        document_xml = archive.read("word/document.xml")
+    root = ElementTree.fromstring(document_xml)
+    paragraphs: list[str] = []
+    for paragraph in root.findall(".//w:p", namespace):
+        parts: list[str] = []
+        for node in paragraph.iter():
+            tag = node.tag.rsplit("}", 1)[-1]
+            if tag == "t" and node.text:
+                parts.append(node.text)
+            elif tag == "tab":
+                parts.append("\t")
+            elif tag in {"br", "cr"}:
+                parts.append("\n")
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
 
 
 def _parse_extensions(value: Any) -> set[str]:

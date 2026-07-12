@@ -3,6 +3,7 @@ loop's failed-read recovery. See shamsu/tools/agent_tools.py and
 shamsu/agents/chat_loop.py."""
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,23 @@ def _write(tmp_path: Path, rel: str, content: str = "x\n") -> Path:
     target = tmp_path / rel
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
+    return target
+
+
+def _write_docx(tmp_path: Path, rel: str, paragraphs: list[str]) -> Path:
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(
+        f"<w:p><w:r><w:t>{paragraph}</w:t></w:r></w:p>"
+        for paragraph in paragraphs
+    )
+    document = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("word/document.xml", document)
     return target
 
 
@@ -105,6 +123,22 @@ def test_read_file_normalizes_quoted_and_backslash_paths(tmp_path: Path):
 
     assert result.ok is True
     assert result.data["resolved_filepath"] == "src/app.py"
+
+
+def test_read_file_extracts_docx_text(tmp_path: Path):
+    _write_docx(
+        tmp_path,
+        "input_files/Practice01_FA.docx",
+        ["Question 1: What is 2 + 2?", "Question 2: Name one primary color."],
+    )
+    registry = _registry(tmp_path)
+
+    result = registry.read_file("input_files/Practice01_FA.docx")
+
+    assert result.ok is True
+    assert result.message == "Read DOCX file."
+    assert "Question 1: What is 2 + 2?" in result.data["content"]
+    assert "Question 2: Name one primary color." in result.data["content"]
 
 
 # ---------------------------------------------------------------------------
