@@ -30,12 +30,18 @@ from shamsu.context.builder import ContextBuilder
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
+from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
 from shamsu.memory.service import MemoryService
-from shamsu.runtime.models import model_for_role
+from shamsu.runtime.models import (
+    model_for_role,
+    model_is_reasoning,
+    model_supports_native_tools,
+)
 from shamsu.safety.clarify import ask_clarifying_question
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.ui.progress import ProgressReporter, summarize_tool_args, summarize_tool_result
+from shamsu.verify.gate import verify_only
 
 # Circuit-breaker ceiling used only in long-running mode — a backstop, not
 # the normal stop condition (the repetition guard is what actually catches
@@ -61,6 +67,14 @@ _HEARTBEAT_INTERVAL_SECONDS: int = int(_os.environ.get("SHAMSU_HEARTBEAT_SECONDS
 _CHAT_MAX_CTX: int = int(_os.environ.get("SHAMSU_CHAT_MAX_CTX", "32768"))
 _CHAT_SUMMARY_BUDGET_TOKENS = 512
 
+# Per-tool-result token budget. A single big read_file/grep_files result can
+# otherwise blow the window mid-loop: the budget-aware history trimmer always
+# keeps the most recent message, so one oversized result survives and crowds out
+# everything else. Cap each result's tokens BEFORE it enters history and tell the
+# model how to see more (a narrower range/query). Override with
+# SHAMSU_TOOL_RESULT_MAX_TOKENS.
+_TOOL_RESULT_MAX_TOKENS: int = int(_os.environ.get("SHAMSU_TOOL_RESULT_MAX_TOKENS", "2000"))
+
 # The interactive agent tool loop does real tool-calling/file work, so it runs on
 # the CODER model by default (fast, tool-friendly) rather than the "thinking"
 # qa/router model, whose long reasoning traces stalled the executor mid-run.
@@ -70,6 +84,14 @@ _CHAT_EXECUTOR_ROLE = _os.environ.get("SHAMSU_CHAT_ROLE", "coder").strip() or "c
 # on very small machines where the extra planner-model round-trip + model swap
 # adds too much latency.
 _CHAT_PLANNER_ENABLED = _os.environ.get("SHAMSU_CHAT_PLANNER", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+# Honesty gate: after an AUTONOMOUS (long_running) run that wrote files, run a
+# deterministic lightweight verifier once so the loop never signs off on a build
+# it never checked (small models routinely hallucinate success). Off for normal
+# interactive chat (the user is in the loop); disable entirely with
+# SHAMSU_VERIFY_GATE=0.
+_VERIFY_GATE_ENABLED = _os.environ.get("SHAMSU_VERIFY_GATE", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
 
@@ -203,6 +225,9 @@ class AgentLoopResult:
     stopped: bool = False
     awaiting_user: bool = False
     timeout_category: str | None = None
+    # Workspace-relative files this run confirmed writing, so a caller (e.g. the
+    # plan runner) can verify the whole set once at the end.
+    changed_files: tuple[str, ...] = ()
 
 
 class AgentChatLoop:
@@ -232,10 +257,21 @@ class AgentChatLoop:
         self.session_logger = session_logger
         self.action_ledger = action_ledger
         self.model_name = model_name or model_for_role(_CHAT_EXECUTOR_ROLE)
+        # Capability flags drive the model I/O boundary: whether to hand this
+        # model a native tools schema (vs. an in-prompt protocol + salvager) and
+        # whether to ask it to `think` so reasoning stays out of the answer.
+        self._supports_native_tools = model_supports_native_tools(self.model_name)
+        self._is_reasoning = model_is_reasoning(self.model_name)
         self.llm = llm or LLMManager(session_logger=session_logger, action_ledger=action_ledger)
         self.context_builder = context_builder or ContextBuilder()
         self.client = client or ollama.AsyncClient(host=base_url)
         self.tools = tools or AgentToolRegistry(self.workspace_root, session_logger=session_logger)
+        # Names the salvager is allowed to recover calls for (a JSON blob naming
+        # an unregistered "tool" is treated as prose, not a call).
+        self._registered_tool_names = {
+            str((schema.get("function") or {}).get("name") or "")
+            for schema in self.tools.tool_schemas()
+        }
         # Optional hook to surface live tool activity (e.g. "Writing game.js")
         # to the REPL while the loop runs. None keeps the loop silent (tests).
         self.on_activity = on_activity
@@ -244,7 +280,10 @@ class AgentChatLoop:
         self.budget_manager = budget_manager
         self.audit = audit
         self.state = state or ChatState(
-            _system_prompt(self.workspace_root),
+            _system_prompt(
+                self.workspace_root,
+                include_tool_protocol=not self._supports_native_tools,
+            ),
             session_logger=session_logger,
         )
         self.long_running = long_running
@@ -326,18 +365,30 @@ class AgentChatLoop:
                 if self.on_activity:
                     self.on_activity(f"still waiting for the model... {elapsed}s")
 
+        chat_kwargs: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.1, "num_ctx": num_ctx},
+        }
+        # Only hand a native tools schema to models that actually do native
+        # tool-calling; for the rest the in-prompt protocol + output salvager
+        # carry it (a schema confuses those models). Ask reasoning models to
+        # think so the trace separates cleanly from the answer.
+        if self._supports_native_tools:
+            chat_kwargs["tools"] = self.tools.tool_schemas()
+        if self._is_reasoning:
+            chat_kwargs["think"] = True
+
         beat = asyncio.ensure_future(_beat())
         try:
-            return await asyncio.wait_for(
-                self.client.chat(
-                    model=self.model_name,
-                    messages=messages,
-                    tools=self.tools.tool_schemas(),
-                    stream=False,
-                    options={"temperature": 0.1, "num_ctx": num_ctx},
-                ),
-                timeout=_MODEL_CALL_TIMEOUT_SECONDS,
-            )
+            try:
+                coro = self.client.chat(**chat_kwargs)
+            except TypeError:
+                # Older ollama clients (or test doubles) may not accept `think`.
+                chat_kwargs.pop("think", None)
+                coro = self.client.chat(**chat_kwargs)
+            return await asyncio.wait_for(coro, timeout=_MODEL_CALL_TIMEOUT_SECONDS)
         finally:
             beat.cancel()
 
@@ -384,6 +435,8 @@ class AgentChatLoop:
         self.state.append_user(user_input)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
+        # Files this run actually wrote (confirmed ok), for the end-of-run verify gate.
+        written_files: list[str] = []
         # The most recent read_file failure that has not yet been recovered from,
         # plus a cap on prose-only "I'll read X next" stalls after such a failure.
         last_failed_read: dict[str, Any] | None = None
@@ -441,19 +494,36 @@ class AgentChatLoop:
                     self.audit.log_error("llm_error", str(exc))
                 self._audit_final(final)
                 return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
-            message = _message_from_response(response)
-            content = str(_get(message, "content", "") or "")
-            tool_calls = _tool_calls_from_message(message)
-            # Surface the model's visible message in `/trace raw` (debug) so the
-            # user can see what the model actually said each round - not hidden
-            # chain-of-thought, just the model-visible content.
+            # Single normalization boundary: native tool_calls when present,
+            # else salvage calls out of the content (embedded JSON /
+            # SEARCH-REPLACE / <tool_call>), split reasoning out, and strip any
+            # leaked tool syntax from the visible answer. This is what stops raw
+            # `{"name":"ask_user",...}` / diff markers from reaching the user.
+            turn = parse_model_turn(response, self._registered_tool_names)
+            content = turn.text
+            tool_calls = [tool_call_to_message_dict(call) for call in turn.tool_calls]
+            # Surface the visible (tool-syntax-stripped) message in `/trace raw`;
+            # keep any reasoning trace out of the answer on a verbose channel.
             if content.strip():
                 self._emit_trace("assistant.content", content, {"round": round_index}, level="raw")
+            if turn.thinking:
+                # Surface a short, dim reasoning glimpse at normal verbosity (the
+                # reasoning was previously hidden/logged-only); keep the full
+                # trace in the session log and the untruncated version at verbose.
+                self._log_thinking(turn.thinking, round_index)
+                self._emit_trace(
+                    "assistant.thinking",
+                    _thinking_preview(turn.thinking),
+                    {"round": round_index, "chars": len(turn.thinking)},
+                    level="normal",
+                )
+            if turn.salvaged and tool_calls:
+                self._emit_trace(
+                    "tool.salvaged",
+                    f"Recovered {len(tool_calls)} tool call(s) from unstructured model output.",
+                    {"round": round_index, "tools": [_tool_call_name(call) for call in tool_calls]},
+                )
             self.state.append_assistant(content, tool_calls=tool_calls)
-            if not tool_calls:
-                json_action_call = _json_action_tool_call(content)
-                if json_action_call:
-                    tool_calls = [json_action_call]
             if not tool_calls and not content.strip():
                 # An empty model reply (no content, no tool call) is the "No
                 # response returned" the user saw. Retry with a nudge rather than
@@ -543,8 +613,11 @@ class AgentChatLoop:
                     self.state.append_assistant(final)
                     self._audit_final(final)
                     return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
-                self._audit_final(content)
-                return AgentLoopResult(final=content, tool_rounds=round_index)
+                final = await self._maybe_verify(content, written_files)
+                self._audit_final(final)
+                return AgentLoopResult(
+                    final=final, tool_rounds=round_index, changed_files=tuple(written_files)
+                )
             for call in tool_calls:
                 name = _tool_call_name(call)
                 arguments = _tool_call_arguments(call)
@@ -584,7 +657,29 @@ class AgentChatLoop:
                     self.progress.tool_result(name, summarize_tool_result(result), ok=result.ok)
                 if self.on_activity and not result.ok:
                     self.on_activity(f"failed: {result.message}")
-                self.state.append_tool(_tool_call_id(call, name), name, result.to_json())
+                self.state.append_tool(
+                    _tool_call_id(call, name),
+                    name,
+                    _budget_tool_result_json(result.to_json(), _TOOL_RESULT_MAX_TOKENS),
+                )
+                if name in {"write_file", "edit_file"} and result.ok:
+                    _data = result.data if isinstance(result.data, dict) else {}
+                    written = str(
+                        _data.get("resolved_filepath")
+                        or _data.get("filepath")
+                        or arguments.get("filepath")
+                        or ""
+                    )
+                    if written and written not in written_files:
+                        written_files.append(written)
+                if name == "search_index" and result.ok and isinstance(result.data, dict):
+                    # Make the context feed visible (G9): the query + top hits with
+                    # scores, at normal verbosity instead of behind a debug flag.
+                    self._emit_trace(
+                        "context.search",
+                        _search_summary(str(arguments.get("query", "")), result.data.get("results", [])),
+                        {"query": str(arguments.get("query", "")), "hits": len(result.data.get("results", []))},
+                    )
                 if name == "read_file":
                     if result.ok:
                         # A successful read (including an auto-resolved candidate)
@@ -687,7 +782,10 @@ class AgentChatLoop:
         final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
         self.state.append_assistant(final)
         self._audit_final(final)
-        return AgentLoopResult(final=final, tool_rounds=self.max_tool_rounds, stopped=True)
+        return AgentLoopResult(
+            final=final, tool_rounds=self.max_tool_rounds, stopped=True,
+            changed_files=tuple(written_files),
+        )
 
     def _append_long_term_memory(self, user_input: str) -> str:
         try:
@@ -744,6 +842,60 @@ class AgentChatLoop:
         self._emit_trace("plan.created", plan.text)
         return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
 
+    async def _maybe_verify(self, content: str, written_files: list[str]) -> str:
+        """Honesty gate for autonomous runs: after writes, run a deterministic
+        lightweight verifier once and fold the verdict into the final answer.
+
+        Never claims success it did not check: a build failure turns into a loud
+        'UNCONFIRMED' note (the model may have claimed success), a pass adds a
+        short confirmation, and an unverifiable change is left untouched (the
+        files are on disk and, in interactive use, the user can see them). Only
+        runs in long_running/autonomous mode; best-effort — a verifier error
+        never breaks the turn."""
+        if not (self.long_running and _VERIFY_GATE_ENABLED) or not written_files:
+            return content
+        try:
+            outcome = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: verify_only(
+                    self.workspace_root,
+                    list(written_files),
+                    command_runner=self.tools.command_runner,
+                    lightweight=True,
+                    session_logger=self.session_logger,
+                ),
+            )
+        except Exception:
+            return content
+        self._emit_trace(
+            "verify.result",
+            outcome.summary,
+            {"status": outcome.status(), "command": outcome.command, "files": len(written_files)},
+        )
+        if self.session_logger:
+            try:
+                self.session_logger.log(
+                    "verify.result",
+                    {
+                        "status": outcome.status(),
+                        "command": outcome.command,
+                        "exit_code": outcome.exit_code,
+                        "files": list(written_files),
+                    },
+                    f"Verify gate: {outcome.status()}",
+                    workflow_id="agent-chat",
+                )
+            except Exception:
+                pass
+        if outcome.unverifiable:
+            return content
+        if outcome.failed:
+            return (
+                f"{content}\n\n⚠ I could not confirm these changes: {outcome.summary} "
+                "Treat this as UNCONFIRMED and re-check the affected file(s) before relying on it."
+            ).strip()
+        return f"{content}\n\n[verified] {outcome.summary}".strip()
+
     def _timeout_category(self, round_index: int, ran_any_tool: bool) -> str:
         """Classify a model-call timeout so the CLI/logs stop blaming the GPU
         when the model already produced a plan or the loop already ran tools.
@@ -771,6 +923,21 @@ class AgentChatLoop:
             self.on_trace(event_type, message, payload, level)
         except Exception:
             # Trace output is cosmetic; never let it break the agent loop.
+            pass
+
+    def _log_thinking(self, thinking: str, round_index: int) -> None:
+        """Persist the full reasoning trace to the session log (the visible
+        trace only shows a short glimpse). Best-effort; never breaks the loop."""
+        if not self.session_logger:
+            return
+        try:
+            self.session_logger.log(
+                "llm.thinking",
+                {"model": self.model_name, "round": round_index, "thinking": thinking[:4000]},
+                "Model reasoning trace",
+                workflow_id="agent-chat",
+            )
+        except Exception:
             pass
 
     def _handle_ask_user(
@@ -1048,8 +1215,58 @@ def _describe_tool_call(name: str, arguments: dict[str, Any]) -> str:
     return f"Tool: {name}"
 
 
-def _system_prompt(workspace: Path) -> str:
-    return f"{AGENT_SYSTEM_PROMPT}\nWorkspace: {workspace}\n"
+# Injected for models that don't do native tool-calling (deepseek-r1/gemma3):
+# the salvager is the primary parser, so the model needs to know the exact JSON
+# shape to emit. Kept out of the prompt for tool-capable models, which get the
+# native tools schema instead.
+_TOOL_PROTOCOL_PROMPT = """
+## Tool protocol
+This model does not use native tool-calls. To use a tool, emit ONE JSON object
+and nothing else in that reply:
+{"name": "<tool>", "arguments": { ... }}
+Examples:
+{"name": "read_file", "arguments": {"filepath": "src/app.py"}}
+{"name": "run_command", "arguments": {"command": "pytest -q"}}
+{"name": "ask_user", "arguments": {"question": "Which file did you mean?"}}
+Use the exact argument names each tool documents. Emit the JSON only when you
+want to run a tool; otherwise answer normally in prose. Never wrap the JSON in
+extra commentary on the same turn.
+"""
+
+
+def _thinking_preview(thinking: str, limit: int = 200) -> str:
+    """A one-line, bounded glimpse of a reasoning trace for the normal-verbosity
+    Reasoning line (the full trace goes to the session log / verbose mode)."""
+    one_line = " ".join((thinking or "").split())
+    if len(one_line) <= limit:
+        return one_line
+    return one_line[:limit].rstrip() + "..."
+
+
+def _search_summary(query: str, results: Any) -> str:
+    """`"query" -> path (score), path (score)` for the visible context feed."""
+    hits = results if isinstance(results, list) else []
+    parts: list[str] = []
+    for hit in hits[:5]:
+        if not isinstance(hit, dict):
+            continue
+        path = str(hit.get("file_path") or hit.get("filepath") or "?")
+        try:
+            score = float(hit.get("score") or 0.0)
+            parts.append(f"{path} ({score:.2f})")
+        except (TypeError, ValueError):
+            parts.append(path)
+    listed = ", ".join(parts) if parts else "no hits"
+    return f'"{query}" -> {listed}'
+
+
+def _system_prompt(workspace: Path, include_tool_protocol: bool = False) -> str:
+    prompt = f"{AGENT_SYSTEM_PROMPT}\nWorkspace: {workspace}\n"
+    if include_tool_protocol:
+        prompt += _TOOL_PROTOCOL_PROMPT
+    return prompt
+
+
 
 
 def _friendly_ollama_error(exc: Exception) -> str:
@@ -1072,26 +1289,6 @@ def _message_from_response(response: Any) -> Any:
     return _get(response, "message", response)
 
 
-def _tool_calls_from_message(message: Any) -> list[dict[str, Any]]:
-    calls = _get(message, "tool_calls", []) or []
-    normalized: list[dict[str, Any]] = []
-    for call in calls:
-        if isinstance(call, dict):
-            normalized.append(call)
-        else:
-            function = _get(call, "function", {})
-            normalized.append(
-                {
-                    "id": _get(call, "id", ""),
-                    "function": {
-                        "name": _get(function, "name", ""),
-                        "arguments": _get(function, "arguments", {}),
-                    },
-                }
-            )
-    return normalized
-
-
 def _tool_call_id(call: dict[str, Any], fallback: str) -> str:
     return str(call.get("id") or fallback)
 
@@ -1111,27 +1308,6 @@ def _tool_call_arguments(call: dict[str, Any]) -> dict[str, Any]:
             return {}
         return parsed if isinstance(parsed, dict) else {}
     return arguments if isinstance(arguments, dict) else {}
-
-
-def _json_action_tool_call(content: str) -> dict[str, Any] | None:
-    stripped = content.strip()
-    if not stripped or not (stripped.startswith("{") and stripped.endswith("}")):
-        return None
-    try:
-        data = json.loads(stripped)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    action = data.get("action")
-    arguments = data.get("arguments")
-    allowed = {"list_files", "read_file", "write_file", "run_command", "search_index"}
-    if action not in allowed or not isinstance(arguments, dict):
-        return None
-    return {
-        "id": f"json_action_{action}",
-        "function": {"name": action, "arguments": arguments},
-    }
 
 
 def _compact_value(value: Any, limit: int = 6000) -> Any:
@@ -1156,6 +1332,34 @@ def _truncate_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[:limit]}\n... [truncated {len(text) - limit} chars]"
+
+
+_TOOL_RESULT_TRUNCATION_HINT = (
+    " ... [tool result truncated to fit ~{budget} tokens. Re-run this tool with a "
+    "narrower scope to see more: read_file with start_line/end_line, grep_files with "
+    "a more specific query or an extensions filter, or a more specific path.]"
+)
+
+
+def _budget_tool_result_json(text: str, max_tokens: int) -> str:
+    """Cap a serialized tool result to ``max_tokens`` BEFORE it enters history, so
+    one oversized read/grep can't crowd the window mid-loop. Under budget passes
+    through unchanged; over budget is trimmed with a hint on how to see more."""
+    if max_tokens <= 0:
+        return text
+    total = count_tokens(text)
+    if total <= max_tokens:
+        return text
+    hint = _TOOL_RESULT_TRUNCATION_HINT.format(budget=max_tokens)
+    # Proportional first cut (chars-per-token), then shrink until it fits, leaving
+    # room for the hint.
+    budget_chars = max(200, len(text) * max_tokens // max(total, 1))
+    truncated = text[:budget_chars]
+    while truncated and count_tokens(truncated + hint) > max_tokens:
+        truncated = truncated[: max(100, int(len(truncated) * 0.85))]
+        if len(truncated) <= 100:
+            break
+    return truncated + hint
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:

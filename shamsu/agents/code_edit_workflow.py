@@ -18,6 +18,7 @@ from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
+from shamsu.llm.output import strip_reasoning
 from shamsu.memory.service import MemoryService
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.templates.frontend import frontend_prompt_rules
@@ -150,7 +151,10 @@ class CodeEditWorkflow:
 
 
 def _clean_diff(raw: str) -> str:
-    text = raw.strip()
+    # Strip any <think> reasoning first (a reasoning model would otherwise embed
+    # its trace in the diff) via the shared model-I/O boundary, then remove a
+    # ``` fence wrapping the whole diff.
+    text = strip_reasoning(raw)
     if text.startswith("```"):
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):

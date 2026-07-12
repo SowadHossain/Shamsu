@@ -14,17 +14,19 @@ from shamsu.runtime.models import (
 
 def test_default_tier_uses_deepseek_r1_for_thinking_and_qwen_coder_for_code():
     assert active_tier() is DEFAULT_TIER
-    # Thinking/router/qa/planner roles run on DeepSeek R1 Distill Qwen 7B;
-    # coding stays qwen2.5-coder.
-    assert model_for_role("router") == "deepseek-r1:7b"
+    # Thinking/qa/planner roles run on DeepSeek R1 Distill Qwen 7B; coding stays
+    # qwen2.5-coder. The router runs on the fast instruct (coding) anchor to skip
+    # the reasoning model's per-turn chain-of-thought (G13).
     assert model_for_role("qa") == "deepseek-r1:7b"
     assert model_for_role("coder") == "qwen2.5-coder:7b-instruct"
+    assert model_for_role("router") == "qwen2.5-coder:7b-instruct"
 
 
 def test_light_tier_uses_small_cpu_friendly_models(tmp_path):
     set_model_tier(tmp_path, ModelTier.LIGHT)
 
-    assert model_for_role("router") == "qwen2.5:3b-instruct"
+    # Router runs on the small instruct (coding) anchor, not the thinking anchor.
+    assert model_for_role("router") == "qwen2.5-coder:3b-instruct"
     assert model_for_role("coder") == "qwen2.5-coder:3b-instruct"
     assert required_model_names() == ["qwen2.5:3b-instruct", "qwen2.5-coder:3b-instruct"]
 
@@ -90,3 +92,17 @@ def test_single_model_mode_uses_active_tiers_thinking_model(tmp_path, monkeypatc
 
     assert model_for_role("coder") == "qwen2.5:3b-instruct"
     assert required_model_names() == ["qwen2.5:3b-instruct"]
+
+
+def test_router_avoids_the_reasoning_anchor_on_every_tier(tmp_path):
+    # G13: the router must not run on the reasoning/thinking anchor (which would
+    # add per-turn chain-of-thought latency); it uses the instruct coding anchor,
+    # which is already required so no extra model is pulled.
+    from shamsu.runtime.models import model_is_reasoning
+
+    for tier in (ModelTier.LIGHT, ModelTier.DEFAULT, ModelTier.HEAVY):
+        set_model_tier(tmp_path, tier)
+        router = model_for_role("router")
+        assert router == model_for_role("coder")
+        assert model_is_reasoning(router) is False
+        assert router in required_model_names()

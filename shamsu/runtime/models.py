@@ -29,6 +29,17 @@ class ModelSpec:
     required: bool = True
     max_vram_gb: float = 8.0
     notes: str = ""
+    # Capability flags the agent loop uses instead of assuming every model does
+    # native tool-calling / clean reasoning separation:
+    #   supports_native_tools - pass a `tools=` schema and prefer native
+    #     tool_calls (the output salvager still backs it up). Models that don't
+    #     do native tools get a compact tool protocol in the prompt and rely on
+    #     the salvager as the PRIMARY parser (passing them a schema confuses them).
+    #   is_reasoning - a chain-of-thought model (deepseek-r1/qwen3); send
+    #     think=true so reasoning separates into the `thinking` field instead of
+    #     leaking inline <think> into the answer.
+    supports_native_tools: bool = False
+    is_reasoning: bool = False
 
 
 class ModelTier(str, Enum):
@@ -67,12 +78,14 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
             _THINKING_ROLES,
             max_vram_gb=3.0,
             notes="Lightweight thinking/text anchor - runs on 8GB RAM, CPU-only machines.",
+            supports_native_tools=True,
         ),
         ModelSpec(
             "qwen2.5-coder:3b-instruct",
             _CODING_ROLES,
             max_vram_gb=3.0,
             notes="Lightweight coding anchor - runs on 8GB RAM, CPU-only machines.",
+            supports_native_tools=True,
         ),
     ),
     ModelTier.DEFAULT: (
@@ -83,12 +96,15 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
             notes="Thinking/text anchor for routing, planning, review, docs, and chat. "
             "Ollama tag for DeepSeek-R1-Distill-Qwen-7B; the coder anchor stays "
             "a qwen2.5-coder.",
+            supports_native_tools=False,
+            is_reasoning=True,
         ),
         ModelSpec(
             "qwen2.5-coder:7b-instruct",
             _CODING_ROLES,
             max_vram_gb=8.0,
             notes="Coding anchor for generation, tests, and repair loops.",
+            supports_native_tools=True,
         ),
     ),
     ModelTier.HEAVY: (
@@ -97,6 +113,7 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
             _THINKING_ROLES,
             max_vram_gb=12.0,
             notes="Heavier thinking/text anchor for 16GB+ RAM machines.",
+            supports_native_tools=True,
         ),
         ModelSpec(
             "qwen2.5-coder:14b",
@@ -107,6 +124,7 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
                 "12B thinking-model ceiling because Qwen2.5-Coder has no ~12B "
                 "step (7B -> 14B)."
             ),
+            supports_native_tools=True,
         ),
     ),
 }
@@ -123,9 +141,11 @@ MODEL_SPECS: tuple[ModelSpec, ...] = TIER_MODEL_SPECS[ModelTier.DEFAULT]
 # stay first-class known models for anyone who kept them installed.
 _ALLOWED_EXTRA_SPECS: tuple[ModelSpec, ...] = (
     ModelSpec("qwen3:8b", roles=(), required=False, max_vram_gb=8.0,
-              notes="Former default thinking anchor; kept allowed for existing installs."),
+              notes="Former default thinking anchor; kept allowed for existing installs.",
+              supports_native_tools=True, is_reasoning=True),
     ModelSpec("gemma3:4b", roles=(), required=False, max_vram_gb=4.0,
-              notes="Former default thinking anchor; kept allowed for existing installs."),
+              notes="Former default thinking anchor; kept allowed for existing installs.",
+              supports_native_tools=False),
 )
 
 # Union across every tier + allowed extras - used for cookbook membership
@@ -210,6 +230,11 @@ def _thinking_model_for_tier(tier: ModelTier) -> str:
     return TIER_MODEL_SPECS[tier][0].name
 
 
+def _coding_model_for_tier(tier: ModelTier) -> str:
+    # The second spec in each tier tuple is the coding/instruct anchor.
+    return TIER_MODEL_SPECS[tier][1].name
+
+
 def single_model_mode_enabled() -> bool:
     value = os.environ.get("SHAMSU_SINGLE_MODEL_MODE", "")
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -219,7 +244,39 @@ def model_for_role(role: str) -> str:
     tier = active_tier()
     if single_model_mode_enabled():
         return _thinking_model_for_tier(tier)
+    if role == "router":
+        # The router runs a schema-constrained JSON classification every turn.
+        # Run it on the tier's fast INSTRUCT (coding) anchor instead of the
+        # reasoning anchor (deepseek-r1 / mistral-nemo), whose per-turn
+        # chain-of-thought is pure latency for pure classification. The coding
+        # anchor is already required/pulled, so this costs no extra model.
+        return _coding_model_for_tier(tier)
     return _role_models_for_tier(tier).get(role, _thinking_model_for_tier(tier))
+
+
+def model_spec(model_name: str) -> ModelSpec | None:
+    """The cookbook :class:`ModelSpec` for *model_name*, or None if it is a
+    user-supplied model SHAMSU doesn't recognize."""
+    return MODEL_COOKBOOK.get(model_name)
+
+
+def model_supports_native_tools(model_name: str) -> bool:
+    """Whether to pass a native ``tools=`` schema to *model_name*.
+
+    Known models use their explicit ``ModelSpec`` flag. An unrecognized (custom)
+    model is assumed tool-capable so we keep passing a schema — the output
+    salvager backs it up either way, and refusing to pass a schema to a model
+    that actually supports tools would be the bigger regression."""
+    spec = MODEL_COOKBOOK.get(model_name)
+    return spec.supports_native_tools if spec is not None else True
+
+
+def model_is_reasoning(model_name: str) -> bool:
+    """Whether *model_name* is a chain-of-thought model that should be asked to
+    ``think`` so its reasoning separates into the ``thinking`` field. Unknown
+    models are assumed non-reasoning."""
+    spec = MODEL_COOKBOOK.get(model_name)
+    return spec.is_reasoning if spec is not None else False
 
 
 def is_allowed_model(model_name: str) -> bool:

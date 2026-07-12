@@ -1,13 +1,14 @@
-# SHAMSU MVP Benchmark
+# SHAMSU Eval Benchmark
 
-Representative PRD generation benchmark. Setup/test commands are simulated so the benchmark measures SHAMSU orchestration and file generation without installing generated-project dependencies.
+- **Tier:** default
+- **Pass rate:** 6/6 (100%)
 
-- Peak RSS: 49.5 MB
-- Target peak: under 7168 MB
-- Status: PASS
+| Case | Result | Time | Notes |
+|------|--------|------|-------|
+| qa_reads_repo_fact | PASS | 23.3s |  |
+| create_file | PASS | 25.6s |  |
+| edit_file_targeted | PASS | 25.3s |  |
+| bugfix_syntax_error | PASS | 23.2s |  |
+| run_command_verify | PASS | 19.1s |  |
+| ask_user_clarifies | PASS | 22.9s |  |
 
-| PRD | Runtime Seconds | RSS MB | Success |
-| --- | ---: | ---: | --- |
-| blog.md | 0.039 | 49.2 | True |
-| expense_tracker.md | 0.051 | 49.4 | True |
-| todo.md | 0.050 | 49.5 | True |

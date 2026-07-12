@@ -144,8 +144,9 @@ async def test_route_ensures_router_model_before_routing(monkeypatch, tmp_path):
     manager = RoutingStub()
     await manager.route("hello", "a project")
 
-    # The router role resolves to the default tier's thinking anchor.
-    assert calls == ["deepseek-r1:7b"]
+    # The router role resolves to the default tier's instruct (coding) anchor -
+    # it skips the reasoning anchor's per-turn chain-of-thought (G13).
+    assert calls == ["qwen2.5-coder:7b-instruct"]
 
 
 @pytest.mark.asyncio

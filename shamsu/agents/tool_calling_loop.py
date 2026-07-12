@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.llm.manager import LLMManager
+from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
 from shamsu.runtime.models import model_for_role
 from shamsu.runtime.run_control import complete_run, register_run
 from shamsu.session.manager import SessionLogger
@@ -73,6 +73,12 @@ class ToolCallingAgentLoop:
         self.max_tool_iterations = max_tool_iterations
         self.max_runtime_seconds = max_runtime_seconds
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": ACTION_AGENT_SYSTEM_PROMPT}]
+        # Names the shared output salvager may recover calls for (native calls
+        # always pass through so an unknown tool still surfaces honestly).
+        self._registered_tool_names = {
+            str((schema.get("function") or {}).get("name") or "")
+            for schema in self.tools.tool_schemas()
+        }
 
     async def run(self, user_input: str) -> ToolCallingAgentResult:
         control = register_run(
@@ -104,20 +110,27 @@ class ToolCallingAgentLoop:
                         return ToolCallingAgentResult(self.run_id, final, RunStatus.CANCELLED, iteration)
                     self._inject_feedback(control)
                     continue
-                message = _message_from_response(response)
-                content = str(message.get("content") or "")
-                tool_calls = _tool_calls_from_message(message)
-                self.messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+                # Single normalization boundary (same parser as the chat loop):
+                # native tool_calls when present, else salvaged from content.
+                turn = parse_model_turn(response, self._registered_tool_names)
+                content = turn.text
+                tool_calls = turn.tool_calls
+                self.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": [tool_call_to_message_dict(call) for call in tool_calls],
+                    }
+                )
                 if not tool_calls:
                     final = content
                     complete_run(self.run_id, RunStatus.COMPLETED, final)
                     return ToolCallingAgentResult(self.run_id, final, RunStatus.COMPLETED, iteration)
-                for call in tool_calls:
+                for tool_call in tool_calls:
                     if control.cancel_event.is_set():
                         final = "Run cancelled."
                         complete_run(self.run_id, RunStatus.CANCELLED, final)
                         return ToolCallingAgentResult(self.run_id, final, RunStatus.CANCELLED, iteration)
-                    tool_call = _normalize_tool_call(call)
                     result = self._execute_tool(tool_call)
                     self.messages.append(
                         {
@@ -207,34 +220,3 @@ class ToolCallingAgentLoop:
             control.feedback_event.clear()
 
 
-def _message_from_response(response: Any) -> dict[str, Any]:
-    message = response.get("message", response) if isinstance(response, dict) else getattr(response, "message", response)
-    if isinstance(message, dict):
-        return message
-    return {
-        "content": str(getattr(message, "content", "") or ""),
-        "tool_calls": getattr(message, "tool_calls", []) or [],
-    }
-
-
-def _tool_calls_from_message(message: dict[str, Any]) -> list[dict[str, Any]]:
-    calls = message.get("tool_calls") or []
-    return [call for call in calls if isinstance(call, dict)]
-
-
-def _normalize_tool_call(call: dict[str, Any]) -> ToolCall:
-    function = call.get("function") or {}
-    args = function.get("arguments") or {}
-    if isinstance(args, str):
-        try:
-            parsed = json.loads(args)
-        except json.JSONDecodeError:
-            parsed = {}
-        args = parsed if isinstance(parsed, dict) else {}
-    if not isinstance(args, dict):
-        args = {}
-    return ToolCall(
-        id=str(call.get("id") or function.get("name") or ""),
-        name=str(function.get("name") or ""),
-        arguments=args,
-    )

@@ -1,0 +1,119 @@
+"""Tests for the eval harness framework (evals/harness.py) using a fake driver,
+so the runner/scoring/reporting is provable without Ollama. The seed cases
+themselves are exercised live via `python -m evals`."""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from evals.cases import SEED_CASES
+from evals.harness import EvalCase, EvalReport, EvalResult, render_report, run_evals
+
+
+def _passing_case(name: str = "ok") -> EvalCase:
+    return EvalCase(
+        name=name,
+        prompt="do the thing",
+        seed=lambda ws: (ws / "seed.txt").write_text("seeded", encoding="utf-8"),
+        check=lambda ws, final: (ws / "made.txt").is_file() and "done" in final,
+    )
+
+
+async def _driver_that_writes(workspace: Path, case: EvalCase) -> str:
+    # A faithful fake: honors the seed, produces the artifact the check wants.
+    assert (workspace / "seed.txt").is_file(), "seed should run before the driver"
+    (workspace / "made.txt").write_text("x", encoding="utf-8")
+    return "done"
+
+
+async def _driver_that_noops(workspace: Path, case: EvalCase) -> str:
+    return "nothing happened"
+
+
+async def _driver_that_raises(workspace: Path, case: EvalCase) -> str:
+    raise RuntimeError("model exploded")
+
+
+@pytest.mark.asyncio
+async def test_run_evals_scores_pass(tmp_path: Path):
+    report = await run_evals([_passing_case()], driver=_driver_that_writes, tier="default")
+    assert report.total == 1
+    assert report.passed == 1
+    assert report.pass_rate == 1.0
+    assert report.results[0].status == "PASS"
+
+
+@pytest.mark.asyncio
+async def test_run_evals_scores_fail_on_check():
+    report = await run_evals([_passing_case()], driver=_driver_that_noops)
+    assert report.passed == 0
+    assert report.results[0].status == "FAIL"
+    assert report.results[0].error == ""
+
+
+@pytest.mark.asyncio
+async def test_run_evals_records_driver_exception_as_error():
+    report = await run_evals([_passing_case()], driver=_driver_that_raises)
+    result = report.results[0]
+    assert result.passed is False
+    assert result.status == "ERROR"
+    assert "model exploded" in result.error
+
+
+@pytest.mark.asyncio
+async def test_each_case_gets_an_isolated_workspace():
+    seen: list[Path] = []
+
+    async def _driver(workspace: Path, case: EvalCase) -> str:
+        seen.append(workspace)
+        return "done"
+
+    cases = [_passing_case("a"), _passing_case("b")]
+    await run_evals(cases, driver=_driver)
+    assert len(seen) == 2
+    assert seen[0] != seen[1]  # distinct temp dirs, no cross-contamination
+
+
+@pytest.mark.asyncio
+async def test_check_receives_final_text():
+    got: dict[str, str] = {}
+
+    async def _driver(workspace: Path, case: EvalCase) -> str:
+        return "the answer is 42"
+
+    def _check(workspace: Path, final: str) -> bool:
+        got["final"] = final
+        return "42" in final
+
+    report = await run_evals(
+        [EvalCase(name="qa", prompt="q", check=_check)], driver=_driver
+    )
+    assert report.passed == 1
+    assert got["final"] == "the answer is 42"
+
+
+def test_render_report_contains_rate_and_cases():
+    report = EvalReport(
+        results=[
+            EvalResult(name="alpha", passed=True, duration_s=1.2),
+            EvalResult(name="beta", passed=False, duration_s=3.4),
+            EvalResult(name="gamma", passed=False, error="TimeoutError: x", duration_s=5.0),
+        ],
+        tier="default",
+    )
+    text = render_report(report)
+    assert "1/3 (33%)" in text
+    assert "alpha" in text and "PASS" in text
+    assert "beta" in text and "FAIL" in text
+    assert "gamma" in text and "ERROR" in text
+    assert "Tier:** default" in text
+
+
+def test_seed_cases_are_well_formed():
+    names = [c.name for c in SEED_CASES]
+    assert len(names) == len(set(names)), "case names must be unique"
+    assert len(SEED_CASES) >= 6
+    for case in SEED_CASES:
+        assert case.prompt.strip()
+        assert callable(case.check)

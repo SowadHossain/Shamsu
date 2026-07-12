@@ -63,6 +63,62 @@ class MemoryService:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    # -- tombstones (forget/exclude-from-recall) -----------------------------
+
+    def _tombstones_path(self) -> Path:
+        return self.memory_dir / "tombstones.json"
+
+    def _load_tombstones(self) -> dict[str, set[str]]:
+        try:
+            data = json.loads(self._tombstones_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        return {
+            "ids": {str(x) for x in data.get("ids", []) if str(x).strip()},
+            "texts": {str(x) for x in data.get("texts", []) if str(x).strip()},
+        }
+
+    def _save_tombstones(self, data: dict[str, set[str]]) -> None:
+        self._write_json(
+            self._tombstones_path(),
+            {"ids": sorted(data["ids"]), "texts": sorted(data["texts"])},
+        )
+
+    def _add_tombstone(self, value: str) -> None:
+        value = str(value or "").strip()
+        if not value:
+            return
+        data = self._load_tombstones()
+        data["ids"].add(value)          # exact id/text match
+        data["texts"].add(_norm(value))  # normalized text/phrase match
+        self._save_tombstones(data)
+
+    def _remove_tombstone(self, value: str) -> None:
+        value = str(value or "").strip()
+        if not value:
+            return
+        data = self._load_tombstones()
+        if value in data["ids"] or _norm(value) in data["texts"]:
+            data["ids"].discard(value)
+            data["texts"].discard(_norm(value))
+            self._save_tombstones(data)
+
+    def _is_tombstoned(self, memory: LongTermMemory, tombstones: dict[str, set[str]] | None = None) -> bool:
+        data = tombstones if tombstones is not None else self._load_tombstones()
+        if not data["ids"] and not data["texts"]:
+            return False
+        memory_id = str(getattr(memory, "memory_id", "") or "")
+        if memory_id and memory_id in data["ids"]:
+            return True
+        text = _norm(getattr(memory, "text", "") or "")
+        if not text:
+            return False
+        if text in data["texts"]:
+            return True
+        # A distinctive forgotten phrase excludes any memory that contains it
+        # (min length guards against a short token matching everything).
+        return any(len(term) >= 8 and term in text for term in data["texts"])
+
     def _log_event(self, event: str, detail: dict[str, Any]) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         line = json.dumps({"event": event, "ts": time.time(), **detail}, ensure_ascii=True)
@@ -139,6 +195,9 @@ class MemoryService:
             result = {"ok": False, "skipped": True, "reason": decision.reason}
             self._log_event("remember_skipped", result)
             return result
+        # Deliberately storing a fact un-forgets it (clears a prior tombstone) so
+        # a wrong-then-corrected fact can come back.
+        self._remove_tombstone(decision.text)
         if self._use_fallback():
             result = self.fallback.remember(decision.text, decision.kind, metadata)
             self._log_event("remember_sqlite", {"ok": bool(result.get("ok")), "kind": decision.kind})
@@ -163,10 +222,17 @@ class MemoryService:
         return result
 
     def get_relevant(self, user_prompt: str, task_type: str | None = None, limit: int = 8) -> list[LongTermMemory]:
+        tombstones = self._load_tombstones()
+        # Over-fetch a little when tombstones exist so filtering forgotten facts
+        # doesn't shrink the result below `limit`.
+        extra = len(tombstones["ids"]) + len(tombstones["texts"])
+        fetch = min(limit + extra, limit + 50) if extra else limit
         if self._use_fallback():
             # Graphiti down: recall from the local SQLite store instead of empty.
-            return _dedupe_memories(self.fallback.get_relevant(user_prompt, task_type, limit))[:limit]
-        memories = self.adapter.get_relevant(self.workspace, user_prompt, task_type, limit)
+            memories = self.fallback.get_relevant(user_prompt, task_type, fetch)
+        else:
+            memories = self.adapter.get_relevant(self.workspace, user_prompt, task_type, fetch)
+        memories = [memory for memory in memories if not self._is_tombstoned(memory, tombstones)]
         return _dedupe_memories(memories)[:limit]
 
     def render_relevant(self, user_prompt: str, task_type: str | None = None, limit: int = 8) -> str:
@@ -179,11 +245,35 @@ class MemoryService:
         return "\n".join(lines)
 
     def forget(self, memory_id_or_query: str) -> dict[str, Any]:
+        """Evict a wrong fact so it is never recalled again.
+
+        SHAMSU owns a tombstone list (`.shamsu/memory/tombstones.json`) that is
+        applied on every recall, so forgetting works even when the backend can't
+        hard-delete (Graphiti's adapter doesn't expose deletion). We also attempt
+        a best-effort backend delete; either way the fact is excluded from recall.
+        """
+        value = str(memory_id_or_query or "").strip()
+        if not value:
+            return {"ok": False, "error": "forget needs a memory id or a query text."}
+        self._add_tombstone(value)
         if self._use_fallback():
-            return self.fallback.forget(memory_id_or_query)
-        result = self.adapter.forget(self.workspace, memory_id_or_query)
-        self._log_event("forget", {"ok": bool(result.get("ok")), "query": memory_id_or_query, "error": result.get("error", "")})
-        return result
+            backend = self.fallback.forget(value)
+        else:
+            backend = self.adapter.forget(self.workspace, value)
+        backend_ok = bool(backend.get("ok"))
+        self._log_event(
+            "forget",
+            {"ok": True, "query": value, "backend_deleted": backend_ok, "backend_error": backend.get("error", "")},
+        )
+        message = "Removed from recall (tombstoned)."
+        message += (
+            " Also hard-deleted from the backend store."
+            if backend_ok
+            else " The backend copy (if any) will be filtered out of every future recall."
+        )
+        # Preserve backend fields (e.g. an id echo) but always report ok=True: the
+        # fact will not be recalled again regardless of backend deletion support.
+        return {**backend, "ok": True, "tombstoned": True, "backend_deleted": backend_ok, "message": message}
 
     def summarize_session(self, session_id: str) -> dict[str, Any]:
         session_events = self.workspace / ".shamsu" / "sessions" / session_id / "events.jsonl"

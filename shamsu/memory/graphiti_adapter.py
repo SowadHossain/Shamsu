@@ -562,7 +562,10 @@ async def main():
         print(json.dumps({"ok": True, "results": out}))
         return
     if action == "forget":
-        print(json.dumps({"ok": False, "error": "Graphiti deletion is not exposed by this adapter yet; search candidates and remove with the upstream tool if needed."}))
+        # graphiti-core versions differ on their deletion API, so we don't hard-
+        # delete from here; SHAMSU tombstones the fact (MemoryService) so it is
+        # excluded from every recall regardless of the backend.
+        print(json.dumps({"ok": False, "error": "Backend hard-delete not performed; SHAMSU tombstones the fact so it is excluded from recall."}))
         return
     print(json.dumps({"ok": False, "error": f"Unsupported action: {action}"}))
 

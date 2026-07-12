@@ -43,7 +43,7 @@ from shamsu.diagnostics import setup as diagnostics_setup
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.diagnostics.setup import DiagnosticsWorkspace
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
-from shamsu.agents.chat_loop import AgentChatLoop
+from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
@@ -59,6 +59,9 @@ from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
 from shamsu.llm.manager import LLMManager, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
+from shamsu.context.progress import render_progress_checklist
+from shamsu.prd.contract import extract_contract
+from shamsu.verify.gate import verify_only
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec, is_static_frontend_prd
 from shamsu.prd.state import create_generation_state, save_generation_state
@@ -298,6 +301,7 @@ SYSTEM_COMMANDS = (
     "/context budget",
     "/context inspect",
     "/context compact",
+    "/context show",
     "/edit ",
     "/fix ",
     "/test-gen ",
@@ -412,6 +416,7 @@ def _print_help(console: Console) -> None:
                     "  /context budget           Show last model call's token budget",
                     "  /context inspect          Detailed budget breakdown",
                     "  /context compact          Show auto-compact threshold and last status",
+                    "  /context show             Show observability + what the working trace surfaces",
                     "  /models status            Show local Ollama/model status",
                     "  /models pull              Pull missing local models",
                     "  /models repair            Start Ollama and pull missing models",
@@ -2828,8 +2833,27 @@ def _handle_context(
                 "when usage exceeds the threshold. "
                 "Exact code snippets, file paths, error codes, and imports are always preserved.[/dim]"
             )
+    elif sub == "show":
+        from shamsu.agents.chat_loop import _CHAT_MAX_CTX, _TOOL_RESULT_MAX_TOKENS
+        from shamsu.ui.trace import read_trace_mode
+
+        lines = [
+            f"Trace mode         : {read_trace_mode(workspace)}",
+            f"Chat context window: {_CHAT_MAX_CTX // 1024}k tokens (SHAMSU_CHAT_MAX_CTX)",
+            f"Per-tool-result cap: {_TOOL_RESULT_MAX_TOKENS:,} tokens (SHAMSU_TOOL_RESULT_MAX_TOKENS)",
+            "",
+            "The working trace now surfaces (at 'normal' verbosity):",
+            "  - Search : each search_index query + its top file hits and scores",
+            "  - Reasoning : a dim one-line glimpse of the model's reasoning trace",
+            "  - Verify : the deterministic verify verdict after writes",
+            "",
+            "Use `/trace verbose` for full args + reasoning, `/context budget` for the",
+            "last model call's token usage, `/context status` for windows/calibration.",
+        ]
+        console.print(Panel("\n".join(lines), title="Context & Observability", border_style="cyan"))
+
     else:
-        console.print("[red]Usage: /context status|budget|inspect|compact[/red]")
+        console.print("[red]Usage: /context status|budget|inspect|compact|show[/red]")
 
 
 def _os_env_flag(name: str) -> bool:
@@ -5923,15 +5947,16 @@ async def _handle_prd_build_request(
     task = _create_prd_build_task(user_input, parsed.title, milestones)
     save_task(task, workspace)
     console.print(f"[dim]Tracking PRD build task: {task.task_id}[/dim]")
-    prd_text = parsed.raw_text or _render_sections(parsed)
+    prd_brief = _prd_brief(parsed)
+    changed_files: list[str] = []
     for index, milestone in enumerate(milestones):
         step = task.steps[index]
         task = mark_step_running(task, step.id)
         save_task(task, workspace)
         console.print(f"[dim]  -> Milestone {index + 1}/{len(milestones)}: {milestone}[/dim]")
         try:
-            await _run_agent_chat(
-                _build_prd_milestone_request(parsed.title, relative_path, prd_text, milestone, index + 1, len(milestones)),
+            result = await _run_agent_chat(
+                _build_prd_milestone_request(parsed.title, relative_path, prd_brief, milestones, index + 1, len(milestones)),
                 workspace,
                 console,
                 session_logger=session_logger,
@@ -5942,6 +5967,9 @@ async def _handle_prd_build_request(
             task = mark_step_failed(task, step.id, str(exc))
             save_task(task, workspace)
             raise
+        for path in getattr(result, "changed_files", ()) or ():
+            if path not in changed_files:
+                changed_files.append(path)
         task = mark_step_done(task, step.id, "Agent completed this milestone build pass.")
         if index < len(milestones) - 1:
             if not advance_phase(task, f"milestone-{index + 2}"):
@@ -5950,6 +5978,8 @@ async def _handle_prd_build_request(
                 return
         save_task(task, workspace)
     console.print(f"[green]PRD milestone build flow complete. Task: {task.task_id}[/green]")
+    # Integration check across everything the milestones built (mirrors /proceed).
+    await _verify_completed_plan(changed_files, workspace, console, session_logger)
 
 
 def _multiplayer_template_present(workspace: Path) -> bool:
@@ -6005,25 +6035,41 @@ def _build_prd_build_request(parsed, relative_path: Path) -> str:
     )
 
 
+def _prd_brief(parsed: Any) -> str:
+    """Compact, structured PRD summary for per-milestone prompts, so the raw PRD
+    text is not re-dumped into every milestone (G10). The agent still has the PRD
+    file path and can read the full text when it needs exact detail. Falls back
+    to the section outline (still far smaller than raw_text) if extraction fails."""
+    try:
+        brief = extract_contract(parsed).render_brief()
+        if brief.strip():
+            return brief
+    except Exception:
+        pass
+    return _render_sections(parsed)
+
+
 def _build_prd_milestone_request(
     title: str,
     relative_path: Path,
-    prd_text: str,
-    milestone: str,
+    prd_brief: str,
+    milestones: list[str],
     milestone_index: int,
     milestone_count: int,
 ) -> str:
+    checklist = render_progress_checklist(milestones, milestone_index - 1, header="Milestones")
     return (
         f"{PRD_BUILD_FRAMING}\n\n"
         f"Project: {title}\n"
-        f"PRD file: {relative_path.as_posix()}\n"
-        f"Current milestone {milestone_index}/{milestone_count}: {milestone}\n\n"
-        "FIRST list and read the files already in the workspace (index.html, style.css, script.js, etc.) so "
-        "you build ON TOP of the previous milestones instead of replacing their work. THEN implement only this "
-        "milestone by editing and extending those files. Every feature from earlier milestones must keep "
-        "working, index.html must load script.js (with no inline game logic left behind), and you must write "
+        f"PRD file: {relative_path.as_posix()} (read it if you need exact detail)\n"
+        f"Current milestone {milestone_index}/{milestone_count}: {milestones[milestone_index - 1]}\n\n"
+        "FIRST list and read the files already in the workspace so you build ON TOP of the previous "
+        "milestones instead of replacing their work. THEN implement only the current milestone by "
+        "editing and extending those files. Every feature from earlier milestones must keep working, "
+        "entry files must still load their scripts (no orphaned inline logic), and you must write "
         "complete runnable files. Verify with run_command when possible.\n\n"
-        f"Full PRD context:\n{prd_text}"
+        f"{prd_brief}\n\n"
+        f"{checklist}"
     )
 
 
@@ -6161,14 +6207,15 @@ async def _execute_plan(
     console.print(
         f"[green]Executing the approved plan - {len(steps)} step(s). Tracking task {task_obj.task_id}.[/green]"
     )
+    changed_files: list[str] = []
     for index, step_text in enumerate(steps):
         step = task_obj.steps[index]
         task_obj = mark_step_running(task_obj, step.id)
         save_task(task_obj, workspace)
         console.print(f"[cyan]  -> Step {index + 1}/{len(steps)}: {step_text}[/cyan]")
         try:
-            await _run_agent_chat(
-                _plan_step_request(task, plan_markdown, step_text, index + 1, len(steps)),
+            result = await _run_agent_chat(
+                _plan_step_request(task, steps, index + 1, len(steps)),
                 workspace,
                 console,
                 session_logger=session_logger,
@@ -6179,9 +6226,55 @@ async def _execute_plan(
             task_obj = mark_step_failed(task_obj, step.id, str(exc))
             save_task(task_obj, workspace)
             raise
+        for path in getattr(result, "changed_files", ()) or ():
+            if path not in changed_files:
+                changed_files.append(path)
         task_obj = mark_step_done(task_obj, step.id, "Agent completed this plan step.")
         save_task(task_obj, workspace)
     console.print(f"[green]Plan execution complete. Task: {task_obj.task_id}[/green]")
+    # Integration check: a later step may have broken an earlier step's file, so
+    # verify the whole changed set once at the end (never claim done unverified).
+    await _verify_completed_plan(changed_files, workspace, console, session_logger)
+
+
+async def _verify_completed_plan(
+    changed_files: list[str],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> None:
+    """Run one deterministic lightweight verifier over everything the plan
+    changed and report an honest verdict. Best-effort: never raises."""
+    if not changed_files:
+        return
+    try:
+        outcome = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: verify_only(
+                workspace,
+                list(changed_files),
+                lightweight=True,
+                session_logger=session_logger,
+            ),
+        )
+    except Exception:
+        return
+    if outcome.unverifiable:
+        console.print(
+            "[dim]No deterministic verifier available for these changes - left UNVERIFIED.[/dim]"
+        )
+        return
+    if outcome.verified:
+        console.print(Panel(outcome.summary, title="Plan verified", border_style="green"))
+    else:
+        console.print(
+            Panel(
+                f"{outcome.summary}\nThe plan's changes did NOT pass verification - "
+                "review the affected files before relying on the result.",
+                title="Plan UNVERIFIED",
+                border_style="red",
+            )
+        )
 
 
 def _create_plan_task(task: str, steps: list[str]) -> MilestoneTask:
@@ -6209,16 +6302,18 @@ def _plan_single_request(task: str, plan_markdown: str) -> str:
 
 
 def _plan_step_request(
-    task: str, plan_markdown: str, step_text: str, index: int, count: int
+    task: str, steps: list[str], index: int, count: int
 ) -> str:
+    """Build a step's request from a compact progress checklist instead of
+    re-dumping the whole plan markdown every step (G10). ``index`` is 1-based."""
+    checklist = render_progress_checklist(steps, index - 1, header="Plan steps")
     return (
         f"You are executing an approved plan, step {index} of {count}.\n\n"
-        "Read any files you need first, then implement ONLY this step by editing/creating files "
-        "with write_file/edit_file. Keep earlier steps' work intact and the project runnable. "
+        "Read any files you need first, then implement ONLY the current step by editing/creating "
+        "files with write_file/edit_file. Keep earlier steps' work intact and the project runnable. "
         "Verify with run_command when possible. Do not claim work you did not do.\n\n"
-        f"## This step\n{step_text}\n\n"
         f"## Original task\n{task}\n\n"
-        f"## Full approved plan (for context)\n{plan_markdown}"
+        f"{checklist}"
     )
 
 
@@ -6381,7 +6476,7 @@ async def _run_agent_chat(
     session_logger: SessionLogger | None = None,
     force_long_running: bool = False,
     auto_approve: bool = False,
-) -> None:
+) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
     # and verification commands during that build run without further prompts
@@ -6442,7 +6537,7 @@ async def _run_agent_chat(
         # record a "task completed" memory: nothing finished yet.
         console.print(Panel(body, title="Need Input", border_style="cyan"))
         _log_assistant_message(session_logger, body, workflow_id="clarification")
-        return
+        return result
     if result.stopped:
         progress.warning("Agent stopped before completing all requested work")
     else:
@@ -6453,6 +6548,7 @@ async def _run_agent_chat(
     # finished the work (a stopped/looping run is not a completed task).
     if not result.stopped:
         _finalize_session_work(session_logger, "agent-chat", user_input)
+    return result
 
 
 def _should_show_context_preview() -> bool:

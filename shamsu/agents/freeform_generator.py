@@ -34,6 +34,7 @@ from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import ProjectSpec
+from shamsu.verify.gate import default_verify_command
 
 _MAX_FILES = 30
 _BUILD_TIMEOUT_SECONDS = 600
@@ -293,23 +294,13 @@ class FreeformGenerator:
 
 def _default_verify(stack: str, contract: PRDContract | None, written: list[str]) -> str:
     """Pick a trustworthy build/syntax verifier from the stack + generated files.
-    Never uses a model-proposed command. Returns "" when nothing can verify."""
-    stack_l = (stack or "").lower()
-    hint = (contract.stack_hint if contract is not None else "") or ""
-    py_files = [f for f in written if f.endswith(".py")]
-    has_package_json = any(f.endswith("package.json") for f in written)
-    has_requirements = any(f.endswith("requirements.txt") for f in written)
+    Never uses a model-proposed command. Returns "" when nothing can verify.
 
-    if has_package_json or "node" in stack_l or "node" in hint or "vite" in stack_l:
-        return "npm install && npm run build"
-    if py_files or "python" in stack_l or "django" in stack_l or hint in {"python", "django"}:
-        if has_requirements:
-            # Install deps then byte-compile everything (a real import-time gate
-            # is unsafe to run blindly; py_compile is a deterministic syntax gate).
-            return "pip install -r requirements.txt && python3 -m py_compile " + " ".join(py_files)
-        if py_files:
-            return "python3 -m py_compile " + " ".join(py_files)
-    return ""
+    Thin wrapper over the shared ``verify.gate.default_verify_command`` (the
+    single source of truth), pinned to ``python3`` for backward compatibility
+    with the freeform build path."""
+    hint = (contract.stack_hint if contract is not None else "") or ""
+    return default_verify_command(written, stack=stack, stack_hint=hint, python_bin="python3")
 
 
 def _safe_rel_path(path: str) -> str:

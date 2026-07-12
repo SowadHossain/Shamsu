@@ -129,7 +129,11 @@ _EVENT_LABELS = {
     "route.detected": "Route",
     "plan.created": "Plan",
     "assistant.content": "Model",
+    "assistant.thinking": "Reasoning",
     "context.sent": "Context",
+    "context.search": "Search",
+    "verify.result": "Verify",
+    "tool.salvaged": "Salvaged",
     "llm.timeout": "Timeout",
     "step.started": "Step",
     "tool.started": "Tool",
@@ -144,6 +148,12 @@ _EVENT_LABELS = {
 _EVENT_STYLES = {
     "route.detected": "cyan",
     "plan.created": "cyan",
+    # Reasoning is surfaced but de-emphasized: the answer is what matters, the
+    # trace just proves the model reasoned and gives a glimpse.
+    "assistant.thinking": "dim",
+    "context.search": "cyan",
+    "verify.result": "cyan",
+    "tool.salvaged": "magenta",
     "clarification.needed": "yellow",
     "clarification.answered": "green",
     "tool.failed": "yellow",

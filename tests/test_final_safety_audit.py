@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from io import StringIO
 from pathlib import Path
 
@@ -162,4 +163,6 @@ def test_repl_help_does_not_expose_arbitrary_shell_execution():
     assert "django setup" in rendered
     assert "run <command>" not in rendered
     assert "shell" not in rendered
-    assert "exec" not in rendered
+    # Guard against a raw `exec` affordance in help, but not the benign English
+    # word "execute" (e.g. plan mode's "/proceed  Execute the last plan").
+    assert not re.search(r"\bexec\b", rendered)
