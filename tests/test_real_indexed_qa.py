@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import zipfile
 from io import StringIO
 
 from rich.console import Console
@@ -26,6 +27,22 @@ def _tools(root):
         WebTool(approval_func=lambda _request: False),
         BrowserTool(root, approval_func=lambda _request: False),
     )
+
+
+def _write_docx(tmp_path, rel: str, paragraphs: list[str]) -> None:
+    target = tmp_path / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = "".join(
+        f"<w:p><w:r><w:t>{paragraph}</w:t></w:r></w:p>"
+        for paragraph in paragraphs
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
+    with zipfile.ZipFile(target, "w") as archive:
+        archive.writestr("word/document.xml", xml)
 
 
 def _use_healthy_codebase_memory(monkeypatch, workspace, code_matches):
@@ -195,30 +212,28 @@ def test_repl_standalone_code_sample_uses_direct_code_route(monkeypatch, tmp_pat
     assert "Codebase-Memory MCP is not ready" not in rendered
 
 
-def test_repl_docx_read_prompt_uses_agent_tool_loop(monkeypatch, tmp_path):
+def test_repl_docx_read_prompt_reads_file_before_model(monkeypatch, tmp_path):
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
-    calls: list[str] = []
+    packs = []
+    _write_docx(
+        tmp_path,
+        "input_files/Practice01_FA.docx",
+        ["Question 1: What is 2 + 2?", "Question 2: Name one primary color."],
+    )
 
     class FakeAgentChatLoop:
-        def __init__(
-            self,
-            workspace,
-            session_logger=None,
-            tools=None,
-            long_running=False,
-            on_activity=None,
-            progress=None,
-            action_ledger=None,
-            **kwargs,
-        ):
-            assert workspace == tmp_path
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("explicit file-read prompts should pre-read the file")
 
-        async def run(self, user_input):
-            calls.append(user_input)
-            return type("Result", (), {"final": "Read and solved from DOCX.", "stopped": False})()
+    class FakeLLM:
+        async def run_specialist(self, role, pack):
+            assert role == "qa"
+            packs.append(pack)
+            return LLMResponse(raw="The answers are grounded in the DOCX.", model_used="fake")
 
     monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *args, **kwargs: FakeLLM())
 
     asyncio.run(
         _handle_request(
@@ -231,9 +246,54 @@ def test_repl_docx_read_prompt_uses_agent_tool_loop(monkeypatch, tmp_path):
     )
 
     rendered = output.getvalue()
-    assert "Read and solved from DOCX." in rendered
-    assert calls
-    assert "input_files/Practice01_FA.docx" in calls[0]
+    assert "The answers are grounded in the DOCX." in rendered
+    assert packs
+    assert "Question 1: What is 2 + 2?" in packs[0].prd_context
+    assert "Question 2: Name one primary color." in packs[0].prd_context
+    assert "The file has already been read successfully" in packs[0].user_request
+    assert "Codebase-Memory MCP is not ready" not in rendered
+
+
+def test_repl_vague_file_read_prompt_uses_single_input_file(monkeypatch, tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+    packs = []
+    _write_docx(
+        tmp_path,
+        "input_files/Practice01_FA.docx",
+        ["Sample problem: Convert this NFA to a DFA."],
+    )
+
+    class FakeAgentChatLoop:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("single input file prompts should pre-read the file")
+
+    class FakeLLM:
+        async def run_specialist(self, role, pack):
+            assert role == "qa"
+            packs.append(pack)
+            return LLMResponse(raw="Solved from the only input file.", model_used="fake")
+
+    monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *args, **kwargs: FakeLLM())
+
+    asyncio.run(
+        _handle_request(
+            "read the file and there are some sample problems given. Solve them",
+            tmp_path,
+            console,
+            web_tool,
+            browser_tool,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Solved from the only input file." in rendered
+    assert packs
+    assert "input_files/Practice01_FA.docx" in packs[0].prd_context
+    assert "Sample problem: Convert this NFA to a DFA." in packs[0].prd_context
+    assert "Detected problem statements:" in packs[0].user_request
+    assert "Sample problem: Convert this NFA to a DFA." in packs[0].user_request
     assert "Codebase-Memory MCP is not ready" not in rendered
 
 

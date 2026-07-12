@@ -3317,6 +3317,70 @@ def _append_agent_context(user_input: str, agent_context: str) -> str:
     return f"{user_input}\n\nAdditional SHAMSU context:\n{agent_context}"
 
 
+_READABLE_INPUT_FILE_SUFFIXES = {
+    ".docx", ".pdf", ".txt", ".md", ".csv", ".json", ".yaml", ".yml",
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css",
+}
+
+
+def _single_input_file_candidate(workspace: Path) -> str | None:
+    input_dir = workspace / "input_files"
+    if not input_dir.is_dir():
+        return None
+    candidates = [
+        path.relative_to(workspace).as_posix()
+        for path in input_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in _READABLE_INPUT_FILE_SUFFIXES
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _extract_requested_file_path(user_input: str, workspace: Path | None = None) -> str | None:
+    for token in re.split(r"\s+", user_input):
+        cleaned = token.strip(" \t\r\n'\"`@,.;:")
+        if re.fullmatch(
+            r"(?:[A-Za-z]:)?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_. -]+)*\.[A-Za-z0-9]{1,12}",
+            cleaned,
+        ):
+            return cleaned
+    match = _FILELIKE_RE.search(user_input)
+    if not match:
+        if workspace is not None and _looks_like_vague_file_read_request(user_input):
+            return _single_input_file_candidate(workspace)
+        return None
+    return match.group(0).strip(" \t\r\n'\"`@,.;:")
+
+
+def _extract_file_problem_lines(content: str) -> list[str]:
+    problems: list[str] = []
+    skip_phrases = (
+        "practice sheet",
+        "design dfas accepting",
+        "first, write down",
+        "convert the following nfa/enfa",
+        "convert the following nfa/",
+        "convert the following enfa",
+    )
+    problem_markers = (
+        "contain ",
+        "start ",
+        "have ",
+        "alternating ",
+        "convert ",
+        "draw ",
+    )
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(phrase in lowered for phrase in skip_phrases):
+            continue
+        if lowered.startswith(problem_markers):
+            problems.append(line)
+    return problems
+
+
 def _classify_route_label(effective_input: str, workspace: Path) -> str:
     """Coarse, read-only route label mirroring the branch order in
     `_handle_request` — used only to record `last_route` in session state, so a
@@ -3331,7 +3395,7 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
         return "workspace.files"
     if _looks_like_prd_build_request(effective_input, workspace):
         return "prd.build"
-    if _looks_like_file_read_request(effective_input):
+    if _looks_like_file_read_request(effective_input, workspace):
         return "file.read"
     if _looks_like_file_write_request(effective_input):
         return "file.write"
@@ -3424,12 +3488,14 @@ async def _handle_request(
     if _looks_like_prd_build_request(effective_input, workspace):
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
         return
-    if _looks_like_file_read_request(effective_input):
-        await _run_agent_chat(
-            _append_agent_context(effective_input, agent_context),
+    if _looks_like_file_read_request(effective_input, workspace):
+        await _handle_file_read_request(
+            effective_input,
             workspace,
             console,
+            _make_llm_manager(session_logger, console, workspace),
             session_logger=session_logger,
+            thinking_status=thinking_status,
         )
         return
     if _looks_like_file_write_request(effective_input):
@@ -4871,17 +4937,9 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     return bool(words & _FILE_HINT_WORDS)
 
 
-def _looks_like_file_read_request(user_input: str) -> bool:
-    """Route explicit file-reading/extraction prompts to the tool loop.
-
-    Without this guard, prompts like "read input_files/foo.docx and solve it"
-    can fall into workspace QA, where the model may answer from context instead
-    of actually calling read_file.
-    """
+def _looks_like_vague_file_read_request(user_input: str) -> bool:
     raw = user_input.strip().lower()
     if not raw:
-        return False
-    if not _FILELIKE_RE.search(user_input):
         return False
     words = set(re.sub(r"[^\w\s]", " ", raw).split())
     read_verbs = {
@@ -4894,7 +4952,35 @@ def _looks_like_file_read_request(user_input: str) -> bool:
         "answer",
         "parse",
     }
-    return bool(words & read_verbs) or "read_file" in raw
+    return bool(words & read_verbs) and bool(words & {"file", "document", "doc", "docx"})
+
+
+def _looks_like_file_read_request(user_input: str, workspace: Path | None = None) -> bool:
+    """Route explicit file-reading/extraction prompts to the tool loop.
+
+    Without this guard, prompts like "read input_files/foo.docx and solve it"
+    can fall into workspace QA, where the model may answer from context instead
+    of actually calling read_file.
+    """
+    raw = user_input.strip().lower()
+    if not raw:
+        return False
+    words = set(re.sub(r"[^\w\s]", " ", raw).split())
+    read_verbs = {
+        "read",
+        "open",
+        "extract",
+        "summarize",
+        "summarise",
+        "solve",
+        "answer",
+        "parse",
+    }
+    if _FILELIKE_RE.search(user_input):
+        return bool(words & read_verbs) or "read_file" in raw
+    if workspace is not None and _looks_like_vague_file_read_request(user_input):
+        return _single_input_file_candidate(workspace) is not None
+    return False
 
 
 # Self-contained "write me some code" asks that need no workspace context.
@@ -4975,6 +5061,86 @@ async def _run_direct_code_answer(
     title = f"Code ({response.model_used})" if response.model_used else "Code"
     console.print(Panel(body, title=title))
     _log_assistant_message(session_logger, body, workflow_id="direct-code")
+
+
+async def _handle_file_read_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    llm: LLMManager,
+    session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
+) -> None:
+    """Read an explicitly named file before asking the model to reason.
+
+    Small local models are prone to saying a file was read without emitting the
+    tool call first. This keeps file prompts grounded without adding a separate
+    workflow or memory system.
+    """
+    filepath = _extract_requested_file_path(user_input, workspace)
+    if not filepath:
+        console.print(Panel("No file path was found in the request.", title="File Read", border_style="red"))
+        _log_assistant_message(session_logger, "No file path was found in the request.", workflow_id="file.read")
+        return
+
+    tools = AgentToolRegistry(workspace, session_logger=session_logger)
+    result = tools.read_file(filepath)
+    if not result.ok:
+        candidates = result.data.get("candidates") if isinstance(result.data, dict) else None
+        detail = f"read_file {filepath} failed: {result.message}"
+        if candidates:
+            detail += "\n\nCandidates:\n" + "\n".join(f"- {candidate}" for candidate in candidates[:10])
+        console.print(Panel(detail, title="File Read Failed", border_style="red"))
+        _log_assistant_message(session_logger, detail, workflow_id="file.read")
+        return
+
+    content = str(result.data.get("content", "")) if isinstance(result.data, dict) else ""
+    if not content.strip():
+        message = f"read_file {filepath} returned no readable content."
+        console.print(Panel(message, title="File Read", border_style="yellow"))
+        _log_assistant_message(session_logger, message, workflow_id="file.read")
+        return
+
+    problem_lines = _extract_file_problem_lines(content)
+    detected = (
+        "\n".join(f"{index}. {line}" for index, line in enumerate(problem_lines, start=1))
+        if problem_lines else "No separate problem lines were detected; use the full file content."
+    )
+    grounded_request = (
+        "The file has already been read successfully by the read_file tool. "
+        "Do not say the file could not be read, do not ask the user to provide the file again, "
+        "and do not answer from memory. Treat the detected problem statements as the questions "
+        "to answer. If a diagram or transition graph is missing from the extracted text, say exactly "
+        "which item needs the original visual.\n\n"
+        f"User request:\n{user_input}\n\n"
+        f"File path: {filepath}\n"
+        f"read_file result: {result.message}\n\n"
+        "Detected problem statements:\n"
+        f"{detected}\n\n"
+        "File content:\n"
+        f"{content}"
+    )
+    pack = ContextPack(
+        task_id="file-read",
+        step_id=1,
+        specialist="qa",
+        user_request=grounded_request,
+        prd_context=grounded_request,
+    )
+    if hasattr(llm, "run_specialist_stream"):
+        try:
+            streamed, _text = await _stream_answer(
+                console, llm, pack, "File Answer", session_logger, "file.read", thinking_status
+            )
+        except Exception:
+            streamed = False
+        if streamed:
+            return
+    response = await llm.run_specialist("qa", pack)
+    body = response.raw.strip() or "No response returned."
+    title = f"File Answer ({response.model_used})" if response.model_used else "File Answer"
+    console.print(Panel(body, title=title))
+    _log_assistant_message(session_logger, body, workflow_id="file.read")
 
 
 def _audit_simple_turn(
