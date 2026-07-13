@@ -84,7 +84,7 @@ def test_salvages_json_embedded_in_prose_and_fences():
         '{"action": "read_file", "parameters": {"filepath": "src/App.tsx"}}\n'
         "```\n"
     )
-    turn = parse_model_turn(resp := _resp(content), REGISTERED)
+    turn = parse_model_turn(_resp(content), REGISTERED)
     assert turn.tool_calls[0].name == "read_file"
     assert turn.tool_calls[0].arguments == {"filepath": "src/App.tsx"}
     assert "read_file" not in turn.text

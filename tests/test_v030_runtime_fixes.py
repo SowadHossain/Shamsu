@@ -12,7 +12,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 from rich.console import Console
 
 from shamsu.agents.chat_loop import AgentChatLoop

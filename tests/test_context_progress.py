@@ -46,7 +46,7 @@ def test_checklist_empty_returns_blank():
 
 def test_checklist_collapses_whitespace_and_caps_length():
     long_item = "word " * 100
-    text = render_progress_checklist([f"first\n\n  line   here", long_item], 0)
+    text = render_progress_checklist(["first\n\n  line   here", long_item], 0)
     assert "first line here" in text
     # each rendered item is capped
     assert all(len(line) < 240 for line in text.splitlines())
