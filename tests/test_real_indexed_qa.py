@@ -301,6 +301,54 @@ def test_repl_weather_question_with_location_uses_web_tool(monkeypatch, tmp_path
     assert "sunny and 31C" in rendered
 
 
+def test_repl_explicit_read_file_prompt_reads_before_answer(monkeypatch, tmp_path):
+    console, output = _console_output()
+    web_tool, browser_tool = _tools(tmp_path)
+    packs = []
+    target = tmp_path / "shamsu" / "llm"
+    target.mkdir(parents=True)
+    (target / "output.py").write_text(
+        "def parse_model_turn(response, registered=None):\n"
+        "    \"\"\"Normalize model output and salvage tool calls.\"\"\"\n"
+        "    return response\n",
+        encoding="utf-8",
+    )
+
+    class FakeAgentChatLoop:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("explicit read_file prompts should not route to generic agent chat")
+
+    class FakeLLM:
+        def __init__(self, session_logger=None, model_pull_progress=None, action_ledger=None):
+            self.session_logger = session_logger
+
+        async def run_specialist(self, specialist, pack):
+            assert specialist == "qa"
+            packs.append(pack)
+            return LLMResponse(raw="parse_model_turn normalizes model output.", model_used="fake")
+
+    monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    asyncio.run(
+        _handle_request(
+            "Use read_file on shamsu/llm/output.py. Then explain parse_model_turn.",
+            tmp_path,
+            console,
+            web_tool,
+            browser_tool,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "File Answer" in rendered
+    assert "parse_model_turn normalizes model output." in rendered
+    assert packs
+    assert "Normalize model output and salvage tool calls" in packs[0].prd_context
+    assert "The file has already been read successfully" in packs[0].user_request
+    assert "Codebase-Memory MCP is not ready" not in rendered
+
+
 def test_repl_followup_web_request_uses_previous_prompt(monkeypatch, tmp_path):
     console, output = _console_output()
     seen = []

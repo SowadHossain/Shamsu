@@ -142,6 +142,7 @@ from shamsu.types import (
     RoutingDecision,
     TaskStep,
     TaskStepStatus,
+    ToolResult,
 )
 
 if sys.platform == "win32":
@@ -3340,6 +3341,20 @@ def _append_agent_context(user_input: str, agent_context: str) -> str:
     return f"{user_input}\n\nAdditional SHAMSU context:\n{agent_context}"
 
 
+def _extract_requested_file_path(user_input: str) -> str | None:
+    for token in re.split(r"\s+", user_input):
+        cleaned = token.strip(" \t\r\n'\"`@,.;:")
+        if re.fullmatch(
+            r"(?:[A-Za-z]:)?[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_. -]+)*\.[A-Za-z0-9]{1,12}",
+            cleaned,
+        ):
+            return cleaned
+    match = _FILELIKE_RE.search(user_input)
+    if match:
+        return match.group(0).strip(" \t\r\n'\"`@,.;:")
+    return None
+
+
 def _classify_route_label(effective_input: str, workspace: Path) -> str:
     """Coarse, read-only route label mirroring the branch order in
     `_handle_request` — used only to record `last_route` in session state, so a
@@ -3354,6 +3369,8 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
         return "workspace.files"
     if _looks_like_prd_build_request(effective_input, workspace):
         return "prd.build"
+    if _looks_like_file_read_request(effective_input):
+        return "file.read"
     if _looks_like_file_write_request(effective_input):
         return "file.write"
     if _looks_like_direct_code_request(effective_input):
@@ -3444,6 +3461,16 @@ async def _handle_request(
         return
     if _looks_like_prd_build_request(effective_input, workspace):
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
+        return
+    if _looks_like_file_read_request(effective_input):
+        await _handle_file_read_request(
+            effective_input,
+            workspace,
+            console,
+            _make_llm_manager(session_logger, console, workspace),
+            session_logger=session_logger,
+            thinking_status=thinking_status,
+        )
         return
     if _looks_like_file_write_request(effective_input):
         await _run_agent_chat(
@@ -4884,6 +4911,31 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     return bool(words & _FILE_HINT_WORDS)
 
 
+def _looks_like_file_read_request(user_input: str) -> bool:
+    """Route explicit file inspection prompts to a deterministic read first.
+
+    Small local models often answer "inspect/read file.py" from QA memory unless
+    the program reads the file before the model gets the turn.
+    """
+    raw = user_input.strip().lower()
+    if not raw or not _FILELIKE_RE.search(user_input):
+        return False
+    words = set(re.sub(r"[^\w\s]", " ", raw).split())
+    read_verbs = {
+        "read",
+        "open",
+        "inspect",
+        "explain",
+        "summarize",
+        "summarise",
+        "parse",
+        "review",
+        "analyze",
+        "analyse",
+    }
+    return "read_file" in raw or bool(words & read_verbs)
+
+
 # Self-contained "write me some code" asks that need no workspace context.
 # These must answer directly from the model (fast) instead of entering the
 # planner + tool loop, which used to only produce a plan and then time out on a
@@ -4962,6 +5014,72 @@ async def _run_direct_code_answer(
     title = f"Code ({response.model_used})" if response.model_used else "Code"
     console.print(Panel(body, title=title))
     _log_assistant_message(session_logger, body, workflow_id="direct-code")
+
+
+async def _handle_file_read_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    llm: LLMManager,
+    session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
+) -> None:
+    filepath = _extract_requested_file_path(user_input)
+    if not filepath:
+        message = "No file path was found in the request."
+        console.print(Panel(message, title="File Read", border_style="red"))
+        _log_assistant_message(session_logger, message, workflow_id="file.read")
+        return
+
+    tools = AgentToolRegistry(workspace, session_logger=session_logger)
+    result = tools.read_file(filepath)
+    if not result.ok:
+        candidates = result.data.get("candidates") if isinstance(result.data, dict) else None
+        detail = f"read_file {filepath} failed: {result.message}"
+        if candidates:
+            detail += "\n\nCandidates:\n" + "\n".join(f"- {candidate}" for candidate in candidates[:10])
+        console.print(Panel(detail, title="File Read Failed", border_style="red"))
+        _log_assistant_message(session_logger, detail, workflow_id="file.read")
+        return
+
+    content = str(result.data.get("content", "")) if isinstance(result.data, dict) else ""
+    if not content.strip():
+        message = f"read_file {filepath} returned no readable content."
+        console.print(Panel(message, title="File Read", border_style="yellow"))
+        _log_assistant_message(session_logger, message, workflow_id="file.read")
+        return
+
+    grounded_request = (
+        "The file has already been read successfully with read_file. "
+        "Answer using only the file content below. Do not answer from memory, "
+        "do not say the file is unavailable, and keep any requested length limit.\n\n"
+        f"User request:\n{user_input}\n\n"
+        f"File path: {filepath}\n"
+        f"read_file result: {result.message}\n\n"
+        "File content:\n"
+        f"{content}"
+    )
+    pack = ContextPack(
+        task_id="file-read",
+        step_id=1,
+        specialist="qa",
+        user_request=grounded_request,
+        prd_context=grounded_request,
+    )
+    if hasattr(llm, "run_specialist_stream"):
+        try:
+            streamed, _text = await _stream_answer(
+                console, llm, pack, "File Answer", session_logger, "file.read", thinking_status
+            )
+        except Exception:
+            streamed = False
+        if streamed:
+            return
+    response = await llm.run_specialist("qa", pack)
+    body = response.raw.strip() or "No response returned."
+    title = f"File Answer ({response.model_used})" if response.model_used else "File Answer"
+    console.print(Panel(body, title=title))
+    _log_assistant_message(session_logger, body, workflow_id="file.read")
 
 
 def _audit_simple_turn(
