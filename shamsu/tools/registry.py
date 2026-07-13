@@ -205,6 +205,6 @@ class ToolRegistry:
 def _looks_like_arbitrary_python(command: str) -> bool:
     normalized = command.strip().lower()
     return bool(
-        re.search(r"(^|\s)(python|python3|py)(\.exe)?\s+(-c|-)\b", normalized)
-        or re.search(r"python(\.exe)?[\"']?\s+(-c|-)\b", normalized)
+        re.search(r"(^|\s)(python|python3|py)(\.exe)?\s+(-c\b|-(?:\s|$))", normalized)
+        or re.search(r"python(\.exe)?[\"']?\s+(-c\b|-(?:\s|$))", normalized)
     )
