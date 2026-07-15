@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SHAMSU Web UI</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Workspace navigation">
+        <div class="brand">
+          <div class="brand-mark">S</div>
+          <div>
+            <strong>SHAMSU</strong>
+            <span>Local coding agent</span>
+          </div>
+        </div>
+
+        <button class="primary-action" type="button" data-command="New task">New task</button>
+
+        <nav class="nav-stack" aria-label="Primary">
+          <button class="nav-item active" type="button">Tasks</button>
+          <button class="nav-item" type="button">Workspace</button>
+          <button class="nav-item" type="button">Code Memory</button>
+          <button class="nav-item" type="button">Models</button>
+          <button class="nav-item" type="button">Audit Log</button>
+        </nav>
+
+        <section class="sidebar-section">
+          <h2>Recent Tasks</h2>
+          <button class="thread active" type="button">
+            <span>Build web UI</span>
+            <small>feature/ui-web-app</small>
+          </button>
+          <button class="thread" type="button">
+            <span>Verify gate review</span>
+            <small>shamsu/verify</small>
+          </button>
+          <button class="thread" type="button">
+            <span>Django generator</span>
+            <small>templates/django</small>
+          </button>
+        </section>
+
+        <section class="sidebar-section compact">
+          <h2>Runtime</h2>
+          <div class="runtime-row">
+            <span>Ollama</span>
+            <strong>Ready</strong>
+          </div>
+          <div class="runtime-row">
+            <span>Model</span>
+            <strong>deepseek-r1:7b</strong>
+          </div>
+        </section>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">C:\Users\Mastu\Desktop\Shamsu</p>
+            <h1>Build SHAMSU UI</h1>
+          </div>
+          <div class="topbar-actions">
+            <button class="ghost-button" type="button" data-command="Pull latest changes">Pull</button>
+            <button class="ghost-button" type="button" data-command="Run the test suite">Run Tests</button>
+            <button class="solid-button" type="button" data-command="Start a dev server">Start Dev Server</button>
+          </div>
+        </header>
+
+        <section class="status-grid" aria-label="Project status">
+          <article class="status-card">
+            <span>Branch</span>
+            <strong>feature/ui-web-app</strong>
+            <small>Ready for UI work</small>
+          </article>
+          <article class="status-card">
+            <span>Code Memory</span>
+            <strong>Fresh</strong>
+            <small>Search and symbols available</small>
+          </article>
+          <article class="status-card">
+            <span>Tasks</span>
+            <strong>3 active</strong>
+            <small>1 in progress, 2 queued</small>
+          </article>
+          <article class="status-card">
+            <span>Safety</span>
+            <strong>Workspace scoped</strong>
+            <small>Approvals required for risky actions</small>
+          </article>
+        </section>
+
+        <section class="content-grid">
+          <article class="panel conversation-panel">
+            <div class="panel-header">
+              <div>
+                <h2>Task</h2>
+                <p>Ask Shamsu to inspect, edit, test, or explain this workspace.</p>
+              </div>
+              <span class="pill">Autonomy off</span>
+            </div>
+
+            <div class="message-list" id="messages" aria-label="Task messages">
+              <div class="message user">
+                <span>You</span>
+                <p>Make a UI that looks like the Codex main page with the necessary buttons and features.</p>
+              </div>
+              <div class="message assistant">
+                <span>Shamsu</span>
+                <p>I can prepare a local web interface with task history, workspace status, model controls, logs, and command actions.</p>
+              </div>
+            </div>
+
+            <form class="composer" id="composer">
+              <label for="prompt">Prompt</label>
+              <textarea id="prompt" rows="4" placeholder="Ask Shamsu to edit files, explain code, run tests, or inspect a localhost app..."></textarea>
+              <div class="composer-actions">
+                <button type="button" class="ghost-button" data-command="Attach a file">Attach file</button>
+                <button type="button" class="ghost-button" data-command="Plan before editing">Plan first</button>
+                <button type="submit" class="solid-button">Send</button>
+              </div>
+            </form>
+          </article>
+
+          <aside class="panel utility-panel">
+            <div class="panel-header">
+              <div>
+                <h2>Controls</h2>
+                <p>Common SHAMSU actions.</p>
+              </div>
+            </div>
+
+            <div class="action-list">
+              <button type="button" data-command="/abstract build refresh">Index workspace</button>
+              <button type="button" data-command="/abstract query ">Search code</button>
+              <button type="button" data-command="explain @">Explain file</button>
+              <button type="button" data-command="/doctor">Run doctor</button>
+              <button type="button" data-command="/sessions list">Show sessions</button>
+              <button type="button" data-command="/browse open http://localhost:5173">Open browser check</button>
+            </div>
+
+            <div class="panel-divider"></div>
+
+            <h3>Plan</h3>
+            <ol class="plan-list">
+              <li class="done">Create UI shell</li>
+              <li class="active">Wire localhost launcher</li>
+              <li>Connect actions to CLI backend</li>
+              <li>Add live task/session data</li>
+            </ol>
+          </aside>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>

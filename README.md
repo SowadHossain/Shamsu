@@ -152,6 +152,30 @@ set "PATH=%USERPROFILE%\.shamsu\bin;%PATH%"
 SHAMSU treats the selected workspace as the project boundary. Indexes and
 local state are written under that workspace's `.shamsu/` folder.
 
+### Run The Local Web UI Preview
+
+SHAMSU also includes a lightweight browser UI preview for local development.
+It is currently a static interface shell for the CLI workflow; backend command
+execution can be wired in a later feature slice.
+
+Windows:
+
+```powershell
+.\scripts\run-webui.ps1
+```
+
+Then open:
+
+```text
+http://localhost:5174
+```
+
+Bash:
+
+```bash
+bash scripts/run-webui.sh
+```
+
 ### Run From Any Repo With `shamsu`
 
 After installing the user command, go to the project you want SHAMSU to inspect:
