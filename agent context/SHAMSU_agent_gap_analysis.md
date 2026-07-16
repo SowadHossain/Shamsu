@@ -2,7 +2,9 @@
 
 **Date:** 2026-07-17
 **Baseline:** `develop` @ `93bba66` + branch `fix/routing-planning-cot` (PRD-routing fix, specialist CoT, plan mode). Test suite fully green: 1080 passed / 1 skipped / 0 failed. Eval baseline 6/6 (default tier).
-**Method:** code-level sweep of the REPL dispatch, agent chat loop, tool registry, planners, verify gate, retrieval, memory, evals, and failure paths. Every finding cites the file it lives in. Nothing here is speculative — each gap was either reproduced or read directly from the code.
+**Method:** code-level sweep of the REPL dispatch, agent chat loop, tool registry, planners, verify gate, retrieval, memory, evals, and failure paths. Every finding cites the file it lives in.
+
+> **Caveat, added 2026-07-17 after being wrong once.** The original version of this doc claimed every finding was "read directly from the code, nothing speculative". **A2 was still wrong** — it was read from a call site (`_run_agent_chat` never passes `state=`) without checking the constructor (`ChatState.__init__` self-hydrates), and shipped as a HIGH. Reading code is not the same as running it. Findings below are marked ✅/◑ only after the behavior was *executed and observed*, not merely read. Treat unfixed entries as leads to verify, not established fact.
 
 This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that doc's gaps are landed to at least a safe, tested baseline (G7's structural trim deferred behind a characterization net). This doc is what's left — and what the reliability work newly exposed.
 
@@ -10,40 +12,44 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 
 ## Severity summary
 
-| # | Gap | Area | Severity |
-|---|-----|------|----------|
-| A1 | One unhandled exception crashes the whole REPL | Robustness | **HIGH** |
-| A2 | Agent loop has no memory between prompts | Conversation | **HIGH** |
-| B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** |
-| B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** |
-| C1 | `create_plan` is ungrounded free text on every mutating workflow | Planning | **HIGH** |
-| F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** |
-| D1 | No web/browser access inside the agent loop | Tooling | MEDIUM |
-| D2 | No delete / move / rename tools | Tooling | MEDIUM |
-| E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM |
-| E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM |
-| G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM |
-| G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM |
-| G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM |
-| B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM |
-| J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** |
-| J2 | The stuck-loop clarify path is dead code — assigned, never called | Clarification | **HIGH** |
-| J3 | Mixed prompt signals make small models never ask | Clarification | MEDIUM-HIGH |
-| J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM |
-| J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM |
-| J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM |
-| H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED |
-| H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED |
-| I1 | Agent-loop answers don't stream | UX | LOW |
-| I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW |
-| I3 | Eval baseline exists for the default tier only | Measurement | LOW |
-| I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW |
+**Status key:** ✅ fixed · ◑ partially addressed · (blank) open
+
+| # | Gap | Area | Severity | Status |
+|---|-----|------|----------|--------|
+| A1 | One unhandled exception crashes the whole REPL | Robustness | **HIGH** | ✅ |
+| A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
+| B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | |
+| B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ◑ drift now caught by tests |
+| C1 | `create_plan` is ungrounded free text on every mutating workflow | Planning | **HIGH** | |
+| F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ◑ routing matrix landed |
+| J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | |
+| J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
+| J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ✅ |
+| J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM | ◑ transcript now carries over |
+| J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM | |
+| J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM | |
+| D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | |
+| D2 | No delete / move / rename tools | Tooling | MEDIUM | |
+| E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | |
+| E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM | |
+| G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM | |
+| G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | |
+| G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | |
+| B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | |
+| H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | |
+| H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
+| I1 | Agent-loop answers don't stream | UX | LOW | |
+| I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | |
+| I3 | Eval baseline exists for the default tier only | Measurement | LOW | |
+| I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW | |
 
 ---
 
 ## A. Robustness
 
-### A1. One unhandled exception crashes the whole REPL — HIGH
+### A1. One unhandled exception crashes the whole REPL — HIGH ✅ FIXED 2026-07-17
+
+> **Landed.** All six ledger-tracked `raise` sites now call `_report_request_error(...)` and continue/return instead of propagating. `LLMStalledError` gets its own actionable panel (`ollama ps`, `SHAMSU_LLM_IDLE_TIMEOUT`); everything else reports type + message and says the session survived, with the traceback in the session log. `KeyboardInterrupt`/`SystemExit` are not `Exception` subclasses, so Ctrl+C and `/exit` are untouched. `_resolve_proceed` returns `True` on a failed plan — it *was* pending, and claiming "nothing to proceed" would be a worse lie. Tests: `tests/test_repl_crash_guard.py` (5).
 
 **Evidence:** `shamsu/cli/repl.py` — the main `while True` prompt loop wraps `_handle_request` in `except Exception as exc: ledger.fail(str(exc)); clear_current_run(); raise`. That `raise` propagates out of the loop, and `main()` has **no outer handler** around `run_repl` — only around workspace resolution at startup.
 
@@ -153,7 +159,11 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 ## F. Measurement
 
-### F1. The eval harness cannot enforce its own rule — HIGH
+### F1. The eval harness cannot enforce its own rule — HIGH ◑ PARTIAL 2026-07-17
+
+> **Routing half landed.** `tests/test_routing_matrix.py` (30) is a prompt → expected-route matrix over real workspace fixtures: PRD-workspace routing, the differently-named-spec regression, ambiguous/empty workspaces, and plain-workspace routes (location, files, file.write, direct_code, git). Deterministic, no Ollama, ~3s. It also pins the B2 mirror with two guards — `test_dispatch_mirror_is_honest` (every detector the mirror consults is still consulted by the real dispatcher) and `test_mirror_and_dispatcher_agree_on_detector_order` (order *is* the routing logic in an if/elif chain, so the shared detectors must appear in the same relative order). That converts B2's silent drift into a loud test failure and gives G7's trim its dispatch-level net.
+>
+> **Still open:** planning evals (a plan must reference only real files — protects C1) and clarification evals (does the model ask when the decision is the user's — would measure J3, which shipped unmeasured). Neither the routing matrix nor `evals/cases.py` covers those yet.
 
 **Evidence:** `evals/cases.py` — 6 cases, all single-turn agent-loop file operations (create/edit/bugfix/run/ask/QA). Zero routing evals, zero planning evals, zero PRD-build evals, zero multi-turn evals.
 
@@ -169,13 +179,17 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 ## G. Conversation & context
 
-### A2. The agent loop has no memory between prompts — HIGH
+### A2. ~~The agent loop has no memory between prompts~~ → Cross-route continuity — MEDIUM ✅ FIXED 2026-07-17
 
-**Evidence:** `repl._run_agent_chat` constructs a fresh `AgentToolRegistry` and `AgentChatLoop` per call and **never passes `state=`**, so every prompt starts a fresh `ChatState` (chat_loop.py accepts the param; nothing uses it). Cross-prompt continuity is only: session logs (not fed back), `_expand_followup_prompt` (two hardcoded phrase families — web, browser), and the pending-question store.
+> **CORRECTION.** The original claim here ("the agent loop has no memory between prompts", HIGH) was **wrong**, and the reasoning was sloppy: I saw `_run_agent_chat` never passes `state=` and concluded each prompt starts blank. It doesn't. `ChatState.__init__` calls `_hydrate_from_session()`, which replays up to `HYDRATE_MAX_MESSAGES` (80) turns from `messages.jsonl`. A fresh loop per prompt still sees the previous ones. **Verified empirically**, not by reading: a second loop was handed `[system, user("build a snake game"), assistant("I built snake.js"), user(...)]`. Amnesia between agent-chat turns was never real. Lesson recorded because the same mistake — auditing a call site without checking the constructor — is what the reliability doc calls fixing by feel.
 
-**Failure story:** *Prompt 1:* "build a snake game" — agent writes 4 files. *Prompt 2:* "now make the snake blue" — the new loop knows nothing: no file list, no prior reasoning, no last answer. It re-searches, re-reads, sometimes re-asks what was already answered. To the user this reads as amnesia, because it is. The budget machinery to hold history already exists (`select_for_budget`, rolling summary — G12/G10 work); it's simply reset each turn.
+**The real (narrower) gap:** only the agent loop ever *wrote* the hydratable transcript — `chat_state._append` is the sole caller of `session_logger.append_message`. Every route that answers **without** the loop (QA, direct code, PRD summary, git read, workspace answers) logged an `assistant.message` *event* but never appended to `messages.jsonl`. Those events are not what hydration reads.
 
-**Fix:** persist one `ChatState` per REPL session (keyed to `session_logger`), reset on `/clear` or route change away from agent-chat. The trimmer already handles overflow. Alternative cheaper step: inject a compact "last run" brief (task, files changed, verify verdict — all already in `AgentLoopResult`) into the next agent-chat request.
+**Failure story (real):** *Prompt 1:* "what does game.js do?" → QA route → good answer, invisible to the transcript. *Prompt 2:* "now add a pause button" → agent loop hydrates and sees **nothing** about game.js. Continuity worked only as long as you stayed on one route; crossing routes silently dropped the thread.
+
+**Fix (landed):** `_audit_simple_turn` — which already meant "record a non-tool-loop turn" and already had both the prompt and the answer — now also appends both sides to the transcript. No double-append risk: the loop persists its own turns and never calls it. Also fixed `_run_direct_code_answer` returning `None`, which made its call site audit an **empty** final — the direct-code answer was being dropped from the trail entirely. Tests: `tests/test_cross_route_continuity.py` (7), including a characterization test pinning the hydration that already worked, so a refactor dropping `session_logger` can't silently introduce the amnesia this entry originally imagined.
+
+**Still open (lower value):** `HYDRATE_MAX_MESSAGES = 80` is a flat cap — a long session silently loses its earliest turns rather than folding them into the rolling summary that `select_for_budget` already maintains in-loop.
 
 ### I2. Follow-up expansion covers only web/browser phrases — LOW
 
@@ -215,7 +229,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** give the specialist path an escape hatch: let QA-style responses carry a structured `needs_input` marker (schema-constrained, like plan_mode's output) that the REPL converts into a pending question. For the mutating workflows, thread the existing pending-question store through their entry points.
 
-### J2. The stuck-loop clarify path is dead code — HIGH
+### J2. The stuck-loop clarify path is dead code — HIGH ✅ FIXED 2026-07-17
+
+> **Landed.** `_ask_for_help_on_stall` routes the guard exits through the same pending-question flow as the model's own `ask_user` — cross-turn, no blocking `input()` (so it also sidesteps G1). Wired at the two guards where the **user plausibly holds the answer**: the repetition breaker (repeating one call = a missing *decision*) and the exhausted read-recovery (offers the candidate paths as options). Deliberately **not** wired at the empty-response and prose-only guards: those are model pathologies, and no user answer fixes them — they still stop plainly. `agent.stuck` telemetry preserved (now with `asked: true`). Dead code deleted: `clarify_prompt`, the `ask_clarifying_question` import, `_give_up_on_repetition`, `_read_blocked_final`. Tests: `tests/test_chat_loop_clarify.py` (8).
 
 **Evidence:** `chat_loop.py:293` — `self.clarify_prompt = clarify_prompt if long_running else None`. That is the **only** occurrence of `self.clarify_prompt` in the file: assigned, never called. `safety/clarify.py` (`ask_clarifying_question`) exists solely to serve it — its docstring says it's for "a long-running loop [that] keeps repeating the same action with no progress." Meanwhile every stall guard the loop actually has — repeated-call breaker (`_MAX_REPEATED_CALLS`), read recoveries (`_MAX_READ_RECOVERIES`), prose corrections (`_MAX_PROSE_CORRECTIONS`), empty-response nudges (`_MAX_EMPTY_RESPONSES`) — ends the run with a give-up message instead of asking.
 
@@ -223,7 +239,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** call `self.clarify_prompt` (or better: route through the same `ask_user` pending-question path, so it works cross-turn) at the guard exits, once, before giving up. The function, the store, and the resume flow all already exist — this is a wiring job.
 
-### J3. Mixed prompt signals make a 7B model never ask — MEDIUM-HIGH
+### J3. Mixed prompt signals make a 7B model never ask — MEDIUM-HIGH ✅ FIXED 2026-07-17
+
+> **Landed.** `ask_user`'s description is now framed on **decision ownership** — "ask when the answer is THEIRS to give: choosing between valid approaches or designs, naming, scope, anything destructive or hard to undo, an ambiguous target… Asking one good question is cheap; acting on a wrong guess is expensive" — with the fact-finding steer kept ("look up plain facts with find_file/grep_files/read_file yourself") but the "only ask when genuinely blocked" framing removed. The clarification rules gained the same threshold plus two concrete examples (sessions-vs-JWT; two candidate config files). Effect is unmeasured until the clarification evals under F1 exist — this is a prompt change, and the doc's own rule says prompt changes need an eval delta.
 
 **Evidence:** the system prompt says ask ("Ask the user a clear question (call ask_user) when required input is missing", chat_loop.py:143). The tool's own description says the opposite: *"Prefer find_file/grep_files/list_files first; **only ask when genuinely blocked**… Calling this ends your turn"* (`agent_tools.py`). Small models weight the discouragement; three "prefer not to" clauses beat one "do ask."
 

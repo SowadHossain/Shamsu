@@ -14,6 +14,35 @@ from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.safety.sandbox import Sandbox, SecurityError
 
 
+def latest_undoable_transaction(workspace_root: Path) -> tuple[str, dict] | None:
+    """The most recent transaction that can still be rolled back, or None.
+
+    Every model-driven write already opens its own transaction (backup + hash),
+    so an undo path existed all along - it just required knowing that
+    `/patch rollback` exists AND digging the right id out of `.shamsu/mutations`.
+    Nobody does that in the moment their code just got mangled (gap G2). This
+    resolves "the last change" so `/undo` can.
+
+    Ordering uses the manifest's `created_at` (microsecond ISO), NOT the id.
+    Ids only carry `%Y%m%dT%H%M%S` - second resolution - so two writes in the
+    same second sort by their random uuid suffix, which would make `/undo`
+    revert an arbitrary one of them. Agent writes are routinely sub-second
+    apart, so that is the common case, not an edge case.
+    """
+    store = TransactionWorkspace(Path(workspace_root).resolve())
+    candidates: list[tuple[str, str, dict]] = []
+    for transaction_id in store.list_transaction_ids():
+        manifest = store.load_manifest(transaction_id)
+        if manifest is None or manifest.get("status") == "rolled_back":
+            continue
+        candidates.append((str(manifest.get("created_at", "")), transaction_id, manifest))
+    if not candidates:
+        return None
+    # created_at first; the id breaks exact ties deterministically.
+    created_at, transaction_id, manifest = max(candidates, key=lambda item: (item[0], item[1]))
+    return transaction_id, manifest
+
+
 def rollback_transaction(workspace_root: Path, transaction_id: str) -> tuple[bool, str]:
     workspace_root = Path(workspace_root).resolve()
     store = TransactionWorkspace(workspace_root)

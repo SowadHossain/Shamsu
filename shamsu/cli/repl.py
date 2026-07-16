@@ -113,6 +113,7 @@ from shamsu.patch import git_apply as patch_git_apply
 from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
+from shamsu.patch.rollback import latest_undoable_transaction
 from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.session.memory import is_affirmative, is_negative
@@ -283,6 +284,7 @@ SYSTEM_COMMANDS = (
     "/patch preview ",
     "/patch apply ",
     "/patch rollback ",
+    "/undo",
     "/patch journal",
     "/patch last",
     "/patch diff ",
@@ -477,6 +479,7 @@ def _print_help(console: Console) -> None:
                     "  /patch status             Show git-apply availability, trash, last transaction",
                     "  /patch preview <file>     Preview a diff or change-request JSON without applying it",
                     "  /patch apply <file>       Apply a change-request JSON through the mutation engine",
+                    "  /undo                     Undo the most recent file change",
                     "  /patch rollback <id>      Restore every file a transaction touched",
                     "  /patch journal            List all recorded transactions",
                     "  /patch last               Show the most recent transaction",
@@ -1888,6 +1891,60 @@ def _reparse_last_command(workspace: Path, ws: "DiagnosticsWorkspace"):
     )
     ws.save_packet(packet.to_dict())
     return packet
+
+
+def _handle_undo(
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Roll back the most recent file change (the `/undo` command).
+
+    Sugar over `/patch rollback <id>`: every model-driven write already opened a
+    transaction with a backup, but using it meant knowing the command existed
+    AND finding the id under `.shamsu/mutations` - which nobody does in the
+    moment the agent just mangled their code (gap G2). Each write is its own
+    transaction, so this undoes the LAST change, not a whole run; the message
+    says so rather than over-promising."""
+    latest = latest_undoable_transaction(workspace)
+    if latest is None:
+        console.print(
+            "[yellow]Nothing to undo - no file changes are recorded for this workspace yet.[/yellow]"
+        )
+        return
+    transaction_id, manifest = latest
+    touched = sorted((manifest.get("backups") or {}).keys()) or sorted(
+        str(op.get("path", "")) for op in (manifest.get("operations") or [])
+    )
+    listing = "\n".join(f"- {path}" for path in touched[:10] if path)
+    console.print(
+        Panel(
+            f"Most recent change ({transaction_id}):\n{listing or '- (no files recorded)'}",
+            title="Undo",
+            border_style="yellow",
+        )
+    )
+    engine = PatchEngine(
+        workspace,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+    )
+    request = ApprovalRequest(
+        action_type="file_delete",
+        description=f"Undo transaction {transaction_id} (restore {len(touched)} file(s)).",
+        risk_level="high",
+        working_dir=str(workspace),
+        reason="Undo restores backed-up files, overwriting current content.",
+    )
+    if not engine.approval_manager.ask(request):
+        console.print("[yellow]Undo cancelled - nothing was changed.[/yellow]")
+        return
+    ok, message = engine.rollback_transaction(transaction_id)
+    if ok:
+        console.print(f"[green]{message}[/green]")
+        console.print("[dim]Undo again to step back further, or `/patch list` to see all changes.[/dim]")
+    else:
+        console.print(f"[red]{message}[/red]")
+    _log_assistant_message(session_logger, message, workflow_id="undo")
 
 
 def _handle_patch(
@@ -3561,14 +3618,14 @@ async def _handle_request(
             {"reason": "self_contained_coding_question"},
             level="normal",
         )
-        await _run_direct_code_answer(
+        answer = await _run_direct_code_answer(
             effective_input,
             console,
             _make_llm_manager(session_logger, console, workspace),
             session_logger=session_logger,
             thinking_status=thinking_status,
         )
-        _audit_simple_turn(workspace, session_logger, "direct_code", effective_input, "")
+        _audit_simple_turn(workspace, session_logger, "direct_code", effective_input, answer)
         return
     if _looks_like_workspace_prd_request(effective_input):
         message = _handle_workspace_prd_request(workspace, console)
@@ -5051,9 +5108,11 @@ async def _run_direct_code_answer(
     llm: LLMManager,
     session_logger: SessionLogger | None = None,
     thinking_status: Any = None,
-) -> None:
+) -> str:
     """Answer a self-contained coding question in one model call - no planner,
-    no tool loop. Streams when the manager supports it so the code appears
+    no tool loop. Returns the answer so the caller can record the real turn
+    (it used to audit an empty string, losing the answer from the trail and
+    the transcript). Streams when the manager supports it so the code appears
     immediately instead of after a full agent run."""
     pack = ContextPack(
         task_id="direct-code",
@@ -5076,12 +5135,13 @@ async def _run_direct_code_answer(
         except Exception:
             streamed = False
         if streamed:
-            return
+            return _text
     response = await llm.run_specialist("qa", pack)
     body = response.raw.strip() or "No response returned."
     title = f"Code ({response.model_used})" if response.model_used else "Code"
     console.print(Panel(body, title=title))
     _log_assistant_message(session_logger, body, workflow_id="direct-code")
+    return body
 
 
 async def _handle_file_read_request(
@@ -5157,15 +5217,32 @@ def _audit_simple_turn(
     prompt: str,
     final: str,
 ) -> None:
-    """Record a non-tool-loop turn (direct code, git read, etc.) in the detailed
-    audit trail so `.shamsu/audit` has an entry for every prompt, not just agent
-    runs. Best-effort: never let auditing break a response."""
+    """Record a non-tool-loop turn (direct code, QA, PRD summary, git read) in
+    the detailed audit trail AND in the session transcript.
+
+    The transcript half matters for continuity: `ChatState` hydrates the agent
+    loop from `messages.jsonl`, but only the loop itself ever wrote there
+    (`chat_state._append`). So anything answered WITHOUT the loop - a QA answer,
+    a PRD summary, a direct-code reply - was invisible to the next agent run:
+    ask "what does game.js do?" then "add a pause button", and the agent had no
+    idea what was just discussed. Writing both sides here closes that hole
+    without double-appending, since the loop persists its own turns and never
+    calls this. Best-effort: never let bookkeeping break a response."""
     try:
         session_id = session_logger.session_id if session_logger is not None else None
         audit = SessionAuditLog(workspace, session_id)
         audit.log_prompt(prompt)
         audit.log_route(route, workflow=route)
         audit.log_final(final)
+    except Exception:
+        pass
+    if session_logger is None:
+        return
+    try:
+        if prompt.strip():
+            session_logger.append_message("user", prompt)
+        if final.strip():
+            session_logger.append_message("assistant", final)
     except Exception:
         pass
 
@@ -6832,6 +6909,11 @@ async def _run_agent_chat(
     else:
         progress.done("Agent finished")
     console.print(Panel(_agent_display_summary(body, activities), title="Agent"))
+    # Point at the escape hatch the moment it's relevant. Every write was
+    # already backed up by a transaction, but /patch rollback needed an id from
+    # .shamsu/mutations - so in practice nobody undid anything (gap G2).
+    if getattr(result, "changed_files", ()):
+        console.print("[dim]Not what you wanted? `/undo` reverts the last change.[/dim]")
     _log_assistant_message(session_logger, body, workflow_id="agent-chat")
     # Update the session summary and durable memory only when the agent actually
     # finished the work (a stopped/looping run is not a completed task).
@@ -7936,6 +8018,9 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("diagnostics"):
             _handle_diagnostics(normalized_input, workspace, console)
+            continue
+        if lowered_input == "undo":
+            _handle_undo(workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("patch"):
             _handle_patch(normalized_input, workspace, console, session_logger=session_logger)
