@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SHAMSU Web UI</title>
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=20260716-2" />
   </head>
   <body>
     <div class="app-shell">
@@ -47,11 +47,11 @@
           <h2>Runtime</h2>
           <div class="runtime-row">
             <span>Ollama</span>
-            <strong>Ready</strong>
+            <strong data-status="runtime">Ready</strong>
           </div>
           <div class="runtime-row">
             <span>Model</span>
-            <strong>deepseek-r1:7b</strong>
+            <strong data-status="model">deepseek-r1:7b</strong>
           </div>
         </section>
       </aside>
@@ -59,10 +59,11 @@
       <main class="workspace">
         <header class="topbar">
           <div>
-            <p class="eyebrow">C:\Users\Mastu\Desktop\Shamsu</p>
+            <p class="eyebrow" data-status="workspace">C:\Users\Mastu\Desktop\Shamsu</p>
             <h1>Build SHAMSU UI</h1>
           </div>
           <div class="topbar-actions">
+            <button class="ghost-button theme-toggle" type="button" id="themeToggle" aria-pressed="false">Light</button>
             <button class="ghost-button" type="button" data-command="Pull latest changes">Pull</button>
             <button class="ghost-button" type="button" data-command="Run the test suite">Run Tests</button>
             <button class="solid-button" type="button" data-command="Start a dev server">Start Dev Server</button>
@@ -147,13 +148,13 @@
             <ol class="plan-list">
               <li class="done">Create UI shell</li>
               <li class="active">Wire localhost launcher</li>
-              <li>Connect actions to CLI backend</li>
+              <li class="done">Connect actions to CLI backend</li>
               <li>Add live task/session data</li>
             </ol>
           </aside>
         </section>
       </main>
     </div>
-    <script src="./app.js"></script>
+    <script src="./app.js?v=20260716-2"></script>
   </body>
 </html>

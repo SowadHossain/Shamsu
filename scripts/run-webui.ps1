@@ -1,17 +1,17 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [int]$Port = 5174
+    [int]$Port = 5174,
+    [string]$Workspace = ""
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
-$WebRoot = Join-Path $RepoRoot "webui"
 $VenvPython = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 
-if (-not (Test-Path $WebRoot)) {
-    Write-Error "webui folder not found."
+if (-not $Workspace) {
+    $Workspace = $RepoRoot.Path
 }
 
 if (Test-Path $VenvPython) {
@@ -23,9 +23,9 @@ else {
 
 Write-Host "Starting SHAMSU Web UI at http://localhost:$Port"
 Write-Host "Press Ctrl+C to stop."
-Push-Location $WebRoot
+Push-Location $RepoRoot
 try {
-    & $Python -m http.server $Port --bind 127.0.0.1
+    & $Python -m shamsu.web.server --port $Port --workspace $Workspace
 }
 finally {
     Pop-Location
