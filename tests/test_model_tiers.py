@@ -106,3 +106,46 @@ def test_router_avoids_the_reasoning_anchor_on_every_tier(tmp_path):
         assert router == model_for_role("coder")
         assert model_is_reasoning(router) is False
         assert router in required_model_names()
+
+
+# ---------------------------------------------------------------------------
+# Gap B3: unknown models fell back to blanket defaults (tool-capable,
+# non-reasoning). That was silently wrong for whole families: a pulled
+# deepseek-r1:14b never got think=true, so it leaked <think> inline and the
+# salvager cleaned up every turn, with no hint why.
+# ---------------------------------------------------------------------------
+
+
+def test_cookbook_specs_always_win_over_family_guesses():
+    from shamsu.runtime.models import model_is_reasoning, model_supports_native_tools
+
+    # gemma3:4b matches the no-native-tools family AND has an explicit spec.
+    assert model_supports_native_tools("gemma3:4b") is False
+    assert model_is_reasoning("gemma3:4b") is False
+    assert model_supports_native_tools("qwen2.5-coder:7b-instruct") is True
+
+
+def test_unknown_reasoning_models_are_recognized_by_family():
+    from shamsu.runtime.models import is_allowed_model, model_is_reasoning
+
+    for name in ("deepseek-r1:14b", "deepseek-r1:32b", "qwen3:14b", "qwq:32b"):
+        assert not is_allowed_model(name), f"{name} should be off-cookbook for this test"
+        assert model_is_reasoning(name) is True, name
+
+
+def test_unknown_models_without_native_tools_are_recognized_by_family():
+    from shamsu.runtime.models import model_supports_native_tools
+
+    assert model_supports_native_tools("gemma3:12b") is False
+    assert model_supports_native_tools("deepseek-r1:14b") is False
+
+
+def test_unknown_models_with_no_family_match_keep_the_safe_defaults():
+    """Assume tool-capable (the salvager backs it up; refusing a schema to a
+    model that supports tools is the bigger regression) and non-reasoning
+    (asking a model with no thinking mode costs a rejected request)."""
+    from shamsu.runtime.models import model_is_reasoning, model_supports_native_tools
+
+    for name in ("mistral:7b", "my-custom-model", ""):
+        assert model_supports_native_tools(name) is True, name
+        assert model_is_reasoning(name) is False, name

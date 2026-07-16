@@ -35,7 +35,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM | |
 | G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | ✅ |
 | G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | |
-| B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | |
+| B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | ✅ |
 | H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | |
 | H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
 | I1 | Agent-loop answers don't stream | UX | LOW | |
@@ -85,7 +85,9 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 
 **Fix:** make dispatch data-driven — a single ordered list of `(name, detector, handler)` tuples that both the dispatcher and the label function iterate. This is also the safe shape for the deferred G7 trim (I4): reordering becomes editing a list, testable by asserting on the list.
 
-### B3. Unknown models get silently-wrong capability defaults — MEDIUM
+### B3. Unknown models get silently-wrong capability defaults — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed.** `model_is_reasoning` / `model_supports_native_tools` now fall back to family-name patterns before the blanket default: `deepseek-r1`/`qwen3`/`qwq`/`magistral`/`phi4-reasoning` -> reasoning; `gemma`/`deepseek-r1`/`llava`/`phi3`/`codellama` -> no native tools. An explicit `ModelSpec` always wins, and a model matching no family keeps the old safe defaults (tool-capable, non-reasoning) for the reasons documented there. So a pulled `deepseek-r1:14b` now gets `think=true` instead of leaking `<think>` inline through the salvager every turn. Tests: `tests/test_model_tiers.py` (+4). The salvage-rate warning suggested below is NOT done.
 
 **Evidence:** `runtime/models.py` — `model_supports_native_tools()` returns **True** for any model not in the cookbook; `model_is_reasoning()` returns **False**.
 

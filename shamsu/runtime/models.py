@@ -260,23 +260,48 @@ def model_spec(model_name: str) -> ModelSpec | None:
     return MODEL_COOKBOOK.get(model_name)
 
 
+# Name patterns for models that are NOT in the cookbook. A user who pulls
+# `deepseek-r1:14b` or `gemma3:12b` gets the right treatment from the family
+# name instead of the blanket default, which was silently wrong for them:
+# deepseek-r1 never got `think=true` (so it leaked <think> inline and the
+# salvager cleaned up every turn), and gemma got a `tools=` schema it handles
+# badly. Family names are stable and few; this is a better guess than a
+# constant, and an explicit ModelSpec still always wins.
+_REASONING_NAME_PATTERNS = ("deepseek-r1", "qwen3", "qwq", "magistral", "phi4-reasoning")
+_NO_NATIVE_TOOLS_NAME_PATTERNS = ("gemma", "deepseek-r1", "llava", "phi3", "codellama")
+
+
+def _matches_family(model_name: str, patterns: tuple[str, ...]) -> bool:
+    lowered = model_name.strip().lower()
+    return any(pattern in lowered for pattern in patterns)
+
+
 def model_supports_native_tools(model_name: str) -> bool:
     """Whether to pass a native ``tools=`` schema to *model_name*.
 
-    Known models use their explicit ``ModelSpec`` flag. An unrecognized (custom)
-    model is assumed tool-capable so we keep passing a schema — the output
-    salvager backs it up either way, and refusing to pass a schema to a model
-    that actually supports tools would be the bigger regression."""
+    Known models use their explicit ``ModelSpec`` flag. For an unrecognized
+    model, fall back to its family name (gemma/deepseek-r1/… don't do native
+    tools); anything still unknown is assumed tool-capable — the output salvager
+    backs it up either way, and refusing to pass a schema to a model that
+    actually supports tools would be the bigger regression."""
     spec = MODEL_COOKBOOK.get(model_name)
-    return spec.supports_native_tools if spec is not None else True
+    if spec is not None:
+        return spec.supports_native_tools
+    return not _matches_family(model_name, _NO_NATIVE_TOOLS_NAME_PATTERNS)
 
 
 def model_is_reasoning(model_name: str) -> bool:
     """Whether *model_name* is a chain-of-thought model that should be asked to
-    ``think`` so its reasoning separates into the ``thinking`` field. Unknown
-    models are assumed non-reasoning."""
+    ``think`` so its reasoning separates into the ``thinking`` field.
+
+    Known models use their explicit ``ModelSpec`` flag; an unrecognized model is
+    matched on its family name (deepseek-r1/qwen3/qwq/…). Anything still unknown
+    is assumed non-reasoning — asking a model without a thinking mode to think
+    costs a rejected request, and the manager only retries once per model."""
     spec = MODEL_COOKBOOK.get(model_name)
-    return spec.is_reasoning if spec is not None else False
+    if spec is not None:
+        return spec.is_reasoning
+    return _matches_family(model_name, _REASONING_NAME_PATTERNS)
 
 
 def is_allowed_model(model_name: str) -> bool:
