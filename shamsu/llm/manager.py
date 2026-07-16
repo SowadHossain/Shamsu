@@ -34,7 +34,7 @@ from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import ILLMManager
 from shamsu.memory.service import MemoryService
-from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role
+from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role, model_is_reasoning
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
 from pathlib import Path
@@ -79,6 +79,12 @@ def _streaming_timeout() -> httpx.Timeout:
 def _blocking_timeout() -> httpx.Timeout:
     """Bounded overall cap for the non-streamed path, short connect to fail fast."""
     return httpx.Timeout(LLM_TOTAL_TIMEOUT_SECONDS, connect=LLM_CONNECT_TIMEOUT_SECONDS)
+
+
+# Models that rejected `think: true` (older Ollama build, or a model without a
+# thinking mode). Remembered per-process so the retry-without-think costs at
+# most one 400 per model rather than one per call.
+_THINK_UNSUPPORTED: set[str] = set()
 
 
 class LLMStalledError(RuntimeError):
@@ -179,6 +185,7 @@ class LLMManager(ILLMManager):
         model_pull_progress: ModelPullProgress | None = None,
         action_ledger: ActionLedger | None = None,
         budget_manager: ContextBudgetManager | None = None,
+        on_thinking: Callable[[str, str], None] | None = None,
     ):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
@@ -187,6 +194,11 @@ class LLMManager(ILLMManager):
         self.action_ledger = action_ledger
         self.model_pull_progress = model_pull_progress
         self.budget_manager = budget_manager
+        # Called with (model, thinking) whenever a reasoning model produces a
+        # chain-of-thought, so the REPL can surface it instead of it living only
+        # in the session log. Receives the FULL trace; the display side decides
+        # how much to show.
+        self.on_thinking = on_thinking
 
     async def _ensure_model(self, model_name: str) -> None:
         """Lazily pull `model_name` the first time it's actually needed."""
@@ -234,30 +246,10 @@ class LLMManager(ILLMManager):
                     workflow_id="model_pull",
                 )
 
-    async def _generate(
-        self, model: str, system: str, prompt: str,
-        temperature: float = 0.1, json_schema: dict | None = None,
-        keep_alive: str = "10m", num_ctx: int = 8192,
-        _estimated_tokens: int = 0,
-    ) -> str:
-        # Stream internally (even though callers want the whole string): it lets
-        # the idle-timeout catch a stalled model instead of blocking on one big
-        # non-streaming read that can't tell "slow" from "deadlocked".
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "system": system,
-            "stream": True,
-            "options": {
-                "temperature": temperature,
-                "num_ctx": num_ctx,
-                "top_p": 0.9,
-                "repeat_penalty": 1.0,
-            },
-            "keep_alive": keep_alive,
-        }
-        if json_schema is not None:
-            payload["format"] = json_schema   # Ollama-native structured output
+    async def _stream_once(
+        self, model: str, payload: dict, on_token: Callable[[str], None] | None = None
+    ) -> tuple[str, str, int]:
+        """One POST to /api/generate; returns (text, thinking, prompt_eval_count)."""
         chunks: list[str] = []
         thinking_chunks: list[str] = []
         prompt_eval_count = 0
@@ -275,8 +267,10 @@ class LLMManager(ILLMManager):
                         token = data.get("response", "")
                         if token:
                             chunks.append(token)
-                        # Reasoning models (qwen3, ...) stream their chain-of-
-                        # thought in a separate "thinking" field, not "response".
+                            if on_token is not None:
+                                on_token(token)
+                        # Reasoning models stream their chain-of-thought in a
+                        # separate "thinking" field, not "response".
                         thinking_token = data.get("thinking", "")
                         if thinking_token:
                             thinking_chunks.append(thinking_token)
@@ -289,31 +283,90 @@ class LLMManager(ILLMManager):
                 "(stalled or deadlocked). Set SHAMSU_LLM_IDLE_TIMEOUT to allow longer "
                 "silences on slow hardware."
             ) from exc
-        # Capture the reasoning trace (logged, kept out of the returned text).
-        self._log_thinking(model, "".join(thinking_chunks))
+        return "".join(chunks), "".join(thinking_chunks), prompt_eval_count
+
+    async def _stream_completion(
+        self, model: str, payload: dict, on_token: Callable[[str], None] | None = None
+    ) -> tuple[str, str, int]:
+        """Stream a completion, asking reasoning models to separate their CoT.
+
+        Streaming is used even when the caller wants one whole string: it lets
+        the idle-timeout tell "slow" apart from "deadlocked" instead of blocking
+        on one big non-streaming read.
+
+        A reasoning model only fills the separate `thinking` field when asked
+        (`think: true`). Without it, deepseek-r1 leaks `<think>` inline into the
+        answer and `thinking` stays empty forever - which is why SHAMSU appeared
+        to have no chain of thought at all on this path. Ollama builds or models
+        that reject the flag get one retry without it, remembered per-model so it
+        costs at most one 400 per model per process.
+        """
+        want_think = model_is_reasoning(model) and model not in _THINK_UNSUPPORTED
+        if not want_think:
+            return await self._stream_once(model, payload, on_token)
+        try:
+            return await self._stream_once(model, {**payload, "think": True}, on_token)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in (400, 422):
+                raise
+            _THINK_UNSUPPORTED.add(model)
+            return await self._stream_once(model, payload, on_token)
+
+    async def _generate(
+        self, model: str, system: str, prompt: str,
+        temperature: float = 0.1, json_schema: dict | None = None,
+        keep_alive: str = "10m", num_ctx: int = 8192,
+        _estimated_tokens: int = 0,
+    ) -> str:
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "system": system,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "num_ctx": num_ctx,
+                "top_p": 0.9,
+                "repeat_penalty": 1.0,
+            },
+            "keep_alive": keep_alive,
+        }
+        if json_schema is not None:
+            payload["format"] = json_schema   # Ollama-native structured output
+        text, thinking, prompt_eval_count = await self._stream_completion(model, payload)
+        # Capture the reasoning trace (surfaced/logged, kept out of the text).
+        self._log_thinking(model, thinking)
         # Calibrate future token estimates with Ollama's ground-truth count.
         if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
             self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
-        return "".join(chunks)
+        return text
 
     def _log_thinking(self, model: str, thinking: str) -> None:
         """Record a reasoning model's chain-of-thought trace if it produced one.
 
         Kept out of the returned text on purpose (answers/diffs must stay clean),
-        but logged so `reasoning not working` is diagnosable instead of a black
-        box. Best-effort - never breaks a generation on a logging failure."""
+        but logged AND handed to `on_thinking` so the REPL can show it - logging
+        it to the session file alone made reasoning invisible to the person
+        actually watching. Best-effort: never breaks a generation on a
+        logging/display failure."""
         thinking = (thinking or "").strip()
-        if not thinking or not self.session_logger:
+        if not thinking:
             return
-        try:
-            self.session_logger.log(
-                "llm.thinking",
-                {"model": model, "thinking_chars": len(thinking), "thinking": thinking[:4000]},
-                "Model reasoning trace",
-                workflow_id="reasoning",
-            )
-        except Exception:
-            pass
+        if self.session_logger:
+            try:
+                self.session_logger.log(
+                    "llm.thinking",
+                    {"model": model, "thinking_chars": len(thinking), "thinking": thinking[:4000]},
+                    "Model reasoning trace",
+                    workflow_id="reasoning",
+                )
+            except Exception:
+                pass
+        if self.on_thinking:
+            try:
+                self.on_thinking(model, thinking)
+            except Exception:
+                pass
 
     async def chat_with_tools(
         self,
@@ -587,44 +640,15 @@ class LLMManager(ILLMManager):
             },
             "keep_alive": keep_alive,
         }
-        chunks: list[str] = []
-        thinking_chunks: list[str] = []
-        prompt_eval_count = 0
-        try:
-            async with httpx.AsyncClient(timeout=_streaming_timeout()) as client:
-                async with client.stream("POST", f"{self.base_url}/api/generate", json=payload) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        token = data.get("response", "")
-                        if token:
-                            chunks.append(token)
-                            on_token(token)
-                        # Reasoning trace streams in a separate "thinking" field -
-                        # accumulate it but keep it out of the visible answer tokens.
-                        thinking_token = data.get("thinking", "")
-                        if thinking_token:
-                            thinking_chunks.append(thinking_token)
-                        if data.get("done"):
-                            prompt_eval_count = data.get("prompt_eval_count", 0)
-                            break
-        except httpx.ReadTimeout as exc:
-            raise LLMStalledError(
-                f"{model} produced no output for {LLM_IDLE_TIMEOUT_SECONDS:.0f}s "
-                "(stalled or deadlocked). Set SHAMSU_LLM_IDLE_TIMEOUT to allow longer "
-                "silences on slow hardware."
-            ) from exc
-        self._log_thinking(model, "".join(thinking_chunks))
+        # Reasoning stays out of the visible answer tokens: `on_token` only ever
+        # sees "response" chunks, never "thinking" ones.
+        text, thinking, prompt_eval_count = await self._stream_completion(model, payload, on_token)
+        self._log_thinking(model, thinking)
         # Same calibration as the non-streaming path (see _generate) - the
         # final streamed chunk carries the same ground-truth prompt_eval_count.
         if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
             self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
-        return "".join(chunks)
+        return text
 
     async def run_specialist_stream(
         self, specialist: str, pack: ContextPack, on_token: Callable[[str], None]

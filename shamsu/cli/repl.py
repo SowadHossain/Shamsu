@@ -43,7 +43,7 @@ from shamsu.diagnostics import setup as diagnostics_setup
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.diagnostics.setup import DiagnosticsWorkspace
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
-from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
+from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult, _thinking_preview
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
@@ -192,7 +192,9 @@ SYSTEM_COMMANDS = (
     "/memory forget ",
     "/memory summarize-session ",
     "/parse-prd ",
+    "/plan",
     "/plan ",
+    "/plan off",
     "/proceed",
     "/plan-prd ",
     "/generate-django ",
@@ -405,7 +407,9 @@ def _print_help(console: Console) -> None:
                     "  /memory search <query>   Search Graphiti memory",
                     "  /memory forget <query>   Forget/mark memory via Graphiti adapter",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
-                    "  /plan <task>              Plan any task first; review .shamsu/plans/*.md",
+                    "  /plan                     Plan mode: your next prompt gets planned, not built",
+                    "  /plan <task>              Plan that task now; review .shamsu/plans/*.md",
+                    "  /plan off                 Leave plan mode",
                     "  /proceed                  Execute the last plan you approved",
                     "  /plan-prd <file>          Preview and approve a project plan",
                     "  /generate-django <file>   Generate deterministic Django backend files",
@@ -2886,7 +2890,29 @@ def _make_llm_manager(
     }
     if budget_manager is not None and _call_accepts_keyword(LLMManager, "budget_manager"):
         kwargs["budget_manager"] = budget_manager
+    # Surface a reasoning model's chain-of-thought on the specialist path (QA,
+    # PRD summary, planner, direct-code). The agent chat loop already shows its
+    # own; without this, everything routed OUTSIDE the loop reasoned invisibly.
+    if workspace is not None and _call_accepts_keyword(LLMManager, "on_thinking"):
+        kwargs["on_thinking"] = _make_thinking_reporter(console, session_logger, workspace)
     return LLMManager(**kwargs)
+
+
+def _make_thinking_reporter(
+    console: Console, session_logger: SessionLogger | None, workspace: Path
+) -> Callable[[str, str], None]:
+    def report(model: str, thinking: str) -> None:
+        emit_trace(
+            console,
+            session_logger,
+            workspace,
+            "assistant.thinking",
+            _thinking_preview(thinking),
+            {"model": model, "thinking_chars": len(thinking)},
+            level="normal",
+        )
+
+    return report
 
 
 # One PermissionMemory per workspace per process, so "always allow" choices
@@ -5471,12 +5497,20 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     """Detect a natural-language "build the product from this PRD" request.
 
     Conservative: requires BOTH a build verb + product noun AND a real PRD
-    signal (the word prd/product requirements, an @-mentioned doc, or exactly
-    one PRD file present). This keeps narrow prompts like "build the navbar"
-    or "fix the build" from triggering a full autonomous product build.
+    signal (the word prd/product requirements, or a doc named in the prompt).
+    This keeps narrow prompts like "build the navbar" or "fix the build" from
+    triggering a full autonomous product build.
     A terse "do the task"/"continue" also counts when exactly one PRD is present
     - in a PRD workspace that almost always means "build that PRD", and the
     build is approval-gated anyway so it is safe to route here.
+
+    Detection is INTENT-only: it deliberately does not require the PRD file to
+    resolve. Resolving is `_handle_prd_build_request`'s job, and it reports
+    honestly (which of several PRDs? none found?). Gating detection on
+    resolution used to drop an unambiguous "build the app from the PRD" through
+    ~15 further rules into the tool-less QA brain - which then just *talks*
+    about building instead of building. A PRD that exists but isn't *named*
+    "prd" (e.g. `spec.md`) hit this on every prompt.
     """
     if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
         return True
@@ -5489,6 +5523,12 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     if not (has_build_verb and has_product_noun):
         return False
     if "prd" in text or "product requirements" in text or "requirements document" in text:
+        return True
+    # No PRD wording, but the prompt names a doc directly ("build the app from
+    # spec.md"): still a build-from-spec request, even though the filename would
+    # never pass `is_prd_filename`. Requires it to actually resolve, since
+    # there is no explicit "prd" in the prompt to vouch for the intent.
+    if _extract_prd_path_from_prompt(user_input):
         return _resolve_build_prd(user_input, workspace) is not None
     return False
 
@@ -5934,8 +5974,10 @@ async def _handle_prd_build_request(
         else:
             console.print(
                 "[yellow]I couldn't find a PRD to build from.[/yellow] "
-                "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or `Product Requirements*`), "
-                "then ask again."
+                "I look for a `.md`, `.txt`, or `.pdf` whose name contains `prd` or "
+                "`Product Requirements`.\n"
+                "If your spec is already here under another name, point me straight at it, "
+                "e.g. `build the app from \"spec.md\"` - I'll build from any file you name."
             )
         return
 
@@ -6230,6 +6272,88 @@ async def _resolve_plan_route(task: str, workspace: Path, llm: LLMManager) -> st
         return decision.intent or "code_edit"
     except Exception:
         return "code_edit"
+
+
+# Natural ways of asking for a plan in ordinary chat. Without these, only the
+# literal `plan <task>` prefix planned anything, so "make me a plan to add auth"
+# fell through to QA and got chatted at instead of planned.
+_PLAN_REQUEST_PHRASES = (
+    "make a plan",
+    "make me a plan",
+    "create a plan",
+    "write a plan",
+    "draft a plan",
+    "draw up a plan",
+    "come up with a plan",
+    "put together a plan",
+    "give me a plan",
+    "build me a plan",
+    "plan out",
+    "plan how",
+    "plan first",
+)
+
+# Questions ABOUT an existing plan are not requests for a new one.
+_PLAN_QUESTION_PREFIXES = (
+    "what is the plan",
+    "what's the plan",
+    "whats the plan",
+    "show me the plan",
+    "show the plan",
+    "explain the plan",
+    "read the plan",
+)
+
+_PLAN_MODE_OFF_COMMANDS = frozenset(
+    {"plan off", "exit plan", "exit plan mode", "cancel plan", "leave plan mode", "plan mode off"}
+)
+
+
+def _looks_like_plan_request(user_input: str) -> bool:
+    """True for a natural-language "plan this for me" request.
+
+    Deliberately phrase-based rather than a bare "plan" keyword: "what's the
+    plan" and "explain the plan" are questions about a plan that already exists.
+    """
+    text = user_input.lower().strip()
+    if any(text.startswith(prefix) for prefix in _PLAN_QUESTION_PREFIXES):
+        return False
+    return any(phrase in text for phrase in _PLAN_REQUEST_PHRASES)
+
+
+def _run_plan_with_ledger(
+    task: str,
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> None:
+    """Run `_handle_plan` inside a tracked run, like any other acting route."""
+    ledger = start_run(workspace, user_input)
+    set_current_run(ledger)
+    try:
+        with console.status(_thinking_status_for_input(user_input), spinner="dots"):
+            asyncio.run(_handle_plan(task, workspace, console, session_logger=session_logger))
+    except Exception as exc:
+        ledger.fail(str(exc))
+        clear_current_run()
+        raise
+    _finish_current_run(workspace, ledger)
+    clear_current_run()
+
+
+def _print_plan_mode_banner(console: Console) -> None:
+    console.print(
+        Panel(
+            "Tell me what you want built, changed, or fixed.\n\n"
+            "I'll research the workspace and write a step-by-step plan to "
+            "`.shamsu/plans/` for you to review - [bold]I won't touch any project "
+            "files yet[/bold]. Reply `proceed` once it looks right, or edit the file first.\n\n"
+            "[dim]/plan off to leave plan mode.[/dim]",
+            title="Plan mode",
+            border_style="cyan",
+        )
+    )
 
 
 async def _handle_plan(
@@ -7379,19 +7503,27 @@ def _print_startup_banner(workspace: Path, console: Console) -> None:
     console.print(Panel(body, title="SHAMSU", border_style="cyan"))
 
 
-def _bottom_toolbar(workspace: Path) -> str:
+def _bottom_toolbar(workspace: Path, plan_mode: bool = False) -> str:
     autonomy = "on" if is_long_running_enabled(workspace) else "off"
     model = model_for_role("qa")
-    return f" {workspace}  |  model: {model}  |  autonomy: {autonomy}  |  /help  /exit "
+    # Plan mode changes what the NEXT prompt does (plan instead of act), so it
+    # has to be visible - an invisible mode is a trap.
+    mode = "  |  PLAN MODE (next prompt gets planned, not built)" if plan_mode else ""
+    return f" {workspace}  |  model: {model}  |  autonomy: {autonomy}{mode}  |  /help  /exit "
 
 
 class CachedBottomToolbar:
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
+        self.plan_mode = False
         self.value = _bottom_toolbar(workspace)
 
     def refresh(self) -> None:
-        self.value = _bottom_toolbar(self.workspace)
+        self.value = _bottom_toolbar(self.workspace, self.plan_mode)
+
+    def set_plan_mode(self, enabled: bool) -> None:
+        self.plan_mode = enabled
+        self.refresh()
 
     def __call__(self) -> str:
         return self.value
@@ -7515,6 +7647,10 @@ def main(argv: list[str] | None = None) -> None:
     bottom_toolbar = CachedBottomToolbar(workspace)
     session = _make_prompt_session(workspace, bottom_toolbar)
     command_router = CommandRouter(SYSTEM_COMMANDS)
+    # Plan mode: `/plan` with no task arms this, and the NEXT natural prompt is
+    # planned instead of executed. Deliberately per-session (not persisted): a
+    # mode that silently survives a restart would plan when you meant to build.
+    plan_mode = False
 
     while True:
         try:
@@ -7616,23 +7752,44 @@ def main(argv: list[str] | None = None) -> None:
                     "[yellow]Nothing to proceed - make a plan first with `plan <task>`.[/yellow]"
                 )
             continue
+        if lowered_input in _PLAN_MODE_OFF_COMMANDS:
+            if plan_mode:
+                plan_mode = False
+                bottom_toolbar.set_plan_mode(False)
+                console.print("[dim]Plan mode off.[/dim]")
+            else:
+                console.print("[dim]Plan mode is already off.[/dim]")
+            continue
+        if plan_mode and not user_input.startswith("/"):
+            # Armed by a bare `/plan`: this prompt is the task to plan, whatever
+            # it looks like. Slash commands still run normally (checked above),
+            # so /help, /exit and friends keep working inside plan mode.
+            # One plan per arming: a plan is now pending `proceed`, so drop back
+            # to normal mode rather than planning every subsequent prompt.
+            plan_mode = False
+            bottom_toolbar.set_plan_mode(False)
+            _run_plan_with_ledger(normalized_input, user_input, workspace, console, session_logger)
+            continue
         if lowered_input == "plan" or lowered_input.startswith("plan "):
-            # Catches both `/plan <task>` and a natural "plan <task>". Produces a
-            # reviewable plan and stores it; `proceed` executes it step by step.
+            # `/plan <task>` plans that task right away. Bare `/plan` turns plan
+            # MODE on instead, so the task can be typed as the next prompt -
+            # bare `/plan` used to just print a usage error.
             _, _, plan_task = normalized_input.partition(" ")
-            ledger = start_run(workspace, user_input)
-            set_current_run(ledger)
-            try:
-                with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                    asyncio.run(
-                        _handle_plan(plan_task, workspace, console, session_logger=session_logger)
-                    )
-            except Exception as exc:
-                ledger.fail(str(exc))
-                clear_current_run()
-                raise
-            _finish_current_run(workspace, ledger)
-            clear_current_run()
+            if not plan_task.strip():
+                plan_mode = True
+                bottom_toolbar.set_plan_mode(True)
+                _print_plan_mode_banner(console)
+                continue
+            plan_mode = False
+            bottom_toolbar.set_plan_mode(False)
+            _run_plan_with_ledger(plan_task, user_input, workspace, console, session_logger)
+            continue
+        if _looks_like_plan_request(lowered_input):
+            # "make me a plan to add auth" in ordinary chat. The whole sentence
+            # is the task: the planner reads it better than a stripped fragment.
+            plan_mode = False
+            bottom_toolbar.set_plan_mode(False)
+            _run_plan_with_ledger(normalized_input, user_input, workspace, console, session_logger)
             continue
         if lowered_input.startswith("generate-django "):
             _handle_generate_django(normalized_input, workspace, console, session_logger=session_logger)

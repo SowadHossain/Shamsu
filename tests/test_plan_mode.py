@@ -207,3 +207,72 @@ def test_command_router_accepts_plan_and_proceed():
     router = CommandRouter(SYSTEM_COMMANDS)
     assert router.route("/plan add a feature").valid
     assert router.route("/proceed").valid
+
+
+# --- plan MODE (bare `/plan`) -------------------------------------------------
+
+
+def test_bare_plan_and_plan_off_are_real_commands():
+    """Bare `/plan` arms plan mode. It used to normalize to `plan` with an empty
+    task and print a usage error, so there was no mode to enter at all."""
+    from shamsu.cli.command_router import CommandRouter
+    from shamsu.cli.repl import SYSTEM_COMMANDS, _PLAN_MODE_OFF_COMMANDS
+
+    router = CommandRouter(SYSTEM_COMMANDS)
+    assert router.route("/plan").valid
+    assert router.route("/plan").normalized == "plan"
+    assert router.route("/plan off").valid
+    # `/plan off` must read as "leave the mode", never as "plan a task called off".
+    assert router.route("/plan off").normalized in _PLAN_MODE_OFF_COMMANDS
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "make me a plan to add auth",
+        "make a plan for the login page",
+        "come up with a plan for the game",
+        "draft a plan for refactoring",
+        "plan out how to add login",
+        "give me a plan for the api",
+    ],
+)
+def test_natural_language_plan_requests_are_detected(text):
+    """These used to fall through to QA and get chatted at instead of planned."""
+    from shamsu.cli.repl import _looks_like_plan_request
+
+    assert _looks_like_plan_request(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "what's the plan",
+        "what is the plan",
+        "show me the plan",
+        "explain the plan",
+        "read the plan",
+        "build the app",
+        "add two numbers",
+    ],
+)
+def test_questions_about_a_plan_are_not_plan_requests(text):
+    """Asking ABOUT a plan must not regenerate one over the top of it."""
+    from shamsu.cli.repl import _looks_like_plan_request
+
+    assert _looks_like_plan_request(text) is False
+
+
+def test_plan_mode_is_visible_in_the_toolbar(tmp_path: Path):
+    """A mode that changes what the next prompt does has to be visible."""
+    from shamsu.cli.repl import CachedBottomToolbar, _bottom_toolbar
+
+    assert "PLAN MODE" in _bottom_toolbar(tmp_path, plan_mode=True)
+    assert "PLAN MODE" not in _bottom_toolbar(tmp_path, plan_mode=False)
+
+    toolbar = CachedBottomToolbar(tmp_path)
+    assert "PLAN MODE" not in toolbar()
+    toolbar.set_plan_mode(True)
+    assert "PLAN MODE" in toolbar()
+    toolbar.set_plan_mode(False)
+    assert "PLAN MODE" not in toolbar()

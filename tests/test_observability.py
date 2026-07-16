@@ -3,13 +3,17 @@ queries + hits and a dim reasoning glimpse at normal verbosity, and `/context
 show` reports the observability snapshot."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import httpx
 import pytest
 from rich.console import Console
 
 import shamsu.cli.repl as repl
+import shamsu.llm.manager as manager_module
 from shamsu.agents.chat_loop import AgentChatLoop, _search_summary, _thinking_preview
+from shamsu.llm.manager import LLMManager
 from shamsu.tools.agent_tools import AgentToolRegistry, ToolResult
 from shamsu.ui.trace import format_trace_line
 
@@ -120,3 +124,133 @@ def test_context_show_reports_observability(tmp_path: Path):
     assert "Observability" in out
     assert "Search" in out and "Reasoning" in out
     assert "Trace mode" in out
+
+
+# ---------------------------------------------------------------------------
+# Reasoning on the SPECIALIST path (QA / PRD summary / planner / direct-code).
+# A reasoning model only fills the separate `thinking` field when asked; without
+# `think: true` the field stays empty forever and SHAMSU shows no CoT at all.
+# ---------------------------------------------------------------------------
+
+
+def _fake_ollama(monkeypatch, captured: list[dict], *, status: int = 200):
+    """Patch httpx.AsyncClient inside the manager with a scripted /api/generate."""
+
+    class FakeStream:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        async def __aenter__(self):
+            captured.append(self._payload)
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            # Only the think-bearing attempt is rejected, mimicking an Ollama
+            # build/model that doesn't accept the flag.
+            if status != 200 and self._payload.get("think"):
+                request = httpx.Request("POST", "http://localhost:11434/api/generate")
+                response = httpx.Response(status, request=request)
+                raise httpx.HTTPStatusError("rejected", request=request, response=response)
+
+        async def aiter_lines(self):
+            yield json.dumps({"thinking": "Step one. "})
+            yield json.dumps({"thinking": "Step two."})
+            yield json.dumps({"response": "The answer is 42."})
+            yield json.dumps({"done": True, "prompt_eval_count": 7})
+
+    class FakeClient:
+        def __init__(self, *a, **k) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        def stream(self, method, url, json=None):  # noqa: A002
+            return FakeStream(json)
+
+    monkeypatch.setattr(manager_module.httpx, "AsyncClient", FakeClient)
+
+
+@pytest.mark.asyncio
+async def test_reasoning_model_is_asked_to_think(monkeypatch):
+    captured: list[dict] = []
+    _fake_ollama(monkeypatch, captured)
+    seen: list[tuple[str, str]] = []
+    manager = LLMManager(on_thinking=lambda model, thinking: seen.append((model, thinking)))
+
+    text = await manager._generate("deepseek-r1:7b", "sys", "prompt")
+
+    assert captured[0].get("think") is True
+    # The chain-of-thought is surfaced whole...
+    assert seen == [("deepseek-r1:7b", "Step one. Step two.")]
+    # ...and kept out of the answer.
+    assert text == "The answer is 42."
+
+
+@pytest.mark.asyncio
+async def test_non_reasoning_model_is_not_asked_to_think(monkeypatch):
+    captured: list[dict] = []
+    _fake_ollama(monkeypatch, captured)
+    manager = LLMManager()
+
+    await manager._generate("qwen2.5-coder:7b-instruct", "sys", "prompt")
+
+    assert "think" not in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_think_rejection_falls_back_once_and_is_remembered(monkeypatch):
+    """An Ollama build that rejects `think` must degrade to a normal call, not
+    break every specialist request."""
+    manager_module._THINK_UNSUPPORTED.discard("deepseek-r1:7b")
+    captured: list[dict] = []
+    _fake_ollama(monkeypatch, captured, status=400)
+    manager = LLMManager()
+
+    text = await manager._generate("deepseek-r1:7b", "sys", "prompt")
+
+    assert text == "The answer is 42."           # answer still delivered
+    assert captured[0].get("think") is True      # tried with think
+    assert "think" not in captured[1]            # retried without it
+    assert "deepseek-r1:7b" in manager_module._THINK_UNSUPPORTED
+
+    # Remembered: the next call skips the doomed think attempt entirely.
+    captured.clear()
+    await manager._generate("deepseek-r1:7b", "sys", "prompt")
+    assert len(captured) == 1 and "think" not in captured[0]
+    manager_module._THINK_UNSUPPORTED.discard("deepseek-r1:7b")
+
+
+@pytest.mark.asyncio
+async def test_streamed_answer_never_leaks_reasoning_tokens(monkeypatch):
+    """`on_token` drives the visible stream - it must see answer tokens only."""
+    captured: list[dict] = []
+    _fake_ollama(monkeypatch, captured)
+    tokens: list[str] = []
+    manager = LLMManager()
+
+    text = await manager._generate_stream("deepseek-r1:7b", "sys", "prompt", tokens.append)
+
+    assert "".join(tokens) == "The answer is 42."
+    assert "Step one" not in "".join(tokens)
+    assert text == "The answer is 42."
+
+
+def test_repl_wires_reasoning_to_the_console(tmp_path: Path):
+    """The manager the REPL builds must report reasoning, or the specialist
+    path reasons invisibly (which is exactly what it used to do)."""
+    console = Console(record=True, width=100)
+    repl.write_trace_mode(tmp_path, "normal")
+    manager = repl._make_llm_manager(None, console, tmp_path)
+
+    assert manager.on_thinking is not None
+    manager.on_thinking("deepseek-r1:7b", "I should check the index first.")
+    out = console.export_text()
+    assert "Reasoning" in out
+    assert "check the index first" in out
