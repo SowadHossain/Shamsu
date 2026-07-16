@@ -17,6 +17,7 @@ import shlex
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -57,7 +58,7 @@ from shamsu.agents.task_harness import append_task_handoff, build_task_plan, pla
 from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
-from shamsu.llm.manager import LLMManager, ModelPullProgress
+from shamsu.llm.manager import LLMManager, LLMStalledError, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
@@ -1339,6 +1340,47 @@ def _resolve_pending_question(
             f"{created_from}\n\n(Answering the earlier question \"{question}\": {resolved_value})"
         )
     return resolved_value
+
+
+def _report_request_error(
+    exc: Exception,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> None:
+    """Last-resort handler: one failed request must never kill the whole REPL.
+
+    Before this existed, every ledger-tracked handler re-raised after logging
+    and `main()` had no outer catch - a single Ollama stall or handler bug took
+    down the entire session, losing plan mode and pending state (gap A1).
+    KeyboardInterrupt/SystemExit are not `Exception` subclasses, so Ctrl+C and
+    /exit keep their existing behavior untouched."""
+    if isinstance(exc, LLMStalledError):
+        body = (
+            f"{exc}\n\n"
+            "The model stopped producing output. Check that Ollama is still running "
+            "(`ollama ps`), or raise SHAMSU_LLM_IDLE_TIMEOUT if this machine is just slow."
+        )
+    else:
+        body = (
+            f"{type(exc).__name__}: {exc}\n\n"
+            "That request failed, but the session is fine - you can keep working. "
+            "The full traceback is in the session log."
+        )
+    console.print(Panel(body, title="Request failed", border_style="red"))
+    if session_logger is not None:
+        try:
+            session_logger.log(
+                "request.failed",
+                {
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                    "traceback": traceback.format_exc()[-4000:],
+                },
+                f"Request failed: {exc}",
+                workflow_id="repl",
+            )
+        except Exception:
+            pass
 
 
 def _continuation_clarification(user_input: str, previous_prompt: str) -> str | None:
@@ -6337,7 +6379,8 @@ def _run_plan_with_ledger(
     except Exception as exc:
         ledger.fail(str(exc))
         clear_current_run()
-        raise
+        _report_request_error(exc, console, session_logger)
+        return
     _finish_current_run(workspace, ledger)
     clear_current_run()
 
@@ -6577,7 +6620,11 @@ def _resolve_proceed(
     except Exception as exc:
         ledger.fail(str(exc))
         clear_current_run()
-        raise
+        # True: there WAS a plan to proceed with - it failed, and that's been
+        # reported. Returning False would make the caller claim nothing was
+        # pending, which is worse than the truth.
+        _report_request_error(exc, console, session_logger)
+        return True
     _finish_current_run(workspace, ledger)
     clear_current_run()
     return True
@@ -7838,7 +7885,8 @@ def main(argv: list[str] | None = None) -> None:
             except Exception as exc:
                 ledger.fail(str(exc))
                 clear_current_run()
-                raise
+                _report_request_error(exc, console, session_logger)
+                continue
             _finish_current_run(workspace, ledger)
             clear_current_run()
             continue
@@ -7866,7 +7914,8 @@ def main(argv: list[str] | None = None) -> None:
                 except Exception as exc:
                     ledger.fail(str(exc))
                     clear_current_run()
-                    raise
+                    _report_request_error(exc, console, session_logger)
+                    continue
                 _finish_current_run(workspace, ledger)
                 clear_current_run()
             else:
@@ -7937,7 +7986,8 @@ def main(argv: list[str] | None = None) -> None:
                 except Exception as exc:
                     ledger.fail(str(exc))
                     clear_current_run()
-                    raise
+                    _report_request_error(exc, console, session_logger)
+                    continue
                 _finish_current_run(workspace, ledger)
                 clear_current_run()
                 continue
@@ -7974,7 +8024,8 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             ledger.fail(str(exc))
             clear_current_run()
-            raise
+            _report_request_error(exc, console, session_logger)
+            continue
         _finish_current_run(workspace, ledger)
         clear_current_run()
 

@@ -481,11 +481,13 @@ class AgentToolRegistry:
             ),
             _tool_schema(
                 "ask_user",
-                "Ask the user a clarifying question when required input is missing and you "
-                "cannot safely infer it with read-only tools. Calling this ends your turn "
-                "and waits for the user's answer. Prefer find_file/grep_files/list_files "
-                "first; only ask when genuinely blocked or when choosing between "
-                "ambiguous/destructive options.",
+                "Ask the user a question when the answer is THEIRS to give: choosing between "
+                "valid approaches or designs, naming, scope, anything destructive or hard to "
+                "undo, an ambiguous target (several matching files), or required input that "
+                "tools cannot find. Asking one good question is cheap; acting on a wrong "
+                "guess is expensive. Look up plain facts with find_file/grep_files/read_file "
+                "yourself instead of asking. Calling this ends your turn and waits for the "
+                "user's answer.",
                 {
                     "question": {"type": "string", "description": "The question to ask the user."},
                     "options": {

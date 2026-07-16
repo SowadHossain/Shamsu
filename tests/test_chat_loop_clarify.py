@@ -47,6 +47,78 @@ def _loop(tmp_path: Path, client, session_logger=None) -> AgentChatLoop:
     )
 
 
+# ---------------------------------------------------------------------------
+# Gap J2: the stall guards must ASK for the missing decision, not give up.
+# `safety/clarify.py` was built for exactly this and was never wired - the
+# loop always ended on a dead-end message the user couldn't act on.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repeated_identical_call_asks_the_user_instead_of_giving_up(tmp_path: Path):
+    """Repeating one call means a missing DECISION, not missing effort."""
+    logger = SessionManager(tmp_path).create_session("Repeat")
+    same_call = _message(tool_calls=[_tool_call("read_file", {"filepath": "ghost.py"})])
+    client = ScriptedClient([same_call, same_call, same_call, same_call])
+    loop = _loop(tmp_path, client, session_logger=logger)
+
+    result = await loop.run("fix the bug in ghost.py")
+
+    # It ends the turn as a QUESTION the user can answer...
+    assert result.awaiting_user is True
+    assert result.stopped is True
+    assert "read_file" in result.final
+    assert "?" in result.final
+    # ...and the question survives the turn, so the next reply resumes the work.
+    pending = logger.get_pending_question()
+    assert pending.get("question")
+    assert pending["created_from_prompt"] == "fix the bug in ghost.py"
+    assert pending["source"] == "stall_guard"
+
+
+@pytest.mark.asyncio
+async def test_exhausted_read_recovery_asks_with_candidates_as_options(tmp_path: Path):
+    """After recoveries run out, the user knows the right path even when the
+    model doesn't - so offer the candidates rather than dead-ending."""
+    (tmp_path / "client").mkdir()
+    (tmp_path / "admin").mkdir()
+    (tmp_path / "client" / "App.tsx").write_text("x", encoding="utf-8")
+    (tmp_path / "admin" / "App.tsx").write_text("y", encoding="utf-8")
+
+    logger = SessionManager(tmp_path).create_session("ReadStall")
+    failed_read = _message(tool_calls=[_tool_call("read_file", {"filepath": "App.tsx"})])
+    stall = _message(content="I will read App.tsx next.")
+    # One failed read, then prose-only stalls until recoveries are exhausted.
+    client = ScriptedClient([failed_read] + [stall] * 6)
+    loop = _loop(tmp_path, client, session_logger=logger)
+
+    result = await loop.run("read App.tsx")
+
+    assert result.awaiting_user is True
+    pending = logger.get_pending_question()
+    assert pending.get("question")
+    labels = [option["label"] for option in pending.get("options", [])]
+    assert any("App.tsx" in label for label in labels), labels
+
+
+@pytest.mark.asyncio
+async def test_stall_ask_is_logged_as_agent_stuck(tmp_path: Path):
+    """The `agent.stuck` telemetry from the old give-up path is preserved."""
+    import json
+
+    logger = SessionManager(tmp_path).create_session("Telemetry")
+    same_call = _message(tool_calls=[_tool_call("read_file", {"filepath": "ghost.py"})])
+    client = ScriptedClient([same_call] * 4)
+    loop = _loop(tmp_path, client, session_logger=logger)
+
+    await loop.run("fix ghost.py")
+
+    lines = logger.events_path.read_text(encoding="utf-8").splitlines()
+    stuck = [json.loads(line) for line in lines if "agent.stuck" in line]
+    assert stuck
+    assert stuck[0]["payload"]["asked"] is True
+
+
 @pytest.mark.asyncio
 async def test_ask_user_ends_turn_and_persists_pending_question(tmp_path: Path):
     logger = SessionManager(tmp_path).create_session("Ask")

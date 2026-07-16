@@ -37,7 +37,6 @@ from shamsu.runtime.models import (
     model_is_reasoning,
     model_supports_native_tools,
 )
-from shamsu.safety.clarify import ask_clarifying_question
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.ui.progress import ProgressReporter, summarize_tool_args, summarize_tool_result
@@ -140,11 +139,16 @@ File tools:
 - After tool results, summarize exactly what happened and what remains.
 
 ## Clarification rules
-- Ask the user a clear question (call ask_user) when required input is missing and tools cannot safely infer it.
+- Call ask_user whenever a decision belongs to the user, not just when you are stuck:
+  choosing between valid approaches/designs, naming, scope, or anything destructive.
+  One good question beats a confidently wrong build.
 - Do not guess between multiple destructive or ambiguous choices.
-- Use read-only tools (find_file, grep_files, list_files, read_file) to gather missing context before asking.
+- Use read-only tools (find_file, grep_files, list_files, read_file) to gather missing FACTS
+  before asking - but never "research your way past" a judgment call that is the user's.
 - For multiple file candidates, call ask_user with the candidates as options so the user can choose.
 - Ask for a commit message, branch/remote, or a specific target when those are required and ambiguous.
+- Example: task says "add auth" and nothing specifies sessions vs JWT -> ask_user with those
+  two options. Example: two config files could be the target -> ask_user listing both.
 
 ## Visible process rules
 - Do not expose hidden chain-of-thought.
@@ -242,7 +246,6 @@ class AgentChatLoop:
         state: ChatState | None = None,
         max_tool_rounds: int = DEFAULT_MAX_TOOL_ROUNDS,
         long_running: bool = False,
-        clarify_prompt: Callable[[str], str] | None = ask_clarifying_question,
         on_activity: Callable[[str], None] | None = None,
         on_trace: TraceCallback | None = None,
         progress: ProgressReporter | None = None,
@@ -288,9 +291,6 @@ class AgentChatLoop:
         )
         self.long_running = long_running
         self.max_tool_rounds = LONG_RUNNING_MAX_TOOL_ROUNDS if long_running else max_tool_rounds
-        # Only used when long_running=True; None disables the clarifying
-        # question (falls back to a plain stop message) â€" useful for tests.
-        self.clarify_prompt = clarify_prompt if long_running else None
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
     async def _messages_within_budget(self, num_ctx: int) -> list[dict[str, Any]]:
@@ -573,9 +573,20 @@ class AgentChatLoop:
                             )
                         )
                         continue
-                    final = _read_blocked_final(last_failed_read)
-                    self.state.append_assistant(final)
-                    return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+                    # Recoveries exhausted: the user knows the right path even
+                    # when the model doesn't - ask, with candidates as options.
+                    failed_path = str(last_failed_read.get("filepath", "the file"))
+                    candidates = [
+                        str(candidate)
+                        for candidate in list(last_failed_read.get("candidates", []))[:6]
+                    ]
+                    return self._ask_for_help_on_stall(
+                        reason=f"I could not read {failed_path} after several attempts.",
+                        question="Which file should I use (or what is the correct path)?",
+                        original_input=user_input,
+                        round_index=round_index,
+                        options=[{"label": candidate, "description": ""} for candidate in candidates],
+                    )
                 if _looks_like_deferred_action(content):
                     # The model said it would take a tool action ("I will read X
                     # next") but did not call a tool. Do not end the turn on an
@@ -624,7 +635,17 @@ class AgentChatLoop:
                 signature = (name, json.dumps(arguments, sort_keys=True, default=str))
                 repeated_calls[signature] += 1
                 if repeated_calls[signature] >= _MAX_REPEATED_CALLS:
-                    return self._give_up_on_repetition(name, arguments, round_index)
+                    # Repeating the same call means the loop is missing a
+                    # decision, not effort - ask for it instead of giving up.
+                    return self._ask_for_help_on_stall(
+                        reason=(
+                            f"I kept repeating the same {name} call "
+                            f"({summarize_tool_args(name, arguments)}) without making progress."
+                        ),
+                        question="What should I do differently, or which target should I use?",
+                        original_input=user_input,
+                        round_index=round_index,
+                    )
                 if self.on_activity:
                     self.on_activity(_describe_tool_call(name, arguments))
                 if self.progress:
@@ -940,6 +961,48 @@ class AgentChatLoop:
         except Exception:
             pass
 
+    def _ask_for_help_on_stall(
+        self,
+        reason: str,
+        question: str,
+        original_input: str,
+        round_index: int,
+        options: list[dict[str, str]] | None = None,
+    ) -> AgentLoopResult:
+        """A stall guard tripped: ask the user for the missing input instead of
+        just giving up (gap J2 - `safety/clarify.py` was built for exactly this
+        and never wired; the loop always ended with a dead-end message).
+
+        Routes through the same pending-question flow as the model's own
+        ask_user calls, so the question survives across turns and the user's
+        next reply resumes the work - no blocking input() (fragile on Windows,
+        gap G1). Only the guards where the USER plausibly holds the answer end
+        here (repetition -> a decision; failed reads -> the right path); model
+        pathologies (empty replies, prose-only promises) still stop plainly,
+        because no user answer can fix those."""
+        pending = {
+            "question": f"{reason} {question}".strip(),
+            "options": list(options or []),
+            "allow_free_text": True,
+            "source": "stall_guard",
+        }
+        self._emit_trace(
+            "workflow.blocked",
+            f"Stall guard asked the user for help: {reason}",
+            {"category": "stall_guard_ask"},
+        )
+        if self.session_logger:
+            try:
+                self.session_logger.log(
+                    "agent.stuck",
+                    {"reason": reason, "asked": True},
+                    "Stalled; asked the user for input",
+                    workflow_id="agent-chat",
+                )
+            except Exception:
+                pass
+        return self._handle_ask_user(pending, original_input, round_index)
+
     def _handle_ask_user(
         self, pending: dict[str, Any], original_input: str, round_index: int
     ) -> AgentLoopResult:
@@ -986,25 +1049,6 @@ class AgentChatLoop:
             f"read_file {filepath} failed ({message}) and no candidate path matched. Use find_file or "
             "grep_files to locate the right file, or call ask_user for the correct path. Do not claim you read it."
         )
-
-    def _give_up_on_repetition(self, tool_name: str, arguments: dict[str, Any], round_index: int) -> AgentLoopResult:
-        """The same tool call repeated past the limit despite corrections â€" stop
-        cleanly rather than burn rounds. No clarifying question, no filler."""
-        final = (
-            f"I stopped because the same {tool_name} call kept repeating without meaningful progress. "
-            f"Target/context: {summarize_tool_args(tool_name, arguments)}. It likely needs a "
-            "different patch, a changed file state, or more detail."
-        )
-        self.state.append_assistant(final)
-        if self.session_logger:
-            self.session_logger.log(
-                "agent.stuck",
-                {"tool_name": tool_name},
-                "Stopped after repeated identical tool calls",
-                workflow_id="agent-chat",
-            )
-        self._audit_final(final)
-        return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
 
     def _log_tool_call(self, name: str, arguments: dict[str, Any]) -> None:
         if not self.session_logger:
@@ -1164,20 +1208,6 @@ def _discovery_failure_correction(tool_name: str, message: str, hint_name: str) 
     return (
         f"Your {tool_name} call failed: {message} Adjust the arguments and try a different query or "
         "path, or state plainly that you are blocked."
-    )
-
-
-def _read_blocked_final(failed_read: dict[str, Any]) -> str:
-    filepath = failed_read.get("filepath", "the file")
-    candidates = failed_read.get("candidates") or []
-    if candidates:
-        return (
-            f"I could not read {filepath}: it does not exist at that path. Closest matches in the "
-            f"workspace: {', '.join(candidates[:6])}. Tell me which one to use and I'll read it."
-        )
-    return (
-        f"I could not read {filepath}: it does not exist in the workspace and no similar files were "
-        "found. Please double-check the path."
     )
 
 
