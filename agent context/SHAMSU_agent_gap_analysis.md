@@ -26,14 +26,14 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
 | J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ✅ |
 | J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM | ◑ transcript now carries over |
-| J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM | |
+| J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM | ✅ |
 | J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM | |
 | D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | |
 | D2 | No delete / move / rename tools | Tooling | MEDIUM | |
 | E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | |
 | E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM | |
 | G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM | |
-| G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | |
+| G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | ✅ |
 | G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | |
 | B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | |
 | H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | |
@@ -207,7 +207,11 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** route approvals through `prompt_toolkit` (already a dependency, already running the session) instead of raw `input()`, pausing the status spinner around the prompt.
 
-### G2. Rollback exists but is practically undiscoverable — MEDIUM
+### G2. Rollback exists but is practically undiscoverable — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed.** `/undo` reverts the most recent file change (approval-gated, same as `/patch rollback`), and any agent run that wrote files now prints "Not what you wanted? `/undo` reverts the last change." — the hint appears exactly when it's needed. Scope is stated honestly: each write is its own transaction, so `/undo` steps back one change at a time rather than reverting a whole run.
+>
+> **Bug found while building it:** `latest_undoable_transaction` first ordered by transaction id, on the reasoning that ids are timestamp-prefixed. They are — to *second* resolution (`%Y%m%dT%H%M%S-<uuid8>`). Two writes in the same second therefore sorted by their **random uuid suffix**, so `/undo` would revert an arbitrary one of them — and back-to-back agent writes are the common case, not an edge case. It passed in isolation and failed in the full suite (uuid lottery). Now ordered by the manifest's microsecond `created_at`, with the id only breaking exact ties. Tests: `tests/test_undo_command.py` (8), including 12 rapid same-second writes.
 
 **Evidence:** every model-driven write IS transactional (`agent_tools.py`: "Every model-driven write goes through a transaction (backup + hash)") and `/patch rollback <transaction-id>` exists. But nothing at run end tells the user a transaction id exists, and there is no "undo the last run" verb.
 
@@ -257,7 +261,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** short-circuit routing for question answers — resume the route recorded when the question was stored (`set_pending_question` already persists context; add the route). Full state resume is the A2 fix; recording the route is a one-line down-payment.
 
-### J5. A question asked mid-plan execution is effectively lost — MEDIUM
+### J5. A question asked mid-plan execution is effectively lost — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed.** `_execute_plan` now checks `result.awaiting_user` after every step. It was worse than "the question waits": the step was marked **done** — a plain lie — and later steps ran on the unanswered assumption. Now the plan pauses at the asking step (left `running`, not `done`), `_pause_plan_for_question` records `{awaiting: "plan_resume", steps, resume_index, changed_files}` next to the pending question, and the user's answer re-enters `_execute_plan` at that step via `_resume_paused_plan` (reusing the milestone/verify machinery rather than duplicating it). The paused record is popped on resume, on decline/cancel, and when a slash command clears a stale question — otherwise it would sit armed and fire off some later unrelated answer. Tests: `tests/test_plan_pause_on_question.py` (5).
 
 **Evidence:** the pending-question check lives only at the top of the REPL prompt loop (repl.py:7686). `_execute_plan`'s `for` loop over steps never checks `get_pending_question` between steps — if step 2's agent pass calls `ask_user`, the loop proceeds to step 3 anyway, and a later step can overwrite the stored question.
 

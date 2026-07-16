@@ -6539,6 +6539,90 @@ async def _execute_pending_plan(
     await _execute_plan(task, route, markdown, steps, workspace, console, session_logger)
 
 
+def _pause_plan_for_question(
+    task: str,
+    route: str,
+    plan_markdown: str,
+    steps: list[str],
+    resume_index: int,
+    changed_files: list[str],
+    workspace: Path,
+    session_logger: SessionLogger | None,
+) -> None:
+    """Record where a plan stopped so the user's answer resumes it (gap J5).
+
+    Stored alongside the pending QUESTION the agent loop already saved: the
+    question captures what was asked, this captures what to do with the answer.
+    """
+    if session_logger is None:
+        return
+    try:
+        session_logger.set_pending_action(
+            {
+                "type": "plan",
+                "awaiting": "plan_resume",
+                "task": task,
+                "route": route,
+                "plan_markdown": plan_markdown,
+                "steps": list(steps),
+                "resume_index": resume_index,
+                "changed_files": list(changed_files),
+            }
+        )
+    except Exception:
+        pass
+
+
+def _take_paused_plan(session_logger: SessionLogger | None) -> dict[str, Any] | None:
+    """Pop a plan paused on a question, if this reply is answering one."""
+    if session_logger is None:
+        return None
+    try:
+        pending = session_logger.get_pending_action()
+    except Exception:
+        return None
+    if pending.get("awaiting") != "plan_resume":
+        return None
+    try:
+        session_logger.clear_pending_action()
+    except Exception:
+        pass
+    return pending
+
+
+async def _resume_paused_plan(
+    paused: dict[str, Any],
+    answer_prompt: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """Re-enter plan execution at the step that asked, with the answer in hand.
+
+    The remaining steps are replayed as a fresh plan run whose first step is the
+    one that stopped - reusing `_execute_plan` rather than duplicating the
+    milestone/verify machinery.
+    """
+    steps = [str(step) for step in (paused.get("steps") or [])]
+    resume_index = int(paused.get("resume_index", 0) or 0)
+    remaining = steps[resume_index:]
+    if not remaining:
+        return
+    console.print(
+        f"[green]Resuming the plan at step {resume_index + 1}/{len(steps)} with your answer.[/green]"
+    )
+    task = str(paused.get("task", ""))
+    await _execute_plan(
+        f"{task}\n\n(The user answered: {answer_prompt})" if task else answer_prompt,
+        str(paused.get("route", "code_edit")),
+        str(paused.get("plan_markdown", "")),
+        remaining,
+        workspace,
+        console,
+        session_logger=session_logger,
+    )
+
+
 async def _execute_plan(
     task: str,
     route: str,
@@ -6591,6 +6675,21 @@ async def _execute_plan(
         for path in getattr(result, "changed_files", ()) or ():
             if path not in changed_files:
                 changed_files.append(path)
+        # The step asked the user something instead of finishing (gap J5). The
+        # pending-question check only ran at the top of the REPL loop, so this
+        # used to mark the step "done" - a plain lie - and run every later step
+        # on the unanswered assumption, with a subsequent step free to overwrite
+        # the question nobody had seen yet. Pause here and resume on the answer.
+        if getattr(result, "awaiting_user", False):
+            save_task(task_obj, workspace)   # leave the step RUNNING, not done
+            _pause_plan_for_question(
+                task, route, plan_markdown, steps, index, changed_files, workspace, session_logger
+            )
+            console.print(
+                f"[yellow]Plan paused at step {index + 1}/{len(steps)} - answer above and "
+                "I'll pick up from here.[/yellow]"
+            )
+            return
         task_obj = mark_step_done(task_obj, step.id, "Agent completed this plan step.")
         save_task(task_obj, workspace)
     console.print(f"[green]Plan execution complete. Task: {task_obj.task_id}[/green]")
@@ -7818,6 +7917,29 @@ def main(argv: list[str] | None = None) -> None:
                     pending_question, user_input, workspace, console, session_logger
                 )
                 if rewritten is None:
+                    # Declined/cancelled: a plan paused on this question must not
+                    # linger and silently resume on some later, unrelated prompt.
+                    _take_paused_plan(session_logger)
+                    continue
+                # If a plan stopped on that question, the answer resumes the plan
+                # rather than starting an unrelated new request (gap J5).
+                paused_plan = _take_paused_plan(session_logger)
+                if paused_plan is not None:
+                    ledger = start_run(workspace, user_input)
+                    set_current_run(ledger)
+                    try:
+                        asyncio.run(
+                            _resume_paused_plan(
+                                paused_plan, rewritten, workspace, console, session_logger
+                            )
+                        )
+                    except Exception as exc:
+                        ledger.fail(str(exc))
+                        clear_current_run()
+                        _report_request_error(exc, console, session_logger)
+                        continue
+                    _finish_current_run(workspace, ledger)
+                    clear_current_run()
                     continue
                 user_input = rewritten
             else:
@@ -7827,8 +7949,11 @@ def main(argv: list[str] | None = None) -> None:
                     _log_assistant_message(session_logger, continuation_message, workflow_id="clarification")
                     continue
         elif session_logger.get_pending_question().get("question"):
-            # Topic change via slash command: drop the stale pending question.
+            # Topic change via slash command: drop the stale pending question,
+            # and any plan paused on it - otherwise the plan would sit armed and
+            # resume off some later, unrelated answer.
             session_logger.clear_pending_question()
+            _take_paused_plan(session_logger)
         if user_input.startswith("/"):
             route = command_router.route(user_input)
             if not route.valid:
