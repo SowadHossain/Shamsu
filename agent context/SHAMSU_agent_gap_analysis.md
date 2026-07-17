@@ -20,16 +20,16 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
 | B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | |
 | B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
-| C1 | `create_plan` is ungrounded free text on every mutating workflow | Planning | **HIGH** | |
+| C1 | Ungrounded planning (plan_mode fixed; `create_plan` still free text) | Planning | **HIGH** | ◑ |
 | F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
 | J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | |
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
-| J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ✅ |
+| J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ◑ measured: still fails on design decisions |
 | J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM | ◑ transcript now carries over |
 | J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM | ✅ |
 | J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM | |
 | D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | |
-| D2 | No delete / move / rename tools | Tooling | MEDIUM | |
+| D2 | No delete / move / rename tools | Tooling | MEDIUM | ✅ |
 | E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | |
 | E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM | |
 | G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM | |
@@ -109,7 +109,15 @@ The ~20-rule order-dependent chain has a 57-test characterization net over its *
 
 ## C. Planning
 
-### C1. `create_plan` is ungrounded free text feeding every mutating workflow — HIGH
+### C1. Ungrounded planning — HIGH ◑ PARTIAL 2026-07-17
+
+> **Confirmed empirically, then half-fixed.** The `plan_references_only_real_files` eval caught it on the first live run. A workspace containing exactly `game.js` + `index.html` (vanilla JS) produced a plan whose **every step** targeted `src/components/PauseButton.tsx` — a React component that does not exist, in a project with no React. Step 1 read: *"Reference the PauseButton component from the real files."* It is not real. A coder handed that plan inherits the hallucination as trusted context.
+>
+> **Root cause was not the model.** `PlanningWorkflow._relevant_files` returned `[]` whenever search found nothing — which is *always* when the index isn't set up (`NullSearchAgent`) or FTS simply misses — and the prompt then demanded a plan "grounded ONLY in the provided workspace context" while providing **none**. Told to ground in nothing, the model invents. The files were sitting on disk the whole time.
+>
+> **Landed (plan_mode / the user-facing `/plan`):** `_relevant_files` never returns empty while the workspace has source files — search first, then a real mtime-sorted directory listing (dependency/build dirs excluded). Plus a grounding gate: `_unreal_targets` flags step targets that don't exist and aren't being created, and the planner gets **one** corrective round naming the phantoms and listing the real files. A retry that isn't better grounded is discarded rather than swapped in. Same "correct, then accept honestly" shape as the tool-call salvager. Traced as `plan.ungrounded`. **Live re-run: the same prompt now targets `index.html` and `game.js`.** Tests: `tests/test_plan_mode.py` (+6, deterministic).
+>
+> **Still open — the original C1 target:** `agents/planner.py::create_plan` is still one free-text call spliced raw into the coder's prompt, on every file-mutating workflow (CodeEditWorkflow, BugFixWorkflow, TestGenerationWorkflow, DocumentationWorkflow). It at least receives real search results, so it is better off than plan_mode was, but it has no schema, no validation, and no eval. Converging it onto the contract above needs its own eval first — shipping it unmeasured would repeat the J3 mistake documented below.
 
 **Evidence:** `agents/planner.py` — one LLM call, plain-text instructions ("Do not write code… under 10 lines"), output spliced raw into the coder specialist's request. No JSON schema, no real-file grounding check, no validation, no trace event. Called by CodeEditWorkflow, BugFixWorkflow, TestGenerationWorkflow, DocumentationWorkflow — i.e. **every file-mutating workflow**.
 
@@ -135,7 +143,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** register a `web_search`/`fetch_url` tool in the registry (approval-gated like `run_command`). The salvager and result budgeting (G12) already handle the output shape.
 
-### D2. No delete / move / rename tools — MEDIUM
+### D2. No delete / move / rename tools — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed.** `move_file` and `delete_file` in `AgentToolRegistry`, both approval-gated and both routed through the same transaction machinery as every other model-driven write - so `/undo` covers them and a model deleting the wrong file is never unrecoverable (tests round-trip both through a real rollback). `move_file` refuses to clobber an existing destination rather than silently destroying it; both are sandbox-validated. `delete_file`'s description points at ask_user when several files could be the target, rather than guessing. Tests: `tests/test_move_delete_tools.py` (9).
 
 **Evidence:** grep confirms no `delete_file`, `move_file`, or `rename` tool names in `agent_tools.py`.
 

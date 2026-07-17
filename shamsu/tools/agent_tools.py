@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -214,6 +215,25 @@ class AgentToolRegistry:
                     "content": {"type": "string", "description": "Complete file content."},
                 },
                 required=["filepath", "content"],
+            ),
+            _tool_schema(
+                "move_file",
+                "Move or rename a file inside the workspace. Use this instead of writing a new "
+                "copy and leaving the old one behind, and instead of shell mv/move. Backed up, so "
+                "it can be undone. Refuses if the destination already exists.",
+                {
+                    "source": {"type": "string", "description": "Existing relative file path."},
+                    "destination": {"type": "string", "description": "New relative file path."},
+                },
+                required=["source", "destination"],
+            ),
+            _tool_schema(
+                "delete_file",
+                "Delete a workspace file. The file is backed up first, so a deletion can be undone. "
+                "Only delete when the task clearly calls for it; if several files could be the "
+                "intended target, call ask_user instead of guessing.",
+                {"filepath": {"type": "string", "description": "Relative file path to delete."}},
+                required=["filepath"],
             ),
             _tool_schema(
                 "run_command",
@@ -551,6 +571,13 @@ class AgentToolRegistry:
                     str(arguments.get("content") or ""),
                     overwrite=True,
                 )
+            if name == "move_file":
+                return self.move_file(
+                    str(arguments.get("source") or ""),
+                    str(arguments.get("destination") or ""),
+                )
+            if name == "delete_file":
+                return self.delete_file(str(arguments.get("filepath") or ""))
             if name == "run_command":
                 return self.run_command(
                     str(arguments.get("command") or ""),
@@ -1121,6 +1148,123 @@ class AgentToolRegistry:
                 "start_line": start_line,
                 "end_line": end_line,
             },
+        )
+
+    def move_file(self, source: str, destination: str) -> ToolResult:
+        """Move/rename a file inside the workspace, transactionally.
+
+        Without this, any refactor that relocates a file forced the model into
+        `run_command` shell hacks (`mv`/`move` - allowlist-dependent and
+        POSIX/Windows-divergent) or into write-new-and-leave-the-old, which
+        litters dead files that then pollute search_index results and future
+        context packs (gap D2).
+        """
+        from_path = _normalize_workspace_path(source)
+        to_path = _normalize_workspace_path(destination)
+        if not from_path or not to_path:
+            return ToolResult(False, "move_file needs both source and destination.", {})
+        if from_path == to_path:
+            return ToolResult(False, "Source and destination are the same file.", {"filepath": from_path})
+        try:
+            src = self.sandbox.validate(from_path)
+            dest = self.sandbox.validate(to_path)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": from_path})
+        if not src.is_file():
+            return ToolResult(
+                False,
+                f"Cannot move {from_path}: it is not a file in this workspace.",
+                {"filepath": from_path},
+            )
+        if dest.exists():
+            return ToolResult(
+                False,
+                f"Refusing to move {from_path} onto {to_path}: the destination already exists. "
+                "Pick a different destination, or edit/delete that file explicitly first.",
+                {"filepath": to_path},
+            )
+
+        request = ApprovalRequest(
+            action_type="file_edit",
+            description=f"Move {from_path} -> {to_path}",
+            risk_level="medium",
+            working_dir=str(self.workspace_root),
+            reason="The agent requested a workspace file move/rename.",
+        )
+        if not self.approval_manager.ask(request):
+            return ToolResult(False, "Move denied by user.", {"filepath": from_path})
+
+        # Back the source up before moving so /undo can restore it, exactly like
+        # every other model-driven mutation.
+        transaction_id = self.transactions.begin(
+            reason=f"Agent move_file: {from_path} -> {to_path}",
+            operations=[{"op": "move_file", "path": from_path, "dest_path": to_path, "reason": ""}],
+            destructive=True,
+        )
+        self.transactions.backup_file(transaction_id, from_path)
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dest))
+        except OSError as exc:
+            self.transactions.finalize(transaction_id, "failed")
+            return ToolResult(False, f"Move failed: {exc}", {"filepath": from_path})
+        self.transactions.record_after(transaction_id, to_path)
+        self.transactions.finalize(transaction_id, "applied")
+        _mark_code_memory_stale(self.workspace_root)
+        return ToolResult(
+            True,
+            f"Moved {from_path} -> {to_path}.",
+            {"filepath": to_path, "source": from_path, "transaction_id": transaction_id},
+        )
+
+    def delete_file(self, filepath: str) -> ToolResult:
+        """Delete a workspace file, recoverably.
+
+        The file goes to the transaction trash rather than being unlinked, so
+        `/undo` (and `/patch rollback`) can bring it back - a model deleting the
+        wrong file must never be unrecoverable.
+        """
+        normalized = _normalize_workspace_path(filepath)
+        if not normalized:
+            return ToolResult(False, "Missing filepath.", {})
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized})
+        if not target.is_file():
+            return ToolResult(
+                False,
+                f"Cannot delete {normalized}: it is not a file in this workspace.",
+                {"filepath": normalized},
+            )
+
+        request = ApprovalRequest(
+            action_type="file_delete",
+            description=f"Delete file: {normalized}",
+            risk_level="high",
+            working_dir=str(self.workspace_root),
+            reason="The agent requested a workspace file deletion.",
+        )
+        if not self.approval_manager.ask(request):
+            return ToolResult(False, "Delete denied by user.", {"filepath": normalized})
+
+        transaction_id = self.transactions.begin(
+            reason=f"Agent delete_file: {normalized}",
+            operations=[{"op": "delete_file", "path": normalized, "dest_path": "", "reason": ""}],
+            destructive=True,
+        )
+        self.transactions.backup_file(transaction_id, normalized)
+        try:
+            target.unlink()
+        except OSError as exc:
+            self.transactions.finalize(transaction_id, "failed")
+            return ToolResult(False, f"Delete failed: {exc}", {"filepath": normalized})
+        self.transactions.finalize(transaction_id, "applied")
+        _mark_code_memory_stale(self.workspace_root)
+        return ToolResult(
+            True,
+            f"Deleted {normalized}. Recoverable with /undo.",
+            {"filepath": normalized, "transaction_id": transaction_id},
         )
 
     def write_file(self, filepath: str, content: str, overwrite: bool = False) -> ToolResult:

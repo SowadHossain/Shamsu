@@ -1,6 +1,7 @@
 """Plan mode: plan generation, plan-file parsing, and the proceed-to-execute path."""
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 from pathlib import Path
@@ -276,3 +277,123 @@ def test_plan_mode_is_visible_in_the_toolbar(tmp_path: Path):
     assert "PLAN MODE" in toolbar()
     toolbar.set_plan_mode(False)
     assert "PLAN MODE" not in toolbar()
+
+
+# ---------------------------------------------------------------------------
+# Gap C1: plan grounding. A plan naming files that don't exist is a
+# hallucination the coder then inherits as trusted context. Caught by the
+# plan_references_only_real_files eval: a vanilla-JS workspace (game.js,
+# index.html) produced a plan whose every step targeted a React component at
+# src/components/PauseButton.tsx - because search returned nothing and the
+# planner was handed NO context while being told to ground "ONLY" in it.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLLM:
+    """Returns queued payloads and records every prompt it was given."""
+
+    def __init__(self, payloads: list[dict]) -> None:
+        self._payloads = list(payloads)
+        self.prompts: list[str] = []
+
+    async def generate_structured(self, role, system, prompt, schema, **kwargs):
+        self.prompts.append(prompt)
+        return json.dumps(self._payloads.pop(0))
+
+
+def _plan_payload(*targets: str, creating: bool = False) -> dict:
+    verb = "Create" if creating else "Edit"
+    return {
+        "title": "T",
+        "steps": [
+            {"description": f"{verb} it.", "target_file": target} for target in targets
+        ],
+        "verification": "run tests",
+    }
+
+
+def _workflow(workspace, llm):
+    from shamsu.agents.plan_mode import PlanningWorkflow
+
+    return PlanningWorkflow(workspace, llm=llm, search=None, memory_service=_StubMemory())
+
+
+def test_planner_grounds_on_real_files_when_search_finds_nothing(tmp_path: Path):
+    """search=None (no index) used to mean an EMPTY context. The files are
+    right there on disk; a plain listing beats nothing."""
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+    (tmp_path / "index.html").write_text("<html>", encoding="utf-8")
+
+    llm = _RecordingLLM([_plan_payload("game.js")])
+    asyncio.run(_workflow(tmp_path, llm).run("add a pause button"))
+
+    prompt = llm.prompts[0]
+    assert "game.js" in prompt and "index.html" in prompt
+
+
+def test_grounding_listing_skips_dependency_noise(tmp_path: Path):
+    (tmp_path / "app.py").write_text("x = 1", encoding="utf-8")
+    junk = tmp_path / "node_modules" / "left-pad"
+    junk.mkdir(parents=True)
+    (junk / "index.js").write_text("// dep", encoding="utf-8")
+
+    llm = _RecordingLLM([_plan_payload("app.py")])
+    asyncio.run(_workflow(tmp_path, llm).run("do a thing"))
+
+    prompt = llm.prompts[0]
+    assert "app.py" in prompt
+    assert "node_modules" not in prompt
+
+
+def test_planner_retries_once_when_it_invents_files(tmp_path: Path):
+    """The exact observed failure: every step targets a phantom component."""
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+
+    llm = _RecordingLLM(
+        [
+            _plan_payload("src/components/PauseButton.tsx"),   # hallucinated
+            _plan_payload("game.js"),                           # corrected
+        ]
+    )
+    plan = asyncio.run(_workflow(tmp_path, llm).run("add a pause button"))
+
+    assert len(llm.prompts) == 2, "a phantom target must trigger one re-grounding round"
+    assert "DO NOT EXIST" in llm.prompts[1]
+    assert "src/components/PauseButton.tsx" in llm.prompts[1]
+    assert "PauseButton" not in plan.markdown
+    assert "game.js" in plan.markdown
+
+
+def test_planner_does_not_retry_a_well_grounded_plan(tmp_path: Path):
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+
+    llm = _RecordingLLM([_plan_payload("game.js")])
+    asyncio.run(_workflow(tmp_path, llm).run("add a pause button"))
+
+    assert len(llm.prompts) == 1, "a grounded plan must not pay for a second model call"
+
+
+def test_creating_a_new_file_is_not_a_hallucination(tmp_path: Path):
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+
+    llm = _RecordingLLM([_plan_payload("pause.js", creating=True)])
+    asyncio.run(_workflow(tmp_path, llm).run("add a pause module"))
+
+    assert len(llm.prompts) == 1, "proposing a new file is legitimate planning"
+
+
+def test_a_worse_retry_does_not_replace_the_first_plan(tmp_path: Path):
+    """If the retry is no better grounded, keep the original - the user can
+    still fix a reviewable plan, but a degraded swap helps nobody."""
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+
+    llm = _RecordingLLM(
+        [
+            _plan_payload("ghost-a.tsx"),
+            _plan_payload("ghost-b.tsx", "ghost-c.tsx"),   # worse
+        ]
+    )
+    plan = asyncio.run(_workflow(tmp_path, llm).run("add a pause button"))
+
+    assert "ghost-a.tsx" in plan.markdown
+    assert "ghost-b.tsx" not in plan.markdown
