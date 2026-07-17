@@ -42,6 +42,12 @@ class CodeEditResult:
     used_full_rewrite: bool = False
     test_suggestion: str = "Run the relevant project tests after reviewing the patch."
     plan: str = ""
+    # Set when the planner judged a decision here is the USER's to make (J1/J6):
+    # the workflow stops BEFORE the coder runs and the caller asks. Previously
+    # the planner's verdict was computed and then silently ignored on this path.
+    needs_input: bool = False
+    question: str = ""
+    options: list[dict[str, str]] = field(default_factory=list)
 
 
 class CodeEditWorkflow:
@@ -62,7 +68,20 @@ class CodeEditWorkflow:
         self.memory_service = memory_service or MemoryService(self.workspace_root)
 
     async def run(self, request: str) -> CodeEditResult:
-        pack, target_paths, plan_text = await self._build_pack(request)
+        pack, target_paths, plan = await self._build_pack(request)
+        plan_text = plan.text
+        # The planner says this needs the user's decision (sessions vs JWT,
+        # ambiguous target, destructive scope): stop before generating a diff
+        # against a guess. The caller turns this into a pending question.
+        if plan.needs_input and plan.question:
+            return CodeEditResult(
+                request=request,
+                pack=pack,
+                plan=plan_text,
+                needs_input=True,
+                question=plan.question,
+                options=list(plan.options),
+            )
         if should_convene_council(target_paths=target_paths):
             council_result = await run_council(self.llm, pack, specialist="coder")
             response = council_result.final
@@ -147,7 +166,7 @@ class CodeEditWorkflow:
             step_id=2,
             specialist="coder",
         )
-        return pack, target_paths, plan.text
+        return pack, target_paths, plan
 
 
 def _clean_diff(raw: str) -> str:

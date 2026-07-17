@@ -137,7 +137,7 @@ from shamsu.tools.git import GitTool
 from shamsu.tools.workspace import MentionResolver, WorkspaceTool
 from shamsu.ui.progress import ProgressReporter
 from shamsu.ui.trace import emit_trace, read_trace_mode, write_trace_mode
-from shamsu.agents.clarification import classify_reply, resolve_answer
+from shamsu.agents.clarification import classify_reply, format_question, resolve_answer
 from shamsu.types import (
     ApprovalRequest,
     ContextPack,
@@ -7549,6 +7549,27 @@ async def _run_code_edit(
     result = await CodeEditWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "edit")
     )
+    if getattr(result, "needs_input", False) and getattr(result, "question", ""):
+        # The planner stopped the edit on a decision that is the user's (J1):
+        # ask, store the question cross-turn, and let the answer re-dispatch
+        # the request. Previously the planner's verdict was computed on this
+        # path and silently ignored - only the chat loop ever acted on it.
+        pending = {
+            "question": result.question,
+            "options": list(getattr(result, "options", []) or []),
+            "allow_free_text": True,
+            "source": "code_edit_upfront",
+            "created_from_prompt": user_input,
+        }
+        body = format_question(pending)
+        console.print(Panel(body, title="Need Input", border_style="cyan"))
+        if session_logger is not None:
+            try:
+                session_logger.set_pending_question(pending)
+            except Exception as exc:
+                swallowed.record("repl.code_edit_pending_question", exc)
+        _log_assistant_message(session_logger, body, workflow_id="code_edit")
+        return
     if getattr(result, "used_full_rewrite", False):
         console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
     message = _print_patch_result("Code Edit", result.applied, result.changed_files, result.error, console)

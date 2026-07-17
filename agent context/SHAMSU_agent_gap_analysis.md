@@ -22,7 +22,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
 | C1 | Ungrounded planning (plan_mode ✅; `create_plan` prose — schema attempt regressed, reverted) | Planning | **HIGH** | ◑ |
 | F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
-| J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | |
+| J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | ✅ (chat loop + code-edit; QA defused by B1) |
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
 | J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ✅ (needed J6 to actually work) |
 | J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM | ◑ transcript now carries over |
@@ -265,7 +265,11 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 *User-reported 2026-07-17: "it's not asking questions when the context is not enough or the agent needs decisions made by the user — not like Claude Code does."* The report is accurate, and it is not one bug — it is six. The machinery exists (`ask_user` tool, pending-question store, cross-turn answer resolution, a passing `ask_user_clarifies` eval) but is unreachable from most paths, actively discouraged where it is reachable, and lossy when it fires.
 
-### J1. Only the agent chat loop can ask anything — HIGH
+### J1. Only the agent chat loop can ask anything — HIGH ✅ FIXED 2026-07-17 (with B1)
+
+> **Closed from two directions.** (1) B1 removed most of the bite: work-shaped prompts no longer land in the can't-ask QA specialist at all - they go to the agent loop, which asks upfront (J6). What reaches QA now is question-shaped, and a question rarely needs a counter-question. (2) `CodeEditWorkflow` - the highest-traffic mutating workflow - now acts on the planner's `needs_input` verdict instead of computing and silently ignoring it: it stops BEFORE generating a diff against a guess, and `_run_code_edit` turns that into the same cross-turn pending question every other ask uses (`source: code_edit_upfront`). Tests: `tests/test_code_edit_asks_upfront.py` (3).
+>
+> **Remaining crumbs, deliberately unwired:** BugFix/TestGeneration/Documentation workflows still ignore `needs_input` - but a bug fix or test run rarely turns on a user decision, and each gets the same three-line wiring whenever it proves needed. The `_run_qa` path itself still cannot ask; post-B1 that is by design.
 
 **Evidence:** grep across `shamsu/agents/*.py` — `ask_user` / `pending_question` are referenced only by `chat_loop.py` and `clarification.py`. The QA/specialist path (a single `run_specialist` call, no tools), `plan_mode`, CodeEditWorkflow, BugFixWorkflow, TestGenerationWorkflow, DocumentationWorkflow, the freeform generator, and the PRD milestone builder have **no ask path at all**.
 
