@@ -86,6 +86,7 @@ class AgentToolRegistry:
         session_logger: SessionLogger | None = None,
         approval_manager: ApprovalManager | None = None,
         action_ledger: ActionLedger | None = None,
+        web_tool: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -102,6 +103,10 @@ class AgentToolRegistry:
         self.approval_func = approval_func
         self.session_logger = session_logger
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
+        # Injected for tests; lazily constructed on first use otherwise (gap D1:
+        # the loop had no way to look anything up mid-task - web was a separate
+        # pre-routed path decided before the agent ever started).
+        self._web_tool = web_tool
 
         # Git commands run through the same CommandRunner so command safety,
         # approval, logging, timeout handling, and diagnostics still apply.
@@ -253,6 +258,22 @@ class AgentToolRegistry:
                 "Search SHAMSU's workspace index.",
                 {"query": {"type": "string", "description": "Search query."}},
                 required=["query"],
+            ),
+            _tool_schema(
+                "web_search",
+                "Search the web for CURRENT or EXTERNAL information the workspace cannot answer: "
+                "library APIs, error messages from third-party tools, versions, documentation. "
+                "Requires user approval. Never use it for anything about this workspace's own "
+                "code - use search_index/grep_files for that.",
+                {"query": {"type": "string", "description": "Search query."}},
+                required=["query"],
+            ),
+            _tool_schema(
+                "fetch_url",
+                "Fetch one web page's readable text (e.g. a documentation page found via "
+                "web_search). Requires user approval.",
+                {"url": {"type": "string", "description": "Absolute http(s) URL."}},
+                required=["url"],
             ),
 
             # -----------------------------------------------------------------
@@ -585,6 +606,10 @@ class AgentToolRegistry:
                 )
             if name == "search_index":
                 return self.search_index(str(arguments.get("query") or ""))
+            if name == "web_search":
+                return self.web_search(str(arguments.get("query") or ""))
+            if name == "fetch_url":
+                return self.fetch_url(str(arguments.get("url") or ""))
 
             # -----------------------------------------------------------------
             # Git read tools
@@ -1147,6 +1172,70 @@ class AgentToolRegistry:
                 "lines_removed": removed,
                 "start_line": start_line,
                 "end_line": end_line,
+            },
+        )
+
+    def _get_web_tool(self):
+        """The shared WebTool, built on first use. Local import: tools/web pulls
+        in provider config this module otherwise never needs."""
+        if self._web_tool is None:
+            from shamsu.tools.web import WebTool
+
+            self._web_tool = WebTool(
+                approval_func=self.approval_func,
+                session_logger=self.session_logger,
+                approval_manager=self.approval_manager,
+                workspace=self.workspace_root,
+                action_ledger=self.action_ledger,
+            )
+        return self._web_tool
+
+    def web_search(self, query: str) -> ToolResult:
+        """Search the web mid-task (gap D1). WebTool carries its own approval
+        gate, enable flag (SHAMSU_WEB_ENABLED) and provider fallback - this is
+        a thin adapter to the ToolResult shape the loop budget expects."""
+        query = (query or "").strip()
+        if not query:
+            return ToolResult(False, "web_search needs a non-empty query.", {})
+        try:
+            result = self._get_web_tool().search(query, reason="The agent needs external information mid-task.")
+        except Exception as exc:
+            return ToolResult(False, f"Web search failed: {exc}", {"query": query})
+        if not result.approved:
+            return ToolResult(False, result.error or "Web search denied.", {"query": query})
+        if result.error:
+            return ToolResult(False, f"Web search failed: {result.error}", {"query": query})
+        hits = [
+            {"title": hit.title, "url": hit.url, "snippet": getattr(hit, "snippet", "")}
+            for hit in result.hits[:5]
+        ]
+        return ToolResult(
+            True,
+            f"Found {len(hits)} result(s) for {query!r}.",
+            {"query": query, "provider": result.provider, "results": hits},
+        )
+
+    def fetch_url(self, url: str) -> ToolResult:
+        """Fetch one page's readable text mid-task (approval-gated in WebTool).
+        The per-tool-result token budget already caps what enters history."""
+        url = (url or "").strip()
+        if not url:
+            return ToolResult(False, "fetch_url needs a URL.", {})
+        try:
+            result = self._get_web_tool().fetch(url, reason="The agent needs this page's content mid-task.")
+        except Exception as exc:
+            return ToolResult(False, f"Fetch failed: {exc}", {"url": url})
+        if not result.approved:
+            return ToolResult(False, result.error or "Fetch denied.", {"url": url})
+        if result.error:
+            return ToolResult(False, f"Fetch failed: {result.error}", {"url": url})
+        return ToolResult(
+            True,
+            f"Fetched {result.final_url or url} ({result.title or 'untitled'}).",
+            {
+                "url": result.final_url or url,
+                "title": result.title,
+                "text": (result.text or result.excerpt or "")[:12000],
             },
         )
 

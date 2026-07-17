@@ -82,6 +82,16 @@ _CHAT_EXECUTOR_ROLE = _os.environ.get("SHAMSU_CHAT_ROLE", "coder").strip() or "c
 # The per-turn planner is on by default, but can be disabled (SHAMSU_CHAT_PLANNER=0)
 # on very small machines where the extra planner-model round-trip + model swap
 # adds too much latency.
+# One bounded strict-repair pass when an autonomous run's verify FAILS (E1).
+# The repair machinery existed (freeform/full_pipeline) but the chat loop only
+# ever reported failure. SHAMSU_AUTO_REPAIR=0 restores report-only.
+_AUTO_REPAIR_ENABLED = _os.environ.get("SHAMSU_AUTO_REPAIR", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+
 # Whether the planner may stop a run to ask the user a decision before work
 # starts (J6). On by default: a wrong build costs far more than one question.
 # SHAMSU_ASK_UPFRONT=0 restores straight-to-work behavior.
@@ -942,11 +952,86 @@ class AgentChatLoop:
         if outcome.unverifiable:
             return content
         if outcome.failed:
+            # One bounded repair before giving up (gap E1). The machinery to fix
+            # a one-line syntax error after a 30-minute run existed all along
+            # (RepairLoop, used by freeform/full_pipeline) and simply was never
+            # invited here - the loop verified, reported failure, and left the
+            # user to start over. Best-effort and capped: a repair error or a
+            # still-failing repair falls through to the honest UNCONFIRMED note.
+            repaired = await self._attempt_repair(written_files)
+            if repaired is not None and repaired.verified:
+                self._emit_trace(
+                    "verify.result",
+                    f"repaired: {repaired.summary}",
+                    {"status": "verified_after_repair", "command": repaired.command},
+                )
+                return (
+                    f"{content}\n\n[verified after repair] The first check failed "
+                    f"({outcome.summary}), so I ran one repair pass; it now passes: {repaired.summary}"
+                ).strip()
             return (
                 f"{content}\n\n⚠ I could not confirm these changes: {outcome.summary} "
-                "Treat this as UNCONFIRMED and re-check the affected file(s) before relying on it."
+                + (
+                    "A repair attempt did not fix it. "
+                    if repaired is not None
+                    else ""
+                )
+                + "Treat this as UNCONFIRMED and re-check the affected file(s) before relying on it."
             ).strip()
         return f"{content}\n\n[verified] {outcome.summary}".strip()
+
+    async def _attempt_repair(self, written_files: list[str]):
+        """Run one strict repair pass over the files this run wrote.
+
+        Returns the repair's VerifyOutcome, or None when repair is disabled,
+        unavailable (no schema-capable LLM), or errored - the caller then keeps
+        the plain UNCONFIRMED behavior. The verifier stays lightweight so a
+        mid-chat repair can never be the thing that runs pip/npm installs."""
+        if not _AUTO_REPAIR_ENABLED:
+            return None
+        generate_async = getattr(self.llm, "generate_structured", None)
+        if not callable(generate_async):
+            return None
+        session_logger = self.session_logger
+
+        def _generate_sync(system: str, user: str, schema: dict) -> str:
+            # Fresh manager + asyncio.run: this runs inside a worker thread with
+            # no event loop, the same shape as repl._pipeline_generate.
+            from shamsu.llm.manager import LLMManager
+
+            return asyncio.run(
+                LLMManager(session_logger=session_logger).generate_structured(
+                    "coder", system, user, schema
+                )
+            )
+
+        try:
+            from shamsu.verify.gate import verify_and_repair
+
+            return await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: verify_and_repair(
+                    self.workspace_root,
+                    list(written_files),
+                    generate=_generate_sync,
+                    command_runner=self.tools.command_runner,
+                    max_attempts=1,
+                    lightweight=True,
+                    session_logger=session_logger,
+                ),
+            )
+        except Exception as exc:
+            if session_logger:
+                try:
+                    session_logger.log(
+                        "verify.repair_error",
+                        {"error": str(exc)},
+                        "Auto-repair attempt errored; keeping UNCONFIRMED verdict",
+                        workflow_id="agent-chat",
+                    )
+                except Exception:
+                    pass
+            return None
 
     def _timeout_category(self, round_index: int, ran_any_tool: bool) -> str:
         """Classify a model-call timeout so the CLI/logs stop blaming the GPU

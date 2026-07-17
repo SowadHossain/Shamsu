@@ -176,14 +176,21 @@ def verify_and_repair(
     max_attempts: int = 2,
     stack: str = "",
     stack_hint: str = "",
+    lightweight: bool = False,
     session_logger: SessionLogger | None = None,
 ) -> VerifyOutcome:
     """Verify the changes and, on failure, drive the strict fix loop up to
     ``max_attempts`` times. ``generate`` is the synchronous ``(system, user,
     schema) -> str`` model adapter the loop's proposer uses; callers in an async
-    context should run this in a worker thread (see ``LLMProposer``)."""
+    context should run this in a worker thread (see ``LLMProposer``).
+
+    ``lightweight`` keeps the repair's verifier on the same no-install command
+    the interactive gates use - a repair pass triggered mid-chat must not be the
+    thing that suddenly runs pip/npm installs."""
     workspace = Path(workspace).resolve()
-    command = default_verify_command(changed_files, stack=stack, stack_hint=stack_hint)
+    command = default_verify_command(
+        changed_files, stack=stack, stack_hint=stack_hint, lightweight=lightweight
+    )
     if not command:
         return VerifyOutcome(
             verified=False,

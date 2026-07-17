@@ -18,7 +18,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 |---|-----|------|----------|--------|
 | A1 | One unhandled exception crashes the whole REPL | Robustness | **HIGH** | ✅ |
 | A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
-| B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | |
+| B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | ✅ QA now earned by question shape |
 | B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
 | C1 | Ungrounded planning (plan_mode ✅; `create_plan` prose — schema attempt regressed, reverted) | Planning | **HIGH** | ◑ |
 | F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
@@ -28,13 +28,13 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM | ◑ transcript now carries over |
 | J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM | ✅ |
 | J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM | ✅ |
-| D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | |
+| D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | ✅ web_search + fetch_url |
 | D2 | No delete / move / rename tools | Tooling | MEDIUM | ✅ |
-| E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | |
+| E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | ✅ |
 | E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM | |
 | G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM | |
 | G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | ✅ |
-| G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | |
+| G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | ✅ ledger + /context show |
 | B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | ✅ |
 | H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | |
 | H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
@@ -57,7 +57,9 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 
 **Fix:** catch at the loop boundary: print the error in a red panel, log it, `continue`. Keep `KeyboardInterrupt`/`SystemExit` passing through. Special-case `LLMStalledError` with its actionable hint (`SHAMSU_LLM_IDLE_TIMEOUT`). One small change, removes the largest single failure mode in the product.
 
-### G3. Exception swallowing hides real failures — MEDIUM
+### G3. Exception swallowing hides real failures — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed as designed** (the fix the entry proposed): `shamsu/diagnostics/swallowed.py` — a process-global, thread-safe `record(where, exc)` ledger whose `record` can never raise (it is called from inside except blocks; an exception with an unprintable `__str__` is covered by a test). Wired at the highest-value repl sites — route recording, the per-prompt audit trail, the simple-turn transcript, and every routing detector — and surfaced in `/context show`: zero prints "all side channels healthy", anything else lists where, count, and last error. Users still see silence; operators finally see the broken audit log. Remaining ~35 bare swallows can adopt `record` opportunistically as files get touched.
 
 **Evidence:** `repl.py` has **33** `except Exception` blocks (highest count of any first-party file); `tools/web.py` 15; `agents/chat_loop.py` 11. Many are deliberate best-effort logging (fine), but the pattern is applied uniformly — audit logging, session state writes, route recording all fail silently with no counter, no trace event, nothing.
 
@@ -69,7 +71,9 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 
 ## B. Routing & intent
 
-### B1. Keyword-list intent detection silently degrades to QA — HIGH (systemic)
+### B1. Keyword-list intent detection silently degrades to QA — HIGH ✅ FIXED 2026-07-17
+
+> **Landed — by flipping the default, not adding keywords.** Re-verified first with concrete failures: "the login page needs a dark mode", "hook the form up to the api", "can you get rid of the sidebar" all landed in tool-less QA (and "i want the score shown at the top" false-positived the *trouble* detector while "the tests are failing on windows" false-negatived it). The fix makes QA **earned by question shape** (`_prefers_qa_answer`): questions, polite-explain forms, casual chat, and short verb-less lookup fragments ("charge card") stay on QA; every other statement of what should change goes to the agent loop, which has tools and asks upfront (J6). Rationale pinned in the code: misrouting a question to the loop costs latency; misrouting work to QA produces a confidently useless answer — the loop is the safe side. The branch decision is extracted (`_qa_branch_routes_to_agent`) and tested directly. Tests: `tests/test_qa_tail_routing.py` (26); live QA eval stayed 3/3. The lookup-fragment refinement came from a real test failure ("charge card" must reach indexed QA), not taste.
 
 **Evidence:** ~28 `_looks_like_*` detectors in `repl.py`, all substring/keyword lists (`_PRD_BUILD_VERBS`, `_PLAN_REQUEST_PHRASES`, `_PRD_SUMMARY_TRIGGERS`, …). When no rule matches, the request falls to the QA/agent-chat tail — with **no signal that intent was missed**.
 
@@ -139,7 +143,9 @@ Contrast with `agents/plan_mode.py`, ten feet away, which does it right: `genera
 
 The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `grep_files`, `edit_file`, `write_file`, `run_command`, `search_index`, `git_status`/git ops, `ask_user`.
 
-### D1. No web/browser access inside the loop — MEDIUM
+### D1. No web/browser access inside the loop — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed.** `web_search` and `fetch_url` in `AgentToolRegistry`, thin adapters over the existing `WebTool` (lazily built, injectable for tests) — so the loop can look up a library API mid-build instead of guessing from 7B weights. WebTool keeps its own approval gate, `SHAMSU_WEB_ENABLED` kill switch, and provider fallback; fetched text is capped at 12k chars and the per-tool-result token budget (G12) caps what enters history. The schema steers usage: external information only, `search_index`/`grep_files` for workspace code. Tests: `tests/test_web_in_loop.py` (6). Browser automation stays a routed path — it needs a live session and is not a sensible mid-loop tool.
 
 **Evidence:** web and browser are **pre-routed** paths (`_looks_like_web_needed_prompt` → `_run_web_assist`), decided before the agent starts. `WebTool`/`BrowserTool` exist but are not registered in `AgentToolRegistry`.
 
@@ -161,7 +167,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 ## E. Verification & repair
 
-### E1. The main agent loop never repairs — MEDIUM
+### E1. The main agent loop never repairs — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed.** On a FAILED autonomous verify, `_maybe_verify` now runs ONE strict-repair pass (`verify_and_repair`, `max_attempts=1`) in a worker thread before reporting. A repaired-and-green result says `[verified after repair]` and names both the original failure and the passing check; a repair that doesn't fix it falls through to the same honest UNCONFIRMED note, now stating a repair was attempted. `verify_and_repair` gained a `lightweight` flag so the repair's verifier stays on the no-install command — a mid-chat repair must never be the thing that suddenly runs pip/npm (E2's concern, respected). Degrades to report-only when the LLM has no schema support, on any repair error, or with `SHAMSU_AUTO_REPAIR=0`. Green verifies never invoke it. Tests: `tests/test_auto_repair.py` (5).
 
 **Evidence:** `RepairLoop` runs in `freeform_generator`, `full_pipeline`, `scaffold_pipeline` only. `AgentChatLoop._maybe_verify` calls `verify_only` — on failure it *tells* the user, full stop. The plan executor (`_verify_completed_plan`) likewise verifies-only.
 

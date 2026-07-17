@@ -254,3 +254,51 @@ def test_repl_wires_reasoning_to_the_console(tmp_path: Path):
     out = console.export_text()
     assert "Reasoning" in out
     assert "check the index first" in out
+
+
+# ---------------------------------------------------------------------------
+# Gap G3: swallowed bookkeeping errors are counted and surfaced, not silent.
+# ---------------------------------------------------------------------------
+
+
+def test_swallowed_ledger_counts_and_snapshots():
+    from shamsu.diagnostics import swallowed
+
+    swallowed.reset()
+    assert swallowed.total() == 0
+    swallowed.record("repl.audit_prompt_route", OSError("disk full"))
+    swallowed.record("repl.audit_prompt_route", OSError("disk full"))
+    swallowed.record("repl.set_last_route", ValueError("bad state"))
+
+    assert swallowed.total() == 3
+    rows = swallowed.snapshot()
+    assert rows[0] == ("repl.audit_prompt_route", 2, "OSError: disk full")
+    swallowed.reset()
+
+
+def test_swallowed_record_never_raises():
+    from shamsu.diagnostics import swallowed
+
+    class Unprintable(Exception):
+        def __str__(self):
+            raise RuntimeError("cannot stringify")
+
+    swallowed.record("anywhere", Unprintable())   # must not raise
+    swallowed.reset()
+
+
+def test_context_show_reports_swallowed_errors(tmp_path: Path):
+    from shamsu.diagnostics import swallowed
+
+    swallowed.reset()
+    console = Console(record=True, width=110)
+    repl._handle_context("/context show", tmp_path, console)
+    assert "all side channels healthy" in console.export_text()
+
+    swallowed.record("repl.audit_prompt_route", OSError("read-only fs"))
+    console = Console(record=True, width=110)
+    repl._handle_context("/context show", tmp_path, console)
+    out = console.export_text()
+    assert "repl.audit_prompt_route" in out
+    assert "read-only fs" in out
+    swallowed.reset()

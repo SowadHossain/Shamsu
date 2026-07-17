@@ -113,6 +113,7 @@ from shamsu.patch import git_apply as patch_git_apply
 from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
+from shamsu.diagnostics import swallowed
 from shamsu.patch.rollback import latest_undoable_transaction
 from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
@@ -2954,6 +2955,17 @@ def _handle_context(
             "Use `/trace verbose` for full args + reasoning, `/context budget` for the",
             "last model call's token usage, `/context status` for windows/calibration.",
         ]
+        # Best-effort bookkeeping that failed silently this session (gap G3).
+        # Zero is the healthy state; anything here means a side channel (audit
+        # trail, session state, transcript) is broken and worth investigating.
+        rows = swallowed.snapshot()
+        lines.append("")
+        if rows:
+            lines.append(f"Swallowed bookkeeping errors this session: {swallowed.total()}")
+            for where, count, last_error in rows[:8]:
+                lines.append(f"  {where:<32} x{count}  last: {last_error}")
+        else:
+            lines.append("Swallowed bookkeeping errors this session: 0 (all side channels healthy)")
         console.print(Panel("\n".join(lines), title="Context & Observability", border_style="cyan"))
 
     else:
@@ -3545,7 +3557,8 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
         try:
             if matches(effective_input, workspace):
                 return label
-        except Exception:
+        except Exception as exc:
+            swallowed.record(f"route.detector.{label}", exc)
             continue
     return ROUTE_FALLTHROUGH
 
@@ -3574,8 +3587,8 @@ async def _handle_request(
     if session_logger is not None:
         try:
             session_logger.set_last_route({"route": route_label, "handled": agent_result.handled})
-        except Exception:
-            pass
+        except Exception as exc:
+            swallowed.record("repl.set_last_route", exc)
     # Audit EVERY prompt (not just tool-loop runs): one prompt+route entry per
     # request under .shamsu/audit, so the trail covers PRD summaries, git, QA and
     # direct-code answers too. Downstream paths add their own step-level detail.
@@ -3585,8 +3598,8 @@ async def _handle_request(
         )
         _audit.log_prompt(effective_input)
         _audit.log_route(route_label, workflow=route_label)
-    except Exception:
-        pass
+    except Exception as exc:
+        swallowed.record("repl.audit_prompt_route", exc)
     if agent_result.handled:
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
@@ -3772,17 +3785,12 @@ async def _handle_request(
             workflow_id=decision.intent,
         )
         if decision.intent in {"qa", "explain"}:
-            # An imperative ("fix the code", "do the thing", "continue", ...) is
-            # an action, not a question. Route it to the agent loop, which
-            # actually has file and command tools, instead of the tool-less QA
-            # brain that would only describe the fix (or claim it can't access
-            # files). With `/autonomy on` the edits run hands-free; otherwise
-            # each write asks for approval.
-            if (
-                _looks_like_action_request(effective_input)
-                or _looks_like_trouble_report(effective_input)
-                or (_is_general_chat_prompt(effective_input) and not uses_real_index)
-            ):
+            # QA must be EARNED by question shape (gap B1). Anything that is
+            # work - an imperative, a trouble report, or a statement of what
+            # should change ("the login page needs a dark mode") - goes to the
+            # agent loop, which has tools and can ask upfront (J6). The
+            # tool-less QA brain would only describe the change, confidently.
+            if _qa_branch_routes_to_agent(effective_input, uses_real_index):
                 await _run_agent_chat(
                     harness_input,
                     workspace,
@@ -4937,6 +4945,62 @@ _QUESTION_PREFIXES = (
 )
 
 
+# Polite-request openers: "can you get rid of the sidebar" is work, not a
+# question, even though it is question-shaped. The explain-style forms stay
+# questions via _QUESTION_PREFIXES ("can you explain" is listed there and is
+# checked FIRST in _prefers_qa_answer).
+_POLITE_REQUEST_PREFIXES = ("can you", "could you", "would you", "will you", "please ")
+
+# Additional interrogative openers beyond _QUESTION_PREFIXES.
+_QUESTION_OPENERS = ("do ", "did ", "has ", "have ", "am i", "will ", "would ", "could ", "should ")
+
+
+def _prefers_qa_answer(user_input: str) -> bool:
+    """True when the tool-less QA specialist is the RIGHT destination: a
+    genuine question (or casual chat) - not work phrased without an action verb.
+
+    QA used to be the catch-all for everything the action-verb list missed
+    (gap B1): "the login page needs a dark mode" or "hook the form up to the
+    api" got a *description* from the tool-less brain instead of the change.
+    Adding verbs to the list is whack-a-mole - the architecture guarantees the
+    next miss. So the default flips: QA must be EARNED by question shape, and
+    everything else goes to the agent loop, which has tools and can ask (J6).
+    Misrouting a question to the loop costs latency; misrouting work to QA
+    produces a confidently useless answer. The loop is the safe side.
+    """
+    raw = user_input.strip().lower()
+    if not raw:
+        return True
+    if _is_casual_prompt(raw):
+        return True
+    # Question-style openers win first so "can you explain X" stays QA...
+    if raw.startswith(_QUESTION_PREFIXES):
+        return True
+    # ...and remaining polite forms ("can you get rid of...") are requests.
+    if raw.startswith(_POLITE_REQUEST_PREFIXES):
+        return False
+    if raw.endswith("?"):
+        return True
+    if raw.startswith(_QUESTION_OPENERS):
+        return True
+    # A short verb-less fragment ("charge card", "auth flow") is a lookup -
+    # the user pointing at something they want explained - not work. Anything
+    # with an action verb was already caught by _looks_like_action_request.
+    words = raw.split()
+    return len(words) <= 3 and not (_ACTION_VERBS & set(words))
+
+
+def _qa_branch_routes_to_agent(effective_input: str, uses_real_index: bool) -> bool:
+    """The qa/explain tail's actual decision, extracted so it is testable:
+    True -> the tool-having agent loop, False -> the tool-less QA specialist."""
+    return (
+        _looks_like_action_request(effective_input)
+        or _looks_like_trouble_report(effective_input)
+        or (_is_general_chat_prompt(effective_input) and not uses_real_index)
+        or not _prefers_qa_answer(effective_input)
+    )
+
+
 def _looks_like_action_request(user_input: str) -> bool:
     """True when the prompt asks SHAMSU to *do work* (fix/edit/build) rather
     than answer a question. Broader than the narrow PRD-build trigger: any clear
@@ -5272,8 +5336,8 @@ def _audit_simple_turn(
         audit.log_prompt(prompt)
         audit.log_route(route, workflow=route)
         audit.log_final(final)
-    except Exception:
-        pass
+    except Exception as exc:
+        swallowed.record("repl.audit_simple_turn", exc)
     if session_logger is None:
         return
     try:
@@ -5281,8 +5345,8 @@ def _audit_simple_turn(
             session_logger.append_message("user", prompt)
         if final.strip():
             session_logger.append_message("assistant", final)
-    except Exception:
-        pass
+    except Exception as exc:
+        swallowed.record("repl.transcript_simple_turn", exc)
 
 
 def _looks_like_run_game_request(user_input: str) -> bool:
@@ -7368,6 +7432,14 @@ def _is_casual_prompt(user_input: str) -> bool:
         "good morning",
         "good afternoon",
         "good evening",
+        # Acknowledgements: a bare "thanks" must never reach the tool loop,
+        # where a small model will try to find something to do with it.
+        # Deliberately NOT "ok"/"okay" - those are affirmative-continue signals
+        # with their own routing.
+        "thanks",
+        "thank you",
+        "thx",
+        "ty",
     }
 
 
