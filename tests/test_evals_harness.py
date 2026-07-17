@@ -195,3 +195,108 @@ def test_destructive_ask_check_requires_no_action_taken(tmp_path: Path):
 
     (data / "users.db").unlink()
     assert _check_asks_before_destructive_guess(tmp_path, "Which one should I delete?") is False
+
+
+# ---------------------------------------------------------------------------
+# Gap I3: single-sample evals can't tell a regression from a coin flip.
+# Measured on real runs: the same unchanged commit gave bugfix_syntax_error
+# PASS / FAIL / PASS. --samples scores by majority and flags flaky cases.
+# ---------------------------------------------------------------------------
+
+
+def _scripted_driver(sequence: list[bool]):
+    """A driver that passes/fails according to a fixed script."""
+    calls = {"n": 0}
+
+    async def _driver(workspace: Path, case: EvalCase) -> str:
+        index = calls["n"]
+        calls["n"] += 1
+        return "good" if sequence[index % len(sequence)] else "bad"
+
+    return _driver
+
+
+def _check_good(_workspace: Path, final: str) -> bool:
+    return final == "good"
+
+
+@pytest.mark.asyncio
+async def test_samples_runs_each_case_n_times():
+    seen = {"n": 0}
+
+    async def _driver(workspace: Path, case: EvalCase) -> str:
+        seen["n"] += 1
+        return "good"
+
+    case = EvalCase(name="c", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_driver, samples=3)
+
+    assert seen["n"] == 3
+    assert report.results[0].passes == 3
+    assert report.results[0].runs == 3
+
+
+@pytest.mark.asyncio
+async def test_majority_pass_survives_one_unlucky_roll():
+    """2/3 is a pass: one bad sample must not condemn a good change."""
+    case = EvalCase(name="c", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_scripted_driver([True, False, True]), samples=3)
+
+    result = report.results[0]
+    assert result.passed is True
+    assert result.passes == 2
+    assert result.status == "PASS 2/3"
+
+
+@pytest.mark.asyncio
+async def test_majority_fail_is_not_rescued_by_one_lucky_roll():
+    case = EvalCase(name="c", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_scripted_driver([False, True, False]), samples=3)
+
+    result = report.results[0]
+    assert result.passed is False
+    assert result.status == "FAIL 1/3"
+
+
+@pytest.mark.asyncio
+async def test_a_flaky_case_is_called_out_in_the_report():
+    """The single most useful thing the harness can say: this number is not
+    trustworthy. A silent 2/3 reads like a solid pass."""
+    case = EvalCase(name="wobbly", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_scripted_driver([True, False, True]), samples=3)
+
+    assert report.results[0].flaky is True
+    rendered = report.render()
+    assert "FLAKY" in rendered
+    assert "wobbly" in rendered
+    assert "do not read a delta from them" in rendered
+
+
+@pytest.mark.asyncio
+async def test_consistent_results_are_not_flagged_flaky():
+    case = EvalCase(name="steady", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_scripted_driver([True]), samples=3)
+
+    assert report.results[0].flaky is False
+    assert "FLAKY" not in report.render()
+
+
+@pytest.mark.asyncio
+async def test_single_sample_keeps_the_old_boolean_behavior():
+    case = EvalCase(name="c", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_scripted_driver([True]), samples=1)
+
+    result = report.results[0]
+    assert result.status == "PASS"          # no "1/1" noise
+    assert result.passes == 1 and result.runs == 1
+    # ...and the report warns that one sample cannot resolve a delta.
+    assert "single-sample" in report.render()
+
+
+@pytest.mark.asyncio
+async def test_a_flaky_case_reports_the_failing_attempt_not_the_passing_one():
+    """When a case wobbles, the failure is the interesting half."""
+    case = EvalCase(name="c", prompt="p", check=_check_good)
+    report = await run_evals([case], driver=_scripted_driver([True, False, True]), samples=3)
+
+    assert report.results[0].final == "bad"

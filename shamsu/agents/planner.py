@@ -44,12 +44,9 @@ Review the task and the code context below, then produce a short plan:
 - a shell command that would verify the change, if one is obvious from context
 Do not write code, diffs, or markdown. Keep it under 10 lines of plain text."""
 
-PLANNER_SYSTEM = """You are SHAMSU's planner. You never write code or files - you plan, and you
-decide whether the user must choose something first. Output ONLY JSON matching the schema.
-
-plan: a short plan (under 10 lines) - the relevant real file(s), the approach, risks, and a
-verify command if one is obvious. Reference only files present in the context; never invent
-files or frameworks.
+DECISION_SYSTEM = """You decide ONE thing about a coding task: must the user choose something
+before work starts? You do not plan and you do not write code. Output ONLY JSON matching the
+schema.
 
 needs_input: true ONLY when the task cannot be done well without a decision that is the USER's
 to make, not yours:
@@ -57,15 +54,15 @@ to make, not yours:
 - naming, scope, or product behavior the task leaves open
 - anything destructive or hard to undo where the target is ambiguous
 Set it false when the task is clear enough to just do, even if details remain - you are expected
-to use good judgment on ordinary implementation choices. Do not ask about things you can look up.
+to use good judgment on ordinary implementation choices, and most tasks need no question at all.
+Do not ask about things that can be looked up in the code.
 
 question: when needs_input is true, the single question to ask. Concrete, not "please clarify".
 options: 2-4 concrete choices for that question, when choices exist."""
 
-PLAN_SCHEMA: dict = {
+DECISION_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "plan": {"type": "string"},
         "needs_input": {"type": "boolean"},
         "question": {"type": "string"},
         "options": {
@@ -80,7 +77,7 @@ PLAN_SCHEMA: dict = {
             },
         },
     },
-    "required": ["plan"],
+    "required": ["needs_input"],
 }
 
 
@@ -110,40 +107,52 @@ async def create_plan(
         step_id=1,
         specialist="planner",
     )
-    structured = await _structured_plan(llm, pack, goal)
-    if structured is not None:
-        return structured
-    # Fallback: free-text planner (an LLM without schema support, or a schema
-    # call that produced nothing usable). Never fail the caller over planning.
+    # The plan itself stays on the ORIGINAL free-text path. Folding it into the
+    # decision's JSON call measurably degraded it: asked for a plan inside a
+    # schema, the model wrote keystroke-level instructions ("write the exact
+    # string 'hello world' using a text editor") and the coder obeyed, producing
+    # a file of plain text instead of Python - create_file went 3/3 -> 0/3.
+    # Rewording the schema prompt then broke edit_file_targeted instead. Planner
+    # wording is load-bearing and tuning it by feel is how you trade one green
+    # case for another, so it is left exactly as it was and measured as-is.
     response = await llm.run_specialist("planner", pack)
-    return PlanResult(text=response.raw.strip(), pack=pack)
+    decision = await _decide_needs_input(llm, pack, goal)
+    return PlanResult(
+        text=response.raw.strip(),
+        pack=pack,
+        needs_input=decision[0],
+        question=decision[1],
+        options=decision[2],
+    )
 
 
-async def _structured_plan(
+async def _decide_needs_input(
     llm: ILLMManager, pack: ContextPack, goal: str
-) -> PlanResult | None:
+) -> tuple[bool, str, list[dict[str, str]]]:
+    """Ask ONE narrow question: is a decision here the user's to make? (J6)
+
+    A second call, deliberately: it keeps the plan text on its proven prompt,
+    and this one is small and schema-constrained (one bool + one question), so
+    it is far cheaper than the plan call it sits beside. Any failure - no schema
+    support on this LLM, a raise, junk output - degrades to "don't ask", which
+    is exactly the old behavior.
+    """
     generate = getattr(llm, "generate_structured", None)
     if not callable(generate):
-        return None
+        return False, "", []
     try:
-        raw = await generate("planner", PLANNER_SYSTEM, _prompt_from_pack(pack, goal), PLAN_SCHEMA)
+        raw = await generate(
+            "planner", DECISION_SYSTEM, _prompt_from_pack(pack, goal), DECISION_SCHEMA
+        )
     except Exception:
-        return None
+        return False, "", []
     data = _loads(raw)
     if not isinstance(data, dict):
-        return None
-    plan_text = str(data.get("plan") or "").strip()
+        return False, "", []
     question = str(data.get("question") or "").strip()
-    needs_input = bool(data.get("needs_input")) and bool(question)
-    if not plan_text and not needs_input:
-        return None
-    return PlanResult(
-        text=plan_text,
-        pack=pack,
-        needs_input=needs_input,
-        question=question,
-        options=_options_from(data.get("options")),
-    )
+    if not (bool(data.get("needs_input")) and question):
+        return False, "", []
+    return True, question, _options_from(data.get("options"))
 
 
 def _prompt_from_pack(pack: ContextPack, goal: str) -> str:

@@ -20,7 +20,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
 | B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | |
 | B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
-| C1 | Ungrounded planning — both planners now schema-constrained | Planning | **HIGH** | ✅ |
+| C1 | Ungrounded planning (plan_mode ✅; `create_plan` prose — schema attempt regressed, reverted) | Planning | **HIGH** | ◑ |
 | F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
 | J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | |
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
@@ -40,7 +40,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
 | I1 | Agent-loop answers don't stream | UX | LOW | |
 | I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | |
-| I3 | Evals are single-sample (noisy) + default tier only | Measurement | MEDIUM | |
+| I3 | Evals are single-sample (noisy) + default tier only | Measurement | MEDIUM | ◑ sampling landed; tiers unmeasured |
 | I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW | ✅ |
 
 ---
@@ -109,7 +109,7 @@ The ~20-rule order-dependent chain has a 57-test characterization net over its *
 
 ## C. Planning
 
-### C1. Ungrounded planning — HIGH ✅ FIXED 2026-07-17
+### C1. Ungrounded planning — HIGH ◑ PARTIAL 2026-07-17
 
 > **Confirmed empirically, then half-fixed.** The `plan_references_only_real_files` eval caught it on the first live run. A workspace containing exactly `game.js` + `index.html` (vanilla JS) produced a plan whose **every step** targeted `src/components/PauseButton.tsx` — a React component that does not exist, in a project with no React. Step 1 read: *"Reference the PauseButton component from the real files."* It is not real. A coder handed that plan inherits the hallucination as trusted context.
 >
@@ -117,9 +117,11 @@ The ~20-rule order-dependent chain has a 57-test characterization net over its *
 >
 > **Landed (plan_mode / the user-facing `/plan`):** `_relevant_files` never returns empty while the workspace has source files — search first, then a real mtime-sorted directory listing (dependency/build dirs excluded). Plus a grounding gate: `_unreal_targets` flags step targets that don't exist and aren't being created, and the planner gets **one** corrective round naming the phantoms and listing the real files. A retry that isn't better grounded is discarded rather than swapped in. Same "correct, then accept honestly" shape as the tool-call salvager. Traced as `plan.ungrounded`. **Live re-run: the same prompt now targets `index.html` and `game.js`.** Tests: `tests/test_plan_mode.py` (+6, deterministic).
 >
-> **`create_plan` converged too (the original C1 target).** `agents/planner.py` no longer asks for free prose: it requests schema-constrained JSON (`plan`, plus the J6 decision fields) via `generate_structured`, parsed through `json_repair` like every other small-model boundary. That closes the last place a raw model string was spliced into a coder's prompt with no validation. An LLM without `generate_structured` (test doubles, narrower interfaces) falls back to the original `run_specialist` text path, so this never hard-depends on a capability `ILLMManager` doesn't promise — and a schema call that raises or returns junk falls back too. All four mutating workflows (CodeEdit, BugFix, TestGeneration, Documentation) keep working unchanged, since they read only `.text`.
+> **`create_plan`: tried, measured, reverted.** Schema-constraining its plan text looked like the obvious C1 convergence — and it made things **worse**, which only the 3-sample evals revealed. Asked for a plan inside a JSON field, the model wrote keystroke-level instructions (*"write the exact string 'hello world' using a text editor"*); the coder obeyed and produced a file of plain text instead of Python. `create_file` went **3/3 -> 0/3**. Rewording the schema prompt to fix that then broke `edit_file_targeted` **3/3 -> 0/3** instead. Planner wording is load-bearing, and tuning it by feel just trades one green case for another.
 >
-> **Not claimed:** `create_plan`'s output is now *structured*, but it is not yet *file-validated* the way plan_mode's is (`_unreal_targets` + re-grounding). Its plan is prose inside a JSON field, not a step list with targets, so there is nothing mechanical to check yet. That is the remaining half.
+> So the plan text stays on its original, proven `run_specialist` prompt, untouched, and the J6 decision moved to its own small schema call beside it (one bool + one question — far cheaper than the plan call). Verified at 3 samples: `create_file`, `edit_file_targeted`, `ask_before_choosing_an_approach`, `does_not_ask_when_unambiguous` all **3/3**.
+>
+> **Still open, honestly:** `create_plan`'s plan text remains free prose spliced into the coder's prompt — the original C1 finding stands. The lesson is that it cannot be fixed by asking the model for JSON instead; it needs its own eval (plan quality, not just grounding) before anyone touches that prompt again.
 
 **Evidence:** `agents/planner.py` — one LLM call, plain-text instructions ("Do not write code… under 10 lines"), output spliced raw into the coder specialist's request. No JSON schema, no real-file grounding check, no validation, no trace event. Called by CodeEditWorkflow, BugFixWorkflow, TestGenerationWorkflow, DocumentationWorkflow — i.e. **every file-mutating workflow**.
 
@@ -191,7 +193,11 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix (highest-leverage single item in this doc):** add a routing eval set — a table of (prompt, workspace-fixture, expected-route) pairs run through `_classify_route_label` (or, post-B2, the real dispatch table). Deterministic, no Ollama, <1s. Then a small planning eval (plan for a fixture task must reference only real files). These directly protect B1, B2, C1.
 
-### I3. Evals are single-sample, so small deltas are unreadable — MEDIUM (raised 2026-07-17)
+### I3. Evals are single-sample, so small deltas are unreadable — MEDIUM ◑ PARTIAL 2026-07-17
+
+> **Sampling landed.** `python -m evals --samples N` runs every case N times and scores by **majority**, so one unlucky roll can't condemn a good change and one lucky roll can't bless a bad one. `EvalResult` carries `passes`/`runs`; the status column reads `PASS 2/3`. Crucially the report now **calls out flaky cases by name** ("passed some attempts and failed others on the SAME code — do not read a delta from them") — a silent `2/3` reads like a solid pass, which is exactly how a noisy harness lies to you. A single-sample run prints its own warning in the header. With `samples=1` everything collapses to the previous behavior, so nothing else changed. Tests: `tests/test_evals_harness.py` (18).
+>
+> **Still open:** the light/heavy tiers have never been baselined at all (3B models are far more salvage-dependent, so a light-tier regression is invisible today), and nothing enforces `--samples 3` for a baseline — it is a convention, not a gate.
 
 **Found by using the harness in anger.** Each case runs ONCE against a stochastic local 7B, and the PASS/FAIL is reported as if deterministic. It is not: re-running `bugfix_syntax_error` on one unchanged commit gave PASS / FAIL / PASS, and the same commit scores 8/10 or 9/10 on the roll. A run that looked like a 2-case regression from the J6 change turned out to be noise — verified by re-running the cases, not by reasoning about them.
 

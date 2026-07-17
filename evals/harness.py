@@ -51,12 +51,30 @@ class EvalResult:
     error: str = ""
     duration_s: float = 0.0
     tags: tuple[str, ...] = ()
+    # How many of `runs` attempts passed. Local models are stochastic: the same
+    # unchanged commit scored PASS/FAIL/PASS on one case, so a single sample
+    # cannot distinguish a regression from a coin flip (gap I3). With runs=1
+    # these collapse to the old boolean behavior.
+    passes: int = 1
+    runs: int = 1
+
+    @property
+    def rate(self) -> float:
+        return (self.passes / self.runs) if self.runs else 0.0
+
+    @property
+    def flaky(self) -> bool:
+        """Passed sometimes and failed sometimes - the result to distrust."""
+        return 0 < self.passes < self.runs
 
     @property
     def status(self) -> str:
         if self.error:
             return "ERROR"
-        return "PASS" if self.passed else "FAIL"
+        label = "PASS" if self.passed else "FAIL"
+        if self.runs > 1:
+            return f"{label} {self.passes}/{self.runs}"
+        return label
 
 
 @dataclass(frozen=True)
@@ -85,18 +103,45 @@ async def run_evals(
     *,
     driver: Driver | None = None,
     tier: str = "",
+    samples: int = 1,
 ) -> EvalReport:
     """Run each case in an isolated temp workspace and score it. A driver or
     check raising is recorded as a failed case (never aborts the run).
 
     Driver precedence: an explicit `driver=` argument (tests) > the case's own
     `driver` (a case measuring a non-loop path) > the default loop driver.
+
+    `samples` runs every case N times and scores it by MAJORITY. One sample
+    against a stochastic local model is not a measurement - the same unchanged
+    commit produced PASS/FAIL/PASS on one case - so a baseline meant to justify
+    "this change is safe" should use samples>=3.
     """
     results: list[EvalResult] = []
     for case in cases:
         run = driver or case.driver or chat_loop_driver
-        results.append(await _run_one(case, run))
+        results.append(await _run_case(case, run, max(1, samples)))
     return EvalReport(results=results, tier=tier)
+
+
+async def _run_case(case: EvalCase, driver: Driver, samples: int) -> EvalResult:
+    attempts = [await _run_one(case, driver) for _ in range(samples)]
+    passes = sum(1 for attempt in attempts if attempt.passed)
+    # Majority, so one unlucky roll doesn't condemn a good change and one lucky
+    # roll doesn't bless a bad one. With samples=1 this is the old behavior.
+    passed = passes * 2 > samples
+    # Surface a failing attempt's detail over a passing one's: when a case is
+    # flaky, the failure is the interesting half.
+    representative = next((a for a in attempts if not a.passed), attempts[0])
+    return EvalResult(
+        name=case.name,
+        passed=passed,
+        final=representative.final,
+        error=representative.error,
+        duration_s=sum(attempt.duration_s for attempt in attempts),
+        tags=case.tags,
+        passes=passes,
+        runs=samples,
+    )
 
 
 async def _run_one(case: EvalCase, driver: Driver) -> EvalResult:
@@ -157,19 +202,33 @@ async def planning_driver(workspace: Path, case: EvalCase) -> str:
 def render_report(report: EvalReport) -> str:
     """Render a BENCHMARK.md-style pass-rate table."""
     pct = round(report.pass_rate * 100)
+    samples = max((result.runs for result in report.results), default=1)
     lines: list[str] = ["# SHAMSU Eval Benchmark", ""]
     tier = report.tier or "(unknown)"
     lines.append(f"- **Tier:** {tier}")
     lines.append(f"- **Pass rate:** {report.passed}/{report.total} ({pct}%)")
+    lines.append(f"- **Samples per case:** {samples}" + ("" if samples > 1 else "  <- single-sample: a ±1 delta is noise, not signal"))
     lines.append("")
     lines.append("| Case | Result | Time | Notes |")
     lines.append("|------|--------|------|-------|")
     for result in report.results:
         note = result.error or ("" if result.passed else "check failed")
+        if result.flaky:
+            # The most important thing this harness can tell you: the case is
+            # not answering the same way twice, so neither a PASS nor a FAIL
+            # from it means anything on its own.
+            note = (note + " " if note else "") + "FLAKY - re-run before trusting"
         lines.append(
             f"| {result.name} | {result.status} | {result.duration_s:.1f}s | {_escape_cell(note)} |"
         )
     lines.append("")
+    flaky = [result.name for result in report.results if result.flaky]
+    if flaky:
+        lines.append(
+            f"> **Flaky this run:** {', '.join(flaky)}. These cases passed some attempts and "
+            "failed others on the SAME code - do not read a delta from them."
+        )
+        lines.append("")
     return "\n".join(lines)
 
 

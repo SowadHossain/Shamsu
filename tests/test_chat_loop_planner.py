@@ -160,7 +160,7 @@ async def test_planner_decision_asks_before_any_work_happens(tmp_path: Path):
 async def test_a_clear_task_is_not_interrupted(tmp_path: Path):
     """The other half of the threshold: asking about everything is its own
     failure. needs_input=false must go straight to work."""
-    llm = StructuredPlannerLLM({"plan": "Create greet.py.", "needs_input": False})
+    llm = StructuredPlannerLLM({"needs_input": False})
     client = FakeOllamaClient()
     loop = AgentChatLoop(
         tmp_path,
@@ -173,8 +173,11 @@ async def test_a_clear_task_is_not_interrupted(tmp_path: Path):
 
     assert result.awaiting_user is False
     assert client.messages_seen, "the tool loop should have run"
-    # The plan still reaches the model, exactly as before.
-    assert "Create greet.py." in client.messages_seen[0][-1]["content"]
+    # The plan text still comes from the proven free-text planner call, NOT the
+    # decision call - folding the plan into the decision's JSON measurably
+    # degraded it (create_file 3/3 -> 0/3).
+    assert llm.specialist_calls == 1
+    assert "fallback plan" in client.messages_seen[0][-1]["content"]
 
 
 @pytest.mark.asyncio

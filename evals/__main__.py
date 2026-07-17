@@ -32,7 +32,7 @@ async def _amain(args: argparse.Namespace) -> int:
         if not cases:
             print(f"No cases matched {sorted(wanted)}. Known: {[c.name for c in SEED_CASES]}")
             return 2
-    report = await run_evals(cases, tier=_tier_label())
+    report = await run_evals(cases, tier=_tier_label(), samples=args.samples)
     text = report.render()
     print(text)
     if args.out:
@@ -46,6 +46,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="List case names and exit.")
     parser.add_argument("--only", default="", help="Comma-separated case names to run.")
     parser.add_argument("--out", default="", help="Also write the report to this file.")
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=1,
+        help=(
+            "Run each case N times and score by majority. Local models are "
+            "stochastic - use 3+ for a baseline you intend to compare against, "
+            "since a single sample cannot tell a regression from a coin flip."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.list:
