@@ -123,3 +123,89 @@ async def test_verify_completed_plan_skips_when_no_changes(tmp_path: Path, monke
     console, buffer = _console()
     await repl._verify_completed_plan([], tmp_path, console, None)
     assert buffer.getvalue() == ""
+
+
+# ---------------------------------------------------------------------------
+# Gap E2: "unverifiable" used to be permanent for node stacks - lightweight
+# mode drops installs, so JS/TS users never got a verdict at all. Now the
+# heavy verifier is OFFERED (one approval, at the end-of-plan pause), never
+# run silently.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingApproval:
+    def __init__(self, answer: bool) -> None:
+        self.answer = answer
+        self.requests = []
+
+    def ask(self, request):  # noqa: ANN001
+        self.requests.append(request)
+        return self.answer
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_node_changes_offer_the_heavy_verifier(tmp_path, monkeypatch):
+    from shamsu.verify.gate import VerifyOutcome
+
+    approval = _RecordingApproval(answer=True)
+    monkeypatch.setattr(repl, "_make_approval_manager", lambda *a, **k: approval)
+
+    heavy_calls: list[dict] = []
+
+    def _fake_verify(workspace, files, lightweight=True, **kwargs):
+        if lightweight:
+            return VerifyOutcome(verified=False, unverifiable=True, summary="node build too heavy")
+        heavy_calls.append({"files": list(files)})
+        return VerifyOutcome(verified=True, exit_code=0, command="npm run build", summary="build passed")
+
+    monkeypatch.setattr(repl, "verify_only", _fake_verify)
+    console = Console(record=True, width=100)
+
+    await repl._verify_completed_plan(["package.json", "src/app.js"], tmp_path, console, None)
+
+    assert approval.requests, "the heavy verifier must be OFFERED"
+    assert "install" in approval.requests[0].reason.lower()
+    assert heavy_calls, "approval should trigger the full verify"
+    assert "Plan verified (full build)" in console.export_text()
+
+
+@pytest.mark.asyncio
+async def test_denying_the_heavy_verifier_leaves_it_unverified(tmp_path, monkeypatch):
+    from shamsu.verify.gate import VerifyOutcome
+
+    approval = _RecordingApproval(answer=False)
+    monkeypatch.setattr(repl, "_make_approval_manager", lambda *a, **k: approval)
+
+    def _fake_verify(workspace, files, lightweight=True, **kwargs):
+        assert lightweight, "a denied offer must never run the heavy verify"
+        return VerifyOutcome(verified=False, unverifiable=True, summary="node build too heavy")
+
+    monkeypatch.setattr(repl, "verify_only", _fake_verify)
+    console = Console(record=True, width=100)
+
+    await repl._verify_completed_plan(["package.json"], tmp_path, console, None)
+
+    out = console.export_text()
+    assert "Skipped the full verifier" in out
+    assert "UNVERIFIED" in out
+
+
+@pytest.mark.asyncio
+async def test_truly_unverifiable_changes_get_no_offer(tmp_path, monkeypatch):
+    """No heavy command exists either (e.g. a lone .md change): don't ask the
+    user to approve something that cannot run."""
+    from shamsu.verify.gate import VerifyOutcome
+
+    approval = _RecordingApproval(answer=True)
+    monkeypatch.setattr(repl, "_make_approval_manager", lambda *a, **k: approval)
+    monkeypatch.setattr(
+        repl,
+        "verify_only",
+        lambda *a, **k: VerifyOutcome(verified=False, unverifiable=True, summary="nothing to run"),
+    )
+    console = Console(record=True, width=100)
+
+    await repl._verify_completed_plan(["README.md"], tmp_path, console, None)
+
+    assert not approval.requests
+    assert "left UNVERIFIED" in console.export_text()

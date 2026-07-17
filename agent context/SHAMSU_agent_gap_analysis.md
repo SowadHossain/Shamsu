@@ -20,7 +20,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
 | B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | ✅ QA now earned by question shape |
 | B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
-| C1 | Ungrounded planning (plan_mode ✅; `create_plan` prose — schema attempt regressed, reverted) | Planning | **HIGH** | ◑ |
+| C1 | Ungrounded planning — plan_mode ✅; `create_plan` grounded (1/3→3/3 measured) | Planning | **HIGH** | ✅ |
 | F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
 | J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | ✅ (chat loop + code-edit; QA defused by B1) |
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
@@ -31,15 +31,15 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | ✅ web_search + fetch_url |
 | D2 | No delete / move / rename tools | Tooling | MEDIUM | ✅ |
 | E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | ✅ |
-| E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM | |
+| E2 | Interactive verify is lightweight-only; node builds unverifiable | Verify/repair | MEDIUM | ✅ heavy verify is offered |
 | G1 | Mid-loop approval admits being fragile on Windows | Approvals | MEDIUM | |
 | G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | ✅ |
 | G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | ✅ ledger + /context show |
 | B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | ✅ |
-| H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | |
+| H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | ◑ zero-hit rescue; embeddings open |
 | H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
-| I1 | Agent-loop answers don't stream | UX | LOW | |
-| I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | |
+| I1 | Agent-loop answers don't stream | UX | LOW | deferred: conflicts with salvage boundary |
+| I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | ✅ subsumed by B1+A2 |
 | I3 | Evals are single-sample (noisy) + default tier only | Measurement | MEDIUM | ◑ sampling landed; tiers unmeasured |
 | I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW | ✅ |
 
@@ -113,7 +113,7 @@ The ~20-rule order-dependent chain has a 57-test characterization net over its *
 
 ## C. Planning
 
-### C1. Ungrounded planning — HIGH ◑ PARTIAL 2026-07-17
+### C1. Ungrounded planning — HIGH ✅ FIXED 2026-07-17
 
 > **Confirmed empirically, then half-fixed.** The `plan_references_only_real_files` eval caught it on the first live run. A workspace containing exactly `game.js` + `index.html` (vanilla JS) produced a plan whose **every step** targeted `src/components/PauseButton.tsx` — a React component that does not exist, in a project with no React. Step 1 read: *"Reference the PauseButton component from the real files."* It is not real. A coder handed that plan inherits the hallucination as trusted context.
 >
@@ -177,7 +177,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** on autonomous/plan verify failure, offer one bounded repair pass (`verify_and_repair` with `max_attempts=1-2`), gated on `long_running` so interactive chat stays untouched. The sync-RepairLoop-in-thread bridge already exists in `verify/gate.py`.
 
-### E2. Interactive verify is lightweight-only — MEDIUM
+### E2. Interactive verify is lightweight-only — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed as the entry proposed: ask, don't silently downgrade.** When the end-of-plan lightweight verify comes back `unverifiable` but a heavy command exists (`default_verify_command(lightweight=False)`), the user gets one approval request - the exact command as preview, with the honest warning that install+build can take minutes. Approve → the full verify runs under a status spinner and reports `Plan verified (full build)` or a red UNVERIFIED. Deny → "Skipped the full verifier - left UNVERIFIED." Changes with no heavy verifier either (a lone .md) get no offer - never ask the user to approve something that cannot run. Tests: `tests/test_plan_verification.py` (+3).
 
 **Evidence:** `verify/gate.py` — `lightweight=True` drops pip/npm installs and marks node builds **unverifiable**. All interactive/plan gates use lightweight.
 
@@ -231,7 +233,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Still open (lower value):** `HYDRATE_MAX_MESSAGES = 80` is a flat cap — a long session silently loses its earliest turns rather than folding them into the rolling summary that `select_for_budget` already maintains in-loop.
 
-### I2. Follow-up expansion covers only web/browser phrases — LOW
+### I2. Follow-up expansion covers only web/browser phrases — LOW ✅ SUBSUMED 2026-07-17
+
+> Closed by B1 + A2 together, not by more phrases: a work-shaped follow-up ("do that again but smaller", "same for the other file") now routes to the agent loop via `_prefers_qa_answer` (B1), and the loop's hydrated transcript (A2) tells it what "that" was. Follow-up *questions* ("why did that fail?") stay on QA. The two web/browser phrase families in `_expand_followup_prompt` remain as accelerators. Tests: `tests/test_qa_tail_routing.py` (+4).
 
 `_expand_followup_prompt` rewrites exactly two follow-up shapes ("check on the web", "open it in the browser"). "do that again but…", "same for the other file", "why did that fail?" all route as brand-new context-free prompts. Subsumed by A2 if ChatState persists; otherwise worth 5–10 more phrase families.
 
@@ -335,7 +339,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 ## I. Architecture & performance
 
-### H1. Retrieval is FTS-only — LOW-MED
+### H1. Retrieval is FTS-only — LOW-MED ◑ PARTIAL 2026-07-17
+
+> **Zero-hit rescue landed.** FTS treats a multi-word query as one unit, so "where is authentication handled" found nothing unless a file contained that phrase. A miss now retries the meaningful words individually (4+ chars, stopwords dropped, capped at 4 lookups) and unions the hits; the hit path pays nothing, and an identical single-word retry is skipped. Found-and-fixed while testing: the guard first rejected any single-word retry, which killed the legitimate case where a long question boils down to one meaningful term. Tests in `tests/test_real_indexed_qa.py` (+3). **Still open:** true semantic retrieval (embeddings via a local model) - the rescue still cannot map "authentication" to code that only says `login`/`jwt`.
 
 **Evidence:** `retriever/search.py` — `SearchAgent.search` = `fts_search` (Codebase-Memory FTS) + path boosting. No embeddings anywhere in `retriever/` or `indexer/`.
 
@@ -351,7 +357,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** decision, not code: either commit (make it the *one* planner for PRD flows, delete overlap) or demote it to optional-enhancer with the in-repo path as default. Needs a product call; flagged, not prescribed.
 
-### I1. Agent-loop answers don't stream — LOW
+### I1. Agent-loop answers don't stream — LOW (deferred, with reason)
+
+> **Deliberately not implemented.** The loop's output passes through the salvage boundary (`parse_model_turn`): on non-tool-capable models the visible text routinely CONTAINS leaked tool JSON / SEARCH-REPLACE blocks / `<think>` spans until the parser strips them. Streaming shows those tokens to the user and then cannot unshow them; the alternatives are a partial stream that pauses on every suspicious brace, or streaming only for native-tool models - both worse UX than the current heartbeat + spinner. Revisit if/when the default tier stops needing salvage at all. The specialist QA path (no salvage) already streams.
 
 **Evidence:** `chat_loop.py` sends `stream=False` on its chat calls; the specialist QA path streams (`run_specialist_stream`). Long final answers pop in all at once after a silent wait — inconsistent with the rest of the REPL. Fix when convenient; the heartbeat mitigates the perceived hang.
 

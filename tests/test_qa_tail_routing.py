@@ -93,3 +93,28 @@ def test_short_verbless_fragments_are_lookups_not_work(prompt: str):
 
 def test_short_fragments_with_an_action_verb_are_still_work():
     assert _prefers_qa_answer("fix the bug") is False
+
+
+# ---------------------------------------------------------------------------
+# Gap I2 (closed by B1 + A2 together): follow-up phrasings used to need their
+# own keyword expansions ("check on the web", "open it in the browser") or
+# they routed as brand-new context-free prompts. Now any work-shaped follow-up
+# reaches the agent loop, and the loop hydrates the transcript - so "do that
+# again but smaller" both routes correctly AND knows what "that" was.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "do that again but smaller",
+        "same for the other file",
+        "now the same thing for the login page",
+    ],
+)
+def test_followup_work_reaches_the_agent_loop(prompt: str):
+    assert _qa_branch_routes_to_agent(prompt, uses_real_index=True) is True
+
+
+def test_followup_questions_stay_on_qa():
+    assert _prefers_qa_answer("why did that fail?") is True

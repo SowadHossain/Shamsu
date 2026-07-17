@@ -33,6 +33,35 @@ _IGNORED_DIRS = frozenset(
     {"node_modules", "__pycache__", "venv", ".venv", "dist", "build", "site-packages", "migrations"}
 )
 
+
+def workspace_source_files(workspace: Path, limit: int = 40) -> list[str]:
+    """Real source files on disk, newest first - the grounding of last resort.
+
+    Shared by both planners: a planner given NO real files invents them
+    (observed: a vanilla-JS workspace produced plans against a phantom React
+    component). A plain directory listing beats nothing.
+    """
+    workspace = Path(workspace)
+    found: list[tuple[float, str]] = []
+    try:
+        for path in workspace.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
+                continue
+            try:
+                relative = path.relative_to(workspace)
+            except ValueError:
+                continue
+            if any(part in _IGNORED_DIRS or part.startswith(".") for part in relative.parts):
+                continue
+            try:
+                found.append((path.stat().st_mtime, relative.as_posix()))
+            except OSError:
+                continue
+    except OSError:
+        return []
+    found.sort(reverse=True)
+    return [name for _mtime, name in found[:limit]]
+
 PLAN_SYSTEM = """You are SHAMSU's planner. Produce a concrete, minimal implementation plan for
 the task, grounded ONLY in the provided workspace context. Output ONLY JSON matching the schema.
 Rules:
@@ -179,26 +208,7 @@ class PlanningWorkflow:
         return self._workspace_source_files()
 
     def _workspace_source_files(self, limit: int = 40) -> list[str]:
-        """Fallback grounding: real source files on disk, newest first."""
-        found: list[tuple[float, str]] = []
-        try:
-            for path in self.workspace.rglob("*"):
-                if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
-                    continue
-                try:
-                    relative = path.relative_to(self.workspace)
-                except ValueError:
-                    continue
-                if any(part in _IGNORED_DIRS or part.startswith(".") for part in relative.parts):
-                    continue
-                try:
-                    found.append((path.stat().st_mtime, relative.as_posix()))
-                except OSError:
-                    continue
-        except OSError:
-            return []
-        found.sort(reverse=True)
-        return [name for _mtime, name in found[:limit]]
+        return workspace_source_files(self.workspace, limit=limit)
 
     def _unreal_targets(self, plan_steps: list[PlanStep]) -> list[str]:
         """Step target_files that don't exist and aren't plausibly being created.

@@ -199,6 +199,29 @@ async def planning_driver(workspace: Path, case: EvalCase) -> str:
     return plan.markdown
 
 
+async def chat_planner_driver(workspace: Path, case: EvalCase) -> str:
+    """Drive `create_plan` exactly as the chat loop does: `results=[]`.
+
+    The chat loop's per-request planner call is context-blind - it never gets
+    search results - which is the same trap that made plan_mode hallucinate a
+    React component into a vanilla-JS workspace. This measures that path's
+    grounding on its own.
+    """
+    from shamsu.agents.planner import create_plan
+    from shamsu.context.builder import ContextBuilder
+    from shamsu.llm.manager import LLMManager
+
+    plan = await create_plan(
+        LLMManager(),
+        ContextBuilder(),
+        results=[],
+        goal=case.prompt,
+        task_id="eval-chat-plan",
+        workspace=workspace,
+    )
+    return plan.text
+
+
 def render_report(report: EvalReport) -> str:
     """Render a BENCHMARK.md-style pass-rate table."""
     pct = round(report.pass_rate * 100)

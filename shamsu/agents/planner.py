@@ -30,10 +30,12 @@ so this never hard-depends on a capability the interface doesn't promise.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from json_repair import repair_json
 
+from shamsu.agents.plan_mode import workspace_source_files
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.types import ContextPack, SearchResult
 
@@ -99,10 +101,29 @@ async def create_plan(
     results: list[SearchResult],
     goal: str,
     task_id: str,
+    workspace: Path | None = None,
 ) -> PlanResult:
+    # Grounding of last resort: with no search results AND a workspace to look
+    # at, list the real files. The chat loop always calls this with results=[]
+    # (context-blind), which is the same trap that made plan_mode hallucinate a
+    # React component into a vanilla-JS workspace - a planner grounded in
+    # nothing invents. Measured before/after on the chat_plan grounding eval;
+    # the proven PLANNER_INSTRUCTIONS wording itself is untouched.
+    grounding = ""
+    if not results and workspace is not None:
+        try:
+            files = workspace_source_files(workspace)
+        except Exception:
+            files = []
+        if files:
+            listing = "\n".join(f"- {name}" for name in files)
+            grounding = (
+                "\n\nReal files in the workspace (reference ONLY these; a new file is fine "
+                f"if the task needs one, but never invent existing ones):\n{listing}"
+            )
     pack = context_builder.pack(
         results=results,
-        request=f"{PLANNER_INSTRUCTIONS}\n\nTask: {goal.strip()}",
+        request=f"{PLANNER_INSTRUCTIONS}{grounding}\n\nTask: {goal.strip()}",
         task_id=task_id,
         step_id=1,
         specialist="planner",

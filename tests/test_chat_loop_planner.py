@@ -260,3 +260,56 @@ async def test_a_broken_structured_planner_does_not_break_the_run(tmp_path: Path
 
     assert result.awaiting_user is False
     assert "Fallback prose plan." in client.messages_seen[0][-1]["content"]
+
+
+# ---------------------------------------------------------------------------
+# C1 remainder: the chat loop's planner call was context-blind (results=[]),
+# the same trap that made plan_mode hallucinate. With no results and a
+# workspace, create_plan now injects a real-files listing into its request.
+# Measured live: 1/3 grounded -> 3/3 grounded on the chat_plan eval.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_context_blind_planner_gets_a_real_files_listing(tmp_path: Path):
+    from shamsu.agents.planner import create_plan
+    from shamsu.context.builder import ContextBuilder
+
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+    (tmp_path / "index.html").write_text("<html>", encoding="utf-8")
+    llm = FakePlannerLLM("plan")
+
+    await create_plan(llm, ContextBuilder(), results=[], goal="add pause", task_id="t", workspace=tmp_path)
+
+    request = llm.calls[0][1].user_request
+    assert "game.js" in request and "index.html" in request
+    assert "never invent" in request
+
+
+@pytest.mark.asyncio
+async def test_planner_with_real_results_gets_no_listing(tmp_path: Path):
+    """Search results ARE the grounding; the listing must not crowd them."""
+    from shamsu.agents.planner import create_plan
+    from shamsu.context.builder import ContextBuilder
+    from shamsu.types import SearchResult
+
+    (tmp_path / "game.js").write_text("// loop", encoding="utf-8")
+    llm = FakePlannerLLM("plan")
+    results = [SearchResult(file_path="game.js", language="js", line_start=1, line_end=1, content="// loop", score=1.0)]
+
+    await create_plan(llm, ContextBuilder(), results=results, goal="add pause", task_id="t", workspace=tmp_path)
+
+    assert "Real files in the workspace" not in llm.calls[0][1].user_request
+
+
+@pytest.mark.asyncio
+async def test_planner_without_workspace_stays_blind(tmp_path: Path):
+    """workspace=None preserves the old behavior exactly (callers that never
+    pass one are unchanged)."""
+    from shamsu.agents.planner import create_plan
+    from shamsu.context.builder import ContextBuilder
+
+    llm = FakePlannerLLM("plan")
+    await create_plan(llm, ContextBuilder(), results=[], goal="add pause", task_id="t")
+
+    assert "Real files in the workspace" not in llm.calls[0][1].user_request

@@ -382,3 +382,79 @@ def test_repl_followup_web_request_uses_previous_prompt(monkeypatch, tmp_path):
     )
 
     assert seen == ["whats the weather today? Please check on the web for this."]
+
+
+# ---------------------------------------------------------------------------
+# Gap H1 (cheap half): zero-hit rescue. FTS treats a multi-word query as one
+# unit, so "where is authentication handled" found nothing unless a file
+# contained that phrase. A miss now retries the meaningful words individually
+# and unions the hits. Embeddings (true semantic search) remain open.
+# ---------------------------------------------------------------------------
+
+
+def test_zero_hit_multiword_query_is_rescued_per_word(tmp_path):
+    from shamsu.retriever.search import SearchAgent
+
+    class _Adapter:
+        def __init__(self):
+            self.queries = []
+
+        def search_code(self, workspace, query, limit=5):
+            self.queries.append(query)
+            if query == "authentication":
+                return {"ok": True, "results": [
+                    {"node": "login", "file": "auth.py", "start_line": 1, "end_line": 2}
+                ]}
+            return {"ok": True, "results": []}
+
+    adapter = _Adapter()
+    agent = SearchAgent(tmp_path, adapter=adapter)
+    (tmp_path / "auth.py").write_text("def login():\n    pass\n", encoding="utf-8")
+
+    hits = agent.search("where is authentication handled", top_k=5)
+
+    assert [h.file_path for h in hits] == ["auth.py"]
+    # The full query ran first; stopwords ("where", "handled") never retried.
+    assert adapter.queries[0] == "where is authentication handled"
+    assert "authentication" in adapter.queries
+    assert "where" not in adapter.queries[1:]
+    assert "handled" not in adapter.queries[1:]
+
+
+def test_single_word_miss_is_not_retried(tmp_path):
+    from shamsu.retriever.search import SearchAgent
+
+    class _Adapter:
+        def __init__(self):
+            self.queries = []
+
+        def search_code(self, workspace, query, limit=5):
+            self.queries.append(query)
+            return {"ok": True, "results": []}
+
+    adapter = _Adapter()
+    agent = SearchAgent(tmp_path, adapter=adapter)
+
+    assert agent.search("authentication", top_k=5) == []
+    assert adapter.queries == ["authentication"], "one word already ran as-is"
+
+
+def test_hit_path_pays_no_rescue_cost(tmp_path):
+    from shamsu.retriever.search import SearchAgent
+
+    class _Adapter:
+        def __init__(self):
+            self.queries = []
+
+        def search_code(self, workspace, query, limit=5):
+            self.queries.append(query)
+            return {"ok": True, "results": [
+                {"node": "x", "file": "a.py", "start_line": 1, "end_line": 1}
+            ]}
+
+    adapter = _Adapter()
+    agent = SearchAgent(tmp_path, adapter=adapter)
+    (tmp_path / "a.py").write_text("x = 1", encoding="utf-8")
+
+    agent.search("game loop timing", top_k=5)
+    assert len(adapter.queries) == 1, "a query with hits must not fan out"

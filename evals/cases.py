@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from evals.harness import EvalCase, planning_driver
+from evals.harness import EvalCase, chat_planner_driver, planning_driver
 
 
 def _write(workspace: Path, rel: str, content: str) -> None:
@@ -249,5 +249,13 @@ SEED_CASES: list[EvalCase] = [
         seed=_seed_plan_grounding,
         driver=planning_driver,
         tags=("plan", "grounding"),
+    ),
+    EvalCase(
+        name="chat_plan_references_only_real_files",
+        prompt="Add a pause button to the game.",
+        check=_check_plan_references_only_real_files,
+        seed=_seed_plan_grounding,
+        driver=chat_planner_driver,
+        tags=("plan", "grounding", "chat"),
     ),
 ]

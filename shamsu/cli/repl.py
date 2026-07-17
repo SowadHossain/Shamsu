@@ -62,7 +62,7 @@ from shamsu.llm.manager import LLMManager, LLMStalledError, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
-from shamsu.verify.gate import verify_only
+from shamsu.verify.gate import default_verify_command, verify_only
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec, is_static_frontend_prd
 from shamsu.prd.state import create_generation_state, save_generation_state
@@ -6823,9 +6823,62 @@ async def _verify_completed_plan(
     except Exception:
         return
     if outcome.unverifiable:
-        console.print(
-            "[dim]No deterministic verifier available for these changes - left UNVERIFIED.[/dim]"
+        # E2: lightweight mode has no verifier for this stack (a node build
+        # needs `npm install`), which used to mean a PERMANENT shrug - JS/TS
+        # users never got a verified verdict at all. If the heavy path could
+        # verify it, OFFER it instead of silently downgrading. One approval,
+        # at the natural end-of-plan pause, never automatic.
+        heavy_command = ""
+        try:
+            heavy_command = default_verify_command(list(changed_files), lightweight=False)
+        except Exception:
+            heavy_command = ""
+        if not heavy_command:
+            console.print(
+                "[dim]No deterministic verifier available for these changes - left UNVERIFIED.[/dim]"
+            )
+            return
+        request = ApprovalRequest(
+            action_type="run_command",
+            description="Run the full verifier (includes dependency install) to confirm the plan's changes.",
+            risk_level="medium",
+            preview=heavy_command,
+            working_dir=str(workspace),
+            reason=(
+                "The quick check cannot verify this stack. The full check installs "
+                "dependencies and builds, which can take minutes."
+            ),
         )
+        if not _make_approval_manager(workspace, session_logger, console).ask(request):
+            console.print(
+                "[dim]Skipped the full verifier - the plan's changes are left UNVERIFIED.[/dim]"
+            )
+            return
+        try:
+            with console.status("Running the full verifier (install + build)...", spinner="dots"):
+                heavy = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: verify_only(
+                        workspace,
+                        list(changed_files),
+                        lightweight=False,
+                        session_logger=session_logger,
+                    ),
+                )
+        except Exception:
+            console.print("[dim]The full verifier errored - left UNVERIFIED.[/dim]")
+            return
+        if heavy.verified:
+            console.print(Panel(heavy.summary, title="Plan verified (full build)", border_style="green"))
+        else:
+            console.print(
+                Panel(
+                    f"{heavy.summary}\nThe full build did NOT pass - review the affected "
+                    "files before relying on the result.",
+                    title="Plan UNVERIFIED",
+                    border_style="red",
+                )
+            )
         return
     if outcome.verified:
         console.print(Panel(outcome.summary, title="Plan verified", border_style="green"))

@@ -9,6 +9,7 @@ code graph here; every result traces back to a real tool call
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from shamsu.action_ledger.context import get_current_run
@@ -48,6 +49,17 @@ _LANGUAGE_BY_EXTENSION = {
 # CLI, so this keeps interactive latency bounded.
 MAX_SYMBOL_SNIPPETS = 5
 
+# Words that carry no search signal in a zero-hit per-word retry. English
+# question scaffolding plus generic code nouns that match everything.
+_RESCUE_STOPWORDS = frozenset(
+    {
+        "where", "what", "when", "which", "does", "how", "why", "who",
+        "the", "this", "that", "with", "from", "into", "have", "has",
+        "handled", "handle", "should", "would", "could", "about",
+        "code", "file", "files", "function", "class", "method", "project",
+    }
+)
+
 
 def _detect_language(file_path: str) -> str:
     return _LANGUAGE_BY_EXTENSION.get(Path(file_path).suffix.lower(), "text")
@@ -71,6 +83,14 @@ class SearchAgent(ISearchAgent):
         (e.g. an exact traceback location from BugFixWorkflow) - a boost
         never replaces the tool's own ranking, only reorders it."""
         results = self.fts_search(query, top_k=max(top_k * 2, top_k))
+        if not results:
+            # Zero-hit rescue (gap H1, cheap half): FTS treats a multi-word
+            # query as one unit, so "where is authentication handled" finds
+            # nothing unless a file contains that phrase - the code says
+            # `login`/`session`. Retry the meaningful words individually and
+            # union the hits. Costs nothing on the hit path, no model call;
+            # true semantic retrieval (embeddings) remains open.
+            results = self._per_word_rescue(query, top_k)
         if not results:
             return results
         boost_terms = [p.lower().replace("\\", "/") for p in (boost_paths or []) if p]
@@ -98,6 +118,31 @@ class SearchAgent(ISearchAgent):
             )
         boosted.sort(key=lambda r: r.score, reverse=True)
         return boosted[:top_k]
+
+    def _per_word_rescue(self, query: str, top_k: int) -> list[SearchResult]:
+        """Union of per-word FTS results for a query that matched nothing whole.
+
+        Only the meaningful words retry (4+ chars, not stopwords), capped at 4
+        lookups; duplicate files keep their best-scoring hit. The only pointless
+        retry is an IDENTICAL one - "where is authentication handled" boiling
+        down to just "authentication" is still a brand-new query.
+        """
+        words = [
+            word
+            for word in re.findall(r"[a-z0-9_]+", query.lower())
+            if len(word) >= 4 and word not in _RESCUE_STOPWORDS
+        ]
+        if not words:
+            return []
+        if len(words) == 1 and words[0] == query.strip().lower():
+            return []
+        merged: dict[tuple[str, int], SearchResult] = {}
+        for word in words[:4]:
+            for hit in self.fts_search(word, top_k=top_k):
+                key = (hit.file_path, hit.line_start)
+                if key not in merged or hit.score > merged[key].score:
+                    merged[key] = hit
+        return sorted(merged.values(), key=lambda r: r.score, reverse=True)[: top_k * 2]
 
     def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
         result = self.adapter.search_code(self.workspace_root, query, limit=top_k)

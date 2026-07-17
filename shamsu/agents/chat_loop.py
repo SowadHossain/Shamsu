@@ -870,7 +870,14 @@ class AgentChatLoop:
         self._pending_upfront_question = None
         try:
             plan = await create_plan(
-                self.llm, self.context_builder, results=[], goal=user_input, task_id="agent-chat-plan",
+                self.llm,
+                self.context_builder,
+                results=[],
+                goal=user_input,
+                task_id="agent-chat-plan",
+                # results is always [] here, so without this the planner was
+                # context-blind - grounded in nothing, free to invent files.
+                workspace=self.workspace_root,
             )
         except Exception:
             return user_input
