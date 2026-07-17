@@ -51,7 +51,12 @@ def test_prd_parse_requires_taskmaster_to_be_ready(monkeypatch, tmp_path):
 
     _handle_prd_command(f"prd parse {prd}", tmp_path, console)
 
-    assert "Taskmaster Required" in output.getvalue()
+    # H2: Taskmaster is optional now - the refusal is a SIGNPOST, not a wall.
+    # It must name the built-in alternative before the setup instructions.
+    rendered = output.getvalue()
+    assert "Taskmaster Unavailable" in rendered
+    assert "do NOT need it" in rendered
+    assert "taskmaster setup" in rendered
 
 
 def test_tasks_requires_taskmaster_to_be_ready(monkeypatch, tmp_path):
@@ -62,7 +67,9 @@ def test_tasks_requires_taskmaster_to_be_ready(monkeypatch, tmp_path):
 
     _handle_tasks("tasks", tmp_path, console)
 
-    assert "Taskmaster Required" in output.getvalue()
+    rendered = output.getvalue()
+    assert "Taskmaster Unavailable" in rendered
+    assert "do NOT need it" in rendered
 
 
 def test_prd_parse_summary_message_reports_failure_reuse_and_new_tasks():

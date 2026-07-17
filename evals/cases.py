@@ -97,6 +97,19 @@ def _check_ask(workspace: Path, final: str) -> bool:
     return "?" in final or "which" in final.lower()
 
 
+# --- rename via the move tool ---------------------------------------------------
+
+
+def _seed_rename(workspace: Path) -> None:
+    _write(workspace, "old_name.py", "GREETING = 'hi'\n")
+
+
+def _check_rename(workspace: Path, final: str) -> bool:
+    new = workspace / "new_name.py"
+    old = workspace / "old_name.py"
+    return new.is_file() and "GREETING" in _read(workspace, "new_name.py") and not old.exists()
+
+
 # --- clarification: a decision that is the USER's to make ---------------------
 # These measure the "ask when the answer is theirs to give" threshold. The
 # ask_user description used to say "only ask when genuinely blocked", and a 7B
@@ -221,6 +234,13 @@ SEED_CASES: list[EvalCase] = [
         check=_check_ask,
         seed=_seed_ask,
         tags=("clarify",),
+    ),
+    EvalCase(
+        name="rename_file_via_move_tool",
+        prompt="Rename old_name.py to new_name.py, keeping its content.",
+        check=_check_rename,
+        seed=_seed_rename,
+        tags=("move", "tools"),
     ),
     EvalCase(
         name="ask_before_choosing_an_approach",

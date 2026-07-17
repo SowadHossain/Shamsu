@@ -36,8 +36,9 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | G2 | Rollback exists but is practically undiscoverable | Safety net | MEDIUM | ✅ |
 | G3 | 33 `except Exception` blocks in repl.py swallow failures silently | Robustness | MEDIUM | ✅ ledger + /context show |
 | B3 | Unknown models get silently-wrong capability defaults | Model registry | MEDIUM | ✅ |
-| H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | ◑ zero-hit rescue; embeddings open |
-| H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
+| H1 | Retrieval is FTS-only — no semantic search | Retrieval | LOW-MED | ✅ zero-hit rescue + semantic last resort |
+| H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | ✅ demoted to optional: refusal is now a signpost |
+| K1 | Eval flakiness: fallback holes + `<tool_response>` echo (found 2026-07-17) | Agent loop | **HIGH** | ✅ |
 | I1 | Agent-loop answers don't stream | UX | LOW | deferred: conflicts with salvage boundary |
 | I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | ✅ subsumed by B1+A2 |
 | I3 | Evals are single-sample (noisy) + default tier only | Measurement | MEDIUM | ◑ sampling landed; tiers unmeasured |
@@ -349,13 +350,19 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix (cheap first step):** LLM-side query expansion — have the router model emit 3–5 synonym terms and union the FTS results — before considering a real embedding index (Ollama can serve `nomic-embed-text` locally, but that's a bigger lift).
 
-### H2. Taskmaster duplicates in-repo capability at high cost — LOW-MED
+### H2. Taskmaster duplicates in-repo capability at high cost — LOW-MED ✅ RESOLVED 2026-07-17 (demoted, not removed)
 
-**Evidence:** `taskmaster/adapter.py` — external npm tool (`task-master-ai`), Node dependency, 900-second AI-call timeouts, health/repair subsystem. Meanwhile `prd/project.py` builds task graphs deterministically and `plan_mode` + `MilestoneTask` execute stepwise plans without it.
+> **Resolved as "optional-enhancer", the smaller of the two options.** Re-verifying showed the hard requirement only ever gated the `/prd` and `/tasks` slash commands — the natural-language build path (`build the app from the PRD`, `/plan` → `proceed`) never needed Taskmaster at all. So nothing needed ripping out; the *wall* was the bug. `REQUIRED_TASKMASTER_MESSAGE` now leads with the built-in alternative ("You do NOT need it to build from a PRD — ask naturally, or `/plan` then `proceed`") before the setup instructions, and the three gate panels went from red "Taskmaster Required" to yellow "Taskmaster Unavailable". A user without Node loses only the external task-graph commands, and is told exactly what to use instead. Removing the integration outright remains available later; nothing now depends on it by default.
 
-**Failure story:** PRD/task-graph flows hard-require (`REQUIRED_TASKMASTER_MESSAGE`) a Node toolchain that SHAMSU's core never needs otherwise; a broken npm install blocks `/prd` workflows entirely, and each Taskmaster AI call re-runs a local model for minutes to produce what `build_project_spec` approximates in milliseconds.
+### K1. Eval flakiness was agent bugs, not model noise — HIGH ✅ FIXED 2026-07-17
 
-**Fix:** decision, not code: either commit (make it the *one* planner for PRD flows, delete overlap) or demote it to optional-enhancer with the in-repo path as default. Needs a product call; flagged, not prescribed.
+> **The standing "flaky evals" signal was chased down and most of it was OURS.** Reproduction with tracing caught three concrete defects behind `bugfix_syntax_error` wobbling at ~2/3:
+>
+> 1. **`MarkdownWriteFallback` had no tests and three holes.** Its path regex required a *leading verb*, so "broken.py has a syntax error — fix it" found no target (filename before verb); a ```bash usage fence next to the fix tripped the "multiple code blocks" refusal (showing how to run the file is how models answer); and the single-block path wrote with `overwrite=False`, which write_file always refuses for the existing file a FIX necessarily targets. The model *showed* the correct fix and the file stayed broken.
+> 2. **The first repair attempt caused a worse regression — caught by the 5-sample eval before commit.** Preferring fence *tags* wrote `python3 broken.py` INTO broken.py (0/5): the model had put the fix in a bare ``` fence and the run command inside a ```python fence. Tags lie. Content now wins: run-command blocks are excluded regardless of tag, and a `.py` replacement must `ast.parse` before it may overwrite.
+> 3. **Qwen-family models echo fabricated `<tool_response>{"ok": true...}` wrappers as answers** (their chat template's tokens), presenting fake success as if a tool had run — observed live via the new `rename_file_via_move_tool` eval. `_strip_tool_artifacts` now removes them (including truncated echoes), so a pure-echo turn goes empty and trips the loop's empty-response correction instead of standing as a final answer.
+>
+> Measured: `bugfix_syntax_error` 2/3 → 4/5 eval + 7/7 direct reproduction (~92% vs ~67%); the fragment-vs-file guard means a snippet can never clobber a large file. Tests: `tests/test_markdown_fallback.py` (12), `tests/test_model_output_boundary.py` (+4). Residual wobble is genuine sampling noise, correctly labeled FLAKY by the harness.
 
 ### I1. Agent-loop answers don't stream — LOW (deferred, with reason)
 

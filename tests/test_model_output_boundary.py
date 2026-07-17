@@ -248,3 +248,62 @@ def test_capability_flags_for_known_models():
 def test_unknown_model_defaults_to_tool_capable_non_reasoning():
     assert model_supports_native_tools("some-custom-model:latest") is True
     assert model_is_reasoning("some-custom-model:latest") is False
+
+
+# ---------------------------------------------------------------------------
+# Echoed <tool_response> wrappers: qwen-family models are trained on these
+# tags and fabricate them as answers ('<tool_response>{"ok": true, ...}' -
+# observed live, presented as if a tool had run). An echoed result must never
+# stand as a real answer.
+# ---------------------------------------------------------------------------
+
+
+def test_echoed_tool_response_is_stripped_from_the_answer():
+    turn = parse_model_turn(
+        {
+            "message": {
+                "content": (
+                    '<tool_response>\n{"ok": true, "message": "Overwrote old_name.py"}\n'
+                    "</tool_response>\nDone - the file was renamed."
+                ),
+                "tool_calls": [],
+            }
+        }
+    )
+    assert "tool_response" not in turn.text
+    assert '"ok": true' not in turn.text
+    assert "Done - the file was renamed." in turn.text
+
+
+def test_pure_echo_turn_becomes_empty_not_a_fake_success():
+    """Only an echoed result, no prose: the visible text must go empty so the
+    loop's empty-response correction fires instead of accepting fake success."""
+    turn = parse_model_turn(
+        {
+            "message": {
+                "content": '<tool_response>\n{"ok": true, "message": "Read file."}\n</tool_response>',
+                "tool_calls": [],
+            }
+        }
+    )
+    assert turn.text == ""
+    assert turn.tool_calls == []
+
+
+def test_truncated_echo_without_closing_tag_is_still_stripped():
+    turn = parse_model_turn(
+        {
+            "message": {
+                "content": '<tool_response>\n{"ok": true, "message": "Overwrote old_name.py (+1 -1',
+                "tool_calls": [],
+            }
+        }
+    )
+    assert turn.text == ""
+
+
+def test_prose_mentioning_the_words_tool_response_is_untouched():
+    turn = parse_model_turn(
+        {"message": {"content": "The tool response format uses JSON.", "tool_calls": []}}
+    )
+    assert turn.text == "The tool response format uses JSON."

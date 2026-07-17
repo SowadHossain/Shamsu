@@ -19,10 +19,13 @@ from shamsu.taskmaster.adapter import TaskmasterAdapter
 from shamsu.taskmaster.types import TaskmasterStatus, TaskmasterTask
 
 REQUIRED_TASKMASTER_MESSAGE = (
-    "Taskmaster is required for PRD/task-graph workflows but is not available.\n\n"
-    "Run: /taskmaster setup\n\n"
-    "or: /taskmaster repair\n\n"
-    "SHAMSU will not run /prd or /tasks execution workflows until local Taskmaster is ready."
+    "Taskmaster (the external task-graph tool) is not available on this machine.\n\n"
+    "You do NOT need it to build from a PRD - the built-in path handles that:\n"
+    "  - ask naturally: `build the app from the PRD`\n"
+    "  - or plan first: `/plan <task>` then `proceed`\n\n"
+    "Only the /prd and /tasks task-graph commands use Taskmaster. To enable those:\n"
+    "  /taskmaster setup   (needs Node.js/npm)\n"
+    "  /taskmaster repair  (if a previous install broke)"
 )
 
 # Real Taskmaster status values, verified against task-master-ai@0.43.1

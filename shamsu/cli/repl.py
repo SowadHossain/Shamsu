@@ -2307,7 +2307,7 @@ def _handle_prd_command(user_input: str, workspace: Path, console: Console) -> N
     if subcommand != "status":
         ready, reason = service.ensure_ready()
         if not ready:
-            console.print(Panel(reason, title="Taskmaster Required", border_style="red"))
+            console.print(Panel(reason, title="Taskmaster Unavailable", border_style="yellow"))
             return
 
     if subcommand == "parse":
@@ -2408,7 +2408,7 @@ async def _handle_tasks_execute(
     service = TaskmasterService(workspace)
     ready, reason = service.ensure_ready()
     if not ready:
-        console.print(Panel(reason, title="Taskmaster Required", border_style="red"))
+        console.print(Panel(reason, title="Taskmaster Unavailable", border_style="yellow"))
         return
 
     if command == "execute" and not task_id_arg:
@@ -2481,7 +2481,7 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
     service = TaskmasterService(workspace)
     ready, reason = service.ensure_ready()
     if not ready:
-        console.print(Panel(reason, title="Taskmaster Required", border_style="red"))
+        console.print(Panel(reason, title="Taskmaster Unavailable", border_style="yellow"))
         return
 
     if command in {"list", ""}:

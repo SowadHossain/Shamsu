@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 from shamsu.action_ledger.context import get_current_run
 from shamsu.interfaces import ISearchAgent
@@ -68,9 +69,26 @@ def _detect_language(file_path: str) -> str:
 class SearchAgent(ISearchAgent):
     """Real implementation, backed by Codebase-Memory MCP."""
 
-    def __init__(self, workspace_root: Path, adapter: CodebaseMemoryAdapter | None = None) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        adapter: CodebaseMemoryAdapter | None = None,
+        semantic_index: Any | None = None,
+    ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.adapter = adapter or CodebaseMemoryAdapter()
+        # Lazily built (embedding model may not be installed); injectable for tests.
+        self._semantic_index = semantic_index
+
+    def _semantic_rescue(self, query: str, top_k: int) -> list[SearchResult]:
+        try:
+            if self._semantic_index is None:
+                from shamsu.retriever.semantic import SemanticIndex
+
+                self._semantic_index = SemanticIndex(self.workspace_root)
+            return self._semantic_index.search(query, top_k=top_k)
+        except Exception:
+            return []
 
     def search(
         self,
@@ -91,6 +109,12 @@ class SearchAgent(ISearchAgent):
             # union the hits. Costs nothing on the hit path, no model call;
             # true semantic retrieval (embeddings) remains open.
             results = self._per_word_rescue(query, top_k)
+        if not results:
+            # Last resort (H1, semantic half): local embeddings can map
+            # "authentication" onto code that only says `login`/`jwt`. Runs
+            # ONLY when both keyword passes found nothing, degrades to [] on
+            # any failure, and is disabled by SHAMSU_SEMANTIC_SEARCH=0.
+            results = self._semantic_rescue(query, top_k)
         if not results:
             return results
         boost_terms = [p.lower().replace("\\", "/") for p in (boost_paths or []) if p]

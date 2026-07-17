@@ -45,6 +45,10 @@ _SEARCH_REPLACE_RE = re.compile(
 
 # `<tool_call>{...}</tool_call>` wrappers some chat templates emit.
 _XML_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(?P<body>\{.*?\})\s*</tool_call>", re.DOTALL)
+# A fabricated tool RESULT echoed by the model (qwen's chat template wraps real
+# results in these tags, so the model reproduces them). Non-greedy body; the
+# closing tag is optional because echoes are often truncated mid-JSON.
+_TOOL_RESPONSE_RE = re.compile(r"<tool_response>\s*\{.*?(?:\}\s*</tool_response>|\}\s*$|$)", re.DOTALL)
 
 # `<think>...</think>` reasoning trace (kept out of the visible answer).
 _THINK_RE = re.compile(r"<think>(?P<body>.*?)</think>", re.DOTALL | re.IGNORECASE)
@@ -269,6 +273,14 @@ def _strip_tool_artifacts(text: str, salvaged_spans: Iterable[str]) -> str:
     # Remove any orphan <tool_call>/</tool_call> tags left after the inner JSON
     # body was stripped by an earlier salvager.
     text = re.sub(r"</?tool_call\s*>", "", text)
+    # Qwen-family models are TRAINED on <tool_response> wrappers, and echo
+    # fabricated ones as their answer ('<tool_response>{"ok": true, "message":
+    # "Overwrote..."}' - observed live, presented as if a tool had run). An
+    # echoed result is never a real answer: strip the spans, so a turn that was
+    # ONLY echo becomes empty and trips the loop's empty-response correction
+    # instead of standing as a final answer that claims fake success.
+    text = _TOOL_RESPONSE_RE.sub("", text)
+    text = re.sub(r"</?tool_response\s*>", "", text)
     text = _strip_empty_fences(text)
     return _collapse_blank_lines(text)
 
