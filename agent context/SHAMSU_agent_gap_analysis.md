@@ -20,14 +20,14 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
 | B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | |
 | B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
-| C1 | Ungrounded planning (plan_mode fixed; `create_plan` still free text) | Planning | **HIGH** | ◑ |
+| C1 | Ungrounded planning — both planners now schema-constrained | Planning | **HIGH** | ✅ |
 | F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
 | J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | |
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
-| J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ◑ measured: still fails on design decisions |
+| J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ✅ (needed J6 to actually work) |
 | J4 | Answering a question restarts the world (re-routed, amnesiac) | Clarification | MEDIUM | ◑ transcript now carries over |
 | J5 | A question asked mid-plan execution is effectively lost | Clarification | MEDIUM | ✅ |
-| J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM | |
+| J6 | No upfront decision-asking before acting on vague requests | Clarification | MEDIUM | ✅ |
 | D1 | No web/browser access inside the agent loop | Tooling | MEDIUM | |
 | D2 | No delete / move / rename tools | Tooling | MEDIUM | ✅ |
 | E1 | The main agent loop never repairs, only reports | Verify/repair | MEDIUM | |
@@ -40,7 +40,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | H2 | Taskmaster: heavy external dependency duplicating in-repo logic | Architecture | LOW-MED | |
 | I1 | Agent-loop answers don't stream | UX | LOW | |
 | I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | |
-| I3 | Eval baseline exists for the default tier only | Measurement | LOW | |
+| I3 | Evals are single-sample (noisy) + default tier only | Measurement | MEDIUM | |
 | I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW | ✅ |
 
 ---
@@ -109,7 +109,7 @@ The ~20-rule order-dependent chain has a 57-test characterization net over its *
 
 ## C. Planning
 
-### C1. Ungrounded planning — HIGH ◑ PARTIAL 2026-07-17
+### C1. Ungrounded planning — HIGH ✅ FIXED 2026-07-17
 
 > **Confirmed empirically, then half-fixed.** The `plan_references_only_real_files` eval caught it on the first live run. A workspace containing exactly `game.js` + `index.html` (vanilla JS) produced a plan whose **every step** targeted `src/components/PauseButton.tsx` — a React component that does not exist, in a project with no React. Step 1 read: *"Reference the PauseButton component from the real files."* It is not real. A coder handed that plan inherits the hallucination as trusted context.
 >
@@ -117,7 +117,9 @@ The ~20-rule order-dependent chain has a 57-test characterization net over its *
 >
 > **Landed (plan_mode / the user-facing `/plan`):** `_relevant_files` never returns empty while the workspace has source files — search first, then a real mtime-sorted directory listing (dependency/build dirs excluded). Plus a grounding gate: `_unreal_targets` flags step targets that don't exist and aren't being created, and the planner gets **one** corrective round naming the phantoms and listing the real files. A retry that isn't better grounded is discarded rather than swapped in. Same "correct, then accept honestly" shape as the tool-call salvager. Traced as `plan.ungrounded`. **Live re-run: the same prompt now targets `index.html` and `game.js`.** Tests: `tests/test_plan_mode.py` (+6, deterministic).
 >
-> **Still open — the original C1 target:** `agents/planner.py::create_plan` is still one free-text call spliced raw into the coder's prompt, on every file-mutating workflow (CodeEditWorkflow, BugFixWorkflow, TestGenerationWorkflow, DocumentationWorkflow). It at least receives real search results, so it is better off than plan_mode was, but it has no schema, no validation, and no eval. Converging it onto the contract above needs its own eval first — shipping it unmeasured would repeat the J3 mistake documented below.
+> **`create_plan` converged too (the original C1 target).** `agents/planner.py` no longer asks for free prose: it requests schema-constrained JSON (`plan`, plus the J6 decision fields) via `generate_structured`, parsed through `json_repair` like every other small-model boundary. That closes the last place a raw model string was spliced into a coder's prompt with no validation. An LLM without `generate_structured` (test doubles, narrower interfaces) falls back to the original `run_specialist` text path, so this never hard-depends on a capability `ILLMManager` doesn't promise — and a schema call that raises or returns junk falls back too. All four mutating workflows (CodeEdit, BugFix, TestGeneration, Documentation) keep working unchanged, since they read only `.text`.
+>
+> **Not claimed:** `create_plan`'s output is now *structured*, but it is not yet *file-validated* the way plan_mode's is (`_unreal_targets` + re-grounding). Its plan is prose inside a JSON field, not a step list with targets, so there is nothing mechanical to check yet. That is the remaining half.
 
 **Evidence:** `agents/planner.py` — one LLM call, plain-text instructions ("Do not write code… under 10 lines"), output spliced raw into the coder specialist's request. No JSON schema, no real-file grounding check, no validation, no trace event. Called by CodeEditWorkflow, BugFixWorkflow, TestGenerationWorkflow, DocumentationWorkflow — i.e. **every file-mutating workflow**.
 
@@ -189,7 +191,13 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix (highest-leverage single item in this doc):** add a routing eval set — a table of (prompt, workspace-fixture, expected-route) pairs run through `_classify_route_label` (or, post-B2, the real dispatch table). Deterministic, no Ollama, <1s. Then a small planning eval (plan for a fixture task must reference only real files). These directly protect B1, B2, C1.
 
-### I3. Baseline exists for the default tier only — LOW
+### I3. Evals are single-sample, so small deltas are unreadable — MEDIUM (raised 2026-07-17)
+
+**Found by using the harness in anger.** Each case runs ONCE against a stochastic local 7B, and the PASS/FAIL is reported as if deterministic. It is not: re-running `bugfix_syntax_error` on one unchanged commit gave PASS / FAIL / PASS, and the same commit scores 8/10 or 9/10 on the roll. A run that looked like a 2-case regression from the J6 change turned out to be noise — verified by re-running the cases, not by reasoning about them.
+
+**Why it matters:** the governing rule is *no prompt/loop change ships without an eval delta*. If the harness cannot resolve a ±1 delta, that rule silently licenses both false alarms (reverting a good change) and false confidence (shipping a bad one). Consistent flips across re-runs ARE readable — `ask_before_choosing_an_approach` and `plan_references_only_real_files` both flipped and stayed flipped — so the harness is useful today, just not at ±1 resolution.
+
+**Fix:** run each case N times and report a rate (2/3) rather than a boolean; treat a case as regressed only when the rate drops beyond the noise band. Cost is linear in N, so gate it (`--samples`, default 1 locally, 3 for a baseline). Then baseline the light/heavy tiers, which have never been measured at all (the original LOW finding — 3B models are far more salvage-dependent, so a light-tier regression is invisible today).
 
 `BENCHMARK.md` records 6/6 on the default tier. Light/heavy tiers have never been baselined; a light-tier regression (3B models are far more salvage-dependent) would be invisible.
 
@@ -289,7 +297,15 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 **Fix:** after each step, if a pending question exists: pause the plan (the pending-action store already supports resumable state — same mechanism as plan approval), surface the question, resume from the same step index on answer.
 
-### J6. No upfront decision-asking before acting on vague requests — MEDIUM
+### J6. No upfront decision-asking before acting on vague requests — MEDIUM ✅ FIXED 2026-07-17
+
+> **Landed, and it is what finally made J3 real.** The prompt-only reframing of `ask_user` measurably did NOT work: `ask_before_choosing_an_approach` stayed red. The reason is structural, not lexical — *mid-loop*, a model that can always do *something* just does it. No wording fixes that.
+>
+> The fix moves the decision to before any work starts, and costs **zero extra model calls**: the chat loop already made one planner call per request (`_append_plan` -> `create_plan`). That call is now schema-constrained and returns `needs_input` / `question` / `options` alongside the plan. When the planner says the decision is the user's, `run()` ends the turn with the question through the same pending-question flow as `ask_user` — so it survives the turn and the answer resumes the work. `SHAMSU_ASK_UPFRONT=0` restores straight-to-work.
+>
+> **Measured:** `ask_before_choosing_an_approach` FAIL -> PASS (asks sessions/JWT/OAuth with concrete options, in ~6s), while `create_file`, `edit_file_targeted`, `ask_user_clarifies` and the `does_not_ask_when_unambiguous` negative guard all still pass — it did not start asking about everything, which was the real risk. Tests: `tests/test_chat_loop_planner.py` (9).
+>
+> **It also exposed a hidden test dependency:** `test_model_timeout_stops_loop` built a loop with no `llm=`, so its planner call reached live Ollama — a test of the *client* timeout quietly depended on a model being up. It surfaced only when the planner started (correctly) judging "do something" too vague to act on. Now injects a planner double.
 
 **Evidence:** `_looks_like_vague_action_request` ("do it", "go", "continue") routes straight to a full PRD build — the code's own comment calls this "safe to route here" because "the build is approval-gated anyway." The PRD pipeline silently picks theme (`_select_theme`), archetype (`classify_archetype`), and stack via heuristics. `plan_mode` writes a plan without ever asking a clarifying question first, even when the task is one ambiguous sentence.
 

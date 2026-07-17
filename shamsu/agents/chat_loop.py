@@ -82,6 +82,16 @@ _CHAT_EXECUTOR_ROLE = _os.environ.get("SHAMSU_CHAT_ROLE", "coder").strip() or "c
 # The per-turn planner is on by default, but can be disabled (SHAMSU_CHAT_PLANNER=0)
 # on very small machines where the extra planner-model round-trip + model swap
 # adds too much latency.
+# Whether the planner may stop a run to ask the user a decision before work
+# starts (J6). On by default: a wrong build costs far more than one question.
+# SHAMSU_ASK_UPFRONT=0 restores straight-to-work behavior.
+_ASK_UPFRONT_ENABLED = _os.environ.get("SHAMSU_ASK_UPFRONT", "1").strip().lower() not in {
+    "0",
+    "false",
+    "off",
+    "no",
+}
+
 _CHAT_PLANNER_ENABLED = _os.environ.get("SHAMSU_CHAT_PLANNER", "1").strip().lower() not in {
     "0", "false", "no", "off",
 }
@@ -430,9 +440,19 @@ class AgentChatLoop:
             self.audit.log_prompt(original_input)
         user_input = self._append_long_term_memory(user_input)
         self._produced_plan = False
+        self._pending_upfront_question: dict[str, Any] | None = None
         if self.long_running or _CHAT_PLANNER_ENABLED:
             user_input = await self._append_plan(user_input)
         self.state.append_user(user_input)
+        # The planner judged this needs a decision only the user can make. Ask
+        # BEFORE doing any work (J6): mid-loop, a model that can always do
+        # *something* just does it, which is why the prompt-only nudge toward
+        # ask_user measurably failed on design decisions. Asking first costs no
+        # extra model call - the planner call already happened above.
+        if self._pending_upfront_question and _ASK_UPFRONT_ENABLED:
+            question = self._pending_upfront_question
+            self._pending_upfront_question = None
+            return self._handle_ask_user(question, original_input, 0)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
         # Files this run actually wrote (confirmed ok), for the end-of-run verify gate.
@@ -833,13 +853,24 @@ class AgentChatLoop:
     async def _append_plan(self, user_input: str) -> str:
         """One planner call per top-level request (not per tool round),
         mirroring CodeEditWorkflow/BugFixWorkflow - see shamsu/agents/planner.py.
-        Best-effort: a planner failure must never block the chat loop itself."""
+        Best-effort: a planner failure must never block the chat loop itself.
+
+        Also captures the planner's upfront "this is the user's decision" verdict
+        for `run()` to act on before any work starts (J6)."""
+        self._pending_upfront_question = None
         try:
             plan = await create_plan(
                 self.llm, self.context_builder, results=[], goal=user_input, task_id="agent-chat-plan",
             )
         except Exception:
             return user_input
+        if plan.needs_input:
+            self._pending_upfront_question = {
+                "question": plan.question,
+                "options": list(plan.options),
+                "allow_free_text": True,
+                "source": "planner_upfront",
+            }
         if not plan.text:
             return user_input
         self._produced_plan = True

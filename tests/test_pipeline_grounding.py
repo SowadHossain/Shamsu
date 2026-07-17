@@ -210,7 +210,19 @@ async def test_model_timeout_stops_loop(tmp_path, monkeypatch):
     fake_client = AsyncMock()
     fake_client.chat.side_effect = slow_chat
 
-    loop = AgentChatLoop(tmp_path, client=fake_client, tools=fake_tools)
+    # Inject the planner too. Without an `llm=`, AgentChatLoop builds a real
+    # LLMManager and the per-request planner call reaches live Ollama - so this
+    # test of the CLIENT timeout was quietly depending on a model being up. It
+    # surfaced when the planner gained an upfront "this needs a decision" verdict
+    # (J6) and correctly judged "do something" too vague, ending the turn with a
+    # question before the tool loop could ever time out.
+    class _QuietPlanner:
+        async def run_specialist(self, specialist, pack):
+            from shamsu.types import LLMResponse
+
+            return LLMResponse(raw="", model_used="fake")
+
+    loop = AgentChatLoop(tmp_path, client=fake_client, tools=fake_tools, llm=_QuietPlanner())
     result = await loop.run("do something")
     assert result.stopped
     assert "timed out" in result.final.lower() or "not respond" in result.final.lower()
