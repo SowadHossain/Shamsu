@@ -252,6 +252,20 @@ def render_report(report: EvalReport) -> str:
             "failed others on the SAME code - do not read a delta from them."
         )
         lines.append("")
+    # Standing footer, part of render() on purpose: BENCHMARK files are
+    # regenerated wholesale every baseline, so a hand-appended caveat section
+    # survives exactly one run before being clobbered and forgotten.
+    lines.append("## Reading these numbers")
+    lines.append("")
+    lines.append(
+        "Local models are stochastic. A case flagged flaky passed some attempts\n"
+        "and failed others on identical code - treat its row as noise until\n"
+        "re-measured with more samples. Compare baselines only at equal\n"
+        "`--samples`; a delta that lives entirely inside the flaky set is no\n"
+        "delta. Tier-specific findings (root causes of consistent failures)\n"
+        "live in `agent context/SHAMSU_agent_gap_analysis.md` under I3."
+    )
+    lines.append("")
     return "\n".join(lines)
 
 

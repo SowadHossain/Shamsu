@@ -81,8 +81,20 @@ def _seed_runcmd(workspace: Path) -> None:
 
 
 def _check_runcmd(workspace: Path, final: str) -> bool:
+    # Two independent requirements:
+    # 1. The ANSWER reports the outcome. "succeed" covers "succeeded" - the
+    #    light tier phrased a correct answer that way and the old substring
+    #    list ("success") failed it, a pure check-wording bug.
+    # 2. The COMMAND actually ran: py_compile leaves __pycache__/ok.*.pyc next
+    #    to the source. Wording alone trusts the model's self-report, which is
+    #    exactly what this harness exists to never do.
     lowered = final.lower()
-    return "exit 0" in lowered or "exited with 0" in lowered or "no error" in lowered or "success" in lowered
+    said_ok = any(
+        marker in lowered
+        for marker in ("exit 0", "exited with 0", "no error", "success", "succeed")
+    )
+    compiled_artifact = any(workspace.glob("__pycache__/ok.*.pyc"))
+    return said_ok and compiled_artifact
 
 
 # --- ask_user clarification ---------------------------------------------------

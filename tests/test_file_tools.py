@@ -406,3 +406,19 @@ async def test_loop_does_not_stop_on_prose_only_read_promise(tmp_path: Path):
     assert result.final == "Done. I read the file."
     assert result.stopped is False
     assert client.calls == 4
+
+
+def test_no_candidate_read_failure_names_the_files_that_do_exist(tmp_path: Path):
+    """Light-tier failure observed live: the model read the DESTINATION of a
+    rename first, got the old "go use find_file" coaching, and echoed the
+    coaching as its final answer. The no-candidate correction must instead name
+    the real files so the productive next call is the easiest continuation."""
+    _write(tmp_path, "old_name.py", "GREETING = 'hi'\n")
+    registry = _registry(tmp_path)
+    loop = AgentChatLoop(tmp_path, client=_ScriptedClient([]), tools=registry, llm=_NoPlanLLM())
+
+    message = loop._read_failure_correction("new_name.py", "not found")
+
+    assert "old_name.py" in message
+    assert "NOT read" in message
+    assert "find_file" not in message

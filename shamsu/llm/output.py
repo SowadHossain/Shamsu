@@ -282,7 +282,24 @@ def _strip_tool_artifacts(text: str, salvaged_spans: Iterable[str]) -> str:
     text = _TOOL_RESPONSE_RE.sub("", text)
     text = re.sub(r"</?tool_response\s*>", "", text)
     text = _strip_empty_fences(text)
-    return _collapse_blank_lines(text)
+    text = _collapse_blank_lines(text)
+    # A turn whose entire visible answer is fence markers (e.g. a single
+    # unpaired "```" left behind once its body was salvaged - observed live on
+    # the light tier) is not an answer. Return empty so the loop's
+    # empty-response correction fires instead of the user seeing "```".
+    if _is_fence_only(text):
+        return ""
+    return text
+
+
+def _is_fence_only(text: str) -> bool:
+    """True when every non-blank line is a bare fence marker (```` ``` ````,
+    optionally with a language tag). Real answers that merely CONTAIN an
+    unclosed fence keep their non-fence lines and stay untouched."""
+    non_blank = [line.strip() for line in text.splitlines() if line.strip()]
+    return bool(non_blank) and all(
+        re.fullmatch(r"`{3,}[\w+-]*", line) for line in non_blank
+    )
 
 
 def _strip_empty_fences(text: str) -> str:

@@ -1168,6 +1168,23 @@ class AgentChatLoop:
                 "Call ask_user with these as options so the user can choose, or read_file the correct "
                 "one. Do NOT guess between them."
             )
+        # No candidate matched. Sending a small model hunting ("use find_file")
+        # is one more hop it fumbles - and the light tier was observed ECHOING
+        # this correction back as its final answer instead of following it.
+        # Name the files that actually exist so the productive next call is the
+        # easiest continuation.
+        try:
+            from shamsu.agents.plan_mode import workspace_source_files
+
+            existing = workspace_source_files(self.workspace_root, limit=10)
+        except Exception:
+            existing = []
+        if existing:
+            return (
+                f"read_file {filepath} failed ({message}) - that file does not exist. "
+                f"Files that DO exist: {'; '.join(existing)}. The file was NOT read. "
+                "Continue the user's task using one of these real paths, or call ask_user if none fits."
+            )
         return (
             f"read_file {filepath} failed ({message}) and no candidate path matched. Use find_file or "
             "grep_files to locate the right file, or call ask_user for the correct path. Do not claim you read it."

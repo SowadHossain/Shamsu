@@ -307,3 +307,29 @@ def test_prose_mentioning_the_words_tool_response_is_untouched():
         {"message": {"content": "The tool response format uses JSON.", "tool_calls": []}}
     )
     assert turn.text == "The tool response format uses JSON."
+
+
+# ---------------------------------------------------------------------------
+# Fence-only finals: a stray unpaired ``` left after salvage is not an answer.
+# Observed live on the light tier - the whole visible turn was "```", which
+# dodged the empty-response correction because it was not technically empty.
+# ---------------------------------------------------------------------------
+
+
+def test_a_bare_unpaired_fence_becomes_empty():
+    turn = parse_model_turn({"message": {"content": "```", "tool_calls": []}})
+    assert turn.text == ""
+
+
+def test_fence_with_language_tag_and_blank_lines_becomes_empty():
+    turn = parse_model_turn(
+        {"message": {"content": "```json\n\n```\n\n```", "tool_calls": []}}
+    )
+    assert turn.text == ""
+
+
+def test_an_answer_containing_an_unclosed_fence_keeps_its_content():
+    content = "Here is the file:\n```python\nx = 1\n"
+    turn = parse_model_turn({"message": {"content": content, "tool_calls": []}})
+    assert "x = 1" in turn.text
+    assert "Here is the file:" in turn.text
