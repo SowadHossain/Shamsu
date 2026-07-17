@@ -19,9 +19,9 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | A1 | One unhandled exception crashes the whole REPL | Robustness | **HIGH** | ✅ |
 | A2 | ~~No memory between prompts~~ → cross-route continuity (claim corrected) | Conversation | MEDIUM | ✅ |
 | B1 | Keyword-list routing silently degrades to QA (systemic) | Routing | **HIGH** | |
-| B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ◑ drift now caught by tests |
+| B2 | Routing truth exists in two hand-synced copies | Routing | **HIGH** | ✅ |
 | C1 | `create_plan` is ungrounded free text on every mutating workflow | Planning | **HIGH** | |
-| F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ◑ routing matrix landed |
+| F1 | Eval harness can't enforce its own rule | Measurement | **HIGH** | ✅ |
 | J1 | Only the agent chat loop can ask the user anything | Clarification | **HIGH** | |
 | J2 | The stuck-loop clarify path is dead code | Clarification | **HIGH** | ✅ |
 | J3 | Mixed prompt signals make small models never ask | Clarification | MED-HIGH | ✅ |
@@ -41,7 +41,7 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 | I1 | Agent-loop answers don't stream | UX | LOW | |
 | I2 | Follow-up expansion covers only web/browser phrases | Conversation | LOW | |
 | I3 | Eval baseline exists for the default tier only | Measurement | LOW | |
-| I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW | |
+| I4 | G7 dispatch-chain structural trim still deferred | Routing | LOW | ✅ |
 
 ---
 
@@ -77,7 +77,13 @@ This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that d
 
 **Fix (direction):** the LLM router (`_route_prompt`) already exists and runs *after* the keyword chain. Invert the relationship for action-shaped prompts: keywords stay as fast-path accelerators, but "no keyword matched AND the prompt contains an imperative verb" should go to the LLM router (or `ask_user`) **before** the tool-less QA brain — QA should be a deliberate destination, never a catch-all for missed intent. Requires routing evals first (F1) per the reliability doc's own rule.
 
-### B2. Routing truth lives in two hand-synced copies — HIGH
+### B2. Routing truth lives in two hand-synced copies — HIGH ✅ FIXED 2026-07-17 (with I4)
+
+> **Landed.** Routing is now one ordered `_ROUTE_RULES` table of `(label, detector)`; `_classify_route_label` walks it and `_handle_request` dispatches on the label it returns. The label IS the decision, so `last_route` and the audit trail cannot disagree with reality.
+>
+> **The drift was real, not theoretical:** the mirror carried 11 of the 20 rules in a different order, so `run the game` dispatched to `run_game` while the trace recorded `qa` — debugging a misroute from a trail that lies is worse than having no trail. A detector that raises now degrades to the QA tail instead of killing the request.
+>
+> **This also closes I4** (the deferred G7 trim): order is now data, so reordering is editing a list, and `tests/test_routing_matrix.py` (32) asserts every rule has a handler, every handler has a rule, labels are unique, and the two order-critical rules (prd_summary, git) stay first.
 
 **Evidence:** `_handle_request` (repl.py:3410+) is the real ~20-rule dispatch chain; `_classify_route_label` (repl.py:3383) is a *manually maintained mirror* used for session traces — its own docstring admits "a missed/added branch degrades to agent-chat". They have already drifted: the mirror checks ~10 of the ~20 rules.
 

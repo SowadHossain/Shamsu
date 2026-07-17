@@ -18,6 +18,7 @@ against drift - it is the one thing that could make this whole file lie.
 from __future__ import annotations
 
 import inspect
+import re
 from pathlib import Path
 
 import pytest
@@ -111,64 +112,64 @@ def test_routing_in_a_plain_workspace(tmp_path: Path, prompt: str, expected: str
     assert _classify_route_label(prompt, tmp_path) == expected
 
 
-# --- the mirror must not lie --------------------------------------------------
+# --- the table is the single source of truth ---------------------------------
+# Routing used to be decided twice: the real if/elif chain in `_handle_request`,
+# and a hand-maintained copy in `_classify_route_label` for the session trace.
+# They had drifted (11 of 20 rules, different order), so "run the game" ran the
+# game while the trace recorded "qa". Now one ordered table decides, and the
+# dispatcher keys off its label. These pin that coupling.
 
 
-def test_dispatch_mirror_is_honest():
-    """`_classify_route_label` mirrors `_handle_request` BY HAND (gap B2), and
-    the whole matrix above trusts it. Pin the coupling: every detector the
-    mirror consults must still be consulted by the real dispatcher, so a
-    detector renamed/removed in one and not the other fails here loudly
-    instead of silently reporting a route that never ran."""
-    mirror = inspect.getsource(_classify_route_label)
-    from shamsu.cli.repl import _handle_request
+def test_every_rule_label_has_a_dispatch_branch():
+    """A rule that routes nowhere silently falls through to the QA tail - the
+    exact silent-degradation this whole doc is about."""
+    from shamsu.cli.repl import _ROUTE_RULES, _handle_request
 
     dispatcher = inspect.getsource(_handle_request)
-
-    detectors = [
-        name
-        for name in (
-            "_looks_like_prd_summary_request",
-            "is_git_request",
-            "_looks_like_workspace_location_prompt",
-            "_looks_like_workspace_files_prompt",
-            "_looks_like_prd_build_request",
-            "_looks_like_file_write_request",
-            "_looks_like_direct_code_request",
-        )
-        if name in mirror
+    missing = [
+        label for label, _ in _ROUTE_RULES if f'route_label == "{label}"' not in dispatcher
     ]
-    assert detectors, "mirror consults no known detectors - it was rewritten"
-    missing = [name for name in detectors if name not in dispatcher]
-    assert not missing, (
-        f"_classify_route_label consults {missing} but _handle_request no longer does. "
-        "The session trace would report a route that never ran."
+    assert not missing, f"_ROUTE_RULES labels with no handler in _handle_request: {missing}"
+
+
+def test_every_dispatch_branch_has_a_rule():
+    """The reverse: a handler nothing can route to is dead code."""
+    from shamsu.cli.repl import _ROUTE_RULES, _handle_request
+
+    dispatcher = inspect.getsource(_handle_request)
+    handled = set(re.findall(r'route_label == "([^"]+)"', dispatcher))
+    labels = {label for label, _ in _ROUTE_RULES}
+    orphans = handled - labels
+    assert not orphans, f"_handle_request branches unreachable from _ROUTE_RULES: {orphans}"
+
+
+def test_rule_labels_are_unique_and_ordered():
+    """First match wins, so a duplicate label means the second is unreachable."""
+    from shamsu.cli.repl import _ROUTE_RULES
+
+    labels = [label for label, _ in _ROUTE_RULES]
+    assert len(labels) == len(set(labels)), f"duplicate route labels: {labels}"
+    assert labels[0] == "prd_summary", (
+        "PRD summary must stay first: otherwise 'checkout the prd' trips git and "
+        "'what is it about' falls into the tool loop and stalls."
+    )
+    assert labels[1] == "git", (
+        "git must stay ahead of web/QA/code-edit: otherwise 'commit the current "
+        "changes' trips the web keyword and 'stage the files' falls into weak QA."
     )
 
 
-def test_mirror_and_dispatcher_agree_on_detector_order():
-    """Order IS the routing logic in an if/elif chain: same detectors in a
-    different order = a different router. The mirror's shared detectors must
-    appear in the same relative order as the dispatcher's."""
-    from shamsu.cli.repl import _handle_request
+def test_a_raising_detector_does_not_take_down_routing():
+    """A detector touching the filesystem can raise (permissions, races). A bad
+    routing guess must degrade to the QA tail, not kill the request."""
+    from shamsu.cli import repl
 
-    mirror = inspect.getsource(_classify_route_label)
-    dispatcher = inspect.getsource(_handle_request)
+    def _boom(_text, _ws):
+        raise OSError("disk gone")
 
-    shared = [
-        "_looks_like_prd_summary_request",
-        "is_git_request",
-        "_looks_like_workspace_location_prompt",
-        "_looks_like_workspace_files_prompt",
-        "_looks_like_prd_build_request",
-        "_looks_like_file_write_request",
-        "_looks_like_direct_code_request",
-    ]
-    in_mirror = [name for name in shared if name in mirror]
-    mirror_order = sorted(in_mirror, key=mirror.index)
-    dispatch_order = sorted(in_mirror, key=dispatcher.index)
-    assert mirror_order == dispatch_order, (
-        "Detector order drifted between _classify_route_label and _handle_request:\n"
-        f"  mirror:     {mirror_order}\n"
-        f"  dispatcher: {dispatch_order}"
-    )
+    original = repl._ROUTE_RULES
+    try:
+        repl._ROUTE_RULES = (("explodes", _boom), *original)
+        assert repl._classify_route_label("anything", Path(".")) != "explodes"
+    finally:
+        repl._ROUTE_RULES = original

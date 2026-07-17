@@ -3480,33 +3480,74 @@ def _extract_requested_file_path(user_input: str) -> str | None:
     return None
 
 
+# The routing chain, as data (gap B2). This is the ONE ordered list of
+# (label, detector) rules; `_classify_route_label` walks it and `_handle_request`
+# dispatches on the label it returns, so there is exactly one place where "which
+# route is this?" is decided.
+#
+# It used to be answered twice: `_handle_request` had the real if/elif chain and
+# `_classify_route_label` re-implemented it BY HAND for the session trace. They
+# had already drifted - the mirror carried 11 of the 20 rules, in a different
+# order, so "run the game" dispatched to run_game while the trace recorded "qa".
+# Debugging a misroute from a trail that lies is worse than having no trail.
+#
+# ORDER IS THE LOGIC: these are evaluated top-down, first match wins. Moving a
+# rule changes routing. `tests/test_routing_matrix.py` pins the behavior.
+# Every detector is normalized to (text, workspace) so the table stays uniform.
+_ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
+    # A "read/summarize the PRD" question is answered from the PRD text before
+    # anything else - otherwise "checkout the prd" trips git and "what is it
+    # about" falls into the tool loop and stalls.
+    ("prd_summary", lambda text, ws: _looks_like_prd_summary_request(text, ws)),
+    # Git/repo requests are classified before web-search, QA and code-edit (see
+    # is_git_request): otherwise "commit the current changes" trips the web
+    # keyword, "stage the files" falls into weak QA, and "what are the unstaged
+    # changes" trips the code-edit heuristic.
+    ("git", lambda text, ws: is_git_request(text)),
+    ("workspace.location", lambda text, ws: _looks_like_workspace_location_prompt(text)),
+    ("workspace.files", lambda text, ws: _looks_like_workspace_files_prompt(text)),
+    ("prd.build", lambda text, ws: _looks_like_prd_build_request(text, ws)),
+    ("file.read", lambda text, ws: _looks_like_file_read_request(text)),
+    ("file.write", lambda text, ws: _looks_like_file_write_request(text)),
+    # A self-contained coding question ("write python for the first 100 primes")
+    # is answered directly by the model - no planner, no tool loop, no timeout.
+    ("direct_code", lambda text, ws: _looks_like_direct_code_request(text)),
+    ("workspace.prds", lambda text, ws: _looks_like_workspace_prd_request(text)),
+    (
+        "continue_game",
+        lambda text, ws: _looks_like_affirmative_continue(text) and _multiplayer_template_present(ws),
+    ),
+    ("run_game", lambda text, ws: _looks_like_run_game_request(text)),
+    ("dev_server.recovery", lambda text, ws: _looks_like_dev_server_failure(text)),
+    ("dev_server", lambda text, ws: _looks_like_dev_server_prompt(text)),
+    ("prd.context_question", lambda text, ws: _looks_like_prd_context_question(text, ws)),
+    ("browser", lambda text, ws: _looks_like_browser_needed_prompt(text)),
+    ("web", lambda text, ws: _looks_like_web_needed_prompt(text)),
+    ("agent-chat", lambda text, ws: _looks_like_react_prompt(text)),
+    ("django", lambda text, ws: _looks_like_django_generation_request(text)),
+    ("plan_prd", lambda text, ws: _looks_like_prd_plan_request(text)),
+)
+
+# No rule matched. NOT a route in its own right so much as the tail: the
+# search/LLM-router path, which ends in the tool-less QA brain.
+ROUTE_FALLTHROUGH = "qa"
+
+
 def _classify_route_label(effective_input: str, workspace: Path) -> str:
-    """Coarse, read-only route label mirroring the branch order in
-    `_handle_request` — used only to record `last_route` in session state, so a
-    missed/added branch degrades to `agent-chat` rather than breaking anything."""
-    if _looks_like_prd_summary_request(effective_input, workspace):
-        return "prd_summary"
-    if is_git_request(effective_input):
-        return "git"
-    if _looks_like_workspace_location_prompt(effective_input):
-        return "workspace.location"
-    if _looks_like_workspace_files_prompt(effective_input):
-        return "workspace.files"
-    if _looks_like_prd_build_request(effective_input, workspace):
-        return "prd.build"
-    if _looks_like_file_read_request(effective_input):
-        return "file.read"
-    if _looks_like_file_write_request(effective_input):
-        return "file.write"
-    if _looks_like_direct_code_request(effective_input):
-        return "direct_code"
-    if _looks_like_browser_needed_prompt(effective_input):
-        return "browser"
-    if _looks_like_web_needed_prompt(effective_input):
-        return "web"
-    if _looks_like_react_prompt(effective_input):
-        return "agent-chat"
-    return "qa"
+    """Resolve which route handles this prompt: the first matching rule's label,
+    or `qa` when nothing matches.
+
+    This is the authority, not a description of one - `_handle_request`
+    dispatches on what this returns. A detector that raises is treated as
+    "no match" rather than taking the whole REPL down over a routing guess.
+    """
+    for label, matches in _ROUTE_RULES:
+        try:
+            if matches(effective_input, workspace):
+                return label
+        except Exception:
+            continue
+    return ROUTE_FALLTHROUGH
 
 
 async def _handle_request(
@@ -3550,10 +3591,12 @@ async def _handle_request(
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
         _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
         return
-    # A "read/summarize the PRD" question is answered from the PRD text before
-    # anything else - otherwise "checkout the prd" trips git and "what is it
-    # about" falls into the tool loop and stalls.
-    if _looks_like_prd_summary_request(effective_input, workspace):
+    # Dispatch on the route already resolved above by `_classify_route_label`.
+    # The detectors themselves live in `_ROUTE_RULES` - this chain used to run a
+    # second, hand-maintained copy of them, which is how the trace ended up
+    # reporting a route that never ran (gap B2). Now the label IS the decision,
+    # so `last_route` and the audit trail cannot disagree with reality.
+    if route_label == "prd_summary":
         await _handle_prd_summary_request(
             effective_input,
             workspace,
@@ -3563,11 +3606,7 @@ async def _handle_request(
             thinking_status=thinking_status,
         )
         return
-    # Git/repo requests are classified first, before web-search, QA, and
-    # code-edit routing (see is_git_request): otherwise "commit the current
-    # changes" trips the web keyword, "stage the files" falls into weak QA, and
-    # "what are the unstaged changes" trips the code-edit heuristic.
-    if is_git_request(effective_input):
+    if route_label == "git":
         await _handle_git_request(
             effective_input,
             workspace,
@@ -3576,18 +3615,18 @@ async def _handle_request(
             agent_context=agent_context,
         )
         return
-    if _looks_like_workspace_location_prompt(effective_input):
+    if route_label == "workspace.location":
         message = _print_workspace_location(workspace, console)
         _log_assistant_message(session_logger, message, workflow_id="workspace.location")
         return
-    if _looks_like_workspace_files_prompt(effective_input):
+    if route_label == "workspace.files":
         message = _print_workspace_files(workspace, console)
         _log_assistant_message(session_logger, message, workflow_id="workspace.files")
         return
-    if _looks_like_prd_build_request(effective_input, workspace):
+    if route_label == "prd.build":
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
         return
-    if _looks_like_file_read_request(effective_input):
+    if route_label == "file.read":
         await _handle_file_read_request(
             effective_input,
             workspace,
@@ -3597,7 +3636,7 @@ async def _handle_request(
             thinking_status=thinking_status,
         )
         return
-    if _looks_like_file_write_request(effective_input):
+    if route_label == "file.write":
         await _run_agent_chat(
             _append_agent_context(effective_input, agent_context),
             workspace,
@@ -3606,9 +3645,7 @@ async def _handle_request(
             auto_approve=is_long_running_enabled(workspace),
         )
         return
-    # A self-contained coding question ("write python for the first 100 primes")
-    # is answered directly by the model - no planner, no tool loop, no timeout.
-    if _looks_like_direct_code_request(effective_input):
+    if route_label == "direct_code":
         emit_trace(
             console,
             session_logger,
@@ -3627,11 +3664,11 @@ async def _handle_request(
         )
         _audit_simple_turn(workspace, session_logger, "direct_code", effective_input, answer)
         return
-    if _looks_like_workspace_prd_request(effective_input):
+    if route_label == "workspace.prds":
         message = _handle_workspace_prd_request(workspace, console)
         _log_assistant_message(session_logger, message, workflow_id="workspace.prds")
         return
-    if _looks_like_affirmative_continue(effective_input) and _multiplayer_template_present(workspace):
+    if route_label == "continue_game":
         await _run_agent_chat(
             _build_continue_game_request(),
             workspace,
@@ -3641,23 +3678,23 @@ async def _handle_request(
             auto_approve=True,
         )
         return
-    if _looks_like_run_game_request(effective_input):
+    if route_label == "run_game":
         await _handle_run_game(workspace, console, session_logger=session_logger)
         return
-    if _looks_like_dev_server_failure(effective_input):
+    if route_label == "dev_server.recovery":
         _handle_dev_server_recovery(workspace, console, session_logger=session_logger)
         return
-    if _looks_like_dev_server_prompt(effective_input):
+    if route_label == "dev_server":
         _handle_dev_server(effective_input, workspace, console, session_logger=session_logger)
         return
-    if _looks_like_prd_context_question(effective_input, workspace):
+    if route_label == "prd.context_question":
         message = _handle_workspace_prd_request(workspace, console)
         _log_assistant_message(session_logger, message, workflow_id="prd.context_question")
         return
-    if _looks_like_browser_needed_prompt(effective_input):
+    if route_label == "browser":
         await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console, workspace), browser_tool=browser_tool)
         return
-    if _looks_like_web_needed_prompt(effective_input):
+    if route_label == "web":
         await _run_web_assist(
             effective_input,
             console,
@@ -3666,17 +3703,18 @@ async def _handle_request(
             session_logger=session_logger,
         )
         return
-    if _looks_like_react_prompt(effective_input):
+    if route_label == "agent-chat":
         await _run_agent_chat(effective_input, workspace, console, session_logger=session_logger)
         return
-    if _looks_like_django_generation_request(effective_input):
+    if route_label == "django":
         generate_command = f"generate-django {_extract_prd_path_from_prompt(effective_input)}"
         _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
         return
-    if _looks_like_prd_plan_request(effective_input):
+    if route_label == "plan_prd":
         plan_command = f"plan-prd {_extract_prd_path_from_prompt(effective_input)}"
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
+    # ROUTE_FALLTHROUGH: no rule matched - the search/LLM-router tail.
     search, uses_real_index = _build_search_agent(workspace, session_logger)
     llm = _make_llm_manager(session_logger, console, workspace)
     if not uses_real_index:

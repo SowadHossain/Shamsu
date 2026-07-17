@@ -36,6 +36,11 @@ class EvalCase:
     seed: SeedFn | None = None
     long_running: bool = False
     tags: tuple[str, ...] = ()
+    # Per-case driver override. Most cases go through the agent loop, but some
+    # measure a different real path (e.g. the planner, which never touches the
+    # loop) - those cannot be scored by driving the loop instead. A fake driver
+    # passed to `run_evals` still wins, so unit tests stay Ollama-free.
+    driver: Driver | None = None
 
 
 @dataclass(frozen=True)
@@ -82,10 +87,14 @@ async def run_evals(
     tier: str = "",
 ) -> EvalReport:
     """Run each case in an isolated temp workspace and score it. A driver or
-    check raising is recorded as a failed case (never aborts the run)."""
-    run = driver or chat_loop_driver
+    check raising is recorded as a failed case (never aborts the run).
+
+    Driver precedence: an explicit `driver=` argument (tests) > the case's own
+    `driver` (a case measuring a non-loop path) > the default loop driver.
+    """
     results: list[EvalResult] = []
     for case in cases:
+        run = driver or case.driver or chat_loop_driver
         results.append(await _run_one(case, run))
     return EvalReport(results=results, tier=tier)
 
@@ -126,6 +135,23 @@ async def chat_loop_driver(workspace: Path, case: EvalCase) -> str:
     loop = AgentChatLoop(workspace, tools=tools, long_running=case.long_running)
     result = await loop.run(case.prompt)
     return result.final
+
+
+async def planning_driver(workspace: Path, case: EvalCase) -> str:
+    """Drive the real planner and return the plan markdown for scoring.
+
+    Planning never goes through the agent loop, so the default driver cannot
+    measure it - which is exactly why plan quality shipped unmeasured while the
+    planner was the one model output still spliced raw into a coder's prompt.
+    """
+    from shamsu.agents.plan_mode import PlanningWorkflow
+    from shamsu.cli.repl import _build_search_agent
+    from shamsu.llm.manager import LLMManager
+
+    search, _uses_real_index = _build_search_agent(workspace, None)
+    workflow = PlanningWorkflow(workspace, llm=LLMManager(), search=search)
+    plan = await workflow.run(case.prompt, route="code_edit")
+    return plan.markdown
 
 
 def render_report(report: EvalReport) -> str:
