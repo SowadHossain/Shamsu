@@ -300,3 +300,20 @@ async def test_a_flaky_case_reports_the_failing_attempt_not_the_passing_one():
     report = await run_evals([case], driver=_scripted_driver([True, False, True]), samples=3)
 
     assert report.results[0].final == "bad"
+
+
+def test_entrypoint_activates_the_tier_from_the_env(monkeypatch):
+    """`python -m evals` must honor SHAMSU_MODEL_TIER (gap I3). The original
+    entrypoint only READ active_tier() - a module global nothing in the eval
+    process had initialized - so a "light baseline" silently ran (and was
+    labeled) default. _resolve_tier must initialize, not just report."""
+    import shamsu.runtime.models as models
+    from evals.__main__ import _resolve_tier
+
+    # setattr-to-current-value registers teardown restoration of the global
+    # that _resolve_tier is about to mutate.
+    monkeypatch.setattr(models, "_ACTIVE_TIER", models._ACTIVE_TIER)
+    monkeypatch.setenv("SHAMSU_MODEL_TIER", "light")
+
+    assert _resolve_tier() == "light"
+    assert models.active_tier().value == "light"

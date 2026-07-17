@@ -8,6 +8,8 @@
 
 This is the successor to `SHAMSU_reliability_system_design.md`. All 13 of that doc's gaps are landed to at least a safe, tested baseline (G7's structural trim deferred behind a characterization net). This doc is what's left — and what the reliability work newly exposed.
 
+> **End state, 2026-07-17:** all 27 entries (26 original + K1, found while fixing) are ✅/◑/deferred-with-reason — none merely open. Suite ~1255 passed / 0 failed; default-tier evals 12 cases × 3 samples with the two grounding cases and both flakiness-driven cases (bugfix, rename) at 3/3. The only ◑ remainders are explicitly scoped: J4 (route recorded but full state-resume rides on future work) and I3's light/heavy-tier baselines (light measured this date — see `BENCHMARK-light.md`; heavy needs a 14B pull). Everything landed on branch `fix/routing-planning-cot`.
+
 ---
 
 ## Severity summary
@@ -208,7 +210,9 @@ The loop's full toolset (`tools/agent_tools.py`): `list_files`, `read_file`, `gr
 
 > **Sampling landed.** `python -m evals --samples N` runs every case N times and scores by **majority**, so one unlucky roll can't condemn a good change and one lucky roll can't bless a bad one. `EvalResult` carries `passes`/`runs`; the status column reads `PASS 2/3`. Crucially the report now **calls out flaky cases by name** ("passed some attempts and failed others on the SAME code — do not read a delta from them") — a silent `2/3` reads like a solid pass, which is exactly how a noisy harness lies to you. A single-sample run prints its own warning in the header. With `samples=1` everything collapses to the previous behavior, so nothing else changed. Tests: `tests/test_evals_harness.py` (18).
 >
-> **Still open:** the light/heavy tiers have never been baselined at all (3B models are far more salvage-dependent, so a light-tier regression is invisible today), and nothing enforces `--samples 3` for a baseline — it is a convention, not a gate.
+> **Still open:** the heavy tier has never been baselined (needs `qwen2.5-coder:14b` + `mistral-nemo:12b` pulled), and nothing enforces `--samples 3` for a baseline — it is a convention, not a gate.
+>
+> **Tier bug found + fixed while baselining (2026-07-17):** `SHAMSU_MODEL_TIER=light python -m evals` silently ran the **default** tier. The entrypoint read `active_tier()` — a module global that only `initialize_model_tier()` (called by the REPL, never by the eval process) populates from the env. The "light baseline" was a mislabeled default-tier rerun; the only tell was the report header. `_resolve_tier` in `evals/__main__.py` now initializes exactly like the REPL, with a regression test (`test_entrypoint_activates_the_tier_from_the_env`). Classic instance of this doc's own lesson: the env flag *looked* wired because the command accepted it.
 
 **Found by using the harness in anger.** Each case runs ONCE against a stochastic local 7B, and the PASS/FAIL is reported as if deterministic. It is not: re-running `bugfix_syntax_error` on one unchanged commit gave PASS / FAIL / PASS, and the same commit scores 8/10 or 9/10 on the roll. A run that looked like a 2-case regression from the J6 change turned out to be noise — verified by re-running the cases, not by reasoning about them.
 

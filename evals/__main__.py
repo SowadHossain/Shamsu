@@ -15,11 +15,18 @@ from evals.cases import SEED_CASES
 from evals.harness import run_evals
 
 
-def _tier_label() -> str:
-    try:
-        from shamsu.runtime.models import active_tier
+def _resolve_tier() -> str:
+    """Resolve and ACTIVATE the model tier before any case runs.
 
-        return str(getattr(active_tier(), "value", active_tier()))
+    ``python -m evals`` must honor SHAMSU_MODEL_TIER exactly like the REPL
+    does. Reading ``active_tier()`` alone is a trap: it returns a module
+    global that nothing in this process has initialized, so the run silently
+    uses (and reports) the default tier no matter what the env says.
+    """
+    try:
+        from shamsu.runtime.models import initialize_model_tier
+
+        return str(initialize_model_tier(Path.cwd()).value)
     except Exception:
         return "(unknown)"
 
@@ -32,7 +39,7 @@ async def _amain(args: argparse.Namespace) -> int:
         if not cases:
             print(f"No cases matched {sorted(wanted)}. Known: {[c.name for c in SEED_CASES]}")
             return 2
-    report = await run_evals(cases, tier=_tier_label(), samples=args.samples)
+    report = await run_evals(cases, tier=_resolve_tier(), samples=args.samples)
     text = report.render()
     print(text)
     if args.out:
