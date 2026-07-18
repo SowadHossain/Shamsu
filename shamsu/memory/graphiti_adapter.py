@@ -34,6 +34,10 @@ _LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "[::1]"}
 
 # Documented upstream quickstart: https://github.com/getzep/graphiti
 # `docker run -p 6379:6379 -p 3000:3000 -it --rm falkordb/falkordb:latest`
+# We only publish 6379 (the graph DB) — the upstream quickstart also maps 3000
+# for FalkorDB's browser UI, which SHAMSU never connects to. Publishing 3000
+# needlessly collided with any dev server already on that very common port and
+# wedged the whole container start (see _start_local_falkordb).
 # Run detached and named so `/memory setup`/`repair` can find and reuse it.
 FALKORDB_CONTAINER_NAME = "shamsu-graphiti-falkordb"
 FALKORDB_IMAGE = "falkordb/falkordb:latest"
@@ -372,7 +376,7 @@ class GraphitiAdapter:
                 self._wait_for_local_port(6379, timeout=10.0)
                 return {"ok": True, "message": "Started existing local FalkorDB container."}
             run = subprocess.run(
-                [docker, "run", "-d", "--name", FALKORDB_CONTAINER_NAME, "-p", "6379:6379", "-p", "3000:3000", FALKORDB_IMAGE],
+                [docker, "run", "-d", "--name", FALKORDB_CONTAINER_NAME, "-p", "6379:6379", FALKORDB_IMAGE],
                 capture_output=True, text=True, timeout=DOCKER_TIMEOUT_SECONDS, creationflags=_no_window_flags(),
             )
             if run.returncode != 0:

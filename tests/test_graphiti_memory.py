@@ -312,10 +312,13 @@ def test_start_local_falkordb_uses_documented_docker_run_command(tmp_path):
 
     assert result["ok"] is True
     run_call = next(cmd for cmd in calls if cmd[1] == "run")
+    # Only 6379 (the graph DB) is published; we deliberately do NOT map 3000
+    # (FalkorDB's unused browser UI) so it can't collide with a dev server.
     assert run_call == [
         "docker", "run", "-d", "--name", "shamsu-graphiti-falkordb",
-        "-p", "6379:6379", "-p", "3000:3000", FALKORDB_IMAGE,
+        "-p", "6379:6379", FALKORDB_IMAGE,
     ]
+    assert "3000:3000" not in run_call
 
 
 def test_start_local_falkordb_reuses_existing_stopped_container(tmp_path):
