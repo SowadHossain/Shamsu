@@ -3584,6 +3584,16 @@ async def _handle_request(
         agent_result.action if agent_result.handled
         else _classify_route_label(effective_input, workspace)
     ) or "agent-chat"
+    # Pure small talk ("hey how are you", "thanks") that matched no specific
+    # route must NOT reach the task router - there it becomes a "QA task" with a
+    # fabricated plan and a "proceed?" prompt. Only override the fallthrough
+    # catch-all, so a real question that fell through to qa is untouched.
+    if (
+        not agent_result.handled
+        and route_label == ROUTE_FALLTHROUGH
+        and _is_conversational_prompt(effective_input)
+    ):
+        route_label = "general_chat"
     if session_logger is not None:
         try:
             session_logger.set_last_route({"route": route_label, "handled": agent_result.handled})
@@ -3609,6 +3619,19 @@ async def _handle_request(
     # second, hand-maintained copy of them, which is how the trace ended up
     # reporting a route that never ran (gap B2). Now the label IS the decision,
     # so `last_route` and the audit trail cannot disagree with reality.
+    if route_label == "general_chat":
+        # A lightweight, single-shot conversational reply: no workspace scan, no
+        # planner, no task handoff, no tools. This is what a greeting or a bit of
+        # small talk should get.
+        await _run_general_chat(
+            effective_input,
+            console,
+            _make_llm_manager(session_logger, console, workspace),
+            extra_context=agent_context,
+            session_logger=session_logger,
+            thinking_status=thinking_status,
+        )
+        return
     if route_label == "prd_summary":
         await _handle_prd_summary_request(
             effective_input,
@@ -7494,6 +7517,53 @@ def _is_casual_prompt(user_input: str) -> bool:
         "thx",
         "ty",
     }
+
+
+# Broadened small-talk detector. `_is_casual_prompt` only matches a bare single
+# greeting ("hey"), so multi-word small talk ("hey how are you") slipped past it
+# into the task router and came back as a "QA task" with a fabricated plan. A
+# greeting token is stripped so "hey how are you" reduces to "how are you"; the
+# REMAINDER must itself be small talk, so "hey, fix the login bug" is NOT caught.
+_GREETING_TOKENS = frozenset(
+    {"hi", "hello", "hey", "yo", "sup", "hiya", "heya", "howdy", "greetings", "hola"}
+)
+
+_SOCIAL_SMALL_TALK = frozenset(
+    {
+        "how are you", "how are you doing", "how are you doing today",
+        "how are you today", "how r you", "how r u", "how are u", "how you doing",
+        "how ya doing", "how is it going", "hows it going", "hows it going today",
+        "how are things", "hows things", "how is everything", "hows everything",
+        "hows life", "how is your day", "hows your day", "hows your day going",
+        "whats up", "what is up", "whats good", "whats new", "how do you do",
+        "how have you been", "you good", "are you ok", "are you okay",
+        "good morning", "good afternoon", "good evening", "good day",
+        "there",  # trailing token for "hey there"
+    }
+)
+
+
+def _is_conversational_prompt(user_input: str) -> bool:
+    """True for pure small talk - a greeting, acknowledgement, or social
+    "how are you" opener that is the ENTIRE message. A greeting followed by an
+    actual request ("hey, fix the login bug") is NOT conversational: only the
+    leading greeting token is stripped and what remains must itself be small
+    talk. Deliberately tighter than `_is_general_chat_prompt` (which is a broad
+    "no project markers" test that also matches real questions like "explain
+    the caching") so it can safely short-circuit straight to general chat."""
+    if _is_casual_prompt(user_input):
+        return True
+    text = re.sub(r"[^\w\s]", "", user_input.lower())
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return False
+    if text in _SOCIAL_SMALL_TALK:
+        return True
+    tokens = text.split()
+    if tokens and tokens[0] in _GREETING_TOKENS:
+        rest = " ".join(tokens[1:]).strip()
+        return rest == "" or rest in _SOCIAL_SMALL_TALK
+    return False
 
 
 def _is_general_chat_prompt(user_input: str) -> bool:

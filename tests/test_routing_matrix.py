@@ -139,7 +139,12 @@ def test_every_dispatch_branch_has_a_rule():
     dispatcher = inspect.getsource(_handle_request)
     handled = set(re.findall(r'route_label == "([^"]+)"', dispatcher))
     labels = {label for label, _ in _ROUTE_RULES}
-    orphans = handled - labels
+    # A few labels are assigned by _handle_request itself, not by a _ROUTE_RULES
+    # detector - e.g. "general_chat", set when a prompt is pure small talk that
+    # matched no rule. Those are reachable, so require the dispatcher to actually
+    # assign them somewhere; they just don't come from the rules table.
+    override_labels = set(re.findall(r'route_label = "([^"]+)"', dispatcher))
+    orphans = handled - labels - override_labels
     assert not orphans, f"_handle_request branches unreachable from _ROUTE_RULES: {orphans}"
 
 

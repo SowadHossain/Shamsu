@@ -124,19 +124,28 @@ def test_repl_request_uses_codebase_memory_context_when_healthy(monkeypatch, tmp
     assert "stub/example.py" not in rendered
 
 
-def test_repl_greeting_uses_agent_chat_when_codebase_memory_is_unavailable(monkeypatch, tmp_path):
+def test_repl_greeting_routes_to_general_chat(monkeypatch, tmp_path):
+    """A bare greeting is pure small talk: it gets a lightweight conversational
+    reply, never the agent loop / task router (which used to answer "hi" with a
+    "QA task" and a fabricated plan). Also asserts no routing jargon leaks."""
     console, output = _console_output()
     web_tool, browser_tool = _tools(tmp_path)
 
-    class FakeAgentChatLoop:
-        def __init__(self, workspace, session_logger=None, tools=None, long_running=False, on_activity=None, progress=None, action_ledger=None):
-            assert workspace == tmp_path
+    async def _fake_general_chat(user_input, console, llm, **kwargs):
+        assert user_input == "hi"
+        console.print("Hey, I am here.")
+
+    monkeypatch.setattr(repl, "_run_general_chat", _fake_general_chat)
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *a, **k: object())
+
+    class _BoomLoop:
+        def __init__(self, *a, **k):
+            pass
 
         async def run(self, user_input):
-            assert user_input == "hi"
-            return type("Result", (), {"final": "Hey, I am here.", "stopped": False})()
+            raise AssertionError("a greeting must not reach the agent loop")
 
-    monkeypatch.setattr(repl, "AgentChatLoop", FakeAgentChatLoop)
+    monkeypatch.setattr(repl, "AgentChatLoop", _BoomLoop)
 
     asyncio.run(_handle_request("hi", tmp_path, console, web_tool, browser_tool))
 

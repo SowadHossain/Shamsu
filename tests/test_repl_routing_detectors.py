@@ -15,6 +15,7 @@ import pytest
 from shamsu.cli.repl import (
     _classify_route_label,
     _extract_prd_path_from_prompt,
+    _is_conversational_prompt,
     _looks_like_capabilities_question,
     _looks_like_code_edit_request,
     _looks_like_direct_code_request,
@@ -27,6 +28,41 @@ from shamsu.cli.repl import (
     _looks_like_workspace_location_prompt,
     _looks_like_workspace_prd_request,
 )
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        # Pure small talk -> conversational (must reach general chat, not the
+        # task router that turned "hey how are you" into a "QA task" + plan).
+        ("hey how are you", True),
+        ("hi", True),
+        ("hello there", True),
+        ("hey there", True),
+        ("thanks", True),
+        ("thank you", True),
+        ("how are you", True),
+        ("how are you doing today", True),
+        ("whats up", True),
+        ("how's it going?", True),
+        ("good morning", True),
+        ("yo", True),
+        # A greeting followed by a real request is NOT small talk: only the
+        # greeting token is stripped and the remainder must itself be small talk.
+        ("hey, fix the login bug", False),
+        # Real questions/work must never be swallowed as chit-chat. In
+        # particular "explain the caching" is where the broad
+        # `_is_general_chat_prompt` (no project markers) would wrongly fire.
+        ("explain the caching", False),
+        ("how does auth work", False),
+        ("whats the weather today", False),
+        ("fix the login bug", False),
+        ("how do I run the tests", False),
+        ("write python for the first 100 primes", False),
+    ],
+)
+def test_is_conversational_prompt(text, expected):
+    assert _is_conversational_prompt(text) is expected
 
 
 @pytest.mark.parametrize(
