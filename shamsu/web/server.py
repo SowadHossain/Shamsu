@@ -19,6 +19,8 @@ from shamsu.runtime.models import active_tier, model_for_role
 from shamsu.runtime.ollama import collect_status
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_CHARS = 200_000
 
 
 def repo_root() -> Path:
@@ -62,15 +64,42 @@ def clean_terminal_output(text: str) -> str:
     return "\n".join(trimmed).strip()
 
 
-def run_prompt(prompt: str, workspace: Path, timeout: int) -> dict[str, Any]:
+def build_prompt(prompt: str, attachments: list[dict[str, Any]]) -> str:
+    if not attachments:
+        return prompt
+    # Slash commands are parsed by the REPL only when the command is the whole
+    # input. Appending attachment text would turn them into natural prompts.
+    if prompt.lstrip().startswith("/"):
+        return prompt
+    parts = [prompt or "Review the attached file content."]
+    parts.append("")
+    parts.append("Attached files shared from the SHAMSU Web UI:")
+    for attachment in attachments[:MAX_ATTACHMENTS]:
+        name = str(attachment.get("name") or "untitled")
+        content = str(attachment.get("content") or "")
+        if len(content) > MAX_ATTACHMENT_CHARS:
+            content = content[:MAX_ATTACHMENT_CHARS] + "\n[Attachment truncated by SHAMSU Web UI]"
+        parts.extend(
+            [
+                "",
+                f"--- BEGIN ATTACHED FILE: {name} ---",
+                content,
+                f"--- END ATTACHED FILE: {name} ---",
+            ]
+        )
+    return "\n".join(parts).strip()
+
+
+def run_prompt(prompt: str, workspace: Path, timeout: int, attachments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     env = os.environ.copy()
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
     command = [sys.executable, "-m", "shamsu.cli.repl", "--workspace", str(workspace)]
+    full_prompt = build_prompt(prompt, attachments or [])
     try:
         completed = subprocess.run(
             command,
-            input=f"{prompt}\nexit\n",
+            input=f"{full_prompt}\nexit\n",
             cwd=repo_root(),
             text=True,
             encoding="utf-8",
@@ -137,10 +166,11 @@ class ShamsuWebHandler(SimpleHTTPRequestHandler):
             self._send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         prompt = str(payload.get("prompt") or "").strip()
-        if not prompt:
+        attachments = self._validated_attachments(payload.get("attachments"))
+        if not prompt and not attachments:
             self._send_json({"ok": False, "error": "Prompt is required."}, HTTPStatus.BAD_REQUEST)
             return
-        self._send_json(run_prompt(prompt, self.workspace, self.prompt_timeout))
+        self._send_json(run_prompt(prompt, self.workspace, self.prompt_timeout, attachments))
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length") or "0")
@@ -154,6 +184,27 @@ class ShamsuWebHandler(SimpleHTTPRequestHandler):
         if not isinstance(parsed, dict):
             raise ValueError("JSON body must be an object.")
         return parsed
+
+    def _validated_attachments(self, raw: Any) -> list[dict[str, Any]]:
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise ValueError("attachments must be a list.")
+        attachments: list[dict[str, Any]] = []
+        for item in raw[:MAX_ATTACHMENTS]:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "untitled")[:180]
+            content = str(item.get("content") or "")
+            attachments.append(
+                {
+                    "name": name,
+                    "type": str(item.get("type") or ""),
+                    "size": int(item.get("size") or 0),
+                    "content": content[:MAX_ATTACHMENT_CHARS],
+                }
+            )
+        return attachments
 
     def _status_payload(self) -> dict[str, Any]:
         try:

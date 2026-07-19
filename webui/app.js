@@ -2,6 +2,11 @@ const messages = document.querySelector("#messages");
 const promptInput = document.querySelector("#prompt");
 const composer = document.querySelector("#composer");
 const themeToggle = document.querySelector("#themeToggle");
+const attachFileButton = document.querySelector("#attachFileButton");
+const fileInput = document.querySelector("#fileInput");
+const attachmentTray = document.querySelector("#attachmentTray");
+const attachments = [];
+const MAX_ATTACHMENT_BYTES = 200 * 1024;
 
 function addMessage(role, text) {
   const item = document.createElement("div");
@@ -34,14 +39,91 @@ function setComposerBusy(isBusy) {
   submit.disabled = isBusy;
   submit.textContent = isBusy ? "Sending..." : "Send";
   promptInput.disabled = isBusy;
+  if (attachFileButton) {
+    attachFileButton.disabled = isBusy;
+  }
 }
 
-async function sendPrompt(text) {
+function formatBytes(size) {
+  if (size < 1024) {
+    return `${size} B`;
+  }
+  if (size < 1024 * 1024) {
+    return `${(size / 1024).toFixed(1)} KB`;
+  }
+  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function renderAttachments() {
+  attachmentTray.innerHTML = "";
+  attachments.forEach((attachment, index) => {
+    const chip = document.createElement("div");
+    chip.className = "attachment-chip";
+
+    const name = document.createElement("span");
+    name.textContent = attachment.name;
+    name.title = attachment.name;
+
+    const size = document.createElement("small");
+    size.textContent = formatBytes(attachment.size);
+
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.setAttribute("aria-label", `Remove ${attachment.name}`);
+    remove.textContent = "x";
+    remove.addEventListener("click", () => {
+      attachments.splice(index, 1);
+      renderAttachments();
+    });
+
+    chip.append(name, size, remove);
+    attachmentTray.append(chip);
+  });
+}
+
+function readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(String(reader.result || "")));
+    reader.addEventListener("error", () => reject(reader.error || new Error("Could not read file.")));
+    reader.readAsText(file);
+  });
+}
+
+async function addFiles(fileList) {
+  const files = Array.from(fileList || []);
+  for (const file of files) {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      addMessage("assistant", `${file.name} is too large for web sharing right now. Limit: ${formatBytes(MAX_ATTACHMENT_BYTES)}.`);
+      continue;
+    }
+    const allowed = window.confirm(
+      `Allow SHAMSU to read and share "${file.name}" with this prompt?\n\nSize: ${formatBytes(file.size)}\nThis file content will be sent to the local SHAMSU backend only.`,
+    );
+    if (!allowed) {
+      continue;
+    }
+    try {
+      const content = await readFileAsText(file);
+      attachments.push({
+        name: file.name,
+        type: file.type || "text/plain",
+        size: file.size,
+        content,
+      });
+    } catch (error) {
+      addMessage("assistant", `Could not read ${file.name}: ${error.message}`);
+    }
+  }
+  renderAttachments();
+}
+
+async function sendPrompt(text, sharedFiles) {
   try {
     const response = await fetch("/api/prompt", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: text }),
+      body: JSON.stringify({ prompt: text, attachments: sharedFiles }),
     });
     const payload = await response.json();
     if (!response.ok || !payload.ok) {
@@ -107,18 +189,35 @@ document.querySelectorAll(".thread").forEach((button) => {
 composer.addEventListener("submit", (event) => {
   event.preventDefault();
   const text = promptInput.value.trim();
-  if (!text) {
+  if (!text && attachments.length === 0) {
     return;
   }
 
-  addMessage("user", text);
+  const sharedFiles = attachments.splice(0, attachments.length);
+  const attachmentSummary = sharedFiles.length
+    ? `\n\nAttached: ${sharedFiles.map((file) => file.name).join(", ")}`
+    : "";
+  addMessage("user", `${text || "Shared file(s) for review."}${attachmentSummary}`);
+  if (sharedFiles.length > 0 && text.startsWith("/")) {
+    addMessage("assistant", "Attached files are only included with natural prompts. Slash commands run exactly as typed.");
+  }
+  renderAttachments();
   promptInput.value = "";
   setComposerBusy(true);
-  sendPrompt(text)
+  sendPrompt(text, sharedFiles)
     .then((answer) => addMessage("assistant", answer))
     .catch((error) => addMessage("assistant", `Unexpected UI error: ${error.message}`))
     .finally(() => setComposerBusy(false));
 });
+
+if (attachFileButton && fileInput) {
+  attachFileButton.addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    addFiles(fileInput.files).finally(() => {
+      fileInput.value = "";
+    });
+  });
+}
 
 if (themeToggle) {
   themeToggle.addEventListener("click", () => {

@@ -155,8 +155,9 @@ local state are written under that workspace's `.shamsu/` folder.
 ### Run The Local Web UI Preview
 
 SHAMSU also includes a lightweight browser UI preview for local development.
-It is currently a static interface shell for the CLI workflow; backend command
-execution can be wired in a later feature slice.
+It includes a local backend bridge for sending prompts to the SHAMSU CLI. The
+file share control asks for browser permission before reading selected files and
+sends approved text attachments only to the local backend.
 
 Windows:
 

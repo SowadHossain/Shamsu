@@ -382,6 +382,52 @@ textarea:focus {
   border-color: rgba(93, 211, 158, 0.65);
 }
 
+.attachment-tray {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 0;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-2) 82%, var(--bg));
+  color: var(--text);
+  padding: 7px 8px 7px 11px;
+  font-size: 13px;
+}
+
+.attachment-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-chip small {
+  color: var(--muted);
+}
+
+.attachment-chip button {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.attachment-chip button:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
 .action-list button {
   min-height: 42px;
   padding: 0 12px;

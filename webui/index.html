@@ -117,8 +117,10 @@
             <form class="composer" id="composer">
               <label for="prompt">Prompt</label>
               <textarea id="prompt" rows="4" placeholder="Ask Shamsu to edit files, explain code, run tests, or inspect a localhost app..."></textarea>
+              <input id="fileInput" type="file" multiple hidden />
+              <div class="attachment-tray" id="attachmentTray" aria-live="polite"></div>
               <div class="composer-actions">
-                <button type="button" class="ghost-button" data-command="Attach a file">Attach file</button>
+                <button type="button" class="ghost-button" id="attachFileButton">Attach file</button>
                 <button type="button" class="ghost-button" data-command="Plan before editing">Plan first</button>
                 <button type="submit" class="solid-button">Send</button>
               </div>
@@ -155,6 +157,6 @@
         </section>
       </main>
     </div>
-    <script src="./app.js?v=20260716-2"></script>
+    <script src="./app.js?v=20260719-1"></script>
   </body>
 </html>
