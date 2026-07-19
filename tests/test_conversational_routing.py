@@ -34,15 +34,20 @@ class _UnhandledOrchestrator:
         )
 
 
-def _wire_dispatch(monkeypatch) -> dict[str, str]:
+def _wire_dispatch(monkeypatch) -> dict[str, object]:
     """Route a greeting through _handle_request with every heavy destination
     replaced: general chat records the call; the task-router paths explode."""
-    recorded: dict[str, str] = {}
+    recorded: dict[str, object] = {}
     monkeypatch.setattr(repl, "AgentOrchestrator", _UnhandledOrchestrator)
-    monkeypatch.setattr(repl, "_make_llm_manager", lambda *a, **k: object())
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *a, **k: k.get("lightweight", False))
 
     async def _fake_general_chat(user_input, console, llm, **kwargs):
         recorded["general_chat"] = user_input
+        recorded["kwargs"] = kwargs
+        # llm here is the return of the patched _make_llm_manager, which echoes
+        # the lightweight flag - so we can assert small talk used a lightweight
+        # manager (no ctx indicator / reasoning dump).
+        recorded["lightweight"] = llm
 
     monkeypatch.setattr(repl, "_run_general_chat", _fake_general_chat)
 
@@ -77,6 +82,24 @@ def test_greeting_routes_to_general_chat(tmp_path, monkeypatch):
     recorded = _wire_dispatch(monkeypatch)
     _dispatch("hey how are you", tmp_path)
     assert recorded.get("general_chat") == "hey how are you"
+    # Small talk must get a LIGHTWEIGHT manager and NO injected workspace
+    # context - injecting agent_context made the model narrate about files
+    # instead of just saying hi.
+    assert recorded.get("lightweight") is True
+    kwargs = recorded.get("kwargs") or {}
+    assert not kwargs.get("extra_context")
+
+
+def test_lightweight_manager_drops_indicator_and_reasoning_trace(tmp_path):
+    """The lightweight manager backing small talk has no budget indicator and no
+    reasoning-trace glimpse, so a greeting is one clean line. The normal manager
+    keeps the reasoning glimpse for real specialist answers (QA, planner, ...)."""
+    light = repl._make_llm_manager(None, _quiet_console(), tmp_path, lightweight=True)
+    assert light.budget_manager is None
+    assert light.on_thinking is None
+
+    heavy = repl._make_llm_manager(None, _quiet_console(), tmp_path)
+    assert heavy.on_thinking is not None
 
 
 def test_bare_acknowledgement_routes_to_general_chat(tmp_path, monkeypatch):

@@ -2991,9 +2991,18 @@ def _make_llm_manager(
     session_logger: SessionLogger | None,
     console: Console,
     workspace: Path | None = None,
+    *,
+    lightweight: bool = False,
 ) -> LLMManager:
+    """Build the specialist LLM manager. `lightweight=True` is for one-shot small
+    talk: it drops the context-budget indicator and the reasoning-trace glimpse,
+    so a greeting reply is a clean single line instead of a "ctx qa .../32.8k"
+    header followed by a "Reasoning:" dump - nobody wants a chain-of-thought
+    for "hi"."""
     lazy_progress = _LazyModelPullProgress(console)
-    budget_manager = _get_budget_manager(workspace, console) if workspace is not None else None
+    budget_manager = (
+        None if lightweight or workspace is None else _get_budget_manager(workspace, console)
+    )
     kwargs: dict[str, Any] = {
         "session_logger": session_logger,
         "model_pull_progress": lazy_progress.as_model_pull_progress(),
@@ -3004,7 +3013,7 @@ def _make_llm_manager(
     # Surface a reasoning model's chain-of-thought on the specialist path (QA,
     # PRD summary, planner, direct-code). The agent chat loop already shows its
     # own; without this, everything routed OUTSIDE the loop reasoned invisibly.
-    if workspace is not None and _call_accepts_keyword(LLMManager, "on_thinking"):
+    if not lightweight and workspace is not None and _call_accepts_keyword(LLMManager, "on_thinking"):
         kwargs["on_thinking"] = _make_thinking_reporter(console, session_logger, workspace)
     return LLMManager(**kwargs)
 
@@ -3621,13 +3630,16 @@ async def _handle_request(
     # so `last_route` and the audit trail cannot disagree with reality.
     if route_label == "general_chat":
         # A lightweight, single-shot conversational reply: no workspace scan, no
-        # planner, no task handoff, no tools. This is what a greeting or a bit of
-        # small talk should get.
+        # planner, no task handoff, no tools, and crucially NO injected workspace
+        # context. Passing agent_context (workspace root, file listing, recent
+        # turns) made the model narrate *about the context* - "the assistant has
+        # no specific action to take based on the user's message" - instead of
+        # just saying hi. The lightweight manager also drops the ctx indicator
+        # and the reasoning-trace glimpse, so a greeting is one clean line.
         await _run_general_chat(
             effective_input,
             console,
-            _make_llm_manager(session_logger, console, workspace),
-            extra_context=agent_context,
+            _make_llm_manager(session_logger, console, workspace, lightweight=True),
             session_logger=session_logger,
             thinking_status=thinking_status,
         )
@@ -7089,11 +7101,15 @@ async def _run_general_chat(
         specialist="qa",
         user_request=user_input,
         prd_context=(
-            "No indexed project context is attached. "
-            "Answer as a general local assistant. "
-            "Do not claim you saw code, tests, or files unless they were actually provided. "
+            "You are SHAMSU, a friendly AI coding assistant, talking with the user. "
+            "Reply directly and naturally in a sentence or two, the way a helpful "
+            "person would. Do NOT narrate your reasoning, do NOT describe yourself "
+            "in the third person, and do NOT mention context, tools, files, or tasks "
+            "unless the user asked about them. If the user greeted you or made small "
+            "talk, reply warmly and briefly and offer to help. Do not claim you saw "
+            "code, tests, or files that were not actually provided. "
             + NO_LIVE_TOOLS_NOTICE
-            + (f" {extra_context}" if extra_context else "")
+            + (f"\n\n{extra_context}" if extra_context else "")
         ),
     )
     if hasattr(llm, "run_specialist_stream"):
