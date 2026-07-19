@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>SHAMSU Web UI</title>
-    <link rel="stylesheet" href="./styles.css?v=20260716-2" />
+    <link rel="stylesheet" href="./styles.css?v=20260719-2" />
   </head>
   <body>
     <div class="app-shell">
@@ -157,6 +157,19 @@
         </section>
       </main>
     </div>
-    <script src="./app.js?v=20260719-1"></script>
+    <div class="permission-modal" id="permissionModal" hidden>
+      <div class="permission-dialog" role="dialog" aria-modal="true" aria-labelledby="permissionTitle">
+        <div>
+          <p class="eyebrow">File access request</p>
+          <h2 id="permissionTitle">Allow SHAMSU to read this file?</h2>
+          <p id="permissionDetails"></p>
+        </div>
+        <div class="permission-actions">
+          <button class="ghost-button" type="button" id="denyFileAccess">Deny</button>
+          <button class="solid-button" type="button" id="allowFileAccess">Allow file access</button>
+        </div>
+      </div>
+    </div>
+    <script src="./app.js?v=20260719-2"></script>
   </body>
 </html>

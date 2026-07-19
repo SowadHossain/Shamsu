@@ -5,8 +5,13 @@ const themeToggle = document.querySelector("#themeToggle");
 const attachFileButton = document.querySelector("#attachFileButton");
 const fileInput = document.querySelector("#fileInput");
 const attachmentTray = document.querySelector("#attachmentTray");
+const permissionModal = document.querySelector("#permissionModal");
+const permissionDetails = document.querySelector("#permissionDetails");
+const allowFileAccess = document.querySelector("#allowFileAccess");
+const denyFileAccess = document.querySelector("#denyFileAccess");
 const attachments = [];
 const MAX_ATTACHMENT_BYTES = 200 * 1024;
+let pendingPermissionResolve = null;
 
 function addMessage(role, text) {
   const item = document.createElement("div");
@@ -90,6 +95,24 @@ function readFileAsText(file) {
   });
 }
 
+function askFilePermission(file) {
+  return new Promise((resolve) => {
+    pendingPermissionResolve = resolve;
+    permissionDetails.textContent = `${file.name} (${formatBytes(file.size)}) will be read in your browser and sent only to the local SHAMSU backend with your next prompt.`;
+    permissionModal.hidden = false;
+    allowFileAccess.focus();
+  });
+}
+
+function closePermissionDialog(allowed) {
+  permissionModal.hidden = true;
+  if (pendingPermissionResolve) {
+    pendingPermissionResolve(allowed);
+    pendingPermissionResolve = null;
+  }
+  attachFileButton.focus();
+}
+
 async function addFiles(fileList) {
   const files = Array.from(fileList || []);
   for (const file of files) {
@@ -97,10 +120,9 @@ async function addFiles(fileList) {
       addMessage("assistant", `${file.name} is too large for web sharing right now. Limit: ${formatBytes(MAX_ATTACHMENT_BYTES)}.`);
       continue;
     }
-    const allowed = window.confirm(
-      `Allow SHAMSU to read and share "${file.name}" with this prompt?\n\nSize: ${formatBytes(file.size)}\nThis file content will be sent to the local SHAMSU backend only.`,
-    );
+    const allowed = await askFilePermission(file);
     if (!allowed) {
+      addMessage("assistant", `File access denied for ${file.name}.`);
       continue;
     }
     try {
@@ -216,6 +238,21 @@ if (attachFileButton && fileInput) {
     addFiles(fileInput.files).finally(() => {
       fileInput.value = "";
     });
+  });
+}
+
+if (allowFileAccess && denyFileAccess && permissionModal) {
+  allowFileAccess.addEventListener("click", () => closePermissionDialog(true));
+  denyFileAccess.addEventListener("click", () => closePermissionDialog(false));
+  permissionModal.addEventListener("click", (event) => {
+    if (event.target === permissionModal) {
+      closePermissionDialog(false);
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (!permissionModal.hidden && event.key === "Escape") {
+      closePermissionDialog(false);
+    }
   });
 }
 
