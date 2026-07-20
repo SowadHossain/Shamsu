@@ -5,7 +5,26 @@
 
 ---
 
+## Document Status
+
+**This is the specification, not a description of the shipped system.**
+
+- Written before implementation; most of it still holds as intent.
+- Sections marked **`[SPEC-ONLY]`** are not built.
+- Sections marked **`[UPDATED]`** were factually wrong against the code and have
+  been corrected in place.
+- Section 0 below maps every requirement group to what actually exists.
+- For behavior that is built but unreliable, read `CURRENT_STATE.md` — a
+  requirement can be implemented and still fail in practice.
+
+Conformance last verified against the code on **2026-07-20**, version `0.4.0b1`.
+When this file and the code disagree, the code wins and this file is the bug.
+
+---
+
 ## Table of Contents
+
+0. [Implementation Conformance](#0-implementation-conformance)
 
 1. [Project Identity](#1-project-identity)
 2. [Project Description](#2-project-description)
@@ -37,6 +56,88 @@
 28. [Future Scope](#28-future-scope)
 29. [Success Criteria](#29-success-criteria)
 30. [Glossary](#30-glossary)
+
+---
+
+# 0. Implementation Conformance
+
+Status key: **Done** = built and behaving · **Partial** = built, with a known
+gap or model-bounded quality · **Spec-only** = not built.
+
+## 0.1 Functional Requirements
+
+| Req | Status | Where / note |
+|---|---|---|
+| FR-1 CLI interface | Done | `shamsu/cli/repl.py`, launcher at `~/.shamsu/bin`, plus headless `shamsu run` |
+| FR-2 Project loading | Done | `--workspace`, `resolve_workspace()` |
+| FR-3 Workspace scope enforcement | Done | `shamsu/safety/` sandbox |
+| FR-4 Project indexing | Done | `indexer/walker.py`, SQLite + FTS5 |
+| FR-5 Ignore unnecessary folders | Done | walker ignore rules |
+| FR-6 Non-LLM code search | Done | FTS5 + re-ranking in `retriever/` |
+| FR-7 Codebase Q&A | Partial | works; slow on trivial reads (~20s), and routing sometimes lands in the wrong lane |
+| FR-8 Code explanation | Done | `agents/qa_workflow.py` |
+| FR-9 Code editing | Partial | `agents/code_edit_workflow.py`; diff quality is bounded by the coder model |
+| FR-10 Patch-based modification | Done | `patch/engine.py`, full-rewrite fallback on malformed diffs only |
+| FR-11 File creation | **Partial — known bug** | works via `write_file`, but simple creation prompts can misroute to the PRD build lane |
+| FR-12 File deletion protection | Done | `file_delete` is never auto-approvable |
+| FR-13 Bug fixing | Partial | `agents/bugfix_workflow.py` + traceback location parsing |
+| FR-14 Code audit | Done | `agents/audit_workflow.py` |
+| FR-15 Test generation | Done | `agents/test_generation_workflow.py` |
+| FR-16 Test execution | Done | `tools/executor.py` behind approval |
+| FR-17 Documentation generation | Done | `agents/doc_workflow.py` |
+| FR-18 PRD input | Done | Markdown, TXT, PDF |
+| FR-19 Non-LLM PRD parsing | Done | `prd/parser.py`, `prd/extractor.py` |
+| FR-20 PRD-to-project planning | Done | `prd/project.py`, preview + approval |
+| FR-21 Autonomous project generation | Partial | Django pipeline solid; template scaffolds disabled by default (`SHAMSU_ENABLE_TEMPLATES=1`) |
+| FR-22 Task decomposition | Done | `tasks/`, `taskmaster/`, plan mode |
+| FR-23 Progress tracking | Done | `MilestoneTask` at `.shamsu/tasks/<id>.json` |
+| FR-24 Resume support | Done | sessions + generation state + plan state |
+| FR-25 Natural prompt understanding | **Partial — weakest area** | `_ROUTE_RULES` in `cli/repl.py`; misroutes are the top open bug class |
+| FR-26 Tool calling | Done | `tools/agent_tools.py` + `llm/output.py` salvage for models without native tools |
+| FR-27 Git awareness | Done | `tools/git.py`, read-only inspect + gated mutations |
+| FR-28 Error handling | Done | `diagnostics/`, `repair/`, swallowed-error recording |
+
+## 0.2 Safety Requirements
+
+| Req | Status | Note |
+|---|---|---|
+| SR-1 Workspace sandbox | Done | |
+| SR-2 Sensitive path blocking | Done | |
+| SR-3 Dangerous command blocking | Done | |
+| SR-4 Command allowlist/denylist | Done | `safety/commands.py` |
+| SR-5 Confirmation for risky actions | **Partial — known bug** | approval machinery works, but "do not change files" is not enforced as a hard gate; under broad approval the agent has mutated files against an explicit read-only instruction |
+| SR-6 Patch preview | Done | `patch/preview.py` |
+| SR-7 Command preview | Done | |
+| SR-8 Secret detection | Done | redaction in logs, summaries, exports |
+| SR-9 No source code leakage | Done | |
+| SR-10 MCP safety | Spec-only | MCP itself is not built |
+| SR-11 Audit trail | Done | `action_ledger/` + `audit/`; every run writes a full artifact bundle |
+
+## 0.3 Non-Functional Requirements
+
+| Req | Status | Evidence |
+|---|---|---|
+| NFR-1 Low memory | Done | peak RSS 90.9 MB (`RELEASE_VALIDATION.md`) |
+| NFR-2 Offline-first | Done | local Ollama only; web is opt-in and gated |
+| NFR-3 Local privacy | Done | |
+| NFR-4 Reasonable performance | Partial | startup 1.27s, warm answer 0.31s — but model-backed reads take ~20s |
+| NFR-5 Modularity | Done | 201 modules, package-per-concern |
+| NFR-6 Maintainability | Done | 1418 tests, ruff clean |
+| NFR-7 Reliability | **Not met yet** | 4 of 7 real dogfood prompts failed on 2026-07-20 |
+| NFR-8 Usability | Partial | |
+| NFR-9 Transparency | Done | run artifacts, `/runs`, `/run show`, decisions log |
+| NFR-10 Extensibility | Partial | registry + template system exists; MCP does not |
+
+## 0.4 Sections That Are Spec-Only
+
+- §22.1–22.2 **General MCP support** — not built. There is no MCP client, server,
+  or tool registry. Two *specific* external tools are integrated by shelling out
+  to their documented CLI mode, not over MCP transport:
+  `tools/codebase_memory.py` (codebase-memory-mcp) and `taskmaster/adapter.py`
+  (task-master). Both are optional and locally installed.
+- §22.3 **Skills system** — `shamsu/skills/` is an empty `__init__.py`. No skill
+  loading, discovery, or execution exists.
+- §28 **Future scope** — unchanged, all still future.
 
 ---
 
@@ -178,6 +279,11 @@ SHAMSU is designed for **sub-8GB devices**.
 - GPU: Optional
 - OS: Linux, macOS, or Windows
 - Runtime: Local LLM runtime such as llama.cpp or Ollama
+
+**`[UPDATED]`** As implemented, the runtime is **Ollama only**, on
+`localhost:11434`. llama.cpp is not wired up. Hardware maps to the three model
+tiers in §21.1: `light` for 8 GB CPU-only, `default` for the 8 GB cookbook,
+`heavy` for 16 GB+.
 
 ## 7.3 Design Constraints for Low Memory
 
@@ -1299,6 +1405,32 @@ Possible model roles:
 - Review model
 - Documentation model
 
+**`[UPDATED]` — as implemented (`shamsu/runtime/models.py`).** The role list
+collapsed into a **two-anchor** contract to minimize model swapping: every
+"thinking" role (router, qa, planner, classifier, review, docs, summarizer,
+chat) shares one anchor, and every "coding" role (coder, frontend, backend,
+tests, bugfix) shares the other. Three hardware tiers provide the anchors:
+
+| Tier | Thinking anchor | Coding anchor |
+|---|---|---|
+| `light` — 8 GB, CPU-only | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` |
+| `default` — 8 GB cookbook | `deepseek-r1:7b` | `qwen2.5-coder:7b-instruct` |
+| `heavy` — 16 GB+ | `mistral-nemo:12b` | `qwen2.5-coder:14b` |
+
+Notes:
+
+- `qwen3:8b` and `gemma3:4b` are **former** anchors — still recognized and
+  allowed for existing installs, never auto-pulled. Older docs naming either as
+  "the default" are stale.
+- Each `ModelSpec` carries capability flags (`supports_native_tools`,
+  `is_reasoning`). SHAMSU does not assume native tool-calling: models without it
+  get a prompt-level tool protocol, with `llm/output.py::parse_model_turn` as the
+  primary parser.
+- Active tier is process-global, persisted at `.shamsu/model_tier.json`, and
+  overridable with `SHAMSU_MODEL_TIER`. `SHAMSU_SINGLE_MODEL_MODE=1` routes every
+  role to the thinking anchor for zero-swap measurement.
+- Models are pulled lazily on first use, not eagerly at install.
+
 ## 21.2 Sequential Execution
 
 Models shall run sequentially.
@@ -1513,27 +1645,39 @@ The system shall store all data locally.
 
 # 27. MVP Scope
 
+**`[UPDATED]`** Every MVP item below is now implemented. Checked boxes mean the
+capability exists and is tested; the notes flag where it is not yet *reliable*.
+MVP scope is met; MVP quality is not — see `CURRENT_STATE.md`.
+
 The MVP version of SHAMSU shall include:
 
-1. CLI interface.
-2. Project folder loading.
-3. Workspace sandbox.
-4. Non-LLM project indexing.
-5. Search and retrieval.
-6. Smart context builder.
-7. Local small LLM integration.
-8. Markdown/TXT/PDF PRD parsing.
-9. Task planning from PRD.
-10. Code generation.
-11. File creation.
-12. Patch-based code editing.
-13. Patch preview and approval.
-14. Dangerous command blocking.
-15. Test command execution with approval.
-16. Progress logging.
-17. Basic documentation generation.
-18. Basic bug fixing.
-19. Basic code audit.
+1. [x] CLI interface. — interactive REPL plus headless `shamsu run`
+2. [x] Project folder loading.
+3. [x] Workspace sandbox.
+4. [x] Non-LLM project indexing. — incremental, SQLite + FTS5
+5. [x] Search and retrieval. — FTS5 with additive re-ranking
+6. [x] Smart context builder. — packing, truncation, token budgeting
+7. [x] Local small LLM integration. — three tiers, lazy pull
+8. [x] Markdown/TXT/PDF PRD parsing.
+9. [x] Task planning from PRD.
+10. [x] Code generation. — *quality bounded by the coder model*
+11. [x] File creation. — *known bug: simple creation prompts can misroute*
+12. [x] Patch-based code editing. — with full-rewrite fallback on malformed diffs
+13. [x] Patch preview and approval.
+14. [x] Dangerous command blocking.
+15. [x] Test command execution with approval.
+16. [x] Progress logging. — full per-run artifact bundle
+17. [x] Basic documentation generation.
+18. [x] Basic bug fixing.
+19. [x] Basic code audit.
+
+Beyond MVP and also built: sessions/resume, run inspection, mutation ledger with
+rollback, permission memory, autonomy mode, plan mode, web + browser tools,
+council mode, diagnostics/`doctor`, Django end-to-end generation, and an eval
+harness.
+
+The remaining gap to a usable release is **behavioral reliability**, not missing
+MVP features.
 
 ---
 

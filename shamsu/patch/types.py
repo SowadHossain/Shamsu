@@ -110,6 +110,7 @@ class VerificationOutcome:
 @dataclass
 class MutationResult:
     ok: bool
+    status: str = ""
     transaction_id: str = ""
     reason: str = ""
     touched_files: list[str] = field(default_factory=list)
@@ -120,6 +121,7 @@ class MutationResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
+            "status": self.status,
             "transaction_id": self.transaction_id,
             "reason": self.reason,
             "touched_files": self.touched_files,
@@ -127,6 +129,36 @@ class MutationResult:
             "verification": self.verification.to_dict() if self.verification else None,
             "rollback_available": self.rollback_available,
         }
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+def apply_diff_with_result(
+    patch_engine: Any,
+    diff_text: str,
+    workspace_root: Any,
+) -> MutationResult:
+    """Apply a diff without discarding a structured engine result.
+
+    Third-party and test patch engines may still implement the original boolean
+    interface, so keep that path working while preferring the richer contract.
+    """
+    apply_result = getattr(patch_engine, "apply_result", None)
+    if callable(apply_result):
+        result = apply_result(diff_text, workspace_root)
+        if isinstance(result, MutationResult):
+            return result
+
+    applied = bool(patch_engine.apply(diff_text, workspace_root))
+    last_result = getattr(patch_engine, "last_apply_result", None)
+    if isinstance(last_result, MutationResult):
+        return last_result
+    return MutationResult(
+        ok=applied,
+        status="applied" if applied else "apply_failed",
+        error="" if applied else "Patch engine returned failure without details.",
+    )
 
 
 def _require_str(payload: dict[str, Any], key: str, *, required: bool = True) -> str:

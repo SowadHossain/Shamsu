@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shamsu.indexer.policy import walk_workspace_files
+
 _SOURCE_EXTS = {".ts", ".tsx", ".js", ".jsx", ".py", ".html", ".css", ".vue", ".svelte"}
 _MAX_SOURCE_BYTES = 400_000
 _STOPWORDS = {
@@ -60,11 +62,11 @@ def _read_source(target: Path) -> str:
         return ""
     chunks: list[str] = []
     total = 0
-    for path in sorted(target.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in _SOURCE_EXTS:
-            continue
-        if "node_modules" in path.parts or ".shamsu" in path.parts:
-            continue
+    for path in walk_workspace_files(
+        target,
+        suffixes=_SOURCE_EXTS,
+        indexable_only=True,
+    ):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:

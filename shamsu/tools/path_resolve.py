@@ -15,32 +15,12 @@ from __future__ import annotations
 import os
 from pathlib import Path, PurePosixPath
 
+from shamsu.indexer.policy import DEFAULT_EXCLUDED_DIRS
+
 # Directories the file-discovery tools never descend into: version-control
 # metadata, virtualenvs, dependency trees, and build output. Kept broad so
 # find_file/grep_files stay fast on JS projects.
-_HEAVY_DIRS = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".shamsu",
-        "node_modules",
-        ".venv",
-        "venv",
-        "env",
-        "dist",
-        "build",
-        ".next",
-        ".nuxt",
-        ".cache",
-        ".turbo",
-        "__pycache__",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".mypy_cache",
-        "coverage",
-    }
-)
+_HEAVY_DIRS = DEFAULT_EXCLUDED_DIRS
 
 # Common web-app source roots. When a model asks for `src/App.tsx` but the file
 # actually lives under `client/src/App.tsx`, these prefixes let the resolver

@@ -27,6 +27,13 @@ Local models are stochastic. A case flagged flaky passed some attempts
 and failed others on identical code - treat its row as noise until
 re-measured with more samples. Compare baselines only at equal
 `--samples`; a delta that lives entirely inside the flaky set is no
-delta. Tier-specific findings (root causes of consistent failures)
-live in `agent context/SHAMSU_agent_gap_analysis.md` under I3.
+delta. Tier-specific findings and open behavioral bugs live in
+`agent context/CURRENT_STATE.md` (the former
+`SHAMSU_agent_gap_analysis.md` no longer exists).
+
+## Deterministic release metrics
+
+Harness startup, first-answer/task time, peak memory, log growth, and
+Python/Django/Node/React/mixed dogfood results are recorded separately in
+`RELEASE_VALIDATION.md` so model variance is not mixed with runtime reliability.
 

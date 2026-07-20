@@ -28,6 +28,20 @@ def test_sqlite_store_dedupes_identical(tmp_path: Path):
     assert second.get("deduped") is True
 
 
+def test_sqlite_store_dedupes_by_content_and_source_run(tmp_path: Path):
+    store = SQLiteMemoryStore(tmp_path / "m.db")
+    text = "Use the parser bounds check"
+
+    first = store.remember(text, "bug_lesson", {"source_run_id": "run-1"})
+    duplicate = store.remember(text, "bug_lesson", {"source_run_id": "run-1"})
+    another_source = store.remember(text, "bug_lesson", {"source_run_id": "run-2"})
+
+    assert first.get("memory_id")
+    assert duplicate.get("deduped") is True
+    assert another_source.get("deduped") is not True
+    assert len(store._all()) == 2
+
+
 def test_sqlite_store_forget(tmp_path: Path):
     store = SQLiteMemoryStore(tmp_path / "m.db")
     created = store.remember("remove this note", "user_preference")
@@ -54,3 +68,12 @@ def test_memory_service_runs_degraded_without_graphiti(tmp_path: Path):
     # forget routes to SQLite too.
     memory_id = service.fallback._all()[0].memory_id
     assert service.forget(memory_id)["ok"] is True
+
+
+def test_memory_status_separates_local_success_from_graphiti_health(tmp_path: Path):
+    status = MemoryService(tmp_path, adapter=UnhealthyAdapter()).status()
+
+    assert status.normal_mode_allowed is True
+    assert status.local_available is True
+    assert status.degraded is True
+    assert status.storage_mode == "local"

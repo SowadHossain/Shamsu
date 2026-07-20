@@ -13,7 +13,7 @@ from shamsu.abstract.service import AbstractService
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m shamsu.abstract.cli")
-    parser.add_argument("command", choices=["status", "setup", "repair"])
+    parser.add_argument("command", choices=["status", "setup", "repair", "build", "refresh"])
     parser.add_argument("--workspace", default=str(Path.cwd()))
     parser.add_argument("--json", action="store_true", dest="as_json")
     args = parser.parse_args(argv)
@@ -24,6 +24,12 @@ def main(argv: list[str] | None = None) -> int:
         ok = payload["normal_mode_allowed"]
     elif args.command == "setup":
         payload = service.setup()
+        ok = bool(payload.get("ok"))
+    elif args.command == "build":
+        payload = service.build()
+        ok = bool(payload.get("ok"))
+    elif args.command == "refresh":
+        payload = service.refresh()
         ok = bool(payload.get("ok"))
     else:
         payload = service.repair()

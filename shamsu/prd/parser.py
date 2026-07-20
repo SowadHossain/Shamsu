@@ -20,7 +20,65 @@ HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
 PLAIN_HEADING_RE = re.compile(
     r"^(?P<title>[A-Z][A-Za-z0-9 /&_-]{2,60})(?::)?$"
 )
+NUMBERED_HEADING_RE = re.compile(
+    r"^(?P<number>\d+(?:\.\d+)*)\.?\s+(?P<title>[A-Z][^.!?]{1,100})$"
+)
 LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+
+TOP_LEVEL_NUMBERED_HEADINGS = {
+    "product overview",
+    "product goals",
+    "target users",
+    "user roles",
+    "main user journey",
+    "functional requirements",
+    "user registration",
+    "user login",
+    "logout",
+    "authentication and authorization",
+    "dashboard",
+    "todo management",
+    "view tasks",
+    "update task",
+    "complete and reopen tasks",
+    "delete task",
+    "search",
+    "filtering",
+    "sorting",
+    "pagination",
+    "category management",
+    "user profile",
+    "account deletion",
+    "database requirements",
+    "database schema",
+    "backend api requirements",
+    "authentication api",
+    "user api",
+    "task api",
+    "category api",
+    "dashboard statistics api",
+    "frontend pages",
+    "navigation",
+    "user interface requirements",
+    "loading and empty states",
+    "error handling",
+    "security requirements",
+    "sqlite-specific requirements",
+    "data validation rules",
+    "date and time handling",
+    "accessibility requirements",
+    "responsive design requirements",
+    "performance requirements",
+    "audit and logging requirements",
+    "business rules",
+    "edge cases",
+    "testing requirements",
+    "acceptance criteria",
+    "initial release scope",
+    "out of scope for initial release",
+    "future enhancements",
+    "final product definition",
+}
 
 
 def _clean_line(line: str) -> str:
@@ -39,13 +97,17 @@ def parse_prd_text(
     raw_text: str,
     fallback_title: str = "PRD",
     markdown: bool = False,
+    line_pages: list[int] | None = None,
 ) -> ParsedPRD:
     title = fallback_title
     sections: dict[str, list[str]] = {}
     current_section = "Overview"
+    source_refs: dict[str, list[dict[str, int | str]]] = {}
+    last_top_level_number = 0
 
-    for raw_line in raw_text.splitlines():
+    for index, raw_line in enumerate(raw_text.splitlines()):
         line = raw_line.strip()
+        page = line_pages[index] if line_pages and index < len(line_pages) else 0
         if not line:
             continue
 
@@ -58,6 +120,16 @@ def parse_prd_text(
             else:
                 current_section = heading_text
                 sections.setdefault(current_section, [])
+                _add_source_ref(source_refs, current_section, page, "heading")
+            continue
+
+        numbered = _match_numbered_heading(line, last_top_level_number)
+        if not markdown and numbered:
+            if "." not in numbered.group("number"):
+                last_top_level_number = int(numbered.group("number"))
+            current_section = f"{numbered.group('number')} {numbered.group('title').strip()}"
+            sections.setdefault(current_section, [])
+            _add_source_ref(source_refs, current_section, page, "heading")
             continue
 
         if not markdown and _looks_like_plain_heading(line):
@@ -66,19 +138,31 @@ def parse_prd_text(
             else:
                 current_section = line.rstrip(":")
                 sections.setdefault(current_section, [])
+                _add_source_ref(source_refs, current_section, page, "heading")
+            continue
+
+        if (
+            not markdown
+            and title == fallback_title
+            and not sections
+            and PLAIN_HEADING_RE.match(line)
+            and line.lower() not in {"product requirements document", "product requirement document"}
+        ):
+            title = line.rstrip(":")
             continue
 
         cleaned = _clean_line(line)
         if cleaned:
             sections.setdefault(current_section, []).append(cleaned)
+            _add_source_ref(source_refs, current_section, page, "content")
 
-    return ParsedPRD(title=title, sections=sections, raw_text=raw_text)
+    return ParsedPRD(title=title, sections=sections, raw_text=raw_text, source_refs=source_refs)
 
 
 def _looks_like_plain_heading(line: str) -> bool:
     if line.endswith("."):
         return False
-    if len(line.split()) > 8:
+    if len(line.split()) > 7:
         return False
     known = {
         "overview",
@@ -93,9 +177,56 @@ def _looks_like_plain_heading(line: str) -> bool:
         "features",
         "requirements",
         "non functional requirements",
+        "product goals",
+        "target users",
+        "user roles",
+        "functional requirements",
+        "user registration",
+        "user login",
+        "authentication and authorization",
+        "todo management",
+        "category management",
+        "database requirements",
+        "database schema",
+        "backend api requirements",
+        "frontend pages",
+        "security requirements",
+        "testing requirements",
+        "acceptance criteria",
+        "initial release scope",
+        "out of scope for initial release",
+        "final product definition",
     }
     lowered = line.rstrip(":").lower()
-    return lowered in known or bool(PLAIN_HEADING_RE.match(line))
+    return lowered in known
+
+
+def _match_numbered_heading(
+    line: str,
+    last_top_level_number: int,
+) -> re.Match[str] | None:
+    match = NUMBERED_HEADING_RE.match(line)
+    if match is None:
+        return None
+    if "." in match.group("number"):
+        return match
+    title = match.group("title").strip().rstrip(":").lower()
+    if title in TOP_LEVEL_NUMBERED_HEADINGS and int(match.group("number")) > last_top_level_number:
+        return match
+    return None
+
+
+def _add_source_ref(
+    refs: dict[str, list[dict[str, int | str]]],
+    section: str,
+    page: int,
+    kind: str,
+) -> None:
+    if page <= 0:
+        return
+    item = {"page": page, "kind": kind}
+    if item not in refs.setdefault(section, []):
+        refs[section].append(item)
 
 
 def parse_markdown_prd(file_path: Path) -> ParsedPRD:

@@ -45,7 +45,149 @@ def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
             entity = _parse_entity_line(line)
             if entity is not None:
                 entities.append(entity)
+    table_entities = _extract_table_entities(parsed)
+    by_name = {entity.name.lower(): entity for entity in entities}
+    for entity in table_entities:
+        by_name[entity.name.lower()] = entity
+    return list(by_name.values())
+
+
+def _extract_table_entities(parsed: ParsedPRD) -> list[EntitySpec]:
+    table_entity_names: list[str] = []
+    for heading, refs in parsed.source_refs.items():
+        normalized = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip()
+        if not normalized.lower().endswith(" table"):
+            continue
+        name = normalized[:-6].strip()
+        if any(ref.get("kind") == "heading" for ref in refs):
+            table_entity_names.append(_to_pascal_case(_singularize(name)))
+
+    schema_tables = [
+        table
+        for table in parsed.tables
+        if table.get("rows")
+        and "field type requirements" in " ".join(
+            str(cell or "") for cell in table["rows"][0]
+        ).lower()
+    ]
+
+    entities: list[EntitySpec] = []
+    for entity_name, table in zip(table_entity_names, schema_tables, strict=False):
+        fields: list[EntityFieldSpec] = []
+        relationships: list[str] = []
+        for row in table.get("rows", []):
+            text = " ".join(str(cell or "").strip() for cell in row).strip()
+            field = _parse_schema_row(text)
+            if field is None:
+                continue
+            fields.append(field)
+            if field.django_type == "ForeignKey":
+                relationships.append(f"belongs_to:{field.kwargs.get('to', '')}")
+        _apply_schema_semantics(entity_name, fields, parsed)
+        if fields:
+            entities.append(EntitySpec(entity_name, fields, relationships))
     return entities
+
+
+def _apply_schema_semantics(
+    entity_name: str,
+    fields: list[EntityFieldSpec],
+    parsed: ParsedPRD,
+) -> None:
+    if entity_name != "Task":
+        return
+    choices_by_field = {
+        "status": _choices_from_section(parsed, "task status options"),
+        "priority": _choices_from_section(parsed, "priority options"),
+    }
+    for field in fields:
+        choices = choices_by_field.get(field.name, [])
+        if choices:
+            field.kwargs["choices"] = choices
+            field.kwargs["max_length"] = max(len(item) for item in choices)
+
+
+def _choices_from_section(parsed: ParsedPRD, section_name: str) -> list[str]:
+    choices: list[str] = []
+    for heading, lines in parsed.sections.items():
+        normalized = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).lower()
+        if normalized != section_name:
+            continue
+        for line in lines:
+            value = line.strip().lstrip("-*+• ").strip()
+            if re.fullmatch(r"[a-z][a-z0-9_ -]{0,30}", value, re.IGNORECASE):
+                choices.append(value.lower().replace(" ", "_"))
+    return choices
+
+
+def _parse_schema_row(row: str) -> EntityFieldSpec | None:
+    match = re.match(
+        r"^(?P<name>[A-Za-z][A-Za-z0-9_]*)\s+"
+        r"(?P<type>Boolean/Integer|DateTime|Integer|Text)\s+"
+        r"(?P<requirements>.+)$",
+        row,
+        re.IGNORECASE,
+    )
+    if not match or match.group("name").lower() == "id":
+        return None
+    name = match.group("name").lower()
+    raw_type = match.group("type").lower()
+    requirements = match.group("requirements").lower()
+    optional = "optional" in requirements
+    kwargs: dict[str, object] = {}
+
+    relation = re.search(r"foreign key to\s+([a-z][a-z0-9_]*)", requirements)
+    if relation:
+        target = _to_pascal_case(_singularize(relation.group(1)))
+        kwargs = {
+            "to": target,
+            "on_delete": "SET_NULL" if optional else "CASCADE",
+        }
+        if optional:
+            kwargs.update({"null": True, "blank": True})
+        return EntityFieldSpec(name=name.removesuffix("_id"), django_type="ForeignKey", kwargs=kwargs)
+
+    if raw_type == "datetime":
+        if name == "created_at":
+            kwargs["auto_now_add"] = True
+        elif name == "updated_at":
+            kwargs["auto_now"] = True
+        elif optional:
+            kwargs.update({"null": True, "blank": True})
+        return EntityFieldSpec(name=name, django_type="DateTimeField", kwargs=kwargs)
+
+    if raw_type == "boolean/integer":
+        kwargs["default"] = "default true" in requirements
+        return EntityFieldSpec(name=name, django_type="BooleanField", kwargs=kwargs)
+
+    if raw_type == "integer":
+        django_type = "IntegerField"
+    elif name == "email":
+        django_type = "EmailField"
+    elif name in {"description"}:
+        django_type = "TextField"
+    else:
+        django_type = "CharField"
+        length = re.search(r"maximum\s+([\d,]+)\s+characters", requirements)
+        kwargs["max_length"] = int(length.group(1).replace(",", "")) if length else 200
+
+    if optional:
+        kwargs.update({"null": True, "blank": True})
+    if "unique" in requirements:
+        kwargs["unique"] = True
+    default = re.search(r"default\s+([a-z0-9_]+)", requirements)
+    if default:
+        kwargs["default"] = default.group(1)
+    return EntityFieldSpec(name=name, django_type=django_type, kwargs=kwargs)
+
+
+def _singularize(name: str) -> str:
+    lowered = name.lower()
+    if lowered.endswith("ies"):
+        return f"{name[:-3]}y"
+    if lowered.endswith("s"):
+        return name[:-1]
+    return name
 
 
 def _parse_entity_line(line: str) -> EntitySpec | None:

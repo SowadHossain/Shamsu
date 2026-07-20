@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pdfplumber
 
+from shamsu.prd.document import normalize_pdf_pages
 from shamsu.prd.parser import MarkdownPRDParser, parse_prd_text
 from shamsu.types import ParsedPRD
 
@@ -46,20 +47,39 @@ class PRDInputParser:
         path = Path(file_path)
         suffix = path.suffix.lower()
         if suffix in {".md", ".markdown"}:
-            return MarkdownPRDParser().parse(path)
+            parsed = MarkdownPRDParser().parse(path)
+            parsed.source_path = str(path.resolve())
+            parsed.source_kind = "markdown"
+            return parsed
         if suffix == ".txt":
             raw_text = path.read_text(encoding="utf-8")
-            return parse_prd_text(raw_text, fallback_title=path.stem)
+            parsed = parse_prd_text(raw_text, fallback_title=path.stem)
+            parsed.source_path = str(path.resolve())
+            parsed.source_kind = "text"
+            return parsed
         if suffix == ".pdf":
-            return parse_prd_text(_extract_pdf_text(path), fallback_title=path.stem)
+            document = _extract_pdf_document(path)
+            parsed = parse_prd_text(
+                document.text,
+                fallback_title=path.stem,
+                line_pages=document.line_pages,
+            )
+            parsed.source_path = str(path.resolve())
+            parsed.source_kind = "pdf"
+            parsed.tables = document.tables
+            parsed.extraction_confidence = document.confidence
+            parsed.extraction_warnings = document.warnings
+            parsed.title = _product_name(parsed) or parsed.title
+            return parsed
         supported = ", ".join(sorted(SUPPORTED_PRD_EXTENSIONS))
         raise PRDParseError(f"Unsupported PRD file type '{suffix}'. Supported: {supported}")
 
 
-def _extract_pdf_text(path: Path) -> str:
+def _extract_pdf_document(path: Path):
     try:
         with pdfplumber.open(path) as pdf:
             page_text = [(page.extract_text() or "").strip() for page in pdf.pages]
+            tables = _extract_pdf_tables(pdf.pages)
     except Exception as exc:  # pdfplumber exposes backend-specific exceptions.
         raise PRDParseError(f"Could not read PDF PRD: {exc}") from exc
 
@@ -69,7 +89,38 @@ def _extract_pdf_text(path: Path) -> str:
             "Could not extract text from PDF PRD. The file may be empty, encrypted, "
             "unreadable, or image-only."
         )
-    return raw_text
+    return normalize_pdf_pages(page_text, tables)
+
+
+def _extract_pdf_text(path: Path) -> str:
+    """Backward-compatible normalized text helper."""
+    return _extract_pdf_document(path).text
+
+
+def _extract_pdf_tables(pages) -> list[dict]:
+    tables: list[dict] = []
+    for page_number, page in enumerate(pages, start=1):
+        extract_tables = getattr(page, "extract_tables", None)
+        for index, rows in enumerate(extract_tables() if extract_tables else [], start=1):
+            clean_rows = [
+                [" ".join(str(cell or "").split()) for cell in row]
+                for row in rows or []
+                if any(str(cell or "").strip() for cell in row)
+            ]
+            if clean_rows:
+                tables.append({"page": page_number, "table": index, "rows": clean_rows})
+    return tables
+
+
+def _product_name(parsed: ParsedPRD) -> str:
+    for heading, lines in parsed.sections.items():
+        if "product name" not in heading.lower():
+            continue
+        for line in lines:
+            candidate = str(line).strip()
+            if candidate:
+                return candidate
+    return ""
 
 
 def parse_prd_file(file_path: Path) -> ParsedPRD:

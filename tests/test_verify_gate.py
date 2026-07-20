@@ -196,14 +196,20 @@ async def test_maybe_verify_unverifiable_leaves_answer_untouched(tmp_path: Path,
 
 
 @pytest.mark.asyncio
-async def test_maybe_verify_skips_when_not_long_running(tmp_path: Path, monkeypatch):
-    def _boom(*a, **k):  # pragma: no cover - must not run
-        raise AssertionError("verify must not run in interactive (non-long-running) mode")
-
-    monkeypatch.setattr(chat_loop_module, "verify_only", _boom)
+async def test_maybe_verify_runs_lightweight_check_when_not_long_running(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(
+        chat_loop_module,
+        "verify_only",
+        lambda *a, **k: VerifyOutcome(
+            verified=True,
+            exit_code=0,
+            command="python -m py_compile a.py",
+            summary="Verification passed.",
+        ),
+    )
     loop = _loop(tmp_path, long_running=False)
     final = await loop._maybe_verify("Answer.", ["a.py"])
-    assert final == "Answer."
+    assert "[verified]" in final
 
 
 @pytest.mark.asyncio

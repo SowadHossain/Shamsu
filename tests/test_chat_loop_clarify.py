@@ -47,6 +47,31 @@ def _loop(tmp_path: Path, client, session_logger=None) -> AgentChatLoop:
     )
 
 
+@pytest.mark.asyncio
+async def test_approval_denial_stops_without_retrying_the_same_mutation(tmp_path: Path):
+    client = ScriptedClient(
+        [
+            _message(
+                tool_calls=[
+                    _tool_call(
+                        "write_file",
+                        {"filepath": "denied.txt", "content": "not written"},
+                    )
+                ]
+            )
+        ]
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: False)
+    loop = AgentChatLoop(tmp_path, client=client, tools=tools, llm=NoPlanLLM())
+
+    result = await loop.run("create denied.txt")
+
+    assert result.stopped is True
+    assert "approval was denied" in result.final
+    assert len(client.messages_seen) == 1
+    assert (tmp_path / "denied.txt").exists() is False
+
+
 # ---------------------------------------------------------------------------
 # Gap J2: the stall guards must ASK for the missing decision, not give up.
 # `safety/clarify.py` was built for exactly this and was never wired - the

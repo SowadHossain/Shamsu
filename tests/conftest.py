@@ -6,6 +6,14 @@ from shamsu.abstract.types import GateResult
 from shamsu.memory.types import MemoryGate
 
 
+@pytest.fixture(autouse=True)
+def _memory_queue_cleanup():
+    from shamsu.memory.queue import reset_memory_queues
+
+    yield
+    reset_memory_queues(timeout=0.2)
+
+
 class _AlwaysOpenAbstractService:
     """Stand-in used only for AgentOrchestrator's default (no explicit
     abstract_service passed). Tests that construct their own AbstractService

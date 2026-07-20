@@ -30,3 +30,9 @@ re-measured with more samples. Compare baselines only at equal
 delta. Tier-specific findings (root causes of consistent failures)
 live in `agent context/SHAMSU_agent_gap_analysis.md` under I3.
 
+## Deterministic release metrics
+
+Harness startup, first-answer/task time, peak memory, log growth, and
+Python/Django/Node/React/mixed dogfood results are recorded separately in
+`RELEASE_VALIDATION.md` so model variance is not mixed with runtime reliability.
+

@@ -17,7 +17,6 @@ _ACTION_LABELS = {
     "file_edit": "file edits",
 }
 
-_YES_ANSWERS = {"1", "y", "yes"}
 _MAX_EMPTY_TTY_READS = 3
 
 
@@ -31,6 +30,10 @@ def _render_request(request: ApprovalRequest, console: Console) -> None:
     body.append(f"Risk: {request.risk_level}\n")
     if request.working_dir:
         body.append(f"Working dir: {request.working_dir}\n")
+    if request.target_paths:
+        body.append("Targets:\n")
+        for path in request.target_paths:
+            body.append(f"  - {path}\n")
     if request.reason:
         body.append(f"Reason: {request.reason}\n")
     body.append(f"\n{request.description}")
@@ -67,7 +70,7 @@ def ask_approval_menu(
     offer_remember: bool = False,
     console: Console | None = None,
 ) -> tuple[bool, str]:
-    """Claude-Code-style numbered approval menu.
+    """Prompt for one stable semantic approval decision.
 
     Returns (approved, remember_scope). remember_scope is "workspace" when the
     user picks the "don't ask again" option, else "none". `offer_remember`
@@ -78,26 +81,22 @@ def ask_approval_menu(
     _render_request(request, console)
 
     console.print("Do you want to proceed?")
-    console.print("  1. Yes")
+    console.print("  [y] Allow once", markup=False)
     if offer_remember:
-        console.print(f"  2. Yes, and don't ask again for {_action_label(request.action_type)} in this workspace")
-        console.print("  3. No")
-        no_answers = {"3", "n", "no", ""}
-        remember_answer = "2"
-    else:
-        console.print("  2. No")
-        no_answers = {"2", "n", "no", ""}
-        remember_answer = None
+        console.print(
+            f"  [a] Always allow {_action_label(request.action_type)} "
+            "in this workspace",
+            markup=False,
+        )
+    console.print("  [n] Deny", markup=False)
 
     answer = _read_approval_answer(console)
     if answer is None:
         return False, "none"
-    if offer_remember and answer == remember_answer:
+    if offer_remember and answer in {"a", "always"}:
         return True, "workspace"
-    if answer in _YES_ANSWERS:
+    if answer in {"y", "yes"}:
         return True, "none"
-    if answer in no_answers:
-        return False, "none"
     # Anything unrecognized is treated as "no" — the safe default.
     return False, "none"
 
@@ -226,24 +225,15 @@ def _read_approval_answer(console: Console) -> str | None:
         if fallback is not None:
             return fallback
 
-    empty_reads = 0
-    while True:
-        _pause_console_live(console)
-        try:
-            answer = input("> ").strip().lower()
-        except EOFError:
-            fallback = _read_windows_console_answer(console)
-            if fallback is not None:
-                return fallback
-            console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
-            return None
-        if answer or not sys.stdin.isatty():
-            return answer
-        empty_reads += 1
-        if empty_reads >= _MAX_EMPTY_TTY_READS:
-            console.print("[yellow]No approval answer was received. Action cancelled.[/yellow]")
-            return None
-        console.print("[yellow]Please choose 1 or 2.[/yellow]")
+    _pause_console_live(console)
+    try:
+        return input("> ").strip().lower()
+    except EOFError:
+        fallback = _read_windows_console_answer(console)
+        if fallback is not None:
+            return fallback
+        console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
+        return None
 
 
 def _read_windows_console_answer(console: Console) -> str | None:
@@ -260,7 +250,7 @@ def _read_windows_console_answer(console: Console) -> str | None:
         import msvcrt
     except ImportError:
         return None
-    console.print("[dim]Press 1 to approve or 2 to cancel.[/dim]")
+    console.print("[dim]Press y to allow once, a to always allow when offered, or n to deny.[/dim]")
     while True:
         try:
             char = msvcrt.getwch()
@@ -276,8 +266,8 @@ def _read_windows_console_answer(console: Console) -> str | None:
         if lowered in {"\x03", "\x1a"}:  # Ctrl+C / Ctrl+Z
             return None
         if lowered == "\x1b":  # Esc
-            console.print("2")
-            return "2"
-        if lowered in {"1", "2", "3", "y", "n"}:
+            console.print("n")
+            return "n"
+        if lowered in {"y", "a", "n"}:
             console.print(char)
             return lowered

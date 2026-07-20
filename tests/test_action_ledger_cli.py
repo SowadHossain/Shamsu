@@ -53,6 +53,10 @@ def test_run_last_shows_latest_run(tmp_path: Path):
     text = output.getvalue()
     assert ledger.run_id in text
     assert "Status: success" in text
+    assert "Decision summary: npm run build" in text
+    assert "Tool outcomes: read_file=success" in text
+    assert "Verification: not run" in text
+    assert "Output: I fixed the login bug." in text
 
 
 def test_run_timeline_shows_events(tmp_path: Path):
@@ -110,6 +114,15 @@ def test_run_context_shows_safe_context_preview(tmp_path: Path):
     text = output.getvalue()
     assert "t1" in text
     assert "qa" in text
+
+
+def test_run_validate_reports_integrity(tmp_path: Path):
+    ledger = _seeded_run(tmp_path)
+    console, output = _console()
+
+    _handle_run(f"run validate {ledger.run_id}", tmp_path, console)
+
+    assert "Integrity: valid" in output.getvalue()
 
 
 def test_run_export_creates_redacted_zip(tmp_path: Path):

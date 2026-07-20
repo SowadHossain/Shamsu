@@ -121,6 +121,188 @@ def load_context_preview(workspace: Path, run_id: str) -> dict[str, Any] | None:
     return _read_json(runs_dir(workspace) / run_id / "context-preview.json")
 
 
+def load_context_records(workspace: Path, run_id: str) -> list[dict[str, Any]]:
+    """Load every v2 context artifact, falling back to the legacy latest preview."""
+    context_dir = runs_dir(workspace) / run_id / "contexts"
+    records = [
+        record
+        for path in sorted(context_dir.glob("context_*.json"))
+        if (record := _read_json(path)) is not None
+    ]
+    if records:
+        return records
+    legacy = load_context_preview(workspace, run_id)
+    if legacy is not None and legacy.get("contexts") == []:
+        return []
+    return [legacy] if legacy is not None else []
+
+
+def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
+    """Validate structural integrity without changing or replaying a run."""
+    run_dir = runs_dir(workspace) / run_id
+    errors: list[str] = []
+    warnings: list[str] = []
+    if not run_dir.is_dir():
+        return {"ok": False, "run_id": run_id, "errors": ["run directory is missing"], "warnings": []}
+
+    manifest = load_manifest(workspace, run_id)
+    if manifest is None:
+        errors.append("manifest.json is missing or invalid")
+        manifest = {}
+    terminal = str(manifest.get("status", "")) != "running"
+    if terminal and load_summary(workspace, run_id) is None:
+        errors.append("terminal run is missing summary.json")
+    if terminal and not (run_dir / "final-output.md").exists():
+        errors.append("terminal run is missing final-output.md")
+
+    groups = {
+        "events": load_events(workspace, run_id),
+        "decisions": load_decisions(workspace, run_id),
+        "tools": load_tool_calls(workspace, run_id),
+        "models": load_model_calls(workspace, run_id),
+        "mutations": load_mutations(workspace, run_id),
+        "contexts": load_context_records(workspace, run_id),
+    }
+    jsonl_paths = {
+        "events": run_dir / "events.jsonl",
+        "decisions": run_dir / "decisions.jsonl",
+        "tools": run_dir / "tool-calls.jsonl",
+        "models": run_dir / "model-calls.jsonl",
+        "mutations": run_dir / "mutations" / "mutations.jsonl",
+    }
+    for name, path in jsonl_paths.items():
+        if not path.exists():
+            continue
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError:
+                errors.append(f"{name} line {line_number} is invalid JSON")
+                continue
+            if not isinstance(parsed, dict):
+                errors.append(f"{name} line {line_number} is not a JSON object")
+    required = {
+        "schema_version",
+        "session_id",
+        "turn_id",
+        "run_id",
+        "operation_id",
+        "parent_operation_id",
+        "timestamp",
+        "sequence",
+    }
+    for group_name, records in groups.items():
+        for index, record in enumerate(records):
+            if int(record.get("schema_version", 1) or 1) < 2:
+                continue
+            missing = sorted(required - record.keys())
+            if missing:
+                errors.append(f"{group_name}[{index}] missing: {', '.join(missing)}")
+            if record.get("run_id") != run_id:
+                errors.append(f"{group_name}[{index}] has the wrong run_id")
+
+    v2_sequences = [
+        int(record.get("sequence", 0) or 0)
+        for records in groups.values()
+        for record in records
+        if int(record.get("schema_version", 1) or 1) >= 2
+    ]
+    if any(sequence <= 0 for sequence in v2_sequences):
+        errors.append("v2 records contain a non-positive sequence")
+    if len(v2_sequences) != len(set(v2_sequences)):
+        errors.append("v2 record sequences are not unique")
+
+    tool_records = groups["tools"]
+    called_tools = {
+        str(record.get("tool_call_id", ""))
+        for record in tool_records
+        if record.get("phase") == "called"
+    }
+    finished_tools = {
+        str(record.get("tool_call_id", ""))
+        for record in tool_records
+        if record.get("phase") == "finished"
+    }
+    for call_id in sorted(called_tools - finished_tools):
+        errors.append(f"tool call {call_id} has no finished record")
+    for call_id in sorted(finished_tools - called_tools):
+        errors.append(f"tool result {call_id} has no called record")
+
+    model_records = groups["models"]
+    started_models = {
+        str(record.get("model_call_id", ""))
+        for record in model_records
+        if record.get("phase") == "started"
+    }
+    finished_models = {
+        str(record.get("model_call_id", ""))
+        for record in model_records
+        if record.get("phase") in {"finished", "failed"}
+    }
+    for call_id in sorted(started_models - finished_models):
+        errors.append(f"model call {call_id} has no terminal record")
+    for context in groups["contexts"]:
+        model_call_id = str(context.get("model_call_id", ""))
+        if model_call_id and model_call_id not in started_models:
+            errors.append(f"context {context.get('context_id', '')} references unknown model call {model_call_id}")
+
+    diagnostic_events = [event for event in groups["events"] if event.get("type") == "diagnostics_parsed"]
+    command_ids = {
+        str(event.get("cmd_id", ""))
+        for event in groups["events"]
+        if event.get("type") == "command_started"
+    }
+    for event in diagnostic_events:
+        relative = str(event.get("diagnostics_path", ""))
+        path = run_dir / relative
+        if not relative or not path.is_file():
+            errors.append(f"diagnostic artifact is missing: {relative or '(empty path)'}")
+            continue
+        try:
+            packet = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            errors.append(f"diagnostic artifact is invalid JSON: {relative}")
+            continue
+        operation_id = str(packet.get("operation_id", ""))
+        if operation_id and operation_id not in command_ids:
+            errors.append(f"diagnostic {relative} references unknown command {operation_id}")
+        raw_log_path = str(packet.get("raw_log_path", ""))
+        if raw_log_path and not Path(raw_log_path).is_absolute() and not (run_dir / raw_log_path).is_file():
+            errors.append(f"diagnostic {relative} references missing raw log {raw_log_path}")
+        traceback_path = str(packet.get("traceback_path", ""))
+        if traceback_path and not Path(traceback_path).is_absolute() and not (run_dir / traceback_path).is_file():
+            errors.append(f"diagnostic {relative} references missing traceback {traceback_path}")
+    for record in groups["tools"]:
+        diagnostics_path = str(record.get("diagnostics_path", ""))
+        if diagnostics_path and not (run_dir / diagnostics_path).is_file():
+            errors.append(
+                f"tool call {record.get('tool_call_id', '')} references missing diagnostics {diagnostics_path}"
+            )
+        traceback_path = str(record.get("traceback_path", ""))
+        if traceback_path and not (run_dir / traceback_path).is_file():
+            errors.append(
+                f"tool call {record.get('tool_call_id', '')} references missing traceback {traceback_path}"
+            )
+    for record in groups["models"]:
+        traceback_path = str(record.get("traceback_path", ""))
+        if traceback_path and not (run_dir / traceback_path).is_file():
+            errors.append(
+                f"model call {record.get('model_call_id', '')} references missing traceback {traceback_path}"
+            )
+
+    if terminal and not groups["decisions"]:
+        warnings.append("run has no structured decision records")
+    return {
+        "ok": not errors,
+        "run_id": run_id,
+        "errors": errors,
+        "warnings": warnings,
+        "counts": {name: len(records) for name, records in groups.items()},
+    }
+
+
 def load_final_output(workspace: Path, run_id: str) -> str:
     path = runs_dir(workspace) / run_id / "final-output.md"
     if not path.exists():

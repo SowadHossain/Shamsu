@@ -71,17 +71,19 @@ def test_command_runner_calls_diagnostic_digest_after_successful_command(tmp_pat
     command, cwd, exit_code, _stdout, _stderr, _raw_log_path = digest.calls[0]
     assert command == "python -c \"print('hi')\""
     assert exit_code == 0
-    assert runner.last_error_packet is not None
+    assert runner.last_error_packet is None
+    assert runner.last_diagnostic_packet is not None
+    assert runner.last_diagnostic_packet.classification == "success"
 
 
-def test_command_runner_saves_error_packet_to_diagnostics_workspace(tmp_path: Path):
+def test_successful_command_does_not_replace_last_error_packet(tmp_path: Path):
     digest = RecordingDigest()
     runner = CommandRunner(tmp_path, approval_func=lambda _r: True, diagnostic_digest=digest)
 
     runner.run("python -c \"print('hi')\"", tmp_path)
 
     packet_path = tmp_path / ".shamsu" / "diagnostics" / "last-error-packet.json"
-    assert packet_path.exists()
+    assert packet_path.exists() is False
 
 
 def test_command_runner_does_not_run_diagnostics_for_blocked_commands(tmp_path: Path):

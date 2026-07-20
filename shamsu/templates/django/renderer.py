@@ -57,6 +57,7 @@ def render_fixed_django_files(
         f"{project.project_name}/wsgi.py": render_template(WSGI_TEMPLATE, values),
         f"{project.project_name}/asgi.py": render_template(ASGI_TEMPLATE, values),
         f"{project.app_name}/__init__.py": "",
+        f"{project.app_name}/migrations/__init__.py": "",
         f"{project.app_name}/apps.py": render_template(APP_CONFIG_TEMPLATE, values),
         f"{project.app_name}/templates/base.html": render_template(BASE_HTML_TEMPLATE, values),
         f"{project.app_name}/templates/login.html": render_template(LOGIN_HTML_TEMPLATE, values),
@@ -113,10 +114,24 @@ def _render_resource_template_files(project: ProjectSpec) -> dict[str, str]:
 
 
 def _resource_field_names(page: PageSpec, entity: EntitySpec | None) -> list[str]:
-    if page.fields_shown:
-        return [_to_snake_case(field_name) for field_name in page.fields_shown]
     if entity is not None and entity.fields:
-        return [field.name for field in entity.fields]
+        field_by_name = {field.name: field for field in entity.fields}
+        requested = (
+            [_to_snake_case(field_name) for field_name in page.fields_shown]
+            if page.fields_shown
+            else list(field_by_name)
+        )
+        return [
+            name
+            for name in requested
+            if name in field_by_name
+            and not (
+                field_by_name[name].django_type == "ForeignKey"
+                and field_by_name[name].kwargs.get("to") == "User"
+            )
+            and not field_by_name[name].kwargs.get("auto_now")
+            and not field_by_name[name].kwargs.get("auto_now_add")
+        ]
     return ["id"]
 
 
@@ -134,11 +149,21 @@ def _render_nav_links(pages: list[PageSpec]) -> str:
     for page in pages:
         if page.page_type == "auth":
             continue
+        is_profile = "profile" in page.name.lower()
+        is_resource_list = page.page_type == "list" and bool(page.resource)
+        if page.page_type != "dashboard" and not is_resource_list and not is_profile:
+            continue
         url_name = _url_name(page)
         if url_name in seen:
             continue
         seen.add(url_name)
-        links.append(f'<li><a href="{{% url \'{url_name}\' %}}">{page.name}</a></li>')
+        if page.page_type == "dashboard":
+            label = "Dashboard"
+        elif is_profile:
+            label = "Profile"
+        else:
+            label = _pluralize_label(_display_name(page.resource or page.name))
+        links.append(f'<li><a href="{{% url \'{url_name}\' %}}">{label}</a></li>')
     return "\n        ".join(links)
 
 

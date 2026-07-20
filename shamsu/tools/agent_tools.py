@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import difflib
 import json
+import traceback
 import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
+from collections.abc import Iterable
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
@@ -13,6 +15,7 @@ from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
+from shamsu.safety.dry_run import DryRunRecorder
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
@@ -102,7 +105,11 @@ class AgentToolRegistry:
         )
         self.approval_func = approval_func
         self.session_logger = session_logger
-        self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
+        self.approval_manager = approval_manager or ApprovalManager(
+            approval_func,
+            session_logger,
+            action_ledger=action_ledger,
+        )
         # Injected for tests; lazily constructed on first use otherwise (gap D1:
         # the loop had no way to look anything up mid-task - web was a separate
         # pre-routed path decided before the agent ever started).
@@ -111,6 +118,80 @@ class AgentToolRegistry:
         # Git commands run through the same CommandRunner so command safety,
         # approval, logging, timeout handling, and diagnostics still apply.
         self.git_tool = GitTool(self.workspace_root, command_runner=self.command_runner)
+
+        # Set when the user's prompt explicitly forbids file changes. This is a
+        # HARD deny on every mutating tool, deliberately independent of the
+        # approval layer: "--approval allow" answers "may SHAMSU write without
+        # asking me?", not "may SHAMSU ignore what I just told it?". A dogfood
+        # run under broad approval overwrote a script the prompt had told it not
+        # to touch, because read-only intent had no enforcement point at all.
+        self._read_only = False
+
+        # Set for a dry run. Mutating tools then report a synthetic success and
+        # record what they WOULD have done, so the agent keeps planning instead
+        # of stopping at a denial - see shamsu/safety/dry_run.py for why a
+        # denying approver cannot produce a preview.
+        self._dry_run: DryRunRecorder | None = None
+
+        # Set for a SCOPED read-only request ("create X, do not modify any
+        # other files"). A blanket refusal would fail the request from the
+        # other direction, so instead the named targets stay writable and
+        # everything else is denied - which is exactly what the user said.
+        self._allowed_write_paths: set[str] | None = None
+
+    def set_read_only(self, read_only: bool) -> None:
+        self._read_only = bool(read_only)
+
+    def set_dry_run(self, recorder: DryRunRecorder | None) -> None:
+        self._dry_run = recorder
+
+    def set_allowed_write_paths(self, paths: Iterable[str] | None) -> None:
+        """Restrict mutations to `paths`. None removes the restriction."""
+        if paths is None:
+            self._allowed_write_paths = None
+            return
+        self._allowed_write_paths = {_normalize_workspace_path(p).lower() for p in paths if p}
+
+    def _outside_allowed_scope(self, path: str) -> ToolResult | None:
+        allowed = self._allowed_write_paths
+        if allowed is None:
+            return None
+        normalized = (_normalize_workspace_path(path) or path).lower()
+        if normalized in allowed:
+            return None
+        return ToolResult(
+            False,
+            f"Refused to touch {path}: this request allowed changes only to "
+            + ", ".join(sorted(allowed))
+            + ". No file was modified.",
+            {"scoped_read_only": True, "filepath": path, "allowed": sorted(allowed)},
+        )
+
+    def _planned(self, action: str, path: str, detail: str, size_bytes: int = 0) -> ToolResult:
+        """Record an intended mutation and report it as done, without doing it."""
+        assert self._dry_run is not None
+        self._dry_run.record(action, path, detail=detail, size_bytes=size_bytes)
+        return ToolResult(
+            True,
+            f"[dry run] Would {action} {path}. Nothing was written. "
+            "Continue as though this succeeded.",
+            {
+                "dry_run": True,
+                "planned_action": action,
+                "filepath": path,
+                "resolved_filepath": path,
+                "detail": detail,
+                "size_bytes": size_bytes,
+            },
+        )
+
+    def _read_only_refusal(self, action: str, target: str) -> ToolResult:
+        return ToolResult(
+            False,
+            f"Refused to {action} {target}: this request said not to change files. "
+            "No file was modified. Ask again without that restriction if you want the change.",
+            {"read_only": True, "blocked_action": action, "filepath": target},
+        )
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         return [
@@ -764,7 +845,24 @@ class AgentToolRegistry:
                 )
             return ToolResult(False, f"Unknown tool: {name}", {"tool": name})
         except Exception as exc:
-            return ToolResult(False, str(exc), {"tool": name})
+            traceback_path = ""
+            if self.action_ledger:
+                traceback_path = self.action_ledger.record_exception(
+                    "tool_execution",
+                    name,
+                    traceback.format_exc(),
+                )
+            return ToolResult(
+                False,
+                str(exc),
+                {
+                    "tool": name,
+                    "exception_class": type(exc).__name__,
+                    "exception_message": str(exc),
+                    "phase": "tool_execution",
+                    "traceback_path": traceback_path,
+                },
+            )
 
     def list_files(self, path: str = ".") -> ToolResult:
         target = self.sandbox.validate(path)
@@ -1062,6 +1160,17 @@ class AgentToolRegistry:
         new_string: str,
         replace_all: bool = False,
     ) -> ToolResult:
+        if self._read_only:
+            return self._read_only_refusal("edit", filepath or "the file")
+        scoped = self._outside_allowed_scope(filepath)
+        if scoped is not None:
+            return scoped
+        if self._dry_run is not None:
+            return self._planned(
+                "edit",
+                _normalize_workspace_path(filepath) or filepath,
+                f"replace {old_string[:40]!r}" if old_string else "in-place edit",
+            )
         normalized = _normalize_workspace_path(filepath)
         if not normalized:
             return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
@@ -1140,6 +1249,7 @@ class AgentToolRegistry:
             preview=_edit_preview(normalized, old_string, new_string),
             working_dir=str(self.workspace_root),
             reason="The agent requested a targeted file edit.",
+            target_paths=[normalized],
         )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "File edit denied by user.", {"filepath": normalized})
@@ -1149,10 +1259,38 @@ class AgentToolRegistry:
             operations=[{"op": "edit_file", "path": normalized, "dest_path": "", "reason": ""}],
             destructive=False,
         )
+        if self.action_ledger:
+            self.action_ledger.log_mutation_started(
+                transaction_id,
+                f"Agent edit_file: {normalized}",
+            )
         self.transactions.backup_file(transaction_id, normalized)
         target.write_text(new_content, encoding="utf-8")
         self.transactions.record_after(transaction_id, normalized)
-        self.transactions.finalize(transaction_id, "applied")
+        diff_text = "".join(
+            difflib.unified_diff(
+                content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{normalized}",
+                tofile=f"b/{normalized}",
+            )
+        )
+        self.transactions.save_patch(transaction_id, diff_text)
+        manifest = self.transactions.finalize(transaction_id, "applied")
+        if self.action_ledger:
+            self.action_ledger.log_mutation_finished(
+                transaction_id,
+                "applied",
+                manifest.get("touched_files", []),
+                rollback_available=True,
+                operations=manifest.get("operations", []),
+                before_hashes=manifest.get("before_hashes", {}),
+                after_hashes=manifest.get("after_hashes", {}),
+                backups=manifest.get("backups", {}),
+                patch_path=f".shamsu/mutations/{transaction_id}/patch.diff",
+                verification=manifest.get("verification"),
+                abstract_index_state="stale",
+            )
         _mark_code_memory_stale(self.workspace_root)
         added, removed = _line_change_counts(old_string, new_string)
         first_index = content.find(old_string)
@@ -1248,6 +1386,17 @@ class AgentToolRegistry:
         litters dead files that then pollute search_index results and future
         context packs (gap D2).
         """
+        if self._read_only:
+            return self._read_only_refusal("move", source or "the file")
+        scoped = self._outside_allowed_scope(source)
+        if scoped is not None:
+            return scoped
+        if self._dry_run is not None:
+            return self._planned(
+                "move",
+                _normalize_workspace_path(source) or source,
+                f"to {_normalize_workspace_path(destination) or destination}",
+            )
         from_path = _normalize_workspace_path(source)
         to_path = _normalize_workspace_path(destination)
         if not from_path or not to_path:
@@ -1279,6 +1428,7 @@ class AgentToolRegistry:
             risk_level="medium",
             working_dir=str(self.workspace_root),
             reason="The agent requested a workspace file move/rename.",
+            target_paths=[from_path, to_path],
         )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "Move denied by user.", {"filepath": from_path})
@@ -1313,6 +1463,13 @@ class AgentToolRegistry:
         `/undo` (and `/patch rollback`) can bring it back - a model deleting the
         wrong file must never be unrecoverable.
         """
+        if self._read_only:
+            return self._read_only_refusal("delete", filepath or "the file")
+        scoped = self._outside_allowed_scope(filepath)
+        if scoped is not None:
+            return scoped
+        if self._dry_run is not None:
+            return self._planned("delete", _normalize_workspace_path(filepath) or filepath, "")
         normalized = _normalize_workspace_path(filepath)
         if not normalized:
             return ToolResult(False, "Missing filepath.", {})
@@ -1333,6 +1490,7 @@ class AgentToolRegistry:
             risk_level="high",
             working_dir=str(self.workspace_root),
             reason="The agent requested a workspace file deletion.",
+            target_paths=[normalized],
         )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "Delete denied by user.", {"filepath": normalized})
@@ -1357,6 +1515,17 @@ class AgentToolRegistry:
         )
 
     def write_file(self, filepath: str, content: str, overwrite: bool = False) -> ToolResult:
+        if self._read_only:
+            return self._read_only_refusal("write", filepath or "the file")
+        scoped = self._outside_allowed_scope(filepath)
+        if scoped is not None:
+            return scoped
+        if self._dry_run is not None:
+            target = _normalize_workspace_path(filepath) or filepath
+            verb = "overwrite" if (self.workspace_root / target).is_file() else "create"
+            return self._planned(
+                verb, target, f"{len(content.splitlines())} line(s)", len(content.encode("utf-8"))
+            )
         normalized = _normalize_workspace_path(filepath)
         if not normalized:
             return ToolResult(False, "Missing filepath.", {})
@@ -1411,6 +1580,7 @@ class AgentToolRegistry:
             preview=content[:4000],
             working_dir=str(self.workspace_root),
             reason="The agent requested a workspace file write.",
+            target_paths=[normalized],
         )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "File write denied by user.", {"filepath": normalized})
@@ -1431,11 +1601,39 @@ class AgentToolRegistry:
             ],
             destructive=False,
         )
+        if self.action_ledger:
+            self.action_ledger.log_mutation_started(
+                transaction_id,
+                f"Agent write_file: {normalized}",
+            )
         self.transactions.backup_file(transaction_id, normalized)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         self.transactions.record_after(transaction_id, normalized)
-        self.transactions.finalize(transaction_id, "applied")
+        diff_text = "".join(
+            difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                content.splitlines(keepends=True),
+                fromfile=f"a/{normalized}" if exists else "/dev/null",
+                tofile=f"b/{normalized}",
+            )
+        )
+        self.transactions.save_patch(transaction_id, diff_text)
+        manifest = self.transactions.finalize(transaction_id, "applied")
+        if self.action_ledger:
+            self.action_ledger.log_mutation_finished(
+                transaction_id,
+                "applied",
+                manifest.get("touched_files", []),
+                rollback_available=True,
+                operations=manifest.get("operations", []),
+                before_hashes=manifest.get("before_hashes", {}),
+                after_hashes=manifest.get("after_hashes", {}),
+                backups=manifest.get("backups", {}),
+                patch_path=f".shamsu/mutations/{transaction_id}/patch.diff" if diff_text else "",
+                verification=manifest.get("verification"),
+                abstract_index_state="stale",
+            )
         _mark_code_memory_stale(self.workspace_root)
         added, removed = _line_change_counts(old_content, content)
         line_count = len(content.splitlines())
@@ -1464,6 +1662,17 @@ class AgentToolRegistry:
             return ToolResult(False, "Missing command.", {})
         code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
         data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
+        packet = getattr(self.command_runner, "last_diagnostic_packet", None)
+        if packet is not None:
+            data["outcome_classification"] = packet.classification
+            data["actionable"] = packet.actionable
+            data["diagnostics_path"] = getattr(self.command_runner, "last_diagnostics_path", "")
+        elif code in {125, 126}:
+            data["outcome_classification"] = "policy_decision"
+            data["actionable"] = False
+        elif code == 127:
+            data["outcome_classification"] = "environment_condition"
+            data["actionable"] = False
 
         # DiagnosticDigest already parsed this command's output into a compact
         # ErrorPacket (see CommandRunner._run_diagnostics) - surface that to

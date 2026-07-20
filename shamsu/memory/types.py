@@ -33,13 +33,19 @@ class MemoryStatus:
     workspace: str
     health: GraphitiHealth
     memory_path: str
-    normal_mode_allowed: bool = False
+    normal_mode_allowed: bool = True
+    local_available: bool = True
+    degraded: bool = False
+    storage_mode: str = "local"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "workspace": self.workspace,
             "memory_path": self.memory_path,
             "normal_mode_allowed": self.normal_mode_allowed,
+            "local_available": self.local_available,
+            "degraded": self.degraded,
+            "storage_mode": self.storage_mode,
             "health": {
                 "available": self.health.available,
                 "tool_path": self.health.tool_path,

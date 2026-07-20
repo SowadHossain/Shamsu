@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import pytest
 
-from shamsu.cli.repl import _prefers_qa_answer, _qa_branch_routes_to_agent
+from shamsu.cli.repl import (
+    _enforce_read_only_decision,
+    _prefers_qa_answer,
+    _qa_branch_routes_to_agent,
+)
+from shamsu.types import RoutingDecision
 
 
 # --- work that used to silently land in QA (the bug) --------------------------
@@ -118,3 +123,29 @@ def test_followup_work_reaches_the_agent_loop(prompt: str):
 
 def test_followup_questions_stay_on_qa():
     assert _prefers_qa_answer("why did that fail?") is True
+
+
+def test_explicit_read_only_question_cannot_reach_the_agent_loop():
+    prompt = "Where is add defined? Do not change any files."
+
+    assert _qa_branch_routes_to_agent(prompt, uses_real_index=True) is False
+
+
+def test_read_only_constraint_overrides_a_mutating_model_decision():
+    decision = RoutingDecision(intent="code_edit", complexity="single", confidence=0.8)
+
+    result = _enforce_read_only_decision(
+        "Explain add without changing any files.",
+        decision,
+    )
+
+    assert result.intent == "qa"
+    assert result.confidence == 1.0
+
+
+def test_scoped_constraint_does_not_block_requested_work():
+    decision = RoutingDecision(intent="bug_fix", complexity="single", confidence=0.8)
+
+    result = _enforce_read_only_decision("Fix app.py but do not change tests.", decision)
+
+    assert result.intent == "bug_fix"

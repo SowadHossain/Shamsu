@@ -20,6 +20,7 @@ from shamsu.patch.safety import (
     is_secret_file,
     validate_mutation_path,
 )
+from shamsu.patch.sanitize import sanitize_model_diff
 from shamsu.patch.trash import TrashWorkspace
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.patch.types import (
@@ -76,6 +77,24 @@ class FilePatchSummary:
 
 class DiffValidationError(ValueError):
     pass
+
+
+def _ledger_manifest_fields(
+    manifest: dict,
+    transaction_id: str,
+    has_patch: bool,
+) -> dict:
+    return {
+        "operations": manifest.get("operations", []),
+        "before_hashes": manifest.get("before_hashes", {}),
+        "after_hashes": manifest.get("after_hashes", {}),
+        "backups": manifest.get("backups", {}),
+        "patch_path": (
+            f".shamsu/mutations/{transaction_id}/patch.diff" if has_patch else ""
+        ),
+        "verification": manifest.get("verification"),
+        "abstract_index_state": "stale",
+    }
 
 
 @dataclass(frozen=True)
@@ -135,24 +154,33 @@ class PatchEngine(IPatchEngine):
         self.transactions = TransactionWorkspace(self.workspace_root)
         self.trash = TrashWorkspace(self.workspace_root)
         self.journal = MutationJournal(self.workspace_root)
+        self.last_apply_result: MutationResult | None = None
 
     def validate_diff(self, diff_text: str) -> tuple[bool, str | None]:
         try:
-            parse_unified_diff(diff_text, self.sandbox)
+            parse_unified_diff(sanitize_model_diff(diff_text), self.sandbox)
         except DiffValidationError as exc:
             return False, str(exc)
         return True, None
 
     def apply(self, diff_text: str, workspace_root: Path) -> bool:
+        self.last_apply_result = self.apply_result(diff_text, workspace_root)
+        return self.last_apply_result.ok
+
+    def apply_result(self, diff_text: str, workspace_root: Path) -> MutationResult:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.audit_logger = AuditLogger(self.workspace_root)
+        diff_text = sanitize_model_diff(diff_text)
         try:
             patches = parse_file_patches(diff_text, self.sandbox)
-        except DiffValidationError:
-            self._log("patch.failed", {"error": "Diff validation failed"}, "Patch validation failed")
-            self.audit_logger.log("patch_apply", "error", details={"error": "invalid diff"})
-            return False
+        except DiffValidationError as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._log("patch.failed", {"error": error}, "Patch validation failed")
+            self.audit_logger.log("patch_apply", "error", details={"error": error})
+            if self.action_ledger:
+                self.action_ledger.log_event("patch_validation_failed", error=error)
+            return MutationResult(ok=False, status="validation_failed", error=error)
 
         from shamsu.patch.preview import print_diff_preview
 
@@ -164,6 +192,7 @@ class PatchEngine(IPatchEngine):
             preview=diff_text,
             working_dir=str(self.workspace_root),
             reason="Patch application modifies files inside the selected workspace.",
+            target_paths=_patch_paths(patches),
         )
         self._log("patch.preview", {"files": [patch.display_path for patch in patches]}, request.description)
         if self.action_ledger:
@@ -178,7 +207,15 @@ class PatchEngine(IPatchEngine):
                 details={"action_type": request.action_type, "preview": request.preview},
             )
             self.audit_logger.log("patch_apply", "denied", affected_paths=_patch_paths(patches))
-            return False
+            error = "Patch denied by user."
+            if self.action_ledger:
+                self.action_ledger.log_event("patch_denied", files=_patch_paths(patches), error=error)
+            return MutationResult(
+                ok=False,
+                status="denied",
+                touched_files=_patch_paths(patches),
+                error=error,
+            )
         self.audit_logger.log(
             "approval",
             "approved",
@@ -191,20 +228,64 @@ class PatchEngine(IPatchEngine):
         try:
             for patch in patches:
                 self._apply_file_patch(patch, backups, created_files)
-        except (DiffValidationError, OSError):
+        except BaseException as exc:
             self._restore_backups(backups)
             for created in created_files:
                 if created.exists():
                     created.unlink()
-            self._log("patch.failed", {"files": [patch.display_path for patch in patches]}, "Patch failed")
-            self.audit_logger.log("patch_apply", "error", affected_paths=_patch_paths(patches))
-            return False
+            if not isinstance(exc, Exception):
+                self._log(
+                    "patch.cancelled",
+                    {"files": _patch_paths(patches), "error": type(exc).__name__},
+                    "Patch cancelled; partial changes restored",
+                )
+                if self.action_ledger:
+                    self.action_ledger.log_event(
+                        "patch_cancelled",
+                        files=_patch_paths(patches),
+                        rollback_completed=True,
+                    )
+                raise
+            error = (
+                "Patch application failed after approval: "
+                f"{request.reason} {type(exc).__name__}: {exc}"
+            )
+            self._log(
+                "patch.failed",
+                {"files": [patch.display_path for patch in patches], "error": error},
+                f"Patch failed: {error}",
+            )
+            self.audit_logger.log(
+                "patch_apply",
+                "error",
+                affected_paths=_patch_paths(patches),
+                details={"error": error},
+            )
+            if self.action_ledger:
+                self.action_ledger.log_event(
+                    "patch_apply_failed",
+                    files=_patch_paths(patches),
+                    error=error,
+                )
+            return MutationResult(
+                ok=False,
+                status="apply_failed",
+                touched_files=_patch_paths(patches),
+                error=error,
+                rollback_available=bool(backups),
+            )
         _queue_code_memory_refresh(self.workspace_root)
         self._log("patch.applied", {"files": [patch.display_path for patch in patches]}, "Patch applied")
         self.audit_logger.log("patch_apply", "success", affected_paths=_patch_paths(patches))
         if self.action_ledger:
             self.action_ledger.log_patch_applied(_patch_paths(patches))
-        return True
+            self.action_ledger.log_event("patch_apply_succeeded", files=_patch_paths(patches))
+        return MutationResult(
+            ok=True,
+            status="applied",
+            touched_files=_patch_paths(patches),
+            rollback_available=bool(backups),
+        )
 
     def rollback(self, file_path: Path) -> bool:
         try:
@@ -235,24 +316,36 @@ class PatchEngine(IPatchEngine):
         try:
             request = parse_change_request(payload)
         except ChangeRequestError as exc:
-            return MutationResult(ok=False, error=f"Rejected change request: {exc}")
+            return MutationResult(
+                ok=False,
+                status="validation_failed",
+                error=f"Rejected change request: {exc}",
+            )
         change_plan = request.change_plan
-        patch_text = request.patch
+        patch_text = sanitize_model_diff(request.patch)
 
         try:
             for path in change_plan.touched_paths:
                 validate_mutation_path(self.sandbox, path)
         except MutationSafetyError as exc:
-            return MutationResult(ok=False, error=str(exc))
+            return MutationResult(ok=False, status="validation_failed", error=str(exc))
 
         if patch_text.strip():
             ok, error = self.validate_diff(patch_text)
             if not ok:
-                return MutationResult(ok=False, error=f"Invalid diff: {error}")
+                return MutationResult(
+                    ok=False,
+                    status="validation_failed",
+                    error=f"Invalid diff: {error}",
+                )
             if git_apply.available(self.workspace_root):
                 git_ok, git_message = git_apply.check(patch_text, self.workspace_root)
                 if not git_ok:
-                    return MutationResult(ok=False, error=f"git apply --check rejected the patch: {git_message}")
+                    return MutationResult(
+                        ok=False,
+                        status="validation_failed",
+                        error=f"git apply --check rejected the patch: {git_message}",
+                    )
 
         approval_request = self._build_change_plan_approval(change_plan, patch_text)
         if not self.approval_manager.ask(approval_request):
@@ -261,7 +354,11 @@ class PatchEngine(IPatchEngine):
                 affected_paths=change_plan.touched_paths,
                 details={"action_type": approval_request.action_type, "reason": change_plan.reason},
             )
-            return MutationResult(ok=False, error="Change request denied by user.")
+            return MutationResult(
+                ok=False,
+                status="denied",
+                error="Change request denied by user.",
+            )
         self.audit_logger.log(
             "approval", "approved",
             affected_paths=change_plan.touched_paths,
@@ -312,17 +409,19 @@ class PatchEngine(IPatchEngine):
                 if outcome.dest_path:
                     touched_files.append(outcome.dest_path)
         except (DiffValidationError, MutationSafetyError, OSError) as exc:
-            manifest = self.transactions.finalize(transaction_id, "failed", error=str(exc))
+            apply_error = f"{change_plan.reason}: {type(exc).__name__}: {exc}"
+            manifest = self.transactions.finalize(transaction_id, "failed", error=apply_error)
             self.audit_logger.log("patch_apply", "error", affected_paths=manifest.get("touched_files", []))
             if self.action_ledger:
                 self.action_ledger.log_mutation_finished(
                     transaction_id, "failed", manifest.get("touched_files", []),
-                    rollback_available=True, error=str(exc),
+                    rollback_available=True, error=apply_error,
+                    **_ledger_manifest_fields(manifest, transaction_id, bool(patch_text.strip())),
                 )
             return MutationResult(
-                ok=False, transaction_id=transaction_id, reason=change_plan.reason,
+                ok=False, status="apply_failed", transaction_id=transaction_id, reason=change_plan.reason,
                 touched_files=manifest.get("touched_files", []),
-                error=str(exc), rollback_available=True,
+                error=apply_error, rollback_available=True,
             )
 
         formatter_result = run_formatter(self.command_runner, self.workspace_root, touched_files)
@@ -350,10 +449,14 @@ class PatchEngine(IPatchEngine):
             self._log("patch.applied", {"transaction_id": transaction_id, "files": touched_files}, "Change applied and verified.")
             if self.action_ledger:
                 self.action_ledger.log_mutation_finished(
-                    transaction_id, "applied", manifest.get("touched_files", []), rollback_available=True
+                    transaction_id, "applied", manifest.get("touched_files", []),
+                    rollback_available=True,
+                    **_ledger_manifest_fields(manifest, transaction_id, bool(patch_text.strip())),
                 )
             return MutationResult(
-                ok=True, transaction_id=transaction_id, reason=change_plan.reason,
+                ok=True,
+                status="verified" if verification.ran else "applied_unverified",
+                transaction_id=transaction_id, reason=change_plan.reason,
                 touched_files=manifest.get("touched_files", []), verification=verification,
                 rollback_available=True,
             )
@@ -363,9 +466,10 @@ class PatchEngine(IPatchEngine):
             self.action_ledger.log_mutation_finished(
                 transaction_id, "verification_failed", manifest.get("touched_files", []),
                 rollback_available=True, error="Verification failed.",
+                **_ledger_manifest_fields(manifest, transaction_id, bool(patch_text.strip())),
             )
         return MutationResult(
-            ok=False, transaction_id=transaction_id, reason=change_plan.reason,
+            ok=False, status="verification_failed", transaction_id=transaction_id, reason=change_plan.reason,
             touched_files=manifest.get("touched_files", []),
             error="Verification command exited non-zero; change was applied but is not reported as successful.",
             verification=verification, rollback_available=True,
@@ -406,6 +510,7 @@ class PatchEngine(IPatchEngine):
             preview=patch_text or "\n".join(str(op.to_dict()) for op in change_plan.operations),
             working_dir=str(self.workspace_root),
             reason="Structured change request modifies files inside the selected workspace.",
+            target_paths=list(change_plan.touched_paths),
         )
 
     def _log(self, event_type: str, payload: dict, summary: str) -> None:

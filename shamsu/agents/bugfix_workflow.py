@@ -14,11 +14,14 @@ from shamsu.agents.rewrite_fallback import (
     rewrite_files_fully,
 )
 from shamsu.context.builder import ContextBuilder
+from shamsu.indexer.policy import walk_workspace_files
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
 from shamsu.memory.service import MemoryService
 from shamsu.patch.engine import PatchEngine, parse_file_patches, parse_unified_diff, _apply_hunks
+from shamsu.patch.sanitize import sanitize_model_diff
+from shamsu.patch.types import apply_diff_with_result
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.path_resolve import remap_diff_paths, resolve_reported_path
@@ -81,6 +84,7 @@ class BugFixResult:
     changed_files: list[str] = field(default_factory=list)
     applied: bool = False
     error: str = ""
+    mutation_status: str = ""
     used_full_rewrite: bool = False
     verification_status: str = "Change applied, not yet verified."
     test_suggestion: str = "Re-run the failing test or command that produced the bug report."
@@ -154,19 +158,43 @@ class BugFixWorkflow:
                     plan=plan_text,
                     remapped_paths=remapped_paths,
                 )
-            applied = self.patch_engine.apply(diff_text, self.workspace_root)
-            return BugFixResult(
-                request=report,
-                pack=pack,
-                locations=locations,
-                diff_text=diff_text,
-                changed_files=changed_files,
-                applied=applied,
-                error="" if applied else "Patch was not applied.",
-                verification_status="Change applied, not yet verified." if applied else "No file was changed.",
-                plan=plan_text,
-                remapped_paths=remapped_paths,
-            )
+            mutation = apply_diff_with_result(self.patch_engine, diff_text, self.workspace_root)
+            if mutation.ok:
+                return BugFixResult(
+                    request=report,
+                    pack=pack,
+                    locations=locations,
+                    diff_text=diff_text,
+                    changed_files=changed_files,
+                    applied=True,
+                    mutation_status=mutation.status,
+                    verification_status="Change applied, not yet verified.",
+                    plan=plan_text,
+                    remapped_paths=remapped_paths,
+                )
+            # A user DENIAL is final - never rewrite around it.
+            if mutation.status == "denied":
+                return BugFixResult(
+                    request=report,
+                    pack=pack,
+                    locations=locations,
+                    diff_text=diff_text,
+                    changed_files=changed_files,
+                    applied=False,
+                    error=mutation.error,
+                    mutation_status=mutation.status,
+                    verification_status="No file was changed.",
+                    plan=plan_text,
+                    remapped_paths=remapped_paths,
+                )
+            # The diff VALIDATED but would not apply - the model's context lines
+            # do not match the real file ("Patch context does not match target
+            # file"). This is where a 7B model's logic-change fixes died with no
+            # recovery (dogfood 2026-07-21). A well-formed-but-unappliable diff
+            # is no more usable than a malformed one, so fall through to the same
+            # full-file rewrite fallback instead of giving up.
+            if not error:
+                error = mutation.error or "Patch did not apply to the target file."
 
         fallback = _parse_search_replace(response.raw)
         if fallback:
@@ -396,21 +424,7 @@ def _clean_diff(raw: str) -> str:
     sentence of explanation), which used to fail with 'Invalid hunk line marker:
     ```'. We take the first fenced block if present, drop any stray fence lines,
     and trim leading prose before the diff header."""
-    text = raw.strip()
-    # Prefer the contents of the first fenced code block, wherever it appears.
-    fenced = re.search(r"```[a-zA-Z0-9_+-]*\n(.*?)```", text, re.S)
-    if fenced:
-        text = fenced.group(1).strip()
-    # Drop any surviving fence lines (unbalanced/nested fences).
-    lines = [line for line in text.splitlines() if not line.strip().startswith("```")]
-    # Trim any leading prose before the real diff starts.
-    diff_starts = ("--- ", "+++ ", "diff --git", "*** ", "Index: ", "@@")
-    for index, line in enumerate(lines):
-        if line.startswith(diff_starts):
-            lines = lines[index:]
-            break
-    text = "\n".join(lines).strip()
-    return text + "\n" if text else ""
+    return sanitize_model_diff(raw)
 
 
 def _changed_files(diff_text: str) -> list[str]:
@@ -508,9 +522,11 @@ def _import_export_paths(workspace_root: Path, report: str, error: ImportExportE
 
 
 def _find_importing_file(workspace_root: Path, module_path: str, name: str) -> str:
-    for path in workspace_root.rglob("*"):
-        if path.suffix.lower() not in {".ts", ".tsx", ".js", ".jsx"} or not path.is_file():
-            continue
+    for path in walk_workspace_files(
+        workspace_root,
+        suffixes={".ts", ".tsx", ".js", ".jsx"},
+        indexable_only=True,
+    ):
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:

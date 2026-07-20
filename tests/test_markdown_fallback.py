@@ -63,6 +63,19 @@ def test_filename_before_the_verb_is_still_found(tmp_path: Path):
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 2\n"
 
 
+def test_existing_filename_wins_over_greedy_fix_phrase(tmp_path: Path):
+    (tmp_path / "qa_probe.py").write_text("value = 1\n", encoding="utf-8")
+
+    result = _fallback(tmp_path).maybe_write(
+        "Fix the bug in qa_probe.py: the value must be 2.",
+        "```python\nvalue = 2\n```",
+    )
+
+    assert result.tool_result is not None and result.tool_result.ok
+    assert (tmp_path / "qa_probe.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert not (tmp_path / "bug in qa_probe.py").exists()
+
+
 def test_usage_fences_do_not_count_as_content(tmp_path: Path):
     (tmp_path / "broken.py").write_text(BROKEN, encoding="utf-8")
 
@@ -167,6 +180,19 @@ def test_multiline_run_commands_are_still_usage(tmp_path: Path):
     )
 
     assert result.tool_result is not None and result.tool_result.ok
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 2\n"
+
+
+def test_verification_only_fences_are_not_reported_as_ambiguous(tmp_path: Path):
+    (tmp_path / "app.py").write_text("x = 2\n", encoding="utf-8")
+
+    result = _fallback(tmp_path).maybe_write(
+        "update app.py",
+        "The edit is applied. Verify it with:\n```bash\npython -m py_compile app.py\n```",
+    )
+
+    assert result.handled is False
+    assert result.tool_result is None
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "x = 2\n"
 
 

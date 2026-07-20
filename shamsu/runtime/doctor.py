@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -19,6 +20,10 @@ from shamsu.runtime.models import allowed_model_names, is_allowed_model
 from shamsu.abstract.service import AbstractService
 from shamsu.memory.service import MemoryService
 from shamsu.diagnostics import doctor as diagnostics_doctor
+from shamsu.action_ledger import store as action_ledger_store
+from shamsu.runtime.state_upgrade import STATE_SCHEMA_VERSION, read_state_schema_version
+from shamsu.tools.browser import BrowserTool
+from shamsu.tools.web import WebConfig, WebServiceManager
 
 IGNORED_DIR_NAMES = {".venv", ".git", "node_modules", "__pycache__"}
 
@@ -116,7 +121,7 @@ def check_graphiti_memory(workspace: Path, service: MemoryService | None = None)
 
 def check_codebase_memory(workspace: Path, service: AbstractService | None = None) -> DoctorCheck:
     status = (service or AbstractService(workspace)).status()
-    if status.normal_mode_allowed and not status.index.stale:
+    if status.health.ok and not status.index.stale:
         return DoctorCheck(
             "codebase_memory",
             True,
@@ -155,6 +160,129 @@ def check_diagnostics(workspace: Path) -> DoctorCheck:
         f"LLMLingua enabled={llmlingua.get('enabled', False)}."
     )
     return DoctorCheck("diagnostics", True, detail)
+
+
+def check_workspace_state(workspace: Path) -> DoctorCheck:
+    """Validate persisted run/index/memory state without repairing it."""
+    workspace = workspace.resolve()
+    problems: list[str] = []
+
+    json_paths = (
+        workspace / ".shamsu" / "abstract" / "last-index.json",
+        workspace / ".shamsu" / "abstract" / "status.json",
+        workspace / ".shamsu" / "memory" / "status.json",
+        workspace / ".shamsu" / "diagnostics" / "last-error-packet.json",
+    )
+    payloads: dict[Path, dict] = {}
+    for path in json_paths:
+        if not path.exists():
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            problems.append(f"{path.relative_to(workspace)} is invalid JSON: {exc}")
+            continue
+        if not isinstance(value, dict):
+            problems.append(f"{path.relative_to(workspace)} is not a JSON object")
+            continue
+        payloads[path] = value
+
+    index_path = workspace / ".shamsu" / "abstract" / "last-index.json"
+    index = payloads.get(index_path, {})
+    if index:
+        generation = int(index.get("workspace_generation", 0) or 0)
+        indexed_generation = int(index.get("indexed_generation", 0) or 0)
+        if indexed_generation > generation:
+            problems.append("abstract index generation is ahead of the workspace generation")
+        if index.get("forced_stale") and generation == indexed_generation:
+            problems.append("abstract index is forced stale but its generations are equal")
+
+    memory_db = workspace / ".shamsu" / "memory" / "memory.db"
+    if memory_db.exists():
+        try:
+            connection = sqlite3.connect(f"file:{memory_db.as_posix()}?mode=ro", uri=True)
+            try:
+                check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+            finally:
+                connection.close()
+            if check.lower() != "ok":
+                problems.append(f"memory database integrity check failed: {check}")
+        except sqlite3.DatabaseError as exc:
+            problems.append(f"memory database is unreadable: {exc}")
+
+    for item in action_ledger_store.list_runs(workspace, limit=20):
+        validation = action_ledger_store.validate_run(workspace, item.run_id)
+        if not validation["ok"]:
+            problems.append(
+                f"run {item.run_id} is corrupt: {'; '.join(validation['errors'][:3])}"
+            )
+
+    if problems:
+        return DoctorCheck(
+            "workspace_state",
+            False,
+            " | ".join(problems),
+            "Inspect the named artifacts with `/run validate <id>`; rebuild only the affected index or state store.",
+        )
+    return DoctorCheck(
+        "workspace_state",
+        True,
+        "Run artifacts, index metadata, and local memory state are internally consistent.",
+    )
+
+
+def check_state_schema(workspace: Path) -> DoctorCheck:
+    version = read_state_schema_version(workspace)
+    if version is None:
+        return DoctorCheck(
+            "state_schema",
+            True,
+            f"No state marker exists yet; schema {STATE_SCHEMA_VERSION} will be initialized on first run.",
+        )
+    if version == STATE_SCHEMA_VERSION:
+        return DoctorCheck("state_schema", True, f"Workspace state schema {version} is current.")
+    if version > STATE_SCHEMA_VERSION:
+        return DoctorCheck(
+            "state_schema",
+            False,
+            f"Workspace state schema {version} is newer than this SHAMSU supports.",
+            "Upgrade SHAMSU before using this workspace.",
+        )
+    return DoctorCheck(
+        "state_schema",
+        False,
+        f"Workspace state schema {version} needs upgrade to {STATE_SCHEMA_VERSION}.",
+        "Start SHAMSU once to run the idempotent workspace-state upgrade.",
+    )
+
+
+def check_web_capability(workspace: Path) -> DoctorCheck:
+    config = WebConfig()
+    service = WebServiceManager(workspace, config.searxng_url).status()
+    fallback_ready = config.enabled and config.provider in {"auto", "duckduckgo"}
+    ok = config.enabled and (service.running or fallback_ready)
+    detail = (
+        f"enabled={config.enabled}; provider={config.provider}; "
+        f"SearXNG={service.state}; DuckDuckGo fallback={'ready' if fallback_ready else 'disabled'}."
+    )
+    return DoctorCheck(
+        "web_capability",
+        ok,
+        detail,
+        "Enable web search or configure a provider with `/web status` and `/web setup`." if not ok else "",
+    )
+
+
+def check_browser_capability(workspace: Path) -> DoctorCheck:
+    status = BrowserTool(workspace).status()
+    return DoctorCheck(
+        "browser_capability",
+        status.available,
+        status.message,
+        "Run `python -m playwright install chromium`." if not status.available else "",
+    )
+
+
 def _global_launcher_dir() -> Path:
     """`~/.shamsu` holds the user-local launcher + PATH manifest, not a project workspace."""
     return (Path.home() / ".shamsu").resolve()
@@ -285,8 +413,38 @@ def run_doctor(
         check_graphiti_memory(resolved_workspace, graphiti_memory_service),
         check_codebase_memory(resolved_workspace, codebase_memory_service),
         check_diagnostics(resolved_workspace),
+        check_web_capability(resolved_workspace),
+        check_browser_capability(resolved_workspace),
+        check_state_schema(resolved_workspace),
+        check_workspace_state(resolved_workspace),
     )
     return DoctorReport(checks=checks)
+
+
+def run_first_run_checks(
+    workspace: Path,
+    ollama_status: RuntimeStatus | None = None,
+    codebase_memory_service: AbstractService | None = None,
+    graphiti_memory_service: MemoryService | None = None,
+) -> DoctorReport:
+    """Collect the six capabilities needed for a productive first session."""
+    status = ollama_status if ollama_status is not None else collect_status()
+    checks = (
+        check_ollama(status),
+        check_cookbook(status),
+        check_codebase_memory(workspace, codebase_memory_service),
+        check_graphiti_memory(workspace, graphiti_memory_service),
+        check_web_capability(workspace),
+        check_browser_capability(workspace),
+    )
+    return DoctorReport(checks=checks)
+
+
+def write_first_run_report(workspace: Path, report: DoctorReport) -> Path:
+    path = Path(workspace).resolve() / ".shamsu" / "first-run-report.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps([asdict(check) for check in report.checks], indent=2), encoding="utf-8")
+    return path
 
 
 def format_report(report: DoctorReport) -> str:

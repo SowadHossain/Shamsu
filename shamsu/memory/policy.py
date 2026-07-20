@@ -39,6 +39,7 @@ class MemoryPolicy:
     """Conservative durable-memory policy; never stores raw logs or code blobs."""
 
     def decide(self, text: str, kind: MemoryKind | None = None, metadata: dict[str, Any] | None = None) -> PolicyDecision:
+        metadata = metadata or {}
         cleaned = self.redact(text).strip()
         lowered = cleaned.lower()
         if not cleaned:
@@ -52,6 +53,15 @@ class MemoryPolicy:
         if any(marker in lowered for marker in TRANSIENT_MARKERS):
             return PolicyDecision(False, kind or "bug_lesson", "", "transient")
         inferred = kind or self.infer_kind(cleaned, metadata)
+        automatic = bool(metadata.get("automatic"))
+        outcome = str(metadata.get("outcome") or "").lower()
+        intent = str(metadata.get("intent") or "").lower()
+        if automatic and intent in {"qa", "explain", "general_chat", "audit"}:
+            return PolicyDecision(False, inferred, "", "read-only chatter")
+        if automatic and outcome not in {"success", "success_unverified"}:
+            return PolicyDecision(False, inferred, "", f"non-durable outcome: {outcome or 'unknown'}")
+        if automatic and inferred == "bug_lesson" and not bool(metadata.get("verified")):
+            return PolicyDecision(False, inferred, "", "bug lesson is not verified")
         durable = kind is not None or any(marker in lowered for marker in EXPLICIT_MARKERS) or self._looks_durable(lowered, inferred)
         if not durable:
             return PolicyDecision(False, inferred, "", "not durable")

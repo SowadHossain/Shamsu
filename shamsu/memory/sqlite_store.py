@@ -55,16 +55,22 @@ class SQLiteMemoryStore:
         text = (text or "").strip()
         if not text:
             return {"ok": False, "error": "empty memory text"}
-        # Dedupe on identical (kind, normalized text).
+        metadata = dict(metadata or {})
+        # Dedupe on identical normalized content from the same source run.
         norm = _norm(text)
+        source_run_id = str(metadata.get("source_run_id") or metadata.get("run_id") or "")
         for existing in self._all():
-            if existing.kind == kind and _norm(existing.text) == norm:
+            existing_source = str(
+                existing.metadata.get("source_run_id") or existing.metadata.get("run_id") or ""
+            )
+            same_source = source_run_id == existing_source or not source_run_id or not existing_source
+            if existing.kind == kind and _norm(existing.text) == norm and same_source:
                 return {"ok": True, "deduped": True, "memory_id": existing.memory_id}
         memory_id = uuid.uuid4().hex[:16]
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO memories (id, kind, text, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-                (memory_id, kind, text, json.dumps(metadata or {}), time.time()),
+                (memory_id, kind, text, json.dumps(metadata), time.time()),
             )
         return {"ok": True, "memory_id": memory_id}
 

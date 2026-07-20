@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.safety.commands import redact
+from shamsu.action_ledger.context import get_current_run
 
 AUDIT_DIR_NAME = "audit"
 EVENTS_FILE = "events.jsonl"
@@ -57,11 +58,14 @@ class SessionAuditLog:
 
     def log(self, event_type: str, payload: dict[str, Any] | None = None, message: str = "") -> None:
         """Append one event to both the global and per-session JSONL files."""
+        ledger = get_current_run()
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "session_id": self.session_id,
             "event_type": event_type,
             "message": _clip(message),
+            "run_id": ledger.run_id if ledger is not None else "",
+            "turn_id": ledger.turn_id if ledger is not None else "",
             **_redact(payload or {}),
         }
         line = json.dumps(record, default=str, ensure_ascii=False)

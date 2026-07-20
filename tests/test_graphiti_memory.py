@@ -99,6 +99,22 @@ def test_memory_remember_stores_explicit_memory(tmp_path):
     assert adapter.remembered[0][0] == "workflow_rule"
 
 
+def test_memory_remember_keeps_local_success_when_mirror_raises(tmp_path):
+    class BrokenMirror(FakeGraphitiAdapter):
+        def remember(self, workspace, text, kind, metadata=None):  # noqa: ANN001
+            raise RuntimeError("graph write unavailable")
+
+    service = MemoryService(tmp_path, adapter=BrokenMirror(available=True))
+
+    result = service.remember("remember this: prefer narrow patches", "workflow_rule")
+
+    assert result["ok"] is True
+    assert result["local"] is True
+    assert result["degraded"] is True
+    assert "graph write unavailable" in result["mirror"]["error"]
+    assert service.fallback._all()[0].text.endswith("prefer narrow patches")
+
+
 def test_memory_search_returns_fake_adapter_results(tmp_path):
     service = MemoryService(tmp_path, adapter=FakeGraphitiAdapter(available=True))
 
@@ -135,6 +151,28 @@ def test_memory_policy_rejects_transient_errors():
     decision = MemoryPolicy().decide("temporary error: pytest failed once")
 
     assert decision.should_store is False
+
+
+def test_memory_policy_rejects_failed_automatic_completion():
+    decision = MemoryPolicy().decide(
+        "Task completed: fixed parser",
+        "task_summary",
+        {"automatic": True, "outcome": "failed", "intent": "bug_fix"},
+    )
+
+    assert decision.should_store is False
+    assert "outcome" in decision.reason
+
+
+def test_memory_policy_rejects_unverified_automatic_bug_lesson():
+    decision = MemoryPolicy().decide(
+        "The fix was to add a bounds check",
+        "bug_lesson",
+        {"automatic": True, "outcome": "success_unverified", "intent": "bug_fix"},
+    )
+
+    assert decision.should_store is False
+    assert decision.reason == "bug lesson is not verified"
 
 
 def test_memory_policy_rejects_secrets():

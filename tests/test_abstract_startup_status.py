@@ -20,7 +20,8 @@ def _run(tmp_path, adapter, monkeypatch):
 def test_startup_shows_required_tool_message_when_unavailable(tmp_path, monkeypatch):
     output = _run(tmp_path, FakeCodebaseMemoryAdapter(available=False), monkeypatch)
 
-    assert "Codebase-Memory MCP is required" in output
+    assert "Codebase-Memory MCP is not available" in output
+    assert "degraded" in output
 
 
 def test_startup_builds_index_automatically_when_missing(tmp_path, monkeypatch):

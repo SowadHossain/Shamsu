@@ -29,6 +29,7 @@ from pathlib import Path
 
 import httpx
 
+from shamsu.indexer.policy import DEFAULT_EXCLUDED_DIRS, SOURCE_SUFFIXES, walk_workspace_files
 from shamsu.types import SearchResult
 
 EMBED_MODEL = os.environ.get("SHAMSU_EMBED_MODEL", "nomic-embed-text").strip()
@@ -47,12 +48,8 @@ _MIN_SCORE = 0.35                # cosine floor: below this it's noise, not a hi
 
 # Kept in sync with plan_mode's grounding sets by test (importing them here
 # would pull the agents layer into the retriever layer).
-_SOURCE_SUFFIXES = frozenset(
-    {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".json", ".md", ".txt", ".toml", ".yml", ".yaml"}
-)
-_IGNORED_DIRS = frozenset(
-    {"node_modules", "__pycache__", "venv", ".venv", "dist", "build", "site-packages", "migrations"}
-)
+_SOURCE_SUFFIXES = SOURCE_SUFFIXES
+_IGNORED_DIRS = DEFAULT_EXCLUDED_DIRS
 
 # Embedder signature: texts -> one vector per text.
 Embedder = Callable[[list[str]], list[list[float]]]
@@ -141,17 +138,14 @@ class SemanticIndex:
     def _source_files(self) -> dict[str, float]:
         found: dict[str, float] = {}
         try:
-            for path in self.workspace_root.rglob("*"):
-                if len(found) >= _MAX_INDEXED_FILES:
-                    break
-                if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
-                    continue
-                try:
-                    relative = path.relative_to(self.workspace_root)
-                except ValueError:
-                    continue
-                if any(part in _IGNORED_DIRS or part.startswith(".") for part in relative.parts):
-                    continue
+            files = walk_workspace_files(
+                self.workspace_root,
+                limit=_MAX_INDEXED_FILES,
+                suffixes=_SOURCE_SUFFIXES,
+                indexable_only=True,
+            )
+            for path in files:
+                relative = path.relative_to(self.workspace_root)
                 try:
                     found[relative.as_posix()] = path.stat().st_mtime
                 except OSError:

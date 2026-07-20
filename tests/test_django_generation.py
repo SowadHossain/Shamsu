@@ -80,12 +80,63 @@ def test_project_writer_writes_inside_workspace_and_records_state(tmp_path):
     state = DjangoProjectWriter(tmp_path, approval_func=approve).write_project(_todo_spec(), prd)
 
     assert approvals
+    assert "manage.py" in approvals[0].target_paths
     assert (tmp_path / "manage.py").exists()
     assert (tmp_path / "app" / "models.py").exists()
     assert (tmp_path / "README.md").exists()
     assert "manage.py" in state.completed_files
     assert "README.md" in state.completed_files
     assert not any(step.status == TaskStepStatus.SKIPPED for step in state.generation_order)
+
+
+def test_project_writer_denial_does_not_create_target_directory(tmp_path):
+    prd = tmp_path / "todo.md"
+    prd.write_text("# Todo App\n", encoding="utf-8")
+    target = tmp_path / "denied-project"
+
+    with pytest.raises(PermissionError, match="not approved"):
+        DjangoProjectWriter(tmp_path, approval_func=lambda _request: False).write_project(
+            _todo_spec(), prd, target_dir=target
+        )
+
+    assert target.exists() is False
+
+
+def test_project_writer_cancellation_rolls_back_partial_files(tmp_path, monkeypatch):
+    prd = tmp_path / "todo.md"
+    prd.write_text("# Todo App\n", encoding="utf-8")
+    target = tmp_path / "cancelled-project"
+    writer = DjangoProjectWriter(tmp_path, approval_func=lambda _request: True)
+    original_write = writer._write_file
+    calls = 0
+
+    def cancel_on_second(root, relative_path, content, transaction_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        original_write(root, relative_path, content, transaction_id)
+
+    monkeypatch.setattr(writer, "_write_file", cancel_on_second)
+
+    with pytest.raises(KeyboardInterrupt):
+        writer.write_project(_todo_spec(), prd, target_dir=target)
+
+    assert not any(path.is_file() for path in target.rglob("*"))
+
+
+def test_project_writer_does_not_reuse_done_state_for_a_new_target(tmp_path):
+    prd = tmp_path / "todo.md"
+    prd.write_text("# Todo App\n\n## Entities\n- Task: title (text)\n", encoding="utf-8")
+    writer = DjangoProjectWriter(tmp_path, approval_func=lambda _request: True)
+
+    first = writer.write_project(_todo_spec(), prd, target_dir=tmp_path / "first")
+    second = writer.write_project(_todo_spec(), prd, target_dir=tmp_path / "second")
+
+    assert first.target_dir == "first"
+    assert second.target_dir == "second"
+    assert (tmp_path / "first" / "app" / "models.py").exists()
+    assert (tmp_path / "second" / "app" / "models.py").exists()
 
 
 def test_project_writer_rejects_path_escape(tmp_path):

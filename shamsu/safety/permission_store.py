@@ -12,6 +12,7 @@ from pathlib import Path
 from shamsu.safety.sandbox import Sandbox
 
 PERMISSIONS_FILENAME = "permissions.json"
+PERMISSIONS_SCHEMA_VERSION = 2
 
 
 class PermissionMemory:
@@ -53,12 +54,19 @@ class PermissionMemory:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return set()
-        return set(data.get("always_allow", []))
+        remembered = data.get("always_allow", []) if isinstance(data, dict) else []
+        return {str(action) for action in remembered if isinstance(action, str)}
 
     def _save(self) -> None:
         path = self._path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"always_allow": sorted(self._workspace_remembered)}, indent=2),
+            json.dumps(
+                {
+                    "schema_version": PERMISSIONS_SCHEMA_VERSION,
+                    "always_allow": sorted(self._workspace_remembered),
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )

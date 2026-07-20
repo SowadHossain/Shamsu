@@ -18,6 +18,7 @@ from typing import Any
 
 from json_repair import repair_json
 
+from shamsu.indexer.policy import DEFAULT_EXCLUDED_DIRS, SOURCE_SUFFIXES, walk_workspace_files
 from shamsu.llm.manager import LLMManager
 from shamsu.memory.service import MemoryService
 from shamsu.plans.store import new_plan_id, parse_plan_steps, write_plan
@@ -26,12 +27,8 @@ _MAX_STEPS = 12
 
 # Files worth grounding a plan on, and directories that are never the user's
 # code (a plan step targeting node_modules is noise, not grounding).
-_SOURCE_SUFFIXES = frozenset(
-    {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".json", ".md", ".txt", ".toml", ".yml", ".yaml"}
-)
-_IGNORED_DIRS = frozenset(
-    {"node_modules", "__pycache__", "venv", ".venv", "dist", "build", "site-packages", "migrations"}
-)
+_SOURCE_SUFFIXES = SOURCE_SUFFIXES
+_IGNORED_DIRS = DEFAULT_EXCLUDED_DIRS
 
 
 def workspace_source_files(workspace: Path, limit: int = 40) -> list[str]:
@@ -44,15 +41,12 @@ def workspace_source_files(workspace: Path, limit: int = 40) -> list[str]:
     workspace = Path(workspace)
     found: list[tuple[float, str]] = []
     try:
-        for path in workspace.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in _SOURCE_SUFFIXES:
-                continue
-            try:
-                relative = path.relative_to(workspace)
-            except ValueError:
-                continue
-            if any(part in _IGNORED_DIRS or part.startswith(".") for part in relative.parts):
-                continue
+        for path in walk_workspace_files(
+            workspace,
+            suffixes=_SOURCE_SUFFIXES,
+            indexable_only=True,
+        ):
+            relative = path.relative_to(workspace)
             try:
                 found.append((path.stat().st_mtime, relative.as_posix()))
             except OSError:

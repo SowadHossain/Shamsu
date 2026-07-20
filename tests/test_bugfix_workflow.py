@@ -114,3 +114,59 @@ def test_bugfix_applies_diff_with_bad_hunk_counts_without_full_rewrite(tmp_path)
     assert result.used_full_rewrite is False   # applied straight from the diff now
     assert result.changed_files == ["app.py"]
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "bug = 2\n"
+
+
+def test_bugfix_rewrites_when_a_valid_diff_will_not_apply(tmp_path):
+    """A well-formed diff whose context lines don't match the file validates,
+    then FAILS to apply ("context does not match target file"). Live 2026-07-21
+    this killed every logic-change fix with no recovery. It must now fall
+    through to the full-file rewrite, the same as a malformed diff."""
+    (tmp_path / "billing.py").write_text(
+        "def discount(price, pct):\n    return price + (price * pct)\n", encoding="utf-8"
+    )
+    mismatch_diff = (
+        "--- a/billing.py\n"
+        "+++ b/billing.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def discount(price, pct):\n"
+        "-    return NONEXISTENT_CONTEXT_LINE\n"
+        "+    return price - (price * pct)\n"
+    )
+    full_rewrite = "def discount(price, pct):\n    return price - (price * pct)\n"
+    llm = _FakeLLM(plan_text="Fix billing.py.", bugfix_responses=[mismatch_diff, full_rewrite])
+
+    result = asyncio.run(
+        _workflow(tmp_path, llm, search=_EmptySearch()).run("fix discount so it subtracts")
+    )
+
+    assert result.applied is True
+    assert result.used_full_rewrite is True
+    assert (tmp_path / "billing.py").read_text(encoding="utf-8") == full_rewrite
+
+
+def test_bugfix_does_not_rewrite_around_a_denied_patch(tmp_path):
+    """A DENIAL is final - a valid diff the user rejected must never be smuggled
+    in via the rewrite fallback."""
+    original = "def discount(price, pct):\n    return price + (price * pct)\n"
+    (tmp_path / "billing.py").write_text(original, encoding="utf-8")
+    good_diff = (
+        "--- a/billing.py\n"
+        "+++ b/billing.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def discount(price, pct):\n"
+        "-    return price + (price * pct)\n"
+        "+    return price - (price * pct)\n"
+    )
+    llm = _FakeLLM(plan_text="Fix billing.py.", bugfix_responses=[good_diff, "REWRITE SHOULD NOT RUN"])
+    workflow = BugFixWorkflow(
+        tmp_path,
+        search=_EmptySearch(),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: False),  # deny
+    )
+
+    result = asyncio.run(workflow.run("fix discount so it subtracts"))
+
+    assert result.applied is False
+    assert result.used_full_rewrite is False
+    assert (tmp_path / "billing.py").read_text(encoding="utf-8") == original

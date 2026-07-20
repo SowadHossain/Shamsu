@@ -202,6 +202,11 @@ class ProjectSpec:
     # registry dataclasses into this base types module.
     prd_contract: Any = None            # shamsu.prd.contract.PRDContract
     suitability: Any = None             # shamsu.registry.suitability.TemplateSuitability
+    generation_ready: bool = True
+    needs_input: bool = False
+    clarification_question: str = ""
+    assumptions: list[str] = field(default_factory=list)
+    definition_of_done: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -301,6 +306,7 @@ class ApprovalRequest:
     preview: Optional[str] = None
     working_dir: Optional[str] = None
     reason: Optional[str] = None
+    target_paths: list[str] = field(default_factory=list)
 
 
 class CommandRisk(str, Enum):
@@ -318,6 +324,12 @@ class ParsedPRD:
     title: str
     sections: dict[str, list[str]]    # heading -> list of bullet/line strings
     raw_text: str = ""
+    source_path: str = ""
+    source_kind: str = "text"
+    source_refs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    tables: list[dict[str, Any]] = field(default_factory=list)
+    extraction_confidence: float = 1.0
+    extraction_warnings: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────

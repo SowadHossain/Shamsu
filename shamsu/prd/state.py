@@ -32,6 +32,7 @@ class GenerationState:
     project_name: str
     app_name: str
     generation_order: list[GenerationStepState]
+    target_dir: str = "."
     completed_files: list[str] = field(default_factory=list)
     last_error: str | None = None
     accepted: bool = False
@@ -64,6 +65,7 @@ def create_generation_state(
     prd_path: Path,
     workspace: Path,
     accepted: bool = False,
+    target_dir: Path | str | None = None,
 ) -> GenerationState:
     validated_prd = Sandbox(workspace).validate(prd_path)
     try:
@@ -75,12 +77,18 @@ def create_generation_state(
         for index, file_spec in enumerate(project.generation_order)
     ]
     contract = getattr(project, "prd_contract", None)
+    validated_target = Sandbox(workspace).validate(target_dir or ".")
+    try:
+        target_relative = str(validated_target.relative_to(Path(workspace).resolve())) or "."
+    except ValueError:
+        target_relative = str(validated_target)
     return GenerationState(
         task_id=f"prd-{uuid.uuid4().hex[:12]}",
         prd_path=prd_relative,
         project_name=project.project_name,
         app_name=project.app_name,
         generation_order=steps,
+        target_dir=target_relative,
         accepted=accepted,
         prd_contract=contract.to_dict() if contract is not None else None,
     )
@@ -171,6 +179,7 @@ def _state_from_dict(data: dict) -> GenerationState:
         project_name=data["project_name"],
         app_name=data["app_name"],
         generation_order=steps,
+        target_dir=data.get("target_dir", "."),
         completed_files=data.get("completed_files", []),
         last_error=data.get("last_error"),
         accepted=data.get("accepted", False),

@@ -1,8 +1,13 @@
 # SHAMSU Progress Tracker
 
-This is the living implementation ledger. Every agent should update this file
-after completing a feature slice, changing priorities, or discovering a
-blocker.
+This is the living implementation ledger — append-only history. Every agent
+should add to this file after completing a feature slice, changing priorities,
+or discovering a blocker.
+
+> **For the current snapshot, read `CURRENT_STATE.md` instead.** This file is
+> long and historical; entries below are accurate as of the date they were
+> written, not necessarily today. `CURRENT_STATE.md` is the single place that
+> says what works right now (last verified 2026-07-20).
 
 ## Current State
 
@@ -202,6 +207,20 @@ blocker.
 
 ## In Progress
 
+### Reliability beta completed (2026-07-20)
+
+- [x] Completed reliability work packages 1-12: baseline/harness, canonical
+  outcomes and logs, patch correctness, composite routing, shared file policy,
+  async memory, TaskFlow PRD acceptance, web/browser, approvals, diagnostics,
+  REPL modularization, and beta release hardening.
+- [x] Added schema-2 state upgrades, canonical empty artifacts, concise run
+  inspection, one-time first-run capability reports, and expanded doctor checks.
+- [x] Validated Bash and PowerShell lifecycle scripts and added Windows/Linux/
+  macOS CI release smoke coverage.
+- [x] Passed Python/Django/Node/React/mixed deterministic dogfood with complete
+  run evidence and published performance/log-growth measurements.
+- [x] Cut package metadata and docs for `0.4.0b1`.
+
 - [ ] v2.3 phase two: marker-based hole filling, bounded DoD repair loop, and Playwright runtime checks for the multiplayer-game template.
 - [ ] Milestone 6 status/log/progress views, safety audit, release docs, and final release cut.
 
@@ -215,10 +234,14 @@ blocker.
 ## Known Notes
 
 - Keep `shamsu/types.py` and `shamsu/interfaces.py` stable unless the team explicitly agrees to change the contract.
-- The root README is for humans; `agent context/AGENTS.md` and this file are for future agent handoff.
-- `agent context/DEV-TASK-DIVI.MD` is the issue/PR planning board for the remaining MVP work.
-- `agent context/MILESTONE-2-FINISH-PLAN.md` records the completed Milestone 2
-  merge checklist and verification path.
+- The root README is for humans; `agent context/AGENTS.md`, `agent context/CURRENT_STATE.md`, and this file are for future agent handoff.
+- **Stale pointers (2026-07-20):** `DEV-TASK-DIVI.MD`, `MILESTONE-2-FINISH-PLAN.md`,
+  `SHAMSU_10day_dev_plan.md`, `SHAMSU_week2_milestone_v2.md`,
+  `claude-hand-off-plan.md`, `SHAMSU_agent_gap_analysis.md`, and
+  `v2.3-techstack-recomendation.md` no longer exist in `agent context/`.
+  References to them below are history, not live pointers. The folder now holds
+  `AGENTS.md`, `CURRENT_STATE.md`, `REQUIREMENTS.md`, `PROGRESS.md`, and
+  `SHAMSU_RELIABILITY_PRODUCT_PLAN.md`.
 - Feature work should branch from `develop` and merge back through PRs. `main`
   is protected for stable milestone merges only.
 - PR #53 (`dev-a`) was reviewed on 2026-07-02 and is conflicting/stale; the safe dirty-worktree warning behavior was salvaged onto `feature/dev-a/frontend-consistency-checker`.

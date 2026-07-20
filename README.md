@@ -2,9 +2,9 @@
 
 Local-first autonomous coding agent for low-resource machines.
 
-SHAMSU is being built as a lightweight coding teammate that can inspect,
-index, search, explain, parse PRDs, and eventually edit, fix, test, document,
-and generate software projects without depending on expensive cloud AI APIs.
+SHAMSU is a lightweight coding teammate that can inspect, index, search,
+explain, edit, fix, test, document, research, and generate software projects
+without depending on cloud AI APIs for inference.
 
 The core rule:
 
@@ -36,6 +36,10 @@ Working now:
 - QA, code-edit, bug-fix, audit, test-generation, and documentation workflows
 - Claude-like prompt loop with local model routing and keyword fallback
 - Workspace-local sessions, resume, redacted event logs, and export bundles
+- Canonical per-prompt runs with decisions, tool/model calls, contexts,
+  mutations, diagnostics, verification, and final output
+- Noninteractive `shamsu run` harness with deterministic approvals, timeout,
+  dry-run, JSON output, and artifact validation
 - Workspace path sandbox for file inputs such as `parse-prd`
 - Command risk classifier and secret redaction helpers
 - Internal command runner with workspace checks, blocked-command rejection,
@@ -43,13 +47,13 @@ Working now:
 - Internal patch validation and Rich diff preview for unified diffs
 - Approval-backed patch apply/rollback with post-patch re-indexing
 - Agent progress tracking in `agent context/PROGRESS.md`
+- Full PRD-to-Django generation with frontend templates, setup, migrations,
+  tests, repair loop, acceptance checks, and local browser inspection
+- First-run capability report plus read-only runtime/index/memory/web/browser
+  diagnostics
 
-Planned next:
-
-- Frontend page/template generation
-- Generated-project dependency install, migrations, and tests
-- Error feedback loop for generated-project failures
-- Full PRD-to-Django pipeline orchestration
+Beta boundaries: generated Django projects target local SQLite development;
+model quality varies by tier; and the workspace sandbox is not an OS sandbox.
 
 ## Requirements
 
@@ -115,11 +119,10 @@ Installer flags:
 -ModelsPath <path> / --models-path <path>
 ```
 
-By default, install does **not** download any model weights. The CLI starts up
-immediately, and each model downloads itself (with a progress bar) the first
-time a task actually needs it. Pass `-PrefetchModels`/`--prefetch-models` if
-you want every required model pulled upfront instead — for example, to
-guarantee the machine works fully offline before you disconnect it.
+By default, install does **not** download model weights. On the first
+interactive run in a workspace, SHAMSU asks for a model tier and downloads
+that tier with visible progress. Pass `-PrefetchModels`/`--prefetch-models`
+to fetch the default tier during installation instead.
 
 The installer may download Ollama and model weights when approved. SHAMSU itself
 does not edit your PowerShell profile, registry, shell startup files, or global
@@ -214,6 +217,19 @@ Bash:
 SHAMSU_WORKSPACE=/path/to/some-project scripts/run-shamsu.sh
 ```
 
+### Run One Prompt Noninteractively
+
+The headless path uses the same dispatcher and writes the same run evidence:
+
+```powershell
+python -m shamsu.cli.repl run --workspace . --prompt "fix the failing test" --approval deny --output json
+python -m shamsu.cli.repl run --workspace . --prompt "show the planned edits" --dry-run --output json
+```
+
+Approval modes are `deny`, `allow`, and `prompt`. Headless mode defaults to
+deny, has a bounded timeout, and returns a nonzero exit code for failed,
+denied, cancelled, or timed-out requests.
+
 ## CLI Commands
 
 Start the REPL:
@@ -242,6 +258,10 @@ models repair
 /browse click <selector>
 /browse type <selector> <text>
 /browse screenshot
+/doctor
+/runs
+/run show [run-id]
+/run timeline|decisions|tools|commands|context|diff|validate [run-id]
 sessions list
 sessions current
 sessions show <id>
@@ -405,6 +425,16 @@ log tail
 Exports are redacted ZIP bundles containing `session.json`, `events.jsonl`, and
 a Markdown summary.
 
+Every prompt also has a canonical run under `.shamsu/runs/<run-id>/`.
+`/run show` gives the concise prompt-to-outcome report: structured decisions,
+tool outcomes, changed files, verification, and final response. Detailed
+subcommands expose the timeline and individual artifact groups.
+
+SHAMSU does not persist private raw chain-of-thought. It records concise
+reason summaries, evidence, alternatives, chosen actions, outcomes, tool/model
+metadata, and redacted context previews. This is enough to debug how a task
+was tackled without turning hidden reasoning or secrets into durable logs.
+
 ### Natural-Language Request
 
 Any other text routes into the local assistant:
@@ -435,6 +465,41 @@ shamsu> models repair
 models. If a workflow hits a local-runtime failure, SHAMSU can kick off this
 guided repair flow from inside the chat instead of only surfacing the raw
 error.
+
+### Model Tiers
+
+| Tier | Thinking/text model | Coding model | Intended host | Measured limitation |
+|---|---|---|---|---|
+| `light` | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` | 8 GB RAM / CPU-first | Faster, but the current 12-case eval is 9/12; clarification and rename/destructive-ambiguity cases remain weak. |
+| `default` | `deepseek-r1:7b` | `qwen2.5-coder:7b-instruct` | 8 GB+ with one model active at a time | Current 12-case eval is 11/12 with two stochastic cases; model swaps can dominate task time. |
+| `heavy` | `mistral-nemo:12b` | `qwen2.5-coder:14b` | 16 GB+ | Higher memory and download cost; not yet represented by a published three-sample benchmark. |
+
+Choose with `/models tier light|default|heavy` or `SHAMSU_MODEL_TIER`. See
+`BENCHMARK.md`, `BENCHMARK-light.md`, and `RELEASE_VALIDATION.md` for measured
+results. A single stochastic model run is not a release-quality measurement.
+
+### Local State And Retention
+
+```text
+.shamsu/
+  state.json                 workspace state schema marker
+  first-run-report.json      one-time six-capability readiness report
+  model_tier.json            selected local model tier
+  index.db                   local code/search index
+  permissions.json           remembered low-risk write/edit approvals
+  sessions/                  resumable conversation metadata and events
+  runs/<run-id>/             canonical prompt evidence and final output
+  abstract/                  code-memory health and generation metadata
+  memory/                    local Graphiti/SQLite memory state
+  web/ and web_cache.db      optional web provider config and cache
+  browser/                   local screenshots
+```
+
+Run logs default to 30-day retention, configured in
+`.shamsu/action_ledger/config.json`; `/run clean` previews stale runs and requires
+approval before deleting them. Session history, indexes, memory, browser
+screenshots, and web cache are not removed by run retention. Workspace state
+schema upgrades are idempotent and never rewrite historical run evidence.
 
 ### `/web ...` and automatic web lookup
 
@@ -640,11 +705,11 @@ Bash:
 bash scripts/doctor.sh
 ```
 
-`doctor` checks the editable install, Ollama status, PATH setup, and for
-stray nested `.shamsu` workspace folders (a common cause of "wrong index" or
-"it forgot everything" symptoms when `shamsu` was run from different
-directories inside the same project). It only reports; it never changes
-anything.
+`doctor` checks the editable install, runtime and model cookbook, PATH setup,
+index and memory health, web fallback, Playwright Chromium, state schema,
+run integrity, and stray/ancestor `.shamsu` workspaces. It only reports; it
+never repairs. The first interactive launch writes the six core capability
+results to `.shamsu/first-run-report.json`.
 
 ### Reinstall Dependencies (last resort)
 

@@ -20,6 +20,7 @@ to decide what's resident.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -354,10 +355,17 @@ class LLMManager(ILLMManager):
             return
         if self.session_logger:
             try:
+                payload = {
+                    "model": model,
+                    "thinking_chars": len(thinking),
+                    "reasoning_available": True,
+                }
+                if self.action_ledger and self.action_ledger.config.get("debug_full_trace", False):
+                    payload["thinking"] = thinking[:4000]
                 self.session_logger.log(
                     "llm.thinking",
-                    {"model": model, "thinking_chars": len(thinking), "thinking": thinking[:4000]},
-                    "Model reasoning trace",
+                    payload,
+                    "Model reasoning metadata",
                     workflow_id="reasoning",
                 )
             except Exception:
@@ -407,13 +415,25 @@ class LLMManager(ILLMManager):
                 workflow_id=workflow_id,
             )
         prompt_preview = "\n".join(str(item.get("content", "")) for item in messages[-8:])
+        ledger_call_id = ""
         if self.action_ledger:
-            self.action_ledger.log_model_call_started(role, model, prompt_preview)
+            ledger_call_id = self.action_ledger.log_model_call_started(role, model, prompt_preview)
         started = time.perf_counter()
-        async with httpx.AsyncClient(timeout=_blocking_timeout()) as client:
-            response = await client.post(f"{self.base_url}/api/chat", json=payload)
-            response.raise_for_status()
-            data = response.json()
+        try:
+            async with httpx.AsyncClient(timeout=_blocking_timeout()) as client:
+                response = await client.post(f"{self.base_url}/api/chat", json=payload)
+                response.raise_for_status()
+                data = response.json()
+        except Exception as exc:
+            if self.action_ledger:
+                self.action_ledger.log_model_call_finished(
+                    role,
+                    model,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    call_id=ledger_call_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            raise
         content = ""
         message = data.get("message")
         if isinstance(message, dict):
@@ -438,6 +458,7 @@ class LLMManager(ILLMManager):
                 content,
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
                 meta={"tool_count": len(tools or [])},
+                call_id=ledger_call_id,
             )
         return data
     async def generate_structured(
@@ -469,15 +490,17 @@ class LLMManager(ILLMManager):
                 "Routing request sent to local model",
                 workflow_id="router",
             )
+        router_call_id = ""
         if self.action_ledger:
-            self.action_ledger.log_model_call_started("router", self.router_model, user_msg)
+            router_call_id = self.action_ledger.log_model_call_started("router", self.router_model, user_msg)
         raw = await self._generate(
             self.router_model, ROUTER_SYSTEM_PROMPT, user_msg,
             temperature=0.0, json_schema=ROUTING_JSON_SCHEMA, keep_alive="-1",
         )
         if self.action_ledger:
             self.action_ledger.log_model_call_finished(
-                "router", self.router_model, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2)
+                "router", self.router_model, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                call_id=router_call_id,
             )
         decision = self._parse_routing(raw)
         if decision is not None:
@@ -491,15 +514,17 @@ class LLMManager(ILLMManager):
             f"Do not include any prose, markdown, or code fences.\n\n{user_msg}"
         )
         retry_started = time.perf_counter()
+        retry_call_id = ""
         if self.action_ledger:
-            self.action_ledger.log_model_call_started("router", self.router_model, retry_prompt)
+            retry_call_id = self.action_ledger.log_model_call_started("router", self.router_model, retry_prompt)
         raw2 = await self._generate(
             self.router_model, ROUTER_SYSTEM_PROMPT, retry_prompt,
             temperature=0.0, json_schema=ROUTING_JSON_SCHEMA, keep_alive="-1",
         )
         if self.action_ledger:
             self.action_ledger.log_model_call_finished(
-                "router", self.router_model, raw2, duration_ms=round((time.perf_counter() - retry_started) * 1000, 2)
+                "router", self.router_model, raw2, duration_ms=round((time.perf_counter() - retry_started) * 1000, 2),
+                call_id=retry_call_id,
             )
         decision = self._parse_routing(raw2)
         if decision is not None:
@@ -585,15 +610,27 @@ class LLMManager(ILLMManager):
                 f"Specialist request sent to {specialist}",
                 workflow_id=pack.task_id,
             )
+        ledger_call_id = ""
         if self.action_ledger:
-            self.action_ledger.log_context_preview(_context_preview(pack))
-            self.action_ledger.log_model_call_started(specialist, model_name, prompt)
+            ledger_call_id = self.action_ledger.log_model_call_started(specialist, model_name, prompt)
+            self.action_ledger.log_context_preview(
+                _context_preview(pack, self.action_ledger.workspace),
+                model_call_id=ledger_call_id,
+            )
         try:
             raw = await self._generate(
                 model_name, "", prompt, temperature=temp,
                 _estimated_tokens=estimated_tokens,
             )
         except Exception as exc:
+            if self.action_ledger:
+                self.action_ledger.log_model_call_finished(
+                    specialist,
+                    model_name,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    call_id=ledger_call_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             if self.session_logger:
                 self.session_logger.log(
                     "llm.error",
@@ -617,7 +654,8 @@ class LLMManager(ILLMManager):
             )
         if self.action_ledger:
             self.action_ledger.log_model_call_finished(
-                specialist, model_name, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2)
+                specialist, model_name, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                call_id=ledger_call_id,
             )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
 
@@ -695,15 +733,27 @@ class LLMManager(ILLMManager):
                 f"Specialist request sent to {specialist} (streaming)",
                 workflow_id=pack.task_id,
             )
+        ledger_call_id = ""
         if self.action_ledger:
-            self.action_ledger.log_context_preview(_context_preview(pack))
-            self.action_ledger.log_model_call_started(specialist, model_name, prompt)
+            ledger_call_id = self.action_ledger.log_model_call_started(specialist, model_name, prompt)
+            self.action_ledger.log_context_preview(
+                _context_preview(pack, self.action_ledger.workspace),
+                model_call_id=ledger_call_id,
+            )
         try:
             raw = await self._generate_stream(
                 model_name, "", prompt, on_token, temperature=temp,
                 _estimated_tokens=estimated_tokens,
             )
         except Exception as exc:
+            if self.action_ledger:
+                self.action_ledger.log_model_call_finished(
+                    specialist,
+                    model_name,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    call_id=ledger_call_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             if self.session_logger:
                 self.session_logger.log(
                     "llm.error",
@@ -727,7 +777,8 @@ class LLMManager(ILLMManager):
             )
         if self.action_ledger:
             self.action_ledger.log_model_call_finished(
-                specialist, model_name, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2)
+                specialist, model_name, raw, duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                call_id=ledger_call_id,
             )
         return LLMResponse(raw=raw, format="text", model_used=model_name)
 
@@ -807,24 +858,50 @@ class LLMManager(ILLMManager):
         return "\n\n".join(sections) + "\n"
 
 
-def _context_preview(pack: ContextPack) -> dict:
+def _context_preview(pack: ContextPack, workspace: Path | None = None) -> dict:
     """Safe, human-inspectable summary of a ContextPack for ActionLedger -
     never fed back into a model, see shamsu/action_ledger/ledger.py."""
+    snippets = []
+    for item in pack.snippets:
+        mtime = None
+        if workspace is not None:
+            try:
+                candidate = (workspace / item.file_path).resolve()
+                if candidate.is_relative_to(workspace.resolve()) and candidate.is_file():
+                    mtime = candidate.stat().st_mtime
+            except OSError:
+                mtime = None
+        snippets.append(
+            {
+                "file_path": item.file_path,
+                "line_start": item.line_start,
+                "line_end": item.line_end,
+                "symbol_name": item.symbol_name,
+                "retrieval_score": item.score,
+                "inclusion_reason": "retrieval_result",
+                "content_sha256": hashlib.sha256(item.content.encode("utf-8")).hexdigest(),
+                "file_mtime": mtime,
+            }
+        )
+    index_metadata: dict = {}
+    if workspace is not None:
+        try:
+            from shamsu.abstract.service import AbstractService
+
+            index_metadata = AbstractService(workspace).index_metadata()
+        except Exception:
+            index_metadata = {}
     return {
         "task_id": pack.task_id,
         "step_id": pack.step_id,
         "specialist": pack.specialist,
         "token_estimate": pack.token_estimate,
         "prompt_preview": pack.user_request[:500],
-        "snippets": [
-            {
-                "file_path": item.file_path,
-                "line_start": item.line_start,
-                "line_end": item.line_end,
-                "symbol_name": item.symbol_name,
-            }
-            for item in pack.snippets
-        ],
+        "prompt_sha256": hashlib.sha256(pack.user_request.encode("utf-8")).hexdigest(),
+        "system_prompt_version": "specialist-pack-v1",
+        "snippets": snippets,
+        "code_memory_index": index_metadata,
+        "omitted_context": {},
     }
 
 

@@ -46,6 +46,16 @@ def test_forget_then_not_recalled_then_re_remember(tmp_path: Path):
     assert any("old-wrong-host" in m.text for m in svc.get_relevant("API base url"))
 
 
+def test_tombstone_is_also_applied_to_search(tmp_path: Path):
+    svc = _svc(tmp_path)
+    fact = "The retired queue name is legacy-work-items"
+    svc.remember(fact, kind="architecture_note")
+    svc._add_tombstone("legacy-work-items")
+
+    result = svc.search("retired queue")
+
+    assert all("legacy-work-items" not in str(item) for item in result["results"])
+
 def test_forget_empty_value_is_rejected(tmp_path: Path):
     svc = _svc(tmp_path)
     out = svc.forget("   ")

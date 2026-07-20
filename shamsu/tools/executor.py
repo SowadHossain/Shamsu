@@ -53,8 +53,13 @@ class CommandRunner(ICommandRunner):
         )
         self.diagnostics_workspace = DiagnosticsWorkspace(self.workspace_root)
         self.last_error_packet: ErrorPacket | None = None
+        self.last_diagnostic_packet: ErrorPacket | None = None
+        self.last_diagnostics_path = ""
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
+        self.last_error_packet = None
+        self.last_diagnostic_packet = None
+        self.last_diagnostics_path = ""
         if self.session_logger:
             self.session_logger.log(
                 "command.started",
@@ -157,7 +162,14 @@ class CommandRunner(ICommandRunner):
                 "timeout",
                 details={"command": command, "stdout": stdout, "stderr": message},
             )
-            diagnostics_path = self._run_diagnostics(command, validated_cwd, TIMEOUT_EXIT_CODE, stdout, message)
+            diagnostics_path = self._run_diagnostics(
+                command,
+                validated_cwd,
+                TIMEOUT_EXIT_CODE,
+                stdout,
+                message,
+                operation_id=ledger_cmd_id,
+            )
             if self.action_ledger:
                 self.action_ledger.log_command_finish(
                     ledger_cmd_id, command, validated_cwd, TIMEOUT_EXIT_CODE, stdout, message, diagnostics_path
@@ -186,24 +198,48 @@ class CommandRunner(ICommandRunner):
             "success" if result[0] == 0 else "error",
             details={"command": command, "exit_code": result[0], "stdout": result[1], "stderr": result[2]},
         )
-        diagnostics_path = self._run_diagnostics(command, validated_cwd, result[0], result[1], result[2])
+        diagnostics_path = self._run_diagnostics(
+            command,
+            validated_cwd,
+            result[0],
+            result[1],
+            result[2],
+            operation_id=ledger_cmd_id,
+        )
         if self.action_ledger:
             self.action_ledger.log_command_finish(
                 ledger_cmd_id, command, validated_cwd, result[0], result[1], result[2], diagnostics_path
             )
         return result
 
-    def _run_diagnostics(self, command: str, cwd: Path, exit_code: int, stdout: str, stderr: str) -> str:
+    def _run_diagnostics(
+        self,
+        command: str,
+        cwd: Path,
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+        operation_id: str = "",
+    ) -> str:
         """Parse this command's output into a compact ErrorPacket *before*
         anything reaches the model - never the other way around. Best-effort:
         a digest failure must never break command execution or hide the raw
         result already returned to the caller. Returns the ActionLedger-relative
         diagnostics path (empty string if there's no ledger or digest failed)."""
         try:
-            raw_log_path = str(self.session_logger.events_path) if self.session_logger else ""
+            raw_log_path = ""
+            if self.action_ledger and operation_id:
+                stream = "stderr" if stderr else "stdout"
+                raw_log_path = f"commands/{operation_id}.{stream}.log"
+            elif self.session_logger:
+                raw_log_path = str(self.session_logger.events_path)
             packet = self.diagnostic_digest.run(command, cwd, exit_code, stdout, stderr, raw_log_path=raw_log_path)
-            self.last_error_packet = packet
-            self.diagnostics_workspace.save_packet(packet.to_dict())
+            packet.phase = "execution"
+            packet.operation_id = operation_id
+            self.last_diagnostic_packet = packet
+            self.last_error_packet = packet if packet.actionable else None
+            if packet.actionable:
+                self.diagnostics_workspace.save_packet(packet.to_dict())
             if self.session_logger:
                 self.session_logger.log(
                     "diagnostics.packet",
@@ -212,7 +248,14 @@ class CommandRunner(ICommandRunner):
                     workflow_id="diagnostics",
                 )
             if self.action_ledger:
-                return self.action_ledger.log_diagnostics(packet.parser_chain, packet.summary, packet.to_dict())
+                self.last_diagnostics_path = self.action_ledger.log_diagnostics(
+                    packet.parser_chain,
+                    packet.summary,
+                    packet.to_dict(),
+                    operation_id=operation_id,
+                )
+                return self.last_diagnostics_path
+            self.last_diagnostics_path = ""
             return ""
         except Exception as exc:  # pragma: no cover - defensive, must never break command execution
             if self.session_logger:

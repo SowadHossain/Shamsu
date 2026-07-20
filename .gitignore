@@ -24,3 +24,19 @@ venv/
 *.sqlite3
 db.sqlite3
 .env
+
+# Dogfood / QA scratch workspaces. These hold real project code, PRDs, run logs
+# and session transcripts from live testing - none of it belongs on GitHub.
+#
+# The canonical workspace (../test-shamsu) already cannot leak: it is a SIBLING
+# of this repo, not inside it, and is its own git repo with no remote. These
+# patterns are belt-and-braces for a workspace created IN-tree, which is easy to
+# do by accident - `scripts/validate_release.py --work-root` takes an arbitrary
+# path, and a stray `git add -A` would otherwise sweep the whole thing up.
+test-shamsu/
+shamsu-launcher-test/
+dogfood-*/
+*-dogfood/
+
+# Scratch build/output dir used by the release scripts.
+tmp/

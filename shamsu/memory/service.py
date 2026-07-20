@@ -137,7 +137,10 @@ class MemoryService:
             workspace=str(self.workspace),
             health=health,
             memory_path=str(self.memory_dir),
-            normal_mode_allowed=health.ok,
+            normal_mode_allowed=True,
+            local_available=True,
+            degraded=not health.ok,
+            storage_mode="local+graphiti" if health.ok else "local",
         )
         self._write_json(self._status_path(), status.to_dict())
         return status
@@ -189,36 +192,117 @@ class MemoryService:
         self._log_event("add_episode", {"ok": bool(result.get("ok")), "error": result.get("error", "")})
         return result
 
-    def remember(self, text: str, kind: MemoryKind | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+    def remember_local(
+        self,
+        text: str,
+        kind: MemoryKind | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Policy-check and commit to the always-available local store."""
         decision = self.policy.decide(text, kind, metadata)
         if not decision.should_store:
             result = {"ok": False, "skipped": True, "reason": decision.reason}
             self._log_event("remember_skipped", result)
             return result
+        full_metadata = _memory_metadata(metadata)
         # Deliberately storing a fact un-forgets it (clears a prior tombstone) so
         # a wrong-then-corrected fact can come back.
         self._remove_tombstone(decision.text)
-        if self._use_fallback():
-            result = self.fallback.remember(decision.text, decision.kind, metadata)
-            self._log_event("remember_sqlite", {"ok": bool(result.get("ok")), "kind": decision.kind})
+        result = self.fallback.remember(decision.text, decision.kind, full_metadata)
+        self._log_event(
+            "remember_local",
+            {
+                "ok": bool(result.get("ok")),
+                "kind": decision.kind,
+                "deduped": bool(result.get("deduped")),
+                "source_run_id": full_metadata.get("source_run_id", ""),
+            },
+        )
+        return {
+            **result,
+            "text": decision.text,
+            "kind": decision.kind,
+            "metadata": full_metadata,
+        }
+
+    def mirror_to_graphiti(
+        self,
+        text: str,
+        kind: MemoryKind | str,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Best-effort external mirror; local persistence must happen first."""
+        if self._is_tombstoned(LongTermMemory(kind=kind, text=text)):  # type: ignore[arg-type]
+            result = {"ok": False, "skipped": True, "reason": "tombstoned"}
+            self._log_event("mirror_skipped", result)
             return result
-        existing = self.get_relevant(decision.text, limit=5)
-        if any(memory.kind == decision.kind and _norm(memory.text) == _norm(decision.text) for memory in existing):
+        try:
+            health = self.healthcheck()
+        except Exception as exc:
+            result = {"ok": False, "error": f"healthcheck failed: {exc}"}
+            self._log_event("mirror_failed", {"kind": kind, "error": result["error"]})
+            return result
+        if not health.ok:
+            result = {"ok": False, "skipped": True, "reason": health.message or "Graphiti unavailable"}
+            self._log_event("mirror_unavailable", {"kind": kind, "reason": result["reason"]})
+            return result
+        try:
+            existing = self.adapter.get_relevant(self.workspace, text, None, 8)
+        except Exception as exc:
+            result = {"ok": False, "error": f"dedup lookup failed: {exc}"}
+            self._log_event("mirror_failed", {"kind": kind, "error": result["error"]})
+            return result
+        source_run_id = str((metadata or {}).get("source_run_id") or (metadata or {}).get("run_id") or "")
+        if any(memory.kind == kind and _norm(memory.text) == _norm(text) for memory in existing):
             result = {"ok": True, "deduped": True, "message": "memory already exists"}
-            self._log_event("remember_deduped", result)
+            self._log_event("mirror_deduped", {**result, "source_run_id": source_run_id})
             return result
-        result = self.adapter.remember(self.workspace, decision.text, decision.kind, metadata)
-        self._log_event("remember", {"ok": bool(result.get("ok")), "kind": decision.kind, "error": result.get("error", "")})
+        try:
+            result = self.adapter.remember(self.workspace, text, kind, metadata)
+        except Exception as exc:
+            result = {"ok": False, "error": f"mirror write failed: {exc}"}
+        self._log_event("mirror", {"ok": bool(result.get("ok")), "kind": kind, "error": result.get("error", "")})
         if result.get("ok"):
-            self._write_json(self._last_sync_path(), {"ts": time.time(), "kind": decision.kind})
+            self._write_json(self._last_sync_path(), {"ts": time.time(), "kind": kind, "source_run_id": source_run_id})
         return result
 
+    def remember(self, text: str, kind: MemoryKind | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Synchronous compatibility API: local commit, then Graphiti mirror."""
+        local = self.remember_local(text, kind, metadata)
+        if not local.get("ok"):
+            return local
+        mirror = self.mirror_to_graphiti(
+            str(local.get("text") or text),
+            str(local.get("kind") or kind or "task_summary"),
+            dict(local.get("metadata") or metadata or {}),
+        )
+        return {
+            **local,
+            "ok": True,
+            "local": True,
+            "mirror": mirror,
+            "degraded": not bool(mirror.get("ok")),
+        }
+
     def search(self, query: str, limit: int = 8, filters: dict[str, Any] | None = None) -> dict[str, Any]:
+        local = self.fallback.search(query, limit)
+        tombstones = self._load_tombstones()
+        local = [item for item in local if not self._is_tombstoned(item, tombstones)]
         if self._use_fallback():
-            memories = self.fallback.search(query, limit)
-            return {"ok": True, "degraded": True, "results": [m.text for m in memories]}
+            return {"ok": True, "degraded": True, "results": [m.text for m in local]}
         result = self.adapter.search(self.workspace, query, limit, filters)
         self._log_event("search", {"ok": bool(result.get("ok")), "limit": limit, "error": result.get("error", "")})
+        external = list(result.get("results") or [])
+        local_rows = [
+            {"id": item.memory_id, "text": item.text, "kind": item.kind, "metadata": item.metadata}
+            for item in local
+        ]
+        result["results"] = [
+            item
+            for item in _dedupe_search_results(local_rows + external)
+            if not _search_result_tombstoned(self, item, tombstones)
+        ][:limit]
+        result["local_included"] = True
         return result
 
     def get_relevant(self, user_prompt: str, task_type: str | None = None, limit: int = 8) -> list[LongTermMemory]:
@@ -227,11 +311,12 @@ class MemoryService:
         # doesn't shrink the result below `limit`.
         extra = len(tombstones["ids"]) + len(tombstones["texts"])
         fetch = min(limit + extra, limit + 50) if extra else limit
-        if self._use_fallback():
-            # Graphiti down: recall from the local SQLite store instead of empty.
-            memories = self.fallback.get_relevant(user_prompt, task_type, fetch)
-        else:
-            memories = self.adapter.get_relevant(self.workspace, user_prompt, task_type, fetch)
+        memories = self.fallback.get_relevant(user_prompt, task_type, fetch)
+        if not self._use_fallback():
+            try:
+                memories.extend(self.adapter.get_relevant(self.workspace, user_prompt, task_type, fetch))
+            except Exception as exc:
+                self._log_event("recall_mirror_failed", {"error": str(exc)})
         memories = [memory for memory in memories if not self._is_tombstoned(memory, tombstones)]
         return _dedupe_memories(memories)[:limit]
 
@@ -256,10 +341,14 @@ class MemoryService:
         if not value:
             return {"ok": False, "error": "forget needs a memory id or a query text."}
         self._add_tombstone(value)
+        local = self.fallback.forget(value)
         if self._use_fallback():
-            backend = self.fallback.forget(value)
+            backend = {"ok": False, "error": "Graphiti unavailable"}
         else:
-            backend = self.adapter.forget(self.workspace, value)
+            try:
+                backend = self.adapter.forget(self.workspace, value)
+            except Exception as exc:
+                backend = {"ok": False, "error": str(exc)}
         backend_ok = bool(backend.get("ok"))
         self._log_event(
             "forget",
@@ -273,7 +362,14 @@ class MemoryService:
         )
         # Preserve backend fields (e.g. an id echo) but always report ok=True: the
         # fact will not be recalled again regardless of backend deletion support.
-        return {**backend, "ok": True, "tombstoned": True, "backend_deleted": backend_ok, "message": message}
+        return {
+            **backend,
+            "ok": True,
+            "tombstoned": True,
+            "local_deleted": int(local.get("deleted", 0)),
+            "backend_deleted": backend_ok,
+            "message": message,
+        }
 
     def summarize_session(self, session_id: str) -> dict[str, Any]:
         session_events = self.workspace / ".shamsu" / "sessions" / session_id / "events.jsonl"
@@ -294,9 +390,24 @@ class MemoryService:
         text = f"Task summary for session {session_id}: " + " ".join(summaries[-5:])
         return self.remember(text, "task_summary", {"session_id": session_id})
 
+    def log_queue_event(self, event: str, detail: dict[str, Any]) -> None:
+        self._log_event(event, detail)
+
 
 def _norm(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _memory_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    result = dict(metadata or {})
+    source_run_id = str(result.get("source_run_id") or result.get("run_id") or "")
+    result["source_run_id"] = source_run_id
+    try:
+        confidence = float(result.get("confidence", 1.0 if result.get("explicit") else 0.85))
+    except (TypeError, ValueError):
+        confidence = 0.85
+    result["confidence"] = max(0.0, min(1.0, confidence))
+    return result
 
 
 def _dedupe_memories(memories: list[LongTermMemory]) -> list[LongTermMemory]:
@@ -309,3 +420,32 @@ def _dedupe_memories(memories: list[LongTermMemory]) -> list[LongTermMemory]:
         seen.add(key)
         result.append(memory)
     return result
+
+
+def _dedupe_search_results(results: list[Any]) -> list[Any]:
+    seen: set[str] = set()
+    output: list[Any] = []
+    for item in results:
+        text = str(item.get("text", "")) if isinstance(item, dict) else str(item)
+        key = _norm(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        output.append(item)
+    return output
+
+
+def _search_result_tombstoned(
+    service: MemoryService,
+    item: Any,
+    tombstones: dict[str, set[str]],
+) -> bool:
+    if isinstance(item, dict):
+        memory = LongTermMemory(
+            kind=item.get("kind", "task_summary"),
+            text=str(item.get("text") or item.get("fact") or ""),
+            memory_id=str(item.get("id") or item.get("memory_id") or ""),
+        )
+    else:
+        memory = LongTermMemory(kind="task_summary", text=str(item))
+    return service._is_tombstoned(memory, tombstones)

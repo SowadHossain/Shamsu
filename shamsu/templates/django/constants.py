@@ -22,13 +22,14 @@ if __name__ == "__main__":
     main()
 """
 
-SETTINGS_TEMPLATE = """from pathlib import Path
+SETTINGS_TEMPLATE = """import os
+from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "{{ secret_key }}"
-DEBUG = True
-ALLOWED_HOSTS = []
+SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "{{ secret_key }}")
+DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() == "true"
+ALLOWED_HOSTS = [item for item in os.environ.get("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if item]
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -88,6 +89,15 @@ USE_TZ = True
 STATIC_URL = "static/"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+        "rest_framework_simplejwt.authentication.JWTAuthentication",
+    ],
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
+}
+
 CRISPY_ALLOWED_TEMPLATE_PACKS = "tailwind"
 CRISPY_TEMPLATE_PACK = "tailwind"
 
@@ -144,20 +154,23 @@ BASE_HTML_TEMPLATE = """<!DOCTYPE html>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/htmx.org@1.9/dist/htmx.min.js"></script>
 </head>
-<body class="min-h-screen bg-base-200">
-  <div class="navbar bg-base-100 shadow">
-    <div class="navbar-start">
+<body class="min-h-screen bg-base-200" hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'>
+  <div class="navbar gap-4 bg-base-100 shadow">
+    <div class="flex-none">
       <a href="{% url 'dashboard' %}" class="btn btn-ghost text-xl">{{ display_name }}</a>
     </div>
-    <div class="navbar-center hidden lg:flex">
+    <div class="hidden min-w-0 flex-1 lg:flex">
       <ul class="menu menu-horizontal px-1">
         {{ nav_links }}
       </ul>
     </div>
-    <div class="navbar-end">
+    <div class="ml-auto flex flex-none items-center">
       {% if user.is_authenticated %}
         <span class="text-sm mr-4 opacity-70">{{ user.username }}</span>
-        <a href="{% url 'logout' %}" class="btn btn-ghost btn-sm">Logout</a>
+        <form method="post" action="{% url 'logout' %}">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-ghost btn-sm">Logout</button>
+        </form>
       {% else %}
         <a href="{% url 'login' %}" class="btn btn-primary btn-sm">Login</a>
       {% endif %}
@@ -305,7 +318,6 @@ djangorestframework==3.15.2
 djangorestframework-simplejwt==5.3.1
 django-crispy-forms==2.3
 crispy-tailwind==1.0.3
-Pillow==10.3.0
 pytest-django==4.8.0
 """
 

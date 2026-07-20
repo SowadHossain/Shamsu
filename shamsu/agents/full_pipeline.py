@@ -108,6 +108,22 @@ class FullDjangoPipeline:
             parsed = parse_prd_file(validated_prd)
             project = build_project_spec(parsed)
             self._log("workflow.started", {"prd_path": str(validated_prd)}, "Full pipeline started")
+            if not project.generation_ready:
+                error = f"Generation needs input: {project.clarification_question}"
+                self._log(
+                    "workflow.needs_input",
+                    {"project": project.project_name, "question": project.clarification_question},
+                    "Full pipeline needs input before writing files",
+                )
+                return FullPipelineResult(
+                    prd_path=validated_prd,
+                    target_dir=validated_target,
+                    project=project,
+                    written_files=[],
+                    diagnostics=[],
+                    success=False,
+                    error=error,
+                )
 
             strategy = self._strategy(project)
             if strategy is GenerationStrategy.SCAFFOLD:

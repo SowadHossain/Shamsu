@@ -26,6 +26,10 @@ class IndexStatus:
     exists: bool = False
     stale: bool = True
     message: str = ""
+    manifest_hash: str = ""
+    policy_version: int = 0
+    workspace_generation: int = 0
+    indexed_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,8 @@ class AbstractStatus:
     health: CodebaseMemoryHealth
     index: IndexStatus
     normal_mode_allowed: bool = False
+    degraded: bool = False
+    retrieval_mode: str = "external"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -48,8 +54,14 @@ class AbstractStatus:
                 "exists": self.index.exists,
                 "stale": self.index.stale,
                 "message": self.index.message,
+                "manifest_hash": self.index.manifest_hash,
+                "policy_version": self.index.policy_version,
+                "workspace_generation": self.index.workspace_generation,
+                "indexed_generation": self.index.indexed_generation,
             },
             "normal_mode_allowed": self.normal_mode_allowed,
+            "degraded": self.degraded,
+            "retrieval_mode": self.retrieval_mode,
         }
 
 

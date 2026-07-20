@@ -40,6 +40,9 @@ def test_error_packet_ok_true_only_when_clean_exit_and_no_root_diagnostics():
     assert ErrorPacket(exit_code=0).ok is True
     assert ErrorPacket(exit_code=1).ok is False
     assert ErrorPacket(exit_code=0, root_diagnostics=[DiagnosticRecord()]).ok is False
+    assert ErrorPacket(exit_code=0).classification == "success"
+    assert ErrorPacket(exit_code=1).classification == "command_failure"
+    assert ErrorPacket(exit_code=1).actionable is True
 
 
 def test_error_packet_to_model_context_includes_root_diagnostics_and_snippets():

@@ -65,6 +65,89 @@ async def test_agent_loop_reports_changed_files(tmp_path: Path):
     assert (tmp_path / "hello.py").is_file()
 
 
+@pytest.mark.asyncio
+async def test_mutation_request_cannot_finish_on_model_done_without_tool(tmp_path: Path):
+    client = _ScriptedClient([_text_response("Done, fixed app.py.")])
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=_NoPlanLLM(),
+    )
+
+    result = await loop.run("fix app.py")
+
+    assert result.stopped is True
+    assert "no file mutation succeeded" in result.final
+    assert "No file was changed" in result.final
+
+
+@pytest.mark.asyncio
+async def test_successful_tool_result_overrides_false_model_failure(tmp_path: Path):
+    client = _ScriptedClient(
+        [
+            _tool_response("write_file", {"filepath": "hello.py", "content": "print('hi')\n"}),
+            _text_response("I could not create hello.py."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=_NoPlanLLM(),
+    )
+
+    result = await loop.run("create hello.py")
+
+    assert "mutation succeeded on disk" in result.final
+    assert "[verified]" in result.final
+    assert (tmp_path / "hello.py").read_text(encoding="utf-8") == "print('hi')\n"
+
+
+@pytest.mark.asyncio
+async def test_successful_write_is_not_reparsed_as_markdown_fallback(tmp_path: Path):
+    client = _ScriptedClient(
+        [
+            _tool_response("write_file", {"filepath": "hello.py", "content": "print('hi')\n"}),
+            _text_response("Done.\n```bash\npython hello.py\n```"),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=_NoPlanLLM(),
+    )
+
+    result = await loop.run("create hello.py")
+
+    assert result.awaiting_user is False
+    assert result.changed_files == ("hello.py",)
+
+
+@pytest.mark.asyncio
+async def test_markdown_fallback_write_counts_as_successful_mutation(tmp_path: Path):
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    client = _ScriptedClient(
+        [
+            _text_response("```python\nvalue = 2\n```"),
+            _text_response("I could not edit app.py."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=_NoPlanLLM(),
+    )
+
+    result = await loop.run("fix the bug in app.py")
+
+    assert "mutation succeeded on disk" in result.final
+    assert result.changed_files == ("app.py",)
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+
+
 # ---------------------------------------------------------------------------
 # _verify_completed_plan honest verdict
 # ---------------------------------------------------------------------------

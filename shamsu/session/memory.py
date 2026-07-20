@@ -68,6 +68,8 @@ class ConversationTurn:
 @dataclass(frozen=True)
 class ConversationMemory:
     turns: list[ConversationTurn]
+    resume_summary: str = ""
+    task_state: str = ""
 
     @classmethod
     def from_session(cls, logger: SessionLogger | None, max_events: int = 80) -> "ConversationMemory":
@@ -93,13 +95,26 @@ class ConversationMemory:
                 message = str(payload.get("message", "")).strip()
                 if message:
                     turns.append(ConversationTurn("assistant", message))
-        return cls(turns)
+        summary = logger.read_summary().strip()
+        state = logger.read_state()
+        task_state = _render_task_state(state)
+        return cls(turns, summary[:2400], task_state)
 
     def build_context(self, max_turns: int = 8) -> str:
         recent = self.turns[-max_turns:]
-        if not recent:
+        sections: list[str] = []
+        if self.resume_summary:
+            sections.append(f"Compact session resume summary:\n{self.resume_summary}")
+        if self.task_state:
+            sections.append(f"Current task state:\n{self.task_state}")
+        if recent:
+            sections.append(
+                "Recent conversation:\n"
+                + "\n".join(f"{turn.role}: {turn.text}" for turn in recent)
+            )
+        if not sections:
             return "No previous conversation turns in this session."
-        return "\n".join(f"{turn.role}: {turn.text}" for turn in recent)
+        return "\n\n".join(sections)
 
     def previous_user_prompt(self) -> str:
         for turn in reversed(self.turns[:-1] if self.turns and self.turns[-1].role == "user" else self.turns):
@@ -122,3 +137,22 @@ class ConversationMemory:
         if lowered.startswith("what about ") and len(lowered.split()) <= 5:
             return f"{previous}\nFollow-up request: {text}"
         return user_input
+
+
+def _render_task_state(state: dict) -> str:
+    lines: list[str] = []
+    pending = state.get("pending_action")
+    if isinstance(pending, dict) and pending:
+        lines.append(
+            f"- Pending action: {pending.get('type', 'action')} "
+            f"(awaiting: {pending.get('awaiting', 'user_input')})"
+        )
+    route = state.get("last_route")
+    if isinstance(route, dict) and route.get("route"):
+        lines.append(f"- Last route: {route['route']}")
+    failure = state.get("last_failure")
+    if isinstance(failure, dict) and failure:
+        command = str(failure.get("command") or "").strip()
+        exit_code = failure.get("exit_code", "")
+        lines.append(f"- Last failing command: {command or '(unknown)'} (exit {exit_code})")
+    return "\n".join(lines)

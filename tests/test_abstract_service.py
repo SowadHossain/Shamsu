@@ -37,14 +37,17 @@ class FakeCodebaseMemoryAdapter:
         return {"ok": self.available, "message": "ok" if self.available else "still missing"}
 
 
-def test_ensure_ready_blocks_when_codebase_memory_unavailable(tmp_path):
+def test_ensure_ready_allows_degraded_mode_when_codebase_memory_unavailable(tmp_path):
     service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=False))
 
     gate = service.ensure_ready()
 
-    assert gate.allowed is False
+    assert gate.allowed is True
     assert gate.reason == REQUIRED_TOOL_MESSAGE
     assert "/abstract setup" in gate.reason
+    assert gate.status is not None
+    assert gate.status.degraded is True
+    assert gate.status.retrieval_mode == "local"
 
 
 def test_status_and_repair_work_without_calling_ensure_ready(tmp_path):
@@ -56,7 +59,8 @@ def test_status_and_repair_work_without_calling_ensure_ready(tmp_path):
     status = service.status()
     repair_result = service.repair()
 
-    assert status.normal_mode_allowed is False
+    assert status.normal_mode_allowed is True
+    assert status.degraded is True
     assert repair_result["ok"] is True  # fake adapter flips available=True on setup
 
 
@@ -118,6 +122,48 @@ def test_multiple_writes_in_one_task_are_debounced_into_one_refresh(tmp_path):
     service.ensure_ready()
 
     assert adapter.refresh_calls == 1
+
+
+def test_mark_stale_updates_status_and_debounces_generation(tmp_path):
+    adapter = FakeCodebaseMemoryAdapter(available=True)
+    service = AbstractService(tmp_path, adapter=adapter)
+    service.ensure_ready()
+
+    service.mark_stale()
+    first = service._read_json(service._last_index_path())
+    status = service._read_json(service._status_path())
+    service.mark_stale()
+    second = service._read_json(service._last_index_path())
+
+    assert status["index"]["stale"] is True
+    assert status["index"]["workspace_generation"] == 1
+    assert first["workspace_generation"] == second["workspace_generation"] == 1
+
+
+def test_manifest_detects_file_set_change_even_when_count_is_unchanged(tmp_path):
+    adapter = FakeCodebaseMemoryAdapter(available=True)
+    first = tmp_path / "first.py"
+    first.write_text("value = 1\n", encoding="utf-8")
+    service = AbstractService(tmp_path, adapter=adapter)
+    service.ensure_ready()
+
+    first.unlink()
+    (tmp_path / "second.py").write_text("value = 1\n", encoding="utf-8")
+
+    assert service.index_status().stale is True
+
+
+def test_internal_shamsu_changes_do_not_make_index_stale(tmp_path):
+    adapter = FakeCodebaseMemoryAdapter(available=True)
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    service = AbstractService(tmp_path, adapter=adapter)
+    service.ensure_ready()
+
+    internal = tmp_path / ".shamsu" / "mutations"
+    internal.mkdir(parents=True)
+    (internal / "backup.py").write_text("value = 2\n", encoding="utf-8")
+
+    assert service.index_status().stale is False
 
 
 def test_repair_rebuilds_index_once_available_again(tmp_path):

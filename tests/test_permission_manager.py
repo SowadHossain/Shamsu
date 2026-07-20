@@ -46,6 +46,7 @@ def test_permission_memory_workspace_scope_persists_across_instances(tmp_path):
     permissions_path = tmp_path / ".shamsu" / "permissions.json"
     assert permissions_path.exists()
     assert json.loads(permissions_path.read_text(encoding="utf-8")) == {
+        "schema_version": 2,
         "always_allow": ["file_write"]
     }
 
@@ -190,59 +191,96 @@ def test_approval_manager_defaults_are_fully_backward_compatible():
     assert logged == ["approval.request", "approval.result"]
 
 
+def test_approval_manager_logs_complete_request_and_decision_scope(tmp_path):
+    events = []
+
+    class FakeLogger:
+        def log(self, event_type, payload, summary, workflow_id=None):
+            events.append((event_type, payload))
+
+    request = ApprovalRequest(
+        action_type="file_edit",
+        description="Edit settings.py",
+        risk_level="medium",
+        preview="- old\n+ new",
+        working_dir="C:/workspace",
+        reason="Apply the requested fix.",
+        target_paths=["settings.py"],
+    )
+    manager = ApprovalManager(
+        session_logger=FakeLogger(),
+        memory=PermissionMemory(tmp_path),
+        menu_prompt=lambda _request, _remember: (True, "workspace"),
+    )
+
+    assert manager.ask(request) is True
+
+    result = events[1][1]
+    assert result["request"]["target_paths"] == ["settings.py"]
+    assert result["request"]["working_dir"] == "C:/workspace"
+    assert result["request"]["risk_level"] == "medium"
+    assert result["decision_scope"] == "workspace"
+    assert result["decision_source"] == "interactive_menu"
+
+
 def _menu_console() -> Console:
     return Console(file=StringIO(), force_terminal=False, width=100)
 
 
-def test_ask_approval_menu_accepts_number_or_yes(monkeypatch):
+def test_ask_approval_menu_accepts_semantic_allow_once(monkeypatch):
     console = _menu_console()
-    for answer in ("1", "y", "yes"):
+    for answer in ("y", "yes"):
         monkeypatch.setattr("builtins.input", lambda _prompt="", a=answer: a)
         approved, scope = ask_approval_menu(_request("file_write"), offer_remember=False, console=console)
         assert approved is True
         assert scope == "none"
 
 
-def test_ask_approval_menu_number_two_is_no_without_remember(monkeypatch):
+def test_ask_approval_menu_numeric_input_is_never_inferred(monkeypatch):
     console = _menu_console()
-    # Without the remember option, "2" is the No option.
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "2")
-    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
-    assert approved is False
-    assert scope == "none"
+    for answer in ("1", "2", "3"):
+        monkeypatch.setattr("builtins.input", lambda _prompt="", a=answer: a)
+        approved, scope = ask_approval_menu(
+            _request("file_write"), offer_remember=True, console=console
+        )
+        assert approved is False
+        assert scope == "none"
 
 
-def test_ask_approval_menu_number_two_remembers_when_offered(monkeypatch):
+def test_ask_approval_menu_a_remembers_only_when_offered(monkeypatch):
     console = _menu_console()
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "2")
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "a")
     approved, scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
     assert approved is True
     assert scope == "workspace"
-    # With the remember option present, "3" is the No option.
-    monkeypatch.setattr("builtins.input", lambda _prompt="": "3")
-    approved, scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
+    approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
     assert approved is False
+    assert scope == "none"
+    rendered = console.file.getvalue()
+    assert "[y] Allow once" in rendered
+    assert "[a] Always allow" in rendered
+    assert "[n] Deny" in rendered
 
 
 def test_ask_approval_menu_empty_or_garbage_defaults_to_no(monkeypatch):
     console = _menu_console()
-    for answer in ("", "nope", "5"):
+    for answer in ("", "nope", "5", "n", "no"):
         monkeypatch.setattr("builtins.input", lambda _prompt="", a=answer: a)
         approved, _scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
         assert approved is False
 
 
-def test_ask_approval_menu_retries_empty_tty_read(monkeypatch):
+def test_ask_approval_menu_empty_tty_read_denies_immediately(monkeypatch):
     console = _menu_console()
-    answers = iter(["", "1"])
-    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+    calls = []
+    monkeypatch.setattr("builtins.input", lambda _prompt="": calls.append(True) or "")
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
 
     approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
 
-    assert approved is True
+    assert approved is False
     assert scope == "none"
-    assert "Please choose" in console.file.getvalue()
+    assert calls == [True]
 
 
 def test_ask_approval_menu_cancels_on_eof(monkeypatch):
@@ -272,7 +310,7 @@ def test_ask_approval_menu_windows_console_fallback_accepts_key(monkeypatch):
     monkeypatch.setitem(
         approval_module.sys.modules,
         "msvcrt",
-        types.SimpleNamespace(getwch=lambda: "1"),
+        types.SimpleNamespace(getwch=lambda: "y"),
     )
 
     approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
@@ -280,8 +318,8 @@ def test_ask_approval_menu_windows_console_fallback_accepts_key(monkeypatch):
     assert approved is True
     assert scope == "none"
     rendered = out.getvalue()
-    assert "approve" in rendered
-    assert "cancel" in rendered
+    assert "allow once" in rendered
+    assert "deny" in rendered
     assert "Action cancelled" not in rendered
 
 
@@ -296,7 +334,7 @@ def test_ask_approval_menu_windows_console_fallback_rejects_key(monkeypatch):
     monkeypatch.setitem(
         approval_module.sys.modules,
         "msvcrt",
-        types.SimpleNamespace(getwch=lambda: "2"),
+        types.SimpleNamespace(getwch=lambda: "n"),
     )
 
     approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
@@ -314,7 +352,7 @@ def test_ask_approval_menu_pauses_tracked_status_before_input(monkeypatch):
         active = getattr(console, "_shamsu_active_statuses", [])
         assert active
         live_states_at_input.append(active[-1]._live.is_started)
-        return "1"
+        return "y"
 
     monkeypatch.setattr("builtins.input", fake_input)
 

@@ -91,7 +91,20 @@ class ErrorPacket:
     recommended_snippets: list[RecommendedSnippet] = field(default_factory=list)
     compact_log: str = ""
     raw_log_path: str = ""
+    classification: str = "auto"
+    actionable: bool = False
+    phase: str = "execution"
+    operation_id: str = ""
+    exception_class: str = ""
+    exception_message: str = ""
+    traceback_path: str = ""
+    suggested_next_check: str = ""
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    def __post_init__(self) -> None:
+        if self.classification == "auto":
+            self.classification = "success" if self.exit_code == 0 else "command_failure"
+            self.actionable = self.exit_code != 0
 
     @property
     def ok(self) -> bool:
@@ -122,6 +135,14 @@ class ErrorPacket:
             "recommended_snippets": [s.to_dict() for s in self.recommended_snippets],
             "compact_log": self.compact_log,
             "raw_log_path": self.raw_log_path,
+            "classification": self.classification,
+            "actionable": self.actionable,
+            "phase": self.phase,
+            "operation_id": self.operation_id,
+            "exception_class": self.exception_class,
+            "exception_message": self.exception_message,
+            "traceback_path": self.traceback_path,
+            "suggested_next_check": self.suggested_next_check,
             "created_at": self.created_at,
         }
 
@@ -131,6 +152,7 @@ class ErrorPacket:
         lines = [f"ErrorPacket for `{self.command}` (exit {self.exit_code}, tool={self.tool or 'unknown'})"]
         if self.summary:
             lines.append(self.summary)
+        lines.append(f"Classification: {self.classification} (actionable={self.actionable})")
         if self.root_diagnostics:
             lines.append("Root diagnostics:")
             for record in self.root_diagnostics:
@@ -145,4 +167,6 @@ class ErrorPacket:
                 lines.append(f"- {snippet.file} lines {snippet.line_start}-{snippet.line_end} ({snippet.reason})")
         if self.repeated_noise_removed:
             lines.append(f"({self.repeated_noise_removed} repeated/boilerplate line(s) removed)")
+        if self.suggested_next_check:
+            lines.append(f"Suggested next check: {self.suggested_next_check}")
         return "\n".join(lines)

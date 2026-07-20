@@ -9,8 +9,10 @@ from pathlib import Path
 from rich.console import Console
 
 import shamsu.memory.service as memory_service
+from shamsu.memory.queue import get_memory_queue
 from shamsu.agents.chat_state import ChatState
-from shamsu.cli.repl import _handle_sessions
+from shamsu.agents.orchestrator import AgentOrchestrator
+from shamsu.cli.repl import _bugfix_report_from_last_failure, _handle_sessions
 from shamsu.session.manager import SessionManager, generate_title_from_prompt
 from shamsu.session.memory import ConversationMemory, is_affirmative, is_negative
 
@@ -36,6 +38,25 @@ def test_session_creation_writes_core_files_and_default_state(tmp_path: Path):
     logger.write_state(state)
     assert (session_dir / "state.json").exists()
     assert json.loads((session_dir / "state.json").read_text())["updated_at"]
+
+
+def test_bugfix_reuse_ignores_expected_probe_and_keeps_actionable_command(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session()
+    logger.set_last_failure("pytest -q", "AssertionError: expected 2", 1)
+    actionable = logger.get_last_failure()
+
+    logger.set_last_failure(
+        "git status --short",
+        "fatal: not a git repository",
+        128,
+        classification="expected_condition",
+        source="environment_probe",
+    )
+
+    assert logger.get_last_failure() == actionable
+    report = _bugfix_report_from_last_failure("fix it", logger)
+    assert report is not None
+    assert "pytest -q" in report[0]
 
 
 def test_metadata_is_backward_compatible_with_old_session_json(tmp_path: Path):
@@ -249,12 +270,13 @@ def test_save_long_term_memory_survives_backend_failure(tmp_path: Path, monkeypa
     def boom(self, *args, **kwargs):  # noqa: ANN001
         raise RuntimeError("graphiti offline")
 
-    monkeypatch.setattr(memory_service.MemoryService, "remember", boom)
+    monkeypatch.setattr(memory_service.MemoryService, "mirror_to_graphiti", boom)
 
     result = logger.save_long_term_memory("session_summary", "A durable, meaningful task summary")
-    # Local memory is still written; the failure is captured, not raised.
+    # Local memory is immediate; the queued mirror failure is only telemetry.
     assert result["local"] is True
-    assert "error" in result
+    assert result["long_term"]["queued"] is True
+    assert get_memory_queue(tmp_path).flush(1.0) is True
     assert logger.read_local_memory()[0]["kind"] == "session_summary"
     assert "memory.long_term.failed" in [event["event_type"] for event in logger.tail(20)]
 
@@ -263,13 +285,15 @@ def test_save_long_term_memory_records_metadata(tmp_path: Path, monkeypatch):
     logger = SessionManager(tmp_path).create_session("Meta")
     captured: dict = {}
 
-    def fake_remember(self, text, kind=None, metadata=None):  # noqa: ANN001
+    original = memory_service.MemoryService.remember_local
+
+    def capture_remember(self, text, kind=None, metadata=None):  # noqa: ANN001
         captured["text"] = text
         captured["kind"] = kind
         captured["metadata"] = metadata
-        return {"ok": True}
+        return original(self, text, kind, metadata)
 
-    monkeypatch.setattr(memory_service.MemoryService, "remember", fake_remember)
+    monkeypatch.setattr(memory_service.MemoryService, "remember_local", capture_remember)
 
     logger.save_long_term_memory("task_summary", "Completed the routing fix", {"workflow": "agent-chat"})
     assert captured["metadata"]["session_id"] == logger.session_id
@@ -332,3 +356,28 @@ def test_sessions_summary_and_memory_and_search_commands(tmp_path: Path):
     assert "Session Summary" in output or "pineapple" in output
     assert "bug_lesson" in output
     assert "pineapple" in output  # search found the message/memory
+
+
+def test_recent_file_followup_uses_successful_session_evidence(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("Recent file")
+    logger.log(
+        "agent.tool_result",
+        {
+            "tool_name": "write_file",
+            "ok": True,
+            "data": {
+                "filepath": "nested/probe.txt",
+                "resolved_filepath": "nested/probe.txt",
+                "created": True,
+            },
+        },
+        "write succeeded",
+    )
+
+    result = AgentOrchestrator(tmp_path, session_logger=logger).run(
+        "What file did you just create and where is it?"
+    )
+
+    assert result.handled is True
+    assert result.action == "session.recent_files"
+    assert "nested/probe.txt" in result.message

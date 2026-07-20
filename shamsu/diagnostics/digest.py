@@ -79,6 +79,14 @@ class DiagnosticDigest:
         compact_log, removed = compact.build_compact_log(redact(combined_text), tool, len(records))
         snippets = compact.recommend_snippets(self.workspace_root, root_diagnostics)
         related_facts = self._codebase_memory_facts(root_diagnostics)
+        classification, actionable, next_check = _classify_outcome(
+            command, exit_code, combined_text, root_diagnostics
+        )
+        exception = next(
+            (record for record in root_diagnostics if record.category in {"exception", "runtime_exception"}),
+            None,
+        )
+        traceback_path = raw_log_path if exception and raw_log_path else ""
 
         return ErrorPacket(
             command=command,
@@ -96,6 +104,12 @@ class DiagnosticDigest:
             recommended_snippets=snippets,
             compact_log=compact_log,
             raw_log_path=raw_log_path,
+            classification=classification,
+            actionable=actionable,
+            exception_class=exception.code if exception else "",
+            exception_message=exception.message if exception else "",
+            traceback_path=traceback_path,
+            suggested_next_check=next_check,
         )
 
     def _fallback_parse(self, tool: str, text: str) -> tuple[list[DiagnosticRecord], list[str]]:
@@ -178,3 +192,33 @@ class DiagnosticDigest:
                 if names:
                     facts.append(f"{record.file} imports: {', '.join(names[:12])}")
         return facts
+
+
+def _classify_outcome(
+    command: str,
+    exit_code: int,
+    output: str,
+    root_diagnostics: list[DiagnosticRecord],
+) -> tuple[str, bool, str]:
+    if exit_code == 0:
+        return "success", False, ""
+    lowered_command = " ".join(command.lower().split())
+    lowered_output = output.lower()
+    if exit_code in {125, 126}:
+        return "policy_decision", False, "Review the approval or command safety policy."
+    if exit_code == 127:
+        return "environment_condition", False, "Check the workspace and working directory."
+    git_probe = lowered_command.startswith(
+        ("git status", "git diff", "git log", "git rev-parse", "git branch")
+    )
+    if git_probe and "not a git repository" in lowered_output:
+        return (
+            "expected_condition",
+            False,
+            "Run `git init` only if this workspace should be version controlled.",
+        )
+    if root_diagnostics:
+        first = root_diagnostics[0]
+        location = f"{first.file}:{first.line}" if first.file else "the first root diagnostic"
+        return "command_failure", True, f"Inspect {location}, then rerun `{command}`."
+    return "command_failure", True, f"Inspect the raw command log, then rerun `{command}`."

@@ -63,6 +63,18 @@ def test_run_command_surfaces_diagnostics_on_failure(tmp_path: Path):
     assert FAIL_CMD.strip('"') in result.data["diagnostics"] or "exit 1" in result.data["diagnostics"]
 
 
+def test_blocked_command_is_policy_outcome_and_clears_prior_error_packet(tmp_path: Path):
+    registry = _registry(tmp_path)
+    assert registry.run_command(FAIL_CMD).data["actionable"] is True
+
+    blocked = registry.run_command("rm -rf /")
+
+    assert blocked.ok is False
+    assert blocked.data["outcome_classification"] == "policy_decision"
+    assert blocked.data["actionable"] is False
+    assert registry.command_runner.last_error_packet is None
+
+
 def test_run_command_missing_command_is_rejected(tmp_path: Path):
     registry = _registry(tmp_path)
 

@@ -24,6 +24,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from shamsu.abstract.types import AdapterResult, CodebaseMemoryHealth
+from shamsu.indexer.policy import ensure_cbm_ignore
 
 CLI_TIMEOUT_SECONDS = 60
 VERSION_TIMEOUT_SECONDS = 5
@@ -261,12 +262,65 @@ class CodebaseMemoryAdapter:
     # -- indexing -----------------------------------------------------------------
 
     def index_workspace(self, workspace: Path) -> dict[str, Any]:
-        return self.run_cli(workspace, "index_repository", {"repo_path": str(workspace)}).to_dict()
+        ignore_policy = ensure_cbm_ignore(workspace)
+        if not ignore_policy.get("ok"):
+            return {
+                "ok": False,
+                "error": f"Could not install Codebase-Memory exclusions: {ignore_policy.get('error', 'unknown error')}",
+                "ignore_policy": ignore_policy,
+            }
+        result = self.run_cli(workspace, "index_repository", {"repo_path": str(workspace)}).to_dict()
+        return {**result, "ignore_policy": ignore_policy}
 
     def refresh_workspace(self, workspace: Path) -> dict[str, Any]:
         # index_repository re-syncs an already-indexed project incrementally
         # per upstream docs; there is no separate "refresh" tool.
-        return self.index_workspace(workspace)
+        refreshed = self.index_workspace(workspace)
+        if not refreshed.get("ok"):
+            return refreshed
+        polluted_paths = self._internal_index_paths(workspace)
+        if not polluted_paths:
+            return refreshed
+
+        deleted = self.delete_workspace_index(workspace)
+        if not deleted.get("ok"):
+            return {
+                "ok": False,
+                "error": "Code memory still contains internal SHAMSU paths and could not be rebuilt.",
+                "polluted_paths": polluted_paths,
+                "delete_result": deleted,
+            }
+        rebuilt = self.index_workspace(workspace)
+        return {
+            **rebuilt,
+            "rebuilt_for_policy": True,
+            "removed_internal_paths": polluted_paths,
+        }
+
+    def delete_workspace_index(self, workspace: Path) -> dict[str, Any]:
+        key = str(Path(workspace).resolve())
+        result = self.run_cli(workspace, "delete_project", {}).to_dict()
+        if result.get("ok"):
+            self._project_cache.pop(key, None)
+        return result
+
+    def _internal_index_paths(self, workspace: Path) -> list[str]:
+        query = (
+            "MATCH (f:File) WHERE f.file_path =~ '^\\\\.shamsu/.*' "
+            "RETURN f.file_path AS file_path LIMIT 20"
+        )
+        result = self.run_cli(workspace, "query_graph", {"query": query}).to_dict()
+        if not result.get("ok"):
+            return []
+        paths: list[str] = []
+        columns = result.get("columns") or []
+        rows = result.get("rows") or []
+        index = columns.index("file_path") if "file_path" in columns else 0
+        for row in rows:
+            value = row[index] if isinstance(row, list) and len(row) > index else row
+            if value:
+                paths.append(str(value))
+        return paths
 
     # -- queries --------------------------------------------------------------
 

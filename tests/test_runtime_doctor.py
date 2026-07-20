@@ -17,10 +17,15 @@ from shamsu.runtime.doctor import (
     check_nested_workspaces,
     check_ollama,
     check_path_manifest,
+    check_state_schema,
+    check_web_capability,
+    check_workspace_state,
     find_ancestor_workspace,
     find_nested_workspaces,
     format_report,
+    run_first_run_checks,
     run_doctor,
+    write_first_run_report,
 )
 from shamsu.runtime.ollama import RuntimeStatus
 from shamsu.abstract.service import AbstractService
@@ -262,9 +267,106 @@ def test_run_doctor_combines_all_checks(tmp_path):
     )
 
     assert isinstance(report, DoctorReport)
-    assert len(report.checks) == 9
+    assert len(report.checks) == 13
     assert any(check.name == "diagnostics" for check in report.checks)
     assert report.all_ok is True
+
+
+def test_first_run_checks_cover_productive_capabilities(tmp_path, monkeypatch):
+    ready_status = RuntimeStatus(
+        ollama_path="/usr/bin/ollama",
+        server_running=True,
+        installed_models=["qwen3:8b"],
+    )
+    cbm_service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=True))
+    cbm_service.ensure_ready()
+    monkeypatch.setattr(
+        "shamsu.runtime.doctor.check_web_capability",
+        lambda _workspace: DoctorCheck("web_capability", True, "ready"),
+    )
+    monkeypatch.setattr(
+        "shamsu.runtime.doctor.check_browser_capability",
+        lambda _workspace: DoctorCheck("browser_capability", True, "ready"),
+    )
+
+    report = run_first_run_checks(
+        tmp_path,
+        ollama_status=ready_status,
+        codebase_memory_service=cbm_service,
+        graphiti_memory_service=MemoryService(
+            tmp_path, adapter=FakeGraphitiAdapter(available=True)
+        ),
+    )
+    path = write_first_run_report(tmp_path, report)
+
+    assert len(report.checks) == 6
+    assert report.all_ok is True
+    assert path.is_file()
+    assert {item["name"] for item in json.loads(path.read_text(encoding="utf-8"))} == {
+        "ollama",
+        "model_cookbook",
+        "codebase_memory",
+        "graphiti_memory",
+        "web_capability",
+        "browser_capability",
+    }
+
+
+def test_web_capability_accepts_configured_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_WEB_ENABLED", "true")
+    monkeypatch.setenv("SHAMSU_WEB_SEARCH_PROVIDER", "auto")
+
+    check = check_web_capability(tmp_path)
+
+    assert check.ok is True
+    assert "fallback=ready" in check.detail
+
+
+def test_state_schema_reports_old_marker(tmp_path):
+    marker = tmp_path / ".shamsu" / "state.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"schema_version": 1}), encoding="utf-8")
+
+    check = check_state_schema(tmp_path)
+
+    assert check.ok is False
+    assert "needs upgrade" in check.detail
+
+
+def test_check_workspace_state_reports_corrupt_run_and_index_json(tmp_path):
+    index_path = tmp_path / ".shamsu" / "abstract" / "last-index.json"
+    index_path.parent.mkdir(parents=True)
+    index_path.write_text("{broken", encoding="utf-8")
+    run_dir = tmp_path / ".shamsu" / "runs" / "run_broken"
+    run_dir.mkdir(parents=True)
+    (run_dir / "manifest.json").write_text("{}", encoding="utf-8")
+
+    check = check_workspace_state(tmp_path)
+
+    assert check.ok is False
+    assert "invalid JSON" in check.detail
+    assert "run_broken" in check.detail
+
+
+def test_check_workspace_state_reports_contradictory_index_generations(tmp_path):
+    index_path = tmp_path / ".shamsu" / "abstract" / "last-index.json"
+    index_path.parent.mkdir(parents=True)
+    index_path.write_text(
+        json.dumps(
+            {
+                "indexed": True,
+                "forced_stale": False,
+                "workspace_generation": 2,
+                "indexed_generation": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    check = check_workspace_state(tmp_path)
+
+    assert check.ok is False
+    assert "ahead" in check.detail
 
 
 def test_run_doctor_flags_problems_when_present(tmp_path):

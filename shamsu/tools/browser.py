@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Any
+from typing import Any, Callable
 
 import httpx
 
@@ -36,6 +36,15 @@ class BrowserActionResult:
     title: str = ""
     visible_text: str = ""
     screenshot_path: str = ""
+    console_errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class BrowserCapabilityStatus:
+    available: bool
+    state: str
+    message: str
+    executable_path: str = ""
 
 
 class BrowserTool:
@@ -45,15 +54,41 @@ class BrowserTool:
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         session_logger: SessionLogger | None = None,
         approval_manager: ApprovalManager | None = None,
+        action_ledger: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.session_logger = session_logger
+        self.action_ledger = action_ledger
         self._playwright_ctx = None
         self._browser = None
         self._page = None
+        self._console_errors: list[str] = []
+
+    def status(self) -> BrowserCapabilityStatus:
+        try:
+            playwright = self._load_playwright()
+        except RuntimeError as exc:
+            return BrowserCapabilityStatus(False, "missing_dependency", str(exc))
+        context = None
+        try:
+            context = playwright().start()
+            executable = Path(context.chromium.executable_path)
+            if not executable.is_file():
+                return BrowserCapabilityStatus(
+                    False,
+                    "missing_browser",
+                    "Playwright is installed, but Chromium is missing. Run `python -m playwright install chromium`.",
+                    str(executable),
+                )
+            return BrowserCapabilityStatus(True, "ready", "Playwright Chromium is available.", str(executable))
+        except Exception as exc:
+            return BrowserCapabilityStatus(False, "failed", str(exc))
+        finally:
+            if context is not None:
+                context.stop()
 
     def open(self, url: str, reason: str = "", require_approval: bool = True) -> BrowserActionResult:
         if require_approval and not self._approve(
@@ -65,11 +100,22 @@ class BrowserTool:
             return BrowserActionResult(ok=False, message="Browser access denied by user.")
         try:
             self._ensure_page()
+            self._console_errors.clear()
             self._page.goto(url, wait_until="domcontentloaded")
             title = self._page.title()
             text = self._page.locator("body").inner_text(timeout=3000)[:8000]
-            self._log("browser.opened", {"url": url, "title": title}, f"Opened browser page: {url}")
-            return BrowserActionResult(ok=True, url=self._page.url, title=title, visible_text=text)
+            self._log(
+                "browser.opened",
+                {"url": self._page.url, "title": title, "console_errors": list(self._console_errors)},
+                f"Opened browser page: {url}",
+            )
+            return BrowserActionResult(
+                ok=True,
+                url=self._page.url,
+                title=title,
+                visible_text=text,
+                console_errors=tuple(self._console_errors),
+            )
         except Exception as exc:
             message = str(exc)
             self._log("browser.failed", {"url": url, "error": message}, f"Browser failed to open: {url}")
@@ -82,7 +128,13 @@ class BrowserTool:
             title = self._page.title()
             text = self._page.locator("body").inner_text(timeout=3000)[:8000]
             self._log("browser.read", {"url": self._page.url, "title": title}, "Read browser page")
-            return BrowserActionResult(ok=True, url=self._page.url, title=title, visible_text=text)
+            return BrowserActionResult(
+                ok=True,
+                url=self._page.url,
+                title=title,
+                visible_text=text,
+                console_errors=tuple(self._console_errors),
+            )
         except Exception as exc:
             message = str(exc)
             self._log("browser.failed", {"url": getattr(self._page, "url", ""), "error": message}, "Browser read failed")
@@ -136,7 +188,13 @@ class BrowserTool:
         try:
             self._page.screenshot(path=str(path), full_page=True)
             self._log("browser.screenshot", {"url": self._page.url, "path": str(path)}, "Captured browser screenshot")
-            return BrowserActionResult(ok=True, url=self._page.url, screenshot_path=str(path), message="Screenshot saved.")
+            return BrowserActionResult(
+                ok=True,
+                url=self._page.url,
+                screenshot_path=str(path),
+                message="Screenshot saved.",
+                console_errors=tuple(self._console_errors),
+            )
         except Exception as exc:
             message = str(exc)
             self._log("browser.failed", {"error": message}, "Browser screenshot failed")
@@ -179,6 +237,13 @@ class BrowserTool:
         self._playwright_ctx = playwright().start()
         self._browser = self._playwright_ctx.chromium.launch(headless=True)
         self._page = self._browser.new_page()
+        self._page.on(
+            "console",
+            lambda message: self._console_errors.append(message.text)
+            if message.type == "error"
+            else None,
+        )
+        self._page.on("pageerror", lambda error: self._console_errors.append(str(error)))
 
     def _load_playwright(self) -> Any:
         try:
@@ -206,3 +271,8 @@ class BrowserTool:
     def _log(self, event_type: str, payload: dict, summary: str) -> None:
         if self.session_logger:
             self.session_logger.log(event_type, payload, summary, workflow_id="browser")
+        if self.action_ledger:
+            try:
+                self.action_ledger.log_event(event_type.replace(".", "_"), **payload)
+            except Exception:
+                pass

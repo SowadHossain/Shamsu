@@ -90,6 +90,23 @@ async def test_agent_chat_loop_logs_tool_calls_into_action_ledger(tmp_path: Path
     tool_calls = store.load_tool_calls(tmp_path, ledger.run_id)
     assert tool_calls[0]["tool"] == "list_files"
     assert tool_calls[1]["ok"] is True
+    model_calls = store.load_model_calls(tmp_path, ledger.run_id)
+    assert [item["role"] for item in model_calls] == [
+        "agent-executor",
+        "agent-executor",
+        "agent-executor",
+        "agent-executor",
+    ]
+    assert [item["phase"] for item in model_calls] == [
+        "started",
+        "finished",
+        "started",
+        "finished",
+    ]
+    contexts = store.load_context_records(tmp_path, ledger.run_id)
+    assert len(contexts) == 2
+    assert all(item["specialist"] == "agent-executor" for item in contexts)
+    assert all(item["model_call_id"] for item in contexts)
 
 
 def test_command_runner_writes_command_events_to_action_ledger(tmp_path: Path):
@@ -150,6 +167,54 @@ def test_patch_engine_writes_mutation_events_to_action_ledger(tmp_path: Path):
     assert mutations[0]["transaction_id"] == result.transaction_id
     assert mutations[0]["status"] == "applied"
     assert "new_module.py" in mutations[0]["touched_files"]
+    assert mutations[0]["operations"][0]["op"] == "create_file"
+    assert mutations[0]["before_hashes"]["new_module.py"] is None
+    assert mutations[0]["after_hashes"]["new_module.py"]
+    assert mutations[0]["abstract_index_state"] == "stale"
+
+
+def test_write_file_tool_links_hashes_diff_and_rollback_to_run(tmp_path: Path):
+    ledger = start_run(tmp_path, "create note")
+    tools = AgentToolRegistry(
+        tmp_path,
+        approval_func=lambda _request: True,
+        action_ledger=ledger,
+    )
+
+    result = tools.execute("write_file", {"filepath": "note.txt", "content": "hello\n"})
+
+    assert result.ok is True
+    mutation = store.load_mutations(tmp_path, ledger.run_id)[0]
+    assert mutation["transaction_id"] == result.data["transaction_id"]
+    assert mutation["before_hashes"]["note.txt"] is None
+    assert mutation["after_hashes"]["note.txt"]
+    assert mutation["patch_path"].endswith("patch.diff")
+    assert (tmp_path / mutation["patch_path"]).is_file()
+    assert mutation["rollback_available"] is True
+
+
+def test_edit_file_tool_records_canonical_mutation(tmp_path: Path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    ledger = start_run(tmp_path, "edit app.py")
+    tools = AgentToolRegistry(
+        tmp_path,
+        approval_func=lambda _request: True,
+        action_ledger=ledger,
+    )
+
+    result = tools.execute(
+        "edit_file",
+        {"filepath": "app.py", "old_string": "value = 1", "new_string": "value = 2"},
+    )
+
+    assert result.ok is True
+    mutations = store.load_mutations(tmp_path, ledger.run_id)
+    assert len(mutations) == 1
+    assert mutations[0]["transaction_id"] == result.data["transaction_id"]
+    assert mutations[0]["status"] == "applied"
+    assert mutations[0]["touched_files"] == ["app.py"]
+    assert mutations[0]["before_hashes"]["app.py"] != mutations[0]["after_hashes"]["app.py"]
 
 
 def test_failed_run_gets_run_failed_event(tmp_path: Path):
@@ -168,12 +233,12 @@ def test_failed_run_gets_run_failed_event(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_handle_request_workspace_location_branch_finishes_run_with_real_answer(tmp_path: Path):
+async def test_handle_request_records_answer_before_lifecycle_finalization(tmp_path: Path):
     """cli/repl.py::_handle_request's own workspace-location shortcut (reached
     for phrasings AgentOrchestrator's earlier gate doesn't catch, e.g. "where
     am i") must close the run with the actual text shown to the user, not an
     empty fallback."""
-    from shamsu.cli.repl import _handle_request
+    from shamsu.cli.repl import _finish_current_run, _handle_request
 
     ledger = start_run(tmp_path, "where am i")
     set_current_run(ledger)
@@ -182,6 +247,7 @@ async def test_handle_request_workspace_location_branch_finishes_run_with_real_a
     browser_tool = BrowserTool(tmp_path, approval_func=lambda _request: False)
     try:
         await _handle_request("where am i", tmp_path, console, web_tool, browser_tool)
+        _finish_current_run(tmp_path, ledger)
     finally:
         clear_current_run()
 
@@ -191,6 +257,7 @@ async def test_handle_request_workspace_location_branch_finishes_run_with_real_a
     assert str(tmp_path) in summary["final_output_preview"]
     types = [event["type"] for event in _events(ledger)]
     assert "final_response_written" in types
+    assert store.load_decisions(tmp_path, ledger.run_id)[0]["decision"] == "dispatch_request"
 
 
 @pytest.mark.asyncio
@@ -274,3 +341,18 @@ def test_diagnostic_digest_logs_code_memory_queried_for_exports_and_imports(tmp_
     query_events = [event for event in _events(ledger) if event["type"] == "code_memory_queried"]
     assert "code_memory_queried" in types
     assert {event["query_type"] for event in query_events} == {"get_exports", "get_imports"}
+
+
+def test_raw_model_reasoning_is_not_persisted_without_debug_opt_in(tmp_path: Path):
+    from shamsu.session.manager import SessionManager
+
+    logger = SessionManager(tmp_path).create_session()
+    ledger = start_run(tmp_path, "reason", session_logger=logger)
+    llm = LLMManager(session_logger=logger, action_ledger=ledger)
+
+    llm._log_thinking("fake", "private step-by-step reasoning")
+
+    event = [item for item in logger.tail(10) if item["event_type"] == "llm.thinking"][-1]
+    assert event["payload"]["reasoning_available"] is True
+    assert event["payload"]["thinking_chars"] > 0
+    assert "thinking" not in event["payload"]

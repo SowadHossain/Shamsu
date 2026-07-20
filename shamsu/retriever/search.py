@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.action_ledger.context import get_current_run
+from shamsu.indexer.policy import SOURCE_SUFFIXES, is_workspace_path, walk_workspace_files
 from shamsu.interfaces import ISearchAgent
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.types import SearchResult
@@ -74,11 +75,13 @@ class SearchAgent(ISearchAgent):
         workspace_root: Path,
         adapter: CodebaseMemoryAdapter | None = None,
         semantic_index: Any | None = None,
+        external_enabled: bool = True,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.adapter = adapter or CodebaseMemoryAdapter()
         # Lazily built (embedding model may not be installed); injectable for tests.
         self._semantic_index = semantic_index
+        self.external_enabled = external_enabled
 
     def _semantic_rescue(self, query: str, top_k: int) -> list[SearchResult]:
         try:
@@ -169,17 +172,23 @@ class SearchAgent(ISearchAgent):
         return sorted(merged.values(), key=lambda r: r.score, reverse=True)[: top_k * 2]
 
     def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        result = self.adapter.search_code(self.workspace_root, query, limit=top_k)
+        result = (
+            self.adapter.search_code(self.workspace_root, query, limit=top_k)
+            if self.external_enabled
+            else {"ok": False, "error": "External code memory is unavailable or stale."}
+        )
         ledger = get_current_run()
         if ledger:
             ledger.log_code_memory_queried("search_code", query, len((result or {}).get("results") or []))
         if not result.get("ok"):
-            return []
+            return self._local_text_search(query, top_k)
         matches = result.get("results") or []
         out: list[SearchResult] = []
         total = len(matches)
         for position, match in enumerate(matches[:top_k]):
             file_path = match.get("file", "")
+            if not self._is_safe_result_path(file_path):
+                continue
             line_start = match.get("start_line", 1)
             line_end = match.get("end_line", line_start)
             content = self._read_snippet(file_path, line_start, line_end)
@@ -197,7 +206,48 @@ class SearchAgent(ISearchAgent):
             )
         return out
 
+    def _local_text_search(self, query: str, top_k: int) -> list[SearchResult]:
+        """Dependency-free degraded search over current user-owned source files."""
+        needle = query.strip().casefold()
+        if not needle:
+            return []
+        results: list[SearchResult] = []
+        for path in walk_workspace_files(
+            self.workspace_root,
+            limit=2000,
+            suffixes=SOURCE_SUFFIXES,
+            indexable_only=True,
+        ):
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line_number, line in enumerate(lines, start=1):
+                if needle not in line.casefold():
+                    continue
+                start = max(0, line_number - 3)
+                end = min(len(lines), line_number + 2)
+                relative = path.relative_to(self.workspace_root).as_posix()
+                results.append(
+                    SearchResult(
+                        file_path=relative,
+                        language=_detect_language(relative),
+                        line_start=start + 1,
+                        line_end=end,
+                        content="\n".join(lines[start:end]),
+                        score=float(top_k - len(results)),
+                        symbol_name=None,
+                        chunk_type="window",
+                    )
+                )
+                break
+            if len(results) >= top_k:
+                break
+        return results
+
     def symbol_lookup(self, name: str) -> list[SearchResult]:
+        if not self.external_enabled:
+            return []
         result = self.adapter.get_symbols(self.workspace_root, name)
         ledger = get_current_run()
         if ledger:
@@ -208,6 +258,8 @@ class SearchAgent(ISearchAgent):
         out: list[SearchResult] = []
         for row in rows[:MAX_SYMBOL_SNIPPETS]:
             file_path = row.get("file_path", "")
+            if not self._is_safe_result_path(file_path):
+                continue
             qualified_name = row.get("qualified_name", "")
             snippet = self.adapter.get_code_snippet(self.workspace_root, qualified_name) if qualified_name else {}
             if snippet.get("ok"):
@@ -243,6 +295,11 @@ class SearchAgent(ISearchAgent):
         start = max(line_start - 1, 0)
         end = min(max(line_end, line_start), len(lines))
         return "\n".join(lines[start:end])
+
+    def _is_safe_result_path(self, file_path: str) -> bool:
+        if not file_path:
+            return False
+        return is_workspace_path(self.workspace_root / file_path, self.workspace_root)
 
 
 class NullSearchAgent(ISearchAgent):

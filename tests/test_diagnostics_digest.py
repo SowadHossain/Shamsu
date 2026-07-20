@@ -62,6 +62,39 @@ def test_digest_packet_includes_parser_chain(tmp_path: Path):
     assert packet.parser_chain == ["typescript_fallback"]
 
 
+def test_digest_classifies_non_repository_git_probe_as_expected_condition(tmp_path: Path):
+    packet = DiagnosticDigest(tmp_path).run(
+        "git status --short",
+        tmp_path,
+        128,
+        "",
+        "fatal: not a git repository (or any of the parent directories): .git",
+    )
+
+    assert packet.classification == "expected_condition"
+    assert packet.actionable is False
+    assert "git init" in packet.suggested_next_check
+
+
+def test_digest_preserves_exception_identity_and_traceback_artifact_path(tmp_path: Path):
+    stderr = (
+        "Traceback (most recent call last):\n"
+        f'  File "{tmp_path / "app.py"}", line 4, in main\n'
+        "ValueError: broken value\n"
+    )
+
+    packet = DiagnosticDigest(tmp_path).run(
+        "python app.py", tmp_path, 1, "", stderr, raw_log_path="commands/cmd_000.stderr.log"
+    )
+
+    assert packet.classification == "command_failure"
+    assert packet.actionable is True
+    assert packet.exception_class == "ValueError"
+    assert packet.exception_message == "broken value"
+    assert packet.traceback_path == "commands/cmd_000.stderr.log"
+    assert packet.target_files
+
+
 def test_digest_compact_log_removes_repeated_npm_lifecycle_noise(tmp_path: Path):
     digest = DiagnosticDigest(tmp_path)
     stderr = (

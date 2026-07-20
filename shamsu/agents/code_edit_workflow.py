@@ -18,9 +18,10 @@ from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
-from shamsu.llm.output import strip_reasoning
 from shamsu.memory.service import MemoryService
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
+from shamsu.patch.sanitize import sanitize_model_diff
+from shamsu.patch.types import apply_diff_with_result
 from shamsu.templates.frontend import frontend_prompt_rules
 from shamsu.types import ContextPack, SearchResult
 
@@ -39,6 +40,7 @@ class CodeEditResult:
     changed_files: list[str] = field(default_factory=list)
     applied: bool = False
     error: str = ""
+    mutation_status: str = ""
     used_full_rewrite: bool = False
     test_suggestion: str = "Run the relevant project tests after reviewing the patch."
     plan: str = ""
@@ -92,20 +94,29 @@ class CodeEditWorkflow:
         if ok:
             # A well-formed diff — apply it (this path honours approval/denial).
             changed_files = _changed_files(diff_text)
-            applied = self.patch_engine.apply(diff_text, self.workspace_root)
-            return CodeEditResult(
-                request=request,
-                pack=pack,
-                diff_text=diff_text,
-                changed_files=changed_files,
-                applied=applied,
-                error="" if applied else "Patch was not applied.",
-                plan=plan_text,
-            )
+            mutation = apply_diff_with_result(self.patch_engine, diff_text, self.workspace_root)
+            # Applied, or the user denied it: both are final. Only a well-formed
+            # diff that FAILED to apply (context mismatch - the model's context
+            # lines don't match the file) falls through to the rewrite below,
+            # the same recovery a malformed diff gets.
+            if mutation.ok or mutation.status == "denied":
+                return CodeEditResult(
+                    request=request,
+                    pack=pack,
+                    diff_text=diff_text,
+                    changed_files=changed_files,
+                    applied=mutation.ok,
+                    error=mutation.error,
+                    mutation_status=mutation.status,
+                    plan=plan_text,
+                )
+            if not error:
+                error = mutation.error or "Patch did not apply to the target file."
 
         # The diff was malformed (a formatting failure — common with small
-        # models), NOT a user denial. Instead of aborting with unchanged/broken
-        # code, rewrite the whole target file(s) from scratch and overwrite them.
+        # models) or well-formed but unappliable, NOT a user denial. Instead of
+        # aborting with unchanged/broken code, rewrite the whole target file(s)
+        # from scratch and overwrite them.
         targets = lenient_diff_target_paths(diff_text) or target_paths
         rewritten = await rewrite_files_fully(
             llm=self.llm,
@@ -173,15 +184,7 @@ def _clean_diff(raw: str) -> str:
     # Strip any <think> reasoning first (a reasoning model would otherwise embed
     # its trace in the diff) via the shared model-I/O boundary, then remove a
     # ``` fence wrapping the whole diff.
-    text = strip_reasoning(raw)
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return text + "\n" if text else ""
+    return sanitize_model_diff(raw)
 
 
 def _changed_files(diff_text: str) -> list[str]:

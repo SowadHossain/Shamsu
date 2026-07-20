@@ -5,21 +5,14 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.indexer.policy import (
+    DEFAULT_EXCLUDED_DIRS,
+    is_workspace_path,
+    walk_workspace_paths,
+)
 from shamsu.safety.sandbox import Sandbox, SecurityError
 
-IGNORED_DIRS = {
-    ".git",
-    ".hg",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".shamsu",
-    ".venv",
-    "__pycache__",
-    "node_modules",
-    "dist",
-    "build",
-}
+IGNORED_DIRS = DEFAULT_EXCLUDED_DIRS
 TEXT_EXTENSIONS = {
     ".cfg",
     ".css",
@@ -92,7 +85,7 @@ class WorkspaceTool:
         entries = []
         hidden_count = 0
         for path in self.workspace_root.iterdir():
-            if path.name in IGNORED_DIRS:
+            if not is_workspace_path(path, self.workspace_root):
                 hidden_count += 1
                 continue
             entries.append(path)
@@ -144,11 +137,7 @@ class WorkspaceTool:
         return suggestions
 
     def _walk_files_and_dirs(self) -> list[Path]:
-        results: list[Path] = []
-        for path in self.workspace_root.rglob("*"):
-            if any(part in IGNORED_DIRS for part in path.relative_to(self.workspace_root).parts):
-                continue
-            results.append(path)
+        results = walk_workspace_paths(self.workspace_root)
         return sorted(results, key=lambda item: item.relative_to(self.workspace_root).as_posix().lower())
 
 

@@ -53,6 +53,36 @@ def test_search_returns_empty_when_adapter_reports_failure(tmp_path):
     assert agent.fts_search("anything") == []
 
 
+def test_search_falls_back_to_local_text_when_adapter_reports_failure(tmp_path):
+    (tmp_path / "auth.py").write_text("def authenticate_user():\n    return True\n", encoding="utf-8")
+
+    class FailingAdapter:
+        def search_code(self, workspace, pattern, limit=20, ignore_case=True):
+            return {"ok": False, "error": "offline"}
+
+    results = SearchAgent(tmp_path, adapter=FailingAdapter()).fts_search("authenticate_user")
+
+    assert [result.file_path for result in results] == ["auth.py"]
+
+
+def test_external_search_results_cannot_expose_internal_shamsu_files(tmp_path):
+    internal = tmp_path / ".shamsu" / "mutations"
+    internal.mkdir(parents=True)
+    (internal / "backup.py").write_text("def leaked_symbol():\n    pass\n", encoding="utf-8")
+    adapter = FakeCodebaseMemorySearchAdapter(
+        code_matches=[
+            {
+                "node": "leaked_symbol",
+                "file": ".shamsu/mutations/backup.py",
+                "start_line": 1,
+                "end_line": 2,
+            }
+        ]
+    )
+
+    assert SearchAgent(tmp_path, adapter=adapter).fts_search("leaked_symbol") == []
+
+
 def test_boost_paths_reorders_above_the_tools_own_ranking(tmp_path):
     (tmp_path / "popular.py").write_text("def target_function():\n    pass\n", encoding="utf-8")
     (tmp_path / "rare.py").write_text("def target_function():\n    pass\n", encoding="utf-8")

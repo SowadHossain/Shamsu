@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import re
 import shutil
 import socket
@@ -9,16 +10,19 @@ import sqlite3
 import subprocess
 import time
 import secrets
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable, Protocol
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from typing import Any, Callable, Iterator, Protocol
+from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 import httpx
 import yaml
+
+from shamsu import __version__
 
 try:
     import trafilatura
@@ -30,7 +34,7 @@ from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
 
-DEFAULT_USER_AGENT = "SHAMSU/0.3.0 (+local coding agent)"
+DEFAULT_USER_AGENT = f"SHAMSU/{__version__} (+local coding agent)"
 DEFAULT_SEARXNG_URL = "http://localhost:8095"
 DEFAULT_SEARCH_TOP_K = 8
 DEFAULT_FETCH_TOP_K = 4
@@ -86,6 +90,7 @@ class WebSearchResult:
     error: str = ""
     provider: str = ""
     fallback_used: bool = False
+    provider_attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -121,6 +126,7 @@ class WebSearchFetchResult:
     provider: str = ""
     fallback_used: bool = False
     query_type: str = "general"
+    provider_attempts: list[dict[str, Any]] = field(default_factory=list)
 
 
 class WebSearchProvider(Protocol):
@@ -183,12 +189,13 @@ class WebCache:
         self.path = Path(path)
         self.ttl_seconds = ttl_seconds
         self.enabled = enabled
-        if self.enabled:
-            self._init()
+        self._initialized = False
 
     def _init(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as conn:
+        connection = sqlite3.connect(self.path)
+        try:
+            conn = connection
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS web_queries (query TEXT, provider TEXT, fetched_at REAL, hit_count INTEGER)"
             )
@@ -201,12 +208,19 @@ class WebCache:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS web_fetch_errors (url TEXT, error TEXT, fetched_at REAL)"
             )
+            connection.commit()
+            self._initialized = True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def record_hits(self, query: str, provider: str, hits: list[SearchHit]) -> None:
         if not self.enabled:
             return
         now = time.time()
-        with sqlite3.connect(self.path) as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT INTO web_queries(query, provider, fetched_at, hit_count) VALUES (?, ?, ?, ?)",
                 (query, provider, now, len(hits)),
@@ -223,7 +237,7 @@ class WebCache:
         if not self.enabled or refresh:
             return None
         cutoff = time.time() - self.ttl_seconds
-        with sqlite3.connect(self.path) as conn:
+        with self._connection() as conn:
             row = conn.execute(
                 "SELECT url, final_url, title, text, excerpt, source_provider, fetched_at, extraction_method "
                 "FROM web_pages WHERE url = ? AND fetched_at >= ?",
@@ -248,7 +262,7 @@ class WebCache:
         if not self.enabled or page.error:
             return
         fetched = _timestamp_to_epoch(page.fetched_at) or time.time()
-        with sqlite3.connect(self.path) as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO web_pages(url, final_url, title, text, excerpt, source_provider, fetched_at, extraction_method) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -267,11 +281,25 @@ class WebCache:
     def record_error(self, url: str, error: str) -> None:
         if not self.enabled:
             return
-        with sqlite3.connect(self.path) as conn:
+        with self._connection() as conn:
             conn.execute(
                 "INSERT INTO web_fetch_errors(url, error, fetched_at) VALUES (?, ?, ?)",
                 (url, error, time.time()),
             )
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        if not self._initialized:
+            self._init()
+        connection = sqlite3.connect(self.path)
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
 
 @dataclass(frozen=True)
@@ -280,6 +308,23 @@ class WebServiceStatus:
     message: str
     running: bool = False
     state: str = "unknown"
+
+
+@dataclass(frozen=True)
+class WebCapabilityStatus:
+    enabled: bool
+    provider_mode: str
+    searxng: WebServiceStatus
+    fallback_state: str
+    fetch_state: str
+    cache_state: str
+    cache_path: str
+
+    @property
+    def ok(self) -> bool:
+        return self.enabled and (
+            self.searxng.running or self.fallback_state in {"configured", "available"}
+        )
 
 
 class WebServiceManager:
@@ -617,10 +662,30 @@ class WebTool:
             enabled=self.config.cache_enabled,
         )
         self.query_planner = QueryPlanner()
+        self._provider_attempts: list[dict[str, Any]] = []
+
+    def status(self) -> WebCapabilityStatus:
+        searxng = self.service_manager.status()
+        fallback_configured = self.config.provider in {"auto", "duckduckgo"}
+        return WebCapabilityStatus(
+            enabled=self.config.enabled,
+            provider_mode=self.config.provider,
+            searxng=searxng,
+            fallback_state="configured" if fallback_configured and self.config.enabled else "disabled",
+            fetch_state="configured_not_probed" if self.config.enabled else "disabled",
+            cache_state=(
+                "enabled" if self.config.cache_enabled else "disabled"
+            ),
+            cache_path=str(self.cache.path),
+        )
 
     def search(self, query: str, reason: str = "", top_k: int = 5) -> WebSearchResult:
         if not self.config.enabled:
             return WebSearchResult(approved=False, query=query, error="Web search is disabled by SHAMSU_WEB_ENABLED=false.")
+        validation_error = self._validate_query(query)
+        if validation_error:
+            self._log("web.request.blocked", {"query": query, "error": validation_error}, "Blocked unsafe external query")
+            return WebSearchResult(approved=False, query=query, error=validation_error)
         request = ApprovalRequest(
             action_type="web_search",
             description="Search the web for current or external information.",
@@ -635,6 +700,7 @@ class WebTool:
             return WebSearchResult(approved=False, query=query, error="Web search denied by user.")
 
         self._log("web.search.started", {"query": query}, f"Started web search: {query}")
+        self._provider_attempts = []
         try:
             hits, provider, fallback_used = self._run_provider_search(query, top_k)
             self.cache.record_hits(query, provider, hits)
@@ -645,19 +711,36 @@ class WebTool:
                     "provider": provider,
                     "fallback_used": fallback_used,
                     "hit_count": len(hits),
-                    "urls": [item.url for item in hits],
+                    "results": _ranked_hit_records(hits),
+                    "provider_attempts": list(self._provider_attempts),
                 },
                 f"Finished web search: {query}",
             )
-            return WebSearchResult(approved=True, query=query, hits=hits, provider=provider, fallback_used=fallback_used)
+            return WebSearchResult(
+                approved=True,
+                query=query,
+                hits=hits,
+                provider=provider,
+                fallback_used=fallback_used,
+                provider_attempts=list(self._provider_attempts),
+            )
         except Exception as exc:
             message = str(exc)
             self._log("web.search.failed", {"query": query, "error": message}, f"Failed web search: {query}")
-            return WebSearchResult(approved=True, query=query, error=message)
+            return WebSearchResult(
+                approved=True,
+                query=query,
+                error=message,
+                provider_attempts=list(self._provider_attempts),
+            )
 
     def fetch(self, url: str, reason: str = "", require_approval: bool = True) -> WebFetchResult:
         if not self.config.enabled:
             return WebFetchResult(approved=False, url=url, error="Web search is disabled by SHAMSU_WEB_ENABLED=false.")
+        validation_error = _validate_external_url(url)
+        if validation_error:
+            self._log("web.request.blocked", {"url": url, "error": validation_error}, "Blocked unsafe external URL")
+            return WebFetchResult(approved=False, url=url, error=validation_error)
         if require_approval:
             request = ApprovalRequest(
                 action_type="web_search",
@@ -674,7 +757,7 @@ class WebTool:
 
         self._log("web.fetch.started", {"url": url}, f"Started fetch: {url}")
         try:
-            response = self._client().get(url, headers={"User-Agent": DEFAULT_USER_AGENT}, follow_redirects=True)
+            response = self._fetch_public_response(url)
             response.raise_for_status()
             extracted, method = _extract_readable_text(response.text, str(response.url))
             title_parser = _VisibleTextParser()
@@ -705,6 +788,8 @@ class WebTool:
                     "title": title,
                     "text_length": len(text),
                     "extraction_method": method,
+                    "fetched_at": page.fetched_at,
+                    "source_provider": page.source_provider,
                 },
                 f"Finished fetch: {url}",
             )
@@ -729,6 +814,10 @@ class WebTool:
                 query=query,
                 error="Web search is disabled by SHAMSU_WEB_ENABLED=false.",
             )
+        validation_error = self._validate_query(query)
+        if validation_error:
+            self._log("web.request.blocked", {"query": query, "error": validation_error}, "Blocked unsafe external query")
+            return WebSearchFetchResult(approved=False, query=query, error=validation_error)
         search_top_k = search_top_k or self.config.search_top_k
         fetch_top_k = fetch_top_k or self.config.fetch_top_k
         query_type = self.query_planner.classify(query)
@@ -757,6 +846,7 @@ class WebTool:
                 self._log("web.search_and_fetch.failed", {"query": query, "error": message}, f"Failed web evidence search: {query}")
                 return WebSearchFetchResult(approved=True, query=query, error=message, query_type=query_type)
 
+        self._provider_attempts = []
         try:
             hits, provider, fallback_used = self._run_provider_search(query, search_top_k)
             hits = _dedupe_hits(hits)
@@ -796,6 +886,8 @@ class WebTool:
                 "page_count": len(pages),
                 "evidence_count": len(evidence),
                 "query_type": query_type,
+                "results": _ranked_hit_records(hits),
+                "provider_attempts": list(self._provider_attempts),
             },
             f"Finished web evidence search: {query}",
         )
@@ -808,7 +900,40 @@ class WebTool:
             provider=provider,
             fallback_used=fallback_used,
             query_type=query_type,
+            provider_attempts=list(self._provider_attempts),
         )
+
+    def _validate_query(self, query: str) -> str:
+        cleaned = query.strip()
+        if not cleaned:
+            return "Web search needs a non-empty query."
+        if len(cleaned) > 1000:
+            return "External search query exceeds the 1000-character privacy limit."
+        workspace_text = str(self.workspace.resolve()).lower()
+        lowered = cleaned.lower()
+        if workspace_text in lowered or ".shamsu" in lowered:
+            return "External search query contains a private workspace path."
+        return ""
+
+    def _fetch_public_response(self, url: str):
+        current = url
+        client = self._client()
+        for _redirect in range(6):
+            error = _validate_external_url(current)
+            if error:
+                raise ValueError(error)
+            response = client.get(
+                current,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+                follow_redirects=False,
+            )
+            if not getattr(response, "is_redirect", False):
+                return response
+            location = response.headers.get("location", "")
+            if not location:
+                return response
+            current = urljoin(current, location)
+        raise RuntimeError("Web fetch exceeded five redirects.")
 
     def _client(self) -> httpx.Client:
         return httpx.Client(timeout=self.timeout_seconds)
@@ -827,26 +952,73 @@ class WebTool:
         self._log("web.provider.selected", {"provider": provider_name, "query": query}, f"Selected web provider: {provider_name}")
         if provider_name == "duckduckgo":
             provider = DuckDuckGoHtmlProvider(client_factory=self._client)
-            return _with_provider(provider.search(query, top_k), provider.name), provider.name, False
+            return self._run_one_provider(provider, query, top_k), provider.name, False
         if provider_name == "searxng":
-            self._ensure_searxng_ready()
-            provider = SearxngProvider(self.config.searxng_url, client_factory=self._client)
-            return _with_provider(provider.search(query, top_k), provider.name), provider.name, False
+            try:
+                self._ensure_searxng_ready()
+                provider = SearxngProvider(self.config.searxng_url, client_factory=self._client)
+                return self._run_one_provider(provider, query, top_k), provider.name, False
+            except Exception as exc:
+                self._record_provider_attempt("searxng", "failed", str(exc))
+                raise
 
         errors: list[str] = []
         try:
             self._ensure_searxng_ready()
             provider = SearxngProvider(self.config.searxng_url, client_factory=self._client)
-            return _with_provider(provider.search(query, top_k), provider.name), provider.name, False
+            return self._run_one_provider(provider, query, top_k), provider.name, False
         except Exception as exc:
             errors.append(f"SearXNG failed: {exc}")
+            self._record_provider_attempt("searxng", "failed", str(exc))
             self._log("web.provider.fallback", {"from": "searxng", "to": "duckduckgo", "error": str(exc)}, "Fell back to DuckDuckGo web search")
         provider = DuckDuckGoHtmlProvider(client_factory=self._client)
         try:
-            return _with_provider(provider.search(query, top_k), provider.name), provider.name, True
+            return self._run_one_provider(provider, query, top_k), provider.name, True
         except Exception as exc:
             errors.append(f"DuckDuckGo failed: {exc}")
             raise RuntimeError("; ".join(errors)) from exc
+
+    def _run_one_provider(
+        self,
+        provider: WebSearchProvider,
+        query: str,
+        top_k: int,
+    ) -> list[SearchHit]:
+        try:
+            hits = _with_provider(provider.search(query, top_k), provider.name)
+        except Exception as exc:
+            self._record_provider_attempt(provider.name, "failed", str(exc))
+            raise
+        self._record_provider_attempt(provider.name, "success", "", len(hits))
+        return hits
+
+    def _record_provider_attempt(
+        self,
+        provider: str,
+        state: str,
+        error: str = "",
+        hit_count: int = 0,
+    ) -> None:
+        comparable = {"provider": provider, "state": state, "error": error}
+        if self._provider_attempts:
+            previous = self._provider_attempts[-1]
+            previous_comparable = {
+                "provider": previous.get("provider"),
+                "state": previous.get("state"),
+                "error": previous.get("error", ""),
+            }
+            if previous_comparable == comparable:
+                return
+        item = {
+            "provider": provider,
+            "state": state,
+            "hit_count": hit_count,
+            "retrieved_at": _now_iso(),
+        }
+        if error:
+            item["error"] = error
+        if item not in self._provider_attempts:
+            self._provider_attempts.append(item)
 
     def _ensure_searxng_ready(self) -> None:
         status = self.service_manager.status()
@@ -1025,6 +1197,42 @@ def _parse_searxng_results(payload: dict[str, Any]) -> list[SearchHit]:
         if title and url:
             hits.append(SearchHit(title=title, url=url, snippet=snippet, source_provider="searxng"))
     return hits
+
+
+def _validate_external_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        return "Web fetch only supports public HTTP or HTTPS URLs."
+    if not parsed.hostname:
+        return "Web fetch URL is missing a hostname."
+    if parsed.username or parsed.password:
+        return "Web fetch URLs cannot contain credentials."
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".localhost"):
+        return "Use the browser tool, not web fetch, for local applications."
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return ""
+    if address.is_loopback:
+        return "Use the browser tool, not web fetch, for local applications."
+    if not address.is_global:
+        return "Web fetch cannot access private, loopback, link-local, or reserved addresses."
+    return ""
+
+
+def _ranked_hit_records(hits: list[SearchHit]) -> list[dict[str, Any]]:
+    retrieved_at = _now_iso()
+    return [
+        {
+            "rank": rank,
+            "title": hit.title,
+            "url": hit.url,
+            "provider": hit.source_provider,
+            "retrieved_at": retrieved_at,
+        }
+        for rank, hit in enumerate(hits, start=1)
+    ]
 
 
 def _with_provider(hits: list[SearchHit], provider: str) -> list[SearchHit]:

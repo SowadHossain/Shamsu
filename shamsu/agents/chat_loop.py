@@ -28,6 +28,7 @@ from shamsu.context.budget import (
 )
 from shamsu.context.builder import ContextBuilder
 from shamsu.context.manager import ContextBudgetManager
+from shamsu.safety import read_only
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
 from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
@@ -227,6 +228,23 @@ _DEFERRED_ACTION_PATTERNS = (
     r"\bi('?ll| will)\b\s+(correct|retry|redo|do that|handle)\b",
 )
 
+_MUTATION_TOOL_NAMES = frozenset({"write_file", "edit_file", "move_file", "delete_file"})
+
+_WORKSPACE_CHANGE_RE = re.compile(
+    r"\b(create|write|build|implement|fix|edit|update|modify|change|add|remove|delete|rename|move|make)\b",
+    re.IGNORECASE,
+)
+_INFORMATION_REQUEST_RE = re.compile(
+    r"^\s*(how|what|why|where|when|who|which|can you explain|could you explain|"
+    r"would you explain|tell me|show me)\b",
+    re.IGNORECASE,
+)
+_FALSE_FAILURE_RE = re.compile(
+    r"\b(could not|couldn't|unable to|failed to|was not able|wasn't able)\s+"
+    r"(apply|edit|write|create|update|change|modify|save|fix|complete)\b",
+    re.IGNORECASE,
+)
+
 # Callback used to surface structured trace events (route/plan/blockers/etc.)
 # to the REPL. None keeps the loop silent (tests, non-interactive callers).
 TraceCallback = Callable[[str, str, "dict[str, Any] | None", str], None]
@@ -274,6 +292,7 @@ class AgentChatLoop:
         context_builder: IContextBuilder | None = None,
         budget_manager: ContextBudgetManager | None = None,
         audit: SessionAuditLog | None = None,
+        read_only: bool = False,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -311,6 +330,12 @@ class AgentChatLoop:
         )
         self.long_running = long_running
         self.max_tool_rounds = LONG_RUNNING_MAX_TOOL_ROUNDS if long_running else max_tool_rounds
+        # The user explicitly forbade file changes ("do not modify files").
+        # Propagated to the tool registry, which denies mutating tools outright
+        # regardless of approval mode - an instruction, not a preference.
+        self.read_only = read_only
+        if read_only:
+            self.tools.set_read_only(True)
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
     async def _messages_within_budget(self, num_ctx: int) -> list[dict[str, Any]]:
@@ -373,7 +398,12 @@ class AgentChatLoop:
         message = _message_from_response(response)
         return str(_get(message, "content", "") or "").strip() or prior_summary
 
-    async def _chat_with_heartbeat(self, messages: list[dict[str, Any]], num_ctx: int) -> Any:
+    async def _chat_with_heartbeat(
+        self,
+        messages: list[dict[str, Any]],
+        num_ctx: int,
+        round_index: int = 0,
+    ) -> Any:
         """Call the model, emitting a periodic 'still waiting' heartbeat so a slow
         local model reads as working, not frozen. The timeout is unchanged."""
 
@@ -400,6 +430,27 @@ class AgentChatLoop:
         if self._is_reasoning:
             chat_kwargs["think"] = True
 
+        serialized_prompt = json.dumps(messages, ensure_ascii=True, default=str)
+        ledger_call_id = ""
+        if self.action_ledger:
+            ledger_call_id = self.action_ledger.log_model_call_started(
+                "agent-executor",
+                self.model_name,
+                serialized_prompt,
+            )
+            self.action_ledger.log_context_preview(
+                {
+                    "task_id": "agent-chat",
+                    "step_id": round_index + 1,
+                    "specialist": "agent-executor",
+                    "token_estimate": count_tokens(serialized_prompt),
+                    "messages": _compact_value(messages, limit=24000),
+                    "snippets": [],
+                    "omitted_context": {},
+                },
+                model_call_id=ledger_call_id,
+            )
+
         beat = asyncio.ensure_future(_beat())
         try:
             try:
@@ -408,7 +459,34 @@ class AgentChatLoop:
                 # Older ollama clients (or test doubles) may not accept `think`.
                 chat_kwargs.pop("think", None)
                 coro = self.client.chat(**chat_kwargs)
-            return await asyncio.wait_for(coro, timeout=_MODEL_CALL_TIMEOUT_SECONDS)
+            response = await asyncio.wait_for(coro, timeout=_MODEL_CALL_TIMEOUT_SECONDS)
+            if self.action_ledger:
+                message = _message_from_response(response)
+                visible = str(_get(message, "content", "") or "")
+                tool_calls = _get(message, "tool_calls", []) or []
+                response_preview = visible or json.dumps(
+                    _compact_value(tool_calls, limit=6000),
+                    ensure_ascii=True,
+                    default=str,
+                )
+                self.action_ledger.log_model_call_finished(
+                    "agent-executor",
+                    self.model_name,
+                    response_preview,
+                    call_id=ledger_call_id,
+                    meta={"round": round_index, "tool_call_count": len(tool_calls)},
+                )
+            return response
+        except Exception as exc:
+            if self.action_ledger:
+                self.action_ledger.log_model_call_finished(
+                    "agent-executor",
+                    self.model_name,
+                    call_id=ledger_call_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                    meta={"round": round_index},
+                )
+            raise
         finally:
             beat.cancel()
 
@@ -476,6 +554,12 @@ class AgentChatLoop:
         # Whether any tool has actually executed yet - used to tell a genuine LLM
         # timeout apart from an executor stall when a model call times out.
         ran_any_tool = False
+        successful_mutation = False
+        # A non-mutating tool (run_command/read_file/...) that actually
+        # succeeded. Such a turn has already done its work through tools, so a
+        # fenced block in the reply is the RESULT, not a file to write - see the
+        # markdown-fallback guard below.
+        nonwrite_tool_succeeded = False
         for round_index in range(self.max_tool_rounds):
             num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
             messages = await self._messages_within_budget(num_ctx)
@@ -494,7 +578,7 @@ class AgentChatLoop:
                     level="verbose",
                 )
             try:
-                response = await self._chat_with_heartbeat(messages, num_ctx)
+                response = await self._chat_with_heartbeat(messages, num_ctx, round_index)
             except asyncio.TimeoutError:
                 category = self._timeout_category(round_index, ran_any_tool)
                 final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
@@ -572,8 +656,24 @@ class AgentChatLoop:
                 self._audit_final(final)
                 return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
             if not tool_calls:
-                fallback = self.markdown_fallback.maybe_write(user_input, content)
-                if fallback.handled:
+                fallback_prompt = content if written_files else user_input
+                # The fallback exists for ONE shape: the model answered a file
+                # task with prose+code instead of calling write_file, so nothing
+                # happened. Once any tool has succeeded this turn, something DID
+                # happen, and a fenced block is far more likely to be output or
+                # illustration - the reading that cost a user their script when
+                # `run_command` printed `5` and the fallback wrote it to disk.
+                # Past that point the model must say it is writing a file.
+                nothing_done_yet = not written_files and not nonwrite_tool_succeeded
+                should_try_fallback = nothing_done_yet or _proposes_additional_file_write(content)
+                fallback = (
+                    self.markdown_fallback.maybe_write(
+                        fallback_prompt, content, read_only=self.read_only
+                    )
+                    if should_try_fallback
+                    else None
+                )
+                if fallback is not None and fallback.handled:
                     if fallback.tool_results:
                         for index, tool_result in enumerate(fallback.tool_results):
                             self.state.append_tool(
@@ -587,6 +687,17 @@ class AgentChatLoop:
                             "write_file",
                             fallback.tool_result.to_json() if fallback.tool_result else fallback.summary,
                         )
+                    fallback_results = fallback.tool_results or (
+                        [fallback.tool_result] if fallback.tool_result is not None else []
+                    )
+                    for tool_result in fallback_results:
+                        if not tool_result.ok:
+                            continue
+                        successful_mutation = True
+                        data = tool_result.data if isinstance(tool_result.data, dict) else {}
+                        written = str(data.get("resolved_filepath") or data.get("filepath") or "")
+                        if written and written not in written_files:
+                            written_files.append(written)
                     continue
                 # A read just failed and the model answered with a bare promise
                 # ("I will read entities.ts next") instead of a tool call - the
@@ -654,6 +765,23 @@ class AgentChatLoop:
                     self.state.append_assistant(final)
                     self._audit_final(final)
                     return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+                if _request_requires_workspace_change(original_input) and not successful_mutation:
+                    final = _missing_mutation_final(content)
+                    self.state.append_assistant(final)
+                    self._emit_trace(
+                        "workflow.failed",
+                        "The request required a workspace change, but no mutation tool succeeded.",
+                        {"category": "required_mutation_missing"},
+                    )
+                    if self.action_ledger:
+                        self.action_ledger.log_event(
+                            "mutation_required_but_missing",
+                            model_response=content,
+                        )
+                    self._audit_final(final)
+                    return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
+                if successful_mutation and _model_claims_mutation_failed(content):
+                    content = _mutation_evidence_final(written_files)
                 final = await self._maybe_verify(content, written_files)
                 self._audit_final(final)
                 return AgentLoopResult(
@@ -686,6 +814,10 @@ class AgentChatLoop:
                 ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
                 result = self.tools.execute(name, arguments)
                 ran_any_tool = True
+                if name in _MUTATION_TOOL_NAMES and result.ok:
+                    successful_mutation = True
+                elif result.ok:
+                    nonwrite_tool_succeeded = True
                 self._log_tool_result(name, result)
                 if self.audit:
                     self.audit.log_tool_result(
@@ -702,7 +834,13 @@ class AgentChatLoop:
                         )
                 if self.action_ledger:
                     self.action_ledger.log_tool_result(
-                        ledger_call_id, name, bool(result.ok), result.message, result.data
+                        ledger_call_id,
+                        name,
+                        bool(result.ok),
+                        result.message,
+                        result.data,
+                        exception_class=str(result.data.get("exception_class", "")),
+                        traceback_path=str(result.data.get("traceback_path", "")),
                     )
                 if self.progress:
                     self.progress.tool_result(name, summarize_tool_result(result), ok=result.ok)
@@ -713,6 +851,24 @@ class AgentChatLoop:
                     name,
                     _budget_tool_result_json(result.to_json(), _TOOL_RESULT_MAX_TOKENS),
                 )
+                if not result.ok and "denied by user" in result.message.lower():
+                    final = (
+                        f"{name} was not run because approval was denied. "
+                        "No action was taken."
+                    )
+                    self.state.append_assistant(final)
+                    self._emit_trace(
+                        "workflow.blocked",
+                        final,
+                        {"category": "approval_denied", "tool": name},
+                    )
+                    self._audit_final(final)
+                    return AgentLoopResult(
+                        final=final,
+                        tool_rounds=round_index,
+                        stopped=True,
+                        changed_files=tuple(written_files),
+                    )
                 if name in {"write_file", "edit_file"} and result.ok:
                     _data = result.data if isinstance(result.data, dict) else {}
                     written = str(
@@ -764,14 +920,19 @@ class AgentChatLoop:
                         or data.get("stdout")
                         or result.message
                     )
-                    try:
-                        self.session_logger.set_last_failure(
-                            str(arguments.get("command", "")),
-                            errors,
-                            int(data.get("exit_code", 1) or 1),
-                        )
-                    except Exception:
-                        pass
+                    if bool(data.get("actionable", True)):
+                        try:
+                            self.session_logger.set_last_failure(
+                                str(arguments.get("command", "")),
+                                errors,
+                                int(data.get("exit_code", 1) or 1),
+                                classification=str(
+                                    data.get("outcome_classification", "command_failure")
+                                ),
+                                operation_id=str(data.get("diagnostics_path", "")),
+                            )
+                        except Exception:
+                            pass
                 if name in {"find_file", "grep_files"} and not result.ok:
                     # A discovery tool that failed (usually an empty query) burns a
                     # round; steer the model to a concrete query, reusing the
@@ -810,6 +971,16 @@ class AgentChatLoop:
                         unconfirmed_failed_writes.pop(filepath, None)
                     else:
                         unconfirmed_failed_writes[filepath] = result.message
+                if name == "edit_file" and not result.ok:
+                    # An edit that did not apply (ambiguous or not-found
+                    # old_string) otherwise gets retried verbatim until the loop
+                    # gives up with nothing changed. Steer the model to a unique
+                    # match or a full rewrite instead.
+                    self.state.append_user(
+                        _edit_failure_correction(
+                            str(arguments.get("filepath", "the file")), result.message
+                        )
+                    )
                 if name == "write_file" and not result.ok:
                     # A write that did not land is the #1 cause of the model
                     # "hallucinating success" and then compiling half-written
@@ -912,16 +1083,14 @@ class AgentChatLoop:
         return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
 
     async def _maybe_verify(self, content: str, written_files: list[str]) -> str:
-        """Honesty gate for autonomous runs: after writes, run a deterministic
-        lightweight verifier once and fold the verdict into the final answer.
+        """After writes, run a deterministic lightweight verifier once.
 
         Never claims success it did not check: a build failure turns into a loud
         'UNCONFIRMED' note (the model may have claimed success), a pass adds a
-        short confirmation, and an unverifiable change is left untouched (the
-        files are on disk and, in interactive use, the user can see them). Only
-        runs in long_running/autonomous mode; best-effort — a verifier error
-        never breaks the turn."""
-        if not (self.long_running and _VERIFY_GATE_ENABLED) or not written_files:
+        short confirmation, and an unverifiable change is left untouched. Safe
+        lightweight checks run interactively; automatic repair is autonomous-only.
+        A verifier error never breaks the turn."""
+        if not _VERIFY_GATE_ENABLED or not written_files:
             return content
         try:
             outcome = await asyncio.get_event_loop().run_in_executor(
@@ -956,6 +1125,19 @@ class AgentChatLoop:
                 )
             except Exception:
                 pass
+        if self.action_ledger:
+            event_type = {
+                "verified": "verification_passed",
+                "failed": "verification_failed",
+                "unverifiable": "verification_unavailable",
+            }[outcome.status()]
+            self.action_ledger.log_event(
+                event_type,
+                command=outcome.command,
+                exit_code=outcome.exit_code,
+                files=list(written_files),
+                summary=outcome.summary,
+            )
         if outcome.unverifiable:
             return content
         if outcome.failed:
@@ -965,7 +1147,7 @@ class AgentChatLoop:
             # invited here - the loop verified, reported failure, and left the
             # user to start over. Best-effort and capped: a repair error or a
             # still-failing repair falls through to the honest UNCONFIRMED note.
-            repaired = await self._attempt_repair(written_files)
+            repaired = await self._attempt_repair(written_files) if self.long_running else None
             if repaired is not None and repaired.verified:
                 self._emit_trace(
                     "verify.result",
@@ -1134,6 +1316,12 @@ class AgentChatLoop:
         pending["created_from_prompt"] = original_input
         if self.session_logger:
             self.session_logger.set_pending_question(pending)
+        if self.action_ledger:
+            self.action_ledger.log_event(
+                "run_needs_input",
+                question=str(pending.get("question", "")),
+                option_count=len(pending.get("options", [])),
+            )
         final = format_question(pending)
         self.state.append_assistant(final)
         self._audit_final(final)
@@ -1265,6 +1453,45 @@ def _prose_blocked_final() -> str:
     )
 
 
+def _request_requires_workspace_change(prompt: str) -> bool:
+    # A prompt that forbids file changes cannot be failed for not changing
+    # files. Without this, "Do not modify files" matched _WORKSPACE_CHANGE_RE on
+    # its own `modify` and a correct, complete web answer was reported as
+    # "I did not complete the requested workspace change".
+    if read_only.applies(prompt):
+        return False
+    text = " ".join(read_only.strip(prompt or "").strip().split())
+    if not text or _INFORMATION_REQUEST_RE.search(text):
+        return False
+    return bool(_WORKSPACE_CHANGE_RE.search(text))
+
+
+def _missing_mutation_final(model_response: str) -> str:
+    detail = " ".join((model_response or "").strip().split())
+    suffix = f" The model's response was: {detail[:300]}" if detail else ""
+    return (
+        "I did not complete the requested workspace change because no file mutation "
+        f"succeeded. No file was changed.{suffix}"
+    )
+
+
+def _model_claims_mutation_failed(content: str) -> bool:
+    return bool(_FALSE_FAILURE_RE.search(content or ""))
+
+
+def _mutation_evidence_final(written_files: list[str]) -> str:
+    targets = ", ".join(written_files)
+    if targets:
+        return (
+            f"The file mutation succeeded on disk for: {targets}. The model's follow-up "
+            "claimed it failed, but the tool result confirms the change was applied."
+        )
+    return (
+        "The workspace mutation succeeded. The model's follow-up claimed it failed, "
+        "but the tool result confirms the change was applied."
+    )
+
+
 def _looks_like_deferred_action(content: str) -> bool:
     """True when a tool-less reply merely *promises* a tool action."""
     text = " ".join(content.strip().lower().split())
@@ -1297,6 +1524,38 @@ def _write_failure_correction(filepath: str, message: str) -> str:
         f"Your write_file to {filepath} did NOT succeed: {message}.{extra} The file was NOT changed. "
         f"Do not assume the fix was applied and do not move on. Call write_file again for "
         f"{filepath} with the ENTIRE corrected file content."
+    )
+
+
+def _edit_failure_correction(filepath: str, message: str) -> str:
+    """Steer the model past the two common edit_file failures.
+
+    Without this, an ambiguous or not-found edit just gets retried with the same
+    arguments and the loop gives up with nothing changed - live, a 7B model gave
+    `old_string="return a + b"` to fix ONE of two identical lines, edit_file
+    correctly refused as ambiguous, and the fix silently never landed. The
+    recovery is deterministic: make the match unique, or rewrite the whole file.
+    """
+    lowered = message.lower()
+    if "appears" in lowered and "time" in lowered:
+        how = (
+            "That old_string is not unique. Include enough SURROUNDING lines to match "
+            "exactly one place - e.g. the enclosing `def`/function line and the line above "
+            "or below the change - or, if every occurrence should change, set replace_all=true."
+        )
+    elif "not found" in lowered or "no match" in lowered or "does not appear" in lowered:
+        how = (
+            "That old_string was not found verbatim. Call read_file on the file first and "
+            "copy the EXACT current text (whitespace included) into old_string, or use "
+            "write_file with the entire corrected file."
+        )
+    else:
+        how = (
+            "Fix the arguments and try again, or use write_file with the entire corrected file."
+        )
+    return (
+        f"Your edit_file on {filepath} did NOT apply: {message}. The file was NOT changed. "
+        f"Do not repeat the same call and do not claim success. {how}"
     )
 
 
@@ -1461,6 +1720,17 @@ def _message_from_response(response: Any) -> Any:
 
 def _tool_call_id(call: dict[str, Any], fallback: str) -> str:
     return str(call.get("id") or fallback)
+
+
+_ADDITIONAL_FILE_WRITE_RE = re.compile(
+    r"\b(?:create|write|save|add|update|edit)\s+(?:a\s+|the\s+)?"
+    r"(?:file\s+)?[`'\"]?[\w./\\-]+\.[A-Za-z0-9_]{1,12}",
+    re.IGNORECASE,
+)
+
+
+def _proposes_additional_file_write(content: str) -> bool:
+    return bool(_ADDITIONAL_FILE_WRITE_RE.search(content or ""))
 
 
 def _tool_call_name(call: dict[str, Any]) -> str:

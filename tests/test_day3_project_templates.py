@@ -29,7 +29,12 @@ def test_build_project_spec_extracts_entities_pages_endpoints_and_order(tmp_path
     assert spec.app_name == "app"
     assert spec.entities[0].name == "Task"
     assert [endpoint.method for endpoint in spec.endpoints] == ["GET", "POST"]
-    assert [page.name for page in spec.pages] == ["Dashboard", "Tasks"]
+    assert [page.name for page in spec.pages] == [
+        "Dashboard",
+        "Tasks",
+        "Task Form",
+        "Task Detail",
+    ]
     assert spec.generation_order[0].path == "manage.py"
     assert spec.generation_order[0].specialist is None
     assert "app/templates/task/list.html" in [file.path for file in spec.generation_order]
@@ -61,8 +66,9 @@ def test_render_fixed_django_files_are_deterministic_and_python_valid(tmp_path):
         "todo_app/urls.py",
         "todo_app/wsgi.py",
         "todo_app/asgi.py",
-        "app/__init__.py",
-        "app/apps.py",
+            "app/__init__.py",
+            "app/migrations/__init__.py",
+            "app/apps.py",
         "app/templates/base.html",
         "app/templates/login.html",
         "app/templates/register.html",
@@ -72,7 +78,7 @@ def test_render_fixed_django_files_are_deterministic_and_python_valid(tmp_path):
         ".env.example",
     }
     assert set(files) == expected_paths
-    assert "SECRET_KEY = \"test-secret\"" in files["todo_app/settings.py"]
+    assert 'SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "test-secret")' in files["todo_app/settings.py"]
     assert "Django==5.0.6" in files["requirements.txt"]
     assert "btn btn-primary" in files["app/templates/base.html"]
 

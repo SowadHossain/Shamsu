@@ -5,17 +5,17 @@ from shamsu.agents.orchestrator import AgentOrchestrator
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 
 
-def test_orchestrator_blocks_normal_code_agent_mode_when_unavailable(tmp_path):
+def test_orchestrator_proceeds_in_degraded_mode_when_unavailable(tmp_path):
     # Passing abstract_service explicitly bypasses conftest's default open-gate
     # stand-in, which only backs AgentOrchestrator's no-argument fallback.
     service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=False))
 
     result = AgentOrchestrator(tmp_path, abstract_service=service).run("explain how auth works")
 
-    assert result.handled is True
-    assert result.action == "abstract.blocked"
-    assert "Codebase-Memory MCP is required" in result.message
-    assert "/abstract setup" in result.message
+    assert result.handled is False
+    assert result.action == ""
+    assert "degraded" in result.context
+    assert "/abstract setup" in result.context
 
 
 def test_orchestrator_enters_normal_mode_when_codebase_memory_healthy(tmp_path):

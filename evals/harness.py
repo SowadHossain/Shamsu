@@ -170,16 +170,17 @@ async def _run_one(case: EvalCase, driver: Driver) -> EvalResult:
     )
 
 
-async def chat_loop_driver(workspace: Path, case: EvalCase) -> str:
-    """Default driver: drive the real interactive agent loop headlessly, with
-    writes auto-approved (no human in the loop), against the active model tier."""
-    from shamsu.agents.chat_loop import AgentChatLoop
-    from shamsu.tools.agent_tools import AgentToolRegistry
+async def full_request_driver(workspace: Path, case: EvalCase) -> str:
+    """Drive the complete user request path, including routing and logging."""
+    from shamsu.cli.noninteractive import run_prompt
 
-    tools = AgentToolRegistry(workspace, approval_func=lambda _request: True)
-    loop = AgentChatLoop(workspace, tools=tools, long_running=case.long_running)
-    result = await loop.run(case.prompt)
-    return result.final
+    result = await run_prompt(workspace, case.prompt, approval="allow")
+    return result.final_response
+
+
+# Compatibility for callers that imported the old name. The implementation is
+# intentionally the full dispatcher now, not AgentChatLoop in isolation.
+chat_loop_driver = full_request_driver
 
 
 async def planning_driver(workspace: Path, case: EvalCase) -> str:
@@ -264,6 +265,14 @@ def render_report(report: EvalReport) -> str:
         "`--samples`; a delta that lives entirely inside the flaky set is no\n"
         "delta. Tier-specific findings (root causes of consistent failures)\n"
         "live in `agent context/SHAMSU_agent_gap_analysis.md` under I3."
+    )
+    lines.append("")
+    lines.append("## Deterministic release metrics")
+    lines.append("")
+    lines.append(
+        "Harness startup, first-answer/task time, peak memory, log growth, and "
+        "Python/Django/Node/React/mixed dogfood results are recorded separately "
+        "in `RELEASE_VALIDATION.md` so model variance is not mixed with runtime reliability."
     )
     lines.append("")
     return "\n".join(lines)

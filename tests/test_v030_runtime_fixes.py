@@ -309,7 +309,8 @@ def test_audit_log_records_everything(tmp_path):
 
     result = asyncio.run(loop.run("create hello.py that prints hi"))
 
-    assert result.final == "Created hello.py that prints hi."
+    assert result.final.startswith("Created hello.py that prints hi.")
+    assert "[verified]" in result.final
     assert (tmp_path / "hello.py").exists()
 
     events_path = tmp_path / ".shamsu" / "audit" / "events.jsonl"

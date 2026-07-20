@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+from shamsu.abstract.types import AdapterResult
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter, is_local_uri
 
 
@@ -86,3 +87,44 @@ def test_query_methods_return_dict_with_ok_false_when_tool_missing(tmp_path):
     assert adapter.get_references(tmp_path, "Foo")["ok"] is False
     assert adapter.get_impact(tmp_path, "foo.py")["ok"] is False
     assert adapter.get_module_contract(tmp_path, "foo.py")["ok"] is False
+
+
+def test_index_workspace_installs_cbmignore_without_replacing_user_rules(monkeypatch, tmp_path):
+    ignore = tmp_path / ".cbmignore"
+    ignore.write_text("private-notes/\n", encoding="utf-8")
+    adapter = CodebaseMemoryAdapter(tool_dir=tmp_path / "unused")
+    monkeypatch.setattr(
+        adapter,
+        "run_cli",
+        lambda workspace, tool, args: AdapterResult(ok=True, data={"status": "indexed"}),
+    )
+
+    result = adapter.index_workspace(tmp_path)
+    first = ignore.read_text(encoding="utf-8")
+    adapter.index_workspace(tmp_path)
+
+    assert result["ok"] is True
+    assert "private-notes/" in first
+    assert ".shamsu/" in first
+    assert "node_modules/" in first
+    assert first.count("BEGIN SHAMSU MANAGED EXCLUSIONS") == 1
+    assert ignore.read_text(encoding="utf-8") == first
+
+
+def test_refresh_rebuilds_an_existing_index_that_contains_internal_paths(monkeypatch, tmp_path):
+    adapter = CodebaseMemoryAdapter(tool_dir=tmp_path / "unused")
+    index_calls = []
+    monkeypatch.setattr(
+        adapter,
+        "index_workspace",
+        lambda workspace: index_calls.append(workspace) or {"ok": True, "status": "indexed"},
+    )
+    monkeypatch.setattr(adapter, "_internal_index_paths", lambda workspace: [".shamsu/runs/old.json"])
+    monkeypatch.setattr(adapter, "delete_workspace_index", lambda workspace: {"ok": True})
+
+    result = adapter.refresh_workspace(tmp_path)
+
+    assert result["ok"] is True
+    assert result["rebuilt_for_policy"] is True
+    assert result["removed_internal_paths"] == [".shamsu/runs/old.json"]
+    assert len(index_calls) == 2

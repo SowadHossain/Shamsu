@@ -16,7 +16,6 @@ import re
 import shlex
 import subprocess
 import sys
-import threading
 import traceback
 from pathlib import Path
 from typing import Any, Callable
@@ -52,23 +51,44 @@ from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.agents.plan_mode import PlanningWorkflow
 from shamsu.cli.command_router import CommandRouter
+from shamsu.cli.arguments import parse_args
+from shamsu.cli.approval_ui import (
+    get_permission_memory as _get_permission_memory,
+    make_approval_manager,
+)
+from shamsu.cli.request_lifecycle import (
+    finish_current_run as _finish_current_run,
+    log_assistant_message as _log_assistant_message,
+    log_event as _log_event,
+)
+from shamsu.cli.session_commands import handle_run as _modular_handle_run
+from shamsu.cli.session_commands import handle_runs as _modular_handle_runs
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
 from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
 from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
+from shamsu.indexer.policy import walk_workspace_files
 from shamsu.llm.manager import LLMManager, LLMStalledError, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
+from shamsu.memory.queue import flush_memory_queues, get_memory_queue
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
+from shamsu.verify import contract
 from shamsu.verify.gate import default_verify_command, verify_only
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec, is_static_frontend_prd
-from shamsu.prd.state import create_generation_state, save_generation_state
+from shamsu.prd.state import create_generation_state, save_generation_state, state_path
 from shamsu.registry.schema import Category
 from shamsu.registry.suitability import templates_enabled
 from shamsu.plans.store import parse_plan_steps, read_plan
+from shamsu.routing.operations import (
+    OperationPlan,
+    OperationStep,
+    parse_operation_plan,
+    recover_original_prompt,
+)
 from shamsu.retriever.search import NullSearchAgent, SearchAgent
 from shamsu.tasks.state import (
     MilestoneTask,
@@ -104,10 +124,9 @@ from shamsu.runtime.ollama import (
     wait_until_running,
 )
 from shamsu.runtime.session_registry import claim_ollama_ownership, register_session
+from shamsu.safety import dry_run, read_only
 from shamsu.safety.approval import ask_approval, ask_approval_menu, ask_tier_choice
 from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
-from shamsu.safety.approval_manager import ApprovalManager
-from shamsu.safety.permission_store import PermissionMemory
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch import git_apply as patch_git_apply
 from shamsu.patch import types as patch_types
@@ -153,15 +172,32 @@ if sys.platform == "win32":
 else:
     NoConsoleScreenBufferError = RuntimeError
 
-DEFAULT_ASK_APPROVAL = ask_approval
-
 EmptySearchAgent = NullSearchAgent
+
+
+def _make_approval_manager(
+    workspace: Path,
+    session_logger: SessionLogger | None,
+    console: Console,
+    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
+):
+    """Compatibility facade; approval policy/UI ownership lives in approval_ui."""
+    return make_approval_manager(
+        workspace,
+        session_logger,
+        console,
+        approval_func,
+        menu_prompt_func=ask_approval_menu,
+    )
 
 # Subcommands that claim the bare word "run" in the REPL dispatcher (see the
 # main loop below) - anything else starting with "run" (e.g. "run the tests")
 # is ordinary English and falls through to the normal agent request path.
 _RUN_SUBCOMMANDS = frozenset(
-    {"last", "show", "timeline", "decisions", "tools", "commands", "context", "diff", "export", "clean"}
+    {
+        "last", "show", "timeline", "decisions", "tools", "commands",
+        "context", "diff", "validate", "export", "clean",
+    }
 )
 
 
@@ -302,6 +338,7 @@ SYSTEM_COMMANDS = (
     "/run commands ",
     "/run context ",
     "/run diff ",
+    "/run validate ",
     "/run export ",
     "/run clean",
     "/context status",
@@ -336,31 +373,6 @@ class SlashCommandCompleter(Completer):
         for command in SYSTEM_COMMANDS:
             if command.startswith(lowered):
                 yield Completion(command, start_position=-len(text))
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="shamsu",
-        description="Local-first coding agent REPL.",
-    )
-    parser.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace directory to treat as the sandbox boundary. Defaults to cwd.",
-    )
-    parser.add_argument(
-        "--session",
-        default=None,
-        help="Resume a session by id or title prefix.",
-    )
-    parser.add_argument(
-        "--new-session",
-        nargs="?",
-        const="Untitled Session",
-        default=None,
-        help="Create a new session with an optional title.",
-    )
-    return parser.parse_args(argv)
 
 
 def resolve_workspace(workspace_arg: str | None) -> Path:
@@ -504,6 +516,7 @@ def _print_help(console: Console) -> None:
                     "  /run commands <run-id>    Show a run's commands, exit codes, log paths",
                     "  /run context <run-id>     Show a run's safe context preview",
                     "  /run diff <run-id>        Show a run's patch/mutation references",
+                    "  /run validate <run-id>    Validate a run's artifact integrity",
                     "  /run export <run-id>      Export a run to a redacted zip + markdown report",
                     "  /run clean                Delete runs older than the retention window (asks for approval)",
                     "  /edit <request>           Force code-edit workflow",
@@ -526,13 +539,15 @@ def _build_search_agent(
     workspace: Path,
     session_logger: SessionLogger | None = None,
 ) -> tuple[SearchAgent | EmptySearchAgent, bool]:
-    """Codebase-Memory MCP-backed search, auto-building/refreshing the index
-    via the same gate `/abstract` and AgentOrchestrator use. Falls back to a
-    no-op agent (not a local SQLite index) when the tool is unavailable."""
+    """Search with external graph retrieval plus local semantic degradation."""
     gate = AbstractService(workspace).ensure_ready()
-    if gate.allowed:
-        return SearchAgent(workspace), True
-    return EmptySearchAgent(), False
+    status = gate.status
+    uses_external_index = bool(
+        status and status.health.ok and status.index.exists and not status.index.stale
+    )
+    search = SearchAgent(workspace)
+    search.external_enabled = uses_external_index
+    return search, uses_external_index
 
 
 def _build_workspace_qa_workflow(
@@ -615,6 +630,9 @@ def _handle_plan_prd(
         workflow_id="plan-prd",
     )
     _print_project_plan(spec, console)
+    if not spec.generation_ready:
+        console.print(f"[yellow]Needs input: {spec.clarification_question}[/yellow]")
+        return
     request = ApprovalRequest(
         action_type="file_write",
         description="Record this PRD project plan as approved for future generation.",
@@ -622,6 +640,7 @@ def _handle_plan_prd(
         preview=_project_plan_summary(spec),
         working_dir=str(workspace),
         reason="M3 only stores resume metadata; it does not generate project files.",
+        target_paths=[state_path(workspace).relative_to(workspace).as_posix()],
     )
     approved = _make_approval_manager(workspace, session_logger, console, approval_func).ask(request)
     if not approved:
@@ -679,6 +698,9 @@ def _handle_generate_django(
         workflow_id="generate-django",
     )
     _print_project_plan(spec, console)
+    if not spec.generation_ready:
+        console.print(f"[yellow]Generation stopped: {spec.clarification_question}[/yellow]")
+        return
     writer = DjangoProjectWriter(
         workspace,
         approval_func=approval_func,
@@ -857,17 +879,24 @@ def _print_project_plan(spec: ProjectSpec, console: Console) -> None:
 
 
 def _project_plan_summary(spec: ProjectSpec) -> str:
-    return "\n".join(
-        [
+    contract = getattr(spec, "prd_contract", None)
+    lines = [
             f"Project: {spec.project_name}",
             f"App: {spec.app_name}",
             f"Theme: {spec.theme}",
+            f"Status: {'ready' if spec.generation_ready else 'needs input'}",
             f"Entities: {len(spec.entities)}",
             f"Endpoints: {len(spec.endpoints)}",
             f"Pages: {len(spec.pages)}",
             f"Files planned: {len(spec.generation_order)}",
-        ]
-    )
+    ]
+    if contract is not None:
+        lines.append(f"Extraction confidence: {contract.extraction_confidence:.0%}")
+        lines.extend(f"Extraction warning: {item}" for item in contract.extraction_warnings)
+    lines.extend(f"Assumption: {item}" for item in spec.assumptions)
+    if spec.clarification_question:
+        lines.append(f"Question: {spec.clarification_question}")
+    return "\n".join(lines)
 
 
 def _resolve_workspace_file(path_text: str, workspace: Path) -> Path:
@@ -886,6 +915,7 @@ def _ensure_code_memory_ready_at_startup(workspace: Path, console: Console) -> N
         service = AbstractService(workspace)
         health = service.adapter.healthcheck(workspace)
         if not health.ok:
+            service.status()
             console.print(f"[yellow]{REQUIRED_TOOL_MESSAGE}[/yellow]")
             return
         index = service.index_status()
@@ -922,9 +952,14 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
 
     if subcommand == "status":
         status = service.status()
-        console.print(f"Available: {status.health.available} ({status.health.message})")
+        queue_status = get_memory_queue(workspace).status()
+        console.print(f"Graphiti available: {status.health.available} ({status.health.message})")
+        console.print(f"Local memory available: {status.local_available}")
+        console.print(f"Storage mode: {status.storage_mode}")
+        console.print(f"Mirror queue: {queue_status['pending']}/{queue_status['capacity']} pending")
         console.print(f"Index: {'stale' if status.index.stale else 'fresh'} - {status.index.message}")
         console.print(f"Normal code-agent mode allowed: {status.normal_mode_allowed}")
+        console.print(f"Retrieval mode: {status.retrieval_mode}{' (degraded)' if status.degraded else ''}")
         return
     if subcommand == "setup":
         result = service.setup()
@@ -935,10 +970,10 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
         console.print("[green]Repair complete.[/green]" if result.get("ok") else f"[red]Repair failed: {result.get('message', result)}[/red]")
         return
     if subcommand == "build":
-        console.print(service.adapter.index_workspace(workspace))
+        console.print(service.build())
         return
     if subcommand == "refresh":
-        console.print(service.adapter.refresh_workspace(workspace))
+        console.print(service.refresh())
         return
     if subcommand == "query":
         if not argument:
@@ -1130,16 +1165,25 @@ def _handle_memory(
         # When there's an active session, route through the session bridge so the
         # explicit memory is also recorded in the session's local memory.jsonl.
         if session_logger is not None:
-            bridge = session_logger.save_long_term_memory("user_preference", argument, {"reason": "explicit_remember"})
+            bridge = session_logger.save_long_term_memory(
+                "user_preference",
+                argument,
+                {"reason": "explicit_remember", "explicit": True, "confidence": 1.0},
+            )
             outcome = bridge.get("long_term") or {}
             if outcome.get("ok"):
-                console.print("[green]Memory stored.[/green]" if not outcome.get("deduped") else "[green]Memory already existed.[/green]")
+                message = "Memory already existed." if outcome.get("deduped") else "Memory stored locally; Graphiti mirror queued."
+                console.print(f"[green]{message}[/green]")
             elif bridge.get("local"):
                 console.print("[green]Saved to session memory (long-term backend unavailable).[/green]")
             else:
                 console.print(f"[yellow]Memory not stored: {outcome.get('reason') or outcome.get('error') or 'skipped'}[/yellow]")
             return
-        result = service.remember(argument)
+        result = get_memory_queue(workspace).enqueue(
+            argument,
+            "user_preference",
+            {"reason": "explicit_remember", "explicit": True, "confidence": 1.0},
+        )
         if result.get("ok"):
             console.print("[green]Memory stored.[/green]" if not result.get("deduped") else "[green]Memory already existed.[/green]")
         else:
@@ -1185,31 +1229,74 @@ def _record_task_memory(
     kind: str = "task_summary",
     session_logger: SessionLogger | None = None,
     metadata: dict[str, Any] | None = None,
-) -> None:
-    """Persist a durable task lesson without blocking the REPL.
-
-    `MemoryService.remember` can fire up to three Graphiti subprocesses
-    (healthcheck, dedup lookup, write) with timeouts measured in minutes. Doing
-    that inline is what made SHAMSU appear to hang at the prompt right after
-    printing an answer. The write is best-effort, so we hand it to a daemon
-    thread and return immediately; failures are logged, never surfaced.
-    """
-
-    def _write() -> None:
-        try:
-            result = MemoryService(workspace).remember(text, kind, metadata)
-        except Exception as exc:
-            _log_event(session_logger, "memory.write_failed", {"error": str(exc)}, "Graphiti memory write failed", workflow_id="memory")
-            return
-        _log_event(
-            session_logger,
-            "memory.write",
-            {"ok": bool(result.get("ok")), "kind": kind, "skipped": bool(result.get("skipped")), "deduped": bool(result.get("deduped"))},
-            "Graphiti memory write evaluated",
-            workflow_id="memory",
+) -> dict[str, Any]:
+    """Persist only evidence-backed automatic memory, then queue its mirror."""
+    ledger = get_current_run()
+    outcome = ledger.evidence_outcome() if ledger is not None else "unknown"
+    events = action_ledger_store.load_events(workspace, ledger.run_id) if ledger is not None else []
+    event_types = {str(event.get("type", "")) for event in events}
+    verified = "verification_passed" in event_types
+    mutation_recorded = any(
+        str(event.get("type", "")) == "patch_apply_succeeded"
+        or (
+            str(event.get("type", "")) == "mutation_finished"
+            and str(event.get("status", "")) == "applied"
         )
+        for event in events
+    )
+    details = {
+        **(metadata or {}),
+        "automatic": True,
+        "outcome": outcome,
+        "verified": verified,
+        "source_run_id": ledger.run_id if ledger is not None else "",
+        "run_id": ledger.run_id if ledger is not None else "",
+    }
+    if outcome not in {"success", "success_unverified"} or not mutation_recorded:
+        result = {"ok": False, "skipped": True, "reason": f"outcome={outcome}, mutation={mutation_recorded}"}
+        _log_event(session_logger, "memory.write_skipped", result, "Automatic memory skipped", workflow_id="memory")
+        return result
+    if kind == "bug_lesson" and not verified:
+        kind = "task_summary"
+    if outcome == "success_unverified":
+        memory_text = f"Task outcome (success_unverified): {_memory_request_text(text)} Changes were applied but not verified."
+        details["confidence"] = 0.65
+    else:
+        prefix = "Verified task outcome" if verified else "Task outcome (success)"
+        memory_text = f"{prefix}: {_memory_request_text(text)}"
+        details["confidence"] = 0.95 if verified else 0.8
+    if session_logger is not None:
+        result = session_logger.save_long_term_memory(kind, memory_text, details)
+        queued = result.get("long_term") or {}
+    else:
+        queued = get_memory_queue(workspace).enqueue(memory_text, kind, details)
+        result = {"local": bool(queued.get("local")), "long_term": queued}
+    _log_event(
+        session_logger,
+        "memory.write",
+        {
+            "ok": bool(queued.get("ok")),
+            "kind": kind,
+            "outcome": outcome,
+            "verified": verified,
+            "queued": bool(queued.get("queued")),
+        },
+        "Automatic memory evaluated",
+        workflow_id="memory",
+    )
+    return result
 
-    threading.Thread(target=_write, name="shamsu-memory-write", daemon=True).start()
+
+def _memory_request_text(text: str) -> str:
+    """Keep automatic memory about the request, not injected retrieval context."""
+    clean = str(text or "").strip()
+    for marker in (
+        "\n\nAdditional SHAMSU context:",
+        "\n\nTask execution handoff:",
+        "\n\nRelevant long-term memory:",
+    ):
+        clean = clean.split(marker, 1)[0].strip()
+    return clean[:700]
 def _handle_permissions(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1731,11 +1818,11 @@ def _handle_run(
         run_id = _resolve_run_or_print_error(workspace, argument, console)
         if not run_id:
             return
-        preview = action_ledger_store.load_context_preview(workspace, run_id)
-        if not preview:
+        previews = action_ledger_store.load_context_records(workspace, run_id)
+        if not previews:
             console.print("[dim]No context preview recorded for this run.[/dim]")
             return
-        console.print(Panel(json.dumps(preview, indent=2, default=str), title=f"Context Preview: {run_id}"))
+        console.print(Panel(json.dumps(previews, indent=2, default=str), title=f"Contexts: {run_id}"))
         return
 
     if subcommand == "diff":
@@ -1769,6 +1856,20 @@ def _handle_run(
         console.print(f"[green]Exported run to {zip_path}[/green]")
         return
 
+    if subcommand == "validate":
+        run_id = _resolve_run_or_print_error(workspace, argument, console)
+        if not run_id:
+            return
+        result = action_ledger_store.validate_run(workspace, run_id)
+        color = "green" if result["ok"] else "red"
+        lines = [f"Integrity: {'valid' if result['ok'] else 'invalid'}"]
+        lines.extend(f"Error: {item}" for item in result["errors"])
+        lines.extend(f"Warning: {item}" for item in result["warnings"])
+        console.print(
+            Panel("\n".join(lines), title=f"Run Validation: {run_id}", border_style=color)
+        )
+        return
+
     if subcommand == "clean":
         config = load_action_ledger_config(workspace)
         retention_days = int(config.get("retention_days", 30))
@@ -1783,6 +1884,7 @@ def _handle_run(
             preview="\n".join(stale[:20]),
             working_dir=str(workspace),
             reason="Run folders under .shamsu/runs/ older than the retention window are being cleaned up.",
+            target_paths=[f".shamsu/runs/{run_id}" for run_id in stale],
         )
         if not approval_func(request):
             console.print("[yellow]Clean cancelled; no runs were deleted.[/yellow]")
@@ -1792,8 +1894,14 @@ def _handle_run(
         return
 
     console.print(
-        "[red]Usage: /run last|show|timeline|decisions|tools|commands|context|diff|export|clean [run-id][/red]"
+        "[red]Usage: /run last|show|timeline|decisions|tools|commands|context|diff|"
+        "validate|export|clean [run-id][/red]"
     )
+
+
+# Temporary compatibility re-exports while callers migrate from repl.py.
+_handle_runs = _modular_handle_runs
+_handle_run = _modular_handle_run
 
 
 _ROOT_CAUSE_EXPLANATIONS = {
@@ -1935,6 +2043,7 @@ def _handle_undo(
         risk_level="high",
         working_dir=str(workspace),
         reason="Undo restores backed-up files, overwriting current content.",
+        target_paths=touched,
     )
     if not engine.approval_manager.ask(request):
         console.print("[yellow]Undo cancelled - nothing was changed.[/yellow]")
@@ -1995,12 +2104,14 @@ def _handle_patch(
         if not argument:
             console.print("[red]Usage: /patch rollback <transaction-id>[/red]")
             return
+        manifest = engine.transactions.load_manifest(argument) or {}
         request = ApprovalRequest(
             action_type="file_delete",
             description=f"Roll back transaction {argument}.",
             risk_level="high",
             working_dir=str(workspace),
             reason="Rollback restores backed-up files, overwriting current content.",
+            target_paths=[str(path) for path in manifest.get("touched_files", [])],
         )
         if not engine.approval_manager.ask(request):
             console.print("[yellow]Rollback denied.[/yellow]")
@@ -2087,6 +2198,7 @@ def _handle_patch(
             risk_level="high",
             working_dir=str(workspace),
             reason="Clean-trash permanently removes files SHAMSU previously moved to .shamsu/trash.",
+            target_paths=[item.relative_path for item in entries],
         )
         if not engine.approval_manager.ask(request):
             console.print("[yellow]Clean-trash denied.[/yellow]")
@@ -2726,7 +2838,7 @@ def _handle_web(
         _print_web_service_status(service.setup(), console)
         return
     if command == "status":
-        _print_web_service_status(service.status(), console)
+        _print_web_capability_status(web_tool.status(), console)
         return
     if command == "start":
         _print_web_service_status(service.start(), console)
@@ -2744,7 +2856,6 @@ def _handle_web(
         result = web_tool.search_and_fetch(
             argument,
             reason="User explicitly requested a sourced web search.",
-            require_local_service=True,
         )
         asyncio.run(_print_web_answer(argument, result, result.pages, console, llm))
         return
@@ -2764,6 +2875,19 @@ def _print_web_service_status(status, console: Console) -> None:
     console.print(Panel(f"{status.message}\nStatus: {state}", title="Web Search Service", border_style=style))
 
 
+def _print_web_capability_status(status, console: Console) -> None:
+    table = Table(title="Web Capabilities")
+    table.add_column("Capability")
+    table.add_column("State")
+    table.add_column("Detail")
+    table.add_row("Web", "enabled" if status.enabled else "disabled", f"mode={status.provider_mode}")
+    table.add_row("SearXNG", status.searxng.state, status.searxng.message)
+    table.add_row("Fallback search", status.fallback_state, "DuckDuckGo HTML provider")
+    table.add_row("Page fetch", status.fetch_state, "Public HTTP/HTTPS only; local/private targets blocked")
+    table.add_row("Cache", status.cache_state, status.cache_path)
+    console.print(table)
+
+
 def _handle_browse(
     user_input: str,
     console: Console,
@@ -2771,6 +2895,14 @@ def _handle_browse(
 ) -> None:
     parts = user_input.split(maxsplit=3)
     command = parts[1].strip().lower() if len(parts) > 1 else ""
+    if command == "status":
+        status = browser_tool.status()
+        style = "green" if status.available else "yellow"
+        detail = status.message
+        if status.executable_path:
+            detail = f"{detail}\nExecutable: {status.executable_path}"
+        console.print(Panel(f"State: {status.state}\n{detail}", title="Browser Capability", border_style=style))
+        return
     if command == "open":
         if len(parts) < 3:
             console.print("[red]Usage: browse open <url>[/red]")
@@ -2798,7 +2930,7 @@ def _handle_browse(
     if command == "screenshot":
         _print_browser_result(browser_tool.screenshot(), console)
         return
-    console.print("[red]Usage: browse open|read|click|type|screenshot[/red]")
+    console.print("[red]Usage: browse status|open|read|click|type|screenshot[/red]")
 
 
 def _build_pull_progress(console: Console) -> Progress:
@@ -3033,55 +3165,6 @@ def _make_thinking_reporter(
         )
 
     return report
-
-
-# One PermissionMemory per workspace per process, so "always allow" choices
-# made in one workflow (e.g. /edit) are honored by later ones (e.g. /fix)
-# within the same REPL session, not just within a single handler call.
-_PERMISSION_MEMORY_CACHE: dict[Path, PermissionMemory] = {}
-
-
-def _get_permission_memory(workspace: Path) -> PermissionMemory:
-    resolved = workspace.resolve()
-    memory = _PERMISSION_MEMORY_CACHE.get(resolved)
-    if memory is None:
-        memory = PermissionMemory(resolved)
-        _PERMISSION_MEMORY_CACHE[resolved] = memory
-    return memory
-
-
-def _make_approval_manager(
-    workspace: Path,
-    session_logger: SessionLogger | None,
-    console: Console,
-    approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
-) -> ApprovalManager:
-    # Autonomy on: apply workspace edits hands-free, so the patch-based
-    # workflows (bug fix, code edit, docs, tests) match the agent chat loop,
-    # which already auto-approves when is_long_running_enabled. Without this,
-    # `/autonomy on` still stopped every diff at a Yes/No prompt - not seamless.
-    # Only kicks in for the real interactive default; an injected approval_func
-    # (tests, custom callers) is never silently overridden.
-    if approval_func is DEFAULT_ASK_APPROVAL and is_long_running_enabled(workspace):
-        return ApprovalManager(
-            approval_func=lambda _request: True,
-            session_logger=session_logger,
-            memory=_get_permission_memory(workspace),
-        )
-    # Otherwise use the interactive single-menu (yes / yes+remember / no) when
-    # this is the real interactive prompt. Callers (mainly tests) that inject
-    # their own approval_func keep their own approval behavior.
-    menu_prompt = (
-        (lambda request, offer: ask_approval_menu(request, offer_remember=offer, console=console))
-        if approval_func is DEFAULT_ASK_APPROVAL
-        else None
-    )
-    return ApprovalManager(
-        approval_func=approval_func,
-        session_logger=session_logger,
-        memory=_get_permission_memory(workspace),
-        menu_prompt=menu_prompt,
-    )
 
 
 def _pull_models_with_progress(
@@ -3412,49 +3495,12 @@ def _handle_log(user_input: str, logger: SessionLogger, console: Console) -> Non
     console.print(table)
 
 
-def _log_event(
-    session_logger: SessionLogger | None,
-    event_type: str,
-    payload: dict,
-    summary: str,
-    workflow_id: str | None = None,
-) -> None:
-    if session_logger:
-        session_logger.log(event_type, payload, summary, workflow_id=workflow_id)
-
-
-def _log_assistant_message(
-    session_logger: SessionLogger | None,
-    message: str,
-    workflow_id: str | None = None,
-) -> None:
-    if session_logger and message:
-        session_logger.log(
-            "assistant.message",
-            {"message": message},
-            "Assistant responded",
-            workflow_id=workflow_id,
-        )
-        # Keep the resumable state's "last answer" in sync so a resumed session
-        # can show where it left off without replaying events.
-        try:
-            session_logger.set_last_assistant_summary(message)
-        except Exception:
-            pass
-    ledger = get_current_run()
-    if ledger and message:
-        ledger.log_task_classified(workflow_id or "unknown")
-        ledger.finish(message, status="success")
-
-
 def _finalize_session_work(
     session_logger: SessionLogger | None,
     workflow: str,
     request_text: str,
 ) -> None:
-    """On meaningful workflow completion: refresh the deterministic session
-    summary and save a durable task summary (local + best-effort long-term).
-    Every step is best-effort so it never breaks the user-facing flow."""
+    """Refresh local resume state and enqueue any evidence-backed memory."""
     if not session_logger:
         return
     try:
@@ -3462,23 +3508,15 @@ def _finalize_session_work(
     except Exception:
         pass
     try:
-        session_logger.save_long_term_memory(
+        _record_task_memory(
+            session_logger.manager.workspace,
+            f"{workflow} request: {request_text.strip()[:500]}",
             "task_summary",
-            f"Task summary ({workflow}): {request_text.strip()[:500]}",
-            {"workflow": workflow},
+            session_logger,
+            {"workflow": workflow, "intent": workflow},
         )
     except Exception:
         pass
-
-
-def _finish_current_run(workspace: Path, ledger: ActionLedger) -> None:
-    """Fallback for request branches that never produced a final assistant
-    message through _log_assistant_message (e.g. workspace-info shortcuts,
-    dev-server launches) - still closes out the run so /runs and /run show
-    a finished status instead of "running" forever."""
-    manifest = action_ledger_store.load_manifest(workspace, ledger.run_id)
-    if manifest and manifest.get("status") == "running":
-        ledger.finish("", status="success")
 
 
 def _append_agent_context(user_input: str, agent_context: str) -> str:
@@ -3525,6 +3563,12 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     # keyword, "stage the files" falls into weak QA, and "what are the unstaged
     # changes" trips the code-edit heuristic.
     ("git", lambda text, ws: is_git_request(text)),
+    # A PLAN request is classified before build/write/workspace rules. "Make a
+    # step by step plan for PRD.md" otherwise matched a build ("implement"), a
+    # file write ("make ... PRD.md"), or the ReAct regex ("make <anything>.md")
+    # long before the plan route at the tail ever ran. Planning is one decision,
+    # made in one place, so it stops being whack-a-mole across every detector.
+    ("plan_prd", lambda text, ws: _looks_like_prd_plan_request(text)),
     ("workspace.location", lambda text, ws: _looks_like_workspace_location_prompt(text)),
     ("workspace.files", lambda text, ws: _looks_like_workspace_files_prompt(text)),
     ("prd.build", lambda text, ws: _looks_like_prd_build_request(text, ws)),
@@ -3546,12 +3590,46 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     ("web", lambda text, ws: _looks_like_web_needed_prompt(text)),
     ("agent-chat", lambda text, ws: _looks_like_react_prompt(text)),
     ("django", lambda text, ws: _looks_like_django_generation_request(text)),
-    ("plan_prd", lambda text, ws: _looks_like_prd_plan_request(text)),
+    # plan_prd is evaluated EARLY (above), not here - a plan request must beat
+    # the build/write/react detectors that would otherwise swallow it.
 )
 
 # No rule matched. NOT a route in its own right so much as the tail: the
 # search/LLM-router path, which ends in the tool-less QA brain.
 ROUTE_FALLTHROUGH = "qa"
+
+
+def _matching_route_labels(effective_input: str, workspace: Path) -> list[str]:
+    # Route detectors are keyword/verb scanners: they read "modify" and "files"
+    # as intent to write, with no idea a "do not" sits in front of them. So a
+    # read-only clause is masked out BEFORE detection - measured live, the same
+    # web-search prompt matched no route without the clause and `file.write`
+    # with it, which then made a correct answer report itself as a failure.
+    # Only the detectors see the masked text; handlers and the model still get
+    # the user's full instruction, and the tool layer enforces it.
+    detector_input = read_only.strip(effective_input)
+    labels: list[str] = []
+    for label, matches in _ROUTE_RULES:
+        try:
+            if matches(detector_input, workspace):
+                labels.append(label)
+        except Exception as exc:
+            swallowed.record(f"route.detector.{label}", exc)
+    return labels
+
+
+def _classify_single_route_label(effective_input: str, workspace: Path) -> str:
+    labels = _matching_route_labels(effective_input, workspace)
+    return labels[0] if labels else ROUTE_FALLTHROUGH
+
+
+def _operation_plan(effective_input: str, workspace: Path) -> OperationPlan:
+    return parse_operation_plan(
+        effective_input,
+        workspace,
+        _classify_single_route_label,
+        _matching_route_labels,
+    )
 
 
 def _classify_route_label(effective_input: str, workspace: Path) -> str:
@@ -3562,14 +3640,8 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
     dispatches on what this returns. A detector that raises is treated as
     "no match" rather than taking the whole REPL down over a routing guess.
     """
-    for label, matches in _ROUTE_RULES:
-        try:
-            if matches(effective_input, workspace):
-                return label
-        except Exception as exc:
-            swallowed.record(f"route.detector.{label}", exc)
-            continue
-    return ROUTE_FALLTHROUGH
+    plan = _operation_plan(effective_input, workspace)
+    return "composite" if plan.is_composite else plan.primary_route
 
 
 async def _handle_request(
@@ -3586,13 +3658,18 @@ async def _handle_request(
     effective_input = agent_result.effective_input or user_input
     if session_logger is None:
         effective_input = _expand_followup_prompt(effective_input, previous_user_prompt)
+    effective_input = recover_original_prompt(effective_input)
     agent_context = agent_result.context
+    operation_plan = _operation_plan(effective_input, workspace)
     # Record the routing decision in session state so `/sessions trace` and a
     # resumed session can see how the last prompt was dispatched.
-    route_label = (
-        agent_result.action if agent_result.handled
-        else _classify_route_label(effective_input, workspace)
-    ) or "agent-chat"
+    if agent_result.handled:
+        route_label = agent_result.action
+    elif operation_plan.is_composite:
+        route_label = "composite"
+    else:
+        route_label = operation_plan.primary_route
+    route_label = route_label or "agent-chat"
     # Pure small talk ("hey how are you", "thanks") that matched no specific
     # route must NOT reach the task router - there it becomes a "QA task" with a
     # fabricated plan and a "proceed?" prompt. Only override the fallthrough
@@ -3603,9 +3680,42 @@ async def _handle_request(
         and _is_conversational_prompt(effective_input)
     ):
         route_label = "general_chat"
+    ledger = get_current_run()
+    if hasattr(web_tool, "action_ledger"):
+        web_tool.action_ledger = ledger
+    if hasattr(browser_tool, "action_ledger"):
+        browser_tool.action_ledger = ledger
+    if ledger is not None:
+        ledger.log_event("operation_plan_created", **operation_plan.to_dict())
+        ledger.log_decision(
+            "dispatch_request",
+            goal=effective_input[:500],
+            observation=(
+                "AgentOrchestrator handled the request directly."
+                if agent_result.handled
+                else "The ordered route table classified the request."
+            ),
+            evidence=[
+                f"route:{route_label}",
+                f"orchestrator_handled:{agent_result.handled}",
+                f"route_candidates:{','.join(operation_plan.candidates) or 'none'}",
+                "operation_sequence:"
+                + ",".join(f"{step.id}:{step.kind}" for step in operation_plan.steps),
+            ],
+            chosen_action=route_label,
+            reason_summary=f"Dispatching this prompt through the {route_label} route.",
+            expected_postcondition="The selected workflow returns a user-visible result or a truthful terminal outcome.",
+            outcome="selected",
+        )
     if session_logger is not None:
         try:
-            session_logger.set_last_route({"route": route_label, "handled": agent_result.handled})
+            session_logger.set_last_route(
+                {
+                    "route": route_label,
+                    "handled": agent_result.handled,
+                    "operation_plan": operation_plan.to_dict(),
+                }
+            )
         except Exception as exc:
             swallowed.record("repl.set_last_route", exc)
     # Audit EVERY prompt (not just tool-loop runs): one prompt+route entry per
@@ -3642,6 +3752,15 @@ async def _handle_request(
             _make_llm_manager(session_logger, console, workspace, lightweight=True),
             session_logger=session_logger,
             thinking_status=thinking_status,
+        )
+        return
+    if route_label == "composite":
+        await _run_composite_request(
+            operation_plan,
+            workspace,
+            console,
+            session_logger=session_logger,
+            agent_context=agent_context,
         )
         return
     if route_label == "prd_summary":
@@ -3759,6 +3878,25 @@ async def _handle_request(
         _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
         return
     if route_label == "plan_prd":
+        # The deterministic `plan-prd` planner extracts Django-style entities and
+        # endpoints, so it produces an empty plan for a plain functional PRD
+        # (dogfood: a temperature-converter PRD yielded nothing). A natural
+        # "make a step by step plan" is better served by the agent loop, which
+        # reads the PRD and writes a real ordered plan - in READ-ONLY mode so a
+        # plan request can never mutate the workspace. The explicit
+        # entity-oriented preview stays for `plan-prd`/`project plan` phrasing.
+        if _looks_like_plan_intent(effective_input):
+            prd_ref = _extract_prd_path_from_prompt(effective_input) or "the PRD"
+            plan_request = (
+                f"Read {prd_ref} and produce a concise, numbered, step-by-step "
+                "implementation plan: the files to create, the order to build them, "
+                "and how to verify the result. Do NOT write any code or files - "
+                "output only the plan as text."
+            )
+            await _run_agent_chat(
+                plan_request, workspace, console, session_logger=session_logger
+            )
+            return
         plan_command = f"plan-prd {_extract_prd_path_from_prompt(effective_input)}"
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
@@ -3791,6 +3929,22 @@ async def _handle_request(
             "[yellow]Codebase-Memory MCP is not ready. Run `/abstract setup` for project-specific QA.[/yellow]"
         )
     decision = await _route_prompt(effective_input, llm)
+    original_intent = decision.intent
+    decision = _enforce_read_only_decision(effective_input, decision)
+    if decision.intent != original_intent:
+        _log_event(
+            session_logger,
+            "routing.read_only_override",
+            {"original_intent": original_intent, "selected_intent": decision.intent},
+            "Blocked a mutating workflow for an explicitly read-only request",
+            workflow_id="qa",
+        )
+        if ledger is not None:
+            ledger.log_event(
+                "routing_read_only_override",
+                original_intent=original_intent,
+                selected_intent=decision.intent,
+            )
     _print_decision(decision, console, verbose=_trace_mode(workspace) == "verbose")
     emit_trace(
         console,
@@ -3899,11 +4053,11 @@ async def _handle_request(
         # long-term memory write for plain questions - it is pure post-answer
         # overhead there. Workflows that actually change the project (edits, bug
         # fixes, tests, docs) still record a summary, now off the hot path.
-        if decision.intent not in {"qa", "explain"}:
+        if decision.intent in {"code_edit", "bug_fix", "test_gen", "doc_gen", "project_gen"}:
             memory_kind = "bug_lesson" if decision.intent == "bug_fix" else "task_summary"
             _record_task_memory(
                 workspace,
-                f"Task summary: {decision.intent} completed for request: {effective_input[:700]}",
+                f"{decision.intent} request: {effective_input[:700]}",
                 memory_kind,
                 session_logger,
                 {"intent": decision.intent},
@@ -3992,11 +4146,58 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
     )
 
 
+_MUTATING_INTENTS = frozenset({"bug_fix", "code_edit", "doc_gen", "generate", "test_gen"})
+
+
+def _explicitly_read_only(user_input: str) -> bool:
+    # Canonical definition lives in shamsu/safety/read_only.py. The local copy
+    # this replaced missed "do not modify any OTHER files" (it required a
+    # literal "any files"), so run 3 of the dogfood never registered a
+    # constraint at all.
+    return read_only.applies(user_input)
+
+
+def _enforce_read_only_decision(
+    user_input: str,
+    decision: RoutingDecision,
+) -> RoutingDecision:
+    if decision.intent not in _MUTATING_INTENTS or not _explicitly_read_only(user_input):
+        return decision
+    return RoutingDecision(
+        intent="qa",
+        complexity="single",
+        steps=[{"id": 1, "specialist": "qa", "task": user_input}],
+        needs_tools=["search"],
+        confidence=1.0,
+    )
+
+
+# A request to PLAN, not to build. "plan the implementation", "make a step by
+# step plan", "outline the approach" - the user wants the plan first, and must
+# not be dropped into a full build because "implementation" happens to contain
+# "implement". Distinct from `proceed`/`run the plan`, which execute one.
+_PLAN_INTENT_RE = re.compile(
+    r"\b(?:make|write|draft|create|give\s+me|outline|sketch|propose)\s+"
+    r"(?:a\s+|an\s+|the\s+)?(?:step[\s-]?by[\s-]?step\s+)?(?:implementation\s+)?plan\b"
+    r"|\bplan\s+(?:out\s+)?(?:the\s+|a\s+|how\s+)"
+    r"|\boutline\s+(?:the\s+)?(?:steps|approach|plan)\b"
+    r"|^\s*plan\b(?!\s*(?:mode|is|was))",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_plan_intent(user_input: str) -> bool:
+    """True when the user is asking for a PLAN, not asking to build now."""
+    return bool(_PLAN_INTENT_RE.search(user_input or ""))
+
+
 def _looks_like_prd_plan_request(user_input: str) -> bool:
     text = user_input.lower()
-    return (
-        any(phrase in text for phrase in ("plan project", "project plan", "plan-prd"))
-        and bool(_extract_prd_path_from_prompt(user_input))
+    has_prd = bool(_extract_prd_path_from_prompt(user_input)) or "prd" in text
+    if not has_prd:
+        return False
+    return _looks_like_plan_intent(user_input) or any(
+        phrase in text for phrase in ("plan project", "project plan", "plan-prd")
     )
 
 
@@ -4115,7 +4316,21 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     extracted_url = _extract_url_from_prompt(user_input)
     if extracted_url and not _is_local_url(extracted_url):
         return True
-    if any(phrase in text for phrase in ("search the web", "look up", "find docs", "documentation for", "official docs", "latest ", "current ", "check on the web")):
+    # An explicit instruction to use the web is not a hint to be weighed - it is
+    # the user telling us which tool to use. "Use web search to find X" matched
+    # NONE of these until 2026-07-20 ("search the web" is not "web search"), so
+    # it fell through to the tool-less QA brain, which answered a "what is the
+    # release date" question from stale model memory and got the year wrong.
+    if any(
+        phrase in text
+        for phrase in (
+            "web search", "search the web", "search online", "online search",
+            "search the internet", "internet search", "on the web", "from the web",
+            "check on the web", "google it", "google for",
+        )
+    ):
+        return True
+    if any(phrase in text for phrase in ("look up", "find docs", "documentation for", "official docs", "latest ", "current ")):
         return True
     if any(word in text for word in ("weather", "forecast", "temperature", "rain today", "news today", "stock price", "exchange rate")):
         return True
@@ -4311,7 +4526,7 @@ def _run_git_read_only(
         )
         sections.append(_format_git_read_result(tool_name, result))
     body = "\n\n".join(section for section in sections if section).strip() or "No git output."
-    console.print(Panel(body, title="Git"))
+    console.print(Panel(Text(body), title="Git"))
     _log_assistant_message(session_logger, body, workflow_id="git-read")
 
 
@@ -4596,7 +4811,11 @@ _PRD_SUMMARY_TRIGGERS = (
 
 def _looks_like_prd_summary_request(user_input: str, workspace: Path) -> bool:
     text = user_input.lower()
-    if not any(trigger in text for trigger in _PRD_SUMMARY_TRIGGERS):
+    explicit_prd = _extract_prd_path_from_prompt(user_input)
+    explicit_summary = bool(explicit_prd) and is_prd_filename(Path(explicit_prd.lstrip("@")).name) and any(
+        verb in text for verb in ("summarize", "summarise", "explain", "describe", "review", "read")
+    )
+    if not explicit_summary and not any(trigger in text for trigger in _PRD_SUMMARY_TRIGGERS):
         return False
     # A build verb ("build/implement the prd") is a build request, not a read.
     if any(verb in text for verb in ("build ", "implement ", "generate ", "scaffold ")):
@@ -4862,9 +5081,7 @@ def _looks_like_code_edit_request(user_input: str) -> bool:
 
 def _find_workspace_prd_files(workspace: Path) -> list[Path]:
     candidates: list[Path] = []
-    for path in workspace.rglob("*"):
-        if not path.is_file():
-            continue
+    for path in walk_workspace_files(workspace):
         if not (is_prd_filename(path.name) or path.name.lower() == "requirements.md"):
             continue
         try:
@@ -4915,6 +5132,14 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> str:
 
 _PRD_BUILD_VERBS = ("build", "finish", "implement", "generate", "make", "create", "develop")
 _PRD_BUILD_NOUNS = ("product", "app", "application", "game", "project", "website", "site", "it", "this", "prd")
+# Matched on WORD boundaries, not as substrings. The plain `noun in text` this
+# replaced meant the "it" entry matched inside with/quit/write/site/edit - so
+# the noun half of the build test was satisfied by almost any English sentence,
+# leaving `_resolve_build_prd` as the only thing standing between an ordinary
+# prompt and a full product build.
+_PRD_BUILD_NOUN_RE = re.compile(
+    r"\b(?:" + "|".join(_PRD_BUILD_NOUNS) + r")s?\b", re.IGNORECASE
+)
 
 # Terse imperative "just do it" style commands. These carry no task detail of
 # their own, so they must be routed to something that can actually act (the
@@ -5028,6 +5253,8 @@ def _prefers_qa_answer(user_input: str) -> bool:
 def _qa_branch_routes_to_agent(effective_input: str, uses_real_index: bool) -> bool:
     """The qa/explain tail's actual decision, extracted so it is testable:
     True -> the tool-having agent loop, False -> the tool-less QA specialist."""
+    if _explicitly_read_only(effective_input):
+        return False
     return (
         _looks_like_action_request(effective_input)
         or _looks_like_trouble_report(effective_input)
@@ -5046,6 +5273,8 @@ def _looks_like_action_request(user_input: str) -> bool:
     caught without another edit here."""
     raw = user_input.strip().lower()
     if not raw:
+        return False
+    if _explicitly_read_only(user_input):
         return False
     if _looks_like_vague_action_request(user_input):
         return True
@@ -5124,6 +5353,12 @@ def _bugfix_report_from_last_failure(
         failure = session_logger.get_last_failure()
     except Exception:
         return None
+    if failure.get("actionable") is False:
+        return None
+    if str(failure.get("classification", "command_failure")) != "command_failure":
+        return None
+    if str(failure.get("source", "user_command")) != "user_command":
+        return None
     command = str(failure.get("command", "")).strip()
     errors = str(failure.get("errors", "")).strip()
     if not errors and not command:
@@ -5164,6 +5399,11 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     if not raw or raw.endswith("?"):
         return False
     if any(raw.startswith(prefix) for prefix in _QUESTION_PREFIXES):
+        return False
+    # "Make a step by step plan for PRD.md" is a plan request, not a file write -
+    # but "make" is a write verb and "PRD.md" is file-like, so it matched here
+    # and skipped planning entirely. A plan intent is never a raw file write.
+    if _looks_like_plan_intent(user_input):
         return False
     words = set(re.sub(r"[^\w\s]", " ", raw).split())
     if not (_FILE_WRITE_VERBS & words):
@@ -5768,6 +6008,12 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     about building instead of building. A PRD that exists but isn't *named*
     "prd" (e.g. `spec.md`) hit this on every prompt.
     """
+    # "Plan the implementation from PRD.md" asks for a PLAN. It used to reach
+    # here and match a build because "implementation" contains "implement" - so
+    # a plan request kicked off a full autonomous build (and, pre-fix, wrote a
+    # .gitignore). A plan intent is never a build.
+    if _looks_like_plan_intent(user_input):
+        return False
     if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
         return True
     text = user_input.lower()
@@ -5775,7 +6021,7 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     has_build_verb = any(verb in text for verb in _PRD_BUILD_VERBS) or _has_fuzzy_word(
         words, _PRD_BUILD_VERBS
     )
-    has_product_noun = any(noun in text for noun in _PRD_BUILD_NOUNS)
+    has_product_noun = bool(_PRD_BUILD_NOUN_RE.search(text))
     if not (has_build_verb and has_product_noun):
         return False
     if "prd" in text or "product requirements" in text or "requirements document" in text:
@@ -5811,6 +6057,13 @@ def _resolve_build_prd(user_input: str, workspace: Path) -> Path | None:
             return None
         if resolved.exists() and resolved.is_file():
             return resolved
+        # The prompt named a document that does NOT exist - almost always the
+        # file the user is asking us to CREATE ("create shamsu_smoke_note.md").
+        # Falling through to "the single workspace PRD" below made every such
+        # prompt resolve to an unrelated PRD, so a one-line file request routed
+        # to prd.build and built somebody else's product instead. If the user
+        # named a doc, that doc is the subject; not finding it is an answer.
+        return None
 
     for mention in MentionResolver(workspace).resolve_all(user_input):
         if mention.resolved and mention.path is not None and is_prd_filename(mention.path.name):
@@ -6090,7 +6343,6 @@ _APP_SOURCE_EXTENSIONS = {
     ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
     ".py", ".vue", ".svelte", ".go", ".rs", ".rb", ".php", ".java",
 }
-_SCAFFOLD_IGNORED_DIRS = {".git", ".shamsu", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
 _SCAFFOLD_IGNORED_FILES = {".gitignore", "readme.md", "readme", "license", "license.md", "license.txt"}
 
 
@@ -6104,15 +6356,7 @@ def _workspace_has_app_files(workspace: Path) -> bool:
     """True if the workspace already contains real source files (so we should
     extend, not scaffold). PRDs, .gitignore, README/LICENSE and tooling dirs do
     not count."""
-    for path in workspace.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            parts = path.relative_to(workspace).parts
-        except ValueError:
-            continue
-        if any(part in _SCAFFOLD_IGNORED_DIRS for part in parts):
-            continue
+    for path in walk_workspace_files(workspace):
         if is_prd_filename(path.name) or path.name.lower() in _SCAFFOLD_IGNORED_FILES:
             continue
         if path.suffix.lower() in _APP_SOURCE_EXTENSIONS:
@@ -6248,7 +6492,13 @@ async def _handle_prd_build_request(
     except ValueError:
         relative_path = prd_path
 
-    _ensure_git_repo(workspace, console, session_logger)
+    # `_ensure_git_repo` writes `.gitignore` directly (not through the tool
+    # registry), so it sidesteps the read-only / dry-run gate. A prompt that
+    # forbade changes ("make a plan, do not write any code") that mis-lands here
+    # would still mutate the workspace - the exact leak the dogfood contract
+    # flagged. Skip repo init when the request is read-only or a dry run.
+    if not _explicitly_read_only(user_input) and not dry_run.active():
+        _ensure_git_repo(workspace, console, session_logger)
 
     # Greenfield static frontend: the user asked to build with HTML/CSS/JS (or
     # the PRD explicitly says static frontend) and the workspace has no app
@@ -6272,6 +6522,18 @@ async def _handle_prd_build_request(
         return
 
     project = build_project_spec(parsed)
+    if not project.generation_ready:
+        console.print(
+            Panel(project.clarification_question, title="PRD Needs Input", border_style="yellow")
+        )
+        _log_event(
+            session_logger,
+            "project.needs_input",
+            {"project": project.project_name, "question": project.clarification_question},
+            "PRD generation stopped for required input",
+            workflow_id="prd-build",
+        )
+        return
     # Templates disabled by default: a game PRD is built from scratch via the
     # agent below (the generic build path), never by copying the 3D multiplayer
     # boilerplate. Set SHAMSU_ENABLE_TEMPLATES=1 to restore the template build.
@@ -6585,7 +6847,7 @@ def _run_plan_with_ledger(
     session_logger: SessionLogger | None,
 ) -> None:
     """Run `_handle_plan` inside a tracked run, like any other acting route."""
-    ledger = start_run(workspace, user_input)
+    ledger = start_run(workspace, user_input, session_logger=session_logger)
     set_current_run(ledger)
     try:
         with console.status(_thinking_status_for_input(user_input), spinner="dots"):
@@ -6979,7 +7241,7 @@ def _resolve_proceed(
     if pending.get("awaiting") != "plan_approval":
         return False
     session_logger.clear_pending_action()
-    ledger = start_run(workspace, "proceed")
+    ledger = start_run(workspace, "proceed", session_logger=session_logger)
     set_current_run(ledger)
     try:
         asyncio.run(_execute_pending_plan(pending, workspace, console, session_logger))
@@ -7128,6 +7390,262 @@ async def _run_general_chat(
     _log_assistant_message(session_logger, body, workflow_id="general-chat")
 
 
+def _ledger_counts(workspace: Path, ledger: ActionLedger | None) -> tuple[int, int]:
+    if not ledger:
+        return 0, 0
+    return (
+        len(action_ledger_store.load_tool_calls(workspace, ledger.run_id)),
+        len(action_ledger_store.load_events(workspace, ledger.run_id)),
+    )
+
+
+def _ledger_delta(
+    workspace: Path, ledger: ActionLedger | None, before_tools: int, before_events: int
+) -> tuple[list[str], set[str]]:
+    """Successful tool names and event types recorded SINCE the snapshot."""
+    if not ledger:
+        return [], set()
+    tool_records = action_ledger_store.load_tool_calls(workspace, ledger.run_id)[before_tools:]
+    events = action_ledger_store.load_events(workspace, ledger.run_id)[before_events:]
+    successful = [
+        str(item.get("tool", ""))
+        for item in tool_records
+        if item.get("phase") == "finished" and item.get("ok") is True
+    ]
+    return successful, {str(item.get("type", "")) for item in events}
+
+
+def _composite_step_prompt(
+    plan: OperationPlan, step: OperationStep, done: list[dict[str, object]], agent_context: str
+) -> str:
+    """A focused prompt for ONE step of an ordered plan.
+
+    Each step runs as its own agent turn (see `_run_composite_request`) so its
+    outcome can be judged on what THAT step actually did, not on aggregate
+    evidence that let one edit mark every step done. The step still sees the
+    whole plan and what earlier steps produced, so "run it" / "show the diff"
+    references resolve.
+    """
+    lines = [
+        f"Original request: {plan.prompt}",
+        "",
+        "You are executing that request one step at a time. The full ordered plan:",
+    ]
+    for planned in plan.steps:
+        marker = ">>" if planned.id == step.id else "  "
+        lines.append(f"{marker} {planned.id}. [{planned.kind}] {planned.instruction}")
+    if done:
+        lines.append("")
+        lines.append("Already completed in earlier steps:")
+        for record in done:
+            lines.append(f"  - step {record['id']} ({record['status']}): {record['instruction']}")
+    lines.extend(
+        [
+            "",
+            f"Do ONLY step {step.id} now: {step.instruction}.",
+            "Use the registered tools to actually perform it - do not merely describe it, "
+            "and do not do any other step. If a real choice is needed, call ask_user.",
+        ]
+    )
+    if _explicitly_read_only(plan.prompt):
+        lines.append("Do not modify any files while doing this.")
+    return _append_agent_context("\n".join(lines), agent_context)
+
+
+async def _run_composite_request(
+    plan: OperationPlan,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+    agent_context: str = "",
+):
+    """Execute an ordered operation plan one step at a time.
+
+    Rewritten 2026-07-21 after dogfooding: the old version ran the WHOLE plan in
+    a single agent turn, then reverse-engineered per-step success from aggregate
+    ledger evidence - so a single successful edit marked EVERY mutation step
+    "success". Live, "edit greet() AND update __main__" changed greet(), never
+    touched __main__, and still reported "Step 2: success" while leaving the file
+    broken. Now each step gets its own turn and is judged on the evidence that
+    turn produced (its own confirmed writes, its own tool calls), so a step that
+    did not happen is reported not_run - honestly - instead of riding on an
+    earlier step's success.
+    """
+    ledger = get_current_run()
+    if ledger:
+        for step in plan.steps:
+            ledger.log_event("operation_step_planned", **step.to_dict())
+    emit_trace(
+        console,
+        session_logger,
+        workspace,
+        "operation.plan",
+        f"Executing {len(plan.steps)} ordered operations",
+        plan.to_dict(),
+        level="normal",
+    )
+
+    statuses: list[dict[str, object]] = []
+    last_result: Any = None
+    blocked = False
+    for step in plan.steps:
+        if blocked:
+            # An earlier step is waiting on the user; later steps depend on the
+            # answer, so they are honestly not-run rather than attempted blind.
+            record = {**step.to_dict(), "status": "not_run", "evidence": ["blocked:awaiting_input"]}
+            statuses.append(record)
+            _record_composite_step(step, record, ledger, session_logger)
+            continue
+
+        before_tools, before_events = _ledger_counts(workspace, ledger)
+        result = await _run_agent_chat(
+            _composite_step_prompt(plan, step, statuses, agent_context),
+            workspace,
+            console,
+            session_logger=session_logger,
+            auto_approve=is_long_running_enabled(workspace),
+        )
+        last_result = result
+        step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
+
+        # A git-inspect step the agent didn't satisfy falls back to the
+        # deterministic git read, then the delta is recomputed so the fallback's
+        # evidence counts for THIS step.
+        if step.kind == "git_inspect" and not (
+            set(step_tools) & {"git_status", "git_diff", "git_diff_staged", "git_log"}
+        ):
+            _execute_composite_git_inspection(workspace, console, session_logger, ledger)
+            step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
+
+        status, evidence = _composite_step_outcome(step, result, step_tools, step_events)
+        record = {**step.to_dict(), "status": status, "evidence": evidence}
+        statuses.append(record)
+        _record_composite_step(step, record, ledger, session_logger)
+        if status == "needs_input" or bool(getattr(result, "awaiting_user", False)):
+            blocked = True
+
+    completed = [item for item in statuses if item["status"] == "success"]
+    incomplete = [item for item in statuses if item["status"] != "success"]
+    if not incomplete:
+        composite_status = "success"
+    elif any(item["status"] == "needs_input" for item in incomplete):
+        composite_status = "needs_input"
+    elif completed:
+        composite_status = "partial"
+    else:
+        composite_status = "failed"
+    if ledger:
+        event_type = "composite_completed" if composite_status == "success" else f"composite_{composite_status}"
+        ledger.log_event(event_type, steps=statuses)
+    if composite_status != "needs_input":
+        lines = [f"Step {item['id']} ({item['kind']}): {item['status']}" for item in statuses]
+        detail = "\n".join(lines)
+        model_final = str(getattr(last_result, "final", "") or "").strip()
+        corrected = (
+            f"{model_final}\n\nComposite execution status: {composite_status}.\n{detail}"
+        ).strip()
+        console.print(Panel(Text(detail), title=f"Composite: {composite_status.title()}"))
+        _log_assistant_message(session_logger, corrected, workflow_id="composite")
+    return last_result
+
+
+def _record_composite_step(
+    step: OperationStep,
+    record: dict[str, object],
+    ledger: ActionLedger | None,
+    session_logger: SessionLogger | None,
+) -> None:
+    if ledger:
+        ledger.log_event("operation_step_finished", **record)
+    _log_event(
+        session_logger,
+        "operation.step_finished",
+        record,
+        f"Operation {step.id} finished: {record['status']}",
+        workflow_id="composite",
+    )
+
+
+def _execute_composite_git_inspection(
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    ledger: ActionLedger | None,
+) -> None:
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=ledger,
+    )
+    sections: list[str] = []
+    for tool_name in ("git_status", "git_diff"):
+        call_id = ledger.log_tool_call(tool_name, {}) if ledger else ""
+        result = registry.execute(tool_name, {})
+        semantic_ok = bool(result.ok) and not (
+            tool_name == "git_status" and not result.data.get("is_git_repo", True)
+        )
+        if ledger:
+            ledger.log_tool_result(call_id, tool_name, semantic_ok, result.message, result.data)
+        _log_event(
+            session_logger,
+            "operation.git_inspection",
+            {"tool": tool_name, "ok": semantic_ok},
+            f"Composite Git inspection: {tool_name}",
+            workflow_id="composite",
+        )
+        sections.append(_format_git_read_result(tool_name, result))
+    body = "\n\n".join(section for section in sections if section).strip()
+    if body:
+        console.print(Panel(Text(body), title="Git Follow-up"))
+
+
+def _composite_step_outcome(
+    step: OperationStep,
+    result: Any,
+    successful_tools: list[str],
+    event_types: set[str],
+) -> tuple[str, list[str]]:
+    tools = set(successful_tools)
+    changed_files = list(getattr(result, "changed_files", ()) or ())
+    stopped = bool(getattr(result, "stopped", False))
+    awaiting_user = bool(getattr(result, "awaiting_user", False))
+    evidence: list[str] = []
+    matched = False
+    if step.kind == "mutation":
+        matched = bool(tools & {"write_file", "edit_file", "move_file", "delete_file"}) or bool(
+            changed_files
+        )
+        evidence = [f"changed:{path}" for path in changed_files]
+    elif step.kind == "verify":
+        if "verification_failed" in event_types:
+            return "failed", ["event:verification_failed"]
+        matched = "verification_passed" in event_types or "run_command" in tools
+        evidence = ["event:verification_passed"] if "verification_passed" in event_types else []
+    elif step.kind == "git_inspect":
+        matched = bool(tools & {"git_status", "git_diff", "git_diff_staged", "git_log"})
+    elif step.kind == "git_mutate":
+        matched = bool(tools & {"git_add", "git_add_all", "git_commit", "git_push", "git_pull"})
+    elif step.kind == "web":
+        matched = bool(tools & {"web_search", "fetch_url"})
+    elif step.kind == "read":
+        matched = "read_file" in tools
+    elif step.kind == "compare":
+        matched = successful_tools.count("read_file") >= 2 and not stopped
+    elif step.kind == "launch":
+        matched = "run_command" in tools and not stopped
+    else:
+        matched = bool(str(getattr(result, "final", "") or "").strip()) and not stopped
+    if matched:
+        evidence.extend(f"tool:{name}" for name in successful_tools)
+        return "success", evidence
+    if awaiting_user:
+        return "needs_input", evidence
+    if stopped:
+        return "failed", evidence
+    return "not_run", evidence
+
+
 async def _run_agent_chat(
     user_input: str,
     workspace: Path,
@@ -7148,6 +7666,30 @@ async def _run_agent_chat(
         approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
         action_ledger=action_ledger,
     )
+    # "Do not change files" outranks auto_approve. Approval mode answers "may I
+    # act without asking?"; it never licenses ignoring an explicit instruction.
+    request_is_read_only = _explicitly_read_only(user_input)
+    if request_is_read_only:
+        tools.set_read_only(True)
+    elif read_only.is_scoped(user_input):
+        # "Create X. Do not modify any other files." - a carve-out, so the
+        # named targets stay writable and everything else is denied. Without a
+        # resolvable target there is nothing to scope TO, and silently denying
+        # every write would fail the request just as badly, so the restriction
+        # is only applied when the prompt actually names its files.
+        allowed = contract.requested_paths(user_input)
+        if allowed:
+            tools.set_allowed_write_paths(allowed)
+    # A dry run is the opposite instruction: keep going, change nothing. Writes
+    # report a synthetic success and are recorded as planned actions instead.
+    # The `--dry-run` flag sets the context recorder; prose ("dry run only:
+    # create X") activates the same mode with a local recorder so the intent is
+    # honored whether it arrived as a flag or as words.
+    active_recorder = dry_run.get_recorder()
+    local_dry_run = active_recorder is None and read_only.is_dry_run(user_input)
+    if local_dry_run:
+        active_recorder = dry_run.DryRunRecorder()
+    tools.set_dry_run(active_recorder)
     long_running = force_long_running or is_long_running_enabled(workspace)
     activities: list[str] = []
     trace_mode = _trace_mode(workspace)
@@ -7178,6 +7720,8 @@ async def _run_agent_chat(
         chat_kwargs["on_trace"] = _make_trace_emitter(console, workspace, session_logger)
     if _call_accepts_keyword(AgentChatLoop, "budget_manager"):
         chat_kwargs["budget_manager"] = _get_budget_manager(workspace, console)
+    if _call_accepts_keyword(AgentChatLoop, "read_only"):
+        chat_kwargs["read_only"] = request_is_read_only
     if _call_accepts_keyword(AgentChatLoop, "audit"):
         session_id = session_logger.session_id if session_logger is not None else None
         audit = SessionAuditLog(workspace, session_id)
@@ -7189,6 +7733,12 @@ async def _run_agent_chat(
         )
         chat_kwargs["audit"] = audit
     result = await AgentChatLoop(workspace, **chat_kwargs).run(user_input)
+    # A prose-triggered dry run has no headless wrapper to report its plan, so
+    # replace the agent's (synthetic-success) narration with the actual preview.
+    if local_dry_run and active_recorder is not None:
+        console.print(Panel(active_recorder.summary(), title="Dry Run", border_style="cyan"))
+        _log_assistant_message(session_logger, active_recorder.summary(), workflow_id="agent-chat")
+        return result
     body = result.final.strip() or "No response returned."
     if getattr(result, "awaiting_user", False):
         # SHAMSU asked the user something and stored the pending question. Print
@@ -7292,6 +7842,26 @@ async def _run_web_assist(
                 llm,
                 extra_context="Web lookup failed. Answer locally and mention that external lookup was unavailable.",
             )
+            return
+        if not combined.hits and not combined.pages:
+            # Approved, no error, and zero results (dead SearXNG, rate-limited
+            # fallback). Previously this asked the model to answer "from memory,
+            # but say you couldn't verify" - and the 7B model IGNORED the caveat
+            # and stated a fabricated fact as though confirmed (dogfood: "Python
+            # 3.10.6, Oct 2023"). A confident wrong answer to a query the user
+            # explicitly sent to the web is worse than an honest miss, and a
+            # small model cannot be trusted to self-disclaim. So the disclaimer
+            # is DETERMINISTIC and the model is not consulted for the fact.
+            provider = combined.provider or "the configured provider"
+            message = (
+                f"I could not retrieve live web results ({provider} returned nothing), "
+                "so I have not verified this against a current source. I'm not going to "
+                "guess at a live fact from memory, because it could be out of date or wrong. "
+                "Check that a search provider is reachable (`/doctor`), or ask me to answer "
+                "from general knowledge and I'll clearly mark it as unverified."
+            )
+            console.print(Panel(message, title="Web Search — No Results", border_style="yellow"))
+            _log_assistant_message(session_logger, message, workflow_id="web")
             return
         await _print_web_answer(user_input, combined, combined.pages, console, llm, session_logger=session_logger)
         return
@@ -7509,6 +8079,10 @@ def _print_browser_result(result, console: Console) -> None:
         body = f"{body}\n\nScreenshot: {result.screenshot_path}"
     if result.url:
         body = f"URL: {result.url}\nTitle: {result.title}\n\n{body}"
+    if getattr(result, "console_errors", ()):
+        body = f"{body}\n\nConsole/page errors:\n" + "\n".join(
+            f"- {item}" for item in result.console_errors
+        )
     console.print(Panel(body, title="Browser"))
 
 
@@ -7982,12 +8556,14 @@ def _install_console_status_tracker(console: Console) -> None:
 
 
 def _print_startup_banner(workspace: Path, console: Console) -> None:
+    from shamsu import __version__
+
     model = model_for_role("qa")
     tier = active_tier().value
     autonomy = "on" if is_long_running_enabled(workspace) else "off"
     runtime = status_text(collect_status())
     body = Text()
-    body.append("SHAMSU v0.3.0", style="bold")
+    body.append(f"SHAMSU v{__version__}", style="bold")
     body.append("  |  Local AI coding agent\n", style="dim")
     body.append("Workspace: ", style="dim")
     body.append(f"{workspace}\n")
@@ -8088,6 +8664,13 @@ def _force_utf8_stdio() -> None:
 def main(argv: list[str] | None = None) -> None:
     _force_utf8_stdio()
     args = parse_args(argv)
+    if args.command == "run":
+        from shamsu.cli.noninteractive import run_cli
+
+        exit_code = run_cli(args)
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
     console = Console()
     _install_console_status_tracker(console)
 
@@ -8096,6 +8679,12 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
         sys.exit(2)
+
+    from shamsu.runtime.state_upgrade import upgrade_workspace_state
+
+    upgrade_report = upgrade_workspace_state(workspace)
+    for warning in upgrade_report.warnings:
+        console.print(f"[yellow]State upgrade warning: {warning}[/yellow]")
 
     # Resolve the active model tier (env var > persisted workspace choice >
     # default) before anything reads model_for_role(), including the banner.
@@ -8110,12 +8699,23 @@ def main(argv: list[str] | None = None) -> None:
     # session stall for a long time on first use. Opt back into shutdown with
     # SHAMSU_SHUTDOWN_OLLAMA_ON_EXIT=1.
     session_pid = register_session()
+    atexit.register(flush_memory_queues)
     if _os_env_flag("SHAMSU_SHUTDOWN_OLLAMA_ON_EXIT"):
         atexit.register(shutdown_if_last_session, session_pid)
 
     _print_startup_banner(workspace, console)
     _ensure_graphiti_ready_at_startup(workspace, console)
     _ensure_code_memory_ready_at_startup(workspace, console)
+    if upgrade_report.initialized:
+        from shamsu.runtime.doctor import run_first_run_checks, write_first_run_report
+
+        first_run_report = run_first_run_checks(workspace)
+        report_path = write_first_run_report(workspace, first_run_report)
+        ready_count = sum(check.ok for check in first_run_report.checks)
+        console.print(
+            f"[dim]First-run checks: {ready_count}/{len(first_run_report.checks)} ready; "
+            f"report: {report_path}[/dim]"
+        )
     ancestor_workspace = find_ancestor_workspace(workspace)
     if ancestor_workspace is not None:
         console.print(
@@ -8158,7 +8758,7 @@ def main(argv: list[str] | None = None) -> None:
                 raw_input_text = session.prompt([("class:prompt", "shamsu> ")])
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye.")
-            sys.exit(0)
+            break
 
         # Strip a stray leading BOM that piped stdin can prepend; it is
         # not whitespace, so .strip() alone leaves it and it would break slash
@@ -8195,7 +8795,7 @@ def main(argv: list[str] | None = None) -> None:
                 # rather than starting an unrelated new request (gap J5).
                 paused_plan = _take_paused_plan(session_logger)
                 if paused_plan is not None:
-                    ledger = start_run(workspace, user_input)
+                    ledger = start_run(workspace, user_input, session_logger=session_logger)
                     set_current_run(ledger)
                     try:
                         asyncio.run(
@@ -8355,7 +8955,7 @@ def main(argv: list[str] | None = None) -> None:
             # Parsing/reparsing calls Taskmaster and the local model, so it
             # gets its own ActionLedger run - same reasoning as /tasks
             # execute|continue below (Taskmaster.md section 12).
-            ledger = start_run(workspace, user_input)
+            ledger = start_run(workspace, user_input, session_logger=session_logger)
             set_current_run(ledger)
             try:
                 _handle_prd_command(normalized_input, workspace, console)
@@ -8380,7 +8980,7 @@ def main(argv: list[str] | None = None) -> None:
                 # language fallback path below - it needs the same active
                 # ActionLedger run so those get recorded (see Taskmaster.md
                 # section 12), not just its own `.shamsu/taskmaster/` bookkeeping.
-                ledger = start_run(workspace, user_input)
+                ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
                     asyncio.run(
@@ -8457,7 +9057,7 @@ def main(argv: list[str] | None = None) -> None:
                 continue
             if is_affirmative(user_input) or _looks_like_follow_plan(user_input):
                 session_logger.clear_pending_action()
-                ledger = start_run(workspace, user_input)
+                ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
                     asyncio.run(
@@ -8485,7 +9085,7 @@ def main(argv: list[str] | None = None) -> None:
                     dispatch_input = f"{origin}\n\n[User confirmed: proceed with this request.]"
                 console.print("[dim]Resolving your confirmation against the pending action.[/dim]")
 
-        ledger = start_run(workspace, dispatch_input)
+        ledger = start_run(workspace, dispatch_input, session_logger=session_logger)
         set_current_run(ledger)
         try:
             with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
@@ -8509,6 +9109,7 @@ def main(argv: list[str] | None = None) -> None:
         _finish_current_run(workspace, ledger)
         clear_current_run()
 
+    flush_memory_queues()
     browser_tool.close()
 
 

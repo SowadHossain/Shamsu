@@ -51,6 +51,7 @@ def scaffold_template(
                 preview=source_file.read_text(encoding="utf-8", errors="replace")[:4000],
                 working_dir=str(target),
                 reason=f"Scaffold {entry.category.value} template into the selected workspace.",
+                target_paths=[relative],
             )
             if not manager.ask(request):
                 skipped.append(relative)

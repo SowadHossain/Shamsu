@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.safety.commands import redact
+from shamsu.action_ledger.context import get_current_run
 from shamsu.safety.sandbox import Sandbox
 from shamsu.types import ContextPack
 
@@ -121,17 +122,11 @@ class SessionManager:
     def close_session(self, query: str) -> SessionMetadata:
         metadata = self.resolve(query)
         logger = SessionLogger(self, metadata)
-        # Persisting a summary + best-effort long-term memory on close is what
-        # lets a future session resume this one without replaying every event.
-        # Both are best-effort: a failure must never block closing the session.
+        # The deterministic local summary is the resume anchor. A whole session
+        # can contain mixed outcomes, so it must not be mirrored as one implied
+        # successful task lesson.
         try:
-            summary = logger.update_summary_from_events()
-            if summary.strip():
-                logger.save_long_term_memory(
-                    "session_summary",
-                    f"Session '{metadata.title}' summary: {summary}",
-                    {"reason": "session_closed"},
-                )
+            logger.update_summary_from_events()
         except Exception as exc:  # pragma: no cover - defensive
             logger.log("session.summary.failed", {"error": str(exc)}, "Summary on close failed", workflow_id="session")
         logger.log("session.closed", {}, "Session closed")
@@ -270,6 +265,7 @@ class SessionLogger:
     def __init__(self, manager: SessionManager, metadata: SessionMetadata):
         self.manager = manager
         self.metadata = metadata
+        self.current_turn_id = ""
 
     @property
     def session_id(self) -> str:
@@ -354,6 +350,7 @@ class SessionLogger:
         self.metadata.updated_at = event["timestamp"]
         if event_type == "user.prompt":
             self.metadata.last_user_prompt = str(event["payload"].get("prompt", ""))
+            self.current_turn_id = str(event["event_id"])
         if event_type == "chat.message":
             self.metadata.message_count += 1
         self.manager._write_metadata(self.metadata)
@@ -516,21 +513,53 @@ class SessionLogger:
         plan = self.read_state().get("last_tool_plan")
         return plan if isinstance(plan, list) else []
 
-    def set_last_failure(self, command: str, errors: str, exit_code: int = 1) -> None:
+    def set_last_failure(
+        self,
+        command: str,
+        errors: str,
+        exit_code: int = 1,
+        *,
+        classification: str = "command_failure",
+        operation_id: str = "",
+        source: str = "user_command",
+    ) -> None:
         """Remember the most recent failing command and its error output so a
         later bug-fix request with no explicit target can reuse it (e.g. after a
         build fails, the user just says "fix it")."""
+        if classification != "command_failure" or source != "user_command":
+            self.log(
+                "session.failure.ignored",
+                {
+                    "command": _clip(str(command or ""), 200),
+                    "exit_code": int(exit_code),
+                    "classification": classification,
+                    "source": source,
+                },
+                "Ignored non-actionable command outcome for bug-fix reuse",
+                workflow_id="session",
+            )
+            return
         state = self.read_state()
         state["last_failure"] = {
             "command": _clip(str(command or ""), 500),
             "errors": _clip(str(errors or ""), 6000),
             "exit_code": int(exit_code),
+            "classification": classification,
+            "actionable": classification == "command_failure",
+            "operation_id": operation_id,
+            "source": source,
             "timestamp": _now(),
         }
         self.write_state(state)
         self.log(
             "session.failure.recorded",
-            {"command": _clip(str(command or ""), 200), "exit_code": int(exit_code)},
+            {
+                "command": _clip(str(command or ""), 200),
+                "exit_code": int(exit_code),
+                "classification": classification,
+                "operation_id": operation_id,
+                "source": source,
+            },
             "Recorded last failing command",
             workflow_id="session",
         )
@@ -538,6 +567,31 @@ class SessionLogger:
     def get_last_failure(self) -> dict[str, Any]:
         failure = self.read_state().get("last_failure")
         return failure if isinstance(failure, dict) else {}
+
+    def recent_file_changes(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Return successful file mutations from newest to oldest."""
+        changes: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for event in reversed(self.tail(400)):
+            event_type = str(event.get("event_type", ""))
+            payload = event.get("payload", {}) or {}
+            candidates: list[tuple[str, str]] = []
+            if event_type == "agent.tool_result" and payload.get("ok"):
+                data = payload.get("data", {}) or {}
+                path = str(data.get("resolved_filepath") or data.get("filepath") or "").strip()
+                if path:
+                    action = "created" if data.get("created") else "changed"
+                    candidates.append((path, action))
+            elif event_type == "patch.applied":
+                candidates.extend((str(path), "changed") for path in payload.get("touched_files", []) or [])
+            for path, action in candidates:
+                if not path or path in seen:
+                    continue
+                seen.add(path)
+                changes.append({"path": path, "action": action, "event_id": event.get("event_id", "")})
+                if len(changes) >= limit:
+                    return changes
+        return changes
 
     def clear_last_failure(self) -> None:
         state = self.read_state()
@@ -622,16 +676,31 @@ class SessionLogger:
         clean = redact(str(text)).strip()
         if not clean:
             return None
-        digest = hashlib.sha1(f"{kind}:{_norm(clean)}".encode("utf-8")).hexdigest()[:16]
+        ledger = get_current_run()
+        source_run_id = str(
+            (metadata or {}).get("source_run_id")
+            or (metadata or {}).get("run_id")
+            or (ledger.run_id if ledger is not None else "")
+        )
+        digest = hashlib.sha1(
+            f"{kind}:{_norm(clean)}:{source_run_id}".encode("utf-8")
+        ).hexdigest()[:16]
         if digest in self._local_memory_hashes():
             return None
+        correlation = {
+            "run_id": source_run_id,
+            "source_run_id": source_run_id,
+            "turn_id": ledger.turn_id if ledger is not None else self.current_turn_id,
+        }
         record = {
             "timestamp": _now(),
             "session_id": self.session_id,
             "kind": kind,
             "text": _clip(clean, MESSAGE_PREVIEW_CHARS),
             "hash": digest,
+            "confidence": _confidence(metadata),
             "metadata": sanitize_payload(metadata or {}),
+            **correlation,
         }
         path = self.memory_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -646,26 +715,33 @@ class SessionLogger:
         text: str,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Always record locally (memory.jsonl); best-effort mirror to the
-        existing MemoryService. A missing/failed memory backend never raises."""
-        local = self.append_local_memory(kind, text, metadata)
-        result: dict[str, Any] = {"local": local is not None}
-        clean = redact(str(text)).strip()
-        if not clean:
-            return result
+        """Record session-local memory, commit SQLite, and queue Graphiti."""
+        ledger = get_current_run()
+        run_id = ledger.run_id if ledger is not None else ""
         full_metadata = {
             "session_id": self.session_id,
             "session_title": self.metadata.title,
             "workspace": self.metadata.workspace,
             "kind": kind,
             "source": "session_manager",
+            "run_id": run_id,
+            "source_run_id": run_id,
+            "turn_id": ledger.turn_id if ledger is not None else self.current_turn_id,
             **(metadata or {}),
         }
+        local = self.append_local_memory(kind, text, full_metadata)
+        result: dict[str, Any] = {"local": local is not None}
+        clean = redact(str(text)).strip()
+        if not clean:
+            return result
         try:
-            from shamsu.memory.service import MemoryService
+            from shamsu.memory.queue import get_memory_queue
 
-            outcome = MemoryService(self.manager.workspace).remember(
-                clean, _map_memory_kind(kind), full_metadata
+            outcome = get_memory_queue(self.manager.workspace).enqueue(
+                clean,
+                _map_memory_kind(kind),
+                full_metadata,
+                self._memory_queue_observer(kind),
             )
         except Exception as exc:
             self.log(
@@ -677,14 +753,14 @@ class SessionLogger:
             result["error"] = str(exc)
             return result
         result["long_term"] = outcome
-        if outcome.get("ok"):
+        if outcome.get("ok") and not outcome.get("queued"):
             self.log(
-                "memory.long_term.saved",
+                "memory.long_term.local_only",
                 {"kind": kind, "deduped": bool(outcome.get("deduped"))},
-                "Long-term memory saved",
+                "Long-term memory committed locally",
                 workflow_id="memory",
             )
-        else:
+        elif not outcome.get("ok"):
             self.log(
                 "memory.long_term.skipped",
                 {"kind": kind, "reason": str(outcome.get("reason") or outcome.get("error") or "not stored")},
@@ -692,6 +768,27 @@ class SessionLogger:
                 workflow_id="memory",
             )
         return result
+
+    def _memory_queue_observer(self, kind: str):
+        def observe(event: str, payload: dict[str, Any]) -> None:
+            event_type = {
+                "queued": "memory.long_term.queued",
+                "mirrored": "memory.long_term.saved",
+                "failed": "memory.long_term.failed",
+            }.get(event, "memory.long_term.updated")
+            self.log(
+                event_type,
+                {
+                    "kind": kind,
+                    "ok": bool(payload.get("ok")),
+                    "deduped": bool(payload.get("deduped")),
+                    "error": str(payload.get("error") or payload.get("reason") or ""),
+                },
+                f"Long-term memory {event}",
+                workflow_id="memory",
+            )
+
+        return observe
 
 
 def sanitize_payload(value: Any) -> Any:
@@ -865,6 +962,14 @@ def _map_memory_kind(kind: str) -> str:
     return _MEMORY_KIND_MAP.get(kind, "task_summary")
 
 
+def _confidence(metadata: dict[str, Any] | None) -> float:
+    try:
+        value = float((metadata or {}).get("confidence", 0.85))
+    except (TypeError, ValueError):
+        value = 0.85
+    return max(0.0, min(1.0, value))
+
+
 # -- Deterministic session summary + search --------------------------------
 
 def _build_summary_markdown(logger: "SessionLogger", events: list[dict[str, Any]]) -> str:
@@ -894,7 +999,7 @@ def _build_summary_markdown(logger: "SessionLogger", events: list[dict[str, Any]
             for item in payload.get("touched_files", []) or []:
                 if str(item) not in files_changed:
                     files_changed.append(str(item))
-        elif event_type == "workflow.finished":
+        elif event_type in {"workflow.finished", "workflow.failed"}:
             summary = str(event.get("summary", "")).strip()
             if summary:
                 workflows.append(summary)

@@ -270,3 +270,30 @@ def test_prd_summary_still_wins_over_build(tmp_path: Path):
     """Reading the PRD is not building it - summary is checked first."""
     workspace = _workspace(tmp_path, "prd.md")
     assert _classify_route_label("what is the prd about", workspace) == "prd_summary"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "plan the implementation from PRD.md",
+        "Make a step by step plan to implement PRD.md. Just the plan, do not write any code yet.",
+        "outline the approach for PRD.md",
+        "give me a plan for the converter in PRD.md",
+    ],
+)
+def test_plan_requests_route_to_planning_not_build(tmp_path: Path, prompt: str):
+    """"plan the implementation ..." used to route to prd.build because
+    "implementation" contains "implement", kicking off a full build (and a stray
+    .gitignore). A plan intent must reach the plan route, not build/write.
+    Found live 2026-07-21."""
+    workspace = _workspace(tmp_path, "PRD.md")
+    assert _looks_like_prd_build_request(prompt, workspace) is False
+    assert _looks_like_file_write_request(prompt) is False
+    assert _classify_route_label(prompt, workspace) == "plan_prd"
+
+
+def test_real_build_requests_are_unaffected_by_the_plan_guard(tmp_path: Path):
+    workspace = _workspace(tmp_path, "PRD.md")
+    assert _classify_route_label("build the app from the prd", workspace) == "prd.build"
+    # "make hello.py" is still a file write, not a plan.
+    assert _looks_like_file_write_request("make hello.py") is True

@@ -14,16 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shamsu.diagnostics.compact import resolve_module_path
+from shamsu.indexer.policy import walk_workspace_files
 
 # Import specifier extensions Vite/tsc resolve, in the order we prefer to
 # emit them (extension is stripped from the final specifier regardless).
 _SUFFIXES = (".ts", ".tsx", ".js", ".jsx")
 _INDEX_FILES = ("index.ts", "index.tsx", "index.js", "index.jsx")
 _STRIP_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
-
-# Directories that never hold source and must not be searched for a match.
-_SKIP_DIRS = {"node_modules", ".git", "dist", "build", ".shamsu", ".venv", "__pycache__"}
-
 
 @dataclass(frozen=True)
 class ImportFix:
@@ -79,16 +76,16 @@ def _find_candidates(workspace_root: Path, basename: str) -> list[Path]:
     """All workspace source files whose stem matches `basename` (or a
     directory `basename/` with an index file), workspace-relative."""
     matches: list[Path] = []
-    for path in workspace_root.rglob("*"):
-        if any(part in _SKIP_DIRS for part in path.parts):
-            continue
-        if path.is_file() and path.suffix in _SUFFIXES and path.stem == basename:
+    files = walk_workspace_files(
+        workspace_root,
+        suffixes=_SUFFIXES,
+        indexable_only=True,
+    )
+    for path in files:
+        if path.stem == basename:
             matches.append(path)
-        elif path.is_dir() and path.name == basename:
-            for index_name in _INDEX_FILES:
-                if (path / index_name).is_file():
-                    matches.append(path / index_name)
-                    break
+        elif path.name in _INDEX_FILES and path.parent.name == basename:
+            matches.append(path)
     return matches
 
 

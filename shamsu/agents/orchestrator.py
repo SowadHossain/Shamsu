@@ -46,6 +46,23 @@ class AgentOrchestrator:
         context = render_mention_context(mentions)
         self._log_resolution(user_input, effective_input, mentions, context)
 
+        if self.session_logger is not None and _asks_recent_file_change(effective_input):
+            changes = self.session_logger.recent_file_changes(limit=3)
+            if changes:
+                lines = ["The most recent recorded workspace file change was:"]
+                lines.extend(
+                    f"- `{item['path']}` ({item['action']})" for item in changes
+                )
+                return AgentResult(
+                    handled=True,
+                    title="Recent Workspace Change",
+                    message="\n".join(lines),
+                    effective_input=effective_input,
+                    context=context,
+                    mentions=mentions,
+                    action="session.recent_files",
+                )
+
         if _asks_workspace_location(effective_input):
             return AgentResult(
                 handled=True,
@@ -141,10 +158,17 @@ class AgentOrchestrator:
                 mentions=mentions,
                 action="abstract.blocked",
             )
+        degraded_notice = gate.reason if gate.reason else ""
         return AgentResult(
             handled=False,
             effective_input=effective_input,
-            context=_agent_context(self.workspace_root, self.workspace_tool, memory, context),
+            context=_agent_context(
+                self.workspace_root,
+                self.workspace_tool,
+                memory,
+                context,
+                degraded_notice,
+            ),
             mentions=mentions,
         )
 
@@ -174,19 +198,31 @@ def _agent_context(
     workspace_tool: WorkspaceTool,
     memory: ConversationMemory,
     mention_context: str,
+    retrieval_notice: str = "",
 ) -> str:
     listing = workspace_tool.list_files(limit=12).render(limit=12)
     parts = [
+        "Authoritative compact session state (prefer exact paths and outcomes here over guesses):",
+        memory.build_context(max_turns=8),
         f"Workspace root: {workspace}",
         "Available tools: workspace files, Codebase-Memory MCP search, @file context, web search with approval, browser with approval, patch preview/apply with approval.",
         "Top-level workspace files:",
         listing,
-        "Recent conversation:",
-        memory.build_context(max_turns=8),
     ]
     if mention_context:
         parts.extend(["Mentioned file context:", mention_context])
+    if retrieval_notice:
+        parts.extend(["Retrieval status:", retrieval_notice])
     return "\n\n".join(parts)
+
+
+def _asks_recent_file_change(text: str) -> bool:
+    lowered = " ".join(str(text or "").lower().split())
+    if "file" not in lowered:
+        return False
+    recent = any(word in lowered for word in ("just", "last", "latest", "recent", "previous"))
+    changed = any(word in lowered for word in ("create", "created", "write", "wrote", "change", "changed", "edit", "edited"))
+    return recent and changed and ("what" in lowered or "which" in lowered or "where" in lowered)
 
 
 def _asks_workspace_location(text: str) -> bool:

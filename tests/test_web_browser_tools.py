@@ -6,6 +6,7 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from rich.console import Console
 
 from shamsu.cli import repl
@@ -15,14 +16,36 @@ from shamsu.tools.web import (
     SearchHit,
     SearxngProvider,
     WebConfig,
+    WebCache,
     WebFetchResult,
     WebSearchFetchResult,
     WebSearchResult,
+    WebServiceStatus,
     WebServiceManager,
     WebTool,
     build_evidence_answer_prompt,
     _extract_readable_text,
 )
+
+
+def test_web_cache_closes_sqlite_connection_after_each_operation(tmp_path):
+    path = tmp_path / "web_cache.db"
+    cache = WebCache(path)
+    cache.record_hits("query", "test", [SearchHit("Title", "https://example.com", "Snippet")])
+
+    path.unlink()
+
+    assert path.exists() is False
+
+
+def test_web_cache_initializes_lazily(tmp_path):
+    path = tmp_path / "web_cache.db"
+    cache = WebCache(path)
+
+    assert path.exists() is False
+
+    cache.record_hits("query", "test", [])
+    assert path.is_file()
 
 
 def test_web_tool_denied_search_skips_network(tmp_path, monkeypatch):
@@ -207,6 +230,131 @@ def test_auto_provider_falls_back_to_duckduckgo(monkeypatch, tmp_path):
     assert result.provider == "duckduckgo"
     assert result.fallback_used is True
     assert result.hits[0].title == "Fallback docs"
+    assert [item["provider"] for item in result.provider_attempts] == ["searxng", "duckduckgo"]
+    assert [item["state"] for item in result.provider_attempts] == ["failed", "success"]
+
+
+def test_web_status_reports_each_capability_without_probing_external_network(tmp_path):
+    tool = WebTool(workspace=tmp_path, config=WebConfig(provider="auto", cache_enabled=True))
+    tool.service_manager = SimpleNamespace(
+        status=lambda: WebServiceStatus(
+            ok=False,
+            message="SearXNG is not reachable.",
+            running=False,
+            state="not_running",
+        )
+    )
+
+    status = tool.status()
+
+    assert status.enabled is True
+    assert status.provider_mode == "auto"
+    assert status.searxng.state == "not_running"
+    assert status.fallback_state == "configured"
+    assert status.fetch_state == "configured_not_probed"
+    assert status.cache_state == "enabled"
+    assert status.ok is True
+
+
+def test_web_search_log_records_ranked_provider_metadata(tmp_path, monkeypatch):
+    logger = SessionManager(tmp_path).create_session("Web metadata")
+    tool = WebTool(
+        workspace=tmp_path,
+        session_logger=logger,
+        approval_func=lambda _request: True,
+        config=WebConfig(provider="duckduckgo"),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_run_provider_search",
+        lambda _query, _top_k: (
+            [SearchHit("Official Docs", "https://example.com/docs", "Reference", "duckduckgo")],
+            "duckduckgo",
+            False,
+        ),
+    )
+
+    tool.search("official docs")
+
+    event = next(item for item in reversed(logger.tail(20)) if item["event_type"] == "web.search.finished")
+    record = event["payload"]["results"][0]
+    assert record["rank"] == 1
+    assert record["title"] == "Official Docs"
+    assert record["provider"] == "duckduckgo"
+    assert record["retrieved_at"]
+
+
+def test_web_events_mirror_ranked_results_to_action_ledger(tmp_path, monkeypatch):
+    events = []
+    ledger = SimpleNamespace(log_event=lambda event_type, **payload: events.append((event_type, payload)))
+    tool = WebTool(
+        workspace=tmp_path,
+        approval_func=lambda _request: True,
+        action_ledger=ledger,
+        config=WebConfig(provider="duckduckgo"),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_run_provider_search",
+        lambda _query, _top_k: (
+            [SearchHit("Official Docs", "https://example.com/docs", "Reference", "duckduckgo")],
+            "duckduckgo",
+            False,
+        ),
+    )
+
+    tool.search("official docs")
+
+    finished = next(payload for event, payload in events if event == "web_search_finished")
+    assert finished["results"][0]["rank"] == 1
+    assert finished["results"][0]["url"] == "https://example.com/docs"
+
+
+def test_web_fetch_blocks_local_and_private_targets_before_network(tmp_path, monkeypatch):
+    tool = WebTool(workspace=tmp_path, approval_func=lambda _request: True)
+    called = []
+    monkeypatch.setattr(tool, "_client", lambda: called.append(True))
+
+    local = tool.fetch("http://127.0.0.1:8000/private")
+    private = tool.fetch("http://192.168.1.10/secrets")
+
+    assert not local.approved
+    assert not private.approved
+    assert "browser tool" in local.error.lower()
+    assert "private" in private.error.lower()
+    assert called == []
+
+
+def test_web_fetch_blocks_redirect_to_local_target(tmp_path, monkeypatch):
+    class RedirectResponse:
+        is_redirect = True
+        headers = {"location": "http://127.0.0.1:8019/admin/"}
+
+    class FakeClient:
+        def get(self, *_args, **_kwargs):
+            return RedirectResponse()
+
+    tool = WebTool(workspace=tmp_path, approval_func=lambda _request: True)
+    monkeypatch.setattr(tool, "_client", lambda: FakeClient())
+
+    result = tool.fetch("https://example.com/redirect")
+
+    assert result.approved
+    assert "browser tool" in result.error.lower()
+
+
+def test_web_search_blocks_private_workspace_path_before_approval(tmp_path):
+    approvals = []
+    tool = WebTool(
+        workspace=tmp_path,
+        approval_func=lambda request: approvals.append(request) or True,
+    )
+
+    result = tool.search(f"upload and explain {tmp_path / 'private.py'}")
+
+    assert not result.approved
+    assert "private workspace path" in result.error.lower()
+    assert approvals == []
 
 
 def test_search_and_fetch_fetches_top_results_once(monkeypatch, tmp_path):
@@ -379,6 +527,23 @@ def test_explicit_web_search_requires_local_searxng_after_approval(tmp_path, mon
     assert not result.hits
 
 
+def test_web_search_command_allows_configured_provider_fallback():
+    calls = []
+
+    class FakeWebTool:
+        service_manager = SimpleNamespace()
+
+        def search_and_fetch(self, query, reason="", require_local_service=False):
+            calls.append((query, require_local_service))
+            return WebSearchFetchResult(approved=True, query=query, hits=[])
+
+    console = Console(file=StringIO(), force_terminal=False)
+
+    repl._handle_web("web search django docs", console, FakeWebTool(), SimpleNamespace())
+
+    assert calls == [("django docs", False)]
+
+
 def test_web_answer_uses_snippet_fallback_when_fetches_empty():
     class FakeLLM:
         async def run_specialist(self, specialist, pack):
@@ -483,6 +648,98 @@ def test_browser_tool_logs_screenshot_event(tmp_path, monkeypatch):
     assert result.ok
     assert "browser.screenshot" in events
     assert result.screenshot_path.endswith(".png")
+
+
+def test_browser_status_distinguishes_missing_dependency(tmp_path, monkeypatch):
+    tool = BrowserTool(tmp_path)
+    monkeypatch.setattr(
+        tool,
+        "_load_playwright",
+        lambda: (_ for _ in ()).throw(RuntimeError("Playwright is not available.")),
+    )
+
+    status = tool.status()
+
+    assert status.available is False
+    assert status.state == "missing_dependency"
+    assert "Playwright" in status.message
+
+
+def test_browser_open_reports_console_errors(tmp_path, monkeypatch):
+    tool = BrowserTool(tmp_path, approval_func=lambda _request: True)
+
+    class Locator:
+        def inner_text(self, timeout=3000):
+            return "Page body"
+
+    class Page:
+        url = "http://127.0.0.1:8000/"
+
+        def goto(self, *_args, **_kwargs):
+            tool._console_errors.append("Uncaught TypeError")
+
+        def title(self):
+            return "Local App"
+
+        def locator(self, _selector):
+            return Locator()
+
+    monkeypatch.setattr(tool, "_ensure_page", lambda: setattr(tool, "_page", Page()))
+
+    result = tool.open("http://127.0.0.1:8000/")
+
+    assert result.ok
+    assert result.console_errors == ("Uncaught TypeError",)
+
+
+def test_browser_events_mirror_to_action_ledger(tmp_path, monkeypatch):
+    events = []
+    ledger = SimpleNamespace(log_event=lambda event_type, **payload: events.append((event_type, payload)))
+    tool = BrowserTool(
+        tmp_path,
+        approval_func=lambda _request: True,
+        action_ledger=ledger,
+    )
+
+    class FakePage:
+        url = "http://127.0.0.1:8000"
+
+        def screenshot(self, path: str, full_page: bool = True):
+            Path(path).write_bytes(b"png")
+
+    monkeypatch.setattr(tool, "_page", FakePage())
+
+    tool.screenshot()
+
+    assert events[0][0] == "browser_screenshot"
+    assert events[0][1]["path"].endswith(".png")
+
+
+def test_real_browser_reads_local_fixture_captures_console_and_screenshot(tmp_path):
+    tool = BrowserTool(tmp_path, approval_func=lambda _request: True)
+    status = tool.status()
+    if not status.available:
+        pytest.skip(status.message)
+    page = tmp_path / "browser-fixture.html"
+    page.write_text(
+        "<html><head><title>Browser Fixture</title></head>"
+        "<body><main>Local browser evidence</main>"
+        "<script>console.error('fixture console error')</script></body></html>",
+        encoding="utf-8",
+    )
+
+    try:
+        opened = tool.open(page.as_uri())
+        screenshot = tool.screenshot()
+    finally:
+        tool.close()
+
+    assert opened.ok
+    assert opened.title == "Browser Fixture"
+    assert "Local browser evidence" in opened.visible_text
+    assert opened.console_errors == ("fixture console error",)
+    assert screenshot.ok
+    assert Path(screenshot.screenshot_path).is_file()
 
 
 def test_web_fetch_result_shape_for_useful_page():
