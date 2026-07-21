@@ -67,6 +67,23 @@ def test_qa_workflow_places_task_at_prompt_end():
     assert preview.prompt.rstrip().endswith("how does login work?")
 
 
+def test_qa_workflow_promotes_mentioned_file_context_to_snippet():
+    request = (
+        "What does qa_probe.py do?\n\n"
+        "Mentioned file context:\n\n"
+        "# @qa_probe.py (file)\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
+    )
+
+    preview = QAWorkflow().build_prompt(request)
+
+    assert preview.pack.snippets[0].file_path == "qa_probe.py"
+    assert preview.pack.snippets[0].score == 50.0
+    assert "# File: qa_probe.py" in preview.prompt
+    assert "def add(a, b)" in preview.prompt
+
+
 @pytest.mark.asyncio
 async def test_coordinator_routes_and_builds_qa_preview():
     result = await Coordinator(llm=FakeLLM(), qa_workflow=QAWorkflow()).handle(

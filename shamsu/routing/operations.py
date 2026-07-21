@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from shamsu.safety import read_only
+
 RouteClassifier = Callable[[str, Path], str]
 CandidateFinder = Callable[[str, Path], list[str]]
 
@@ -29,17 +31,6 @@ _REFERENCE_RE = re.compile(
 _ORIGINAL_MARKER = "Original request: "
 _PLAN_MARKER = "\n\nOrdered operation plan:"
 _ANSWER_MARKER = "\n\n(Answering the earlier question"
-_READ_ONLY_CONSTRAINT_RE = re.compile(
-    r"\b(?:do\s+not|don't|dont|never)\s+"
-    r"(?:change|edit|modify|write|create|delete|remove|touch)\s+"
-    r"(?:any\s+)?(?:files?|code|anything|the\s+workspace)\b"
-    r"|\bwithout\s+(?:changing|editing|modifying|writing|creating|deleting|touching)\s+"
-    r"(?:any\s+)?(?:files?|code|anything|the\s+workspace)\b"
-    r"|\b(?:read[ -]?only|no\s+file\s+changes?)\b",
-    re.IGNORECASE,
-)
-
-
 @dataclass(frozen=True)
 class OperationStep:
     id: int
@@ -232,8 +223,8 @@ def _split_clauses(prompt: str) -> list[str]:
 
 def _operation_kind(clause: str) -> str:
     text = " ".join(clause.lower().split())
-    explicitly_read_only = bool(_READ_ONLY_CONSTRAINT_RE.search(text))
-    action_text = _READ_ONLY_CONSTRAINT_RE.sub("", text)
+    explicitly_read_only = read_only.applies(text)
+    action_text = read_only.strip(text)
     if not text:
         return ""
     if any(

@@ -43,7 +43,9 @@ _TARGET = (
 # a different way of failing the same task. Detected, reported separately, and
 # deliberately NOT wired to the tool gate - scoping enforcement needs to know
 # the permitted target, which belongs with the per-run semantic contract.
-_CARVE_OUT_RE = re.compile(r"\b(?:other|else|remaining|rest\s+of|besides)\b", re.IGNORECASE)
+_CARVE_OUT_RE = re.compile(
+    r"\b(?:other|else|remaining|rest\s+of|besides|except|outside)\b", re.IGNORECASE
+)
 
 # NOTE: "dry run only" is deliberately NOT here. A dry run is "plan the change
 # but don't apply it" - the opposite of a read-only refusal, which blocks the
@@ -72,6 +74,28 @@ def _matches(text: str) -> list[re.Match[str]]:
     return list(READ_ONLY_RE.finditer(text or ""))
 
 
+def _is_scoped_match(text: str, match: re.Match[str]) -> bool:
+    """Recognize carve-out words that immediately follow the regex match.
+
+    ``_TARGET`` can legally finish at ``anything`` in ``anything else``. The
+    old implementation inspected only ``match.group(0)``, so it missed the
+    trailing ``else`` and turned a scoped write request into a blanket deny.
+    Only inspect the rest of the same clause to avoid borrowing words from a
+    later sentence.
+    """
+    if _CARVE_OUT_RE.search(match.group(0)):
+        return True
+    tail = (text or "")[match.end() :]
+    same_clause = re.split(r"[.!?;\n\r]", tail, maxsplit=1)[0]
+    return bool(
+        re.match(
+            r"^\s*(?:,\s*)?(?:else\b|other\b|besides\b|except\b|outside\b|remaining\b|rest\s+of\b)",
+            same_clause,
+            re.IGNORECASE,
+        )
+    )
+
+
 def applies(text: str) -> bool:
     """True when the prompt forbids changing files OUTRIGHT.
 
@@ -79,12 +103,12 @@ def applies(text: str) -> bool:
     change and forbids the rest, so blocking every write fails the request just
     as surely as ignoring it did.
     """
-    return any(not _CARVE_OUT_RE.search(match.group(0)) for match in _matches(text))
+    return any(not _is_scoped_match(text, match) for match in _matches(text))
 
 
 def is_scoped(text: str) -> bool:
     """True for a carve-out: this change is fine, leave everything else alone."""
-    return any(_CARVE_OUT_RE.search(match.group(0)) for match in _matches(text))
+    return any(_is_scoped_match(text, match) for match in _matches(text))
 
 
 def strip(text: str) -> str:

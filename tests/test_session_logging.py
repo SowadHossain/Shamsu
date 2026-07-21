@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,25 @@ def test_session_manager_creates_metadata_and_index(tmp_path: Path):
     index = json.loads((tmp_path / ".shamsu" / "sessions" / "index.json").read_text())
     assert index["sessions"][0]["title"] == "Feature work"
     assert logger.metadata.event_count == 1
+
+
+def test_parallel_session_creation_keeps_index_valid_and_complete(tmp_path: Path):
+    # Exercise concurrent index updates after the workspace session store has
+    # been initialized, matching parallel headless runs in a real workspace.
+    SessionManager(tmp_path).root.mkdir(parents=True, exist_ok=True)
+
+    def create(index: int) -> str:
+        return SessionManager(tmp_path).create_session(f"Parallel {index}").session_id
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        session_ids = list(pool.map(create, range(24)))
+
+    raw = (tmp_path / ".shamsu" / "sessions" / "index.json").read_text(encoding="utf-8")
+    index = json.loads(raw)
+    indexed_ids = {item["session_id"] for item in index["sessions"]}
+
+    assert len(session_ids) == len(set(session_ids)) == 24
+    assert indexed_ids == set(session_ids)
 
 
 def test_session_list_resume_rename_close_and_export(tmp_path: Path):

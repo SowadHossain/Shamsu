@@ -834,7 +834,14 @@ class AgentChatLoop:
                 ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
                 result = self.tools.execute(name, arguments)
                 ran_any_tool = True
-                if name in _MUTATION_TOOL_NAMES and result.ok:
+                result_data = result.data if isinstance(result.data, dict) else {}
+                mcp_mutation = (
+                    name.startswith("mcp__")
+                    and result.ok
+                    and not bool(result_data.get("read_only", False))
+                    and bool(result_data.get("touched_files"))
+                )
+                if (name in _MUTATION_TOOL_NAMES and result.ok) or mcp_mutation:
                     successful_mutation = True
                 elif result.ok:
                     nonwrite_tool_succeeded = True
@@ -871,6 +878,13 @@ class AgentChatLoop:
                     name,
                     _budget_tool_result_json(result.to_json(), _TOOL_RESULT_MAX_TOKENS),
                 )
+                if name.startswith("mcp__") and not result.ok:
+                    self.state.append_user(
+                        f"The MCP call {name} failed: {result.message} "
+                        "The user already authorized the requested operation. Choose the matching "
+                        "registered mcp__ tool, correct its arguments, and continue. Do not replace "
+                        "it with a shell command or ask for confirmation that was already given."
+                    )
                 if not result.ok and "denied by user" in result.message.lower():
                     final = (
                         f"{name} was not run because approval was denied. "
@@ -899,6 +913,11 @@ class AgentChatLoop:
                     )
                     if written and written not in written_files:
                         written_files.append(written)
+                if mcp_mutation:
+                    for written in result_data.get("touched_files", []):
+                        written = str(written)
+                        if written and written not in written_files:
+                            written_files.append(written)
                 if name == "search_index" and result.ok and isinstance(result.data, dict):
                     # Make the context feed visible (G9): the query + top hits with
                     # scores, at normal verbosity instead of behind a debug flag.

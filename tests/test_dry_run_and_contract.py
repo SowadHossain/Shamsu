@@ -154,6 +154,17 @@ def test_contract_reads_the_promises_out_of_a_prompt():
     assert contract.read_only is False
 
 
+def test_contract_normalizes_absolute_workspace_target_to_relative_path(tmp_path: Path):
+    target = tmp_path / "mcp-smoke.txt"
+
+    contract = run_contract.derive(
+        f"Create {target}. Do not modify anything else.", workspace=tmp_path
+    )
+
+    assert contract.requested_paths == ("mcp-smoke.txt",)
+    assert contract.scoped_read_only is True
+
+
 def test_contract_ignores_files_that_are_only_being_read():
     """"Inspect qa_probe.py" names a file but requests no change to it -
     demanding it be written would fail every read-only run."""
@@ -243,6 +254,58 @@ def test_contract_fails_a_dry_run_that_actually_wrote():
 
     assert result.ok is False
     assert any("dry_run_changed_nothing" in v for v in result.violations)
+
+
+def test_outside_folder_clause_is_scoped_and_allows_descendants(tmp_path: Path):
+    prompt = (
+        "Build the app from prd.pdf in a folder named generated-app. "
+        "Do not modify anything outside generated-app."
+    )
+
+    derived = run_contract.derive(prompt, workspace=tmp_path)
+    result = run_contract.check(
+        derived,
+        changed_files=[{"path": "generated-app/src/main.py", "change": "created"}],
+    )
+
+    assert derived.read_only is False
+    assert derived.scoped_read_only is True
+    assert derived.requested_paths == ("generated-app",)
+    assert result.ok is True
+
+
+def test_build_only_prompt_still_records_a_named_directory_scope(tmp_path: Path):
+    prompt = (
+        "Build the app in a new folder named output-app. "
+        "Do not modify anything outside output-app."
+    )
+
+    derived = run_contract.derive(prompt, workspace=tmp_path)
+
+    assert derived.scoped_read_only is True
+    assert derived.requested_paths == ("output-app",)
+
+
+def test_denied_outcome_does_not_report_a_missing_requested_write():
+    derived = run_contract.derive("Create denied.txt with hello")
+
+    result = run_contract.check(derived, changed_files=[], outcome="denied")
+
+    assert result.ok is True
+    assert not any("requested_files_were_written" in item for item in result.violations)
+
+
+def test_dry_run_rejects_a_plan_for_a_stale_path():
+    derived = run_contract.derive("Create requested.txt with hello", dry_run=True)
+
+    result = run_contract.check(
+        derived,
+        changed_files=[],
+        planned_mutations=[{"action": "create", "path": "old-session/stale.txt"}],
+    )
+
+    assert result.ok is False
+    assert any("dry_run_planned_requested_paths" in item for item in result.violations)
 
 
 def test_a_prompt_with_no_promises_is_not_judged():

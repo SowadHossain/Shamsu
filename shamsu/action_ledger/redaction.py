@@ -13,6 +13,25 @@ from shamsu.patch.safety import is_secret_file
 from shamsu.safety.commands import redact
 
 
+_SECRET_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "client_secret",
+        "credential",
+        "credentials",
+        "password",
+        "private_key",
+        "refresh_token",
+        "secret",
+        "secret_key",
+        "token",
+    }
+)
+
+
 def redact_text(value: str) -> str:
     return redact(value)
 
@@ -21,7 +40,12 @@ def redact_value(value: Any) -> Any:
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, dict):
-        return {str(key): redact_value(item) for key, item in value.items()}
+        return {
+            str(key): "[REDACTED]"
+            if str(key).lower().replace("-", "_") in _SECRET_KEYS
+            else redact_value(item)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
         return [redact_value(item) for item in value]
     return value

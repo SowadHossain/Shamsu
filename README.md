@@ -536,6 +536,96 @@ shamsu> /browse screenshot
 Browser actions require approval before opening the session and before
 state-changing actions like click/type.
 
+## External MCP Servers
+
+SHAMSU can connect to standard external MCP servers and expose their tools to
+the normal coding-agent loop. It uses the official MCP Python SDK and supports:
+
+- local `stdio` servers launched as child processes
+- remote Streamable HTTP servers
+- legacy remote SSE servers
+- static headers whose secret values come from environment variables
+- OAuth 2.1 for remote HTTP servers, with tokens stored in the OS keyring
+- Claude-compatible project configuration in `.mcp.json`
+
+Create `.mcp.json` in the workspace. A stdio server uses the same `mcpServers`
+shape as Claude Desktop and Claude Code:
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "F:\\Work\\my-project"
+      ]
+    }
+  }
+}
+```
+
+A remote server with a token can reference an environment variable. Do not put
+the token itself in the JSON file:
+
+```json
+{
+  "mcpServers": {
+    "company": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${COMPANY_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+For a remote server that implements MCP OAuth discovery and dynamic client
+registration, use `"auth": "oauth"`. SHAMSU opens the authorization page in
+the browser on first connection and stores access, refresh, and client
+credentials in the operating system keyring:
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "auth": "oauth",
+      "oauth_scopes": "read write"
+    }
+  }
+}
+```
+
+Configuration is merged in this order, with later files overriding earlier
+ones: `~/.shamsu/mcp.json`, `<workspace>/.shamsu/mcp.json`, then
+`<workspace>/.mcp.json`. Use these REPL commands to inspect it:
+
+```text
+/mcp status
+/mcp tools [server]
+/mcp config
+/mcp reload
+/mcp auth logout <server>
+```
+
+External calls ask for approval by default. Server settings support
+`"approval": "always"`, `"writes"`, or `"never"`, plus per-tool
+`tool_permissions` values of `allow`, `ask`, or `deny`. MCP annotations are
+untrusted hints, so SHAMSU does not use a server's `readOnlyHint` to bypass a
+read-only request unless `"trust_tool_annotations": true` is explicitly set.
+For stricter configuration, list reviewed tool names in `read_only_tools`.
+
+Discovered tools are named `mcp__<server>__<tool>` in model calls and run logs.
+Arguments, approvals, results, errors, and structured content pass through the
+existing session and ActionLedger logging; common credential fields are
+redacted by key. Direct MCP resource and prompt browsing is not exposed yet;
+the current integration covers MCP tools.
+
 ## Smoke Test
 
 From the SHAMSU repo root after install:

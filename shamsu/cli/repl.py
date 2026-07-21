@@ -18,6 +18,7 @@ import shlex
 import subprocess
 import sys
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -135,6 +136,7 @@ from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
 from shamsu.diagnostics import swallowed
 from shamsu.patch.rollback import latest_undoable_transaction
+from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.session.memory import is_affirmative, is_negative
@@ -275,6 +277,12 @@ SYSTEM_COMMANDS = (
     "/sessions search ",
     "/permissions list",
     "/permissions clear",
+    "/mcp status",
+    "/mcp servers",
+    "/mcp tools ",
+    "/mcp config",
+    "/mcp reload",
+    "/mcp auth logout ",
     "/milestones list",
     "/milestones show ",
     "/taskmaster status",
@@ -464,6 +472,11 @@ def _print_help(console: Console) -> None:
                     "  /sessions search <query>  Search titles, summaries, messages, memory",
                     "  /permissions list         Show remembered 'always allow' decisions",
                     "  /permissions clear        Forget all remembered approval decisions",
+                    "  /mcp status              Connect to configured external MCP servers",
+                    "  /mcp tools [server]      List discovered external tools",
+                    "  /mcp config              Show MCP config locations and safe settings",
+                    "  /mcp reload              Reload config and reconnect servers",
+                    "  /mcp auth logout <name>  Clear a server's OAuth credentials",
                     "  /milestones list          List tracked internal multi-step milestones",
                     "  /milestones show <id>     Show a milestone's steps, phase, and blockers",
                     "  /taskmaster status        Show Taskmaster install/provider health",
@@ -3570,6 +3583,7 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     # long before the plan route at the tail ever ran. Planning is one decision,
     # made in one place, so it stops being whack-a-mole across every detector.
     ("plan_prd", lambda text, ws: _looks_like_prd_plan_request(text)),
+    ("mcp", lambda text, ws: _looks_like_mcp_request(text)),
     ("workspace.location", lambda text, ws: _looks_like_workspace_location_prompt(text)),
     ("workspace.files", lambda text, ws: _looks_like_workspace_files_prompt(text)),
     ("prd.build", lambda text, ws: _looks_like_prd_build_request(text, ws)),
@@ -3829,6 +3843,9 @@ async def _handle_request(
             console,
             session_logger=session_logger,
             auto_approve=is_long_running_enabled(workspace),
+            user_request=effective_input,
+            use_long_term_memory=False,
+            use_planner=False,
         )
         return
     if route_label == "direct_code":
@@ -3889,6 +3906,9 @@ async def _handle_request(
             session_logger=session_logger,
         )
         return
+    if route_label == "mcp":
+        await _run_agent_chat(effective_input, workspace, console, session_logger=session_logger)
+        return
     if route_label == "agent-chat":
         await _run_agent_chat(effective_input, workspace, console, session_logger=session_logger)
         return
@@ -3934,6 +3954,7 @@ async def _handle_request(
                     workspace,
                     console,
                     session_logger=session_logger,
+                    user_request=effective_input,
                 )
             else:
                 console.print(
@@ -4005,6 +4026,7 @@ async def _handle_request(
                     console,
                     session_logger=session_logger,
                     auto_approve=is_long_running_enabled(workspace),
+                    user_request=effective_input,
                 )
             else:
                 await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger, thinking_status=thinking_status)
@@ -4318,6 +4340,15 @@ def _looks_like_capabilities_question(user_input: str) -> bool:
     `_asks_capabilities` there), before the memory gate and model routing."""
     text = user_input.lower()
     return any(phrase in text for phrase in _CAPABILITY_QUESTION_PHRASES)
+
+
+def _looks_like_mcp_request(user_input: str) -> bool:
+    """Explicit MCP instructions must reach the tool-calling loop."""
+    text = user_input.lower()
+    return bool(
+        re.search(r"\bmcp\b|\bmcp__[a-z0-9_-]+__[a-z0-9_-]+\b", text)
+        and re.search(r"\b(use|call|ask|query|list|read|write|create|search|fetch|test)\b", text)
+    )
 
 
 def _looks_like_django_generation_request(user_input: str) -> bool:
@@ -4783,6 +4814,7 @@ async def _handle_git_request(
         workspace,
         console,
         session_logger=session_logger,
+        user_request=user_input,
     )
 
 
@@ -6556,6 +6588,17 @@ async def _handle_prd_build_request(
             workflow_id="prd-build",
         )
         return
+    strategy = getattr(getattr(project, "suitability", None), "strategy", None)
+    if getattr(strategy, "value", strategy) == "django":
+        await _run_django_prd_build(
+            user_input,
+            prd_path,
+            project,
+            workspace,
+            console,
+            session_logger=session_logger,
+        )
+        return
     # Templates disabled by default: a game PRD is built from scratch via the
     # agent below (the generic build path), never by copying the 3D multiplayer
     # boilerplate. Set SHAMSU_ENABLE_TEMPLATES=1 to restore the template build.
@@ -6651,6 +6694,14 @@ async def _handle_prd_build_request(
             use_planner=False,
         )
         changed_files = list(getattr(result, "changed_files", ()) or ())
+        if not changed_files:
+            ledger = get_current_run()
+            if ledger:
+                ledger.log_event(
+                    "mutation_required_but_missing",
+                    route="prd.build",
+                    target=", ".join(output_scope) or ".",
+                )
         if acceptance:
             passed, failures = _run_prd_validation(
                 parsed.raw_text,
@@ -6735,6 +6786,254 @@ async def _handle_prd_build_request(
     console.print(f"[green]PRD milestone build flow complete. Task: {task.task_id}[/green]")
     # Integration check across everything the milestones built (mirrors /proceed).
     await _verify_completed_plan(changed_files, workspace, console, session_logger)
+
+
+def _prd_target_directory(user_input: str, project: Any) -> str:
+    match = re.search(
+        r"\b(?:new\s+)?(?:folder|directory)\s+(?:named|called)\s+"
+        r"(?P<path>[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)",
+        user_input,
+        re.IGNORECASE,
+    )
+    if match:
+        return match.group("path").rstrip(".")
+    return str(getattr(project, "project_name", "generated-app") or "generated-app")
+
+
+def _planned_django_paths(project: Any, target_dir: str) -> list[str]:
+    prefix = Path(target_dir)
+    paths = [
+        (prefix / str(file_spec.path)).as_posix()
+        for file_spec in getattr(project, "generation_order", [])
+    ]
+    app_name = str(getattr(project, "app_name", "app") or "app")
+    paths.extend(
+        [
+            (prefix / "SHAMSU_SUMMARY.md").as_posix(),
+            (prefix / "db.sqlite3").as_posix(),
+            (prefix / app_name / "migrations" / "0001_initial.py").as_posix(),
+        ]
+    )
+    return list(dict.fromkeys(paths))
+
+
+async def _run_django_prd_build(
+    user_input: str,
+    prd_path: Path,
+    project: Any,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> FullPipelineResult:
+    """Run the deterministic PRD pipeline for supported CRUD/API products."""
+    target_dir = _prd_target_directory(user_input, project)
+    target = Sandbox(workspace).validate(target_dir)
+    if target.exists() and any(target.iterdir()):
+        message = (
+            f"The requested project folder is not empty: {target_dir}. "
+            "Choose a new folder so the PRD build cannot overwrite unrelated work."
+        )
+        console.print(Panel(message, title="PRD Build Needs Input", border_style="yellow"))
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_event("run_needs_input", reason="prd_target_not_empty", target=target_dir)
+        _log_assistant_message(session_logger, message, workflow_id="prd-build")
+        return FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=target,
+            project=project,
+            written_files=[],
+            success=False,
+            error=message,
+        )
+
+    ledger = get_current_run()
+    if ledger:
+        try:
+            prd_text = parse_prd_file(prd_path).raw_text or ""
+        except PRDParseError:
+            prd_text = ""
+        ledger.log_context_preview(
+            {
+                "task_id": "prd-build",
+                "specialist": "deterministic-prd-pipeline",
+                "token_estimate": max((len(user_input) + len(prd_text)) // 4, 1),
+                "user_request": user_input[:8000],
+                "prd_context": prd_text[:16000],
+                "snippets": [],
+                "omitted_context": {
+                    "user_request_chars": max(len(user_input) - 8000, 0),
+                    "prd_context_chars": max(len(prd_text) - 16000, 0),
+                },
+                "deterministic": True,
+            }
+        )
+    transactions = TransactionWorkspace(workspace)
+    planned_paths = _planned_django_paths(project, target_dir)
+    transaction_id = transactions.begin(
+        f"Build {getattr(project, 'project_name', 'project')} from {prd_path.name}",
+        [{"op": "prd_build", "path": path} for path in planned_paths],
+        destructive=False,
+    )
+    for path in planned_paths:
+        transactions.backup_file(transaction_id, path)
+    if ledger:
+        ledger.log_mutation_started(transaction_id, "Deterministic PRD-to-project build")
+        ledger.log_event(
+            "prd_parsed",
+            path=str(prd_path),
+            project=getattr(project, "project_name", ""),
+            target=target_dir,
+        )
+
+    command_runner = CommandRunner(
+        workspace,
+        approval_func=lambda _request: True,
+        session_logger=session_logger,
+        action_ledger=ledger,
+    )
+    search, _uses_real_index = _build_search_agent(workspace, session_logger)
+    result = await FullDjangoPipeline(
+        workspace,
+        search=search,
+        session_logger=session_logger,
+        approval_func=lambda _request: True,
+        setup_runner=DjangoSetupRunner(
+            workspace,
+            command_runner=command_runner,
+            session_logger=session_logger,
+        ),
+        test_runner=DjangoTestRunner(
+            workspace,
+            command_runner=command_runner,
+            session_logger=session_logger,
+        ),
+        long_running=True,
+    ).run(prd_path, target_dir=target_dir)
+
+    demo_credentials: tuple[str, str] | None = None
+    if result.success and _requests_demo_login(user_input, project):
+        seeded, seed_error = _seed_django_demo_login(target, command_runner)
+        if seeded:
+            demo_credentials = ("demo@example.com", "ShamsuDemo123!")
+            _append_demo_login_docs(target, *demo_credentials)
+            if ledger:
+                ledger.log_event(
+                    "demo_credentials_seeded",
+                    target=target_dir,
+                    username=demo_credentials[0],
+                )
+        else:
+            result = replace(
+                result,
+                success=False,
+                error=f"Django project passed setup and tests, but demo login seeding failed: {seed_error}",
+            )
+
+    touched = [path for path in planned_paths if (workspace / path).exists()]
+    for path in touched:
+        transactions.record_after(transaction_id, path)
+    mutation_status = "applied" if touched else "failed"
+    manifest = transactions.finalize(
+        transaction_id,
+        mutation_status,
+        "" if touched else (result.error or "PRD build wrote no files"),
+    )
+    if ledger:
+        ledger.log_mutation_finished(
+            transaction_id,
+            mutation_status,
+            touched_files=touched,
+            rollback_available=bool(touched),
+            error="" if touched else (result.error or "PRD build wrote no files"),
+            operations=list(manifest.get("operations", [])),
+            before_hashes=dict(manifest.get("before_hashes", {})),
+            after_hashes=dict(manifest.get("after_hashes", {})),
+            backups=dict(manifest.get("backups", {})),
+            verification={
+                "ran": bool(result.setup_result or result.test_result),
+                "passed": bool(result.success),
+            },
+        )
+        if not touched:
+            ledger.log_event("mutation_required_but_missing", route="prd.build", target=target_dir)
+        elif result.success:
+            ledger.log_event("verification_passed", command="django setup and test", source="prd_pipeline")
+        else:
+            ledger.log_event(
+                "verification_failed",
+                command="django setup and test",
+                source="prd_pipeline",
+                error=result.error,
+            )
+
+    _print_full_pipeline_result(result, console)
+    if result.success:
+        message = (
+            f"Built {getattr(project, 'project_name', 'the project')} in {target_dir}. "
+            f"Generated {len(touched)} files; setup and tests passed."
+        )
+        if demo_credentials:
+            message += (
+                f" Demo login: {demo_credentials[0]} / {demo_credentials[1]}. "
+                f"Run it with {sys.executable} manage.py runserver from {target_dir}."
+            )
+    else:
+        message = (
+            f"The PRD build created {len(touched)} files in {target_dir}, but verification failed: "
+            f"{result.error or 'see the command logs for details'}"
+        )
+    _log_assistant_message(session_logger, message, workflow_id="prd-build")
+    if result.success:
+        _record_task_memory(
+            workspace,
+            f"PRD build request: {user_input}",
+            session_logger=session_logger,
+            metadata={"workflow": "prd-build", "target": target_dir},
+        )
+    return result
+
+
+def _requests_demo_login(user_input: str, project: Any) -> bool:
+    lowered = user_input.casefold()
+    requested = any(term in lowered for term in ("seed", "demo data", "demo login", "login credentials"))
+    pages = list(getattr(project, "pages", []) or [])
+    has_login = any(
+        getattr(page, "page_type", "") == "auth" or "login" in getattr(page, "name", "").casefold()
+        for page in pages
+    )
+    return requested and has_login
+
+
+def _seed_django_demo_login(target: Path, command_runner: CommandRunner) -> tuple[bool, str]:
+    code = (
+        "from django.contrib.auth import get_user_model; "
+        "User=get_user_model(); "
+        "user,_=User.objects.get_or_create(username='demo@example.com', "
+        "defaults={'email':'demo@example.com','first_name':'Demo'}); "
+        "user.email='demo@example.com'; user.first_name='Demo'; "
+        "user.set_password('ShamsuDemo123!'); user.save()"
+    )
+    command = f'"{sys.executable}" manage.py shell -c "{code}"'
+    exit_code, stdout, stderr = command_runner.run(command, target)
+    if exit_code == 0:
+        return True, ""
+    return False, (stderr or stdout or f"seed command exited with {exit_code}").strip()
+
+
+def _append_demo_login_docs(target: Path, username: str, password: str) -> None:
+    section = (
+        "\n\n## Demo Login\n\n"
+        f"- Email: `{username}`\n"
+        f"- Password: `{password}`\n"
+    )
+    for name in ("README.md", "SHAMSU_SUMMARY.md"):
+        path = target / name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if "## Demo Login" not in text:
+            path.write_text(text.rstrip() + section, encoding="utf-8")
 
 
 def _multiplayer_template_present(workspace: Path) -> bool:
@@ -7853,6 +8152,8 @@ async def _run_composite_request(
             console,
             session_logger=session_logger,
             auto_approve=is_long_running_enabled(workspace),
+            user_request=plan.prompt,
+            force_read_only=step.kind not in {"mutation", "git_mutate"},
         )
         last_result = result
         step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
@@ -7903,6 +8204,13 @@ async def _run_composite_request(
         lines = []
         for item in statuses:
             line = f"Step {item['id']} ({item['kind']}): {item['status']}"
+            tool_evidence = [
+                str(value).removeprefix("tool:")
+                for value in item.get("evidence", [])
+                if str(value).startswith("tool:")
+            ]
+            if tool_evidence:
+                line += f" via {', '.join(tool_evidence)}"
             if item.get("output"):
                 line += f"\n{item['output']}"
             lines.append(line)
@@ -8079,20 +8387,26 @@ def _composite_step_outcome(
     event_types: set[str],
 ) -> tuple[str, list[str]]:
     tools = set(successful_tools)
+    tool_leaves = [_tool_leaf(name) for name in successful_tools]
     changed_files = list(getattr(result, "changed_files", ()) or ())
     stopped = bool(getattr(result, "stopped", False))
     awaiting_user = bool(getattr(result, "awaiting_user", False))
     evidence: list[str] = []
     matched = False
     if step.kind == "mutation":
-        matched = bool(tools & {"write_file", "edit_file", "move_file", "delete_file"}) or bool(
-            changed_files
-        )
+        matched = bool(
+            set(tool_leaves)
+            & {"write_file", "edit_file", "move_file", "delete_file", "create_directory"}
+        ) or bool(changed_files)
         evidence = [f"changed:{path}" for path in changed_files]
     elif step.kind == "verify":
         if "verification_failed" in event_types:
             return "failed", ["event:verification_failed"]
-        matched = "verification_passed" in event_types or "run_command" in tools
+        matched = (
+            "verification_passed" in event_types
+            or "run_command" in tools
+            or any(_mcp_tool_provides_read_evidence(name) for name in successful_tools)
+        )
         evidence = ["event:verification_passed"] if "verification_passed" in event_types else []
     elif step.kind == "git_inspect":
         matched = bool(tools & {"git_status", "git_diff", "git_diff_staged", "git_log"})
@@ -8101,9 +8415,12 @@ def _composite_step_outcome(
     elif step.kind == "web":
         matched = bool(tools & {"web_search", "fetch_url"})
     elif step.kind == "read":
-        matched = "read_file" in tools
+        matched = any(_tool_provides_read_evidence(name) for name in successful_tools)
     elif step.kind == "compare":
-        matched = successful_tools.count("read_file") >= 2 and not stopped
+        matched = (
+            sum(_tool_provides_read_evidence(name) for name in successful_tools) >= 2
+            and not stopped
+        )
     elif step.kind == "launch":
         matched = "run_command" in tools and not stopped
     else:
@@ -8118,6 +8435,59 @@ def _composite_step_outcome(
     return "not_run", evidence
 
 
+def _tool_leaf(name: str) -> str:
+    if name.startswith("mcp__"):
+        parts = name.split("__", 2)
+        if len(parts) == 3:
+            return parts[2]
+    return name
+
+
+_READ_EVIDENCE_TOOLS = frozenset(
+    {
+        "read_file",
+        "read_text_file",
+        "read_multiple_files",
+        "list_directory",
+        "list_directory_with_sizes",
+        "directory_tree",
+        "search_files",
+        "get_file_info",
+        "list_allowed_directories",
+    }
+)
+
+
+def _mcp_tool_provides_read_evidence(name: str) -> bool:
+    return name.startswith("mcp__") and _tool_leaf(name) in _READ_EVIDENCE_TOOLS
+
+
+def _tool_provides_read_evidence(name: str) -> bool:
+    return _tool_leaf(name) in _READ_EVIDENCE_TOOLS
+
+
+def _configure_agent_request_safety(
+    tools: AgentToolRegistry,
+    safety_input: str,
+    *,
+    workspace: Path | None = None,
+    force_read_only: bool = False,
+    allowed_write_paths: tuple[str, ...] | None = None,
+) -> bool:
+    """Apply permissions from the clean current request, never model context."""
+    tools.set_user_request(safety_input)
+    request_is_read_only = force_read_only or _explicitly_read_only(safety_input)
+    if request_is_read_only:
+        tools.set_read_only(True)
+    elif read_only.is_scoped(safety_input):
+        allowed = contract.requested_paths(safety_input, workspace)
+        if allowed:
+            tools.set_allowed_write_paths(allowed)
+    if allowed_write_paths:
+        tools.set_allowed_write_paths(allowed_write_paths)
+    return request_is_read_only
+
+
 async def _run_agent_chat(
     user_input: str,
     workspace: Path,
@@ -8128,6 +8498,8 @@ async def _run_agent_chat(
     allowed_write_paths: tuple[str, ...] | None = None,
     use_long_term_memory: bool = True,
     use_planner: bool = True,
+    user_request: str | None = None,
+    force_read_only: bool = False,
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -8141,33 +8513,71 @@ async def _run_agent_chat(
         approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
         action_ledger=action_ledger,
     )
-    tools.set_user_request(user_input)
+    # ``user_input`` may include session memory, task handoffs, or focused
+    # composite instructions. Those are useful model context but must never
+    # silently change the permissions granted by the current user request.
+    safety_input = user_request if user_request is not None else user_input
     # "Do not change files" outranks auto_approve. Approval mode answers "may I
     # act without asking?"; it never licenses ignoring an explicit instruction.
-    request_is_read_only = _explicitly_read_only(user_input)
-    if request_is_read_only:
-        tools.set_read_only(True)
-    elif read_only.is_scoped(user_input):
-        # "Create X. Do not modify any other files." - a carve-out, so the
-        # named targets stay writable and everything else is denied. Without a
-        # resolvable target there is nothing to scope TO, and silently denying
-        # every write would fail the request just as badly, so the restriction
-        # is only applied when the prompt actually names its files.
-        allowed = contract.requested_paths(user_input)
-        if allowed:
-            tools.set_allowed_write_paths(allowed)
-    if allowed_write_paths:
-        tools.set_allowed_write_paths(allowed_write_paths)
+    request_is_read_only = _configure_agent_request_safety(
+        tools,
+        safety_input,
+        workspace=workspace,
+        force_read_only=force_read_only,
+        allowed_write_paths=allowed_write_paths,
+    )
+    if _looks_like_mcp_request(safety_input):
+        use_long_term_memory = False
+        use_planner = False
+        tools.require_tool_prefix("mcp__")
+        mcp_names = [
+            str((schema.get("function") or {}).get("name") or "")
+            for schema in tools.tool_schemas()
+            if str((schema.get("function") or {}).get("name") or "").startswith("mcp__")
+        ]
+        if mcp_names:
+            mutation_request = bool(
+                contract.requested_paths(safety_input, workspace)
+                and re.search(
+                    r"\b(create|write|save|edit|update|modify|change|delete|remove)\b",
+                    read_only.strip(safety_input),
+                    re.IGNORECASE,
+                )
+            )
+            preferred = [
+                name
+                for name in mcp_names
+                if mutation_request
+                and re.search(r"__(?:write|create|edit|update|delete|remove)[a-z0-9_-]*$", name)
+            ]
+            preference = (
+                " This is an explicitly authorized mutation. Call "
+                + (preferred[0] if preferred else "the matching MCP mutation tool")
+                + " directly; do not probe the missing destination with a read tool and do not ask for confirmation."
+                if mutation_request
+                else ""
+            )
+            user_input = (
+                f"{user_input}\n\nMCP tool requirement: call one of these registered tools directly: "
+                + ", ".join(mcp_names)
+                + ". Do not run an `mcp` shell command and do not substitute a local tool."
+                + preference
+            )
     # A dry run is the opposite instruction: keep going, change nothing. Writes
     # report a synthetic success and are recorded as planned actions instead.
     # The `--dry-run` flag sets the context recorder; prose ("dry run only:
     # create X") activates the same mode with a local recorder so the intent is
     # honored whether it arrived as a flag or as words.
     active_recorder = dry_run.get_recorder()
-    local_dry_run = active_recorder is None and read_only.is_dry_run(user_input)
+    local_dry_run = active_recorder is None and read_only.is_dry_run(safety_input)
     if local_dry_run:
         active_recorder = dry_run.DryRunRecorder()
     tools.set_dry_run(active_recorder)
+    if active_recorder is not None:
+        # A preview should be anchored only to the current request. Retrieved
+        # memories and a speculative planner can introduce stale output paths.
+        use_long_term_memory = False
+        use_planner = False
     long_running = force_long_running or is_long_running_enabled(workspace)
     activities: list[str] = []
     trace_mode = _trace_mode(workspace)
@@ -8215,6 +8625,14 @@ async def _run_agent_chat(
         )
         chat_kwargs["audit"] = audit
     result = await AgentChatLoop(workspace, **chat_kwargs).run(user_input)
+    if action_ledger and getattr(result, "timeout_category", None):
+        action_ledger.log_event(
+            "run_timed_out",
+            phase="model",
+            category=result.timeout_category,
+        )
+    elif action_ledger and result.stopped and not getattr(result, "awaiting_user", False):
+        action_ledger.log_event("agent_stopped", reason=result.final[:500])
     # A prose-triggered dry run has no headless wrapper to report its plan, so
     # replace the agent's (synthetic-success) narration with the actual preview.
     if local_dry_run and active_recorder is not None:
@@ -8222,6 +8640,13 @@ async def _run_agent_chat(
         _log_assistant_message(session_logger, active_recorder.summary(), workflow_id="agent-chat")
         return result
     body = result.final.strip() or "No response returned."
+    mcp_tools_used = _successful_mcp_tools(action_ledger, workspace)
+    if mcp_tools_used and not all(name in body for name in mcp_tools_used):
+        body = (
+            f"{body}\n\nExternal MCP tool used: "
+            + ", ".join(f"`{name}`" for name in mcp_tools_used)
+        )
+        result = replace(result, final=body)
     if getattr(result, "awaiting_user", False):
         # SHAMSU asked the user something and stored the pending question. Print
         # it clearly and stop - the next reply is resolved against it. Do not
@@ -8245,6 +8670,23 @@ async def _run_agent_chat(
     if not result.stopped:
         _finalize_session_work(session_logger, "agent-chat", user_input)
     return result
+
+
+def _successful_mcp_tools(
+    ledger: ActionLedger | None,
+    workspace: Path,
+) -> list[str]:
+    if ledger is None:
+        return []
+    return list(
+        dict.fromkeys(
+            str(record.get("tool", ""))
+            for record in action_ledger_store.load_tool_calls(workspace, ledger.run_id)
+            if record.get("phase") == "finished"
+            and record.get("ok") is True
+            and str(record.get("tool", "")).startswith("mcp__")
+        )
+    )
 
 
 def _should_show_context_preview() -> bool:
@@ -8301,17 +8743,23 @@ async def _run_web_assist(
     web_tool: WebTool,
     session_logger: SessionLogger | None = None,
 ) -> None:
+    search_query = _web_search_query(user_input)
     if hasattr(web_tool, "search_and_fetch"):
         ledger = getattr(web_tool, "action_ledger", None)
         call_id = (
             ledger.log_tool_call(
-                "web_search", {"query": user_input, "mode": "search_and_fetch"}
+                "web_search",
+                {
+                    "query": search_query,
+                    "original_request": user_input,
+                    "mode": "search_and_fetch",
+                },
             )
             if ledger
             else ""
         )
         combined = web_tool.search_and_fetch(
-            user_input,
+            search_query,
             reason="SHAMSU thinks this request needs current or external information from the web.",
         )
         if ledger:
@@ -8376,7 +8824,7 @@ async def _run_web_assist(
         return
 
     result = web_tool.search(
-        user_input,
+        search_query,
         reason="SHAMSU thinks this request needs current or external information from the web.",
     )
     fetches: list[WebFetchResult] = []
@@ -8430,6 +8878,28 @@ async def _run_web_assist(
                 if fetch.approved and not fetch.error and _is_useful_web_fetch(fetch):
                     fetches.append(fetch)
     await _print_web_answer(user_input, result, fetches, console, llm, session_logger=session_logger)
+
+
+def _web_search_query(user_input: str) -> str:
+    """Turn an instruction into the concise subject sent to the search engine."""
+    query = " ".join(str(user_input or "").split())
+    query = re.sub(
+        r"^(?:please\s+)?(?:use\s+)?(?:the\s+)?(?:web\s+search|search\s+the\s+web|"
+        r"search\s+online|look\s+online)\s+(?:to\s+)?",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"^(?:find|look\s+up|check)\s+", "", query, flags=re.IGNORECASE)
+    query = re.sub(r"^the\s+", "", query, flags=re.IGNORECASE)
+    query = re.split(
+        r"\s*(?:,|;|\band\b)\s*(?:cite|include\s+sources?|tell\s+me\s+where|"
+        r"do\s+not\s+modify|don't\s+modify)",
+        query,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return query.strip(" ,:;") or user_input.strip()
 
 
 async def _run_browser_assist(
@@ -8547,13 +9017,80 @@ async def _print_web_answer(
         )
         response = await llm.run_specialist("qa", pack)
         body = response.raw.strip() or "I found sources, but could not synthesize an answer from the snippets."
-    sources = "\n".join(f"- {hit.title}: {hit.url}" for hit in result.hits[:5])
+    body = re.split(
+        r"\n\s*(?:#{1,4}\s*)?(?:sources?\s+used|sources?\s+searched(?:/fetched)?|sources?)\s*:?[ \t]*\n",
+        body,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip()
+    grounded = _grounded_release_answer(query, fetches)
+    if grounded:
+        body = grounded
+    source_items: list[tuple[str, str]] = []
+    for page in fetches:
+        item = (page.title or page.url, getattr(page, "final_url", "") or page.url)
+        if item[1] and item[1] not in {url for _title, url in source_items}:
+            source_items.append(item)
+    for hit in result.hits:
+        item = (hit.title, hit.url)
+        if item[1] and item[1] not in {url for _title, url in source_items}:
+            source_items.append(item)
+    official_domains = _official_domains_for_query(query) if "official" in query.lower() else ()
+    if official_domains:
+        official_items = [
+            item
+            for item in source_items
+            if any(
+                (urlparse(item[1]).hostname or "") == domain
+                or (urlparse(item[1]).hostname or "").endswith("." + domain)
+                for domain in official_domains
+            )
+        ]
+        if official_items:
+            source_items = official_items
+    sources = "\n".join(f"- {title}: {url}" for title, url in source_items[:5])
     provider_note = ""
     if getattr(result, "fallback_used", False):
         provider_note = "\n\nNote: SearXNG was unavailable, so SHAMSU fell back to DuckDuckGo."
     message = f"{body}{provider_note}\n\nSources:\n{sources}"
     console.print(Panel(message, title="Web Answer"))
     _log_assistant_message(session_logger, message, workflow_id="web")
+
+
+def _official_domains_for_query(query: str) -> tuple[str, ...]:
+    text = query.lower()
+    if "python" in text:
+        return ("python.org",)
+    if "node.js" in text or "nodejs" in text:
+        return ("nodejs.org",)
+    if "django" in text:
+        return ("djangoproject.com",)
+    if "react" in text:
+        return ("react.dev",)
+    return ()
+
+
+def _grounded_release_answer(query: str, fetches: list[WebFetchResult]) -> str:
+    """Resolve simple latest-version facts directly from first-party evidence."""
+    text = query.lower()
+    if not re.search(r"\b(current|latest|stable)\b", text) or not re.search(
+        r"\b(version|release)\b", text
+    ):
+        return ""
+    domains = _official_domains_for_query(query)
+    if domains != ("python.org",):
+        return ""
+    candidates: set[tuple[int, int, int]] = set()
+    for page in fetches:
+        host = urlparse(getattr(page, "final_url", "") or page.url).hostname or ""
+        if not any(host == domain or host.endswith("." + domain) for domain in domains):
+            continue
+        for match in re.finditer(r"\bPython\s+(\d+)\.(\d+)\.(\d+)\b", page.text):
+            candidates.add(tuple(int(part) for part in match.groups()))
+    if not candidates:
+        return ""
+    version = ".".join(str(part) for part in max(candidates))
+    return f"The current stable Python release is **Python {version}**, according to Python.org."
 
 
 def _is_useful_web_fetch(fetch: WebFetchResult) -> bool:
@@ -9453,6 +9990,11 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("permissions"):
             _handle_permissions(normalized_input, workspace, console)
+            continue
+        if lowered_input == "mcp" or lowered_input.startswith("mcp "):
+            from shamsu.mcp.cli import handle_mcp_command
+
+            handle_mcp_command(normalized_input, workspace, console, session_logger)
             continue
         if lowered_input.startswith("milestones"):
             _handle_milestones(normalized_input, workspace, console)

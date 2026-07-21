@@ -221,6 +221,20 @@ or discovering a blocker.
   run evidence and published performance/log-growth measurements.
 - [x] Cut package metadata and docs for `0.4.0b1`.
 
+### External MCP host completed (2026-07-21)
+
+- [x] Added Claude-compatible `.mcp.json` loading plus user/workspace config
+  precedence for external MCP servers.
+- [x] Added official MCP SDK clients for stdio, Streamable HTTP, and legacy SSE,
+  including remote OAuth with OS-keyring token storage.
+- [x] Bridged discovered MCP tools into the normal agent loop with approval,
+  read-only, dry-run, per-tool permission, timeout, and redacted logging gates.
+- [x] Added `/mcp status|tools|config|reload` and OAuth logout commands.
+- [x] Validated real protocol servers over all three transports and dogfooded
+  the published `@modelcontextprotocol/server-filesystem` package against
+  `test-shamsu` (14 tools discovered; directory call succeeded).
+- [x] Full verification: Ruff clean; 1,520 passed, 1 skipped.
+
 - [ ] v2.3 phase two: marker-based hole filling, bounded DoD repair loop, and Playwright runtime checks for the multiplayer-game template.
 - [ ] Milestone 6 status/log/progress views, safety audit, release docs, and final release cut.
 

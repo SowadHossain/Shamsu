@@ -20,6 +20,7 @@ from shamsu.agents.freeform_generator import FreeformGenerator, FreeformRunResul
 from shamsu.agents.scaffold_pipeline import ScaffoldPipeline, ScaffoldRunResult
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.interfaces import ISearchAgent
+from shamsu.llm.manager import LLMManager
 from shamsu.prd.input import parse_prd_file
 from shamsu.prd.project import build_project_spec
 from shamsu.registry import load_registry_entry
@@ -425,7 +426,7 @@ class FullDjangoPipeline:
         fix = await BugFixWorkflow(
             self.workspace_root,
             search=self.search,
-            session_logger=self.session_logger,
+            llm=LLMManager(session_logger=self.session_logger),
         ).run(setup_result.bugfix_context)
         if not fix.applied:
             return setup_result

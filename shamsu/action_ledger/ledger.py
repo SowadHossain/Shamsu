@@ -211,6 +211,19 @@ class ActionLedger:
         self._write_json(self.manifest_path, manifest)
         terminal_event = "run_finished" if status in {"success", "success_unverified"} else "run_failed"
         self.log_event(terminal_event, status=status)
+        events = self._read_jsonl(self.events_path)
+        decisions = self._read_jsonl(self.decisions_path)
+        tool_records = self._read_jsonl(self.tool_calls_path)
+        mutations = self._read_jsonl(self.mutations_dir / "mutations.jsonl")
+        finished_tools = [record for record in tool_records if record.get("phase") == "finished"]
+        route = next(
+            (
+                str(record.get("chosen_action", ""))
+                for record in reversed(decisions)
+                if record.get("decision") == "dispatch_request"
+            ),
+            "",
+        )
         summary = {
             **self._correlation(self.root_operation_id),
             "run_id": self.run_id,
@@ -225,6 +238,70 @@ class ActionLedger:
             "context_count": self._count_glob(self.contexts_dir, "context_*.json"),
             "command_count": self._count_glob(self.commands_dir, "cmd_*.stdout.log"),
             "final_output_preview": _preview(final_output or ""),
+            "route": route,
+            "tools": [
+                {
+                    "tool": str(record.get("tool", "")),
+                    "ok": bool(record.get("ok")),
+                    "status": str(record.get("status", "")),
+                    "duration_ms": record.get("duration_ms"),
+                    "message": str(record.get("message", "")),
+                }
+                for record in finished_tools
+            ],
+            "changed_files": list(
+                dict.fromkeys(
+                    str(path)
+                    for mutation in mutations
+                    if mutation.get("status") == "applied"
+                    for path in mutation.get("touched_files", [])
+                )
+            ),
+            "transaction_ids": [
+                str(record.get("transaction_id", ""))
+                for record in mutations
+                if record.get("transaction_id")
+            ],
+            "approvals": [
+                {
+                    "type": str(event.get("type", "")),
+                    "action_type": str(
+                        event.get("action_type")
+                        or (event.get("request") or {}).get("action_type", "")
+                    ),
+                    "approved": (
+                        bool(event.get("approved"))
+                        if "approved" in event
+                        else True
+                        if event.get("type") == "approval_granted"
+                        else False
+                        if event.get("type") == "approval_denied"
+                        else None
+                    ),
+                    "decision_scope": str(event.get("decision_scope", "")),
+                    "decision_source": str(event.get("decision_source", "")),
+                }
+                for event in events
+                if str(event.get("type", "")).startswith("approval_")
+            ],
+            "verification": [
+                {
+                    "type": str(event.get("type", "")),
+                    "command": str(event.get("command", "")),
+                    "exit_code": event.get("exit_code"),
+                }
+                for event in events
+                if event.get("type") in {"verification_started", "verification_passed", "verification_failed"}
+            ],
+            "artifacts": {
+                "events": "events.jsonl",
+                "decisions": "decisions.jsonl",
+                "tool_calls": "tool-calls.jsonl",
+                "model_calls": "model-calls.jsonl",
+                "contexts": "contexts/",
+                "mutations": "mutations/mutations.jsonl",
+                "final_output": "final-output.md",
+            },
         }
         self._write_json(self.summary_path, summary)
         return summary
@@ -289,6 +366,7 @@ class ActionLedger:
                 "patch_apply_failed",
                 "mutation_required_but_missing",
                 "contract_failed",
+                "agent_stopped",
             }
         ) or any(
             status not in {"applied", "rolled_back"} for status in mutation_statuses
@@ -587,7 +665,8 @@ class ActionLedger:
             return ""
         idx = self._diagnostics_seq
         self._diagnostics_seq += 1
-        path = self.diagnostics_dir / f"error_packet_{idx:03d}.json"
+        kind = "error_packet" if bool((packet or {}).get("actionable", False)) else "diagnostic_packet"
+        path = self.diagnostics_dir / f"{kind}_{idx:03d}.json"
         self._write_json(path, packet or {})
         relative = str(path.relative_to(self.run_dir).as_posix())
         self.log_event(

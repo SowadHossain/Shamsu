@@ -76,6 +76,18 @@ def test_command_runner_calls_diagnostic_digest_after_successful_command(tmp_pat
     assert runner.last_diagnostic_packet.classification == "success"
 
 
+def test_successful_command_uses_a_neutral_diagnostic_artifact_name(tmp_path: Path):
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "run a successful command")
+    runner = CommandRunner(tmp_path, approval_func=lambda _r: True, action_ledger=ledger)
+
+    runner.run("python -c \"print('ok')\"", tmp_path)
+
+    assert "diagnostic_packet_" in runner.last_diagnostics_path
+    assert "error_packet_" not in runner.last_diagnostics_path
+
+
 def test_successful_command_does_not_replace_last_error_packet(tmp_path: Path):
     digest = RecordingDigest()
     runner = CommandRunner(tmp_path, approval_func=lambda _r: True, diagnostic_digest=digest)

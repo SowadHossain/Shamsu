@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import uuid
 import zipfile
@@ -10,6 +11,8 @@ from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from filelock import FileLock
 
 from shamsu.safety.commands import redact
 from shamsu.action_ledger.context import get_current_run
@@ -58,6 +61,9 @@ class SessionManager:
         self.sandbox = Sandbox(self.workspace)
         self.root = self.sandbox.validate(Path(".shamsu") / "sessions")
         self.index_path = self.sandbox.validate(Path(".shamsu") / "sessions" / "index.json")
+        self.index_lock_path = self.sandbox.validate(
+            Path(".shamsu") / "sessions" / "index.lock"
+        )
 
     def create_session(self, title: str | None = None, parent_session_id: str | None = None) -> "SessionLogger":
         now = _now()
@@ -251,14 +257,31 @@ class SessionManager:
 
     def _write_index(self, index: dict[str, list[dict]]) -> None:
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        self.index_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+        temporary = self.sandbox.validate(
+            self.index_path.with_name(
+                f".{self.index_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+        )
+        try:
+            temporary.write_text(json.dumps(index, indent=2), encoding="utf-8")
+            os.replace(temporary, self.index_path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _upsert_index(self, metadata: SessionMetadata) -> None:
-        index = self._read_index()
-        sessions = [item for item in index.get("sessions", []) if item["session_id"] != metadata.session_id]
-        sessions.append(asdict(metadata))
-        index["sessions"] = sorted(sessions, key=lambda item: item["updated_at"], reverse=True)
-        self._write_index(index)
+        self.index_path.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(self.index_lock_path), timeout=30):
+            index = self._read_index()
+            sessions = [
+                item
+                for item in index.get("sessions", [])
+                if item["session_id"] != metadata.session_id
+            ]
+            sessions.append(asdict(metadata))
+            index["sessions"] = sorted(
+                sessions, key=lambda item: item["updated_at"], reverse=True
+            )
+            self._write_index(index)
 
 
 class SessionLogger:
@@ -795,7 +818,17 @@ def sanitize_payload(value: Any) -> Any:
     if isinstance(value, ContextPack):
         return sanitize_payload(value.to_dict())
     if isinstance(value, dict):
-        return {str(key): sanitize_payload(item) for key, item in value.items()}
+        secret_keys = {
+            "access_token", "api_key", "apikey", "authorization", "client_secret",
+            "credential", "credentials", "password", "private_key", "refresh_token",
+            "secret", "secret_key", "token",
+        }
+        return {
+            str(key): "[REDACTED]"
+            if str(key).lower().replace("-", "_") in secret_keys
+            else sanitize_payload(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [sanitize_payload(item) for item in value]
     if isinstance(value, tuple):

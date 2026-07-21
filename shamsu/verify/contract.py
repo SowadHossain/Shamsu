@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable
 
 from shamsu.safety import read_only
@@ -36,7 +37,7 @@ from shamsu.safety import read_only
 # the contract then fails a perfectly good run because a phantom file was never
 # written. Real extensions do not look like that; sentence boundaries do.
 _FILE_TOKEN_RE = re.compile(
-    r"[\w][\w./\\-]*\.(?:[a-z0-9_]{1,12}|[A-Z0-9_]{1,12})\b"
+    r"(?:[A-Za-z]:[\\/])?[\w][\w./\\-]*\.(?:[a-z0-9_]{1,12}|[A-Z0-9_]{1,12})\b"
 )
 # Extensionless dotfiles, which the pattern above cannot match (`.gitignore` is
 # a dot plus a name, with no trailing `.ext`). A NAMED allowlist rather than a
@@ -48,10 +49,16 @@ _DOTFILE_RE = re.compile(
     r"npmrc|nvmrc|prettierrc|eslintrc|babelrc)\b",
     re.IGNORECASE,
 )
+_NAMED_DIRECTORY_RE = re.compile(
+    r"\b(?:new\s+)?(?:folder|directory)\s+(?:named|called)\s+"
+    r"(?P<path>[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)",
+    re.IGNORECASE,
+)
 # Verbs that make a named file the TARGET of the request rather than a
 # reference to read. "explain qa_probe.py" names a file but requests no change.
 _WRITE_VERB_RE = re.compile(
-    r"\b(creat|writ|sav|add|generat|mak|edit|updat|modif|chang|fix|delet|remov|renam|mov)"
+    r"\b(creat|writ|sav|add|generat|mak|edit|updat|modif|chang|fix|delet|remov|renam|mov|"
+    r"build|implement|scaffold|seed)"
     r"(?:e|es|ed|ing)?\b",
     re.IGNORECASE,
 )
@@ -142,7 +149,17 @@ def _is_source_reference(text: str, token_start: int, candidate: str) -> bool:
     return bool(_SOURCE_PREPOSITION_RE.search(preceding))
 
 
-def requested_paths(prompt: str) -> tuple[str, ...]:
+def _requested_path(candidate: str, workspace: Path | None) -> str:
+    candidate_path = Path(candidate)
+    if workspace is not None and candidate_path.is_absolute():
+        try:
+            return candidate_path.resolve().relative_to(Path(workspace).resolve()).as_posix()
+        except ValueError:
+            pass
+    return _strip_leading_dot_slash(candidate.replace("\\", "/"))
+
+
+def requested_paths(prompt: str, workspace: Path | None = None) -> tuple[str, ...]:
     """Files the prompt asks to be created or changed, in order of appearance.
 
     Read-only clauses are masked first: "do not modify any other files" must
@@ -155,10 +172,14 @@ def requested_paths(prompt: str) -> tuple[str, ...]:
     if not _WRITE_VERB_RE.search(text):
         return ()
     spans: list[tuple[int, str]] = [
-        (match.start(), _strip_leading_dot_slash(match.group(0).replace("\\", "/")))
+        (match.start(), _requested_path(match.group(0), workspace))
         for match in _FILE_TOKEN_RE.finditer(text)
     ]
     spans.extend((match.start(), match.group(0)) for match in _DOTFILE_RE.finditer(text))
+    spans.extend(
+        (match.start("path"), _requested_path(match.group("path").rstrip("."), workspace))
+        for match in _NAMED_DIRECTORY_RE.finditer(text)
+    )
     seen: list[str] = []
     for position, candidate in sorted(spans):
         if candidate in seen or _is_source_reference(text, position, candidate):
@@ -167,12 +188,14 @@ def requested_paths(prompt: str) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def derive(prompt: str, *, dry_run: bool = False) -> RunContract:
+def derive(
+    prompt: str, *, dry_run: bool = False, workspace: Path | None = None
+) -> RunContract:
     """Read the prompt's checkable promises. Never touches the model."""
     return RunContract(
         read_only=read_only.applies(prompt),
         scoped_read_only=read_only.is_scoped(prompt),
-        requested_paths=requested_paths(prompt),
+        requested_paths=requested_paths(prompt, workspace),
         dry_run=bool(dry_run),
     )
 
@@ -182,6 +205,7 @@ def check(
     *,
     changed_files: Iterable[dict[str, str]],
     planned_mutations: Iterable[dict[str, Any]] = (),
+    outcome: str = "",
 ) -> ContractResult:
     """Compare the contract against what the filesystem shows actually happened.
 
@@ -193,6 +217,17 @@ def check(
     changed_paths.discard("")
     wanted = {_normalize(path) for path in contract.requested_paths}
     planned = [dict(entry) for entry in planned_mutations]
+    planned_paths = {
+        _normalize(str(entry.get("path") or entry.get("filepath") or ""))
+        for entry in planned
+    }
+    planned_paths.discard("")
+
+    def within(path: str, scope: str) -> bool:
+        return path == scope or path.startswith(scope.rstrip("/") + "/")
+
+    def covered(scope: str, paths: set[str]) -> bool:
+        return any(within(path, scope) for path in paths)
 
     checks: list[dict[str, Any]] = []
     violations: list[str] = []
@@ -230,9 +265,25 @@ def check(
             if planned
             else "the prompt asked for a file change but the dry run planned none",
         )
+        if wanted and planned:
+            unexpected = sorted(
+                path for path in planned_paths if not any(within(path, scope) for scope in wanted)
+            )
+            missing = sorted(scope for scope in wanted if not covered(scope, planned_paths))
+            record(
+                "dry_run_planned_requested_paths",
+                not unexpected and not missing,
+                "planned paths match the request"
+                if not unexpected and not missing
+                else "planned paths drifted from the request"
+                + (f"; unexpected: {', '.join(unexpected)}" if unexpected else "")
+                + (f"; missing: {', '.join(missing)}" if missing else ""),
+            )
 
     if contract.scoped_read_only and wanted:
-        collateral = sorted(changed_paths - wanted)
+        collateral = sorted(
+            path for path in changed_paths if not any(within(path, scope) for scope in wanted)
+        )
         record(
             "only_requested_files_changed",
             not collateral,
@@ -242,8 +293,15 @@ def check(
             + " but these also changed: " + ", ".join(collateral),
         )
 
-    if wanted and not contract.read_only and not contract.dry_run:
-        missing = sorted(wanted - changed_paths)
+    terminal_without_execution = outcome in {
+        "denied",
+        "cancelled",
+        "timed_out",
+        "needs_input",
+        "failed",
+    }
+    if wanted and not contract.read_only and not contract.dry_run and not terminal_without_execution:
+        missing = sorted(scope for scope in wanted if not covered(scope, changed_paths))
         record(
             "requested_files_were_written",
             not missing,

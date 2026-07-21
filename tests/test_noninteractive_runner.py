@@ -146,6 +146,77 @@ async def test_headless_runner_reports_a_request_timeout(tmp_path: Path, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_agent_model_timeout_is_a_timed_out_run(tmp_path: Path, monkeypatch):
+    import shamsu.cli.repl as repl
+    from shamsu.agents.chat_loop import AgentLoopResult
+
+    class TimedOutAgent:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def run(self, _prompt):
+            return AgentLoopResult(
+                final="The model timed out.",
+                stopped=True,
+                timeout_category="llm_no_first_token_timeout",
+            )
+
+    monkeypatch.setattr(repl, "AgentChatLoop", TimedOutAgent)
+
+    result = await run_prompt(tmp_path, "Create timed-out.txt with hello", approval="allow")
+
+    assert result.status == "timed_out"
+    assert result.contract["ok"] is True
+    assert result.changed_files == []
+
+
+@pytest.mark.asyncio
+async def test_summary_indexes_route_tools_context_and_output(tmp_path: Path):
+    result = await run_prompt(tmp_path, "what folder are you in?")
+
+    summary = json.loads(Path(result.artifacts["summary"]).read_text(encoding="utf-8"))
+
+    assert summary["route"] == "workspace.location"
+    assert summary["tools"] == []
+    assert summary["changed_files"] == []
+    assert summary["artifacts"]["contexts"] == "contexts/"
+    assert summary["artifacts"]["final_output"] == "final-output.md"
+
+
+def test_nested_pipeline_approvals_are_projected_into_headless_result():
+    from shamsu.cli.noninteractive import _merge_approval_records
+
+    events = [
+        {
+            "type": "approval_granted",
+            "request": {
+                "action_type": "run_command",
+                "description": "Run migrations",
+            },
+            "action_type": "run_command",
+            "decision_scope": "once",
+            "decision_source": "approval_callback",
+        }
+    ]
+
+    records = _merge_approval_records([], events)
+
+    assert records == [
+        {
+            "request": {
+                "action_type": "run_command",
+                "description": "Run migrations",
+            },
+            "action_type": "run_command",
+            "description": "Run migrations",
+            "approved": True,
+            "decision_scope": "once",
+            "source": "approval_callback",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_headless_runner_flushes_memory_queue_on_exit(tmp_path: Path, monkeypatch):
     import shamsu.cli.noninteractive as noninteractive
 

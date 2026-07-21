@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.cli.repl import _web_search_query
 from shamsu.tools.agent_tools import AgentToolRegistry
 
 
@@ -75,6 +76,15 @@ def test_web_search_returns_budgetable_hits(tmp_path: Path):
     assert result.ok
     assert fake.searches == ["flask jwt"]
     assert result.data["results"][0]["url"] == "https://example.com/jwt"
+
+
+def test_web_instruction_is_rewritten_to_a_search_subject():
+    prompt = (
+        "Use web search to find the current official Python stable release version, "
+        "cite where you got it from, and do not modify files."
+    )
+
+    assert _web_search_query(prompt) == "current official Python stable release version"
 
 
 def test_web_search_denial_is_an_honest_failure(tmp_path: Path):

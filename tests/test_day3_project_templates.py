@@ -4,6 +4,7 @@ import ast
 
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.prd.project import build_project_spec
+from shamsu.templates.django.frontend import render_django_test_files
 from shamsu.templates.django.renderer import render_fixed_django_files, render_template
 from shamsu.types import ParsedPRD
 
@@ -137,3 +138,7 @@ def test_resource_list_templates_use_consistent_urls_fields_and_htmx(tmp_path):
     assert 'hx-target="#task-{{ object.id }}"' in item_html
     assert 'hx-swap="outerHTML"' in item_html
     assert 'class="btn btn-error btn-sm"' in item_html
+
+    generated_tests = render_django_test_files(spec)["app/tests.py"]
+    assert "def test_root_route_is_available" in generated_tests
+    assert "self.client.get(reverse('home'))" in generated_tests

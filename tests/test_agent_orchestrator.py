@@ -73,6 +73,31 @@ def test_mention_resolver_reads_file_inside_workspace(tmp_path):
     assert "This is the project" in context.content
 
 
+def test_orchestrator_adds_plain_filename_context_for_questions(tmp_path):
+    (tmp_path / "qa_probe.py").write_text(
+        "def add(a, b):\n    return a + b\n",
+        encoding="utf-8",
+    )
+
+    result = AgentOrchestrator(tmp_path).run(
+        "What does qa_probe.py do? Do not change files."
+    )
+
+    assert result.handled is False
+    assert "# @qa_probe.py (file)" in result.context
+    assert "def add(a, b)" in result.context
+
+
+def test_orchestrator_deduplicates_at_and_plain_filename_context(tmp_path):
+    (tmp_path / "qa_probe.py").write_text("print(5)\n", encoding="utf-8")
+
+    result = AgentOrchestrator(tmp_path).run(
+        "Using @qa_probe.py, tell me what qa_probe.py does."
+    )
+
+    assert result.context.count("# @qa_probe.py (file)") == 1
+
+
 def test_mention_resolver_reads_quoted_path_with_spaces(tmp_path):
     docs = tmp_path / "agent context"
     docs.mkdir()

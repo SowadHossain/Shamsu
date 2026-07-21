@@ -74,6 +74,64 @@ def test_do_not_modify_any_OTHER_files_is_a_carve_out_not_a_ban():
     assert "modify" not in read_only.strip(CREATE_FILE_PROMPT).lower()
 
 
+def test_do_not_modify_anything_else_is_also_a_scoped_carve_out():
+    prompt = "Create notes.md with hello. Do not modify anything else."
+
+    assert read_only.is_scoped(prompt) is True
+    assert read_only.applies(prompt) is False
+
+
+def test_agent_safety_uses_current_request_not_augmented_context():
+    class FakeTools:
+        def __init__(self):
+            self.user_request = ""
+            self.read_only = False
+            self.allowed = None
+
+        def set_user_request(self, value):
+            self.user_request = value
+
+        def set_read_only(self, value):
+            self.read_only = value
+
+        def set_allowed_write_paths(self, value):
+            self.allowed = tuple(value)
+
+    tools = FakeTools()
+    current = "Create mcp-smoke.txt with hello."
+    augmented = current + "\n\nEarlier context: Do not modify any files."
+
+    repl._configure_agent_request_safety(tools, current)
+
+    assert read_only.applies(augmented) is True
+    assert tools.user_request == current
+    assert tools.read_only is False
+
+
+def test_agent_safety_scopes_anything_else_to_requested_file():
+    class FakeTools:
+        def __init__(self):
+            self.read_only = False
+            self.allowed = None
+
+        def set_user_request(self, _value):
+            pass
+
+        def set_read_only(self, value):
+            self.read_only = value
+
+        def set_allowed_write_paths(self, value):
+            self.allowed = tuple(value)
+
+    tools = FakeTools()
+    repl._configure_agent_request_safety(
+        tools, "Create notes.md with hello. Do not modify anything else."
+    )
+
+    assert tools.read_only is False
+    assert tools.allowed == ("notes.md",)
+
+
 def test_read_only_clause_does_not_create_a_write_route(prd_workspace: Path):
     """Measured live: this prompt matched NO route without its final sentence
     and `file.write` with it. The clause was the entire cause of the route."""
@@ -239,6 +297,12 @@ def test_use_web_search_actually_routes_to_web(prd_workspace: Path):
     assert repl._matching_route_labels(WEB_PROMPT, prd_workspace) == ["web"]
 
 
+def test_explicit_mcp_request_reaches_the_tool_calling_agent(prd_workspace: Path):
+    prompt = "Use the external MCP filesystem server to list the workspace root."
+
+    assert repl._classify_route_label(prompt, prd_workspace) == "mcp"
+
+
 @pytest.mark.parametrize("prompt", [
     "look up the django auth docs",
     "search online for the colyseus changelog",
@@ -264,6 +328,31 @@ def test_headless_dispatches_read_only_inspection_commands():
 
     assert "run" in _HEADLESS_COMMAND_HANDLERS
     assert "runs" in _HEADLESS_COMMAND_HANDLERS
+    assert "mcp" in _HEADLESS_COMMAND_HANDLERS
+
+
+def test_headless_dispatches_mcp_status(tmp_path: Path):
+    from rich.console import Console
+
+    from shamsu.cli.noninteractive import _dispatch_slash_command
+
+    console = Console(record=True)
+    handled, refusal = _dispatch_slash_command("mcp status", tmp_path, console)
+
+    assert handled is True
+    assert refusal == ""
+    assert "No MCP servers configured" in console.export_text()
+
+
+def test_headless_refuses_mutating_mcp_admin_commands(tmp_path: Path):
+    from rich.console import Console
+
+    from shamsu.cli.noninteractive import _dispatch_slash_command
+
+    handled, refusal = _dispatch_slash_command("mcp auth logout server", tmp_path, Console())
+
+    assert handled is False
+    assert "not available in headless mode" in refusal
 
 
 def test_headless_refuses_unsupported_slash_commands_instead_of_guessing(tmp_path: Path):

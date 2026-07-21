@@ -12,11 +12,12 @@ from collections.abc import Iterable
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.mcp.manager import MCPManager, get_shared_mcp_manager, summarize_mcp_result
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
-from shamsu.safety.commands import command_may_write_workspace
+from shamsu.safety.commands import command_may_write_workspace, redact
 from shamsu.safety.dry_run import DryRunRecorder
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
@@ -69,6 +70,31 @@ _READABLE_FILENAMES = frozenset({"Dockerfile", "Makefile", ".gitignore", ".env",
 # Max characters returned for a whole-file read before truncation kicks in.
 MAX_READ_CHARS = 6000
 
+_MCP_PATH_ARGUMENTS = frozenset(
+    {
+        "path",
+        "filepath",
+        "file",
+        "source",
+        "destination",
+        "target",
+        "directory",
+        "dir",
+    }
+)
+
+
+def _mcp_mutation_paths(arguments: dict[str, Any]) -> list[str]:
+    """Extract explicit paths from a mutating MCP call for scope enforcement."""
+    paths: list[str] = []
+    for key, value in arguments.items():
+        normalized_key = re.sub(r"[_-]", "", str(key)).lower()
+        if normalized_key not in _MCP_PATH_ARGUMENTS:
+            continue
+        values = value if isinstance(value, list) else [value]
+        paths.extend(str(item) for item in values if isinstance(item, (str, Path)) and str(item))
+    return paths
+
 
 @dataclass(frozen=True)
 class ToolResult:
@@ -92,6 +118,7 @@ class AgentToolRegistry:
         approval_manager: ApprovalManager | None = None,
         action_ledger: ActionLedger | None = None,
         web_tool: Any | None = None,
+        mcp_manager: MCPManager | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -116,6 +143,9 @@ class AgentToolRegistry:
         # the loop had no way to look anything up mid-task - web was a separate
         # pre-routed path decided before the agent ever started).
         self._web_tool = web_tool
+        self._mcp = mcp_manager or get_shared_mcp_manager(
+            self.workspace_root, session_logger=session_logger
+        )
 
         # Git commands run through the same CommandRunner so command safety,
         # approval, logging, timeout handling, and diagnostics still apply.
@@ -141,6 +171,7 @@ class AgentToolRegistry:
         # everything else is denied - which is exactly what the user said.
         self._allowed_write_paths: set[str] | None = None
         self._user_request = ""
+        self._required_tool_prefix = ""
 
     def set_read_only(self, read_only: bool) -> None:
         self._read_only = bool(read_only)
@@ -158,12 +189,23 @@ class AgentToolRegistry:
     def set_user_request(self, request: str) -> None:
         self._user_request = str(request or "")
 
+    def require_tool_prefix(self, prefix: str | None) -> None:
+        """Prevent an explicit tool request from being replaced by a shell guess."""
+        self._required_tool_prefix = str(prefix or "")
+
     def _outside_allowed_scope(self, path: str) -> ToolResult | None:
         allowed = self._allowed_write_paths
         if allowed is None:
             return None
-        normalized = (_normalize_workspace_path(path) or path).lower()
-        if normalized in allowed:
+        clean = _normalize_workspace_path(path) or path
+        try:
+            normalized = self.sandbox.validate(clean).relative_to(self.workspace_root).as_posix().lower()
+        except (SecurityError, ValueError):
+            normalized = clean.lower()
+        if any(
+            normalized == item or normalized.startswith(item.rstrip("/") + "/")
+            for item in allowed
+        ):
             return None
         return ToolResult(
             False,
@@ -200,7 +242,7 @@ class AgentToolRegistry:
         )
 
     def tool_schemas(self) -> list[dict[str, Any]]:
-        return [
+        local_schemas = [
             _tool_schema(
                 "list_files",
                 "List files and folders inside the workspace.",
@@ -638,9 +680,27 @@ class AgentToolRegistry:
                 required=["question"],
             ),
         ]
+        return local_schemas + self._mcp.tool_schemas()
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         try:
+            if (
+                self._required_tool_prefix
+                and not name.startswith(self._required_tool_prefix)
+                and name != "ask_user"
+            ):
+                return ToolResult(
+                    False,
+                    f"This request explicitly requires a {self._required_tool_prefix} tool. "
+                    f"Do not substitute {name}; call one of the registered "
+                    f"{self._required_tool_prefix} tools.",
+                    {
+                        "required_tool_prefix": self._required_tool_prefix,
+                        "blocked_tool": name,
+                    },
+                )
+            if name.startswith("mcp__"):
+                return self._execute_mcp(name, arguments)
             if name == "list_files":
                 return self.list_files(str(arguments.get("path") or "."))
             if name == "read_file":
@@ -869,6 +929,190 @@ class AgentToolRegistry:
                     "traceback_path": traceback_path,
                 },
             )
+
+    def _execute_mcp(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        tool = self._mcp.get_tool(name)
+        if tool is None:
+            return ToolResult(False, f"Unknown MCP tool: {name}", {"tool": name})
+        arguments = dict(arguments)
+        # Small models commonly express "the workspace root" as POSIX `/`.
+        # On Windows the filesystem MCP resolves that to the drive root, which
+        # is outside the advertised MCP Root. Keep the call inside SHAMSU's
+        # sandbox by resolving only this unambiguous shorthand.
+        if str(arguments.get("path", "")).strip() in {"/", "\\"}:
+            arguments["path"] = str(self.workspace_root)
+        config = self._mcp.config.servers[tool.server]
+        effective_read_only = tool.name in config.read_only_tools or (
+            config.trust_tool_annotations and tool.read_only
+        )
+        permission = config.tool_permissions.get(
+            tool.name, config.tool_permissions.get(name, "ask")
+        )
+        metadata = {
+            "mcp_server": tool.server,
+            "mcp_tool": tool.name,
+            "transport": config.transport,
+            "read_only": effective_read_only,
+            "server_read_only_hint": tool.read_only,
+            "destructive": tool.destructive,
+            "effective_arguments": arguments,
+        }
+        if permission == "deny":
+            return ToolResult(
+                False,
+                f"MCP tool {tool.server}/{tool.name} is denied by configuration.",
+                {**metadata, "permission": "deny"},
+            )
+        if self._read_only and not effective_read_only:
+            return ToolResult(
+                False,
+                f"Refused MCP tool {tool.server}/{tool.name}: this request said not to make "
+                "changes, and the tool is not configured as trusted read-only.",
+                {**metadata, "read_only_request": True},
+            )
+        if self._allowed_write_paths is not None and not effective_read_only:
+            scoped_paths = _mcp_mutation_paths(arguments)
+            if not scoped_paths:
+                return ToolResult(
+                    False,
+                    f"Refused MCP tool {tool.server}/{tool.name}: this request limits file "
+                    "changes, but SHAMSU could not prove which path the external tool would touch.",
+                    {
+                        **metadata,
+                        "scoped_read_only": True,
+                        "allowed": sorted(self._allowed_write_paths),
+                    },
+                )
+            for scoped_path in scoped_paths:
+                outside = self._outside_allowed_scope(scoped_path)
+                if outside is not None:
+                    return ToolResult(False, outside.message, {**metadata, **outside.data})
+        if self._dry_run is not None and not effective_read_only:
+            self._dry_run.record(
+                "call_mcp_tool",
+                f"{tool.server}/{tool.name}",
+                detail=redact(json.dumps(arguments, ensure_ascii=True, default=str)),
+            )
+            return ToolResult(
+                True,
+                f"[dry run] Would call MCP tool {tool.server}/{tool.name}. Nothing was sent.",
+                {**metadata, "dry_run": True},
+            )
+
+        needs_approval = permission != "allow" and (
+            config.approval == "always"
+            or (config.approval == "writes" and not effective_read_only)
+        )
+        if needs_approval:
+            preview = redact(json.dumps(arguments, ensure_ascii=True, default=str))
+            approved = self.approval_manager.ask(
+                ApprovalRequest(
+                    action_type="mcp_tool",
+                    description=f"Call external MCP tool {tool.server}/{tool.name}",
+                    risk_level="high" if tool.destructive else "medium",
+                    preview=preview[:3000],
+                    reason=(
+                        "This sends data to an external MCP server and may change external state."
+                        if not effective_read_only
+                        else "This sends a query to an external MCP server."
+                    ),
+                )
+            )
+            if not approved:
+                return ToolResult(
+                    False,
+                    f"MCP tool call denied by user: {tool.server}/{tool.name}",
+                    {**metadata, "approval": "denied"},
+                )
+        transaction_id = ""
+        local_paths: list[str] = []
+        if not effective_read_only:
+            for candidate in _mcp_mutation_paths(arguments):
+                try:
+                    relative = (
+                        self.sandbox.validate(candidate)
+                        .relative_to(self.workspace_root)
+                        .as_posix()
+                    )
+                except (SecurityError, ValueError):
+                    continue
+                if relative not in local_paths:
+                    local_paths.append(relative)
+            if local_paths:
+                operations = [
+                    {"op": "mcp_tool", "path": path, "tool": name}
+                    for path in local_paths
+                ]
+                transaction_id = self.transactions.begin(
+                    f"External MCP tool {tool.server}/{tool.name}",
+                    operations,
+                    destructive=bool(tool.destructive),
+                )
+                for path in local_paths:
+                    self.transactions.backup_file(transaction_id, path)
+                if self.action_ledger:
+                    self.action_ledger.log_mutation_started(
+                        transaction_id,
+                        f"External MCP tool {tool.server}/{tool.name}",
+                    )
+        try:
+            raw = self._mcp.call(name, arguments)
+        except Exception as exc:
+            if transaction_id:
+                manifest = self.transactions.finalize(transaction_id, "failed", str(exc))
+                if self.action_ledger:
+                    self.action_ledger.log_mutation_finished(
+                        transaction_id,
+                        "failed",
+                        touched_files=local_paths,
+                        rollback_available=bool(manifest.get("backups")),
+                        error=str(exc),
+                        operations=list(manifest.get("operations", [])),
+                        before_hashes=dict(manifest.get("before_hashes", {})),
+                        after_hashes=dict(manifest.get("after_hashes", {})),
+                        backups=dict(manifest.get("backups", {})),
+                    )
+            return ToolResult(
+                False,
+                f"MCP tool {tool.server}/{tool.name} failed: {exc}",
+                {**metadata, "exception_class": exc.__class__.__name__},
+            )
+        message, data = summarize_mcp_result(raw)
+        is_error = bool(data.get("is_error"))
+        if transaction_id:
+            for path in local_paths:
+                self.transactions.record_after(transaction_id, path)
+            status = "failed" if is_error else "applied"
+            manifest = self.transactions.finalize(
+                transaction_id,
+                status,
+                message if is_error else "",
+            )
+            rollback_available = bool(local_paths)
+            if self.action_ledger:
+                self.action_ledger.log_mutation_finished(
+                    transaction_id,
+                    status,
+                    touched_files=local_paths,
+                    rollback_available=rollback_available,
+                    error=message if is_error else "",
+                    operations=list(manifest.get("operations", [])),
+                    before_hashes=dict(manifest.get("before_hashes", {})),
+                    after_hashes=dict(manifest.get("after_hashes", {})),
+                    backups=dict(manifest.get("backups", {})),
+                )
+            metadata.update(
+                {
+                    "transaction_id": transaction_id,
+                    "touched_files": local_paths,
+                    "rollback_available": rollback_available,
+                }
+            )
+        return ToolResult(
+            not is_error,
+            message if message else f"MCP tool {tool.server}/{tool.name} completed.",
+            {**metadata, **data},
+        )
 
     def list_files(self, path: str = ".") -> ToolResult:
         target = self.sandbox.validate(path)

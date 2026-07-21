@@ -245,6 +245,10 @@ def _test_case_block(entity: EntitySpec, entities: list[EntitySpec]) -> list[str
 def _authentication_test_block() -> list[str]:
     return [
         "class AuthenticationTests(TestCase):",
+        "    def test_root_route_is_available(self):",
+        "        response = self.client.get(reverse('home'))",
+        "        self.assertIn(response.status_code, (200, 302))",
+        "",
         "    def test_registration_hashes_password_and_normalizes_email(self):",
         "        response = self.client.post(reverse('register'), data={",
         "            'full_name': 'Example User',",

@@ -13,17 +13,22 @@ from __future__ import annotations
 
 import asyncio
 from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from shamsu.cli.repl import (
+    _append_demo_login_docs,
     _extract_dev_command,
     _looks_like_dev_server_failure,
     _looks_like_dev_server_prompt,
     _bugfix_request_has_actionable_target,
     _looks_like_prd_build_request,
     _looks_like_prd_context_question,
+    _requests_demo_login,
+    _seed_django_demo_login,
 )
 
 
@@ -43,6 +48,46 @@ def test_prd_build_request_detected_with_pdf_mention(tmp_path):
 
 def test_prd_build_request_not_triggered_without_prd(tmp_path):
     assert not _looks_like_prd_build_request("build the navbar", tmp_path)
+
+
+def test_demo_login_is_seeded_only_when_requested_for_an_auth_project():
+    auth_project = SimpleNamespace(
+        pages=[SimpleNamespace(page_type="auth", name="Login")]
+    )
+    plain_project = SimpleNamespace(
+        pages=[SimpleNamespace(page_type="dashboard", name="Dashboard")]
+    )
+
+    assert _requests_demo_login("seed demo data so I can log in", auth_project)
+    assert not _requests_demo_login("build the project", auth_project)
+    assert not _requests_demo_login("seed demo data", plain_project)
+
+
+def test_demo_login_seed_command_and_docs_are_deterministic(tmp_path: Path):
+    class FakeRunner:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, command, cwd):
+            self.calls.append((command, cwd))
+            return 0, "", ""
+
+    runner = FakeRunner()
+    (tmp_path / "README.md").write_text("# App\n", encoding="utf-8")
+    (tmp_path / "SHAMSU_SUMMARY.md").write_text("# Summary\n", encoding="utf-8")
+
+    ok, error = _seed_django_demo_login(tmp_path, runner)
+    _append_demo_login_docs(tmp_path, "demo@example.com", "ShamsuDemo123!")
+    _append_demo_login_docs(tmp_path, "demo@example.com", "ShamsuDemo123!")
+
+    assert ok is True
+    assert error == ""
+    assert runner.calls[0][1] == tmp_path
+    assert "manage.py shell -c" in runner.calls[0][0]
+    assert "set_password('ShamsuDemo123!')" in runner.calls[0][0]
+    readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert readme.count("## Demo Login") == 1
+    assert "demo@example.com" in readme
 
 
 def test_prd_build_request_does_not_hijack_unrelated_game_request_with_single_prd(tmp_path):

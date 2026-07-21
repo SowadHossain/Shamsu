@@ -220,6 +220,15 @@ def render_views(project: ProjectSpec) -> str:
 
 def render_app_urls(project: ProjectSpec) -> str:
     entities = _business_entities(project)
+    landing_page = next(
+        (
+            page
+            for page in project.pages
+            if "landing" in page.name.casefold() or _page_route(page) == "landing-page/"
+        ),
+        None,
+    )
+    root_view = _page_function_name(landing_page) if landing_page else "dashboard"
     blocks = [
         "from django.contrib.auth import views as auth_views",
         "from django.urls import include, path",
@@ -238,6 +247,7 @@ def render_app_urls(project: ProjectSpec) -> str:
         [
             "",
             "urlpatterns = [",
+            f'    path("", views.{root_view}, name="home"),',
             '    path("api/", include((router.urls, "api"), namespace="api")),',
         ]
     )

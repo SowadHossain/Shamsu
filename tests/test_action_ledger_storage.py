@@ -70,6 +70,31 @@ def test_finish_writes_summary_json(tmp_path: Path):
     assert summary["final_output_preview"] == "All done."
 
 
+def test_summary_resolves_action_type_from_nested_approval_request(tmp_path: Path):
+    ledger = start_run(tmp_path, "build it")
+    ledger.log_event(
+        "approval_request",
+        request={"action_type": "file_write", "target_paths": ["app.py"]},
+    )
+    ledger.log_event(
+        "approval_granted",
+        request={"action_type": "file_write", "target_paths": ["app.py"]},
+        action_type="file_write",
+        approved=True,
+        decision_scope="once",
+        decision_source="approval_callback",
+    )
+
+    summary = ledger.finish("done")
+
+    assert [item["action_type"] for item in summary["approvals"]] == [
+        "file_write",
+        "file_write",
+    ]
+    assert summary["approvals"][0]["approved"] is None
+    assert summary["approvals"][1]["approved"] is True
+
+
 def test_run_ids_are_unique_and_sortable():
     from datetime import datetime, timedelta, timezone
 

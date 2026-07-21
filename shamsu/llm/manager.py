@@ -32,6 +32,7 @@ import httpx
 from json_repair import repair_json
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.action_ledger.redaction import redact_text
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import ILLMManager
 from shamsu.memory.service import MemoryService
@@ -881,6 +882,7 @@ def _context_preview(pack: ContextPack, workspace: Path | None = None) -> dict:
                 "inclusion_reason": "retrieval_result",
                 "content_sha256": hashlib.sha256(item.content.encode("utf-8")).hexdigest(),
                 "file_mtime": mtime,
+                "content_preview": redact_text(item.content)[:4000],
             }
         )
     index_metadata: dict = {}
@@ -900,8 +902,17 @@ def _context_preview(pack: ContextPack, workspace: Path | None = None) -> dict:
         "prompt_sha256": hashlib.sha256(pack.user_request.encode("utf-8")).hexdigest(),
         "system_prompt_version": "specialist-pack-v1",
         "snippets": snippets,
+        "context": {
+            "user_request": redact_text(pack.user_request)[:8000],
+            "prd_context": redact_text(pack.prd_context)[:16000],
+            "error_context": redact_text(pack.error_context)[:8000],
+        },
         "code_memory_index": index_metadata,
-        "omitted_context": {},
+        "omitted_context": {
+            "user_request_chars": max(0, len(pack.user_request) - 8000),
+            "prd_context_chars": max(0, len(pack.prd_context) - 16000),
+            "error_context_chars": max(0, len(pack.error_context) - 8000),
+        },
     }
 
 

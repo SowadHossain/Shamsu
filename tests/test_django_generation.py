@@ -41,9 +41,25 @@ def test_backend_generators_create_valid_todo_backend_files():
     assert "class TaskForm(forms.ModelForm):" in files["app/forms.py"]
     assert "class TaskViewSet(ModelViewSet):" in files["app/views.py"]
     assert 'router.register("tasks", views.TaskViewSet' in files["app/urls.py"]
+    assert 'path("", views.dashboard, name="home")' in files["app/urls.py"]
     assert "admin.site.register(Task)" in files["app/admin.py"]
     for path, content in files.items():
         ast.parse(content, filename=path)
+
+
+def test_backend_urls_route_root_to_named_landing_page():
+    project = _spec(
+        "# Todo App\n\n"
+        "## Entities\n"
+        "- Task: title (text), user (FK to User)\n\n"
+        "## Pages\n"
+        "- Landing Page: product overview\n"
+        "- Dashboard: task stats\n"
+    )
+
+    urls = render_backend_django_files(project)["app/urls.py"]
+
+    assert 'path("", views.landing_page, name="home")' in urls
 
 
 def test_backend_generators_cover_expense_and_blog_relationships():

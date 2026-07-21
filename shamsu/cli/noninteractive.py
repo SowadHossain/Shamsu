@@ -79,6 +79,7 @@ _HEADLESS_COMMAND_HANDLERS: dict[str, str] = {
     "doctor": "_handle_doctor",
     "tasks": "_handle_tasks",
     "permissions": "_handle_permissions",
+    "mcp": "_handle_mcp_inspection",
 }
 
 
@@ -96,10 +97,22 @@ def _dispatch_slash_command(
             + ", ".join(f"/{item}" for item in sorted(_HEADLESS_COMMAND_HANDLERS))
             + ". Use the interactive REPL for the rest."
         )
-    handler = getattr(repl, handler_name)
+    if handler_name == "_handle_mcp_inspection":
+        parts = normalized.split()
+        subcommand = parts[1].lower() if len(parts) > 1 else "status"
+        if subcommand not in {"status", "list", "servers", "test", "tools", "config"}:
+            return False, (
+                f"/mcp {subcommand} is not available in headless mode. "
+                "Supported here: /mcp status, /mcp servers, /mcp tools [server], /mcp config."
+            )
+        from shamsu.mcp.cli import handle_mcp_command
+
+        handle_mcp_command(normalized, workspace, console)
+    else:
+        handler = getattr(repl, handler_name)
     if handler_name == "_handle_doctor":
         handler(workspace, console)
-    else:
+    elif handler_name != "_handle_mcp_inspection":
         handler(normalized, workspace, console)
     return True, ""
 
@@ -278,9 +291,10 @@ async def run_prompt(
             browser_tool.close()
         changed_now = _changed_files(before, _workspace_snapshot(root))
         contract_now = run_contract.check(
-            run_contract.derive(clean_prompt, dry_run=dry_run),
+            run_contract.derive(clean_prompt, dry_run=dry_run, workspace=root),
             changed_files=changed_now,
             planned_mutations=recorder.as_dicts() if recorder is not None else [],
+            outcome=ledger.evidence_outcome(),
         )
         manifest_now = ledger_store.load_manifest(root, ledger.run_id) or {}
         if manifest_now.get("status") == "running":
@@ -370,6 +384,7 @@ def _build_result(
 ) -> HeadlessRunResult:
     manifest = ledger_store.load_manifest(workspace, run_id) or {}
     events = ledger_store.load_events(workspace, run_id)
+    approvals = _merge_approval_records(approvals, events)
     mutations = ledger_store.load_mutations(workspace, run_id)
     run_dir = ledger_store.runs_dir(workspace) / run_id
     artifact_paths = {
@@ -416,9 +431,10 @@ def _build_result(
     # itself - a run that reports success while changing the wrong files is
     # exactly what this is for.
     contract_result = run_contract.check(
-        run_contract.derive(prompt, dry_run=dry_run),
+        run_contract.derive(prompt, dry_run=dry_run, workspace=workspace),
         changed_files=changed,
         planned_mutations=planned_mutations,
+        outcome=result_status,
     )
     if result_status == "dry_run":
         # Report what the agent PLANNED, which is the question a dry run asks.
@@ -441,7 +457,7 @@ def _build_result(
         timeout_phase=timeout_phase,
         dry_run=dry_run,
         approvals=approvals,
-        planned_actions=[record["request"] for record in approvals],
+        planned_actions=[record.get("request", {}) for record in approvals],
         planned_mutations=planned_mutations,
         operations=operations,
         tool_calls=ledger_store.load_tool_calls(workspace, run_id),
@@ -454,6 +470,45 @@ def _build_result(
         run_validation=ledger_store.validate_run(workspace, run_id),
         contract=contract_result.to_dict(),
     )
+
+
+def _merge_approval_records(
+    callback_records: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Include approvals issued below the headless callback boundary."""
+    records = list(callback_records)
+    seen = {
+        (
+            str(record.get("action_type", "")),
+            str(record.get("description", "")),
+            bool(record.get("approved")),
+        )
+        for record in records
+    }
+    for event in events:
+        event_type = str(event.get("type", ""))
+        if event_type not in {"approval_granted", "approval_denied"}:
+            continue
+        request = event.get("request") if isinstance(event.get("request"), dict) else {}
+        action_type = str(event.get("action_type") or request.get("action_type", ""))
+        description = str(request.get("description", ""))
+        approved = event_type == "approval_granted"
+        key = (action_type, description, approved)
+        if key in seen:
+            continue
+        records.append(
+            {
+                "request": request,
+                "action_type": action_type,
+                "description": description,
+                "approved": approved,
+                "decision_scope": str(event.get("decision_scope", "")),
+                "source": str(event.get("decision_source", "ledger")),
+            }
+        )
+        seen.add(key)
+    return records
 
 
 def _workspace_snapshot(workspace: Path) -> dict[str, str]:

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from shamsu.abstract.service import AbstractService
 from shamsu.action_ledger.context import get_current_run
+from shamsu.agents.rewrite_fallback import mentioned_workspace_files
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
@@ -44,6 +45,7 @@ class AgentOrchestrator:
         memory = ConversationMemory.from_session(self.session_logger)
         effective_input = memory.resolve_followup(user_input)
         mentions = self.mention_resolver.resolve_all(effective_input)
+        mentions = self._add_plain_file_mentions(effective_input, mentions)
         context = render_mention_context(mentions)
         self._log_resolution(user_input, effective_input, mentions, context)
 
@@ -198,6 +200,27 @@ class AgentOrchestrator:
                 "Agent resolved prompt context",
                 workflow_id="agent",
             )
+
+    def _add_plain_file_mentions(
+        self,
+        effective_input: str,
+        mentions: list[MentionContext],
+    ) -> list[MentionContext]:
+        """Ground explicit filename questions even when the user skips @syntax."""
+        existing = {
+            item.path.as_posix()
+            for item in mentions
+            if item.path is not None
+        }
+        enriched = list(mentions)
+        for rel in mentioned_workspace_files(self.workspace_root, effective_input):
+            if rel in existing:
+                continue
+            context = self.mention_resolver.resolve(rel)
+            if context.path is not None:
+                existing.add(context.path.as_posix())
+            enriched.append(context)
+        return enriched
 
 
 def _agent_context(

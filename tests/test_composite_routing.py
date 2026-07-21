@@ -291,6 +291,41 @@ async def test_composite_dispatch_passes_ordered_plan_to_agent(tmp_path: Path, m
 
 
 @pytest.mark.asyncio
+async def test_direct_file_write_ignores_stale_memory_and_speculative_planner(
+    tmp_path: Path, monkeypatch
+):
+    captured: dict[str, object] = {}
+
+    class _Orchestrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, prompt):
+            return SimpleNamespace(handled=False, effective_input=prompt, context="", action="")
+
+    async def _fake_agent(*args, **kwargs):
+        captured.update(kwargs)
+        return AgentLoopResult(final="stopped", stopped=True)
+
+    monkeypatch.setattr(repl, "AgentOrchestrator", _Orchestrator)
+    monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent)
+
+    await repl._handle_request(
+        "Create exact-output.txt containing hello. Do not modify any other files.",
+        tmp_path,
+        Console(record=True),
+        object(),
+        object(),
+    )
+
+    assert captured["use_long_term_memory"] is False
+    assert captured["use_planner"] is False
+    assert captured["user_request"] == (
+        "Create exact-output.txt containing hello. Do not modify any other files."
+    )
+
+
+@pytest.mark.asyncio
 async def test_skipped_followup_finalizes_as_partial(tmp_path: Path, monkeypatch):
     ledger = start_run(tmp_path, "edit app.py then show the diff")
     set_current_run(ledger)
@@ -450,6 +485,53 @@ def test_composite_verify_infers_python_command_for_named_script(tmp_path: Path)
     assert repl._composite_verification_command(plan, plan.steps[1]) == "python calc.py"
     prompt = repl._composite_step_prompt(plan, plan.steps[1], [], "")
     assert "Do not modify any files while doing this." in prompt
+
+
+def test_composite_read_and_verify_accept_successful_mcp_read_evidence():
+    result = AgentLoopResult(final="Listed the directory.")
+
+    read_status, read_evidence = repl._composite_step_outcome(
+        SimpleNamespace(kind="read"),
+        result,
+        ["mcp__filesystem__list_directory"],
+        set(),
+    )
+    verify_status, verify_evidence = repl._composite_step_outcome(
+        SimpleNamespace(kind="verify"),
+        result,
+        ["mcp__filesystem__list_directory"],
+        set(),
+    )
+
+    assert read_status == "success"
+    assert verify_status == "success"
+    assert "tool:mcp__filesystem__list_directory" in read_evidence
+    assert "tool:mcp__filesystem__list_directory" in verify_evidence
+
+
+def test_composite_mutation_accepts_successful_mcp_write_evidence():
+    status, evidence = repl._composite_step_outcome(
+        SimpleNamespace(kind="mutation"),
+        AgentLoopResult(final="Wrote the file."),
+        ["mcp__filesystem__write_file"],
+        set(),
+    )
+
+    assert status == "success"
+    assert evidence == ["tool:mcp__filesystem__write_file"]
+
+
+def test_scoped_mcp_create_clause_remains_a_mutation(tmp_path: Path):
+    target = tmp_path / "mcp-smoke.txt"
+    prompt = (
+        f"Use the external MCP filesystem server to create {target} with hello. "
+        "Do not modify anything else. After it succeeds, report the exact MCP tool name."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.steps[0].kind == "mutation"
+    assert plan.steps[1].kind == "summarize"
 
 
 @pytest.mark.asyncio

@@ -703,6 +703,7 @@ class WebTool:
         self._provider_attempts = []
         try:
             hits, provider, fallback_used = self._run_provider_search(query, top_k)
+            hits = _rank_authoritative_hits(query, _dedupe_hits(hits))
             self.cache.record_hits(query, provider, hits)
             self._log(
                 "web.search.finished",
@@ -849,7 +850,7 @@ class WebTool:
         self._provider_attempts = []
         try:
             hits, provider, fallback_used = self._run_provider_search(query, search_top_k)
-            hits = _dedupe_hits(hits)
+            hits = _rank_authoritative_hits(query, _dedupe_hits(hits))
             self.cache.record_hits(query, provider, hits)
         except Exception as exc:
             message = str(exc)
@@ -1338,6 +1339,30 @@ def _score_text(query_words: set[str], title: str, text: str, url: str) -> float
     return overlap + title_overlap + domain_bonus + recency_bonus
 
 
+def _rank_authoritative_hits(query: str, hits: list[SearchHit]) -> list[SearchHit]:
+    """Prefer first-party documentation when the user explicitly asks for it."""
+    text = query.lower()
+    preferred: tuple[str, ...] = ()
+    if "python" in text:
+        preferred = ("python.org",)
+    elif "node.js" in text or "nodejs" in text:
+        preferred = ("nodejs.org",)
+    elif "django" in text:
+        preferred = ("djangoproject.com",)
+    elif "react" in text:
+        preferred = ("react.dev",)
+    if "official" not in text and not preferred:
+        return hits
+
+    def score(hit: SearchHit) -> tuple[int, int]:
+        host = urlparse(hit.url).hostname or ""
+        first_party = int(any(host == domain or host.endswith("." + domain) for domain in preferred))
+        docs_like = int(host.startswith("docs.") or "/docs" in hit.url or "/download" in hit.url)
+        return first_party, docs_like
+
+    return sorted(hits, key=score, reverse=True)
+
+
 def build_evidence_answer_prompt(query: str, result: WebSearchFetchResult) -> str:
     evidence = result.evidence or select_evidence(query, result.hits, result.pages)
     evidence_text = "\n\n".join(
@@ -1363,5 +1388,8 @@ def build_evidence_answer_prompt(query: str, result: WebSearchFetchResult) -> st
         f"Sources fetched:\n{fetched or '(none)'}\n\n"
         f"Sources searched:\n{searched or '(none)'}\n\n"
         f"What may be missing: {missing or 'State any missing evidence yourself if the chunks are incomplete.'}\n\n"
-        "Response format:\nDirect answer\n\nSources used\n\nSources searched/fetched\n\nWhat was missing or uncertain"
+        "Give one direct, internally consistent answer. Reconcile conflicting evidence by preferring "
+        "first-party sources and the newest final/stable release. Do not add a source list; the harness "
+        "will append the exact fetched URLs. Briefly state uncertainty only when the fetched evidence "
+        "does not resolve it."
     )
