@@ -257,6 +257,34 @@ def test_later_pass_recovers_an_earlier_verification_failure(tmp_path: Path):
     assert ledger.evidence_outcome() == "success"
 
 
+def test_failed_command_controls_evidence_outcome_even_with_mutations(tmp_path: Path):
+    ledger = start_run(tmp_path, "build the app")
+    ledger.log_mutation_finished("txn-1", "applied", ["package.json"])
+    cmd_id = ledger.log_command_start("npm run build", tmp_path)
+    ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 1, "", "build failed")
+
+    assert ledger.evidence_outcome() == "failed"
+
+
+def test_successful_command_verifies_mutations(tmp_path: Path):
+    ledger = start_run(tmp_path, "build the app")
+    ledger.log_mutation_finished("txn-1", "applied", ["package.json"])
+    cmd_id = ledger.log_command_start("npm run build", tmp_path)
+    ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 0, "built", "")
+
+    assert ledger.evidence_outcome() == "success"
+
+
+def test_later_successful_command_recovers_earlier_command_failure(tmp_path: Path):
+    ledger = start_run(tmp_path, "repair the app")
+    first = ledger.log_command_start("npm run build", tmp_path)
+    ledger.log_command_finish(first, "npm run build", tmp_path, 1, "", "build failed")
+    second = ledger.log_command_start("npm run build", tmp_path)
+    ledger.log_command_finish(second, "npm run build", tmp_path, 0, "built", "")
+
+    assert ledger.evidence_outcome() == "success"
+
+
 def test_run_retention_removes_diagnostics_with_stale_run_and_keeps_fresh_run(tmp_path: Path):
     stale = start_run(tmp_path, "old failure")
     stale.log_diagnostics(

@@ -12,6 +12,7 @@ import re
 from shamsu.types import EntityFieldSpec, EntitySpec, ParsedPRD
 
 ENTITY_LINE_RE = re.compile(r"^(?:[-*+]\s*)?(?:\*\*)?([A-Za-z][\w ]+)(?:\*\*)?\s*:\s*(.+)$")
+ENTITY_HEADING_RE = re.compile(r"^entity\s*:\s*(?P<name>[A-Za-z][\w -]*)$", re.IGNORECASE)
 FIELD_RE = re.compile(
     r"^(?P<name>[A-Za-z_][\w ]*)\s*(?:\((?P<type>[^)]*)\)|:\s*(?P<colon_type>.+))?$"
 )
@@ -39,6 +40,14 @@ TYPE_MAP = {
 def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
     entities: list[EntitySpec] = []
     for heading, lines in parsed.sections.items():
+        heading_entity = _entity_name_from_heading(heading)
+        if heading_entity:
+            entity = _parse_entity_section(heading_entity, lines)
+            if entity is not None:
+                entities.append(entity)
+            # Do not parse field bullets inside a heading-style entity section
+            # as independent compact entity declarations.
+            continue
         if "entit" not in heading.lower() and "data model" not in heading.lower():
             continue
         for line in lines:
@@ -50,6 +59,168 @@ def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
     for entity in table_entities:
         by_name[entity.name.lower()] = entity
     return list(by_name.values())
+
+
+def _entity_name_from_heading(heading: str) -> str:
+    normalized = _normalize_heading(heading)
+    match = ENTITY_HEADING_RE.match(normalized)
+    if not match:
+        return ""
+    return _to_pascal_case(match.group("name"))
+
+
+def _normalize_heading(heading: str) -> str:
+    return re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip().rstrip(":")
+
+
+def _parse_entity_section(entity_name: str, lines: list[str]) -> EntitySpec | None:
+    fields: list[EntityFieldSpec] = []
+    relationships: list[str] = []
+    in_fields = False
+    saw_fields_heading = False
+
+    for line in lines:
+        cleaned = _strip_markdown(line).strip()
+        if not cleaned:
+            continue
+        label = cleaned.rstrip(":").strip().lower()
+        if label == "fields":
+            in_fields = True
+            saw_fields_heading = True
+            continue
+        if label in {"rules", "constraints", "indexes", "validations", "validation"}:
+            in_fields = False
+            continue
+        if saw_fields_heading and not in_fields:
+            continue
+        field = _parse_block_field(cleaned)
+        if field is None:
+            continue
+        fields.append(field)
+        if field.django_type in {"ForeignKey", "ManyToManyField"}:
+            relation = "many_to_many" if field.django_type == "ManyToManyField" else "belongs_to"
+            relationships.append(f"{relation}:{field.kwargs.get('to', '')}")
+
+    if not fields:
+        return None
+    return EntitySpec(name=entity_name, fields=fields, relationships=relationships)
+
+
+def _parse_block_field(raw_field: str) -> EntityFieldSpec | None:
+    """Parse common PRD field bullets, e.g.
+
+    ``site_id: string, required, references Site``
+    ``status: enum, values: new, triaged, resolved``
+    ``tags: string array``
+    """
+    cleaned = raw_field.strip().lstrip("-*+\u2022 ").strip()
+    if ":" not in cleaned:
+        return None
+    raw_name, raw_type = cleaned.split(":", 1)
+    name = _to_snake_case(raw_name)
+    if not name or name == "id":
+        return None
+
+    description = raw_type.strip()
+    lowered = description.lower()
+    nullable = any(marker in lowered for marker in ("optional", "nullable", "null"))
+    unique = "unique" in lowered
+
+    relation = re.search(
+        r"(?:references?|foreign key to)\s+(?P<target>[A-Za-z][A-Za-z0-9_]*)",
+        description,
+        re.IGNORECASE,
+    )
+    if relation:
+        target = _to_pascal_case(_singularize(relation.group("target")))
+        kwargs: dict[str, object] = {"to": target, "on_delete": "SET_NULL" if nullable else "CASCADE"}
+        if nullable:
+            kwargs.update({"null": True, "blank": True})
+        return EntityFieldSpec(
+            name=name.removesuffix("_id"),
+            django_type="ForeignKey",
+            kwargs=kwargs,
+        )
+
+    if re.search(r"\benum\b", lowered):
+        kwargs = {"max_length": 50}
+        choices = _parse_values_choices(description) or _parse_choices(description)
+        if choices:
+            kwargs["choices"] = choices
+            kwargs["max_length"] = max(50, max(len(choice) for choice in choices))
+        if nullable:
+            kwargs.update({"null": True, "blank": True})
+        if unique:
+            kwargs["unique"] = True
+        return EntityFieldSpec(name=name, django_type="CharField", kwargs=kwargs)
+
+    base_type = _block_base_type(lowered, name)
+    django_type, kwargs = _block_field_type(base_type, name)
+    kwargs = dict(kwargs)
+    if "array" in lowered or " list" in lowered:
+        django_type = "JSONField"
+        kwargs = {"default": {"__callable__": "list"}, "blank": True}
+    elif name == "created_at" and django_type == "DateTimeField":
+        kwargs["auto_now_add"] = True
+    elif name == "updated_at" and django_type == "DateTimeField":
+        kwargs["auto_now"] = True
+
+    kwargs.update(_parse_numeric_kwargs(lowered))
+    max_length = _parse_max_length(lowered)
+    if max_length and django_type in {"CharField", "EmailField", "URLField"}:
+        kwargs["max_length"] = max_length
+    default = _parse_default(lowered)
+    if default is not None:
+        kwargs["default"] = default
+    if nullable and django_type not in {"JSONField"}:
+        kwargs.update({"null": True, "blank": True})
+    if unique:
+        kwargs["unique"] = True
+    return EntityFieldSpec(name=name, django_type=django_type, kwargs=kwargs)
+
+
+def _parse_values_choices(raw_type: str) -> list[str]:
+    match = re.search(r"\bvalues?\s*:\s*(?P<choices>.+)$", raw_type, re.IGNORECASE)
+    if not match:
+        return []
+    return [
+        choice.strip(" '\".").lower().replace(" ", "_")
+        for choice in re.split(r"[/|,]", match.group("choices"))
+        if choice.strip(" '\".")
+    ]
+
+
+def _block_base_type(lowered: str, name: str) -> str:
+    if name == "email" or "valid email" in lowered:
+        return "email"
+    if "datetime" in lowered or "date time" in lowered:
+        return "datetime"
+    if re.search(r"\bdate\b", lowered):
+        return "date"
+    if "decimal" in lowered:
+        return "decimal"
+    if re.search(r"\binteger\b|\bint\b", lowered):
+        return "integer"
+    if re.search(r"\bnumber\b", lowered):
+        return "number"
+    if re.search(r"\bbool(?:ean)?\b", lowered):
+        return "boolean"
+    if re.search(r"\btext\b", lowered):
+        return "long text"
+    if re.search(r"\burl\b", lowered):
+        return "url"
+    return "string"
+
+
+def _block_field_type(base_type: str, name: str) -> tuple[str, dict[str, object]]:
+    if base_type == "number":
+        return "DecimalField", {"max_digits": 12, "decimal_places": 2}
+    django_type, kwargs = TYPE_MAP.get(base_type, ("CharField", {"max_length": 200}))
+    if django_type == "CharField" and "max_length" not in kwargs:
+        kwargs = {**kwargs, "max_length": 200}
+    if name in {"description", "notes", "body", "summary", "justification", "blocked_reason"}:
+        return "TextField", {}
+    return django_type, dict(kwargs)
 
 
 def _extract_table_entities(parsed: ParsedPRD) -> list[EntitySpec]:
@@ -361,4 +532,4 @@ def _to_snake_case(text: str) -> str:
 
 
 def _to_pascal_case(text: str) -> str:
-    return "".join(part.capitalize() for part in re.split(r"[^A-Za-z0-9]+", text) if part)
+    return "".join(part[:1].upper() + part[1:] for part in re.split(r"[^A-Za-z0-9]+", text) if part)

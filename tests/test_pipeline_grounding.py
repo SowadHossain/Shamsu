@@ -311,6 +311,62 @@ def test_prd_parse_happens_before_template_build(tmp_path, monkeypatch):
     assert parse_calls[0] == str(prd)
 
 
+def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, monkeypatch):
+    """A complex Node+CLI PRD must produce files via FullDjangoPipeline's
+    freeform path, not a chat answer that merely describes the work."""
+    from rich.console import Console
+    from shamsu.agents.full_pipeline import FullPipelineResult
+    from shamsu.cli import repl as repl_mod
+
+    prd = tmp_path / "prd.md"
+    prd.write_text(
+        "# AtlasOps\n\n"
+        "## Overview\n"
+        "A full-stack web application with a browser UI and terminal CLI.\n\n"
+        "## Recommended Technical Stack\n"
+        "- TypeScript\n- React\n- Vite\n- Node.js\n- SQLite\n\n"
+        "### Entity: Incident\n\n"
+        "Fields:\n\n"
+        "- id: string, required, unique\n"
+        "- title: string, required\n"
+        "- status: enum, values: new, triaged, resolved\n\n"
+        "## Required CLI Commands\n"
+        "atlas init\natlas status\n",
+        encoding="utf-8",
+    )
+
+    calls: dict[str, object] = {}
+
+    async def fake_pipeline_run(self, prd_path, target_dir=None):
+        calls["pipeline"] = True
+        calls["target_dir"] = target_dir
+        return FullPipelineResult(
+            prd_path=Path(prd_path),
+            target_dir=tmp_path / str(target_dir),
+            written_files=["package.json"],
+            success=True,
+        )
+
+    async def fail_plain_chat(*_args, **_kwargs):
+        raise AssertionError("freeform PRD build fell through to plain chat")
+
+    monkeypatch.setattr(repl_mod.FullDjangoPipeline, "run", fake_pipeline_run)
+    monkeypatch.setattr(repl_mod, "_run_agent_chat", fail_plain_chat)
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=120)
+    asyncio.run(
+        repl_mod._handle_prd_build_request(
+            "build the product from prd.md in a new folder named atlasops-freeform",
+            tmp_path,
+            console,
+        )
+    )
+
+    assert calls["pipeline"] is True
+    assert calls["target_dir"] == "atlasops-freeform"
+
+
 def test_bugfix_request_requires_concrete_target_before_workflow():
     assert not _bugfix_request_has_actionable_target("fix a code for me")
     assert _bugfix_request_has_actionable_target("fix app.py")

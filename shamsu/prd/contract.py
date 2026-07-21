@@ -41,6 +41,12 @@ _STACK_PATTERNS: list[tuple[str, str]] = [
     ("django", r"\bdjango\b"),
     ("python", r"\b(?:flask|fastapi|python|pytest)\b"),
     ("node", r"\b(?:react|vue|svelte|node(?:\.js)?|express|vite|typescript|javascript|phaser)\b|\bnext\.js\b"),
+    ("typescript", r"\btypescript\b"),
+    ("react", r"\breact\b"),
+    ("vite", r"\bvite\b"),
+    ("zod", r"\bzod\b"),
+    ("vitest", r"\bvitest\b"),
+    ("playwright", r"\bplaywright\b"),
     ("go", r"\b(?:golang|go module)\b"),
     ("rust", r"\b(?:rust|cargo)\b"),
 ]

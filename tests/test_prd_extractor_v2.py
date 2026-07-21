@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from shamsu.prd.classifier import classify_archetype
+from shamsu.prd.extractor import extract_entities
 from shamsu.prd.parser import parse_prd_text
 from shamsu.prd.project import build_project_spec
 from shamsu.templates.registry import get_template_provider
@@ -115,3 +116,136 @@ def test_template_registry_wraps_django_for_web_crud():
     assert provider.smoke_test() is True
     assert provider.render_all(spec)["manage.py"].startswith("#!/usr/bin/env python")
     assert provider.build_manifest(spec).holes
+
+
+ATLASOPS_PRD_EXCERPT = """# Product Requirements Document: AtlasOps Command Center
+
+## 1. Overview
+
+AtlasOps Command Center is a local-first operations platform for managing incident
+response, field work orders, inventory, vendors, approvals, audit trails, and
+executive reporting. The product must include both a browser UI and a terminal CLI.
+The application must run locally without cloud services. The default implementation
+should use SQLite for persistence.
+
+## 4. Recommended Technical Stack
+
+- TypeScript
+- React
+- Vite
+- Node.js
+- SQLite
+- Zod
+- Vitest
+- Playwright
+
+## 5. Roles
+
+### Entity: User
+
+Fields:
+
+- id: string, required, unique
+- name: string, required
+- email: string, required, unique, valid email
+- role: enum, required, values: admin, manager, dispatcher, technician, auditor
+- active: boolean, default true
+
+Rules:
+
+- Only active users can be assigned work.
+
+## 6. Core Entities
+
+### Entity: Site
+
+Fields:
+
+- id: string, required, unique
+- code: string, required, unique
+- name: string, required
+- timezone: string, required
+- risk_level: enum, values: low, medium, high, critical
+- active: boolean, default true
+
+Rules:
+
+- Site code must be uppercase alphanumeric plus hyphen only.
+
+### Entity: Incident
+
+Fields:
+
+- id: string, required, unique
+- incident_number: string, required, unique
+- title: string, required
+- description: text, required
+- site_id: string, required, references Site
+- severity: enum, values: low, medium, high, critical
+- status: enum, values: new, triaged, linked_to_work_order, resolved, canceled
+- detected_at: datetime, required
+- resolved_at: datetime, optional
+- tags: string array
+- created_by_user_id: string, required, references User
+
+Rules:
+
+- A canceled incident cannot be converted to a work order.
+
+### Entity: WorkOrder
+
+Fields:
+
+- id: string, required, unique
+- work_order_number: string, required, unique
+- title: string, required
+- site_id: string, required, references Site
+- incident_id: string, optional, references Incident
+- assigned_user_id: string, optional, references User
+- priority: enum, values: low, normal, high, urgent
+- status: enum, values: draft, ready, assigned, in_progress, blocked, completed, canceled
+
+## 8. Required CLI Commands
+
+```bash
+atlas init
+atlas status
+atlas incident add --title "Water leak" --site HQ --severity high --reporter "Sam"
+```
+"""
+
+
+def test_heading_style_entities_do_not_become_field_name_models():
+    parsed = parse_prd_text(ATLASOPS_PRD_EXCERPT, markdown=True)
+
+    entities = extract_entities(parsed)
+    names = {entity.name for entity in entities}
+
+    assert {"User", "Site", "Incident", "WorkOrder"} <= names
+    assert {"Name", "Email", "SiteId", "IncidentNumber", "WorkOrderNumber"} - names == {
+        "Name", "Email", "SiteId", "IncidentNumber", "WorkOrderNumber",
+    }
+
+    incident = next(entity for entity in entities if entity.name == "Incident")
+    fields = {field.name: field for field in incident.fields}
+    assert fields["site"].django_type == "ForeignKey"
+    assert fields["site"].kwargs["to"] == "Site"
+    assert fields["created_by_user"].kwargs["to"] == "User"
+    assert fields["status"].kwargs["choices"] == [
+        "new", "triaged", "linked_to_work_order", "resolved", "canceled",
+    ]
+    assert fields["tags"].django_type == "JSONField"
+    assert fields["tags"].kwargs["default"] == {"__callable__": "list"}
+
+
+def test_complex_node_cli_prd_routes_to_freeform_not_django():
+    parsed = parse_prd_text(ATLASOPS_PRD_EXCERPT, markdown=True)
+
+    spec = build_project_spec(parsed)
+
+    assert spec.generation_ready is True
+    assert spec.needs_input is False
+    assert {entity.name for entity in spec.entities} >= {"User", "Site", "Incident", "WorkOrder"}
+    assert "node" in spec.prd_contract.required_stack
+    assert getattr(spec.suitability.strategy, "value", spec.suitability.strategy) == "freeform"
+    assert "Django generator" in " ".join(spec.suitability.conflicts)

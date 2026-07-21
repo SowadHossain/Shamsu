@@ -347,6 +347,19 @@ class ActionLedger:
         event_types = [str(event.get("type", "")) for event in events]
         mutations = self._read_jsonl(self.mutations_dir / "mutations.jsonl")
         mutation_statuses = [str(item.get("status", "")) for item in mutations]
+        failure_event_seen = any(
+            event_type in event_types
+            for event_type in {
+                "patch_validation_failed",
+                "patch_apply_failed",
+                "mutation_required_but_missing",
+                "contract_failed",
+                "agent_stopped",
+            }
+        )
+        bad_mutation_seen = any(
+            status not in {"applied", "rolled_back"} for status in mutation_statuses
+        )
         if "run_cancelled" in event_types:
             outcome = "cancelled"
         elif "run_timed_out" in event_types:
@@ -359,19 +372,16 @@ class ActionLedger:
             outcome = "failed"
         elif "composite_partial" in event_types:
             outcome = "partial"
-        elif self._has_unrecovered_verification_failure(events) or any(
-            event_type in event_types
-            for event_type in {
-                "patch_validation_failed",
-                "patch_apply_failed",
-                "mutation_required_but_missing",
-                "contract_failed",
-                "agent_stopped",
-            }
-        ) or any(
-            status not in {"applied", "rolled_back"} for status in mutation_statuses
-        ) or self._has_unrecovered_tool_failure():
+        elif (
+            self._has_unrecovered_verification_failure(events)
+            or self._has_unrecovered_command_failure(events)
+            or failure_event_seen
+            or bad_mutation_seen
+            or self._has_unrecovered_tool_failure()
+        ):
             outcome = "failed"
+        elif self._has_successful_command(events):
+            outcome = "success"
         elif any(
             event_type in event_types for event_type in {"mutation_finished", "patch_apply_succeeded"}
         ) and "verification_passed" not in event_types:
@@ -379,6 +389,28 @@ class ActionLedger:
         else:
             outcome = "success"
         return outcome
+
+    def _has_unrecovered_command_failure(self, events: list[dict[str, Any]]) -> bool:
+        latest_exit_code: int | None = None
+        for event in events:
+            if event.get("type") != "command_finished":
+                continue
+            try:
+                latest_exit_code = int(event.get("exit_code", 1))
+            except (TypeError, ValueError):
+                latest_exit_code = 1
+        return latest_exit_code is not None and latest_exit_code != 0
+
+    def _has_successful_command(self, events: list[dict[str, Any]]) -> bool:
+        for event in events:
+            if event.get("type") != "command_finished":
+                continue
+            try:
+                if int(event.get("exit_code", 1)) == 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _has_unrecovered_tool_failure(self) -> bool:
         """Detect failures that were not superseded by later successful work."""

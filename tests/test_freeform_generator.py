@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from shamsu.agents.freeform_generator import FreeformGenerator, _default_verify
+from shamsu.agents.freeform_generator import (
+    FreeformGenerator,
+    PlannedFile,
+    _default_verify,
+    _normalize_planned_files,
+    _sanitize_generated_content,
+)
 from shamsu.prd.contract import PRDContract
 from shamsu.prd.parser import parse_prd_text
 from shamsu.prd.project import build_project_spec
@@ -20,6 +26,28 @@ A bespoke headless CMS for markdown docs with a Python REST API. Built in Python
 ## Features
 - Create and edit markdown documents
 - Full-text search
+"""
+
+VITE_PRD = """# Ops Console
+
+## Overview
+A local-first React and Vite operations dashboard with a small terminal CLI.
+
+## Recommended Technical Stack
+- TypeScript
+- React
+- Vite
+- Node.js
+- Zod
+- Vitest
+
+### Entity: Incident
+
+Fields:
+- id: string, required
+- title: string, required
+- severity: enum, values: low, medium, high
+- status: enum, values: new, in_progress, completed
 """
 
 
@@ -53,6 +81,10 @@ def _python_generate(stack: str = "python", files=None):
 
 def _project():
     return build_project_spec(parse_prd_text(CMS_PRD, markdown=True))
+
+
+def _vite_project():
+    return build_project_spec(parse_prd_text(VITE_PRD, markdown=True))
 
 
 # --- deterministic verifier selection ----------------------------------------
@@ -123,6 +155,132 @@ def test_freeform_no_plan_is_honest_failure(tmp_path: Path):
     result = gen.run(project, tmp_path / "cms")
     assert result.success is False
     assert "plan" in result.final_message.lower()
+
+
+def test_freeform_skips_timed_out_file_generation(tmp_path: Path):
+    project = _project()
+    files = [
+        {"path": "slow.py", "purpose": "times out"},
+        {"path": "app.py", "purpose": "entry point"},
+    ]
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        if "planning a small project" in system:
+            return json.dumps({"stack": "python", "files": files})
+        if "slow.py" in user.split("## File to write now", 1)[-1][:80]:
+            raise TimeoutError("too slow")
+        return json.dumps({"content": "print('ok')\n"})
+
+    gen = FreeformGenerator(tmp_path, generate, command_runner=FakeRunner(0))
+    result = gen.run(project, tmp_path / "cms")
+
+    assert result.success is True
+    assert result.written_files == ["app.py"]
+    assert not (tmp_path / "cms" / "slow.py").exists()
+
+
+def test_freeform_sanitizes_markdown_file_wrappers():
+    assert _sanitize_generated_content("## package.json\n{\"scripts\": {}}\n", "package.json") == (
+        '{"scripts": {}}\n'
+    )
+    assert _sanitize_generated_content("```json\n{\"ok\": true}\n```", "package.json") == (
+        '{"ok": true}\n'
+    )
+    assert _sanitize_generated_content(
+        "Here is package.json:\n```json\n{\"scripts\": {}}\n```",
+        "package.json",
+    ) == (
+        '{"scripts": {}}\n'
+    )
+    assert _sanitize_generated_content("#!/usr/bin/env node\nconsole.log(1)\n", "bin/atlas") == (
+        "#!/usr/bin/env node\nconsole.log(1)\n"
+    )
+
+
+def test_freeform_normalizes_extensionless_plan_paths():
+    normalized = _normalize_planned_files(
+        [
+            PlannedFile("src/cli"),
+            PlannedFile("src/cli/index.ts"),
+            PlannedFile("src/components"),
+            PlannedFile("src/styles"),
+            PlannedFile("src/assets"),
+        ]
+    )
+
+    assert [file.path for file in normalized] == [
+        "src/cli/index.ts",
+        "src/components/index.tsx",
+        "src/styles.css",
+    ]
+
+
+def test_freeform_plan_collision_does_not_crash_generation(tmp_path: Path):
+    project = _project()
+    files = [
+        {"path": "src/cli", "purpose": "cli placeholder"},
+        {"path": "src/cli/index.ts", "purpose": "cli entry"},
+    ]
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        if "planning a small project" in system:
+            return json.dumps({"stack": "unknown", "files": files})
+        return json.dumps({"content": "export const ok = true;\n"})
+
+    result = FreeformGenerator(tmp_path, generate, command_runner=FakeRunner(0)).run(
+        project,
+        tmp_path / "cms",
+    )
+
+    assert result.written_files == ["src/cli/index.ts"]
+    assert (tmp_path / "cms" / "src" / "cli").is_dir()
+    assert (tmp_path / "cms" / "src" / "cli" / "index.ts").read_text() == (
+        "export const ok = true;\n"
+    )
+
+
+def test_freeform_hardens_vite_react_project_before_verify(tmp_path: Path):
+    project = _vite_project()
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        if "planning a small project" in system:
+            return json.dumps(
+                {
+                    "stack": "TypeScript React Vite",
+                    "files": [
+                        {"path": "package.json", "purpose": "manifest"},
+                        {"path": "src/App.tsx", "purpose": "broken app shell"},
+                    ],
+                }
+            )
+        if "package.json" in user.split("## File to write now", 1)[-1][:80]:
+            return json.dumps(
+                {
+                    "content": json.dumps(
+                        {
+                            "scripts": {"build": "vite build"},
+                            "dependencies": {"@types/zod": "^2.0.2"},
+                        }
+                    )
+                }
+            )
+        return json.dumps({"content": "export default function App() { return null }\n"})
+
+    runner = FakeRunner(0)
+    result = FreeformGenerator(tmp_path, generate, command_runner=runner).run(
+        project,
+        tmp_path / "ops",
+    )
+
+    package = json.loads((tmp_path / "ops" / "package.json").read_text())
+    assert result.success is True
+    assert "index.html" in result.written_files
+    assert "src/data.ts" in result.written_files
+    assert "@types/zod" not in package["dependencies"]
+    assert "@types/zod" not in package["devDependencies"]
+    assert "@vitejs/plugin-react" in package["devDependencies"]
+    assert "demo-admin" in (tmp_path / "ops" / "src" / "data.ts").read_text()
+    assert runner.commands == ["npm install && npm run build"]
 
 
 # --- full pipeline routing ----------------------------------------------------

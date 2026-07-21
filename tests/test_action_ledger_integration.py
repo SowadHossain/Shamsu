@@ -306,6 +306,27 @@ async def test_run_specialist_logs_context_preview_and_model_call(tmp_path: Path
     assert preview["task_id"] == "t1"
 
 
+@pytest.mark.asyncio
+async def test_generate_structured_logs_model_call_and_context_preview(tmp_path: Path):
+    class FakeLLM(LLMManager):
+        async def _generate(self, model, system, prompt, **kwargs):
+            return '{"ok": true}'
+
+    ledger = start_run(tmp_path, "write a project plan")
+    llm = FakeLLM(action_ledger=ledger)
+
+    raw = await llm.generate_structured("coder", "system", "prompt", {"type": "object"})
+
+    assert raw == '{"ok": true}'
+    model_calls = store.load_model_calls(tmp_path, ledger.run_id)
+    assert [item["phase"] for item in model_calls] == ["started", "finished"]
+    assert all(item["role"] == "coder" for item in model_calls)
+    contexts = store.load_context_records(tmp_path, ledger.run_id)
+    assert len(contexts) == 1
+    assert contexts[0]["task_id"] == "coder-structured"
+    assert contexts[0]["model_call_id"] == model_calls[0]["model_call_id"]
+
+
 def test_diagnostic_digest_logs_code_memory_queried_for_exports_and_imports(tmp_path: Path):
     """DiagnosticDigest's Codebase-Memory MCP lookups (get_exports/get_imports,
     used to build root-cause facts for missing-export errors) must log

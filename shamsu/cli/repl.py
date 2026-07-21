@@ -769,13 +769,28 @@ def _pipeline_generate(session_logger: SessionLogger | None):
     model, so the freeform/scaffold pipeline can drive generation from its worker
     thread. Without this the FREEFORM strategy has no model wired and cannot build
     - the reason the template scaffolds used to be the only working path."""
+    ledger = get_current_run()
+    timeout_seconds = float(os.environ.get("SHAMSU_FREEFORM_MODEL_TIMEOUT_SECONDS", "180"))
 
     def _generate(system: str, user: str, schema: dict) -> str:
-        return asyncio.run(
-            LLMManager(session_logger=session_logger).generate_structured(
-                "coder", system, user, schema
+        async def _call() -> str:
+            return await asyncio.wait_for(
+                LLMManager(session_logger=session_logger, action_ledger=ledger).generate_structured(
+                    "coder", system, user, schema
+                ),
+                timeout=timeout_seconds,
             )
-        )
+
+        try:
+            return asyncio.run(_call())
+        except asyncio.TimeoutError as exc:
+            if ledger:
+                ledger.log_event(
+                    "freeform_model_call_timed_out",
+                    role="coder",
+                    timeout_seconds=timeout_seconds,
+                )
+            raise TimeoutError(f"Freeform model call timed out after {timeout_seconds:.0f}s") from exc
 
     return _generate
 
@@ -6662,6 +6677,7 @@ async def _handle_prd_build_request(
         return
 
     project = build_project_spec(parsed)
+    _log_prd_contract_summary(project)
     if not project.generation_ready:
         console.print(
             Panel(project.clarification_question, title="PRD Needs Input", border_style="yellow")
@@ -6675,6 +6691,16 @@ async def _handle_prd_build_request(
         )
         return
     strategy = getattr(getattr(project, "suitability", None), "strategy", None)
+    if getattr(strategy, "value", strategy) == "freeform":
+        await _run_freeform_prd_build(
+            user_input,
+            prd_path,
+            project,
+            workspace,
+            console,
+            session_logger=session_logger,
+        )
+        return
     if getattr(strategy, "value", strategy) == "django":
         await _run_django_prd_build(
             user_input,
@@ -6874,6 +6900,55 @@ async def _handle_prd_build_request(
     await _verify_completed_plan(changed_files, workspace, console, session_logger)
 
 
+def _log_prd_contract_summary(project: Any) -> None:
+    ledger = get_current_run()
+    if ledger is None:
+        return
+    contract = getattr(project, "prd_contract", None)
+    suitability = getattr(project, "suitability", None)
+    entities = list(getattr(project, "entities", []) or [])
+    entity_summaries = [
+        {
+            "name": getattr(entity, "name", ""),
+            "fields": [getattr(field, "name", "") for field in getattr(entity, "fields", [])],
+        }
+        for entity in entities[:50]
+    ]
+    contract_dict = contract.to_dict() if hasattr(contract, "to_dict") else {}
+    suitability_dict = suitability.to_dict() if hasattr(suitability, "to_dict") else {}
+    artifact = {
+        "project": getattr(project, "project_name", ""),
+        "app": getattr(project, "app_name", ""),
+        "generation_ready": bool(getattr(project, "generation_ready", False)),
+        "needs_input": bool(getattr(project, "needs_input", False)),
+        "clarification_question": getattr(project, "clarification_question", ""),
+        "archetype": str(getattr(project, "archetype", "")),
+        "category": getattr(project, "category", ""),
+        "entities": entity_summaries,
+        "contract": contract_dict,
+        "suitability": suitability_dict,
+    }
+    try:
+        (ledger.run_dir / "prd-contract.json").write_text(
+            json.dumps(artifact, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+    ledger.log_event(
+        "prd_contract_extracted",
+        project=getattr(project, "project_name", ""),
+        generation_ready=bool(getattr(project, "generation_ready", False)),
+        needs_input=bool(getattr(project, "needs_input", False)),
+        entity_count=len(entities),
+        entities=[item["name"] for item in entity_summaries],
+        required_stack=list(getattr(contract, "required_stack", []) or []),
+        strategy=suitability_dict.get("strategy", ""),
+        warnings=list(getattr(contract, "extraction_warnings", []) or []),
+        artifact="prd-contract.json",
+    )
+
+
 def _prd_target_directory(user_input: str, project: Any) -> str:
     match = re.search(
         r"\b(?:new\s+)?(?:folder|directory)\s+(?:named|called)\s+"
@@ -6901,6 +6976,88 @@ def _planned_django_paths(project: Any, target_dir: str) -> list[str]:
         ]
     )
     return list(dict.fromkeys(paths))
+
+
+async def _run_freeform_prd_build(
+    user_input: str,
+    prd_path: Path,
+    project: Any,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> FullPipelineResult:
+    """Run the structured template-free PRD pipeline.
+
+    This is the right path for complex/bespoke apps (non-Django requested
+    stacks, browser+CLI products, CMS-like products). It forces an actual file
+    plan, writes files transactionally, and verifies instead of letting a plain
+    chat response describe work without doing it.
+    """
+    target_dir = _prd_target_directory(user_input, project)
+    target = Sandbox(workspace).validate(target_dir)
+    if target.exists() and any(target.iterdir()):
+        message = (
+            f"The requested project folder is not empty: {target_dir}. "
+            "Choose a new folder so the PRD build cannot overwrite unrelated work."
+        )
+        console.print(Panel(message, title="PRD Build Needs Input", border_style="yellow"))
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_event("run_needs_input", reason="prd_target_not_empty", target=target_dir)
+        _log_assistant_message(session_logger, message, workflow_id="prd-build")
+        return FullPipelineResult(
+            prd_path=prd_path,
+            target_dir=target,
+            project=project,
+            written_files=[],
+            success=False,
+            error=message,
+        )
+
+    ledger = get_current_run()
+    if ledger:
+        ledger.log_event(
+            "prd_freeform_build_started",
+            target=target_dir,
+            strategy=getattr(getattr(project, "suitability", None), "strategy", ""),
+        )
+
+    search, _uses_real_index = _build_search_agent(workspace, session_logger)
+    result = await FullDjangoPipeline(
+        workspace,
+        search=search,
+        session_logger=session_logger,
+        approval_func=lambda _request: True,
+        long_running=True,
+        generate=_pipeline_generate(session_logger),
+    ).run(prd_path, target_dir=target_dir)
+
+    _print_full_pipeline_result(result, console)
+    written = list(result.written_files or [])
+    if ledger:
+        if written:
+            ledger.log_event(
+                "prd_freeform_build_finished",
+                target=target_dir,
+                written_files=written,
+                success=bool(result.success),
+                error=result.error,
+            )
+        else:
+            ledger.log_event("mutation_required_but_missing", route="prd.build", target=target_dir)
+
+    if result.success:
+        message = (
+            f"Built {getattr(project, 'project_name', 'the project')} in {target_dir}. "
+            f"Generated {len(written)} files and verification passed."
+        )
+    else:
+        message = (
+            f"The PRD freeform build generated {len(written)} files in {target_dir}, "
+            f"but verification did not pass: {result.error or 'see logs for details'}"
+        )
+    _log_assistant_message(session_logger, message, workflow_id="prd-build")
+    return result
 
 
 async def _run_django_prd_build(

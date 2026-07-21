@@ -13,6 +13,16 @@ from shamsu.registry.schema import Category
 from shamsu.registry.suitability import assess
 from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
+_ENTITY_HEADING_RE = re.compile(r"^entity\s*:\s*(?P<name>[A-Za-z][\w -]*)$", re.IGNORECASE)
+_FIELD_NAME_ENTITY_HINTS = {
+    "action", "active", "amount", "approvedat", "assetid", "assettag", "body",
+    "category", "city", "code", "completedat", "contactname", "country",
+    "createdat", "currency", "deletedat", "description", "detectedat", "email",
+    "entityid", "entitytype", "id", "name", "notes", "phone", "priority",
+    "quantity", "region", "role", "severity", "siteid", "status", "summary",
+    "timestamp", "title", "type", "updatedat", "vendorid", "visibility",
+}
+
 
 # Explicit signals that a PRD asks for a static HTML/CSS/JS frontend, so the
 # planner must NOT fall back to a generic Django project (manage.py / settings /
@@ -104,6 +114,9 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
     project_name = _to_snake_case(parsed.title)
     app_name = _default_app_name(project_name)
     entities = extract_entities(parsed)
+    extraction_error = _entity_extraction_error(parsed, entities)
+    if extraction_error:
+        contract.extraction_warnings.append(extraction_error)
     endpoints = (
         [
             EndpointSpec(
@@ -129,7 +142,7 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         selected_archetype = CATEGORY_TO_ARCHETYPE.get(category, archetype.archetype)
 
     domain_entities = [entity for entity in entities if entity.name.lower() not in {"user", "session"}]
-    needs_input = contract.requires_full_stack and not domain_entities
+    needs_input = (contract.requires_full_stack and not domain_entities) or bool(extraction_error)
     assumptions = list(contract.assumptions)
     if contract.requires_full_stack and not contract.stack_hint:
         assumptions = [item for item in assumptions if "framework" not in item.lower()]
@@ -151,6 +164,8 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
     # whether a template fits (and which) or whether to generate template-free;
     # it does not mutate `category` (kept as the raw detected category).
     suitability = assess(contract, category, selected_archetype)
+    if not needs_input and getattr(getattr(suitability, "strategy", None), "value", "") == "freeform":
+        generation_order = _generic_generation_order()
 
     return ProjectSpec(
         project_name=project_name,
@@ -177,13 +192,47 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         generation_ready=not needs_input,
         needs_input=needs_input,
         clarification_question=(
-            "Which persistent domain entities and fields should the full-stack application manage?"
+            extraction_error
+            if extraction_error
+            else "Which persistent domain entities and fields should the full-stack application manage?"
             if needs_input
             else ""
         ),
         assumptions=_dedupe_strings(assumptions),
         definition_of_done=list(contract.acceptance_criteria),
     )
+
+
+def _entity_extraction_error(parsed: ParsedPRD, entities) -> str:
+    heading_names = _entity_heading_names(parsed)
+    if not heading_names:
+        return ""
+    extracted = {entity.name.lower() for entity in entities}
+    missing = [name for name in heading_names if name.lower() not in extracted]
+    generic_entities = [
+        entity.name for entity in entities
+        if entity.name.lower() in _FIELD_NAME_ENTITY_HINTS and len(entity.fields) <= 2
+    ]
+    too_many_generic = len(generic_entities) >= max(5, len(heading_names))
+    mostly_missing = bool(missing) and len(missing) >= max(1, len(heading_names) // 2)
+    if mostly_missing or too_many_generic:
+        return (
+            "PRD entity extraction looks unsafe: the parser appears to have extracted field "
+            "names as entities instead of the heading-defined domain model. Expected entity "
+            f"headings include {', '.join(heading_names[:8])}; extracted suspicious entities "
+            f"include {', '.join(generic_entities[:8]) or 'none'}."
+        )
+    return ""
+
+
+def _entity_heading_names(parsed: ParsedPRD) -> list[str]:
+    names: list[str] = []
+    for heading in parsed.sections:
+        normalized = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip().rstrip(":")
+        match = _ENTITY_HEADING_RE.match(normalized)
+        if match:
+            names.append(_to_pascal_case(match.group("name")))
+    return names
 
 
 def _dedupe_strings(items: list[str]) -> list[str]:
@@ -561,7 +610,7 @@ def _to_kebab_case(text: str) -> str:
 
 
 def _to_pascal_case(text: str) -> str:
-    return "".join(part.capitalize() for part in re.split(r"[^A-Za-z0-9]+", text) if part)
+    return "".join(part[:1].upper() + part[1:] for part in re.split(r"[^A-Za-z0-9]+", text) if part)
 
 
 def _pluralize(text: str) -> str:

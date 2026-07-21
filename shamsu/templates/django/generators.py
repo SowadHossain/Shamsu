@@ -347,6 +347,11 @@ def _render_kwargs(kwargs: dict[str, Any]) -> str:
         if key == "choices" and isinstance(value, list):
             choices = [(choice, _display_name(choice)) for choice in value]
             parts.append(f"{key}={choices!r}")
+        elif key == "default" and isinstance(value, dict) and value.get("__callable__") in {
+            "dict",
+            "list",
+        }:
+            parts.append(f"{key}={value['__callable__']}")
         elif isinstance(value, str) and value in {
             "CASCADE", "PROTECT", "RESTRICT", "SET_DEFAULT", "SET_NULL",
         }:

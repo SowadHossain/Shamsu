@@ -470,9 +470,83 @@ class LLMManager(ILLMManager):
         Does not manage model pulls (the session ensures models at startup), so
         it is safe to call from a fresh event loop in a worker thread."""
         model = model_for_role(role)
-        return await self._generate(
-            model, system, prompt, temperature=temperature, json_schema=schema
-        )
+        workflow_id = f"{role}-structured"
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.request",
+                {
+                    "specialist": role,
+                    "model": model,
+                    "endpoint": self.base_url,
+                    "structured": True,
+                    "schema_keys": sorted((schema or {}).keys()),
+                },
+                f"Structured request sent to {role}",
+                workflow_id=workflow_id,
+            )
+        ledger_call_id = ""
+        prompt_text = f"{system}\n\n{prompt}".strip()
+        if self.action_ledger:
+            ledger_call_id = self.action_ledger.log_model_call_started(role, model, prompt_text)
+            self.action_ledger.log_context_preview(
+                {
+                    "task_id": workflow_id,
+                    "specialist": role,
+                    "token_estimate": 0,
+                    "snippets": [
+                        {
+                            "path": "structured-prompt",
+                            "content_preview": _short_preview(redact_text(prompt_text), 4000),
+                        }
+                    ],
+                },
+                model_call_id=ledger_call_id,
+            )
+        started = time.perf_counter()
+        try:
+            raw = await self._generate(
+                model, system, prompt, temperature=temperature, json_schema=schema
+            )
+        except BaseException as exc:
+            if self.action_ledger:
+                self.action_ledger.log_model_call_finished(
+                    role,
+                    model,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                    call_id=ledger_call_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            if self.session_logger:
+                self.session_logger.log(
+                    "llm.error",
+                    {"specialist": role, "model": model, "error": str(exc), "structured": True},
+                    f"Structured request for {role} failed",
+                    workflow_id=workflow_id,
+                )
+            raise
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.response",
+                {
+                    "specialist": role,
+                    "model": model,
+                    "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+                    "response_chars": len(raw),
+                    "structured": True,
+                },
+                f"Structured request for {role} returned a response",
+                workflow_id=workflow_id,
+            )
+        if self.action_ledger:
+            self.action_ledger.log_model_call_finished(
+                role,
+                model,
+                raw,
+                duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                meta={"structured": True, "schema_keys": sorted((schema or {}).keys())},
+                call_id=ledger_call_id,
+            )
+        return raw
 
     async def route(self, prompt: str, project_summary: str) -> RoutingDecision:
         """
@@ -914,6 +988,13 @@ def _context_preview(pack: ContextPack, workspace: Path | None = None) -> dict:
             "error_context_chars": max(0, len(pack.error_context) - 8000),
         },
     }
+
+
+def _short_preview(text: str, limit: int) -> str:
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
 
 
 def _validate_local_llm_url(base_url: str) -> None:

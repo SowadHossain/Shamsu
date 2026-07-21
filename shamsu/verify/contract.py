@@ -39,6 +39,16 @@ from shamsu.safety import read_only
 _FILE_TOKEN_RE = re.compile(
     r"(?:[A-Za-z]:[\\/])?[\w][\w./\\-]*\.(?:[a-z0-9_]{1,12}|[A-Z0-9_]{1,12})\b"
 )
+_NON_PATH_FILE_TOKENS = {
+    "bun.js",
+    "d3.js",
+    "deno.js",
+    "node.js",
+    "next.js",
+    "nuxt.js",
+    "three.js",
+    "vue.js",
+}
 # Extensionless dotfiles, which the pattern above cannot match (`.gitignore` is
 # a dot plus a name, with no trailing `.ext`). A NAMED allowlist rather than a
 # loose `\.[a-z]+` alternative on purpose: a loose one would also match the
@@ -182,7 +192,11 @@ def requested_paths(prompt: str, workspace: Path | None = None) -> tuple[str, ..
     )
     seen: list[str] = []
     for position, candidate in sorted(spans):
-        if candidate in seen or _is_source_reference(text, position, candidate):
+        if (
+            candidate in seen
+            or _normalize(candidate) in _NON_PATH_FILE_TOKENS
+            or _is_source_reference(text, position, candidate)
+        ):
             continue
         seen.append(candidate)
     return tuple(seen)

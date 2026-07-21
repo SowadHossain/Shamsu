@@ -353,6 +353,12 @@ def test_a_source_file_is_not_a_write_target():
     assert run_contract.requested_paths("based on README.md write app.py") == ("app.py",)
 
 
+def test_stack_names_are_not_write_targets():
+    assert run_contract.requested_paths(
+        "Build the app in a folder named atlasops. Use Node.js, Vite, and SQLite."
+    ) == ("atlasops",)
+
+
 def test_prd_build_contract_passes_when_the_target_is_written():
     result = run_contract.check(
         run_contract.derive("Build the converter described in PRD.md. Create converter.py."),

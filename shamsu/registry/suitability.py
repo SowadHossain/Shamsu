@@ -16,6 +16,7 @@ PRD it does not fit - which is exactly how a Pong PRD became a snake-like game.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -144,6 +145,34 @@ def _assess_game(contract: PRDContract) -> TemplateSuitability:
 
 def _assess_django(contract: PRDContract, archetype: Archetype) -> TemplateSuitability:
     label = "REST API" if archetype == Archetype.REST_API else "CRUD web app"
+    requested_stack = {item.lower() for item in contract.required_stack}
+    non_django_stack = requested_stack & {"go", "node", "rust"}
+    if non_django_stack and not (requested_stack & {"django", "python"}):
+        return TemplateSuitability(
+            strategy=GenerationStrategy.FREEFORM,
+            candidate="",
+            reason=(
+                f"{label} asks for {', '.join(sorted(non_django_stack))}; build from the "
+                "PRD instead of forcing the deterministic Django CRUD generator."
+            ),
+            matches=[f"{label} structure", "entity-backed product"],
+            conflicts=["Django generator would ignore the requested non-Django stack."],
+            must_change=["derive architecture, schema, UI, CLI, and tests from the PRD"],
+            fit_score=0.0,
+        )
+    if _contract_requires_cli(contract):
+        return TemplateSuitability(
+            strategy=GenerationStrategy.FREEFORM,
+            candidate="",
+            reason=(
+                f"{label} includes a terminal/CLI surface; build from the PRD instead "
+                "of using the browser-only Django CRUD generator."
+            ),
+            matches=[f"{label} structure", "CLI requirement"],
+            conflicts=["Django generator does not create the required CLI commands."],
+            must_change=["derive browser UI, CLI commands, persistence, and tests from the PRD"],
+            fit_score=0.0,
+        )
     return TemplateSuitability(
         strategy=GenerationStrategy.DJANGO,
         candidate="",
@@ -153,6 +182,22 @@ def _assess_django(contract: PRDContract, archetype: Archetype) -> TemplateSuita
         must_change=["generate models/views from PRD entities"],
         fit_score=0.8,
     )
+
+
+def _contract_requires_cli(contract: PRDContract) -> bool:
+    sections = " ".join(contract.source_refs)
+    text = " ".join(
+        [
+            sections,
+            contract.product_summary,
+            *contract.features,
+            *contract.acceptance_criteria,
+            *contract.required_tests,
+            *contract.constraints,
+            *contract.nonfunctional_requirements,
+        ]
+    ).lower()
+    return bool(re.search(r"\bcli\b|command[- ]line|terminal|workspace commands|atlas\s+\w+", text))
 
 
 def _assess_freeform(contract: PRDContract, category: Category) -> TemplateSuitability:
