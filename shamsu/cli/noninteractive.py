@@ -14,7 +14,7 @@ from typing import Any, Literal, Sequence
 from rich.console import Console
 
 from shamsu.action_ledger import store as ledger_store
-from shamsu.indexer.policy import walk_workspace_files
+from shamsu.indexer.policy import DEFAULT_EXCLUDED_FILES, walk_workspace_files
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import start_run
 from shamsu.runtime.models import initialize_model_tier
@@ -261,10 +261,36 @@ async def run_prompt(
                 ledger.finish(error, status="timed_out")
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
+                failed_tools = [
+                    record
+                    for record in ledger_store.load_tool_calls(root, ledger.run_id)
+                    if record.get("phase") == "finished" and not record.get("ok", False)
+                ]
+                if failed_tools:
+                    latest = failed_tools[-1]
+                    error += (
+                        f"\nLast tool failure: {latest.get('tool', 'unknown')}: "
+                        f"{latest.get('message', '')}"
+                    )
                 ledger.fail(error)
     finally:
         if browser_tool is not None:
             browser_tool.close()
+        changed_now = _changed_files(before, _workspace_snapshot(root))
+        contract_now = run_contract.check(
+            run_contract.derive(clean_prompt, dry_run=dry_run),
+            changed_files=changed_now,
+            planned_mutations=recorder.as_dicts() if recorder is not None else [],
+        )
+        manifest_now = ledger_store.load_manifest(root, ledger.run_id) or {}
+        if manifest_now.get("status") == "running":
+            if not contract_now.ok:
+                ledger.log_event("contract_failed", violations=contract_now.violations)
+            if dry_run:
+                ledger.finish(
+                    recorder.summary() if recorder is not None else "Dry run complete.",
+                    status="dry_run",
+                )
         _finish_current_run(root, ledger)
         clear_current_run()
         flush_memory_queues()
@@ -438,6 +464,17 @@ def _workspace_snapshot(workspace: Path) -> dict[str, str]:
             continue
         try:
             snapshot[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    # Index policy files are deliberately excluded from retrieval, but they are
+    # still real root-level workspace files. Include them in the behavioral
+    # contract so a read-only run cannot create `.cbmignore` invisibly.
+    for name in DEFAULT_EXCLUDED_FILES:
+        path = workspace / name
+        if not path.is_file():
+            continue
+        try:
+            snapshot[name] = hashlib.sha256(path.read_bytes()).hexdigest()
         except OSError:
             continue
     return snapshot

@@ -984,8 +984,15 @@ class WebTool:
         query: str,
         top_k: int,
     ) -> list[SearchHit]:
+        effective_query = _simplify_search_query(query) or query
+        if effective_query != query:
+            self._log(
+                "web.query.simplified",
+                {"provider": provider.name, "original_query": query, "query": effective_query},
+                "Simplified conversational web request for the search provider",
+            )
         try:
-            hits = _with_provider(provider.search(query, top_k), provider.name)
+            hits = _with_provider(provider.search(effective_query, top_k), provider.name)
         except Exception as exc:
             self._record_provider_attempt(provider.name, "failed", str(exc))
             raise
@@ -1155,6 +1162,29 @@ def _normalize_ddg_href(href: str) -> str:
     return href
 
 
+def _simplify_search_query(query: str) -> str:
+    """Turn a conversational web request into a search-engine query."""
+    simplified = " ".join(query.split()).strip()
+    simplified = re.sub(
+        r"^(?:please\s+)?(?:use\s+(?:the\s+)?web\s+search\s+to\s+|"
+        r"search\s+(?:the\s+)?web\s+(?:for|to\s+find)\s+|"
+        r"browse\s+(?:the\s+)?web\s+(?:for|to\s+find)\s+)",
+        "",
+        simplified,
+        flags=re.IGNORECASE,
+    )
+    simplified = re.sub(
+        r"^(?:find|look\s+up|search\s+for)\s+", "", simplified, flags=re.IGNORECASE
+    )
+    simplified = re.split(
+        r"(?<=[.!?])\s+(?=(?:give|return|include|cite|tell|report|do\s+not|don't|please)\b)",
+        simplified,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    return simplified.strip(" \t\r\n.!?")
+
+
 def _extract_readable_text(html: str, url: str) -> tuple[str | None, str]:
     if trafilatura is None:
         return None, "none"
@@ -1322,7 +1352,10 @@ def build_evidence_answer_prompt(query: str, result: WebSearchFetchResult) -> st
     missing = "" if result.pages else "No readable fetched page evidence was available; do not answer factual/current claims from snippets alone."
     return (
         "Answer only from fetched evidence below. If the evidence does not contain the answer, say that SHAMSU could not verify it. "
-        "Do not guess or fill gaps from snippets/general knowledge. Mention uncertainty. Include source titles and URLs.\n\n"
+        "Do not guess or fill gaps from snippets/general knowledge. Preserve the exact entity, version, and event in the user's question. "
+        "For an unqualified major/minor software version release date, answer with that version's initial final release "
+        "(usually x.y.0), not a later maintenance, bugfix, security, or end-of-life date. If evidence mentions several "
+        "release types, label them explicitly and do not substitute one for another. Mention uncertainty. Include source titles and URLs.\n\n"
         f"User question: {query}\n"
         f"Query type: {result.query_type}\n"
         f"Provider: {result.provider or 'unknown'}{' (fallback used)' if result.fallback_used else ''}\n\n"

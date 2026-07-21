@@ -52,6 +52,7 @@ TERMINAL_OUTCOMES = frozenset(
         "needs_input",
         "cancelled",
         "timed_out",
+        "dry_run",
     }
 )
 
@@ -277,22 +278,22 @@ class ActionLedger:
             outcome = "needs_input"
         elif "approval_denied" in event_types:
             outcome = "denied"
-        elif any(
-            event_type in event_types
-            for event_type in {
-                "verification_failed",
-                "patch_validation_failed",
-                "patch_apply_failed",
-                "mutation_required_but_missing",
-            }
-        ) or any(
-            status not in {"applied", "rolled_back"} for status in mutation_statuses
-        ):
-            outcome = "failed"
         elif "composite_failed" in event_types:
             outcome = "failed"
         elif "composite_partial" in event_types:
             outcome = "partial"
+        elif self._has_unrecovered_verification_failure(events) or any(
+            event_type in event_types
+            for event_type in {
+                "patch_validation_failed",
+                "patch_apply_failed",
+                "mutation_required_but_missing",
+                "contract_failed",
+            }
+        ) or any(
+            status not in {"applied", "rolled_back"} for status in mutation_statuses
+        ) or self._has_unrecovered_tool_failure():
+            outcome = "failed"
         elif any(
             event_type in event_types for event_type in {"mutation_finished", "patch_apply_succeeded"}
         ) and "verification_passed" not in event_types:
@@ -300,6 +301,53 @@ class ActionLedger:
         else:
             outcome = "success"
         return outcome
+
+    def _has_unrecovered_tool_failure(self) -> bool:
+        """Detect failures that were not superseded by later successful work."""
+        records = self._read_jsonl(self.tool_calls_path)
+        arguments = {
+            str(record.get("tool_call_id", "")): record.get("arguments", {})
+            for record in records
+            if record.get("phase") == "called"
+        }
+        latest: dict[str, tuple[int, dict[str, Any]]] = {}
+        for index, record in enumerate(records):
+            if record.get("phase") != "finished":
+                continue
+            latest[str(record.get("tool", "unknown"))] = (index, record)
+        for tool, (failure_index, record) in latest.items():
+            if bool(record.get("ok")):
+                continue
+            if tool not in {"read_file", "edit_file", "write_file"}:
+                return True
+            failed_args = arguments.get(str(record.get("tool_call_id", "")), {})
+            failed_path = str(failed_args.get("filepath") or "").replace("\\", "/")
+            recovered = False
+            for later in records[failure_index + 1 :]:
+                if later.get("phase") != "finished" or not bool(later.get("ok")):
+                    continue
+                if later.get("tool") not in {"edit_file", "write_file"}:
+                    continue
+                later_args = arguments.get(str(later.get("tool_call_id", "")), {})
+                later_path = str(later_args.get("filepath") or "").replace("\\", "/")
+                if failed_path and later_path == failed_path:
+                    recovered = True
+                    break
+            if not recovered:
+                return True
+        return False
+
+    @staticmethod
+    def _has_unrecovered_verification_failure(events: list[dict[str, Any]]) -> bool:
+        """A later verdict for the same command supersedes an earlier failure."""
+        latest: dict[str, bool] = {}
+        for event in events:
+            event_type = str(event.get("type", ""))
+            if event_type not in {"verification_failed", "verification_passed"}:
+                continue
+            key = str(event.get("command") or "__general__")
+            latest[key] = event_type == "verification_passed"
+        return any(not passed for passed in latest.values())
 
     # -- generic event timeline ---------------------------------------------
 

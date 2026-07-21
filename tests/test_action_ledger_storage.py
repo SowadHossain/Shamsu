@@ -196,6 +196,42 @@ def test_model_failure_writes_linked_exception_artifact(tmp_path: Path):
     assert store.validate_run(tmp_path, ledger.run_id)["ok"] is True
 
 
+def test_unrecovered_tool_failure_controls_evidence_outcome(tmp_path: Path):
+    ledger = start_run(tmp_path, "run the script")
+    call_id = ledger.log_tool_call("run_command", {"command": "python app.py"})
+    ledger.log_tool_result(call_id, "run_command", False, "Command exited with 1.")
+
+    assert ledger.evidence_outcome() == "failed"
+
+
+def test_later_success_recovers_an_earlier_tool_failure(tmp_path: Path):
+    ledger = start_run(tmp_path, "fix the file")
+    failed = ledger.log_tool_call("edit_file", {"filepath": "app.py"})
+    ledger.log_tool_result(failed, "edit_file", False, "old_string was ambiguous")
+    recovered = ledger.log_tool_call("edit_file", {"filepath": "app.py"})
+    ledger.log_tool_result(recovered, "edit_file", True, "edited")
+
+    assert ledger.evidence_outcome() == "success"
+
+
+def test_creating_requested_path_recovers_initial_missing_read(tmp_path: Path):
+    ledger = start_run(tmp_path, "create app.py")
+    read_call = ledger.log_tool_call("read_file", {"filepath": "app.py"})
+    ledger.log_tool_result(read_call, "read_file", False, "Not a file: app.py")
+    write_call = ledger.log_tool_call("write_file", {"filepath": "app.py"})
+    ledger.log_tool_result(write_call, "write_file", True, "Created app.py")
+
+    assert ledger.evidence_outcome() == "success"
+
+
+def test_later_pass_recovers_an_earlier_verification_failure(tmp_path: Path):
+    ledger = start_run(tmp_path, "repair and rerun")
+    ledger.log_event("verification_failed", command="python app.py")
+    ledger.log_event("verification_passed", command="python app.py")
+
+    assert ledger.evidence_outcome() == "success"
+
+
 def test_run_retention_removes_diagnostics_with_stale_run_and_keeps_fresh_run(tmp_path: Path):
     stale = start_run(tmp_path, "old failure")
     stale.log_diagnostics(

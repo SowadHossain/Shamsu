@@ -333,3 +333,14 @@ def test_an_answer_containing_an_unclosed_fence_keeps_its_content():
     turn = parse_model_turn({"message": {"content": content, "tool_calls": []}})
     assert "x = 1" in turn.text
     assert "Here is the file:" in turn.text
+
+
+def test_salvaged_json_preserves_python_apostrophe_escapes():
+    content = r'''{"name":"write_file","arguments":{"filepath":"converter.py","content":"print('Invalid mode: use \'c2f\' or \'f2c\'.')"}}'''
+
+    turn = parse_model_turn(_resp(content), REGISTERED)
+
+    assert turn.salvaged is True
+    generated = turn.tool_calls[0].arguments["content"]
+    assert "\\'c2f\\'" in generated
+    compile(generated, "converter.py", "exec")

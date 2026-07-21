@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.session.manager import SessionManager
 from shamsu.session.memory import ConversationMemory
@@ -134,3 +136,22 @@ def test_weather_without_location_asks_before_web(tmp_path):
     assert result.handled
     assert result.action == "web.needs_location"
     assert "Which location" in result.message
+
+
+def test_read_only_turn_does_not_auto_build_code_memory_index(tmp_path):
+    class RecordingAbstract:
+        def __init__(self):
+            self.auto_build: list[bool] = []
+
+        def ensure_ready(self, auto_build=True):
+            self.auto_build.append(auto_build)
+            return SimpleNamespace(allowed=True, reason="", status=None)
+
+    abstract = RecordingAbstract()
+
+    result = AgentOrchestrator(tmp_path, abstract_service=abstract).run(
+        "Run calc.py and report output. Do not change files."
+    )
+
+    assert result.handled is False
+    assert abstract.auto_build == [False]

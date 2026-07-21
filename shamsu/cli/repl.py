@@ -6,6 +6,7 @@ The selected workspace is the sandbox boundary for project reads and indexes.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import atexit
 import difflib
@@ -3624,6 +3625,24 @@ def _classify_single_route_label(effective_input: str, workspace: Path) -> str:
 
 
 def _operation_plan(effective_input: str, workspace: Path) -> OperationPlan:
+    # A build-from-PRD request is already a complete workflow: it reads the
+    # contract, writes the product, and verifies acceptance. Splitting its
+    # sentences into generic read/mutate/run steps loses the PRD contract and
+    # lets unrelated route keywords hijack individual clauses.
+    if _looks_like_prd_build_request(effective_input, workspace):
+        return OperationPlan(
+            prompt=effective_input.strip(),
+            candidates=("prd.build",),
+            clauses=(effective_input.strip(),),
+            steps=(
+                OperationStep(
+                    id=1,
+                    kind="mutation",
+                    route="prd.build",
+                    instruction=effective_input.strip(),
+                ),
+            ),
+        )
     return parse_operation_plan(
         effective_input,
         workspace,
@@ -6492,12 +6511,15 @@ async def _handle_prd_build_request(
     except ValueError:
         relative_path = prd_path
 
+    output_scope = contract.requested_paths(user_input)
+    acceptance = _extract_prd_acceptance_commands(parsed.raw_text or "")
+
     # `_ensure_git_repo` writes `.gitignore` directly (not through the tool
     # registry), so it sidesteps the read-only / dry-run gate. A prompt that
     # forbade changes ("make a plan, do not write any code") that mis-lands here
     # would still mutate the workspace - the exact leak the dogfood contract
     # flagged. Skip repo init when the request is read-only or a dry run.
-    if not _explicitly_read_only(user_input) and not dry_run.active():
+    if not output_scope and not _explicitly_read_only(user_input) and not dry_run.active():
         _ensure_git_repo(workspace, console, session_logger)
 
     # Greenfield static frontend: the user asked to build with HTML/CSS/JS (or
@@ -6612,14 +6634,67 @@ async def _handle_prd_build_request(
     )
     milestones = _extract_prd_milestones(parsed)
     if not milestones:
-        await _run_agent_chat(
-            _build_prd_build_request(parsed, relative_path),
+        result = await _run_agent_chat(
+            _build_prd_build_request(
+                parsed,
+                relative_path,
+                output_scope=output_scope,
+                acceptance=acceptance,
+            ),
             workspace,
             console,
             session_logger=session_logger,
             force_long_running=True,
             auto_approve=True,
+            allowed_write_paths=output_scope or None,
+            use_long_term_memory=False,
+            use_planner=False,
         )
+        changed_files = list(getattr(result, "changed_files", ()) or ())
+        if acceptance:
+            passed, failures = _run_prd_validation(
+                parsed.raw_text,
+                output_scope,
+                acceptance,
+                workspace,
+                console,
+                session_logger=session_logger,
+            )
+            for repair_attempt in range(1, 3):
+                if passed or not output_scope:
+                    break
+                repair_prompt = (
+                    f"Validation-guided PRD repair pass {repair_attempt}/2. Fix every failed check "
+                    "below while preserving every requirement and every working function from the "
+                    "authoritative PRD. Read the current file before writing it. Do not remove working "
+                    "features to fix one check. Make a complete correction and run verification. "
+                    "Do not ask for confirmation.\n"
+                    f"Modify ONLY: {', '.join(output_scope)}.\n\n"
+                    f"Authoritative PRD:\n{parsed.raw_text}\n\n"
+                    "Current validation failures:\n"
+                    + "\n\n".join(failures)
+                )
+                await _run_agent_chat(
+                    repair_prompt,
+                    workspace,
+                    console,
+                    session_logger=session_logger,
+                    force_long_running=True,
+                    auto_approve=True,
+                    allowed_write_paths=output_scope,
+                    use_long_term_memory=False,
+                    use_planner=False,
+                )
+                passed, failures = _run_prd_validation(
+                    parsed.raw_text,
+                    output_scope,
+                    acceptance,
+                    workspace,
+                    console,
+                    session_logger=session_logger,
+                )
+        else:
+            await _verify_completed_plan(changed_files, workspace, console, session_logger)
         return
 
     task = _create_prd_build_task(user_input, parsed.title, milestones)
@@ -6640,6 +6715,8 @@ async def _handle_prd_build_request(
                 session_logger=session_logger,
                 force_long_running=True,
                 auto_approve=True,
+                use_long_term_memory=False,
+                use_planner=False,
             )
         except Exception as exc:
             task = mark_step_failed(task, step.id, str(exc))
@@ -6703,14 +6780,286 @@ def _build_continue_game_request() -> str:
     )
 
 
-def _build_prd_build_request(parsed, relative_path: Path) -> str:
+def _build_prd_build_request(
+    parsed,
+    relative_path: Path,
+    *,
+    output_scope: tuple[str, ...] = (),
+    acceptance: list[tuple[str, str]] | None = None,
+) -> str:
+    scope_text = ""
+    if output_scope:
+        scope_text = (
+            "\nWrite scope: modify ONLY these explicitly requested output files: "
+            + ", ".join(output_scope)
+            + ". Do not edit, overwrite, or create any other workspace file.\n"
+        )
+    acceptance_items = list(acceptance or [])
+    acceptance_text = ""
+    if acceptance_items:
+        lines = ["\nMandatory acceptance checks (the harness will run these exactly):"]
+        for command, expected in acceptance_items:
+            suffix = f" -> expected stdout: {expected!r}" if expected else ""
+            lines.append(f"- {command}{suffix}")
+        acceptance_text = "\n".join(lines) + "\n"
     return (
         f"{PRD_BUILD_FRAMING}\n\n"
         "Build the complete product described by the following PRD. Create all necessary files "
-        "in the workspace, working milestone by milestone. Do not claim work you did not do.\n\n"
+        "in the workspace, working milestone by milestone. Do not claim work you did not do."
+        f"{scope_text}{acceptance_text}\n"
         f"=== PRD: {relative_path.as_posix()} ===\n"
         f"{parsed.raw_text or _render_sections(parsed)}"
     )
+
+
+_ACCEPTANCE_COMMAND_RE = re.compile(
+    r"^\s*[-*]\s*`(?P<command>[^`]+)`"
+    r"(?:\s+(?:prints?|outputs?|returns?)\s+`(?P<expected>[^`]*)`)?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _extract_prd_acceptance_commands(text: str) -> list[tuple[str, str]]:
+    """Extract explicit backticked acceptance commands and expected stdout."""
+    commands: list[tuple[str, str]] = []
+    for match in _ACCEPTANCE_COMMAND_RE.finditer(text or ""):
+        command = match.group("command").strip()
+        if not re.match(
+            r"^(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet|java|mvn|gradle)\b",
+            command,
+            re.IGNORECASE,
+        ):
+            continue
+        item = (command, (match.group("expected") or "").strip())
+        if item not in commands:
+            commands.append(item)
+    return commands
+
+
+def _run_prd_acceptance_commands(
+    acceptance: list[tuple[str, str]],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+    failure_details: list[str] | None = None,
+    summary_out: list[str] | None = None,
+    log_assistant: bool = True,
+) -> bool:
+    """Run PRD acceptance commands and record semantic pass/fail evidence."""
+    ledger = get_current_run()
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(
+            workspace, session_logger, console, lambda _request: True
+        ),
+        action_ledger=ledger,
+    )
+    all_passed = True
+    lines: list[str] = []
+    for command, expected in acceptance:
+        if ledger:
+            ledger.log_event("verification_started", command=command, source="prd_acceptance")
+            call_id = ledger.log_tool_call("run_command", {"command": command})
+        else:
+            call_id = ""
+        result = registry.execute("run_command", {"command": command})
+        stdout = str(result.data.get("stdout", "")).strip()
+        matches_expected = not expected or stdout == expected
+        passed = bool(result.ok) and matches_expected
+        all_passed = all_passed and passed
+        if ledger:
+            ledger.log_tool_result(call_id, "run_command", passed, result.message, result.data)
+            ledger.log_event(
+                "verification_passed" if passed else "verification_failed",
+                command=command,
+                source="prd_acceptance",
+                expected_stdout=expected,
+                actual_stdout=stdout,
+                exit_code=result.data.get("exit_code"),
+            )
+        verdict = "PASS" if passed else "FAIL"
+        detail = stdout or str(result.data.get("stderr", "")).strip() or result.message
+        lines.append(f"{verdict}  {command}\n{detail}")
+        if not passed and failure_details is not None:
+            failure_details.append(
+                f"Failed command: {command}\nExpected stdout: {expected or '(exit 0)'}\n"
+                f"Actual result:\n{detail}"
+            )
+    summary = (
+        "PRD acceptance passed.\n" if all_passed else "PRD acceptance failed.\n"
+    ) + "\n\n".join(lines)
+    console.print(
+        Panel(
+            summary,
+            title="PRD Acceptance",
+            border_style="green" if all_passed else "red",
+        )
+    )
+    if summary_out is not None:
+        summary_out.append(summary)
+    if log_assistant:
+        _log_assistant_message(session_logger, summary, workflow_id="prd-build")
+    return all_passed
+
+
+def _run_prd_validation(
+    prd_text: str,
+    output_scope: tuple[str, ...],
+    acceptance: list[tuple[str, str]],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> tuple[bool, list[str]]:
+    failures: list[str] = []
+    summaries: list[str] = []
+    conformance_passed = _run_prd_conformance_checks(
+        prd_text,
+        output_scope,
+        acceptance,
+        workspace,
+        console,
+        session_logger=session_logger,
+        failure_details=failures,
+        summary_out=summaries,
+    )
+    acceptance_passed = _run_prd_acceptance_commands(
+        acceptance,
+        workspace,
+        console,
+        session_logger=session_logger,
+        failure_details=failures,
+        summary_out=summaries,
+        log_assistant=False,
+    )
+    passed = conformance_passed and acceptance_passed
+    summary = (
+        "PRD validation passed.\n\n" if passed else "PRD validation failed.\n\n"
+    ) + "\n\n".join(summaries)
+    _log_assistant_message(session_logger, summary, workflow_id="prd-build")
+    return passed, failures
+
+
+def _run_prd_conformance_checks(
+    prd_text: str,
+    output_scope: tuple[str, ...],
+    acceptance: list[tuple[str, str]],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+    failure_details: list[str] | None = None,
+    summary_out: list[str] | None = None,
+) -> bool:
+    """Check explicit Python structure and CLI error-handling requirements."""
+    ledger = get_current_run()
+    lines: list[str] = []
+    all_passed = True
+    python_files = [path for path in output_scope if Path(path).suffix.lower() == ".py"]
+    required_functions = set(
+        re.findall(r"`([A-Za-z_]\w*)\([^`\n]*\)`", prd_text or "")
+    )
+    if python_files and required_functions:
+        found: set[str] = set()
+        parse_errors: list[str] = []
+        for relative in python_files:
+            try:
+                tree = ast.parse((workspace / relative).read_text(encoding="utf-8"))
+                found.update(
+                    node.name
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                )
+            except (OSError, SyntaxError) as exc:
+                parse_errors.append(f"{relative}: {exc}")
+        missing = sorted(required_functions - found)
+        passed = not missing and not parse_errors
+        all_passed = all_passed and passed
+        detail = (
+            "all named functions present"
+            if passed
+            else "; ".join(parse_errors + ([f"missing functions: {', '.join(missing)}"] if missing else []))
+        )
+        command = "prd:function-contract"
+        lines.append(f"{'PASS' if passed else 'FAIL'}  named Python functions\n{detail}")
+        if ledger:
+            ledger.log_event(
+                "verification_passed" if passed else "verification_failed",
+                command=command,
+                source="prd_conformance",
+                detail=detail,
+            )
+        if not passed and failure_details is not None:
+            failure_details.append(f"PRD function contract failed: {detail}")
+
+    lower_prd = (prd_text or "").lower()
+    needs_argument_probes = (
+        "usage" in lower_prd and "missing" in lower_prd and "invalid" in lower_prd
+    )
+    script_parts: list[str] = []
+    if needs_argument_probes:
+        for command, _expected in acceptance:
+            try:
+                parts = shlex.split(command, posix=os.name != "nt")
+            except ValueError:
+                continue
+            if len(parts) >= 2 and re.match(r"^(?:python3?|py)$", parts[0], re.IGNORECASE):
+                script_parts = parts[:2]
+                break
+    if script_parts:
+        probes = [
+            ("missing arguments", script_parts, ("usage",)),
+            ("invalid arguments", script_parts + ["__shamsu_invalid__", "0"], ("usage", "invalid")),
+        ]
+        registry = AgentToolRegistry(
+            workspace,
+            session_logger=session_logger,
+            approval_manager=_make_approval_manager(
+                workspace, session_logger, console, lambda _request: True
+            ),
+            action_ledger=ledger,
+        )
+        for label, parts, expected_words in probes:
+            command = subprocess.list2cmdline(parts)
+            if ledger:
+                ledger.log_event("verification_started", command=command, source="prd_conformance")
+                call_id = ledger.log_tool_call("run_command", {"command": command})
+            else:
+                call_id = ""
+            result = registry.execute("run_command", {"command": command})
+            stdout = str(result.data.get("stdout") or "")
+            stderr = str(result.data.get("stderr") or "")
+            combined = (stdout + "\n" + stderr).strip()
+            lowered = combined.lower()
+            passed = any(word in lowered for word in expected_words) and "traceback" not in lowered
+            all_passed = all_passed and passed
+            if ledger:
+                ledger.log_tool_result(call_id, "run_command", passed, result.message, result.data)
+                ledger.log_event(
+                    "verification_passed" if passed else "verification_failed",
+                    command=command,
+                    source="prd_conformance",
+                    detail=combined,
+                )
+            detail = combined or result.message
+            lines.append(f"{'PASS' if passed else 'FAIL'}  {label}: {command}\n{detail}")
+            if not passed and failure_details is not None:
+                failure_details.append(
+                    f"PRD {label} check failed. Command: {command}\nActual result:\n{detail}"
+                )
+
+    summary = (
+        "PRD conformance passed.\n" if all_passed else "PRD conformance failed.\n"
+    ) + ("\n\n".join(lines) if lines else "No supplemental checks were inferred.")
+    console.print(
+        Panel(
+            summary,
+            title="PRD Conformance",
+            border_style="green" if all_passed else "red",
+        )
+    )
+    if summary_out is not None:
+        summary_out.append(summary)
+    return all_passed
 
 
 def _prd_brief(parsed: Any) -> str:
@@ -7447,7 +7796,7 @@ def _composite_step_prompt(
             "and do not do any other step. If a real choice is needed, call ask_user.",
         ]
     )
-    if _explicitly_read_only(plan.prompt):
+    if _explicitly_read_only(plan.prompt) or step.kind not in {"mutation", "git_mutate"}:
         lines.append("Do not modify any files while doing this.")
     return _append_agent_context("\n".join(lines), agent_context)
 
@@ -7517,8 +7866,21 @@ async def _run_composite_request(
             _execute_composite_git_inspection(workspace, console, session_logger, ledger)
             step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
 
+        step_output = ""
+        if step.kind == "verify" and "run_command" not in set(step_tools):
+            step_output = _execute_deterministic_composite_verification(
+                plan, step, workspace, console, session_logger, ledger
+            )
+            step_tools, step_events = _ledger_delta(
+                workspace, ledger, before_tools, before_events
+            )
+        if step.kind == "verify" and not step_output:
+            step_output = _composite_command_output(workspace, ledger, before_tools)
+
         status, evidence = _composite_step_outcome(step, result, step_tools, step_events)
         record = {**step.to_dict(), "status": status, "evidence": evidence}
+        if step_output:
+            record["output"] = step_output
         statuses.append(record)
         _record_composite_step(step, record, ledger, session_logger)
         if status == "needs_input" or bool(getattr(result, "awaiting_user", False)):
@@ -7538,12 +7900,20 @@ async def _run_composite_request(
         event_type = "composite_completed" if composite_status == "success" else f"composite_{composite_status}"
         ledger.log_event(event_type, steps=statuses)
     if composite_status != "needs_input":
-        lines = [f"Step {item['id']} ({item['kind']}): {item['status']}" for item in statuses]
+        lines = []
+        for item in statuses:
+            line = f"Step {item['id']} ({item['kind']}): {item['status']}"
+            if item.get("output"):
+                line += f"\n{item['output']}"
+            lines.append(line)
         detail = "\n".join(lines)
         model_final = str(getattr(last_result, "final", "") or "").strip()
-        corrected = (
-            f"{model_final}\n\nComposite execution status: {composite_status}.\n{detail}"
-        ).strip()
+        if composite_status == "success":
+            corrected = f"Composite execution status: success.\n{detail}"
+        else:
+            corrected = (
+                f"{model_final}\n\nComposite execution status: {composite_status}.\n{detail}"
+            ).strip()
         console.print(Panel(Text(detail), title=f"Composite: {composite_status.title()}"))
         _log_assistant_message(session_logger, corrected, workflow_id="composite")
     return last_result
@@ -7600,6 +7970,108 @@ def _execute_composite_git_inspection(
         console.print(Panel(Text(body), title="Git Follow-up"))
 
 
+def _composite_verification_command(
+    plan: OperationPlan, step: OperationStep
+) -> str:
+    explicit = re.search(r"`([^`]+)`", step.instruction)
+    if explicit and re.match(
+        r"^(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)\b",
+        explicit.group(1).strip(),
+        re.IGNORECASE,
+    ):
+        return explicit.group(1).strip()
+    target = _extract_requested_file_path(plan.prompt)
+    instruction = step.instruction.lower()
+    if target and any(word in instruction for word in ("run", "execute", "script")):
+        suffix = Path(target).suffix.lower()
+        quoted = subprocess.list2cmdline([target]) if os.name == "nt" else shlex.quote(target)
+        if suffix == ".py":
+            return f"python {quoted}"
+        if suffix in {".js", ".mjs", ".cjs"}:
+            return f"node {quoted}"
+    if re.search(r"\b(?:run|rerun|re-run)\b.*\btests?\b", instruction):
+        return "python -m pytest -q"
+    return ""
+
+
+def _execute_deterministic_composite_verification(
+    plan: OperationPlan,
+    step: OperationStep,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    ledger: ActionLedger | None,
+) -> str:
+    command = _composite_verification_command(plan, step)
+    if not command:
+        return ""
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=ledger,
+    )
+    call_id = ledger.log_tool_call("run_command", {"command": command}) if ledger else ""
+    if ledger:
+        ledger.log_event("verification_started", command=command, source="composite_fallback")
+    result = registry.execute("run_command", {"command": command})
+    if ledger:
+        ledger.log_tool_result(call_id, "run_command", result.ok, result.message, result.data)
+        ledger.log_event(
+            "verification_passed" if result.ok else "verification_failed",
+            command=command,
+            source="composite_fallback",
+            exit_code=result.data.get("exit_code"),
+        )
+    output = str(result.data.get("stdout") or result.data.get("stderr") or result.message).strip()
+    rendered = f"$ {command}\n{output}".strip()
+    console.print(
+        Panel(
+            Text(rendered),
+            title="Verification",
+            border_style="green" if result.ok else "red",
+        )
+    )
+    return rendered
+
+
+def _composite_command_output(
+    workspace: Path,
+    ledger: ActionLedger | None,
+    before_tools: int,
+) -> str:
+    """Render the latest command evidence produced during a composite step."""
+    if ledger is None:
+        return ""
+    records = action_ledger_store.load_tool_calls(workspace, ledger.run_id)[before_tools:]
+    finished = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("tool") == "run_command" and record.get("phase") == "finished"
+        ),
+        None,
+    )
+    if finished is None:
+        return ""
+    call_id = finished.get("tool_call_id")
+    called = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("tool_call_id") == call_id and record.get("phase") == "called"
+        ),
+        {},
+    )
+    arguments = called.get("arguments") if isinstance(called, dict) else {}
+    command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
+    data = finished.get("data") if isinstance(finished.get("data"), dict) else {}
+    output = str(data.get("stdout") or data.get("stderr") or finished.get("message") or "").strip()
+    if not command and not output:
+        return ""
+    return f"$ {command}\n{output}".strip()
+
+
 def _composite_step_outcome(
     step: OperationStep,
     result: Any,
@@ -7653,6 +8125,9 @@ async def _run_agent_chat(
     session_logger: SessionLogger | None = None,
     force_long_running: bool = False,
     auto_approve: bool = False,
+    allowed_write_paths: tuple[str, ...] | None = None,
+    use_long_term_memory: bool = True,
+    use_planner: bool = True,
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -7666,6 +8141,7 @@ async def _run_agent_chat(
         approval_manager=_make_approval_manager(workspace, session_logger, console, approval_func),
         action_ledger=action_ledger,
     )
+    tools.set_user_request(user_input)
     # "Do not change files" outranks auto_approve. Approval mode answers "may I
     # act without asking?"; it never licenses ignoring an explicit instruction.
     request_is_read_only = _explicitly_read_only(user_input)
@@ -7680,6 +8156,8 @@ async def _run_agent_chat(
         allowed = contract.requested_paths(user_input)
         if allowed:
             tools.set_allowed_write_paths(allowed)
+    if allowed_write_paths:
+        tools.set_allowed_write_paths(allowed_write_paths)
     # A dry run is the opposite instruction: keep going, change nothing. Writes
     # report a synthetic success and are recorded as planned actions instead.
     # The `--dry-run` flag sets the context recorder; prose ("dry run only:
@@ -7722,6 +8200,10 @@ async def _run_agent_chat(
         chat_kwargs["budget_manager"] = _get_budget_manager(workspace, console)
     if _call_accepts_keyword(AgentChatLoop, "read_only"):
         chat_kwargs["read_only"] = request_is_read_only
+    if _call_accepts_keyword(AgentChatLoop, "use_long_term_memory"):
+        chat_kwargs["use_long_term_memory"] = use_long_term_memory
+    if _call_accepts_keyword(AgentChatLoop, "use_planner"):
+        chat_kwargs["use_planner"] = use_planner
     if _call_accepts_keyword(AgentChatLoop, "audit"):
         session_id = session_logger.session_id if session_logger is not None else None
         audit = SessionAuditLog(workspace, session_id)
@@ -7820,10 +8302,37 @@ async def _run_web_assist(
     session_logger: SessionLogger | None = None,
 ) -> None:
     if hasattr(web_tool, "search_and_fetch"):
+        ledger = getattr(web_tool, "action_ledger", None)
+        call_id = (
+            ledger.log_tool_call(
+                "web_search", {"query": user_input, "mode": "search_and_fetch"}
+            )
+            if ledger
+            else ""
+        )
         combined = web_tool.search_and_fetch(
             user_input,
             reason="SHAMSU thinks this request needs current or external information from the web.",
         )
+        if ledger:
+            ok = bool(combined.approved and not combined.error and (combined.hits or combined.pages))
+            ledger.log_tool_result(
+                call_id,
+                "web_search",
+                ok,
+                combined.error or f"Found {len(combined.hits)} result(s) and fetched {len(combined.pages)} page(s).",
+                {
+                    "query": combined.query,
+                    "provider": combined.provider,
+                    "fallback_used": combined.fallback_used,
+                    "hit_count": len(combined.hits),
+                    "page_count": len(combined.pages),
+                    "sources": [
+                        {"title": hit.title, "url": hit.url}
+                        for hit in combined.hits[:10]
+                    ],
+                },
+            )
         if not combined.approved:
             await _run_general_chat(
                 user_input,

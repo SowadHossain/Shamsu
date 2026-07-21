@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -67,6 +68,78 @@ async def test_planner_failure_does_not_block_the_chat_loop(tmp_path: Path):
     result = await loop.run("list the files here")
 
     assert result.final == "Done listing files."
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_edit_recovers_with_context_and_verifies(tmp_path: Path):
+    source = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a + b\n\n"
+        "print(subtract(5, 2))\n"
+    )
+    (tmp_path / "calc.py").write_text(source, encoding="utf-8")
+    command = f'"{sys.executable}" calc.py'
+
+    class RecoveryClient:
+        def __init__(self) -> None:
+            self.messages_seen: list[list[dict]] = []
+            self.responses = [
+                {"message": {"content": "", "tool_calls": [{
+                    "id": "read", "function": {
+                        "name": "read_file", "arguments": {"filepath": "calc.py"}
+                    }
+                }]}},
+                {"message": {"content": "", "tool_calls": [{
+                    "id": "ambiguous", "function": {
+                        "name": "edit_file", "arguments": {
+                            "filepath": "calc.py",
+                            "old_string": "return a + b",
+                            "new_string": "return a - b",
+                        }
+                    }
+                }]}},
+                {"message": {"content": "", "tool_calls": [{
+                    "id": "contextual", "function": {
+                        "name": "edit_file", "arguments": {
+                            "filepath": "calc.py",
+                            "old_string": "def subtract(a, b):\n    return a + b",
+                            "new_string": "def subtract(a, b):\n    return a - b",
+                        }
+                    }
+                }]}},
+                {"message": {"content": "", "tool_calls": [{
+                    "id": "verify", "function": {
+                        "name": "run_command", "arguments": {"command": command}
+                    }
+                }]}},
+                {"message": {"content": "Fixed and verified: subtract(5, 2) prints 3.", "tool_calls": []}},
+            ]
+
+        async def chat(self, **_kwargs):
+            self.messages_seen.append(list(_kwargs["messages"]))
+            return self.responses.pop(0)
+
+    client = RecoveryClient()
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _request: True),
+        llm=FakePlannerLLM("Fix only subtract, then run calc.py."),
+    )
+
+    result = await loop.run("Fix subtract in calc.py and run it.")
+
+    assert "return a - b" in (tmp_path / "calc.py").read_text(encoding="utf-8")
+    assert result.stopped is False
+    assert "prints 3" in result.final
+    correction_messages = [
+        message["content"]
+        for message in client.messages_seen[2]
+        if message.get("role") == "user"
+    ]
+    assert any("Exact candidate blocks" in message for message in correction_messages)
 
 
 @pytest.mark.asyncio

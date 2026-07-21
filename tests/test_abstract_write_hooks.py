@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 
 from shamsu.abstract.service import AbstractService
+from shamsu.action_ledger.ledger import start_run
+from shamsu.cli import request_lifecycle
 from shamsu.patch.engine import PatchEngine
 from shamsu.tools.agent_tools import AgentToolRegistry
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
@@ -65,3 +67,27 @@ def test_failed_patch_apply_does_not_queue_refresh(tmp_path):
 
     assert applied is False
     assert _last_index_payload(tmp_path).get("forced_stale") is not True
+
+
+def test_run_finalization_refreshes_code_memory_once_after_mutations(tmp_path, monkeypatch):
+    adapter = FakeCodebaseMemoryAdapter(available=True)
+    service = AbstractService(tmp_path, adapter=adapter)
+    service.ensure_ready()
+    ledger = start_run(tmp_path, "create app.py")
+    registry = AgentToolRegistry(
+        tmp_path,
+        approval_func=lambda _request: True,
+        action_ledger=ledger,
+    )
+    assert registry.write_file("app.py", "print('hi')\n").ok is True
+    assert service.index_status().stale is True
+    monkeypatch.setattr(
+        request_lifecycle,
+        "AbstractService",
+        lambda _workspace: service,
+    )
+
+    request_lifecycle.finish_current_run(tmp_path, ledger)
+
+    assert adapter.refresh_calls == 1
+    assert service.index_status().stale is False

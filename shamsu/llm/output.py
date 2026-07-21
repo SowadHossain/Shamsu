@@ -375,6 +375,17 @@ def _load_json(span: str) -> Any:
         return json.loads(span)
     except (ValueError, TypeError):
         pass
+    # Small coding models often emit Python apostrophe escapes (\') directly
+    # inside a JSON string. JSON does not recognize that escape, and generic
+    # repair libraries commonly drop the backslash, silently turning valid
+    # intended Python into a syntax error. Preserve it as a literal backslash
+    # before using broader JSON repair.
+    apostrophe_safe = re.sub(r"(?<!\\)\\'", r"\\\\'", span)
+    if apostrophe_safe != span:
+        try:
+            return json.loads(apostrophe_safe)
+        except (ValueError, TypeError):
+            pass
     try:  # Repair the near-miss JSON small models routinely emit.
         from json_repair import repair_json
 

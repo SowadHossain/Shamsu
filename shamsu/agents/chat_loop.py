@@ -293,6 +293,8 @@ class AgentChatLoop:
         budget_manager: ContextBudgetManager | None = None,
         audit: SessionAuditLog | None = None,
         read_only: bool = False,
+        use_long_term_memory: bool = True,
+        use_planner: bool = True,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -334,6 +336,8 @@ class AgentChatLoop:
         # Propagated to the tool registry, which denies mutating tools outright
         # regardless of approval mode - an instruction, not a preference.
         self.read_only = read_only
+        self.use_long_term_memory = use_long_term_memory
+        self.use_planner = use_planner
         if read_only:
             self.tools.set_read_only(True)
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
@@ -526,10 +530,11 @@ class AgentChatLoop:
         original_input = user_input
         if self.audit:
             self.audit.log_prompt(original_input)
-        user_input = self._append_long_term_memory(user_input)
+        if self.use_long_term_memory:
+            user_input = self._append_long_term_memory(user_input)
         self._produced_plan = False
         self._pending_upfront_question: dict[str, Any] | None = None
-        if self.long_running or _CHAT_PLANNER_ENABLED:
+        if self.use_planner and (self.long_running or _CHAT_PLANNER_ENABLED):
             user_input = await self._append_plan(user_input)
         self.state.append_user(user_input)
         # The planner judged this needs a decision only the user can make. Ask
@@ -543,6 +548,7 @@ class AgentChatLoop:
             return self._handle_ask_user(question, original_input, 0)
         repeated_calls: Counter[tuple[str, str]] = Counter()
         unconfirmed_failed_writes: dict[str, str] = {}
+        mutation_recovery_attempts = 0
         # Files this run actually wrote (confirmed ok), for the end-of-run verify gate.
         written_files: list[str] = []
         # The most recent read_file failure that has not yet been recovered from,
@@ -711,6 +717,7 @@ class AgentChatLoop:
                                 str(last_failed_read.get("filepath", "the file")),
                                 str(last_failed_read.get("message", "Not a file.")),
                                 list(last_failed_read.get("candidates", [])),
+                                original_input,
                             )
                         )
                         continue
@@ -761,6 +768,19 @@ class AgentChatLoop:
                         timeout_category=TIMEOUT_TOOL_MISSING_AFTER_PROMISE,
                     )
                 if unconfirmed_failed_writes:
+                    if mutation_recovery_attempts < 2:
+                        mutation_recovery_attempts += 1
+                        details = "; ".join(
+                            f"{path}: {message}"
+                            for path, message in unconfirmed_failed_writes.items()
+                        )
+                        self.state.append_user(
+                            "A required file mutation is still unconfirmed: "
+                            f"{details}. Your NEXT response must call read_file plus a corrected "
+                            "edit_file, or write_file with the complete corrected file. Do not "
+                            "reply with a success summary until a mutation tool returns ok."
+                        )
+                        continue
                     final = _failed_write_final(unconfirmed_failed_writes)
                     self.state.append_assistant(final)
                     self._audit_final(final)
@@ -908,6 +928,7 @@ class AgentChatLoop:
                                 last_failed_read["filepath"],
                                 last_failed_read["message"],
                                 last_failed_read["candidates"],
+                                original_input,
                             )
                         )
                 if name == "run_command" and not result.ok and self.session_logger is not None:
@@ -957,7 +978,7 @@ class AgentChatLoop:
                     # concrete next step: read the one strong candidate, ask the
                     # user to choose between several, or discover the path.
                     correction = self._read_failure_correction(
-                        str(arguments.get("filepath", "")), result.message
+                        str(arguments.get("filepath", "")), result.message, original_input
                     )
                     self.state.append_user(correction)
                     self._emit_trace(
@@ -976,10 +997,20 @@ class AgentChatLoop:
                     # old_string) otherwise gets retried verbatim until the loop
                     # gives up with nothing changed. Steer the model to a unique
                     # match or a full rewrite instead.
+                    filepath = str(arguments.get("filepath", "the file"))
+                    unconfirmed_failed_writes[filepath] = result.message
                     self.state.append_user(
                         _edit_failure_correction(
-                            str(arguments.get("filepath", "the file")), result.message
+                            filepath,
+                            result.message,
+                            result.data,
+                            old_string=str(arguments.get("old_string", "")),
+                            new_string=str(arguments.get("new_string", "")),
                         )
+                    )
+                elif name == "edit_file" and result.ok:
+                    unconfirmed_failed_writes.pop(
+                        str(arguments.get("filepath", "the file")), None
                     )
                 if name == "write_file" and not result.ok:
                     # A write that did not land is the #1 cause of the model
@@ -1332,7 +1363,9 @@ class AgentChatLoop:
         )
         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True, awaiting_user=True)
 
-    def _read_failure_correction(self, filepath: str, message: str) -> str:
+    def _read_failure_correction(
+        self, filepath: str, message: str, user_request: str = ""
+    ) -> str:
         candidates: list[str] = []
         query = Path(filepath).name or filepath
         if query.strip():
@@ -1344,6 +1377,12 @@ class AgentChatLoop:
                 candidates = []
         # Drop an exact self-match so we don't suggest the very path that failed.
         candidates = [candidate for candidate in candidates if candidate != filepath]
+        if not candidates and _request_explicitly_creates_path(user_request, filepath):
+            return (
+                f"read_file {filepath} confirmed that the requested new file does not exist. "
+                f"The user explicitly asked to create {filepath}; call write_file now with its complete "
+                "implementation. Do not ask whether to create it and do not modify another file."
+            )
         if len(candidates) == 1:
             return (
                 f"read_file {filepath} failed ({message}). The closest matching file is "
@@ -1527,7 +1566,14 @@ def _write_failure_correction(filepath: str, message: str) -> str:
     )
 
 
-def _edit_failure_correction(filepath: str, message: str) -> str:
+def _edit_failure_correction(
+    filepath: str,
+    message: str,
+    data: dict[str, Any] | None = None,
+    *,
+    old_string: str = "",
+    new_string: str = "",
+) -> str:
     """Steer the model past the two common edit_file failures.
 
     Without this, an ambiguous or not-found edit just gets retried with the same
@@ -1537,11 +1583,26 @@ def _edit_failure_correction(filepath: str, message: str) -> str:
     recovery is deterministic: make the match unique, or rewrite the whole file.
     """
     lowered = message.lower()
-    if "appears" in lowered and "time" in lowered:
+    if old_string == new_string and old_string:
+        how = (
+            "old_string and new_string are identical, so this cannot fix anything. "
+            "Call read_file, then use distinct exact strings; if quoting is difficult, use "
+            "write_file with the complete corrected file instead."
+        )
+    elif "appears" in lowered and "time" in lowered:
+        candidates = list((data or {}).get("candidate_contexts") or [])
+        exact_blocks = ""
+        if candidates:
+            rendered = [
+                f"lines {item.get('line_start')}-{item.get('line_end')}:\n{item.get('text', '')}"
+                for item in candidates[:3]
+            ]
+            exact_blocks = " Exact candidate blocks from the file:\n" + "\n---\n".join(rendered)
         how = (
             "That old_string is not unique. Include enough SURROUNDING lines to match "
             "exactly one place - e.g. the enclosing `def`/function line and the line above "
             "or below the change - or, if every occurrence should change, set replace_all=true."
+            + exact_blocks
         )
     elif "not found" in lowered or "no match" in lowered or "does not appear" in lowered:
         how = (
@@ -1563,7 +1624,18 @@ def _basename(filepath: str) -> str:
     return filepath.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or filepath
 
 
-def _read_failure_correction(filepath: str, message: str, candidates: list[str]) -> str:
+def _read_failure_correction(
+    filepath: str,
+    message: str,
+    candidates: list[str],
+    user_request: str = "",
+) -> str:
+    if not candidates and _request_explicitly_creates_path(user_request, filepath):
+        return (
+            f'The read_file call confirmed that "{filepath}" does not exist. The user explicitly '
+            f"asked to create {filepath}; your NEXT response MUST call write_file for that exact path "
+            "with the complete implementation. Do not search for a replacement and do not ask whether to create it."
+        )
     if candidates:
         cand_text = ", ".join(candidates[:6])
         instruction = (
@@ -1585,6 +1657,21 @@ def _read_failure_correction(filepath: str, message: str, candidates: list[str])
         f'Your read_file call for "{filepath}" failed: {message} {instruction} '
         'Do NOT say "I will read..." or "let me read..." without emitting a read_file tool call in '
         "the SAME response, and do NOT claim you read or know the contents of that file."
+    )
+
+
+def _request_explicitly_creates_path(user_request: str, filepath: str) -> bool:
+    normalized_path = filepath.replace("\\", "/").lower().strip()
+    basename = _basename(normalized_path).lower()
+    request = user_request.lower()
+    if not normalized_path or not request or (normalized_path not in request and basename not in request):
+        return False
+    return bool(
+        re.search(
+            r"\b(create|build|implement|generate|write|add|make)\b",
+            request,
+            re.IGNORECASE,
+        )
     )
 
 

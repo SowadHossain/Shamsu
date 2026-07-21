@@ -152,7 +152,9 @@ def summarize_tool_result(result: Any) -> str:
             preview = ", ".join(str(item) for item in candidates[:3])
             return f"{message}{(' - ' + preview) if preview else ''}"
         if "matches" in data:
-            return f"{message} ({len(data.get('matches') or [])} matches)"
+            matches = data.get("matches")
+            count = matches if isinstance(matches, int) else len(matches or [])
+            return f"{message} ({count} matches)"
         if "listing" in data:
             return f"{message}"
     return message or ("ok" if ok else "failed")

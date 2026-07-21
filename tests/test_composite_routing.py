@@ -83,6 +83,148 @@ def test_explicit_prd_mention_summary_stays_prd_summary(tmp_path: Path):
     assert plan.primary_route == "prd_summary"
 
 
+def test_prd_implementation_with_acceptance_uses_dedicated_build_route(tmp_path: Path):
+    (tmp_path / "PRD.md").write_text("# Converter", encoding="utf-8")
+    prompt = (
+        "Read PRD.md and implement the requested CLI in converter.py. "
+        "Then run the acceptance commands from the PRD."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert plan.primary_route == "prd.build"
+
+
+def test_prd_acceptance_extraction_preserves_commands_and_expected_stdout():
+    text = (
+        "## Acceptance\n"
+        "- `python converter.py c2f 100` prints `212.0`.\n"
+        "- `python converter.py f2c 32` prints `0.0`.\n"
+        "- `converter.py` exists.\n"
+    )
+
+    assert repl._extract_prd_acceptance_commands(text) == [
+        ("python converter.py c2f 100", "212.0"),
+        ("python converter.py f2c 32", "0.0"),
+    ]
+
+
+def test_prd_acceptance_runner_records_exact_output_verdicts(tmp_path: Path):
+    (tmp_path / "converter.py").write_text(
+        "import sys\nprint('212.0' if sys.argv[1] == 'c2f' else '0.0')\n",
+        encoding="utf-8",
+    )
+    ledger = start_run(tmp_path, "build converter from PRD")
+    set_current_run(ledger)
+    try:
+        passed = repl._run_prd_acceptance_commands(
+            [
+                ("python converter.py c2f 100", "212.0"),
+                ("python converter.py f2c 32", "0.0"),
+            ],
+            tmp_path,
+            Console(record=True),
+        )
+    finally:
+        clear_current_run()
+
+    assert passed is True
+    events = store.load_events(tmp_path, ledger.run_id)
+    assert sum(event["type"] == "verification_passed" for event in events) == 2
+    calls = store.load_tool_calls(tmp_path, ledger.run_id)
+    assert sum(record.get("phase") == "called" for record in calls) == 2
+
+
+def test_prd_acceptance_runner_returns_failure_diagnostics(tmp_path: Path):
+    (tmp_path / "converter.py").write_text("raise SyntaxError('broken')\n", encoding="utf-8")
+    failures: list[str] = []
+
+    passed = repl._run_prd_acceptance_commands(
+        [("python converter.py c2f 100", "212.0")],
+        tmp_path,
+        Console(record=True),
+        failure_details=failures,
+    )
+
+    assert passed is False
+    assert len(failures) == 1
+    assert "Failed command: python converter.py c2f 100" in failures[0]
+    assert "SyntaxError: broken" in failures[0]
+
+
+def test_prd_conformance_checks_named_functions_and_invalid_cli(tmp_path: Path):
+    prd = (
+        "Functions `celsius_to_fahrenheit(c)`, `fahrenheit_to_celsius(f)`, and `main()`. "
+        "If arguments are missing or invalid, print usage."
+    )
+    (tmp_path / "converter.py").write_text(
+        "import sys\n"
+        "def celsius_to_fahrenheit(c): return c * 9 / 5 + 32\n"
+        "def fahrenheit_to_celsius(f): return (f - 32) * 5 / 9\n"
+        "def main():\n"
+        "    if len(sys.argv) != 3 or sys.argv[1] not in {'c2f', 'f2c'}:\n"
+        "        print('Usage: converter.py c2f|f2c number')\n"
+        "        return\n"
+        "    print(celsius_to_fahrenheit(float(sys.argv[2])))\n"
+        "if __name__ == '__main__': main()\n",
+        encoding="utf-8",
+    )
+    failures: list[str] = []
+
+    passed = repl._run_prd_conformance_checks(
+        prd,
+        ("converter.py",),
+        [("python converter.py c2f 100", "212.0")],
+        tmp_path,
+        Console(record=True),
+        failure_details=failures,
+    )
+
+    assert passed is True
+    assert failures == []
+
+
+def test_prd_conformance_rejects_missing_main_and_invalid_arg_traceback(tmp_path: Path):
+    prd = "Provide `main()`. If arguments are missing or invalid, print usage."
+    (tmp_path / "converter.py").write_text(
+        "import sys\n"
+        "if len(sys.argv) < 2:\n"
+        "    print('Usage')\n"
+        "else:\n"
+        "    print(result)\n",
+        encoding="utf-8",
+    )
+    failures: list[str] = []
+
+    passed = repl._run_prd_conformance_checks(
+        prd,
+        ("converter.py",),
+        [("python converter.py c2f 100", "212.0")],
+        tmp_path,
+        Console(record=True),
+        failure_details=failures,
+    )
+
+    assert passed is False
+    assert any("missing functions: main" in failure for failure in failures)
+    assert any("invalid arguments" in failure for failure in failures)
+
+
+def test_prd_build_prompt_enforces_named_output_scope():
+    parsed = SimpleNamespace(raw_text="# Converter", sections={})
+
+    prompt = repl._build_prd_build_request(
+        parsed,
+        Path("PRD.md"),
+        output_scope=("converter.py",),
+        acceptance=[("python converter.py c2f 100", "212.0")],
+    )
+
+    assert "modify ONLY these explicitly requested output files: converter.py" in prompt
+    assert "python converter.py c2f 100" in prompt
+
+
 def test_same_operation_clauses_keep_dedicated_routes(tmp_path: Path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
@@ -300,6 +442,90 @@ def test_genuine_multi_action_prompt_still_splits(tmp_path: Path):
 
     assert plan.is_composite is True
     assert [s.kind for s in plan.steps] == ["read", "verify"]
+
+
+def test_composite_verify_infers_python_command_for_named_script(tmp_path: Path):
+    plan = repl._operation_plan("fix calc.py, then run the script", tmp_path)
+
+    assert repl._composite_verification_command(plan, plan.steps[1]) == "python calc.py"
+    prompt = repl._composite_step_prompt(plan, plan.steps[1], [], "")
+    assert "Do not modify any files while doing this." in prompt
+
+
+@pytest.mark.asyncio
+async def test_composite_verify_runs_clear_script_when_model_only_describes_command(
+    tmp_path: Path, monkeypatch
+):
+    (tmp_path / "calc.py").write_text("print(3)\n", encoding="utf-8")
+    ledger = start_run(tmp_path, "fix calc.py, then run the script")
+    set_current_run(ledger)
+    calls = {"n": 0}
+
+    async def _fake_agent(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            call_id = ledger.log_tool_call("edit_file", {"filepath": "calc.py"})
+            ledger.log_tool_result(call_id, "edit_file", True, "edited")
+            return AgentLoopResult(final="Edited.", changed_files=("calc.py",))
+        return AgentLoopResult(final="Run `python calc.py`.")
+
+    class AllowAll:
+        session_logger = None
+
+        def ask(self, _request):
+            return True
+
+    monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent)
+    monkeypatch.setattr(repl, "_make_approval_manager", lambda *args, **kwargs: AllowAll())
+    try:
+        plan = repl._operation_plan("fix calc.py, then run the script", tmp_path)
+        await repl._run_composite_request(plan, tmp_path, Console(record=True))
+        summary = ledger.finalize_from_evidence()
+    finally:
+        clear_current_run()
+
+    assert summary["status"] == "success"
+    output = store.load_final_output(tmp_path, ledger.run_id)
+    assert "$ python calc.py" in output
+    assert "\n3" in output
+
+
+@pytest.mark.asyncio
+async def test_composite_final_includes_command_output_when_model_runs_verification(
+    tmp_path: Path, monkeypatch
+):
+    ledger = start_run(tmp_path, "fix calc.py, then run the script")
+    set_current_run(ledger)
+    calls = {"n": 0}
+
+    async def _fake_agent(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            call_id = ledger.log_tool_call("edit_file", {"filepath": "calc.py"})
+            ledger.log_tool_result(call_id, "edit_file", True, "edited")
+            return AgentLoopResult(final="Edited.", changed_files=("calc.py",))
+        call_id = ledger.log_tool_call("run_command", {"command": "python calc.py"})
+        ledger.log_tool_result(
+            call_id,
+            "run_command",
+            True,
+            "Command completed",
+            {"stdout": "add(2, 3) = 5\nsubtract(5, 2) = 3\n", "exit_code": 0},
+        )
+        return AgentLoopResult(final="The script passed.")
+
+    monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent)
+    try:
+        plan = repl._operation_plan("fix calc.py, then run the script", tmp_path)
+        await repl._run_composite_request(plan, tmp_path, Console(record=True))
+        summary = ledger.finalize_from_evidence()
+    finally:
+        clear_current_run()
+
+    assert summary["status"] == "success"
+    output = store.load_final_output(tmp_path, ledger.run_id)
+    assert "$ python calc.py" in output
+    assert "subtract(5, 2) = 3" in output
 
 
 @pytest.mark.asyncio

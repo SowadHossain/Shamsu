@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 from rich.console import Console
 
+from shamsu.action_ledger import store
+from shamsu.action_ledger.ledger import start_run
 from shamsu.cli import repl
 from shamsu.session.manager import SessionManager
 from shamsu.tools.browser import BrowserTool
@@ -133,6 +135,31 @@ def test_web_tool_decodes_duckduckgo_redirect_href(monkeypatch):
     result = tool.search("dhaka weather")
 
     assert result.hits[0].url == "https://example.com/weather?q=Dhaka"
+
+
+def test_web_search_uses_search_shaped_query_for_provider(monkeypatch):
+    queries = []
+
+    class FakeProvider:
+        name = "duckduckgo"
+
+        def search(self, query, _top_k):
+            queries.append(query)
+            return [SearchHit("Python 3.13", "https://python.org/", "Release", self.name)]
+
+    tool = WebTool(approval_func=lambda _request: True, config=WebConfig(provider="duckduckgo"))
+    monkeypatch.setattr(
+        "shamsu.tools.web.DuckDuckGoHtmlProvider",
+        lambda client_factory=None: FakeProvider(),
+    )
+
+    result = tool.search(
+        "Use web search to find the official Python 3.13 release date. "
+        "Give the date and source URL. Do not modify files."
+    )
+
+    assert result.hits
+    assert queries == ["the official Python 3.13 release date"]
 
 
 def test_web_tool_fetch_can_skip_per_url_approval(monkeypatch):
@@ -621,6 +648,44 @@ def test_web_assist_uses_single_followup_fetch_approval(monkeypatch, tmp_path):
 
     assert approvals == ["Search the web and fetch the top results."]
     assert "Synthesized answer." in console_file.getvalue()
+
+
+def test_pre_routed_web_assist_records_canonical_tool_call(tmp_path):
+    ledger = start_run(tmp_path, "use web search for official docs")
+
+    class FakeWebTool:
+        action_ledger = ledger
+
+        def search_and_fetch(self, query: str, reason: str = ""):
+            return WebSearchFetchResult(
+                approved=True,
+                query=query,
+                hits=[SearchHit("Official", "https://example.com/docs", "Reference")],
+                pages=[WebFetchResult(
+                    approved=True,
+                    url="https://example.com/docs",
+                    final_url="https://example.com/docs",
+                    title="Official",
+                    text="Official documentation evidence " * 20,
+                )],
+                provider="fake",
+            )
+
+    class FakeLLM:
+        async def run_specialist(self, specialist, pack):
+            return SimpleNamespace(raw="Sourced answer.", model_used="fake")
+
+    asyncio.run(
+        repl._run_web_assist(
+            "official docs", Console(record=True), FakeLLM(), FakeWebTool()
+        )
+    )
+
+    records = store.load_tool_calls(tmp_path, ledger.run_id)
+    assert [record["phase"] for record in records] == ["called", "finished"]
+    assert records[0]["tool"] == "web_search"
+    assert records[1]["ok"] is True
+    assert records[1]["data"]["sources"][0]["url"] == "https://example.com/docs"
 
 
 def test_browser_tool_requires_open_before_read(tmp_path):

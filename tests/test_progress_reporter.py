@@ -4,7 +4,9 @@ from io import StringIO
 
 from rich.console import Console
 
-from shamsu.ui.progress import ProgressReporter
+from types import SimpleNamespace
+
+from shamsu.ui.progress import ProgressReporter, summarize_tool_result
 
 
 def test_progress_reporter_redacts_secrets_in_output():
@@ -35,3 +37,13 @@ def test_progress_reporter_logs_session_events():
     assert logger.events
     assert logger.events[0][0] == "progress.event"
     assert logger.events[0][1]["kind"] == "progress.tool_start"
+
+
+def test_tool_result_summary_accepts_integer_match_count():
+    result = SimpleNamespace(
+        ok=False,
+        message="old_string appears twice",
+        data={"matches": 2},
+    )
+
+    assert summarize_tool_result(result).endswith("(2 matches)")

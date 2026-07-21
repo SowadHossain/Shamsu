@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import re
 import traceback
 import shutil
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
+from shamsu.safety.commands import command_may_write_workspace
 from shamsu.safety.dry_run import DryRunRecorder
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
@@ -138,6 +140,7 @@ class AgentToolRegistry:
         # other direction, so instead the named targets stay writable and
         # everything else is denied - which is exactly what the user said.
         self._allowed_write_paths: set[str] | None = None
+        self._user_request = ""
 
     def set_read_only(self, read_only: bool) -> None:
         self._read_only = bool(read_only)
@@ -151,6 +154,9 @@ class AgentToolRegistry:
             self._allowed_write_paths = None
             return
         self._allowed_write_paths = {_normalize_workspace_path(p).lower() for p in paths if p}
+
+    def set_user_request(self, request: str) -> None:
+        self._user_request = str(request or "")
 
     def _outside_allowed_scope(self, path: str) -> ToolResult | None:
         allowed = self._allowed_write_paths
@@ -1221,12 +1227,30 @@ class AgentToolRegistry:
                 f"old_string not found in {normalized}. The file was NOT changed. {hint}",
                 {"filepath": normalized, "matches": 0},
             )
+        auto_disambiguated = False
+        if count > 1 and not replace_all:
+            candidate_contexts = _edit_context_candidates(content, old_string)
+            selected = _select_edit_context(
+                candidate_contexts, self._user_request, old_string
+            )
+            if selected is not None:
+                contextual_old = str(selected.get("text", ""))
+                contextual_new = contextual_old.replace(old_string, new_string, 1)
+                if contextual_old and content.count(contextual_old) == 1:
+                    old_string = contextual_old
+                    new_string = contextual_new
+                    count = 1
+                    auto_disambiguated = True
         if count > 1 and not replace_all:
             return ToolResult(
                 False,
                 f"old_string appears {count} times in {normalized}. Add more surrounding context to "
                 "make it unique, or set replace_all=true. The file was NOT changed.",
-                {"filepath": normalized, "matches": count},
+                {
+                    "filepath": normalized,
+                    "matches": count,
+                    "candidate_contexts": candidate_contexts,
+                },
             )
         if old_string == new_string:
             return ToolResult(
@@ -1310,6 +1334,7 @@ class AgentToolRegistry:
                 "lines_removed": removed,
                 "start_line": start_line,
                 "end_line": end_line,
+                "auto_disambiguated": auto_disambiguated,
             },
         )
 
@@ -1660,6 +1685,19 @@ class AgentToolRegistry:
     def run_command(self, command: str, cwd: str = ".") -> ToolResult:
         if not command.strip():
             return ToolResult(False, "Missing command.", {})
+        if self._read_only and command_may_write_workspace(command):
+            return ToolResult(
+                False,
+                "Refused to run a workspace-writing command: this request said not to "
+                "change files. Run the command without redirection or file-writing shell syntax.",
+                {
+                    "read_only": True,
+                    "blocked_action": "run_command",
+                    "command": command,
+                    "outcome_classification": "policy_decision",
+                    "actionable": False,
+                },
+            )
         code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
         data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
         packet = getattr(self.command_runner, "last_diagnostic_packet", None)
@@ -1964,6 +2002,84 @@ def _nearby_edit_hint(content: str, old_string: str) -> str:
                 "Match the exact text and whitespace (read a line range first if unsure)."
             )
     return "Read the file to copy the exact text, including whitespace."
+
+
+def _edit_context_candidates(
+    content: str, old_string: str, *, context_lines: int = 2, limit: int = 5
+) -> list[dict[str, Any]]:
+    """Return bounded exact blocks that can make an ambiguous edit unique."""
+    if not old_string:
+        return []
+    lines = content.splitlines()
+    candidates: list[dict[str, Any]] = []
+    offset = 0
+    while len(candidates) < limit:
+        index = content.find(old_string, offset)
+        if index < 0:
+            break
+        start_line = content.count("\n", 0, index)
+        span_lines = max(1, old_string.count("\n") + 1)
+        block_start = max(0, start_line - context_lines)
+        block_end = min(len(lines), start_line + span_lines + context_lines)
+        candidates.append(
+            {
+                "line_start": block_start + 1,
+                "line_end": block_end,
+                "match_line": start_line + 1,
+                "text": "\n".join(lines[block_start:block_end]),
+            }
+        )
+        offset = index + max(len(old_string), 1)
+    return candidates
+
+
+_EDIT_HINT_STOPWORDS = frozenset(
+    {
+        "after", "before", "change", "code", "file", "fix", "from", "function",
+        "make", "returns", "script", "smallest", "then", "this", "verify", "where",
+        "with", "output", "into", "instead", "named", "result", "requested",
+    }
+)
+
+
+def _select_edit_context(
+    candidates: list[dict[str, Any]], user_request: str, old_string: str
+) -> dict[str, Any] | None:
+    """Select one ambiguous block only when request tokens identify it uniquely."""
+    request_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", user_request or "")
+        if token.lower() not in _EDIT_HINT_STOPWORDS
+    }
+    old_tokens = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", old_string or "")
+    }
+    hints = request_tokens - old_tokens
+    if not hints:
+        return None
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for candidate in candidates:
+        candidate_lines = str(candidate.get("text", "")).splitlines()
+        relative_match = max(
+            0,
+            int(candidate.get("match_line", candidate.get("line_end", 1)))
+            - int(candidate.get("line_start", 1)),
+        )
+        hint_text = "\n".join(candidate_lines[: relative_match + 1])
+        text_tokens = {
+            token.lower()
+            for token in re.findall(
+                r"[A-Za-z_][A-Za-z0-9_]{2,}", hint_text
+            )
+        }
+        scored.append((len(hints & text_tokens), candidate))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored or scored[0][0] <= 0:
+        return None
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return None
+    return scored[0][1]
 
 
 def _edit_preview(filepath: str, old_string: str, new_string: str) -> str:

@@ -6,6 +6,17 @@ Target branch: `develop`, through reviewed feature/fix branches
 
 Progress through 2026-07-20:
 
+2026-07-21 dogfood remediation update:
+
+- Read-only command safety, snapshot visibility, and no-write code-memory bootstrap are implemented and live-tested.
+- Ambiguous edit recovery, failed-mutation retries, and malformed JSON apostrophe preservation are implemented and live-tested.
+- Composite verification fallback, evidence-first output, stdout reporting, and recovered outcome semantics are implemented and live-tested.
+- Dedicated scoped PRD builds now execute exact acceptance commands and deterministic Python function/CLI conformance checks with bounded validation-guided repair.
+- Web requests now use search-shaped provider queries and preserve exact release/version semantics during evidence synthesis.
+- Abstract/code memory refreshes after applied mutations; fresh generation parity was confirmed in dogfood runs.
+- Current quality gate: 1510 passed, 2 skipped; compile and diff checks pass.
+- Remaining priority: reduce generic composite latency and model-call count while retaining the new evidence gates.
+
 - Recommended PR 2, the noninteractive full-request harness, is implemented.
 - Work Package 2's canonical v2 run/logging contract is implemented and its
   exit criteria are covered by deterministic tests.

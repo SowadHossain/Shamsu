@@ -10,6 +10,7 @@ from shamsu.action_ledger.context import get_current_run
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
+from shamsu.safety import read_only
 from shamsu.tools.workspace import MentionContext, MentionResolver, WorkspaceTool, render_mention_context
 
 
@@ -147,7 +148,13 @@ class AgentOrchestrator:
                 mentions=mentions,
                 action="memory.blocked",
             )
-        gate = self.abstract_service.ensure_ready()
+        # Index bootstrap/refresh can create the managed root `.cbmignore`.
+        # An explicit read-only request must not cause even that policy write;
+        # use the existing index if ready, or degraded local retrieval for this
+        # turn, and let the next mutating/ordinary turn refresh normally.
+        gate = self.abstract_service.ensure_ready(
+            auto_build=not read_only.applies(effective_input)
+        )
         if not gate.allowed:
             return AgentResult(
                 handled=True,

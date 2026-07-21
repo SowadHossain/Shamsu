@@ -257,8 +257,33 @@ def test_edit_file_fails_on_multiple_matches_without_replace_all(tmp_path: Path)
 
     assert result.ok is False
     assert result.data["matches"] == 3
+    assert len(result.data["candidate_contexts"]) == 3
+    assert result.data["candidate_contexts"][0]["text"].startswith("a = 1")
     # File is untouched on an ambiguous edit.
     assert (tmp_path / "nums.py").read_text(encoding="utf-8") == "a = 1\nb = 1\nc = 1\n"
+
+
+def test_edit_file_uses_uniquely_named_request_context_to_disambiguate(tmp_path: Path):
+    source = (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a + b\n"
+    )
+    _write(tmp_path, "calc.py", source)
+    registry = _registry(tmp_path)
+    registry.set_user_request("Fix the subtract function in calc.py so it returns a - b")
+
+    result = registry.edit_file("calc.py", "return a + b", "return a - b")
+
+    assert result.ok is True
+    assert result.data["auto_disambiguated"] is True
+    assert (tmp_path / "calc.py").read_text(encoding="utf-8") == (
+        "def add(a, b):\n"
+        "    return a + b\n\n"
+        "def subtract(a, b):\n"
+        "    return a - b\n"
+    )
 
 
 def test_edit_file_replace_all(tmp_path: Path):
@@ -422,3 +447,73 @@ def test_no_candidate_read_failure_names_the_files_that_do_exist(tmp_path: Path)
     assert "old_name.py" in message
     assert "NOT read" in message
     assert "find_file" not in message
+
+
+@pytest.mark.asyncio
+async def test_requested_new_file_recovers_from_failed_read_by_writing(tmp_path: Path):
+    registry = _registry(tmp_path)
+    client = _ScriptedClient(
+        [
+            _tool_response("read_file", {"filepath": "converter.py"}),
+            _tool_response(
+                "write_file",
+                {"filepath": "converter.py", "content": "print('212.0')\n"},
+            ),
+            _text_response("Created converter.py."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=registry,
+        llm=_NoPlanLLM(),
+        use_long_term_memory=False,
+        use_planner=False,
+    )
+
+    result = await loop.run("Create a new file named converter.py with the implementation.")
+
+    assert result.awaiting_user is False
+    assert result.changed_files == ("converter.py",)
+    assert (tmp_path / "converter.py").read_text(encoding="utf-8") == "print('212.0')\n"
+    user_contents = [message.content for message in loop.state.all_messages if message.role == "user"]
+    assert any("call write_file" in content and "Do not ask" in content for content in user_contents)
+
+
+@pytest.mark.asyncio
+async def test_failed_edit_prose_is_forced_into_bounded_mutation_retry(tmp_path: Path):
+    _write(tmp_path, "converter.py", "print('broken')\n")
+    registry = _registry(tmp_path)
+    client = _ScriptedClient(
+        [
+            _tool_response(
+                "edit_file",
+                {
+                    "filepath": "converter.py",
+                    "old_string": "missing",
+                    "new_string": "fixed",
+                },
+            ),
+            _text_response("The edit is fixed now."),
+            _tool_response(
+                "write_file",
+                {"filepath": "converter.py", "content": "print('fixed')\n"},
+            ),
+            _text_response("Fixed converter.py."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=registry,
+        llm=_NoPlanLLM(),
+        use_long_term_memory=False,
+        use_planner=False,
+    )
+
+    result = await loop.run("Fix converter.py.")
+
+    assert result.stopped is False
+    assert result.changed_files == ("converter.py",)
+    assert (tmp_path / "converter.py").read_text(encoding="utf-8") == "print('fixed')\n"
+    assert client.calls == 4

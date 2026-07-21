@@ -84,6 +84,26 @@ def test_run_command_missing_command_is_rejected(tmp_path: Path):
     assert result.data == {}
 
 
+def test_read_only_run_command_blocks_shell_redirection(tmp_path: Path):
+    registry = _registry(tmp_path)
+    registry.set_read_only(True)
+
+    result = registry.run_command('python calc.py 2>&1 > output.txt')
+
+    assert result.ok is False
+    assert result.data["read_only"] is True
+    assert not (tmp_path / "output.txt").exists()
+
+
+def test_read_only_run_command_allows_nonwriting_execution(tmp_path: Path):
+    registry = _registry(tmp_path)
+    registry.set_read_only(True)
+
+    result = registry.run_command(PASS_CMD)
+
+    assert result.ok is True
+
+
 def test_find_file_returns_matching_candidates(tmp_path: Path):
     (tmp_path / "client" / "src").mkdir(parents=True)
     (tmp_path / "admin" / "src").mkdir(parents=True)

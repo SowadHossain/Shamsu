@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from shamsu.cli.noninteractive import _ApprovalScript, run_cli, run_prompt
+from shamsu.cli.noninteractive import _ApprovalScript, _workspace_snapshot, run_cli, run_prompt
 from shamsu.cli.repl import parse_args
 from shamsu.safety.approval_context import get_approval_override
 from shamsu.types import ApprovalRequest
@@ -36,6 +36,14 @@ def test_parse_run_command_contract():
     assert args.approval == "allow"
     assert args.timeout == 12
     assert args.dry_run is True
+
+
+def test_workspace_snapshot_includes_root_code_memory_policy_file(tmp_path: Path):
+    (tmp_path / ".cbmignore").write_text("node_modules/\n", encoding="utf-8")
+
+    snapshot = _workspace_snapshot(tmp_path)
+
+    assert ".cbmignore" in snapshot
 
 
 def test_scripted_approvals_are_deterministic_and_default_to_deny():

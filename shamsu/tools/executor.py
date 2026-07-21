@@ -4,6 +4,7 @@ Internal command execution helpers for workspace-bound SHAMSU tools.
 from __future__ import annotations
 
 import re
+import os
 import subprocess
 import sys
 from collections.abc import Callable
@@ -27,6 +28,18 @@ BLOCKED_EXIT_CODE = 126
 DENIED_EXIT_CODE = 125
 TIMEOUT_EXIT_CODE = 124
 WORKSPACE_EXIT_CODE = 127
+
+
+def _platform_command(command: str) -> str:
+    """Use the running interpreter for `python3` command segments on Windows."""
+    if os.name != "nt" or not command:
+        return command
+    executable = f'"{sys.executable}"'
+    return re.sub(
+        r"(?i)(?P<prefix>^|(?:&&|\|\||[;&|])\s*)python3(?:\.exe)?(?=\s|$)",
+        lambda match: f"{match.group('prefix')}{executable}",
+        command,
+    )
 
 
 class CommandRunner(ICommandRunner):
@@ -57,6 +70,7 @@ class CommandRunner(ICommandRunner):
         self.last_diagnostics_path = ""
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
+        command = _platform_command(command)
         self.last_error_packet = None
         self.last_diagnostic_packet = None
         self.last_diagnostics_path = ""
