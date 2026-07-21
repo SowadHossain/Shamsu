@@ -14,6 +14,7 @@ import pytest
 
 from shamsu.cli.repl import (
     _classify_route_label,
+    _command_for_existing_script_request,
     _extract_prd_path_from_prompt,
     _is_conversational_prompt,
     _looks_like_capabilities_question,
@@ -91,6 +92,22 @@ def test_workspace_location_prompt(text, expected):
 )
 def test_workspace_files_prompt(text, expected):
     assert _looks_like_workspace_files_prompt(text) is expected
+
+
+def test_existing_script_run_routes_to_direct_command(tmp_path: Path):
+    (tmp_path / "qa_probe.py").write_text("print(5)\n", encoding="utf-8")
+
+    prompt = "Run qa_probe.py and tell me the command output. Do not change files."
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == "python qa_probe.py"
+    assert _classify_route_label(prompt, tmp_path) == "command.run"
+
+
+def test_script_run_route_requires_existing_workspace_file(tmp_path: Path):
+    prompt = "Run qa_probe.py and tell me the command output. Do not change files."
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == ""
+    assert _classify_route_label(prompt, tmp_path) != "command.run"
 
 
 @pytest.mark.parametrize(

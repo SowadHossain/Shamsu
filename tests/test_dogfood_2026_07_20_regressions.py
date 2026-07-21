@@ -328,7 +328,32 @@ def test_headless_dispatches_read_only_inspection_commands():
 
     assert "run" in _HEADLESS_COMMAND_HANDLERS
     assert "runs" in _HEADLESS_COMMAND_HANDLERS
+    assert "abstract" in _HEADLESS_COMMAND_HANDLERS
     assert "mcp" in _HEADLESS_COMMAND_HANDLERS
+
+
+def test_headless_dispatches_abstract_status(tmp_path: Path):
+    from rich.console import Console
+
+    from shamsu.cli.noninteractive import _dispatch_slash_command
+
+    console = Console(record=True)
+    handled, refusal = _dispatch_slash_command("abstract status", tmp_path, console)
+
+    assert handled is True
+    assert refusal == ""
+    assert "Index:" in console.export_text()
+
+
+def test_headless_refuses_mutating_abstract_commands(tmp_path: Path):
+    from rich.console import Console
+
+    from shamsu.cli.noninteractive import _dispatch_slash_command
+
+    handled, refusal = _dispatch_slash_command("abstract repair", tmp_path, Console())
+
+    assert handled is False
+    assert "not available in headless mode" in refusal
 
 
 def test_headless_dispatches_mcp_status(tmp_path: Path):

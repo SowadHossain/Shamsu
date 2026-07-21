@@ -967,9 +967,7 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
     if subcommand == "status":
         status = service.status()
         queue_status = get_memory_queue(workspace).status()
-        console.print(f"Graphiti available: {status.health.available} ({status.health.message})")
-        console.print(f"Local memory available: {status.local_available}")
-        console.print(f"Storage mode: {status.storage_mode}")
+        console.print(f"Codebase-Memory available: {status.health.available} ({status.health.message})")
         console.print(f"Mirror queue: {queue_status['pending']}/{queue_status['capacity']} pending")
         console.print(f"Index: {'stale' if status.index.stale else 'fresh'} - {status.index.message}")
         console.print(f"Normal code-agent mode allowed: {status.normal_mode_allowed}")
@@ -3553,6 +3551,71 @@ def _extract_requested_file_path(user_input: str) -> str | None:
     return None
 
 
+def _command_for_existing_script_request(user_input: str, workspace: Path) -> str:
+    text = str(user_input or "")
+    lowered = text.lower()
+    if not re.search(r"\b(?:run|execute|launch)\b", lowered):
+        return ""
+    requested = _extract_requested_file_path(text)
+    if not requested:
+        return ""
+    suffix = Path(requested).suffix.lower()
+    if suffix not in {".py", ".js", ".mjs", ".cjs"}:
+        return ""
+    try:
+        candidate = (Path(workspace).resolve() / requested).resolve()
+        candidate.relative_to(Path(workspace).resolve())
+    except (OSError, ValueError):
+        return ""
+    if not candidate.is_file():
+        return ""
+    rel = candidate.relative_to(Path(workspace).resolve()).as_posix()
+    quoted = subprocess.list2cmdline([rel]) if os.name == "nt" else shlex.quote(rel)
+    if suffix == ".py":
+        return f"python {quoted}"
+    return f"node {quoted}"
+
+
+def _handle_run_existing_script_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> str:
+    command = _command_for_existing_script_request(user_input, workspace)
+    if not command:
+        message = "I could not find an existing workspace script to run."
+        console.print(Panel(message, title="Run Command", border_style="yellow"))
+        _log_assistant_message(session_logger, message, workflow_id="command.run")
+        return message
+    ledger = get_current_run()
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=ledger,
+    )
+    call_id = ledger.log_tool_call("run_command", {"command": command}) if ledger else ""
+    if ledger:
+        ledger.log_event("verification_started", command=command, source="direct_script_run")
+    result = registry.execute("run_command", {"command": command})
+    if ledger:
+        ledger.log_tool_result(call_id, "run_command", result.ok, result.message, result.data)
+        ledger.log_event(
+            "verification_passed" if result.ok else "verification_failed",
+            command=command,
+            source="direct_script_run",
+            exit_code=result.data.get("exit_code"),
+        )
+    stdout = str(result.data.get("stdout") or "").strip()
+    stderr = str(result.data.get("stderr") or "").strip()
+    output = stdout or stderr or result.message
+    body = f"Command output:\n```\n{output}\n```" if result.ok else f"Command failed:\n```\n{output}\n```"
+    console.print(Panel(body, title=f"$ {command}", border_style="green" if result.ok else "red"))
+    _log_assistant_message(session_logger, body, workflow_id="command.run")
+    return body
+
+
 # The routing chain, as data (gap B2). This is the ONE ordered list of
 # (label, detector) rules; `_classify_route_label` walks it and `_handle_request`
 # dispatches on the label it returns, so there is exactly one place where "which
@@ -3589,6 +3652,7 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     ("prd.build", lambda text, ws: _looks_like_prd_build_request(text, ws)),
     ("file.read", lambda text, ws: _looks_like_file_read_request(text)),
     ("file.write", lambda text, ws: _looks_like_file_write_request(text)),
+    ("command.run", lambda text, ws: _command_for_existing_script_request(text, ws) != ""),
     # A self-contained coding question ("write python for the first 100 primes")
     # is answered directly by the model - no planner, no tool loop, no timeout.
     ("direct_code", lambda text, ws: _looks_like_direct_code_request(text)),
@@ -3653,6 +3717,20 @@ def _operation_plan(effective_input: str, workspace: Path) -> OperationPlan:
                     id=1,
                     kind="mutation",
                     route="prd.build",
+                    instruction=effective_input.strip(),
+                ),
+            ),
+        )
+    if _command_for_existing_script_request(effective_input, workspace):
+        return OperationPlan(
+            prompt=effective_input.strip(),
+            candidates=("command.run",),
+            clauses=(effective_input.strip(),),
+            steps=(
+                OperationStep(
+                    id=1,
+                    kind="verify",
+                    route="command.run",
                     instruction=effective_input.strip(),
                 ),
             ),
@@ -3846,6 +3924,14 @@ async def _handle_request(
             user_request=effective_input,
             use_long_term_memory=False,
             use_planner=False,
+        )
+        return
+    if route_label == "command.run":
+        _handle_run_existing_script_request(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
         )
         return
     if route_label == "direct_code":

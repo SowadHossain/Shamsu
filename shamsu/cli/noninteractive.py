@@ -77,6 +77,7 @@ _HEADLESS_COMMAND_HANDLERS: dict[str, str] = {
     "runs": "_handle_runs",
     "run": "_handle_run",
     "doctor": "_handle_doctor",
+    "abstract": "_handle_abstract_inspection",
     "tasks": "_handle_tasks",
     "permissions": "_handle_permissions",
     "mcp": "_handle_mcp_inspection",
@@ -108,11 +109,21 @@ def _dispatch_slash_command(
         from shamsu.mcp.cli import handle_mcp_command
 
         handle_mcp_command(normalized, workspace, console)
+    elif handler_name == "_handle_abstract_inspection":
+        parts = normalized.split()
+        subcommand = parts[1].lower() if len(parts) > 1 else "status"
+        if subcommand not in {"status", "query", "exports", "imports", "symbols", "who-uses", "impact"}:
+            return False, (
+                f"/abstract {subcommand} is not available in headless mode. "
+                "Supported here: /abstract status, /abstract query <text>, "
+                "/abstract exports|imports|symbols|who-uses|impact <target>."
+            )
+        repl._handle_abstract(normalized, workspace, console)
     else:
         handler = getattr(repl, handler_name)
     if handler_name == "_handle_doctor":
         handler(workspace, console)
-    elif handler_name != "_handle_mcp_inspection":
+    elif handler_name not in {"_handle_mcp_inspection", "_handle_abstract_inspection"}:
         handler(normalized, workspace, console)
     return True, ""
 
