@@ -1,285 +1,230 @@
 # Agent Context: SHAMSU
 
-This file is the quick-start context for agents working in this repository.
+Quick-start context for any agent working in this repository. Read this first,
+then `CURRENT_STATE.md` for what actually works today.
 
-## Repository Snapshot
+Last verified: **2026-07-20** (tests, layout, model tiers, and route table all
+checked against the code on this date).
 
-- Repo path: `F:\Work\PROJECTS\shamsu\Shamsu`
-- Remote: `https://github.com/SowadHossain/Shamsu.git`
-- Current branch: `main`
-- Current state: Day-1 scaffold unpacked, installed, and extended with the first dev-plan slice.
-- Existing source documents:
-  - `agent context/REQUIREMENTS.md`: full product requirements for SHAMSU.
-  - `agent context/SHAMSU_week2_milestone_v2.md`: v0.2.0 implementation milestone focused on PRD-to-Django project generation.
-  - `agent context/SHAMSU_10day_dev_plan.md`: current 10-day build plan based on the scaffold zip.
-  - `agent context/PROGRESS.md`: live completed-feature and next-task tracker.
+---
 
-## Product Identity
+## 1. Where Things Are
+
+- **Repo root (the real one):** `F:\Work\PROJECTS\shamsu\Shamsu`
+  The parent folder `F:\Work\PROJECTS\shamsu` is *not* the package. It holds the
+  repo plus scratch dogfood workspaces (`test-shamsu/`, `shamsu-launcher-test/`).
+  Run `pytest`, `ruff`, and `python -m shamsu...` from the nested `Shamsu\` dir.
+- **Remote:** `https://github.com/SowadHossain/Shamsu.git`
+- **Branching:** feature branches target `develop`. Do not push directly to `main`.
+- **Version:** `0.4.0b1` (see `pyproject.toml`)
+- **Python:** 3.11+. Always use the repo venv: `.\.venv\Scripts\python.exe`.
+
+### Docs that exist in `agent context/`
+
+| File | What it is |
+|---|---|
+| `AGENTS.md` | This file. Orientation + rules for agents. |
+| `CURRENT_STATE.md` | **Ground truth**: what is built, what works, what is broken. |
+| `REQUIREMENTS.md` | The original product spec, now with a conformance table. Aspirational in places — check the status markers before trusting a line. |
+| `PROGRESS.md` | Append-only implementation ledger. Long. Historical detail lives here. |
+| `SHAMSU_RELIABILITY_PRODUCT_PLAN.md` | The reliability work-package plan (WP1–WP12). |
+| `prompts/` | Currently empty. |
+
+Docs referenced by older notes that **no longer exist**: `SHAMSU_week2_milestone_v2.md`,
+`SHAMSU_10day_dev_plan.md`, `DEV-TASK-DIVI.MD`, `MILESTONE-2-FINISH-PLAN.md`,
+`claude-hand-off-plan.md`, `SHAMSU_agent_gap_analysis.md`, `v2.3-techstack-recomendation.md`.
+If a doc cites one of those, treat that citation as history, not as a live pointer.
+
+Root-level docs: `README.md` (for humans), `CHANGELOG.md`, `BENCHMARK.md` /
+`BENCHMARK-light.md` (model-quality evals), `RELEASE_VALIDATION.md`
+(deterministic runtime gates), `DEMO_SCRIPT.md`.
+
+---
+
+## 2. Product Identity
 
 SHAMSU is a local-first autonomous coding agent for low-resource machines.
 
 Core promise:
 
 - Run on sub-8GB devices.
-- Avoid cloud API bills.
-- Keep source code local and private.
-- Use deterministic tools for scanning, indexing, parsing, searching, and validation.
-- Use small local LLMs only for reasoning, planning, summarization, and code generation.
+- No cloud API bills. Inference is local-only via Ollama on `localhost:11434`.
+- Source code stays local and private.
+- Deterministic tools do the scanning, indexing, parsing, searching, and validation.
+- Small local LLMs are used only for reasoning, planning, summarization, and generation.
 
-The central engineering principle is:
+The central engineering principle:
 
-> Do not use the LLM as a brute-force scanner. Use tools to find the right context, then use the LLM to reason and generate.
+> Do not use the LLM as a brute-force scanner. Use tools to find the right
+> context, then use the LLM to reason and generate.
 
-## MVP Scope From Requirements
+---
 
-The MVP should include:
+## 3. Package Map
 
-- CLI interface.
-- Project folder loading.
-- Workspace sandbox enforcement.
-- Non-LLM project indexing.
-- Search and retrieval.
-- Context builder.
-- Local small LLM integration.
-- Markdown, TXT, and PDF PRD parsing.
-- Task planning from PRD.
-- Code generation.
-- File creation.
-- Patch-based code editing.
-- Patch preview and approval.
-- Dangerous command blocking.
-- Approved test execution.
-- Progress logging.
-- Basic documentation generation.
-- Basic bug fixing.
-- Basic code audit.
+`shamsu/` — 201 modules. The ones that matter most:
 
-## Target Architecture
+| Package | Role |
+|---|---|
+| `cli/` | Entry point. `repl.py` (~8.9k lines) is the interactive + headless driver; `command_router.py`, `noninteractive.py`, `arguments.py`, `request_lifecycle.py`, `approval_ui.py`, `session_commands.py` split out of it. |
+| `agents/` | Workflows: `chat_loop.py` (the ReAct loop), `orchestrator.py` (pre-model deterministic answers), `qa_workflow.py`, `code_edit_workflow.py`, `bugfix_workflow.py`, `audit_workflow.py`, `doc_workflow.py`, `test_generation_workflow.py`, `plan_mode.py`, `planner.py`, `full_pipeline.py`, `scaffold_*`, `*_fallback.py`. |
+| `routing/` | `operations.py` — deterministic parsing of composite multi-action prompts into an ordered `OperationPlan`. |
+| `llm/` | `manager.py` (specialist dispatch, streaming, lazy model pull), `output.py` (`parse_model_turn` — salvages tool calls from messy small-model output), `council.py` (draft→critique→reconcile, gated). |
+| `runtime/` | `models.py` (tier cookbook), `ollama.py`, `doctor.py`, `session_registry.py`. |
+| `action_ledger/` | Canonical per-run artifacts: events, decisions, tool-calls, model-calls, contexts, mutations, final output, manifest. |
+| `indexer/` | `walker.py` (incremental SQLite/FTS5 index), `parser.py` (tree-sitter/AST symbols). |
+| `retriever/`, `context/` | Search + ranking, context packing and budgeting. |
+| `abstract/`, `memory/` | Code-memory / abstract index; optional Graphiti+FalkorDB adapter with SQLite store. |
+| `safety/` | Sandbox, command classification, approvals, permission memory, autonomy toggle, clarification. |
+| `verify/` | `gate.py` (verification gate), `checks.py`, `dod.py`, `prd_checklist.py`. |
+| `tools/` | Model-facing tools: `agent_tools.py`, `workspace.py`, `executor.py`, `git.py`, `web.py`, `browser.py`, `dev_server.py`, `django.py`. |
+| `prd/`, `templates/`, `registry/` | PRD parse/extract/plan, Django + frontend generators, category registry. |
+| `tasks/`, `plans/`, `taskmaster/` | `MilestoneTask` state, plan-mode plans, task decomposition. |
+| `diagnostics/`, `repair/`, `audit/`, `session/`, `ui/` | Error parsing/adapters, repair loops, audit trail, session store, Rich rendering. |
 
-The requirements describe these main modules:
+`tests/` — 125 files. `evals/` — task-success harness (`python -m evals`).
+`scripts/` — install/uninstall/doctor/run for PowerShell and Bash, plus
+`benchmark_mvp.py` and `validate_release.py`.
 
-- CLI interface
-- Coordinator agent
-- Planner agent
-- Search agent / retriever
-- Project indexer
-- Context builder
-- LLM manager
-- Code writer
-- Review agent
-- Test agent
-- Documentation agent
-- Safety manager
-- Tool executor
-- Logger
-- Storage layer
+---
 
-Suggested local data folder:
+## 4. Models
 
-```text
-.shamsu/
-  index.db
-  tasks/
-  logs/
-  context/
-  skills/
-  config.json
-```
+Three tiers, one role contract (`shamsu/runtime/models.py`). Thinking roles
+(router/qa/planner/classifier/review/docs/summarizer/chat) get one anchor;
+coding roles (coder/frontend/backend/tests/bugfix) get the other.
 
-## Current Milestone Direction
+| Tier | Thinking anchor | Coding anchor |
+|---|---|---|
+| `light` (8GB, CPU-only) | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` |
+| `default` (8GB cookbook) | `deepseek-r1:7b` | `qwen2.5-coder:7b-instruct` |
+| `heavy` (16GB+) | `mistral-nemo:12b` | `qwen2.5-coder:14b` |
 
-`SHAMSU_week2_milestone_v2.md` narrows v0.2.0 toward generating complete Django web projects from PRDs.
+- `qwen3:8b` and `gemma3:4b` are **former** anchors — still allowed and known,
+  never auto-pulled. Older docs naming either as "the default" are stale.
+- `ModelSpec` carries capability flags: `supports_native_tools` and
+  `is_reasoning`. Do not assume a model does native tool-calling — the default
+  thinking anchor (`deepseek-r1:7b`) does not, and gets a prompt-level tool
+  protocol with `llm/output.py` as the primary parser.
+- Active tier is process-global (`initialize_model_tier` / `set_model_tier`),
+  persisted at `.shamsu/model_tier.json`, overridable with `SHAMSU_MODEL_TIER`.
+- `SHAMSU_SINGLE_MODEL_MODE=1` routes every role to the thinking anchor.
 
-Chosen generated-app stack:
+---
 
-- Python 3.11+
-- Django 5
-- Django REST Framework
-- django.contrib.auth plus simplejwt
-- SQLite for development
-- Django templates
-- HTMX
-- DaisyUI and Tailwind via CDN
-- django-crispy-forms plus crispy-tailwind
-- Django TestCase plus DRF APIClient
+## 5. How Requests Are Routed
 
-Rationale:
+`_ROUTE_RULES` in `shamsu/cli/repl.py` (~line 3554) is a single ordered table.
+**Order is the logic: top-down, first match wins.** Moving a rule changes
+behavior; `tests/test_routing_matrix.py` pins it.
 
-- Django and DRF reduce generated code volume.
-- Built-in auth and ORM reduce custom security and persistence code.
-- Templates plus HTMX avoid a separate frontend server, CORS, JWT-in-browser complexity, and node_modules.
-- DaisyUI gives stable semantic class names for small-model-friendly UI generation.
+Current order: `prd_summary` → `git` → `workspace.location` → `workspace.files`
+→ `prd.build` → `file.read` → `file.write` → `direct_code` → `workspace.prds`
+→ `continue_game` → `run_game` → `dev_server.recovery` → `dev_server` →
+`prd.context_question` → `browser` → `web` → `agent-chat` → `django` →
+`plan_prd`. No match falls through to `qa` (`ROUTE_FALLTHROUGH`), the tool-less
+QA brain.
 
-## Week 2 Pipeline To Preserve
+Before routing, `AgentOrchestrator` answers deterministic workspace questions
+(location, file listing, PRD discovery) without a model call at all.
 
-The milestone proposes this PRD-to-project flow:
+Composite prompts ("read X and then fix Y") are split by
+`routing/operations.py` into an ordered `OperationPlan` before dispatch.
 
-1. Parse PRD with non-LLM tools.
-2. Extract entities, endpoints, pages, and relationships.
-3. Use a planner model to create a project plan.
-4. Ask for approval.
-5. Generate fixed template files without LLM calls.
-6. Generate Django backend files in dependency order:
-   - `models.py`
-   - `serializers.py`
-   - `forms.py`
-   - `views.py`
-   - `urls.py`
-   - `admin.py`
-7. Generate frontend templates after backend URL and view names exist.
-8. Generate tests.
-9. Run install, migration, and test commands behind approval gates.
-10. Feed errors into a targeted bug-fix loop.
-11. Generate README and final summary.
+---
 
-Dependency order matters. Do not generate templates before URLs/views exist, and do not generate serializers/forms/views before models exist.
+## 6. Running SHAMSU
 
-## Safety Rules To Keep Front And Center
-
-The system is safety-first by design:
-
-- Treat the active project folder as the workspace boundary.
-- Block path traversal and sensitive system paths.
-- Ask before writing, editing, deleting, moving files, installing dependencies, running commands, accessing the internet, or calling external tools.
-- Prefer patch-based edits with preview.
-- Block dangerous commands by default.
-- Redact secrets in logs and summaries.
-- Do not send private project source code to external web services.
-- Log file modifications and command executions.
-
-## Practical Next Implementation Path
-
-The scaffold package now exists. The next step is to continue the day-by-day plan from `agent context/SHAMSU_10day_dev_plan.md`.
-Update `agent context/PROGRESS.md` at the end of each feature slice.
-
-Completed first slice:
-
-- Scaffold extracted from `SHAMSU_day1_scaffold.zip`.
-- `pyproject.toml`, package files, `.github` CI config, and baseline tests are present.
-- Baseline scaffold tests pass.
-- `indexer/walker.py` indexes project files into SQLite using streamed sha256 hashing.
-- `indexer/parser.py` extracts Python imports, classes, functions, methods, docstrings, signatures, and line ranges.
-- The file walker now writes symbols and searchable line-window snippets.
-- The file walker removes stale index rows after file moves/deletes.
-- `core/coordinator.py` routes requests and falls back to QA preview if Ollama is unavailable.
-- `agents/qa_workflow.py` wires `SearchAgentStub` to `ContextBuilder`.
-- `prd/parser.py` parses Markdown/plain-text PRD content into `ParsedPRD`.
-- `prd/input.py` accepts Markdown, TXT, and PDF PRD files.
-- `prd/extractor.py` extracts `EntitySpec` values, field types, choices, optional fields, and relationships from PRD entity sections.
-- `prd/project.py` assembles `ProjectSpec` values with inferred endpoints, pages, theme, and generation order.
-- `prd/state.py` stores accepted generation-plan resume state under workspace `.shamsu/`.
-- `templates/django/constants.py` and `templates/django/renderer.py` provide deterministic fixed Django generation.
-- `templates/django/generators.py` deterministically generates backend `models.py`, `serializers.py`, `forms.py`, `views.py`, app `urls.py`, and `admin.py`.
-- `templates/django/writer.py` writes generated Django files inside the workspace behind approval and updates generation resume state.
-- `templates/django/checker.py` statically checks backend model/serializer/form/view/url/admin references.
-- `session/manager.py` stores workspace-local sessions, appends redacted JSONL events, supports resume/list/rename/close/export, and writes shareable ZIP bundles.
-- `safety/approval.py` displays Rich approval panels.
-- `cli/repl.py` supports `--workspace <path>`, `--session <id-or-title>`, `--new-session [title]`, `index`, `status`, `search <query>`, `symbols <name>`, `parse-prd <file>`, `plan-prd <file>`, `generate-django <file>`, session management commands, `log tail`, and QA context preview.
-- `scripts/install.ps1` and `scripts/install.sh` install into repo-local `.venv`.
-- `scripts/run-shamsu.ps1` and `scripts/run-shamsu.sh` run SHAMSU from that `.venv` while preserving the caller workspace.
-- `parse-prd` and `plan-prd` file inputs are validated through `Sandbox.validate()`.
-- `tools/executor.py` provides an internal `CommandRunner` with workspace-bound `cwd` validation, blocked-command rejection, approval gates, timeout handling, output capture, and redaction.
-- `patch/engine.py` validates unified diffs, checks hunk structure and counts, and rejects unsafe patch paths.
-- `patch/preview.py` renders Rich patch summaries and colorized diff previews.
-- `LLMManager`, `CommandRunner`, `PatchEngine`, and `DjangoProjectWriter` accept an optional `SessionLogger` and keep normal behavior unchanged when no logger is passed.
-
-Recommended next slice:
-
-1. Add frontend page generation for dashboard/list/detail/form templates.
-2. Add migration/dependency/test runner flow for generated Django projects.
-3. Add generated-project feedback loop that uses test/check failures to produce fixes.
-4. Keep the session logger wired into new workflows through optional dependency injection.
-5. Keep `types.py` and `interfaces.py` frozen unless the team explicitly agrees to change them.
-
-## Suggested Initial File Layout
-
-```text
-src/shamsu/
-  __init__.py
-  cli.py
-  config.py
-  specs.py
-  safety.py
-  workspace.py
-  logging.py
-  prd/
-    __init__.py
-    parser.py
-    extractor.py
-  generation/
-    __init__.py
-    django_project.py
-    templates.py
-    validators.py
-  tools/
-    __init__.py
-    command_runner.py
-    patcher.py
-  indexing/
-    __init__.py
-    file_walker.py
-    symbols.py
-  llm/
-    __init__.py
-    manager.py
-    prompts.py
-tests/
-```
-
-## Development Notes
-
-- Use Python-first tooling unless the project direction changes.
-- Keep generated-app templates deterministic whenever possible.
-- Use local files and indexes as the handoff mechanism between models.
-- Keep memory usage low; avoid always-on heavy services.
-- Keep implementation small and testable. The project is trying to help small models, so the codebase itself should be boring in the best way.
-- Some existing markdown text appears to contain mojibake/encoding artifacts. Preserve meaning when editing docs, but avoid broad formatting churn unless the user asks for cleanup.
-
-## Useful Commands
-
-Current repository inspection:
+Interactive:
 
 ```powershell
-git status --short --branch
-git log --oneline -5
-rg -n "^(#|##|###) " "agent context"
-python -m pytest tests/ -v
-python -m ruff check shamsu tests
-python -m shamsu.indexer.walker
-.\scripts\install.ps1
 .\scripts\run-shamsu.ps1
 ```
 
-Session commands:
+Headless (this is what the dogfood harness uses):
 
 ```powershell
-.\scripts\run-shamsu.ps1 --new-session "Todo PRD run"
-.\scripts\run-shamsu.ps1 --session 20260702
+python -m shamsu.cli.repl run `
+  --workspace F:\path\to\workspace `
+  --prompt "<prompt>" `
+  --output json `
+  --approval allow   # or: deny
 ```
 
-Inside the REPL:
+Other `run` flags: `--session`, `--new-session`, `--dry-run`, `--timeout`.
 
-```text
-sessions list
-sessions current
-sessions resume <id-or-title>
-sessions rename <id> <title>
-sessions close [id]
-sessions export <id>
-log tail
-```
+Every prompt writes a run bundle under `<workspace>\.shamsu\runs\<run-id>\`:
+`manifest.json`, `events.jsonl`, `decisions.jsonl`, `tool-calls.jsonl`,
+`model-calls.jsonl`, `mutations/mutations.jsonl`, `context-preview.json`,
+`contexts/`, `final-output.md`, `summary.json`. Inspect with `/runs` and
+`/run show|timeline|decisions|tools|commands|context|diff|validate` **inside the
+REPL** — see the known bug in §8 about slash commands in headless mode.
 
-REPL smoke checks:
+---
+
+## 7. Safety Rules To Keep Front And Center
+
+- The active project folder is the workspace boundary. Block path traversal and
+  sensitive system paths.
+- Ask before writing, editing, deleting, or moving files; installing
+  dependencies; running commands; accessing the internet; calling external tools.
+- Prefer patch-based edits with preview; fall back to full-file rewrite only on
+  a *malformed* diff, never on a user denial.
+- Block dangerous commands by default. `run_command`, `file_delete`,
+  `web_search`, and `mcp_tool` are never auto-approvable, regardless of
+  remembered permissions.
+- Redact secrets in logs and summaries. Never send private source to the web.
+- Answer local workspace questions with deterministic tools before an LLM call.
+- Resolve `@file` / `@folder` mentions through the sandbox only.
+- Preserve recent conversation turns so follow-ups inherit context.
+
+---
+
+## 8. Known-Broken Behavior (read before you "fix" something)
+
+From the fresh dogfood pass on 2026-07-20
+(`../../test-shamsu/SHAMSU_FRESH_DOGFOOD_2026-07-20.md`). The artifact/logging
+layer is healthy; the **behavior layer is not**. Open bugs, highest value first:
+
+1. Stale PRD/TaskFlow context leaks into unrelated prompts.
+2. Simple file-creation prompts misroute to `prd.build`.
+3. "Do not change files" is not honored when broad approvals are allowed.
+4. Running a command can turn its stdout into a file write.
+5. A read-only web answer is mislabeled `failed` / route `file.write`.
+6. Dry-run produces no planned mutation for new-file creation.
+7. Headless slash commands (`/run show`) are not handled before model dispatch.
+8. Artifact validation checks completeness, not task semantics — a wrong result
+   still validates `ok`.
+
+Do not treat "run validation ok" as "the agent did the right thing."
+
+---
+
+## 9. Working Rules For Agents
+
+- Keep `shamsu/types.py` and `shamsu/interfaces.py` stable unless the team
+  explicitly agrees to change the contract.
+- Update `CURRENT_STATE.md` when behavior changes; append to `PROGRESS.md` for
+  the historical record. Do not rewrite `PROGRESS.md` history.
+- Keep generated-app templates deterministic wherever possible.
+- Use local files and indexes as the handoff mechanism between models.
+- Keep memory usage low; avoid always-on heavy services.
+- Keep implementation small and testable. SHAMSU exists to help small models —
+  the codebase itself should be boring in the best way.
+- Some older markdown contains mojibake. Preserve meaning when editing, but
+  avoid broad formatting churn unless asked.
+
+---
+
+## 10. Verification Commands
 
 ```powershell
-@'
-index
-how does login work?
-exit
-'@ | python -m shamsu.cli.repl
-
-@'
-parse-prd "agent context/SHAMSU_10day_dev_plan.md"
-exit
-'@ | python -m shamsu.cli.repl
+.\.venv\Scripts\python.exe -m pytest tests/ -q
+.\.venv\Scripts\python.exe -m ruff check shamsu tests scripts
+.\.venv\Scripts\python.exe -m evals            # model-quality task success
+.\.venv\Scripts\python.exe scripts\validate_release.py
+.\scripts\doctor.ps1
 ```
+
+Baseline as of 2026-07-20: **1418 passed, 1 skipped**; evals 11/12 on the
+default tier (2 cases flagged flaky); release gate PASS.

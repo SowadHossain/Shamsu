@@ -1,0 +1,20 @@
+{
+  "name": "shamsu-multiplayer-game",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "client",
+    "server"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c blue,green \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "npm --workspace server run dev",
+    "dev:client": "npm --workspace client run dev",
+    "build": "npm --workspace server run build && npm --workspace client run build",
+    "build:server": "npm --workspace server run build",
+    "build:client": "npm --workspace client run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

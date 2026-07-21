@@ -113,6 +113,6 @@ async def test_code_edit_workflow_reports_denied_or_failed_apply(tmp_path: Path)
     ).run("change value to 2")
 
     assert result.applied is False
-    assert result.error == "Patch was not applied."
+    assert result.error == "Patch denied by user."
     assert result.changed_files == ["app.py"]
     assert target.read_text(encoding="utf-8") == "value = 1\n"

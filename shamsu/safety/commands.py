@@ -41,14 +41,51 @@ SECRET_PATTERNS = [
     r"AKIA[0-9A-Z]{16}",                      # AWS key
     r"sk-[a-zA-Z0-9]{32,}",                   # OpenAI-style key
     r"ghp_[a-zA-Z0-9]{36}",                   # GitHub token
+    r"-----BEGIN.*PRIVATE KEY[^-]*-----[\s\S]+?-----END.*PRIVATE KEY[^-]*-----",
     r"-----BEGIN.*PRIVATE KEY",
     r"password\s*=\s*['\"][^'\"]+",
+    r'"password"\s*:\s*"[^"]+"',
     r"api_key\s*=\s*['\"][^'\"]+",
+    r'"api_key"\s*:\s*"[^"]+"',
     r"secret\s*=\s*['\"][^'\"]+",
+    r'"secret"\s*:\s*"[^"]+"',
+    r"token\s*=\s*['\"][^'\"]+",
+    r'"token"\s*:\s*"[^"]+"',
     r"SECRET_KEY\s*=\s*['\"][^'\"]+",         # Django-specific
+    r'"SECRET_KEY"\s*:\s*"[^"]+"',             # Django-specific JSON logs
+    r"[Aa]uthorization\s*:\s*(Bearer|Basic|Token)\s+\S+",  # HTTP auth headers
+    r'"[Aa]uthorization"\s*:\s*"[^"]+"',
     r"postgresql://[^@]*:[^@]*@",
     r"mysql://[^@]*:[^@]*@",
+    r"mongodb(\+srv)?://[^@]*:[^@]*@",
 ]
+
+
+# Action types that MAY be auto-approved once the user chooses to remember
+# a decision for them (see shamsu/safety/permission_store.py). Shell commands,
+# deletions, and external network actions are never auto-approvable here,
+# regardless of remembered choices — those always go through approval_func.
+AUTO_APPROVABLE_ACTION_TYPES = {"file_write", "file_edit"}
+
+
+def is_auto_approvable_action(action_type: str) -> bool:
+    return action_type in AUTO_APPROVABLE_ACTION_TYPES
+
+
+# Shell syntax and commands that can write into the current workspace. This is
+# intentionally conservative: read-only requests may run tests and programs,
+# but they may not smuggle a write past the file-tool guard via the shell.
+_SHELL_WRITE_RE = re.compile(
+    r"(?:^|\s)(?:>>?|[12]>>?|&>)\s*[^&|]"
+    r"|\b(?:tee|out-file|set-content|add-content|new-item|remove-item|move-item|"
+    r"copy-item|touch|mkdir|rmdir|del|erase|move|copy|rm|mv|cp)\b",
+    re.IGNORECASE,
+)
+
+
+def command_may_write_workspace(command: str) -> bool:
+    """Return True when shell syntax visibly writes files or directories."""
+    return bool(_SHELL_WRITE_RE.search(command or ""))
 
 
 def classify_command(cmd: str) -> CommandRisk:

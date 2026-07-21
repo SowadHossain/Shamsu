@@ -1,0 +1,59 @@
+category: multiplayer-game
+stack:
+  runtime: node
+  framework: vite-react-ts
+  render: r3f
+  net: colyseus-relay
+  physics: rapier
+  db: sqlite
+  ui_state: zustand
+entry: client/src/main.tsx
+build_cmd: "npm install && npm run build"
+run_cmd: "npm run dev"
+preview_url: "http://localhost:5173"
+# Everything common to multiplayer games is pre-coded and working. The model
+# only fills these holes with game-specific logic. Read the file around each
+# marker before writing; keep every export the rest of the app imports.
+holes:
+  - id: entity.player
+    target_file: client/src/game/entities.ts
+    marker: "// HOLE:entity.player"
+    kind: schema
+    signature: "makePlayer(id: string, color: string): Entity"
+    description: "Player-specific fields (health, size, color, abilities) in the entity bag."
+    depends_on: []
+  - id: entity.world
+    target_file: client/src/game/entities.ts
+    marker: "// HOLE:entity.world"
+    kind: schema
+    signature: "makePickup(id, x, z) and any other non-player entity makers"
+    description: "Non-player entities (obstacles, pickups) and their fields."
+    depends_on: []
+  - id: rule.update
+    target_file: client/src/game/rules.ts
+    marker: "// HOLE:rule.update"
+    kind: function
+    signature: "updateWorld(world: World, ctx: TickContext): void"
+    description: "Per-tick logic: move the player from input, move/spawn entities, handle collisions, call ctx.onScore."
+    depends_on: [entity.player, entity.world]
+  - id: rule.win
+    target_file: client/src/game/rules.ts
+    marker: "// HOLE:rule.win"
+    kind: function
+    signature: "checkWin(world: World): boolean"
+    description: "The local end condition (the server also enforces score >= winScore)."
+    depends_on: [rule.update]
+  - id: rule.score
+    target_file: client/src/game/rules.ts
+    marker: "// HOLE:rule.score"
+    kind: function
+    signature: "scorePoints(): number"
+    description: "How many points one scoring event is worth."
+    depends_on: [rule.update]
+  - id: ui.hud
+    target_file: client/src/ui/Hud.tsx
+    marker: "// HOLE:ui.hud"
+    kind: component
+    signature: "bind HUD slots to game state fields"
+    description: "Bind the pre-built HUD slots to the real game-state fields."
+    depends_on: [entity.player, rule.score]

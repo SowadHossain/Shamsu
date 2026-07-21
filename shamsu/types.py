@@ -32,16 +32,6 @@ class SearchResult:
     chunk_type: Literal["function", "class", "import_block", "window", "html_block"] = "window"
 
 
-@dataclass
-class IndexEntry:
-    file_id: int
-    path: str
-    language: str
-    hash: str
-    symbol_count: int
-    last_modified: float
-
-
 # ─────────────────────────────────────────────────────────────────────────
 # Context packs (Dev B owns the builder, the LLM layer consumes)
 # ─────────────────────────────────────────────────────────────────────────
@@ -99,6 +89,7 @@ class TaskStep:
     target_file: Optional[str] = None
     result: Optional[str] = None
     error: Optional[str] = None
+    phase: str = "default"
 
 
 @dataclass
@@ -123,6 +114,14 @@ class TaskState:
 # ─────────────────────────────────────────────────────────────────────────
 # Project generation spec (PRD → Django project)
 # ─────────────────────────────────────────────────────────────────────────
+
+class Archetype(str, Enum):
+    WEB_CRUD = "web_crud"
+    REST_API = "rest_api"
+    SAAS_FULLSTACK = "saas_fullstack"
+    REALTIME_3D_GAME = "realtime_3d_game"
+    GENERIC_WEB = "generic_web"
+
 
 @dataclass
 class EntityFieldSpec:
@@ -165,6 +164,23 @@ class DjangoFileSpec:
 
 
 @dataclass
+class Hole:
+    id: str
+    hole_type: str
+    target_file: str
+    description: str
+    signature: Optional[str] = None
+    schema: Optional[dict[str, Any]] = None
+    depends_on: list[str] = field(default_factory=list)
+    specialist: str = "coder"
+
+
+@dataclass
+class GenerationManifest:
+    holes: list[Hole] = field(default_factory=list)
+
+
+@dataclass
 class ProjectSpec:
     project_name: str
     app_name: str
@@ -173,6 +189,24 @@ class ProjectSpec:
     pages: list[PageSpec]
     theme: str = "corporate"            # DaisyUI theme
     generation_order: list[DjangoFileSpec] = field(default_factory=list)
+    archetype: Archetype = Archetype.WEB_CRUD
+    archetype_confidence: float = 1.0
+    archetype_spec: Any = None
+    category: str | None = None
+    master_prompt: str = ""
+    manifest_path: str = ""
+    dod_path: str = ""
+    feature_requests: list[str] = field(default_factory=list)
+    # Populated by build_project_spec: the structured PRD (source of truth) and
+    # the chosen generation strategy. Typed as Any to avoid importing the prd/
+    # registry dataclasses into this base types module.
+    prd_contract: Any = None            # shamsu.prd.contract.PRDContract
+    suitability: Any = None             # shamsu.registry.suitability.TemplateSuitability
+    generation_ready: bool = True
+    needs_input: bool = False
+    clarification_question: str = ""
+    assumptions: list[str] = field(default_factory=list)
+    definition_of_done: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -202,6 +236,61 @@ class RoutingDecision:
     confidence: float = 1.0
 
 
+@dataclass(frozen=True)
+class ToolDefinition:
+    name: str
+    description: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    required: list[str] = field(default_factory=list)
+
+    def to_ollama_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": self.parameters,
+                    "required": self.required,
+                },
+            },
+        }
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    ok: bool
+    message: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> str:
+        import json
+
+        return json.dumps(
+            {"ok": self.ok, "message": self.message, "data": self.data},
+            ensure_ascii=True,
+            default=str,
+        )
+
+
+class RunStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    CANCELLED = "cancelled"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    TIMED_OUT = "timed_out"
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Safety
 # ─────────────────────────────────────────────────────────────────────────
@@ -217,6 +306,7 @@ class ApprovalRequest:
     preview: Optional[str] = None
     working_dir: Optional[str] = None
     reason: Optional[str] = None
+    target_paths: list[str] = field(default_factory=list)
 
 
 class CommandRisk(str, Enum):
@@ -234,6 +324,12 @@ class ParsedPRD:
     title: str
     sections: dict[str, list[str]]    # heading -> list of bullet/line strings
     raw_text: str = ""
+    source_path: str = ""
+    source_kind: str = "text"
+    source_refs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    tables: list[dict[str, Any]] = field(default_factory=list)
+    extraction_confidence: float = 1.0
+    extraction_warnings: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────

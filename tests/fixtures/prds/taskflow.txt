@@ -1,0 +1,81 @@
+TaskFlow Todo App
+
+1 Product Overview
+TaskFlow is a secure full-stack web application for personal task management.
+
+1.2 Product Summary
+Users create accounts, log in, and manage private tasks and categories in SQLite.
+
+3 Target Users
+- Students
+- Employees
+
+4 User Roles
+
+4.1 Regular User
+Owns a private workspace.
+
+7 User Registration
+Passwords must be hashed and email addresses must be unique.
+
+8 User Login
+Valid credentials create an authenticated session.
+
+10 Authentication and Authorization
+Protected routes require an authenticated user.
+
+10.2 Ownership Validation
+The backend must not trust user IDs supplied by a client.
+Every task and category lookup must include the authenticated user ID.
+
+Entities
+User: full_name (text max_length=100), email (email), password_hash (text)
+Category: user (foreign key to User), name (text max_length=50), color (text optional)
+Task: user (foreign key to User), category (foreign key to Category optional), title (text max_length=200), description (long text optional), status (choices: pending,in_progress,completed), priority (choices: low,medium,high,urgent), due_at (datetime optional), completed_at (datetime optional)
+
+27 Authentication API
+
+27.1 Register
+POST /api/auth/register
+
+27.2 Login
+POST /api/auth/login
+
+29 Task API
+
+29.1 List Tasks
+GET /api/tasks
+Supports search, filtering, sorting, and pagination.
+
+29.3 Create Task
+POST /api/tasks
+
+29.4 Update Task
+PATCH /api/tasks/:taskId
+
+29.7 Delete Task
+DELETE /api/tasks/:taskId
+
+32 Frontend Pages
+- Landing page
+- Registration page
+- Login page
+- Dashboard
+- Task details page
+- Categories management page
+- User profile page
+
+37 Security Requirements
+No user may view, modify, or delete another user's records.
+
+38 SQLite-Specific Requirements
+All persistent data must remain available after an application restart.
+
+47 Testing Requirements
+Automated tests must cover authentication, authorization, ownership, and task operations.
+
+48 Acceptance Criteria
+- Users can register, log in, and log out.
+- Users can create, view, update, complete, reopen, and delete their own tasks.
+- Tasks can be searched, filtered, sorted, and paginated.
+- Persistent data is stored in SQLite.

@@ -126,7 +126,7 @@ def _check_view_references(
     form_names: set[str],
 ) -> list[ConsistencyDiagnostic]:
     diagnostics: list[ConsistencyDiagnostic] = []
-    known = model_names | serializer_names | form_names | {"UserCreationForm"}
+    known = model_names | serializer_names | form_names | _imported_names(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and (
             node.id.endswith("Serializer") or node.id.endswith("Form") or node.id in model_names
@@ -136,6 +136,14 @@ def _check_view_references(
                     ConsistencyDiagnostic(file_path, node.id, f"References missing symbol {node.id}.")
                 )
     return diagnostics
+
+
+def _imported_names(tree: ast.Module) -> set[str]:
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update(alias.asname or alias.name.split(".")[-1] for alias in node.names)
+    return names
 
 
 def _check_url_references(

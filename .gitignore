@@ -5,12 +5,38 @@ venv/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
-.shamsu/index.db
-.shamsu/index.db-wal
-.shamsu/index.db-shm
-.shamsu/logs/*.jsonl
-.shamsu/tasks/*.json
-.shamsu/context/*.json
+
+# SHAMSU workspace-local runtime state. Keep placeholder dirs tracked, but do
+# not push local indexes, runtime config, sessions, logs, permissions, tasks,
+# generated state, or other machine-specific agent state.
+.shamsu/**
+!.shamsu/
+!.shamsu/.gitkeep
+!.shamsu/context/
+!.shamsu/context/.gitkeep
+!.shamsu/logs/
+!.shamsu/logs/.gitkeep
+!.shamsu/skills/
+!.shamsu/skills/.gitkeep
+!.shamsu/tasks/
+!.shamsu/tasks/.gitkeep
+
 *.sqlite3
 db.sqlite3
 .env
+
+# Dogfood / QA scratch workspaces. These hold real project code, PRDs, run logs
+# and session transcripts from live testing - none of it belongs on GitHub.
+#
+# The canonical workspace (../test-shamsu) already cannot leak: it is a SIBLING
+# of this repo, not inside it, and is its own git repo with no remote. These
+# patterns are belt-and-braces for a workspace created IN-tree, which is easy to
+# do by accident - `scripts/validate_release.py --work-root` takes an arbitrary
+# path, and a stray `git add -A` would otherwise sweep the whole thing up.
+test-shamsu/
+shamsu-launcher-test/
+dogfood-*/
+*-dogfood/
+
+# Scratch build/output dir used by the release scripts.
+tmp/

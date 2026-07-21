@@ -3,17 +3,154 @@ from __future__ import annotations
 
 import re
 
+from shamsu.prd.classifier import classify_archetype
+from shamsu.prd.contract import extract_contract
 from shamsu.prd.extractor import extract_entities
-from shamsu.types import DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
+from shamsu.registry import load_registry_entry
+from shamsu.registry.categories import CATEGORY_TO_ARCHETYPE
+from shamsu.registry.detector import detect_category
+from shamsu.registry.schema import Category
+from shamsu.registry.suitability import assess
+from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
 
-def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
+# Explicit signals that a PRD asks for a static HTML/CSS/JS frontend, so the
+# planner must NOT fall back to a generic Django project (manage.py / settings /
+# login / register / dashboard). Grounded: we only take this branch when the PRD
+# text itself says so.
+_STATIC_FRONTEND_PHRASES = (
+    "static site", "static website", "static web app", "static web page",
+    "vanilla javascript", "vanilla js", "plain html", "plain javascript",
+    "no backend", "without a backend", "frontend only", "front-end only",
+    "client-side only", "client side only", "browser only",
+)
+# Backend/framework signals that disqualify the static-frontend branch: if the
+# PRD really needs a server, keep the normal (possibly Django) planning path.
+_BACKEND_FRAMEWORK_PHRASES = (
+    "django", "flask", "fastapi", "express", "rails", "spring", "laravel",
+    "node backend", "node.js backend", "backend service", "server-side",
+    "server side", "microservice", "rest api", "graphql",
+    "postgres", "postgresql", "mysql", "sqlite", "mongodb", "database",
+    " sql ", "orm", "authentication service", "oauth",
+)
+
+
+def _mentions_html_css_js(text: str) -> bool:
+    return "html" in text and ("css" in text or "javascript" in text or " js" in text or "js." in text)
+
+
+def is_static_frontend_prd(parsed: ParsedPRD) -> bool:
+    """True when the PRD explicitly asks for a static HTML/CSS/JS frontend and
+    shows no backend/framework/database signals. Used to stop the planner from
+    defaulting to a generic Django CRUD project on a small frontend PRD."""
+    text = f"{parsed.title}\n{parsed.raw_text}".lower()
+    signal = _mentions_html_css_js(text) or any(phrase in text for phrase in _STATIC_FRONTEND_PHRASES)
+    if not signal:
+        return False
+    return not any(phrase in text for phrase in _BACKEND_FRAMEWORK_PHRASES)
+
+
+def _frontend_generation_order() -> list[DjangoFileSpec]:
+    """Deterministic static-frontend file set - the three files a 'build with
+    HTML/CSS/JS' PRD expects, plus a README. Never manage.py/settings/login."""
+    return [
+        DjangoFileSpec("index.html", "frontend_template", "coder"),
+        DjangoFileSpec("style.css", "frontend_template", "coder"),
+        DjangoFileSpec("script.js", "frontend_template", "coder"),
+        DjangoFileSpec("README.md", "generic_docs", "doc_agent"),
+    ]
+
+
+def _build_static_frontend_spec(parsed: ParsedPRD) -> ProjectSpec:
     project_name = _to_snake_case(parsed.title)
     app_name = _default_app_name(project_name)
     entities = extract_entities(parsed)
-    endpoints = _extract_or_infer_endpoints(parsed, entities)
+    # Only pages the PRD explicitly lists - never an inferred Dashboard/CRUD set.
+    pages = _extract_pages(parsed)
+    theme = _select_theme(parsed.raw_text)
+    contract = extract_contract(parsed)
+    category = Category.GENERAL_WEB
+    return ProjectSpec(
+        project_name=project_name,
+        app_name=app_name,
+        entities=entities,
+        endpoints=[],
+        pages=pages,
+        theme=theme,
+        generation_order=_frontend_generation_order(),
+        archetype=Archetype.GENERIC_WEB,
+        archetype_confidence=0.9,
+        archetype_spec={
+            "reason": "PRD explicitly requests a static HTML/CSS/JS frontend; no backend signals.",
+            "category_reason": "static-frontend override",
+            "category_scores": {},
+        },
+        category=category.value,
+        master_prompt="",
+        manifest_path="",
+        dod_path="",
+        feature_requests=_feature_requests(parsed),
+        prd_contract=contract,
+        suitability=assess(contract, category, Archetype.GENERIC_WEB),
+    )
+
+
+def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
+    # Grounding gate: a PRD that explicitly asks for static HTML/CSS/JS (and
+    # shows no backend signals) must not become a generic Django CRUD project.
+    if is_static_frontend_prd(parsed):
+        return _build_static_frontend_spec(parsed)
+    contract = extract_contract(parsed)
+    project_name = _to_snake_case(parsed.title)
+    app_name = _default_app_name(project_name)
+    entities = extract_entities(parsed)
+    endpoints = (
+        [
+            EndpointSpec(
+                str(item["method"]),
+                str(item["path"]),
+                _resource_from_path(str(item["path"])),
+                auth_required=bool(item.get("auth_required", True)),
+            )
+            for item in contract.api_endpoints
+        ]
+        if contract.api_endpoints
+        else _extract_or_infer_endpoints(parsed, entities)
+    )
     pages = _extract_or_infer_pages(parsed, entities)
     theme = _select_theme(parsed.raw_text)
+    archetype = classify_archetype(parsed)
+    category_decision = detect_category(parsed.raw_text)
+    if contract.requires_full_stack:
+        category = Category.WEB_CRUD
+        selected_archetype = Archetype.WEB_CRUD
+    else:
+        category = _resolve_category(category_decision.category, archetype.archetype)
+        selected_archetype = CATEGORY_TO_ARCHETYPE.get(category, archetype.archetype)
+
+    domain_entities = [entity for entity in entities if entity.name.lower() not in {"user", "session"}]
+    needs_input = contract.requires_full_stack and not domain_entities
+    assumptions = list(contract.assumptions)
+    if contract.requires_full_stack and not contract.stack_hint:
+        assumptions = [item for item in assumptions if "framework" not in item.lower()]
+        assumptions.append(
+            "Django is selected as SHAMSU's supported local full-stack default; "
+            "the PRD does not specify an application framework."
+        )
+
+    generation_order = (
+        _fixed_generation_order(project_name, app_name, pages)
+        if not needs_input and selected_archetype in {Archetype.WEB_CRUD, Archetype.REST_API}
+        else _generic_generation_order()
+    )
+    if needs_input:
+        generation_order = []
+    master_prompt, manifest_path, dod_path = _registry_metadata(category)
+
+    # Source-of-truth PRD contract + generation strategy. Suitability decides
+    # whether a template fits (and which) or whether to generate template-free;
+    # it does not mutate `category` (kept as the raw detected category).
+    suitability = assess(contract, category, selected_archetype)
 
     return ProjectSpec(
         project_name=project_name,
@@ -22,8 +159,79 @@ def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
         endpoints=endpoints,
         pages=pages,
         theme=theme,
-        generation_order=_fixed_generation_order(project_name, app_name),
+        generation_order=generation_order,
+        archetype=selected_archetype,
+        archetype_confidence=max(archetype.confidence, category_decision.confidence),
+        archetype_spec={
+            "reason": archetype.reason,
+            "category_reason": category_decision.reason,
+            "category_scores": category_decision.scores,
+        },
+        category=category.value,
+        master_prompt=master_prompt,
+        manifest_path=manifest_path,
+        dod_path=dod_path,
+        feature_requests=_feature_requests(parsed),
+        prd_contract=contract,
+        suitability=suitability,
+        generation_ready=not needs_input,
+        needs_input=needs_input,
+        clarification_question=(
+            "Which persistent domain entities and fields should the full-stack application manage?"
+            if needs_input
+            else ""
+        ),
+        assumptions=_dedupe_strings(assumptions),
+        definition_of_done=list(contract.acceptance_criteria),
     )
+
+
+def _dedupe_strings(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result
+
+
+def _resolve_category(category: Category, archetype: Archetype) -> Category:
+    if category != Category.GENERAL_WEB:
+        return category
+    if archetype == Archetype.WEB_CRUD:
+        return Category.WEB_CRUD
+    if archetype == Archetype.REST_API:
+        return Category.REST_API
+    return category
+
+
+def _registry_metadata(category: Category) -> tuple[str, str, str]:
+    try:
+        entry = load_registry_entry(category)
+    except (FileNotFoundError, ValueError):
+        return "", "", ""
+    return (
+        entry.master_prompt,
+        str(entry.root / "manifest.yaml"),
+        str(entry.root / "dod.yaml"),
+    )
+
+
+def _feature_requests(parsed: ParsedPRD) -> list[str]:
+    requests: list[str] = []
+    for heading, lines in parsed.sections.items():
+        if any(word in heading.lower() for word in ["feature", "requirement", "gameplay"]):
+            requests.extend(line.strip("- ").strip() for line in lines if line.strip())
+    return requests[:20]
+
+
+def _generic_generation_order() -> list[DjangoFileSpec]:
+    return [
+        DjangoFileSpec("index.html", "generic_template", None),
+        DjangoFileSpec("README.md", "generic_docs", None),
+    ]
 
 
 def _extract_or_infer_endpoints(parsed: ParsedPRD, entities) -> list[EndpointSpec]:
@@ -66,9 +274,9 @@ def _extract_endpoints(parsed: ParsedPRD) -> list[EndpointSpec]:
 
 
 def _extract_or_infer_pages(parsed: ParsedPRD, entities) -> list[PageSpec]:
-    pages = _extract_pages(parsed)
+    pages = _extract_pages(parsed, entities)
     if pages:
-        return pages
+        return _ensure_resource_pages(pages, entities)
 
     inferred = [PageSpec("Dashboard", "dashboard", "Overview and recent activity")]
     for entity in entities:
@@ -105,29 +313,66 @@ def _extract_or_infer_pages(parsed: ParsedPRD, entities) -> list[PageSpec]:
     return inferred
 
 
-def _extract_pages(parsed: ParsedPRD) -> list[PageSpec]:
+def _ensure_resource_pages(pages: list[PageSpec], entities) -> list[PageSpec]:
+    complete = list(pages)
+    existing = {(page.resource, page.page_type) for page in pages if page.resource}
+    for entity in entities:
+        if entity.name.lower() in {"user", "session"}:
+            continue
+        fields = [field.name for field in entity.fields]
+        for page_type, label, purpose in (
+            ("list", "List", "List and manage records"),
+            ("form", "Form", "Create and edit records"),
+            ("detail", "Detail", "View one record"),
+        ):
+            if (entity.name, page_type) in existing:
+                continue
+            complete.append(
+                PageSpec(
+                    name=f"{entity.name} {label}",
+                    page_type=page_type,
+                    purpose=f"{purpose} for {entity.name}",
+                    resource=entity.name,
+                    fields_shown=fields,
+                )
+            )
+    return complete
+
+
+def _extract_pages(parsed: ParsedPRD, entities=()) -> list[PageSpec]:
     pages: list[PageSpec] = []
     for heading, lines in parsed.sections.items():
-        if "page" not in heading.lower() and "screen" not in heading.lower():
+        normalized_heading = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).lower()
+        if normalized_heading not in {"pages", "screens", "frontend pages"}:
             continue
         for line in lines:
             name, purpose = _split_name_and_purpose(line)
+            if not name or name.lower().startswith(("the application should", "required elements")):
+                continue
             page_type = _detect_page_type(name, purpose)
-            resource = _detect_resource(name)
+            resource = _detect_resource(name, entities)
+            public_page = any(
+                token in name.lower()
+                for token in ("landing", "login", "registration", "register", "not found", "error")
+            )
             pages.append(
                 PageSpec(
                     name=name,
                     page_type=page_type,
                     purpose=purpose,
                     resource=resource,
-                    requires_login=page_type != "auth" and "public" not in purpose.lower(),
+                    requires_login=not public_page and "public" not in purpose.lower(),
                 )
             )
     return pages
 
 
-def _fixed_generation_order(project_name: str, app_name: str) -> list[DjangoFileSpec]:
-    return [
+def _fixed_generation_order(
+    project_name: str,
+    app_name: str,
+    pages: list[PageSpec],
+) -> list[DjangoFileSpec]:
+    files = [
         DjangoFileSpec("manage.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/__init__.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/settings.py", "fixed_template", None),
@@ -135,6 +380,7 @@ def _fixed_generation_order(project_name: str, app_name: str) -> list[DjangoFile
         DjangoFileSpec(f"{project_name}/wsgi.py", "fixed_template", None),
         DjangoFileSpec(f"{project_name}/asgi.py", "fixed_template", None),
         DjangoFileSpec(f"{app_name}/__init__.py", "fixed_template", None),
+        DjangoFileSpec(f"{app_name}/migrations/__init__.py", "fixed_template", None),
         DjangoFileSpec(f"{app_name}/apps.py", "fixed_template", None),
         DjangoFileSpec(f"{app_name}/models.py", "model_generator", "coder"),
         DjangoFileSpec(
@@ -208,10 +454,33 @@ def _fixed_generation_order(project_name: str, app_name: str) -> list[DjangoFile
         DjangoFileSpec(".env.example", "fixed_template", None),
         DjangoFileSpec("README.md", "doc_generator", "doc_agent"),
     ]
+    seen_resources: set[str] = set()
+    for page in pages:
+        if page.page_type != "list" or not page.resource:
+            continue
+        resource_key = _to_kebab_case(page.resource)
+        if not resource_key or resource_key in seen_resources:
+            continue
+        seen_resources.add(resource_key)
+        files.extend(
+            [
+                DjangoFileSpec(
+                    f"{app_name}/templates/{resource_key}/list.html",
+                    "fixed_template",
+                    None,
+                ),
+                DjangoFileSpec(
+                    f"{app_name}/templates/{resource_key}/_item.html",
+                    "fixed_template",
+                    None,
+                ),
+            ]
+        )
+    return files
 
 
 def _split_name_and_purpose(line: str) -> tuple[str, str]:
-    cleaned = line.replace("**", "").strip()
+    cleaned = line.replace("**", "").strip().lstrip("-*+• ").strip()
     if ":" in cleaned:
         name, purpose = cleaned.split(":", 1)
     elif "-" in cleaned:
@@ -223,20 +492,28 @@ def _split_name_and_purpose(line: str) -> tuple[str, str]:
 
 def _detect_page_type(name: str, purpose: str):
     text = f"{name} {purpose}".lower()
-    if "login" in text or "register" in text or "auth" in text:
+    if "login" in text or "register" in text or "registration" in text or "auth" in text:
         return "auth"
     if "dashboard" in text:
         return "dashboard"
     if "detail" in text:
         return "detail"
-    if "form" in text or "create" in text or "new" in text:
+    if "form" in text or "create" in text or "new" in text or "edit" in text or "profile" in text:
         return "form"
     return "list"
 
 
-def _detect_resource(name: str) -> str | None:
+def _detect_resource(name: str, entities=()) -> str | None:
     lowered = name.lower()
-    if "dashboard" in lowered or "login" in lowered or "register" in lowered:
+    if any(token in lowered for token in ("dashboard", "login", "register", "profile", "password")):
+        return None
+    words = set(re.findall(r"[a-z0-9]+", lowered))
+    for entity in entities:
+        entity_name = entity.name.lower()
+        plural = _pluralize(entity_name)
+        if entity_name in words or plural in words:
+            return entity.name
+    if entities:
         return None
     tokens = [token for token in re.split(r"[^A-Za-z0-9]+", name) if token]
     if not tokens:

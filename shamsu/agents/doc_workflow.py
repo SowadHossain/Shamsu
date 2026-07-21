@@ -11,6 +11,7 @@ import difflib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from shamsu.agents.planner import create_plan
 from shamsu.context.builder import ContextBuilder
 from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearchAgent
 from shamsu.llm.manager import LLMManager
@@ -29,6 +30,7 @@ class DocumentationProposal:
     markdown: str
     diff_text: str
     raw_response: str
+    plan: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,12 +63,13 @@ class DocumentationWorkflow:
         target_path: str = "README.md",
     ) -> DocumentationProposal:
         results = self._search_for_documentation_context(request)
-        request_text = _build_doc_request(request, existing_readme)
+        plan = await create_plan(self.llm, self.context_builder, results, goal=request, task_id="doc-plan")
+        request_text = _build_doc_request(request, existing_readme, plan.text)
         pack = self.context_builder.pack(
             results=results,
             request=request_text,
             task_id="doc-generation",
-            step_id=1,
+            step_id=2,
             specialist="doc_agent",
         )
         response = await self.llm.run_specialist("doc_agent", pack)
@@ -78,6 +81,7 @@ class DocumentationWorkflow:
             markdown=markdown,
             diff_text=diff_text,
             raw_response=response.raw,
+            plan=plan.text,
         )
 
     async def apply_readme_update(
@@ -176,15 +180,16 @@ def _documentation_queries(request: str) -> list[str]:
     ]
 
 
-def _build_doc_request(request: str, existing_readme: str) -> str:
+def _build_doc_request(request: str, existing_readme: str, plan_text: str = "") -> str:
     existing = existing_readme.strip()
+    plan_block = f"Plan from planner model:\n{plan_text}\n\n" if plan_text.strip() else ""
     if existing:
         return (
-            f"{DOC_SYSTEM_INSTRUCTIONS}\n\n"
+            f"{DOC_SYSTEM_INSTRUCTIONS}\n\n{plan_block}"
             f"User documentation request: {request}\n\n"
             f"Existing README to improve:\n{existing}"
         )
-    return f"{DOC_SYSTEM_INSTRUCTIONS}\n\nUser documentation request: {request}"
+    return f"{DOC_SYSTEM_INSTRUCTIONS}\n\n{plan_block}User documentation request: {request}"
 
 
 def _clean_markdown(raw: str) -> str:

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import sqlite3
-
 import pytest
 
 from shamsu.agents.qa_workflow import QAWorkflow
 from shamsu.core.coordinator import Coordinator
-from shamsu.indexer.walker import FileWalker, sha256_file
+from shamsu.indexer.walker import FileWalker
 from shamsu.prd.parser import MarkdownPRDParser
 from shamsu.safety.approval import ask_approval
 from shamsu.types import ApprovalRequest, LLMResponse, RoutingDecision
@@ -34,22 +32,14 @@ class FakeLiveLLM(FakeLLM):
         )
 
 
-def test_file_walker_indexes_files_and_ignores_heavy_dirs(tmp_path):
+def test_file_walker_discover_ignores_heavy_dirs(tmp_path):
     (tmp_path / "app.py").write_text("print('hello')\n", encoding="utf-8")
     (tmp_path / "node_modules").mkdir()
     (tmp_path / "node_modules" / "ignored.js").write_text("x", encoding="utf-8")
 
-    db_path = tmp_path / ".shamsu" / "index.db"
-    entries = FileWalker(tmp_path, db_path=db_path).index()
+    discovered = FileWalker(tmp_path).discover()
 
-    assert [entry.path for entry in entries] == ["app.py"]
-    assert entries[0].language == "python"
-    assert entries[0].hash == sha256_file(tmp_path / "app.py")
-
-    conn = sqlite3.connect(db_path)
-    rows = conn.execute("SELECT path, language FROM files").fetchall()
-    conn.close()
-    assert rows == [("app.py", "python")]
+    assert [path.relative_to(tmp_path).as_posix() for path in discovered] == ["app.py"]
 
 
 def test_markdown_prd_parser_extracts_title_and_sections(tmp_path):
@@ -75,7 +65,23 @@ def test_qa_workflow_places_task_at_prompt_end():
 
     assert preview.pack.specialist == "qa"
     assert preview.prompt.rstrip().endswith("how does login work?")
-    assert "stub/example.py" in preview.prompt
+
+
+def test_qa_workflow_promotes_mentioned_file_context_to_snippet():
+    request = (
+        "What does qa_probe.py do?\n\n"
+        "Mentioned file context:\n\n"
+        "# @qa_probe.py (file)\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
+    )
+
+    preview = QAWorkflow().build_prompt(request)
+
+    assert preview.pack.snippets[0].file_path == "qa_probe.py"
+    assert preview.pack.snippets[0].score == 50.0
+    assert "# File: qa_probe.py" in preview.prompt
+    assert "def add(a, b)" in preview.prompt
 
 
 @pytest.mark.asyncio

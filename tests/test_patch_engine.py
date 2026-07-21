@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
-from shamsu.indexer.walker import FileWalker
 from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.patch.preview import print_diff_preview
-from shamsu.retriever.search import SearchAgent
 from shamsu.safety.sandbox import Sandbox
 
 
@@ -75,19 +74,25 @@ def test_malformed_hunk_header_fails(tmp_path):
     assert "Malformed hunk header" in error
 
 
-def test_hunk_line_count_mismatch_fails(tmp_path):
+def test_hunk_count_mismatch_is_recounted_not_rejected(tmp_path):
+    """A wrong @@ line count (declared 1,2/1,2 for a one-line change) is a
+    routine local-model mistake - it must be recounted from the body and
+    applied, not rejected. Regression guard for the 'invalid diff' failures."""
+    target = tmp_path / "app" / "models.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("old\n", encoding="utf-8")
     diff = """--- a/app/models.py
 +++ b/app/models.py
 @@ -1,2 +1,2 @@
 -old
 +new
 """
-    engine = PatchEngine(tmp_path)
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
 
     ok, error = engine.validate_diff(diff)
-
-    assert ok is False
-    assert "line count mismatch" in error
+    assert ok is True, error
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8") == "new\n"
 
 
 def test_path_escape_fails(tmp_path):
@@ -195,6 +200,80 @@ def test_apply_modifies_file_and_creates_backup_after_approval(tmp_path):
     assert (tmp_path / "app.py.bak").read_text(encoding="utf-8") == "value = 1\n"
 
 
+def test_apply_cancellation_restores_every_partial_change(tmp_path, monkeypatch):
+    first = tmp_path / "first.py"
+    second = tmp_path / "second.py"
+    first.write_text("value = 1\n", encoding="utf-8")
+    second.write_text("value = 1\n", encoding="utf-8")
+    diff = """--- a/first.py
++++ b/first.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+--- a/second.py
++++ b/second.py
+@@ -1 +1 @@
+-value = 1
++value = 2
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+    original_apply = engine._apply_file_patch
+    calls = 0
+
+    def cancel_after_first(patch, backups, created_files):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt
+        original_apply(patch, backups, created_files)
+
+    monkeypatch.setattr(engine, "_apply_file_patch", cancel_after_first)
+
+    with pytest.raises(KeyboardInterrupt):
+        engine.apply_result(diff, tmp_path)
+
+    assert first.read_text(encoding="utf-8") == "value = 1\n"
+    assert second.read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_apply_tolerates_wrong_hunk_line_numbers(tmp_path):
+    """Regression: a diff whose @@ header points at the wrong line (very common
+    from local models) must still apply by locating the context, not reject."""
+    target = tmp_path / "app.py"
+    target.write_text("import os\n\n\ndef foo():\n    return 1\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -99,2 +99,2 @@
+ def foo():
+-    return 1
++    return 42
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8") == "import os\n\n\ndef foo():\n    return 42\n"
+
+
+def test_apply_tolerates_trailing_whitespace_in_context(tmp_path):
+    """Regression: trailing-whitespace drift on a context line must not reject
+    the patch, and the file's real bytes on untouched lines are preserved."""
+    target = tmp_path / "app.py"
+    target.write_text("def foo():\n    x = 1   \n    return x\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1,3 +1,3 @@
+ def foo():
+     x = 1
+-    return x
++    return x + 1
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    # The untouched 'x = 1' line keeps its original trailing spaces.
+    assert target.read_text(encoding="utf-8") == "def foo():\n    x = 1   \n    return x + 1\n"
+
+
 def test_rollback_restores_backup(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("value = 1\n", encoding="utf-8")
@@ -211,6 +290,77 @@ def test_apply_invalid_diff_returns_false(tmp_path):
     engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
 
     assert engine.apply("not a diff", tmp_path) is False
+
+
+def test_apply_result_preserves_validation_failure_status(tmp_path):
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    result = engine.apply_result("not a diff", tmp_path)
+
+    assert result.ok is False
+    assert result.status == "validation_failed"
+    assert result.error.startswith("DiffValidationError:")
+
+
+def test_apply_result_preserves_denied_status(tmp_path):
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-value = 1\n+value = 2\n"
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: False)
+
+    result = engine.apply_result(diff, tmp_path)
+
+    assert result.ok is False
+    assert result.status == "denied"
+    assert result.error == "Patch denied by user."
+
+
+def test_apply_result_preserves_exact_context_mismatch_error(tmp_path):
+    (tmp_path / "app.py").write_text("actual = 1\n", encoding="utf-8")
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-expected = 1\n+expected = 2\n"
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    result = engine.apply_result(diff, tmp_path)
+
+    assert result.ok is False
+    assert result.status == "apply_failed"
+    assert result.error == (
+        "Patch application failed after approval: Patch application modifies files inside "
+        "the selected workspace. DiffValidationError: Patch context does not match target file."
+    )
+
+
+def test_model_context_label_is_removed_before_patch_application(tmp_path):
+    target = tmp_path / "qa_probe.py"
+    target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    diff = """--- a/qa_probe.py
++++ b/qa_probe.py
+@@ -1,3 +1,2 @@
+ # File: qa_probe.py (lines 1-2)
+ def add(a, b):
+-    return a - b
++    return a + b
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    result = engine.apply_result(diff, tmp_path)
+
+    assert result.ok is True
+    assert target.read_text(encoding="utf-8") == "def add(a, b):\n    return a + b\n"
+
+
+def test_real_added_file_comment_is_not_sanitized(tmp_path):
+    target = tmp_path / "app.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    diff = """--- a/app.py
++++ b/app.py
+@@ -1 +1,2 @@
++# File: generated.py (lines 1-2)
+ value = 1
+"""
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    assert engine.apply(diff, tmp_path) is True
+    assert target.read_text(encoding="utf-8").startswith("# File: generated.py")
 
 
 def test_apply_restores_backup_on_context_mismatch(tmp_path):
@@ -285,10 +435,9 @@ def test_apply_rejects_outside_workspace_path(tmp_path):
     assert engine.apply(diff, tmp_path) is False
 
 
-def test_apply_reindexes_modified_python_file(tmp_path):
+def test_apply_logs_patch_applied_event_when_session_logger_provided(tmp_path):
     target = tmp_path / "app.py"
     target.write_text("def old_name():\n    return 1\n", encoding="utf-8")
-    FileWalker(tmp_path).index()
     diff = """--- a/app.py
 +++ b/app.py
 @@ -1,2 +1,2 @@
@@ -296,46 +445,16 @@ def test_apply_reindexes_modified_python_file(tmp_path):
 +def new_name():
      return 1
 """
-    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
+
+    class RecordingLogger:
+        def __init__(self):
+            self.events = []
+
+        def log(self, event_type, payload, summary, workflow_id=None):
+            self.events.append(event_type)
+
+    logger = RecordingLogger()
+    engine = PatchEngine(tmp_path, approval_func=lambda _request: True, session_logger=logger)
 
     assert engine.apply(diff, tmp_path) is True
-
-    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
-    assert search.symbol_lookup("new_name")
-    assert search.symbol_lookup("old_name") == []
-    assert search.search("new_name")
-
-
-def test_apply_indexes_created_python_file(tmp_path):
-    FileWalker(tmp_path).index()
-    diff = """--- /dev/null
-+++ b/new_module.py
-@@ -0,0 +1,2 @@
-+def generated_symbol():
-+    return True
-"""
-    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
-
-    assert engine.apply(diff, tmp_path) is True
-
-    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
-    assert search.symbol_lookup("generated_symbol")
-
-
-def test_apply_removes_deleted_file_from_index(tmp_path):
-    target = tmp_path / "dead.py"
-    target.write_text("def removed_symbol():\n    return False\n", encoding="utf-8")
-    FileWalker(tmp_path).index()
-    diff = """--- a/dead.py
-+++ /dev/null
-@@ -1,2 +0,0 @@
--def removed_symbol():
--    return False
-"""
-    engine = PatchEngine(tmp_path, approval_func=lambda _request: True)
-
-    assert engine.apply(diff, tmp_path) is True
-
-    search = SearchAgent(tmp_path / ".shamsu" / "index.db")
-    assert search.symbol_lookup("removed_symbol") == []
-    assert search.search("removed_symbol") == []
+    assert "patch.applied" in logger.events

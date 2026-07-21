@@ -1,146 +1,172 @@
 from __future__ import annotations
 
-from pathlib import Path
+import asyncio
 
-import pytest
-
-from shamsu.agents.bugfix_workflow import BugFixWorkflow, parse_traceback_locations
+from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.patch.engine import PatchEngine
 from shamsu.types import ContextPack, LLMResponse, SearchResult
 
 
-class FakeSearch:
-    def __init__(self) -> None:
-        self.queries: list[str] = []
-
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
-        self.queries.append(query)
+class _FakeSearch:
+    def search(self, query, top_k=5, boost_paths=None):
         return [
             SearchResult(
-                file_path="app.py",
-                language="python",
-                line_start=1,
-                line_end=2,
-                content="def divide(a, b):\n    return a / b",
-                score=1.0,
+                file_path="app.py", language="python", line_start=1, line_end=1,
+                content="bug = 1", score=1.0,
             )
         ]
 
-    def symbol_lookup(self, name: str) -> list[SearchResult]:
+    def symbol_lookup(self, name):
         return []
 
-    def fts_search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def fts_search(self, query, top_k=5):
         return self.search(query, top_k=top_k)
 
+class _EmptySearch:
+    def search(self, query, top_k=5, boost_paths=None):
+        return []
 
-class FakeLLM:
-    def __init__(self, raw: str) -> None:
-        self.raw = raw
-        self.specialist = ""
-        self.pack: ContextPack | None = None
+    def symbol_lookup(self, name):
+        return []
 
-    async def route(self, prompt: str, project_summary: str):  # pragma: no cover
-        raise NotImplementedError
+    def fts_search(self, query, top_k=5):
+        return []
+
+class _FakeLLM:
+    """Answers "planner" calls with a fixed plan and "bugfix" calls from a
+    queue of canned responses, recording every (specialist, pack) call."""
+
+    def __init__(self, plan_text: str, bugfix_responses: list[str]) -> None:
+        self.plan_text = plan_text
+        self.bugfix_responses = list(bugfix_responses)
+        self.calls: list[tuple[str, ContextPack]] = []
 
     async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
-        self.specialist = specialist
-        self.pack = pack
-        return LLMResponse(raw=self.raw, format="diff", model_used="fake-bugfix")
+        self.calls.append((specialist, pack))
+        if specialist == "planner":
+            return LLMResponse(raw=self.plan_text, model_used="fake")
+        return LLMResponse(raw=self.bugfix_responses.pop(0), model_used="fake")
 
 
-def test_parse_traceback_locations_accepts_tracebacks_and_plain_locations():
-    report = '''Traceback (most recent call last):
-  File "tests/test_app.py", line 7, in test_divide
-    divide(1, 0)
-  File "app.py", line 2, in divide
-    return a / b
-ZeroDivisionError: division by zero
-Also see app.py:2
-'''
-
-    locations = parse_traceback_locations(report)
-
-    assert [(location.file_path, location.line) for location in locations] == [
-        ("tests/test_app.py", 7),
-        ("app.py", 2),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_bugfix_workflow_applies_valid_diff_with_real_patch_engine(tmp_path: Path):
-    target = tmp_path / "app.py"
-    target.write_text("def divide(a, b):\n    return a / b\n", encoding="utf-8")
-    diff = """--- a/app.py
-+++ b/app.py
-@@ -1,2 +1,4 @@
- def divide(a, b):
-+    if b == 0:
-+        return 0
-     return a / b
-"""
-    report = '''Traceback (most recent call last):
-  File "app.py", line 2, in divide
-ZeroDivisionError: division by zero
-'''
-    search = FakeSearch()
-    llm = FakeLLM(diff)
-
-    result = await BugFixWorkflow(
-        workspace_root=tmp_path,
-        search=search,
+def _workflow(tmp_path, llm, search=None) -> BugFixWorkflow:
+    return BugFixWorkflow(
+        tmp_path,
+        search=search or _FakeSearch(),
         llm=llm,
         patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
-    ).run(report)
+    )
+
+
+def test_bugfix_calls_planner_before_bugfix_and_folds_plan_into_request(tmp_path):
+    (tmp_path / "app.py").write_text("bug = 1\n", encoding="utf-8")
+    diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-bug = 1\n+bug = 2\n"
+    llm = _FakeLLM(plan_text="Fix app.py line 1.", bugfix_responses=[diff])
+
+    result = asyncio.run(_workflow(tmp_path, llm).run("Traceback: bug = 1 should be 2"))
 
     assert result.applied is True
-    assert result.error == ""
+    assert result.plan == "Fix app.py line 1."
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "bug = 2\n"
+
+    specialists = [specialist for specialist, _ in llm.calls]
+    assert specialists == ["planner", "bugfix"]
+    bugfix_pack = llm.calls[1][1]
+    assert "Fix app.py line 1." in bugfix_pack.user_request
+
+
+def test_bugfix_repair_loop_reuses_the_plan_without_a_second_planner_call(tmp_path):
+    (tmp_path / "app.py").write_text("bug = 1\n", encoding="utf-8")
+    bad_diff = "this is not a unified diff"
+    good_diff = "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-bug = 1\n+bug = 2\n"
+    llm = _FakeLLM(plan_text="Fix app.py line 1.", bugfix_responses=[bad_diff, good_diff])
+
+    result = asyncio.run(_workflow(tmp_path, llm).run("Traceback: bug = 1 should be 2"))
+
+    assert result.applied is True
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "bug = 2\n"
+
+    planner_calls = [pack for specialist, pack in llm.calls if specialist == "planner"]
+    assert len(planner_calls) == 1  # the repair retry does not re-invoke the planner
+
+    repair_pack = llm.calls[-1][1]
+    assert "Fix app.py line 1." in repair_pack.user_request
+
+
+def test_bugfix_applies_diff_with_bad_hunk_counts_without_full_rewrite(tmp_path):
+    """A light model's wrong @@ counts now recount-and-apply directly, so the
+    fix lands on the first diff instead of burning retries + a full rewrite."""
+    (tmp_path / "app.py").write_text("bug = 1\n", encoding="utf-8")
+    bad_diff = (
+        "--- a/app.py\n"
+        "+++ b/app.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-bug = 1\n"
+        "+bug = 2\n"
+    )
+    llm = _FakeLLM(
+        plan_text="Fix app.py line 1.",
+        bugfix_responses=[bad_diff],
+    )
+
+    result = asyncio.run(_workflow(tmp_path, llm, search=_EmptySearch()).run("AssertionError: bug should be 2"))
+
+    assert result.applied is True
+    assert result.used_full_rewrite is False   # applied straight from the diff now
     assert result.changed_files == ["app.py"]
-    assert result.locations[0].file_path == "app.py"
-    assert "if b == 0" in target.read_text(encoding="utf-8")
-    assert search.queries[0] == report.strip()
-    assert "app.py" in search.queries
-    assert "ZeroDivisionError" in search.queries[-1]
-    assert llm.specialist == "bugfix"
-    assert llm.pack is not None
-    assert "Output ONLY a unified diff" in llm.pack.user_request
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "bug = 2\n"
 
 
-@pytest.mark.asyncio
-async def test_bugfix_workflow_rejects_malformed_output_without_applying(tmp_path: Path):
-    target = tmp_path / "app.py"
-    target.write_text("value = 1\n", encoding="utf-8")
+def test_bugfix_rewrites_when_a_valid_diff_will_not_apply(tmp_path):
+    """A well-formed diff whose context lines don't match the file validates,
+    then FAILS to apply ("context does not match target file"). Live 2026-07-21
+    this killed every logic-change fix with no recovery. It must now fall
+    through to the full-file rewrite, the same as a malformed diff."""
+    (tmp_path / "billing.py").write_text(
+        "def discount(price, pct):\n    return price + (price * pct)\n", encoding="utf-8"
+    )
+    mismatch_diff = (
+        "--- a/billing.py\n"
+        "+++ b/billing.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def discount(price, pct):\n"
+        "-    return NONEXISTENT_CONTEXT_LINE\n"
+        "+    return price - (price * pct)\n"
+    )
+    full_rewrite = "def discount(price, pct):\n    return price - (price * pct)\n"
+    llm = _FakeLLM(plan_text="Fix billing.py.", bugfix_responses=[mismatch_diff, full_rewrite])
 
-    result = await BugFixWorkflow(
-        workspace_root=tmp_path,
-        search=FakeSearch(),
-        llm=FakeLLM("The bug is in app.py."),
-        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
-    ).run("app.py:1 ValueError: wrong value")
+    result = asyncio.run(
+        _workflow(tmp_path, llm, search=_EmptySearch()).run("fix discount so it subtracts")
+    )
+
+    assert result.applied is True
+    assert result.used_full_rewrite is True
+    assert (tmp_path / "billing.py").read_text(encoding="utf-8") == full_rewrite
+
+
+def test_bugfix_does_not_rewrite_around_a_denied_patch(tmp_path):
+    """A DENIAL is final - a valid diff the user rejected must never be smuggled
+    in via the rewrite fallback."""
+    original = "def discount(price, pct):\n    return price + (price * pct)\n"
+    (tmp_path / "billing.py").write_text(original, encoding="utf-8")
+    good_diff = (
+        "--- a/billing.py\n"
+        "+++ b/billing.py\n"
+        "@@ -1,2 +1,2 @@\n"
+        " def discount(price, pct):\n"
+        "-    return price + (price * pct)\n"
+        "+    return price - (price * pct)\n"
+    )
+    llm = _FakeLLM(plan_text="Fix billing.py.", bugfix_responses=[good_diff, "REWRITE SHOULD NOT RUN"])
+    workflow = BugFixWorkflow(
+        tmp_path,
+        search=_EmptySearch(),
+        llm=llm,
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: False),  # deny
+    )
+
+    result = asyncio.run(workflow.run("fix discount so it subtracts"))
 
     assert result.applied is False
-    assert result.error.startswith("Invalid diff:")
-    assert target.read_text(encoding="utf-8") == "value = 1\n"
-
-
-@pytest.mark.asyncio
-async def test_bugfix_workflow_reports_denied_apply(tmp_path: Path):
-    target = tmp_path / "app.py"
-    target.write_text("value = 1\n", encoding="utf-8")
-    diff = """--- a/app.py
-+++ b/app.py
-@@ -1 +1 @@
--value = 1
-+value = 2
-"""
-
-    result = await BugFixWorkflow(
-        workspace_root=tmp_path,
-        search=FakeSearch(),
-        llm=FakeLLM(diff),
-        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: False),
-    ).run("app.py:1 AssertionError")
-
-    assert result.applied is False
-    assert result.error == "Patch was not applied."
-    assert result.changed_files == ["app.py"]
-    assert target.read_text(encoding="utf-8") == "value = 1\n"
+    assert result.used_full_rewrite is False
+    assert (tmp_path / "billing.py").read_text(encoding="utf-8") == original

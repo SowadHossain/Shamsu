@@ -5,12 +5,14 @@ from io import StringIO
 from rich.console import Console
 
 from shamsu.cli.repl import (
+    _handle_log,
     _handle_parse_prd,
     _resolve_workspace_file,
     parse_args,
     resolve_workspace,
 )
 from shamsu.safety.sandbox import SecurityError
+from shamsu.session.manager import SessionManager
 
 
 def test_parse_args_accepts_workspace():
@@ -30,6 +32,14 @@ def test_resolve_workspace_uses_explicit_path(tmp_path):
     workspace.mkdir()
 
     assert resolve_workspace(str(workspace)) == workspace.resolve()
+
+
+def test_resolve_workspace_does_not_auto_redirect_to_ancestor_workspace(tmp_path):
+    (tmp_path / ".shamsu").mkdir()
+    child = tmp_path / "scripts"
+    child.mkdir()
+
+    assert resolve_workspace(str(child)) == child.resolve()
 
 
 def test_parse_prd_path_accepts_file_inside_workspace(tmp_path):
@@ -78,3 +88,30 @@ def test_handle_parse_prd_reports_outside_workspace(tmp_path):
         assert "outside workspace" in output.getvalue()
     finally:
         outside.unlink(missing_ok=True)
+
+
+def test_handle_log_tails_and_redacts_session_events(tmp_path):
+    logger = SessionManager(tmp_path).create_session("test")
+    logger.log("test.first", {"message": "first"}, "first")
+    logger.log("test.secret", {"password": "abc123"}, 'password = "abc123"')
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=120)
+
+    _handle_log("log tail 1", logger, console)
+
+    rendered = output.getvalue()
+    assert "Last 1 Events" in rendered
+    assert "[REDACTED]" in rendered
+    assert "abc123" not in rendered
+    assert "first" not in rendered
+
+
+def test_handle_log_reports_empty_session_events(tmp_path):
+    logger = SessionManager(tmp_path).create_session("test")
+    logger.events_path.unlink()
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=120)
+
+    _handle_log("log", logger, console)
+
+    assert "No session events yet" in output.getvalue()

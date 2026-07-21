@@ -16,7 +16,7 @@ class FakeSearch:
     def __init__(self) -> None:
         self.queries: list[str] = []
 
-    def search(self, query: str, top_k: int = 5) -> list[SearchResult]:
+    def search(self, query: str, top_k: int = 5, boost_paths: list[str] | None = None) -> list[SearchResult]:
         self.queries.append(query)
         return [
             SearchResult(
@@ -52,6 +52,35 @@ class FakeLLM:
             format="text",
             model_used="fake-doc-agent",
         )
+
+
+class FakeSpecialistAwareLLM:
+    """Returns a different canned response per specialist, so the planner's
+    output can be distinguished from the doc_agent's own response."""
+
+    def __init__(self, responses: dict[str, str]) -> None:
+        self.responses = responses
+        self.requests: dict[str, list[str]] = {}
+
+    async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse:
+        self.requests.setdefault(specialist, []).append(pack.user_request)
+        return LLMResponse(raw=self.responses[specialist], format="text", model_used="fake")
+
+
+@pytest.mark.asyncio
+async def test_documentation_workflow_folds_the_plan_into_the_doc_agent_request():
+    llm = FakeSpecialistAwareLLM({
+        "planner": "Document the CLI entrypoint and run instructions.",
+        "doc_agent": "# SHAMSU\n\n## Run\nUse `shamsu`.\n",
+    })
+
+    proposal = await DocumentationWorkflow(search=FakeSearch(), llm=llm).propose_readme_update(
+        existing_readme="# Old\n",
+        request="document the CLI",
+    )
+
+    assert proposal.plan == "Document the CLI entrypoint and run instructions."
+    assert "Document the CLI entrypoint and run instructions." in llm.requests["doc_agent"][0]
 
 
 @pytest.mark.asyncio

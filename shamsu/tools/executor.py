@@ -4,21 +4,42 @@ Internal command execution helpers for workspace-bound SHAMSU tools.
 from __future__ import annotations
 
 import re
+import os
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
+from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.diagnostics.digest import DiagnosticDigest
+from shamsu.diagnostics.setup import DiagnosticsWorkspace
+from shamsu.diagnostics.types import ErrorPacket
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.approval import ask_approval
+from shamsu.safety.approval_manager import ApprovalManager
+from shamsu.safety.audit import AuditLogger
 from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
+from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.types import ApprovalRequest, CommandRisk, TestRunResult
 
 BLOCKED_EXIT_CODE = 126
 DENIED_EXIT_CODE = 125
 TIMEOUT_EXIT_CODE = 124
 WORKSPACE_EXIT_CODE = 127
+
+
+def _platform_command(command: str) -> str:
+    """Use the running interpreter for `python3` command segments on Windows."""
+    if os.name != "nt" or not command:
+        return command
+    executable = f'"{sys.executable}"'
+    return re.sub(
+        r"(?i)(?P<prefix>^|(?:&&|\|\||[;&|])\s*)python3(?:\.exe)?(?=\s|$)",
+        lambda match: f"{match.group('prefix')}{executable}",
+        command,
+    )
 
 
 class CommandRunner(ICommandRunner):
@@ -28,14 +49,31 @@ class CommandRunner(ICommandRunner):
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
         timeout_seconds: int = 120,
         session_logger: SessionLogger | None = None,
+        approval_manager: ApprovalManager | None = None,
+        diagnostic_digest: DiagnosticDigest | None = None,
+        action_ledger: ActionLedger | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
+        self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
         self.timeout_seconds = timeout_seconds
         self.session_logger = session_logger
+        self.action_ledger = action_ledger
+        self.audit_logger = AuditLogger(self.workspace_root)
+        self.diagnostic_digest = diagnostic_digest or DiagnosticDigest(
+            self.workspace_root, memory_adapter=CodebaseMemoryAdapter()
+        )
+        self.diagnostics_workspace = DiagnosticsWorkspace(self.workspace_root)
+        self.last_error_packet: ErrorPacket | None = None
+        self.last_diagnostic_packet: ErrorPacket | None = None
+        self.last_diagnostics_path = ""
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
+        command = _platform_command(command)
+        self.last_error_packet = None
+        self.last_diagnostic_packet = None
+        self.last_diagnostics_path = ""
         if self.session_logger:
             self.session_logger.log(
                 "command.started",
@@ -43,6 +81,7 @@ class CommandRunner(ICommandRunner):
                 f"Command started: {command}",
                 workflow_id="command",
             )
+        ledger_cmd_id = self.action_ledger.log_command_start(command, cwd) if self.action_ledger else ""
         try:
             validated_cwd = self._validate_cwd(cwd)
         except (SecurityError, ValueError) as exc:
@@ -53,6 +92,9 @@ class CommandRunner(ICommandRunner):
                     "Command rejected before execution",
                     workflow_id="command",
                 )
+            self.audit_logger.log("command_run", "error", details={"command": command, "stderr": str(exc)})
+            if self.action_ledger:
+                self.action_ledger.log_command_finish(ledger_cmd_id, command, cwd, WORKSPACE_EXIT_CODE, "", str(exc))
             return WORKSPACE_EXIT_CODE, "", str(exc)
 
         risk = classify_command(command)
@@ -63,6 +105,11 @@ class CommandRunner(ICommandRunner):
                     {"command": command, "risk": risk.value},
                     f"Blocked command: {command}",
                     workflow_id="command",
+                )
+            self.audit_logger.log("command_run", "blocked", details={"command": command, "risk": risk.value})
+            if self.action_ledger:
+                self.action_ledger.log_command_finish(
+                    ledger_cmd_id, command, validated_cwd, BLOCKED_EXIT_CODE, "", f"Blocked command: {command}"
                 )
             return BLOCKED_EXIT_CODE, "", f"Blocked command: {command}"
 
@@ -75,7 +122,8 @@ class CommandRunner(ICommandRunner):
                 working_dir=str(validated_cwd),
                 reason="Command is medium risk or unknown.",
             )
-            if not self.approval_func(request):
+            self.approval_manager.session_logger = self.session_logger
+            if not self.approval_manager.ask(request):
                 if self.session_logger:
                     self.session_logger.log(
                         "command.denied",
@@ -83,7 +131,22 @@ class CommandRunner(ICommandRunner):
                         f"Command denied: {command}",
                         workflow_id="command",
                     )
+                self.audit_logger.log(
+                    "approval",
+                    "denied",
+                    details={"action_type": request.action_type, "preview": request.preview},
+                )
+                self.audit_logger.log("command_run", "denied", details={"command": command, "risk": risk.value})
+                if self.action_ledger:
+                    self.action_ledger.log_command_finish(
+                        ledger_cmd_id, command, validated_cwd, DENIED_EXIT_CODE, "", f"Command denied by user: {command}"
+                    )
                 return DENIED_EXIT_CODE, "", f"Command denied by user: {command}"
+            self.audit_logger.log(
+                "approval",
+                "approved",
+                details={"action_type": request.action_type, "preview": request.preview},
+            )
 
         try:
             completed = subprocess.run(
@@ -93,6 +156,7 @@ class CommandRunner(ICommandRunner):
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
             )
         except subprocess.TimeoutExpired as exc:
             stdout = redact(_as_text(exc.stdout))
@@ -106,6 +170,23 @@ class CommandRunner(ICommandRunner):
                     {"command": command, "stdout": stdout, "stderr": message, "exit_code": TIMEOUT_EXIT_CODE},
                     f"Command timed out: {command}",
                     workflow_id="command",
+                )
+            self.audit_logger.log(
+                "command_run",
+                "timeout",
+                details={"command": command, "stdout": stdout, "stderr": message},
+            )
+            diagnostics_path = self._run_diagnostics(
+                command,
+                validated_cwd,
+                TIMEOUT_EXIT_CODE,
+                stdout,
+                message,
+                operation_id=ledger_cmd_id,
+            )
+            if self.action_ledger:
+                self.action_ledger.log_command_finish(
+                    ledger_cmd_id, command, validated_cwd, TIMEOUT_EXIT_CODE, stdout, message, diagnostics_path
                 )
             return TIMEOUT_EXIT_CODE, stdout, message
 
@@ -126,7 +207,130 @@ class CommandRunner(ICommandRunner):
                 f"Command finished with exit {result[0]}: {command}",
                 workflow_id="command",
             )
+        self.audit_logger.log(
+            "command_run",
+            "success" if result[0] == 0 else "error",
+            details={"command": command, "exit_code": result[0], "stdout": result[1], "stderr": result[2]},
+        )
+        diagnostics_path = self._run_diagnostics(
+            command,
+            validated_cwd,
+            result[0],
+            result[1],
+            result[2],
+            operation_id=ledger_cmd_id,
+        )
+        if self.action_ledger:
+            self.action_ledger.log_command_finish(
+                ledger_cmd_id, command, validated_cwd, result[0], result[1], result[2], diagnostics_path
+            )
         return result
+
+    def _run_diagnostics(
+        self,
+        command: str,
+        cwd: Path,
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+        operation_id: str = "",
+    ) -> str:
+        """Parse this command's output into a compact ErrorPacket *before*
+        anything reaches the model - never the other way around. Best-effort:
+        a digest failure must never break command execution or hide the raw
+        result already returned to the caller. Returns the ActionLedger-relative
+        diagnostics path (empty string if there's no ledger or digest failed)."""
+        try:
+            raw_log_path = ""
+            if self.action_ledger and operation_id:
+                stream = "stderr" if stderr else "stdout"
+                raw_log_path = f"commands/{operation_id}.{stream}.log"
+            elif self.session_logger:
+                raw_log_path = str(self.session_logger.events_path)
+            packet = self.diagnostic_digest.run(command, cwd, exit_code, stdout, stderr, raw_log_path=raw_log_path)
+            packet.phase = "execution"
+            packet.operation_id = operation_id
+            self.last_diagnostic_packet = packet
+            self.last_error_packet = packet if packet.actionable else None
+            if packet.actionable:
+                self.diagnostics_workspace.save_packet(packet.to_dict())
+            if self.session_logger:
+                self.session_logger.log(
+                    "diagnostics.packet",
+                    packet.to_dict(),
+                    packet.summary or "Diagnostics parsed.",
+                    workflow_id="diagnostics",
+                )
+            if self.action_ledger:
+                self.last_diagnostics_path = self.action_ledger.log_diagnostics(
+                    packet.parser_chain,
+                    packet.summary,
+                    packet.to_dict(),
+                    operation_id=operation_id,
+                )
+                return self.last_diagnostics_path
+            self.last_diagnostics_path = ""
+            return ""
+        except Exception as exc:  # pragma: no cover - defensive, must never break command execution
+            if self.session_logger:
+                self.session_logger.log(
+                    "diagnostics.error",
+                    {"command": command, "error": str(exc)},
+                    "DiagnosticDigest failed; raw output remains available in session logs.",
+                    workflow_id="diagnostics",
+                )
+            return ""
+
+    def validate_and_approve(
+        self,
+        command: str,
+        cwd: Path,
+        description: str | None = None,
+    ) -> tuple[bool, int, str, Path | None]:
+        """Validate command/cwd and ask approval when needed without executing.
+
+        Used by detached dev-server launches: the command must pass the same
+        safety gates as normal command execution, but SHAMSU must not wait for
+        a long-running server process to exit.
+        """
+        try:
+            validated_cwd = self._validate_cwd(cwd)
+        except (SecurityError, ValueError) as exc:
+            return False, WORKSPACE_EXIT_CODE, str(exc), None
+
+        risk = classify_command(command)
+        if risk == CommandRisk.BLOCKED:
+            if self.session_logger:
+                self.session_logger.log(
+                    "command.blocked",
+                    {"command": command, "risk": risk.value},
+                    f"Blocked command: {command}",
+                    workflow_id="command",
+                )
+            self.audit_logger.log("command_run", "blocked", details={"command": command, "risk": risk.value})
+            return False, BLOCKED_EXIT_CODE, f"Blocked command: {command}", validated_cwd
+
+        if risk == CommandRisk.MEDIUM:
+            request = ApprovalRequest(
+                action_type="run_command",
+                description=description or f"Run command: {command}",
+                risk_level="medium",
+                preview=command,
+                working_dir=str(validated_cwd),
+                reason="Command is medium risk or unknown.",
+            )
+            self.approval_manager.session_logger = self.session_logger
+            if not self.approval_manager.ask(request):
+                if self.session_logger:
+                    self.session_logger.log(
+                        "command.denied",
+                        {"command": command, "cwd": str(validated_cwd)},
+                        f"Command denied: {command}",
+                        workflow_id="command",
+                    )
+                self.audit_logger.log("command_run", "denied", details={"command": command, "risk": risk.value})
+                return False, DENIED_EXIT_CODE, f"Command denied by user: {command}", validated_cwd
+        return True, 0, "Command approved.", validated_cwd
 
     def run_tests(self, cwd: Path) -> TestRunResult:
         exit_code, stdout, stderr = self.run("python -m pytest tests/ -q", cwd)

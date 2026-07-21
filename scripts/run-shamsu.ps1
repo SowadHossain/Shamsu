@@ -1,4 +1,4 @@
-[CmdletBinding()]
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Workspace = (Get-Location).Path,
     [Parameter(ValueFromPipeline = $true)]

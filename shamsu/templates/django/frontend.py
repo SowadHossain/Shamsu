@@ -145,44 +145,159 @@ def render_django_tests(project: ProjectSpec) -> str:
         imports.extend([f"from .models import {', '.join(entity.name for entity in entities)}", ""])
     blocks = imports
     for entity in entities:
-        blocks.extend(_test_case_block(entity))
+        blocks.extend(_test_case_block(entity, entities))
+    blocks.extend(_authentication_test_block())
     if not entities:
         blocks.extend(["class GeneratedProjectSmokeTests(TestCase):", "    def test_smoke(self):", "        self.assertTrue(True)", ""])
     return "\n".join(blocks).rstrip() + "\n"
 
 
-def _test_case_block(entity: EntitySpec) -> list[str]:
+def _test_case_block(entity: EntitySpec, entities: list[EntitySpec]) -> list[str]:
     class_name = f"{entity.name}ApiTests"
     object_name = _to_snake_case(entity.name)
     factory_kwargs = _factory_kwargs(entity)
-    create_data = _api_payload(entity)
-    return [
+    other_factory_kwargs = _factory_kwargs(entity, user_expression="self.other_user")
+    create_data = _api_payload(entity, prefix="Created")
+    blocks = [
         f"class {class_name}(TestCase):",
         "    def setUp(self):",
         "        self.user = get_user_model().objects.create_user(username='tester', password='pass12345')",
+        "        self.other_user = get_user_model().objects.create_user(username='other', password='pass12345')",
         "        self.client = APIClient()",
         "        self.client.force_authenticate(self.user)",
         f"        self.{object_name} = {entity.name}.objects.create({factory_kwargs})",
+        f"        self.other_{object_name} = {entity.name}.objects.create({other_factory_kwargs})",
         "",
         "    def test_list(self):",
-        f"        response = self.client.get(reverse('{_resource_url_name(entity.name)}-list'))",
-        "        self.assertIn(response.status_code, {200, 301, 302})",
+        f"        response = self.client.get(reverse('api:{_resource_url_name(entity.name)}-list'))",
+        "        self.assertEqual(response.status_code, 200)",
+        "        records = response.data.get('results', response.data)",
+        f"        self.assertEqual([record['id'] for record in records], [self.{object_name}.id])",
         "",
         "    def test_create(self):",
-        f"        response = self.client.post(reverse('{_resource_url_name(entity.name)}-list'), data={create_data!r}, format='json')",
-        "        self.assertIn(response.status_code, {200, 201, 400})",
+        f"        response = self.client.post(reverse('api:{_resource_url_name(entity.name)}-list'), data={create_data!r}, format='json')",
+        "        self.assertEqual(response.status_code, 201)",
+        "        self.assertEqual(response.data.get('user'), None)",
         "",
         "    def test_retrieve(self):",
-        f"        response = self.client.get(reverse('{_resource_url_name(entity.name)}-detail', args=[self.{object_name}.pk]))",
-        "        self.assertIn(response.status_code, {200, 301, 302})",
+        f"        response = self.client.get(reverse('api:{_resource_url_name(entity.name)}-detail', args=[self.{object_name}.pk]))",
+        "        self.assertEqual(response.status_code, 200)",
+        "",
+        "    def test_cannot_retrieve_another_users_record(self):",
+        f"        response = self.client.get(reverse('api:{_resource_url_name(entity.name)}-detail', args=[self.other_{object_name}.pk]))",
+        "        self.assertEqual(response.status_code, 404)",
         "",
         "    def test_update(self):",
-        f"        response = self.client.put(reverse('{_resource_url_name(entity.name)}-detail', args=[self.{object_name}.pk]), data={create_data!r}, format='json')",
-        "        self.assertIn(response.status_code, {200, 400})",
+        f"        response = self.client.put(reverse('api:{_resource_url_name(entity.name)}-detail', args=[self.{object_name}.pk]), data={create_data!r}, format='json')",
+        "        self.assertEqual(response.status_code, 200)",
         "",
         "    def test_delete(self):",
-        f"        response = self.client.delete(reverse('{_resource_url_name(entity.name)}-detail', args=[self.{object_name}.pk]))",
-        "        self.assertIn(response.status_code, {204, 301, 302})",
+        f"        response = self.client.delete(reverse('api:{_resource_url_name(entity.name)}-detail', args=[self.{object_name}.pk]))",
+        "        self.assertEqual(response.status_code, 204)",
+        "",
+        "    def test_html_delete_rejects_another_users_record(self):",
+        "        self.client.force_login(self.user)",
+        f"        response = self.client.post(reverse('{_resource_url_name(entity.name)}-delete', args=[self.other_{object_name}.pk]))",
+        "        self.assertEqual(response.status_code, 404)",
+        "",
+    ]
+    if entity.name == "Task":
+        blocks.extend(
+            [
+                "    def test_complete_and_reopen(self):",
+                "        complete = self.client.post(reverse('api:task-complete', args=[self.task.pk]))",
+                "        self.assertEqual(complete.status_code, 200)",
+                "        self.task.refresh_from_db()",
+                "        self.assertEqual(self.task.status, 'completed')",
+                "        self.assertIsNotNone(self.task.completed_at)",
+                "        reopen = self.client.post(reverse('api:task-reopen', args=[self.task.pk]))",
+                "        self.assertEqual(reopen.status_code, 200)",
+                "        self.task.refresh_from_db()",
+                "        self.assertEqual(self.task.status, 'pending')",
+                "        self.assertIsNone(self.task.completed_at)",
+                "",
+            ]
+        )
+        if any(item.name == "Category" for item in entities):
+            blocks.extend(
+                [
+                    "    def test_rejects_another_users_category(self):",
+                    "        category = Category.objects.create(user=self.other_user, name='Private')",
+                    f"        data = {create_data!r}",
+                    "        data['category'] = category.pk",
+                    "        response = self.client.post(reverse('api:task-list'), data=data, format='json')",
+                    "        self.assertEqual(response.status_code, 400)",
+                    "",
+                    "    def test_deleting_category_keeps_task_and_sets_null(self):",
+                    "        category = Category.objects.create(user=self.user, name='Temporary')",
+                    "        self.task.category = category",
+                    "        self.task.save(update_fields=['category'])",
+                    "        response = self.client.delete(reverse('api:category-detail', args=[category.pk]))",
+                    "        self.assertEqual(response.status_code, 204)",
+                    "        self.task.refresh_from_db()",
+                    "        self.assertIsNone(self.task.category)",
+                    "",
+                ]
+            )
+    return blocks
+
+
+def _authentication_test_block() -> list[str]:
+    return [
+        "class AuthenticationTests(TestCase):",
+        "    def test_root_route_is_available(self):",
+        "        response = self.client.get(reverse('home'))",
+        "        self.assertIn(response.status_code, (200, 302))",
+        "",
+        "    def test_registration_hashes_password_and_normalizes_email(self):",
+        "        response = self.client.post(reverse('register'), data={",
+        "            'full_name': 'Example User',",
+        "            'email': 'USER@Example.COM',",
+        "            'username': 'example',",
+        "            'password1': 'StrongPass123!',",
+        "            'password2': 'StrongPass123!',",
+        "        })",
+        "        self.assertEqual(response.status_code, 302)",
+        "        user = get_user_model().objects.get(username='example')",
+        "        self.assertEqual(user.email, 'user@example.com')",
+        "        self.assertTrue(user.check_password('StrongPass123!'))",
+        "",
+        "    def test_duplicate_email_is_rejected(self):",
+        "        get_user_model().objects.create_user(username='existing', email='user@example.com')",
+        "        response = self.client.post(reverse('register'), data={",
+        "            'full_name': 'Example User',",
+        "            'email': 'USER@example.com',",
+        "            'username': 'example',",
+        "            'password1': 'StrongPass123!',",
+        "            'password2': 'StrongPass123!',",
+        "        })",
+        "        self.assertEqual(response.status_code, 200)",
+        "        self.assertContains(response, 'already exists')",
+        "",
+        "    def test_dashboard_requires_login(self):",
+        "        response = self.client.get(reverse('dashboard'))",
+        "        self.assertEqual(response.status_code, 302)",
+        "",
+        "    def test_api_registration_and_email_login(self):",
+        "        client = APIClient()",
+        "        registration = client.post(reverse('api-register'), data={",
+        "            'fullName': 'API User',",
+        "            'email': 'api@example.com',",
+        "            'password': 'StrongPass123!',",
+        "            'confirmPassword': 'StrongPass123!',",
+        "        }, format='json')",
+        "        self.assertEqual(registration.status_code, 201)",
+        "        self.assertNotIn('password', registration.data)",
+        "        login = client.post(reverse('api-login'), data={",
+        "            'email': 'api@example.com',",
+        "            'password': 'StrongPass123!',",
+        "        }, format='json')",
+        "        self.assertEqual(login.status_code, 200)",
+        "        self.assertIn('access', login.data)",
+        "",
+        "    def test_current_user_api_requires_authentication(self):",
+        "        response = APIClient().get(reverse('api-current-user'))",
+        "        self.assertIn(response.status_code, {401, 403})",
         "",
     ]
 
@@ -230,28 +345,35 @@ def _display_fields(entity: EntitySpec) -> list[EntityFieldSpec]:
     return [field for field in entity.fields if field.django_type not in {"ForeignKey", "ManyToManyField"}] or entity.fields
 
 
-def _factory_kwargs(entity: EntitySpec) -> str:
+def _factory_kwargs(entity: EntitySpec, user_expression: str = "self.user") -> str:
     values = []
     for field in entity.fields:
         if field.django_type == "ManyToManyField":
             continue
+        if field.kwargs.get("auto_now") or field.kwargs.get("auto_now_add"):
+            continue
         if field.django_type == "ForeignKey" and field.kwargs.get("to") == "User":
-            values.append(f"{field.name}=self.user")
+            values.append(f"{field.name}={user_expression}")
         elif field.django_type != "ForeignKey":
             values.append(f"{field.name}={_sample_value(field)!r}")
     return ", ".join(values)
 
 
-def _api_payload(entity: EntitySpec) -> dict[str, object]:
+def _api_payload(entity: EntitySpec, prefix: str = "Sample") -> dict[str, object]:
     payload: dict[str, object] = {}
     for field in entity.fields:
         if field.django_type in {"ForeignKey", "ManyToManyField"}:
             continue
-        payload[field.name] = _sample_value(field)
+        if field.kwargs.get("auto_now") or field.kwargs.get("auto_now_add"):
+            continue
+        payload[field.name] = _sample_value(field, prefix=prefix)
     return payload
 
 
-def _sample_value(field: EntityFieldSpec) -> object:
+def _sample_value(field: EntityFieldSpec, prefix: str = "Sample") -> object:
+    choices = field.kwargs.get("choices")
+    if isinstance(choices, list) and choices:
+        return choices[0]
     if field.django_type == "BooleanField":
         return True
     if field.django_type in {"IntegerField", "PositiveIntegerField"}:
@@ -259,10 +381,10 @@ def _sample_value(field: EntityFieldSpec) -> object:
     if field.django_type == "DecimalField":
         return "12.50"
     if field.django_type in {"DateField", "DateTimeField"}:
-        return "2026-01-01"
+        return "2026-01-01T12:00:00Z" if field.django_type == "DateTimeField" else "2026-01-01"
     if field.django_type == "EmailField":
         return "user@example.com"
-    return f"Sample {_display_name(field.name)}"
+    return f"{prefix} {_display_name(field.name)}"
 
 
 def _resource_url_name(text: str) -> str:

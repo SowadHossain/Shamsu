@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from shamsu.prd.classifier import classify_archetype
 from shamsu.prd.parser import parse_prd_text
 from shamsu.prd.project import build_project_spec
+from shamsu.templates.registry import get_template_provider
+from shamsu.types import Archetype
 
 
 def test_todo_prd_infers_crud_endpoints_and_pages():
@@ -18,6 +21,8 @@ def test_todo_prd_infers_crud_endpoints_and_pages():
     assert spec.entities[0].fields[1].kwargs["default"] is False
     assert {endpoint.method for endpoint in spec.endpoints} == {"GET", "POST", "PUT", "DELETE"}
     assert {page.page_type for page in spec.pages} >= {"dashboard", "list", "detail", "form"}
+    assert spec.archetype == Archetype.WEB_CRUD
+    assert spec.archetype_confidence >= 0.65
 
 
 def test_expense_prd_extracts_decimal_foreign_key_and_optional_fields():
@@ -64,3 +69,49 @@ def test_blog_prd_extracts_public_pages_many_to_many_and_choices():
     assert public_pages
     assert all(page.requires_login is False for page in public_pages)
     assert spec.theme == "nord"
+
+
+def test_classifier_detects_game_archetype():
+    parsed = parse_prd_text(
+        "# Cube Runner 3D\n\n"
+        "Build a realtime 3D game with player movement, physics, scoring, and levels."
+    )
+
+    decision = classify_archetype(parsed)
+
+    assert decision.archetype == Archetype.REALTIME_3D_GAME
+    assert decision.confidence >= 0.65
+
+
+def test_non_django_archetype_uses_generic_generation_order_until_provider_exists():
+    parsed = parse_prd_text(
+        "# Cube Runner 3D\n\n"
+        "Build a realtime 3D game with player movement, physics, scoring, and levels."
+    )
+
+    spec = build_project_spec(parsed)
+
+    assert spec.archetype == Archetype.REALTIME_3D_GAME
+    assert [file.path for file in spec.generation_order] == ["index.html", "README.md"]
+
+
+def test_classifier_falls_back_to_generic_web_for_vague_prd():
+    parsed = parse_prd_text("# Something\n\nMake a nice thing for people.")
+
+    decision = classify_archetype(parsed)
+
+    assert decision.archetype == Archetype.GENERIC_WEB
+
+
+def test_template_registry_wraps_django_for_web_crud():
+    parsed = parse_prd_text(
+        "# Todo App\n\n"
+        "## Entities\n"
+        "- Task: title (text), done (boolean)\n"
+    )
+    spec = build_project_spec(parsed)
+    provider = get_template_provider(spec.archetype)
+
+    assert provider.smoke_test() is True
+    assert provider.render_all(spec)["manage.py"].startswith("#!/usr/bin/env python")
+    assert provider.build_manifest(spec).holes

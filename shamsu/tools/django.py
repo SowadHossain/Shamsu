@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
+import sys
 
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.commands import redact
@@ -12,10 +13,11 @@ from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import TestFailure, TestRunResult
 
-INSTALL_REQUIREMENTS_COMMAND = "pip install -r requirements.txt"
-MAKE_MIGRATIONS_COMMAND = "python manage.py makemigrations"
-MIGRATE_COMMAND = "python manage.py migrate"
-DJANGO_TEST_COMMAND = "python manage.py test --verbosity=2"
+_PYTHON = f'"{sys.executable}"'
+INSTALL_REQUIREMENTS_COMMAND = f"{_PYTHON} -m pip install -r requirements.txt"
+MAKE_MIGRATIONS_COMMAND = f"{_PYTHON} manage.py makemigrations"
+MIGRATE_COMMAND = f"{_PYTHON} manage.py migrate"
+DJANGO_TEST_COMMAND = f"{_PYTHON} manage.py test --verbosity=2"
 
 
 @dataclass(frozen=True)

@@ -8,12 +8,36 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install -e ".[dev]"
-      - run: ruff check shamsu/
-      - run: pytest tests/ -v --tb=short
+      - run: ruff check shamsu/ tests/ evals/ scripts/
+      - run: pytest tests/ -q --tb=short
+      - name: Validate Unix lifecycle scripts
+        if: runner.os != 'Windows'
+        run: bash -n scripts/install.sh scripts/run-shamsu.sh scripts/doctor.sh scripts/uninstall.sh
+      - name: Validate Windows lifecycle scripts
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($file in @('scripts/install.ps1', 'scripts/run-shamsu.ps1', 'scripts/doctor.ps1', 'scripts/uninstall.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { $errors | ForEach-Object { Write-Error $_ }; $failed = $true }
+          }
+          if ($failed) { exit 1 }
+      - name: Run installed headless command
+        shell: bash
+        run: |
+          python -c "from pathlib import Path; Path('release-smoke').mkdir(exist_ok=True)"
+          python -m shamsu.cli.repl run --workspace release-smoke --prompt "what folder are you in?" --approval deny --output json

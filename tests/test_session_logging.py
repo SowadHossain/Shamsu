@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,25 @@ def test_session_manager_creates_metadata_and_index(tmp_path: Path):
     index = json.loads((tmp_path / ".shamsu" / "sessions" / "index.json").read_text())
     assert index["sessions"][0]["title"] == "Feature work"
     assert logger.metadata.event_count == 1
+
+
+def test_parallel_session_creation_keeps_index_valid_and_complete(tmp_path: Path):
+    # Exercise concurrent index updates after the workspace session store has
+    # been initialized, matching parallel headless runs in a real workspace.
+    SessionManager(tmp_path).root.mkdir(parents=True, exist_ok=True)
+
+    def create(index: int) -> str:
+        return SessionManager(tmp_path).create_session(f"Parallel {index}").session_id
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        session_ids = list(pool.map(create, range(24)))
+
+    raw = (tmp_path / ".shamsu" / "sessions" / "index.json").read_text(encoding="utf-8")
+    index = json.loads(raw)
+    indexed_ids = {item["session_id"] for item in index["sessions"]}
+
+    assert len(session_ids) == len(set(session_ids)) == 24
+    assert indexed_ids == set(session_ids)
 
 
 def test_session_list_resume_rename_close_and_export(tmp_path: Path):
@@ -212,6 +232,40 @@ def test_session_paths_are_workspace_local(tmp_path: Path):
     logger = manager.create_session("Sandbox")
 
     assert logger.events_path.is_relative_to(tmp_path)
+
+
+def test_pending_question_set_get_answer_and_clear(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("Pending")
+    question = {
+        "question": "Which file should I read?",
+        "options": [{"label": "client/src/App.tsx", "description": "frontend"}],
+        "created_from_prompt": "read App.tsx",
+        "awaiting": "user_input",
+    }
+
+    logger.set_pending_question(question)
+    stored = logger.get_pending_question()
+
+    assert stored["question"] == "Which file should I read?"
+    assert stored["options"][0]["label"] == "client/src/App.tsx"
+    assert (tmp_path / ".shamsu" / "sessions" / logger.session_id / "pending.json").exists()
+
+    logger.clear_pending_question(answered=True, answer="client/src/App.tsx")
+
+    assert logger.get_pending_question() == {}
+    event_types = [event["event_type"] for event in logger.tail(10)]
+    assert "session.pending_question.set" in event_types
+    assert "session.pending_question.answered" in event_types
+
+
+def test_pending_question_cleared_event_when_not_answered(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("Pending")
+    logger.set_pending_question({"question": "Pick one"})
+
+    logger.clear_pending_question()
+
+    assert logger.get_pending_question() == {}
+    assert "session.pending_question.cleared" in [event["event_type"] for event in logger.tail(10)]
 
 
 def test_project_spec_helper_still_has_generation_order():
