@@ -40,3 +40,4 @@ dogfood-*/
 
 # Scratch build/output dir used by the release scripts.
 tmp/
+ASE2_PRD_EVAL_ARTIFACTS/
