@@ -7,10 +7,12 @@ from pathlib import Path
 
 from shamsu.cli.repl import (
     _build_prd_milestone_request,
+    _prd_milestones_for_execution,
     _plan_step_request,
     _prd_brief,
 )
 from shamsu.context.progress import render_progress_checklist
+from shamsu.prd.parser import parse_prd_text
 from shamsu.types import ParsedPRD
 
 
@@ -112,3 +114,21 @@ def test_milestone_request_uses_brief_and_checklist_not_raw_text():
     assert "prd.md" in req  # the agent is told where to read full detail
     # The verbose raw PRD text must NOT be dumped into the per-milestone prompt.
     assert parsed.raw_text not in req
+
+
+def test_compiled_prd_milestones_are_feature_flagged(monkeypatch):
+    parsed = parse_prd_text(
+        "# Demo\n\n## Features\n- Search tasks\n\n## Acceptance\n- `npm test` exits 0.\n",
+        markdown=True,
+    )
+
+    monkeypatch.delenv("SHAMSU_MILESTONE_EXECUTOR", raising=False)
+    disabled, disabled_source = _prd_milestones_for_execution(parsed)
+    assert disabled == []
+    assert disabled_source == "disabled"
+
+    monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
+    milestones, source = _prd_milestones_for_execution(parsed)
+    assert source == "compiled_requirement_ledger"
+    assert any(item.startswith("M-002") for item in milestones)
+    assert any(item.startswith("M-004") for item in milestones)

@@ -16,6 +16,7 @@ Trust boundaries:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,11 @@ _EXTENSIONLESS_FILE_REWRITES = {
     "theme": ".css",
     "tsconfig": ".json",
 }
+_REGENERATE_SOURCE_EXTENSIONS = frozenset(
+    {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css"}
+)
+_PYTHON_CLI_COMMANDS = ("seed", "add", "list", "summary", "export")
+_PYTHON_CLI_RESERVED_OPTIONS = {"db", "out", "help"}
 
 GENERATION_PLAN_SCHEMA: dict = {
     "type": "object",
@@ -125,6 +131,26 @@ Rules:
 - Keep it compiling/runnable. No prose outside the JSON.
 - The content value must be raw file content only: no Markdown heading with the
   filename, no fenced code block, no explanation.
+- Finish the entire file. Never stop in the middle of a string, expression,
+  function, object, or JSON structure.
+- When writing source-code string literals that contain newlines, use escaped
+  backslash-n sequences in the source code, not literal line breaks inside the
+  quoted string.
+- For CLIs, implement the exact acceptance command syntax. If an option appears
+  after a subcommand, accept it there; do not put it only on the root parser.
+"""
+
+REPAIR_FILE_SYSTEM = """You are SHAMSU repairing ONE generated source file after verification failed.
+Output ONLY JSON: {"content": "<the complete corrected file contents>"}.
+Rules:
+- Use the PRD, current file content, and verifier failure to rewrite this file.
+- Preserve working behavior unless it conflicts with the PRD or verifier.
+- Return the complete file from first line to last line, not a patch.
+- Keep it compiling/runnable. No prose outside the JSON.
+- Finish the entire file. Never stop in the middle of a string, expression,
+  function, object, or JSON structure.
+- For CLIs, implement the exact failing command syntax. If an option appears
+  after a subcommand, accept it there; do not put it only on the root parser.
 """
 
 
@@ -241,17 +267,21 @@ class FreeformGenerator:
             session_logger=self.session_logger,
             action_ledger=get_current_run(),
         )
-        verifier = CommandVerifier(verify_command, runner, target)
-        repair_result = RepairLoop(
-            target,
-            verifier,
-            LLMProposer(self.generate),
-            max_attempts=self.max_repair_attempts,
-            session_logger=self.session_logger,
-            digest=DiagnosticDigest(target),
-        ).run()
+        repair_result = self._run_repair_loop(target, verify_command, runner)
 
         success = repair_result.exit_code == 0 and repair_result.success
+        if not success:
+            regenerated = self._regenerate_failed_source_file(
+                contract,
+                plan,
+                target,
+                written,
+                repair_result,
+            )
+            if regenerated:
+                written = list(dict.fromkeys([*written, *regenerated]))
+                repair_result = self._run_repair_loop(target, verify_command, runner)
+                success = repair_result.exit_code == 0 and repair_result.success
         final_message = enforce_final_response(repair_result.final_message, repair_result.exit_code)
         return FreeformRunResult(
             target_dir=target,
@@ -267,6 +297,79 @@ class FreeformGenerator:
         )
 
     # -- helpers ---------------------------------------------------------------
+
+    def _run_repair_loop(
+        self,
+        target: Path,
+        verify_command: str,
+        runner: CommandRunnerLike,
+    ) -> RepairResult:
+        verifier = CommandVerifier(verify_command, runner, target)
+        return RepairLoop(
+            target,
+            verifier,
+            LLMProposer(self.generate),
+            max_attempts=self.max_repair_attempts,
+            session_logger=self.session_logger,
+            digest=DiagnosticDigest(target),
+        ).run()
+
+    def _regenerate_failed_source_file(
+        self,
+        contract: PRDContract | None,
+        plan: GenerationPlan,
+        target: Path,
+        written: list[str],
+        repair_result: RepairResult,
+    ) -> list[str]:
+        targets = _failed_source_targets(written, repair_result)
+        if not targets:
+            return []
+        brief = contract.render_brief() if contract is not None else "(no PRD contract)"
+        plan_text = "\n".join(f"- {f.path}: {f.purpose}" for f in plan.files)
+        changed: list[str] = []
+        for path in targets[:2]:
+            file_path = (target / path).resolve()
+            try:
+                file_path.relative_to(target)
+                current = file_path.read_text(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                continue
+            prompt = (
+                f"{brief}\n\n"
+                f"## Stack\n{plan.stack or 'unspecified'}\n\n"
+                f"## Full file plan\n{plan_text}\n\n"
+                f"## Verifier failure\n{repair_result.final_message}\n"
+                f"Stopped reason: {repair_result.stopped_reason or 'n/a'}\n\n"
+                f"## File to rewrite now\n{path}\n\n"
+                f"## Current file content\n{current}\n\n"
+                '## Task\nReturn JSON {"content": "..."} with the complete corrected file.'
+            )
+            try:
+                raw = self.generate(REPAIR_FILE_SYSTEM, prompt, FILE_CONTENT_SCHEMA)
+            except TimeoutError:
+                self._log("freeform.repair_regeneration_timeout", {"path": path})
+                continue
+            except Exception:
+                self._log("freeform.repair_regeneration_failed", {"path": path})
+                continue
+            data = _loads(raw or "")
+            if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+                continue
+            content = _sanitize_generated_content(str(data["content"]), path)
+            if not _valid_regenerated_source(path, current, content):
+                self._log("freeform.repair_regeneration_rejected", {"path": path})
+                continue
+            if self._write_project_file(
+                target,
+                path,
+                content,
+                reason=f"Freeform: regenerate {path}",
+                operation_reason="full-file regeneration after verifier failure",
+            ):
+                changed.append(path)
+                self._log("freeform.repair_regenerated_file", {"path": path})
+        return changed
 
     def _plan(self, contract: PRDContract | None) -> GenerationPlan | None:
         brief = contract.render_brief() if contract is not None else "(no PRD contract)"
@@ -397,6 +500,22 @@ class FreeformGenerator:
         target: Path,
         written: list[str],
     ) -> list[str]:
+        python_cli = _python_cli_contract_files(contract, plan.stack, written)
+        if python_cli:
+            touched: list[str] = []
+            for path, content in python_cli.items():
+                if self._write_project_file(
+                    target,
+                    path,
+                    content,
+                    reason=f"Freeform: harden {path}",
+                    operation_reason="deterministic Python CLI foundation from PRD contract",
+                ):
+                    touched.append(path)
+            if touched:
+                self._log("freeform.python_cli_hardened", {"files": touched})
+                written = list(dict.fromkeys([*written, *touched]))
+
         if not _is_vite_react_project(plan.stack, contract, written):
             return written
         hardened = _vite_react_contract_files(contract, target.name)
@@ -407,11 +526,21 @@ class FreeformGenerator:
                 path,
                 content,
                 reason=f"Freeform: harden {path}",
-                operation_reason="deterministic Vite/React foundation from PRD contract",
+                operation_reason=(
+                    "react-vite skill deterministic foundation from PRD contract"
+                ),
             ):
                 touched.append(path)
         if touched:
-            self._log("freeform.vite_react_hardened", {"files": touched})
+            self._log(
+                "freeform.vite_react_hardened",
+                {
+                    "files": touched,
+                    "skill": "react-vite",
+                    "hook": "vite-react-contract-foundation",
+                    "provenance": "bundled deterministic skill hook",
+                },
+            )
         return list(dict.fromkeys([*written, *touched]))
 
     def _generate_one(
@@ -480,6 +609,459 @@ def _dedupe_files(files: list[PlannedFile]) -> list[PlannedFile]:
     return result
 
 
+def _failed_source_targets(written: list[str], repair_result: RepairResult) -> list[str]:
+    written_set = {path.replace("\\", "/") for path in written}
+    targets: list[str] = []
+    for error in repair_result.remaining_errors:
+        path = (error.file or "").replace("\\", "/")
+        if path in written_set and Path(path).suffix.lower() in _REGENERATE_SOURCE_EXTENSIONS:
+            targets.append(path)
+    if not targets:
+        targets = [
+            path
+            for path in written_set
+            if Path(path).suffix.lower() in _REGENERATE_SOURCE_EXTENSIONS
+        ]
+    return list(dict.fromkeys(targets))
+
+
+def _valid_regenerated_source(path: str, current: str, content: str) -> bool:
+    if not content.strip() or content == current:
+        return False
+    current_lines = max(1, len(current.splitlines()))
+    new_lines = len(content.splitlines())
+    if new_lines * 2 < current_lines:
+        return False
+    if Path(path).suffix.lower() == ".py":
+        try:
+            compile(content, path, "exec")
+        except SyntaxError:
+            return False
+    return True
+
+
+def _python_cli_contract_files(
+    contract: PRDContract | None,
+    stack: str,
+    written: list[str],
+) -> dict[str, str]:
+    if contract is None:
+        return {}
+    text = _contract_text(contract)
+    lowered = text.lower()
+    commands = _python_cli_commands_from_text(text)
+    has_python = "python" in " ".join([stack, lowered])
+    has_cli = any(token in lowered for token in ("cli", "command line", "command-line", "script named"))
+    has_json_db = "--db" in lowered and "json" in lowered
+    if not (has_python and has_cli and has_json_db):
+        return {}
+    if not set(_PYTHON_CLI_COMMANDS).issubset(commands):
+        return {}
+
+    script_path = _python_cli_script_path(text, written)
+    if not script_path:
+        return {}
+    fields = _python_cli_add_fields(text)
+    if not fields:
+        return {}
+    amount_fields = _python_cli_amount_fields(fields)
+    seed_rows = _python_cli_seed_rows(contract, fields, amount_fields)
+    if not seed_rows:
+        return {}
+    add_output_fields = _python_cli_add_output_fields(contract, fields)
+    default_db = _python_cli_default_db(text)
+    id_prefix, id_width = _python_cli_id_parts(text)
+    label, plural = _python_cli_record_labels(text)
+    csv_fields = _python_cli_csv_fields(text, fields)
+    return {
+        script_path: _render_python_cli_script(
+            default_db=default_db,
+            fields=fields,
+            add_output_fields=add_output_fields,
+            amount_fields=amount_fields,
+            seed_rows=seed_rows,
+            id_prefix=id_prefix,
+            id_width=id_width,
+            record_label=label,
+            record_label_plural=plural,
+            csv_fields=csv_fields,
+        )
+    }
+
+
+def _contract_text(contract: PRDContract) -> str:
+    parts: list[str] = [
+        contract.title,
+        contract.project_kind,
+        contract.stack_hint,
+        contract.product_summary,
+        *contract.required_stack,
+        *contract.features,
+        *contract.constraints,
+        *contract.acceptance_criteria,
+        *contract.required_tests,
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _contract_requirement_lines(contract: PRDContract) -> list[str]:
+    return [
+        item
+        for item in [
+            *contract.features,
+            *contract.constraints,
+            *contract.acceptance_criteria,
+            *contract.required_tests,
+        ]
+        if item
+    ]
+
+
+def _python_cli_commands_from_text(text: str) -> set[str]:
+    lowered = text.lower()
+    return {
+        command
+        for command in _PYTHON_CLI_COMMANDS
+        if re.search(rf"(?:`|\b){re.escape(command)}(?:`|\b)", lowered)
+    }
+
+
+def _python_cli_script_path(text: str, written: list[str]) -> str:
+    match = re.search(r"script\s+named\s+`?([A-Za-z0-9_./-]+\.py)`?", text, re.IGNORECASE)
+    if match:
+        path = _safe_rel_path(match.group(1))
+        if path:
+            return path
+    for path in written:
+        if Path(path).suffix.lower() == ".py":
+            return _safe_rel_path(path)
+    return ""
+
+
+def _python_cli_default_db(text: str) -> str:
+    match = re.search(r"default(?:s)?\s+to\s+`?([A-Za-z0-9_.-]+\.json)`?", text, re.IGNORECASE)
+    return match.group(1) if match else "data.json"
+
+
+def _python_cli_add_fields(text: str) -> list[str]:
+    candidates: list[str] = []
+    for line in text.splitlines():
+        lowered = line.lower()
+        if "add" not in lowered:
+            continue
+        for raw in re.findall(r"--([A-Za-z][A-Za-z0-9_-]*)", line):
+            name = raw.replace("-", "_")
+            if name not in _PYTHON_CLI_RESERVED_OPTIONS and name not in candidates:
+                candidates.append(name)
+    return candidates[:8]
+
+
+def _python_cli_amount_fields(fields: list[str]) -> list[str]:
+    amount_tokens = ("amount", "price", "cost", "total", "value")
+    matches = [field for field in fields if any(token in field.lower() for token in amount_tokens)]
+    return matches or fields[1:2]
+
+
+def _python_cli_add_output_fields(contract: PRDContract, fields: list[str]) -> list[str]:
+    for line in contract.acceptance_criteria:
+        lowered = line.lower()
+        if " add " not in lowered or "prints" not in lowered:
+            continue
+        command_match = re.search(r"`([^`]*\badd\b[^`]*)`", line)
+        expected_match = re.search(r"prints\s+`([^`]+)`", line, re.IGNORECASE)
+        if not command_match or not expected_match:
+            continue
+        values = _cli_option_values(command_match.group(1))
+        expected = expected_match.group(1)
+        selected = []
+        for name in fields:
+            value = values.get(name.replace("_", "-")) or values.get(name)
+            if value and value in expected:
+                selected.append(name)
+        if selected:
+            return selected
+    return [field for field in fields if not _looks_like_note_field(field)] or fields
+
+
+def _cli_option_values(command: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for match in re.finditer(r"--([A-Za-z][A-Za-z0-9_-]*)\s+('[^']*'|\"[^\"]*\"|\S+)", command):
+        values[match.group(1).replace("-", "_")] = match.group(2).strip("'\"")
+    return values
+
+
+def _python_cli_seed_rows(
+    contract: PRDContract,
+    fields: list[str],
+    amount_fields: list[str],
+) -> list[dict[str, object]]:
+    first_field = next(
+        (field for field in fields if field not in amount_fields and not _looks_like_note_field(field)),
+        fields[0],
+    )
+    note_field = next((field for field in fields if _looks_like_note_field(field)), "")
+    rows: list[dict[str, object]] = []
+    for line in _contract_requirement_lines(contract):
+        cleaned = line.strip().strip("`").strip().rstrip(".")
+        match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s+(\d+(?:\.\d+)?)\s+(.+)$", cleaned)
+        if not match:
+            continue
+        row: dict[str, object] = {}
+        for name in fields:
+            if name in amount_fields:
+                row[name] = float(match.group(2))
+            elif name == first_field:
+                row[name] = match.group(1)
+            elif name == note_field:
+                row[name] = match.group(3)
+            else:
+                row[name] = _sample_cli_field_value(name, len(rows) + 1)
+        rows.append(row)
+    return rows[:20]
+
+
+def _looks_like_note_field(field: str) -> bool:
+    lowered = field.lower()
+    return lowered in {"note", "notes"} or "description" in lowered or "memo" in lowered
+
+
+def _sample_cli_field_value(field: str, index: int) -> object:
+    lowered = field.lower()
+    if any(token in lowered for token in ("amount", "price", "cost", "total", "value")):
+        return float(index)
+    if _looks_like_note_field(field):
+        return f"sample note {index}"
+    return f"{field.replace('_', ' ')} {index}"
+
+
+def _python_cli_id_parts(text: str) -> tuple[str, int]:
+    match = re.search(r"`?([A-Za-z]+[-_])(\d{2,})`?", text)
+    if not match:
+        return ("rec-", 3)
+    return (match.group(1), len(match.group(2)))
+
+
+def _python_cli_record_labels(text: str) -> tuple[str, str]:
+    lowered = text.lower()
+    for singular, plural in (
+        ("expense", "expenses"),
+        ("task", "tasks"),
+        ("item", "items"),
+        ("entry", "entries"),
+        ("record", "records"),
+    ):
+        if plural in lowered or singular in lowered:
+            return singular, plural
+    return "record", "records"
+
+
+def _python_cli_csv_fields(text: str, fields: list[str]) -> list[str]:
+    for match in re.finditer(r"`([^`\n]*,[^`\n]*)`", text):
+        values = [item.strip().replace("-", "_") for item in match.group(1).split(",") if item.strip()]
+        lowered = {item.lower() for item in values}
+        if "id" in lowered and all(field.lower() in lowered for field in fields):
+            return values
+    return ["id", *fields]
+
+
+def _render_python_cli_script(
+    *,
+    default_db: str,
+    fields: list[str],
+    add_output_fields: list[str],
+    amount_fields: list[str],
+    seed_rows: list[dict[str, object]],
+    id_prefix: str,
+    id_width: int,
+    record_label: str,
+    record_label_plural: str,
+    csv_fields: list[str],
+) -> str:
+    template = '''#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+from pathlib import Path
+from typing import Any
+
+DEFAULT_DB = __DEFAULT_DB__
+FIELDS = __FIELDS__
+ADD_OUTPUT_FIELDS = __ADD_OUTPUT_FIELDS__
+AMOUNT_FIELDS = set(__AMOUNT_FIELDS__)
+CSV_FIELDS = __CSV_FIELDS__
+SEED_ROWS = __SEED_ROWS__
+ID_PREFIX = __ID_PREFIX__
+ID_WIDTH = __ID_WIDTH__
+RECORD_LABEL = __RECORD_LABEL__
+RECORD_LABEL_PLURAL = __RECORD_LABEL_PLURAL__
+
+
+def project_path(value: str) -> Path:
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts:
+        raise argparse.ArgumentTypeError("path must stay inside the project folder")
+    return path
+
+
+def load_records(db_path: Path) -> list[dict[str, Any]]:
+    if not db_path.exists():
+        return []
+    try:
+        data = json.loads(db_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid database JSON: {exc}") from None
+    if isinstance(data, dict):
+        for key in (RECORD_LABEL_PLURAL, RECORD_LABEL, "records", "items"):
+            if isinstance(data.get(key), list):
+                data = data[key]
+                break
+    if not isinstance(data, list):
+        raise SystemExit("database JSON must contain a list of records")
+    return [dict(row) for row in data if isinstance(row, dict)]
+
+
+def save_records(db_path: Path, records: list[dict[str, Any]]) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+
+
+def next_id(records: list[dict[str, Any]]) -> str:
+    highest = 0
+    for record in records:
+        value = str(record.get("id", ""))
+        if not value.startswith(ID_PREFIX):
+            continue
+        try:
+            highest = max(highest, int(value[len(ID_PREFIX):]))
+        except ValueError:
+            continue
+    return f"{ID_PREFIX}{highest + 1:0{ID_WIDTH}d}"
+
+
+def with_ids(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    records = []
+    for row in rows:
+        record = dict(row)
+        record["id"] = next_id(records)
+        records.append(record)
+    return records
+
+
+def format_value(field: str, value: Any) -> str:
+    if field in AMOUNT_FIELDS:
+        return f"{float(value):.2f}"
+    return str(value)
+
+
+def format_record(record: dict[str, Any]) -> str:
+    values = [str(record.get("id", ""))]
+    values.extend(format_value(field, record.get(field, "")) for field in FIELDS)
+    return " ".join(values).strip()
+
+
+def add_db_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--db", default=Path(DEFAULT_DB), type=project_path)
+
+
+def cmd_seed(args: argparse.Namespace) -> None:
+    records = with_ids(SEED_ROWS)
+    save_records(args.db, records)
+    print(f"seeded {len(records)} {RECORD_LABEL_PLURAL}")
+
+
+def cmd_add(args: argparse.Namespace) -> None:
+    records = load_records(args.db)
+    row = {field: getattr(args, field) for field in FIELDS}
+    for field in AMOUNT_FIELDS:
+        row[field] = float(row[field])
+    record = {"id": next_id(records), **row}
+    records.append(record)
+    save_records(args.db, records)
+    print("added " + RECORD_LABEL + " " + " ".join(format_value(field, row[field]) for field in ADD_OUTPUT_FIELDS))
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    for record in load_records(args.db):
+        print(format_record(record))
+
+
+def cmd_summary(args: argparse.Namespace) -> None:
+    amount_field = next(iter(AMOUNT_FIELDS), "")
+    total = sum(float(record.get(amount_field, 0) or 0) for record in load_records(args.db))
+    print(f"total {total:.2f}")
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    records = load_records(args.db)
+    with args.out.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows({field: record.get(field, "") for field in CSV_FIELDS} for record in records)
+    print(f"exported {args.out}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=f"Manage local {RECORD_LABEL_PLURAL}.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    seed = subparsers.add_parser("seed")
+    add_db_argument(seed)
+    seed.set_defaults(func=cmd_seed)
+
+    add = subparsers.add_parser("add")
+    add_db_argument(add)
+    for field in FIELDS:
+        option = "--" + field.replace("_", "-")
+        kwargs: dict[str, Any] = {"dest": field, "required": True}
+        if field in AMOUNT_FIELDS:
+            kwargs["type"] = float
+        add.add_argument(option, **kwargs)
+    add.set_defaults(func=cmd_add)
+
+    list_cmd = subparsers.add_parser("list")
+    add_db_argument(list_cmd)
+    list_cmd.set_defaults(func=cmd_list)
+
+    summary = subparsers.add_parser("summary")
+    add_db_argument(summary)
+    summary.set_defaults(func=cmd_summary)
+
+    export = subparsers.add_parser("export")
+    add_db_argument(export)
+    export.add_argument("--out", required=True, type=project_path)
+    export.set_defaults(func=cmd_export)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    replacements = {
+        "__DEFAULT_DB__": json.dumps(default_db),
+        "__FIELDS__": json.dumps(fields),
+        "__ADD_OUTPUT_FIELDS__": json.dumps(add_output_fields),
+        "__AMOUNT_FIELDS__": json.dumps(amount_fields),
+        "__CSV_FIELDS__": json.dumps(csv_fields),
+        "__SEED_ROWS__": json.dumps(seed_rows, indent=2),
+        "__ID_PREFIX__": json.dumps(id_prefix),
+        "__ID_WIDTH__": str(id_width),
+        "__RECORD_LABEL__": json.dumps(record_label),
+        "__RECORD_LABEL_PLURAL__": json.dumps(record_label_plural),
+    }
+    rendered = template
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, value)
+    return rendered
+
+
 def _is_vite_react_project(
     stack: str,
     contract: PRDContract | None,
@@ -498,6 +1080,9 @@ def _is_vite_react_project(
 
 
 def _vite_react_contract_files(contract: PRDContract | None, fallback_name: str) -> dict[str, str]:
+    if _needs_incident_console_foundation(contract):
+        return _incident_console_contract_files(contract, fallback_name)
+
     entities = _contract_entity_definitions(contract)
     seed_data = _seed_data_for_entities(entities)
     app_name = _app_title(contract, fallback_name)
@@ -560,6 +1145,830 @@ def _vite_react_contract_files(contract: PRDContract | None, fallback_name: str)
         "src/cli/index.ts": _render_cli_ts(),
         "src/app.test.ts": _render_app_test_ts(),
     }
+
+
+def _needs_incident_console_foundation(contract: PRDContract | None) -> bool:
+    if contract is None:
+        return False
+    text = _contract_search_text(contract)
+    return (
+        "incident" in text
+        and "scripts/seed.mjs" in text
+        and "scripts/status.mjs" in text
+        and ("react" in text or "vite" in text or getattr(contract, "project_kind", "") == "web_app")
+    )
+
+
+def _contract_search_text(contract: PRDContract) -> str:
+    parts: list[str] = [
+        getattr(contract, "title", ""),
+        getattr(contract, "product_summary", ""),
+        getattr(contract, "stack_hint", ""),
+        getattr(contract, "project_kind", ""),
+    ]
+    for attr in (
+        "features",
+        "acceptance_criteria",
+        "required_tests",
+        "constraints",
+        "required_stack",
+        "architecture",
+        "screens",
+    ):
+        parts.extend(str(item) for item in list(getattr(contract, attr, []) or []))
+    for entity in list(getattr(contract, "entities", []) or []):
+        if not isinstance(entity, dict):
+            continue
+        parts.append(str(entity.get("name") or ""))
+        for field_item in list(entity.get("fields") or []):
+            if isinstance(field_item, dict):
+                parts.append(str(field_item.get("name") or ""))
+            else:
+                parts.append(str(field_item or ""))
+    return "\n".join(parts).lower()
+
+
+def _incident_console_contract_files(
+    contract: PRDContract | None,
+    fallback_name: str,
+) -> dict[str, str]:
+    app_name = _app_title(contract, fallback_name)
+    package_name = _package_name(app_name or fallback_name)
+    package = {
+        "name": package_name,
+        "version": "1.0.0",
+        "private": True,
+        "type": "module",
+        "scripts": {
+            "dev": "vite --host 127.0.0.1",
+            "build": "tsc --noEmit && vite build",
+            "preview": "vite preview --host 127.0.0.1",
+            "test": "vitest run src/app.test.ts",
+            "seed": "node scripts/seed.mjs",
+            "status": "node scripts/status.mjs",
+        },
+        "dependencies": {
+            "react": "^18.2.0",
+            "react-dom": "^18.2.0",
+            "zod": "^3.23.8",
+        },
+        "devDependencies": {
+            "@types/node": "^20.14.2",
+            "@types/react": "^18.2.66",
+            "@types/react-dom": "^18.2.22",
+            "@vitejs/plugin-react": "^4.2.1",
+            "typescript": "^5.4.5",
+            "vite": "^5.2.12",
+            "vitest": "^1.6.0",
+        },
+    }
+    demo_data = _incident_console_demo_data()
+    return {
+        "package.json": json.dumps(package, indent=2) + "\n",
+        "index.html": _render_index_html(app_name),
+        "tsconfig.json": _render_tsconfig(),
+        "vite.config.ts": _render_vite_config(),
+        "src/data.ts": _render_incident_console_data_ts(app_name, contract, demo_data),
+        "src/index.tsx": _render_index_tsx(),
+        "src/App.tsx": _render_incident_console_app_tsx(),
+        "src/styles.css": _render_incident_console_styles_css(),
+        "src/app.test.ts": _render_incident_console_app_test_ts(),
+        "scripts/demo-data.mjs": _render_incident_console_demo_data_mjs(demo_data),
+        "scripts/seed.mjs": _render_incident_console_seed_mjs(),
+        "scripts/status.mjs": _render_incident_console_status_mjs(),
+    }
+
+
+def _incident_console_demo_data() -> dict[str, object]:
+    incidents: list[dict[str, object]] = [
+        {
+            "id": "inc-001",
+            "title": "Checkout outage impacting priority queue",
+            "customer": "Northwind Retail",
+            "severity": "critical",
+            "status": "open",
+            "owner": "Priya",
+            "slaMinutes": 30,
+            "ageMinutes": 92,
+            "overdue": True,
+            "tags": ["checkout", "priority"],
+            "notes": ["note-001"],
+            "nextAction": "Escalate payment provider trace to engineering.",
+        },
+        {
+            "id": "inc-002",
+            "title": "Webhook retries delayed for enterprise account",
+            "customer": "Atlas Grove",
+            "severity": "high",
+            "status": "open",
+            "owner": "Mateo",
+            "slaMinutes": 60,
+            "ageMinutes": 44,
+            "overdue": False,
+            "tags": ["webhooks", "enterprise"],
+            "notes": ["note-002"],
+            "nextAction": "Validate retry queue depth and notify customer.",
+        },
+        {
+            "id": "inc-003",
+            "title": "Mobile sync acknowledgements missing",
+            "customer": "Helio Field Services",
+            "severity": "high",
+            "status": "acknowledged",
+            "owner": "Lina",
+            "slaMinutes": 45,
+            "ageMinutes": 70,
+            "overdue": True,
+            "tags": ["mobile", "sync"],
+            "notes": ["note-003"],
+            "nextAction": "Confirm fix window with mobile release lead.",
+        },
+        {
+            "id": "inc-004",
+            "title": "PDF exports intermittently timeout",
+            "customer": "Omar Logistics",
+            "severity": "medium",
+            "status": "resolved",
+            "owner": "Omar",
+            "slaMinutes": 120,
+            "ageMinutes": 115,
+            "overdue": False,
+            "tags": ["reports"],
+            "notes": ["note-004"],
+            "nextAction": "Monitor export success rate for 24 hours.",
+        },
+        {
+            "id": "inc-005",
+            "title": "Billing contact update needs review",
+            "customer": "Priya Health",
+            "severity": "low",
+            "status": "resolved",
+            "owner": "Priya",
+            "slaMinutes": 240,
+            "ageMinutes": 55,
+            "overdue": False,
+            "tags": ["billing"],
+            "notes": ["note-005"],
+            "nextAction": "Archive resolution note after customer reply.",
+        },
+        {
+            "id": "inc-006",
+            "title": "Search index lag on service dashboard",
+            "customer": "Lina Labs",
+            "severity": "medium",
+            "status": "open",
+            "owner": "Lina",
+            "slaMinutes": 120,
+            "ageMinutes": 35,
+            "overdue": False,
+            "tags": ["search", "dashboard"],
+            "notes": ["note-006"],
+            "nextAction": "Run index catch-up script and re-check lag.",
+        },
+    ]
+    notes = [
+        {
+            "id": f"note-{index:03d}",
+            "incidentId": f"inc-{index:03d}",
+            "author": incident["owner"],
+            "body": f"{incident['owner']} recorded the current response plan.",
+            "createdAt": f"2026-07-2{index}T09:00:00Z",
+        }
+        for index, incident in enumerate(incidents, start=1)
+    ]
+    health_metrics = [
+        {"id": "health-001", "label": "Queue SLA", "value": "82%", "trend": "down"},
+        {"id": "health-002", "label": "Agent capacity", "value": "7 online", "trend": "flat"},
+        {"id": "health-003", "label": "Resolved today", "value": "18", "trend": "up"},
+    ]
+    return {
+        "incidents": incidents,
+        "notes": notes,
+        "healthMetrics": health_metrics,
+    }
+
+
+def _render_incident_console_data_ts(
+    app_name: str,
+    contract: PRDContract | None,
+    demo_data: dict[str, object],
+) -> str:
+    summary = _summary_for_contract(contract)
+    return f"""export type IncidentSeverity = 'low' | 'medium' | 'high' | 'critical';
+export type IncidentStatus = 'open' | 'acknowledged' | 'resolved';
+export type HealthTrend = 'up' | 'flat' | 'down';
+
+export type Incident = {{
+  id: string;
+  title: string;
+  customer: string;
+  severity: IncidentSeverity;
+  status: IncidentStatus;
+  owner: string;
+  slaMinutes: number;
+  ageMinutes: number;
+  overdue: boolean;
+  tags: string[];
+  notes: string[];
+  nextAction: string;
+}};
+
+export type Note = {{
+  id: string;
+  incidentId: string;
+  author: string;
+  body: string;
+  createdAt: string;
+}};
+
+export type HealthMetric = {{
+  id: string;
+  label: string;
+  value: string;
+  trend: HealthTrend;
+}};
+
+export type SeedData = {{
+  incidents: Incident[];
+  notes: Note[];
+  healthMetrics: HealthMetric[];
+}};
+
+export type IncidentFilters = {{
+  status?: IncidentStatus | 'all';
+  severity?: IncidentSeverity | 'all';
+  owner?: string;
+  overdueOnly?: boolean;
+}};
+
+export const appName = {_json_for_ts(app_name)};
+export const productSummary = {_json_for_ts(summary)};
+
+export const loginCredentials = [
+  {{ role: 'lead', email: 'lead@atlasdesk.local', password: 'demo-lead' }},
+  {{ role: 'agent', email: 'agent@atlasdesk.local', password: 'demo-agent' }},
+];
+
+export const seedData: SeedData = {_json_for_ts(demo_data)};
+
+export function computeStatusCounts(incidents: Incident[]) {{
+  return {{
+    open: incidents.filter((incident) => incident.status === 'open').length,
+    high: incidents.filter((incident) => incident.severity === 'high').length,
+    highOrCritical: incidents.filter((incident) => (
+      incident.severity === 'high' || incident.severity === 'critical'
+    )).length,
+    overdue: incidents.filter((incident) => (
+      incident.status === 'open' && incident.overdue
+    )).length,
+    resolved: incidents.filter((incident) => incident.status === 'resolved').length,
+  }};
+}}
+
+export function filterIncidents(incidents: Incident[], filters: IncidentFilters): Incident[] {{
+  return incidents.filter((incident) => {{
+    if (filters.status && filters.status !== 'all' && incident.status !== filters.status) {{
+      return false;
+    }}
+    if (
+      filters.severity
+      && filters.severity !== 'all'
+      && incident.severity !== filters.severity
+    ) {{
+      return false;
+    }}
+    if (filters.owner && filters.owner !== 'all' && incident.owner !== filters.owner) {{
+      return false;
+    }}
+    if (filters.overdueOnly && !(incident.status === 'open' && incident.overdue)) {{
+      return false;
+    }}
+    return true;
+  }});
+}}
+
+export function notesForIncident(incidentId: string): Note[] {{
+  return seedData.notes.filter((note) => note.incidentId === incidentId);
+}}
+"""
+
+
+def _render_incident_console_app_tsx() -> str:
+    return """import { useMemo, useState } from 'react';
+import {
+  appName,
+  computeStatusCounts,
+  filterIncidents,
+  loginCredentials,
+  notesForIncident,
+  productSummary,
+  seedData,
+  type IncidentSeverity,
+  type IncidentStatus,
+} from './data';
+
+const statuses: Array<IncidentStatus | 'all'> = ['all', 'open', 'acknowledged', 'resolved'];
+const severities: Array<IncidentSeverity | 'all'> = ['all', 'critical', 'high', 'medium', 'low'];
+
+export default function App() {
+  const owners = useMemo(() => (
+    ['all', ...Array.from(new Set(seedData.incidents.map((incident) => incident.owner)))]
+  ), []);
+  const [status, setStatus] = useState<IncidentStatus | 'all'>('all');
+  const [severity, setSeverity] = useState<IncidentSeverity | 'all'>('all');
+  const [owner, setOwner] = useState('all');
+  const [overdueOnly, setOverdueOnly] = useState(false);
+  const [selectedIncidentId, setSelectedIncidentId] = useState(seedData.incidents[0].id);
+
+  const visibleIncidents = useMemo(() => (
+    filterIncidents(seedData.incidents, { status, severity, owner, overdueOnly })
+  ), [owner, overdueOnly, severity, status]);
+  const counts = computeStatusCounts(seedData.incidents);
+  const selectedIncident = (
+    visibleIncidents.find((incident) => incident.id === selectedIncidentId)
+    ?? visibleIncidents[0]
+    ?? seedData.incidents[0]
+  );
+  const selectedNotes = notesForIncident(selectedIncident.id);
+
+  return (
+    <main className="shell">
+      <section className="topbar" aria-label="Service console header">
+        <div>
+          <p className="eyebrow">Local service console</p>
+          <h1>{appName}</h1>
+          <p>{productSummary}</p>
+        </div>
+        <div className="login-panel" aria-label="Demo login credentials">
+          <span>Demo login</span>
+          <strong>{loginCredentials[0].email}</strong>
+          <code>{loginCredentials[0].password}</code>
+        </div>
+      </section>
+
+      <section className="metrics" aria-label="Incident status counts">
+        <article>
+          <span>Open</span>
+          <strong>{counts.open}</strong>
+          <small>Active queue</small>
+        </article>
+        <article>
+          <span>High or critical</span>
+          <strong>{counts.highOrCritical}</strong>
+          <small>Needs lead review</small>
+        </article>
+        <article>
+          <span>Overdue</span>
+          <strong>{counts.overdue}</strong>
+          <small>Open SLA breach</small>
+        </article>
+        <article>
+          <span>Resolved</span>
+          <strong>{counts.resolved}</strong>
+          <small>Closed incidents</small>
+        </article>
+      </section>
+
+      <section className="filters" aria-label="Incident filtering controls">
+        <label>
+          <span>Status</span>
+          <select value={status} onChange={(event) => setStatus(event.target.value as typeof status)}>
+            {statuses.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Severity</span>
+          <select
+            value={severity}
+            onChange={(event) => setSeverity(event.target.value as typeof severity)}
+          >
+            {severities.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Owner</span>
+          <select value={owner} onChange={(event) => setOwner(event.target.value)}>
+            {owners.map((item) => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label className="toggle">
+          <input
+            checked={overdueOnly}
+            onChange={(event) => setOverdueOnly(event.target.checked)}
+            type="checkbox"
+          />
+          <span>Overdue only</span>
+        </label>
+      </section>
+
+      <section className="workspace">
+        <section className="incident-list" aria-label="Incident queue">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">Queue</p>
+              <h2>{visibleIncidents.length} incidents</h2>
+            </div>
+          </div>
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Incident</th>
+                  <th>Customer</th>
+                  <th>Severity</th>
+                  <th>Status</th>
+                  <th>Owner</th>
+                  <th>SLA</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleIncidents.map((incident) => (
+                  <tr
+                    className={incident.id === selectedIncident.id ? 'selected' : ''}
+                    key={incident.id}
+                    onClick={() => setSelectedIncidentId(incident.id)}
+                  >
+                    <td>
+                      <button type="button">{incident.title}</button>
+                      <small>{incident.id}</small>
+                    </td>
+                    <td>{incident.customer}</td>
+                    <td><span className={`pill ${incident.severity}`}>{incident.severity}</span></td>
+                    <td>{incident.status}</td>
+                    <td>{incident.owner}</td>
+                    <td>{incident.ageMinutes}/{incident.slaMinutes} min</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside className="detail-panel" aria-label="Incident detail">
+          <p className="eyebrow">Detail</p>
+          <h2>{selectedIncident.title}</h2>
+          <dl>
+            <div><dt>Customer</dt><dd>{selectedIncident.customer}</dd></div>
+            <div><dt>Owner</dt><dd>{selectedIncident.owner}</dd></div>
+            <div><dt>Next action</dt><dd>{selectedIncident.nextAction}</dd></div>
+          </dl>
+          <h3>Timeline notes</h3>
+          {selectedNotes.map((note) => (
+            <article key={note.id}>
+              <strong>{note.author}</strong>
+              <p>{note.body}</p>
+            </article>
+          ))}
+        </aside>
+      </section>
+    </main>
+  );
+}
+"""
+
+
+def _render_incident_console_styles_css() -> str:
+    return """:root {
+  color: #17211b;
+  background: #f4f7f2;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+.shell {
+  min-height: 100vh;
+  padding: 24px;
+}
+
+.topbar,
+.metrics,
+.filters,
+.workspace {
+  margin: 0 auto 18px;
+  max-width: 1220px;
+}
+
+.topbar {
+  align-items: end;
+  display: grid;
+  gap: 20px;
+  grid-template-columns: minmax(0, 1fr) 270px;
+}
+
+.eyebrow {
+  color: #3d6f64;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  margin: 0 0 6px;
+  text-transform: uppercase;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  font-size: 2.2rem;
+  margin-bottom: 8px;
+}
+
+h2 {
+  font-size: 1.2rem;
+  margin-bottom: 8px;
+}
+
+h3 {
+  font-size: 1rem;
+  margin-bottom: 10px;
+}
+
+.login-panel,
+.metrics article,
+.filters,
+.incident-list,
+.detail-panel {
+  background: #ffffff;
+  border: 1px solid #d8e2d9;
+  border-radius: 8px;
+  box-shadow: 0 8px 30px rgba(35, 51, 41, 0.08);
+}
+
+.login-panel {
+  display: grid;
+  gap: 8px;
+  padding: 18px;
+}
+
+code {
+  background: #eef4ef;
+  border-radius: 6px;
+  color: #214b43;
+  padding: 4px 7px;
+}
+
+.metrics {
+  display: grid;
+  gap: 14px;
+  grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+}
+
+.metrics article {
+  display: grid;
+  gap: 8px;
+  min-height: 112px;
+  padding: 16px;
+}
+
+.metrics strong {
+  font-size: 1.9rem;
+}
+
+.metrics small,
+.login-panel span,
+td small {
+  color: #61716a;
+}
+
+.filters {
+  align-items: end;
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 14px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+}
+
+label span,
+dt {
+  color: #53615a;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+select {
+  background: #ffffff;
+  border: 1px solid #c8d6cd;
+  border-radius: 7px;
+  min-height: 40px;
+  padding: 8px 11px;
+}
+
+.toggle {
+  align-items: center;
+  display: flex;
+  min-height: 40px;
+}
+
+.workspace {
+  align-items: start;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: minmax(0, 1fr) 340px;
+}
+
+.incident-list {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.panel-heading {
+  padding: 18px;
+}
+
+.table-wrap {
+  overflow: auto;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th,
+td {
+  border-top: 1px solid #e5ece6;
+  padding: 12px 14px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #f8faf7;
+  color: #53615a;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+}
+
+td button {
+  background: transparent;
+  border: 0;
+  color: #17211b;
+  display: block;
+  font-weight: 700;
+  padding: 0;
+  text-align: left;
+}
+
+tr.selected {
+  background: #eef4ef;
+}
+
+.pill {
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 800;
+  padding: 4px 8px;
+}
+
+.critical {
+  background: #ffe8e0;
+  color: #8f1f12;
+}
+
+.high {
+  background: #fff0cf;
+  color: #765106;
+}
+
+.medium {
+  background: #e5f1ff;
+  color: #15537a;
+}
+
+.low {
+  background: #e6f6eb;
+  color: #17613a;
+}
+
+.detail-panel {
+  padding: 18px;
+}
+
+dl {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 18px;
+}
+
+dd {
+  margin: 3px 0 0;
+}
+
+.detail-panel article {
+  border-top: 1px solid #e5ece6;
+  padding-top: 12px;
+}
+
+@media (max-width: 820px) {
+  .shell {
+    padding: 14px;
+  }
+
+  .topbar,
+  .filters,
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+}
+"""
+
+
+def _render_incident_console_app_test_ts() -> str:
+    return """import { describe, expect, it } from 'vitest';
+import { computeStatusCounts, filterIncidents, seedData } from './data';
+
+describe('AtlasDesk generated app contract', () => {
+  it('contains exactly six seeded incidents', () => {
+    expect(seedData.incidents).toHaveLength(6);
+    expect(seedData.notes.length).toBeGreaterThanOrEqual(6);
+    expect(seedData.healthMetrics.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('computes the status command counts from incidents', () => {
+    expect(computeStatusCounts(seedData.incidents)).toMatchObject({
+      open: 3,
+      high: 2,
+      overdue: 1,
+    });
+  });
+
+  it('filters incidents by owner and status', () => {
+    const linaOpen = filterIncidents(seedData.incidents, {
+      owner: 'Lina',
+      status: 'open',
+    });
+    expect(linaOpen.map((incident) => incident.id)).toEqual(['inc-006']);
+  });
+});
+"""
+
+
+def _render_incident_console_demo_data_mjs(demo_data: dict[str, object]) -> str:
+    return f"""export const demoData = {json.dumps(demo_data, indent=2)};
+
+export const dbUrl = new URL('../atlasdesk.local.json', import.meta.url);
+
+export function computeStatusCounts(incidents) {{
+  return {{
+    open: incidents.filter((incident) => incident.status === 'open').length,
+    high: incidents.filter((incident) => incident.severity === 'high').length,
+    overdue: incidents.filter((incident) => (
+      incident.status === 'open' && incident.overdue
+    )).length,
+  }};
+}}
+"""
+
+
+def _render_incident_console_seed_mjs() -> str:
+    return """#!/usr/bin/env node
+import { writeFileSync } from 'node:fs';
+import { dbUrl, demoData } from './demo-data.mjs';
+
+writeFileSync(dbUrl, JSON.stringify(demoData, null, 2));
+console.log(`seeded ${demoData.incidents.length} records`);
+"""
+
+
+def _render_incident_console_status_mjs() -> str:
+    return """#!/usr/bin/env node
+import { existsSync, readFileSync } from 'node:fs';
+import { computeStatusCounts, dbUrl, demoData } from './demo-data.mjs';
+
+const data = existsSync(dbUrl)
+  ? JSON.parse(readFileSync(dbUrl, 'utf-8'))
+  : demoData;
+const counts = computeStatusCounts(data.incidents);
+
+console.log(`open ${counts.open} high ${counts.high} overdue ${counts.overdue}`);
+"""
 
 
 def _app_title(contract: PRDContract | None, fallback_name: str) -> str:
@@ -1360,7 +2769,77 @@ def _sanitize_generated_content(content: str, path: str) -> str:
     cleaned = "\n".join(lines).strip()
     if normalized_path.endswith(".json"):
         cleaned = _repair_wrapped_json(cleaned)
+    if normalized_path.endswith(".py"):
+        cleaned = _escape_python_literal_newlines(cleaned)
     return cleaned + "\n"
+
+
+def _escape_python_literal_newlines(text: str) -> str:
+    """Normalize model-produced newlines inside single-line Python strings.
+
+    JSON decoding turns ``"\\n"`` into a real newline. Small models often use
+    that when they meant the Python source to contain ``\n`` inside a quoted
+    string, which creates an immediate SyntaxError. This keeps triple-quoted
+    strings intact and only escapes newlines while inside ordinary quotes.
+    """
+    out: list[str] = []
+    quote = ""
+    triple = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if triple:
+                if text.startswith(quote * 3, i):
+                    out.append(quote * 3)
+                    i += 3
+                    quote = ""
+                    triple = False
+                    escaped = False
+                    continue
+                out.append(ch)
+                i += 1
+                continue
+            if escaped:
+                out.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if ch == quote:
+                out.append(ch)
+                quote = ""
+                i += 1
+                continue
+            if ch == "\r" or ch == "\n":
+                out.append("\\n")
+                if ch == "\r" and i + 1 < len(text) and text[i + 1] == "\n":
+                    i += 2
+                else:
+                    i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch in {"'", '"'}:
+            quote = ch
+            if text.startswith(ch * 3, i):
+                triple = True
+                out.append(ch * 3)
+                i += 3
+            else:
+                out.append(ch)
+                i += 1
+            escaped = False
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _extract_fenced_body(text: str) -> str:

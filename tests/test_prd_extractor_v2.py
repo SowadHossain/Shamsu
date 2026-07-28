@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from shamsu.prd.classifier import classify_archetype
 from shamsu.prd.extractor import extract_entities
 from shamsu.prd.parser import parse_prd_text
@@ -249,3 +251,69 @@ def test_complex_node_cli_prd_routes_to_freeform_not_django():
     assert "node" in spec.prd_contract.required_stack
     assert getattr(spec.suitability.strategy, "value", spec.suitability.strategy) == "freeform"
     assert "Django generator" in " ".join(spec.suitability.conflicts)
+
+
+def test_data_model_plain_headings_extract_entities_from_long_prd():
+    prd_text = Path("evals/fixtures/prds/atlasdesk_long.md").read_text(encoding="utf-8")
+    parsed = parse_prd_text(prd_text, markdown=True)
+
+    entities = extract_entities(parsed)
+    names = {entity.name for entity in entities}
+
+    assert {"Incident", "Note", "HealthMetric"} <= names
+    incident = next(entity for entity in entities if entity.name == "Incident")
+    incident_fields = {field.name: field for field in incident.fields}
+    assert {"title", "customer", "severity", "status", "owner", "sla_minutes", "notes"} <= (
+        set(incident_fields)
+    )
+    assert incident_fields["sla_minutes"].django_type == "IntegerField"
+    assert incident_fields["notes"].django_type == "JSONField"
+
+    note = next(entity for entity in entities if entity.name == "Note")
+    assert {"incident_id", "author", "body", "created_at"} <= {field.name for field in note.fields}
+
+
+def test_sections_after_an_entity_container_are_not_entities():
+    """`parsed.sections` is flat, so a "## Entities" container had no closing
+    boundary: every later "##" section inherited it and became an entity whose
+    bullets lexed as fields. "## API Endpoints" and "## Pages" - the ordinary PRD
+    shape - produced APIEndpoints/Pages entities and Django models to match."""
+    parsed = parse_prd_text(
+        "# Todo App\n\n"
+        "## Entities\n"
+        "- Task: title, done\n\n"
+        "## API Endpoints\n"
+        "- GET /api/tasks/ - list tasks\n"
+        "- POST /api/tasks/ - create task\n\n"
+        "## Pages\n"
+        "- Dashboard: task stats and recent tasks\n"
+        "- Tasks: full task list\n",
+        markdown=True,
+    )
+
+    assert [entity.name for entity in extract_entities(parsed)] == ["Task"]
+
+    spec = build_project_spec(parsed)
+    assert [page.name for page in spec.pages] == [
+        "Dashboard",
+        "Tasks",
+        "Task Form",
+        "Task Detail",
+    ]
+
+
+def test_entity_container_still_claims_real_sub_entities():
+    """The container boundary must not over-correct: genuine entity sub-sections
+    under a "Data Model" heading are still extracted."""
+    parsed = parse_prd_text(
+        "# App\n\n"
+        "## Data Model\n\n"
+        "### Task\n"
+        "- title: str\n"
+        "- done: bool\n\n"
+        "### Category\n"
+        "- name: str\n",
+        markdown=True,
+    )
+
+    assert {entity.name for entity in extract_entities(parsed)} == {"Task", "Category"}

@@ -58,6 +58,13 @@ SECRET_PATTERNS = [
     r"postgresql://[^@]*:[^@]*@",
     r"mysql://[^@]*:[^@]*@",
     r"mongodb(\+srv)?://[^@]*:[^@]*@",
+    # Unquoted assignments (`export API_KEY=abc`, `--token=abc`, `password: abc`).
+    # The quoted forms above miss these, which is the shape a secret actually
+    # takes in a pasted prompt or a shell command - and full prompts/CoT are now
+    # written to .shamsu/runs/, so an unredacted value would land on disk.
+    # Placed last: the quoted patterns consume their key name first, so these
+    # only ever see what those left behind.
+    r"(api[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|secret|token)\s*[=:]\s*[^\s'\";,)]{4,}",
 ]
 
 

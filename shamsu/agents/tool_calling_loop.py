@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.context.budget import count_tokens
 from shamsu.llm.manager import LLMManager
 from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
 from shamsu.runtime.models import model_for_role
@@ -177,6 +178,8 @@ class ToolCallingAgentLoop:
             return validation
         ledger_call_id = self.action_ledger.log_tool_call(call.name, call.arguments) if self.action_ledger else ""
         result = self.tools.execute(call.name, call.arguments)
+        result_json = result.to_json()
+        result_tokens = count_tokens(result_json)
         if self.action_ledger:
             self.action_ledger.log_tool_result(
                 ledger_call_id,
@@ -184,6 +187,10 @@ class ToolCallingAgentLoop:
                 result.ok,
                 result.message,
                 result.data,
+                original_tokens=result_tokens,
+                returned_tokens=result_tokens,
+                max_tokens=0,
+                truncated=False,
             )
         self._log_tool(call, result)
         return result

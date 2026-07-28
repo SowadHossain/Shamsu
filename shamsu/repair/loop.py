@@ -10,8 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
+from shamsu.action_ledger.context import get_current_run
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.diagnostics.types import ErrorPacket
 from shamsu.patch.rollback import rollback_transaction
@@ -30,6 +31,9 @@ from shamsu.repair.types import (
     RepairResult,
 )
 from shamsu.session.manager import SessionLogger
+
+if TYPE_CHECKING:
+    from shamsu.action_ledger.ledger import ActionLedger
 
 _INSPECT_WINDOW = 40
 _IMPORT_KINDS = {ErrorKind.IMPORT_ERROR, ErrorKind.MODULE_NOT_FOUND}
@@ -98,6 +102,7 @@ class RepairLoop:
         max_attempts: int = 4,
         session_logger: SessionLogger | None = None,
         digest: DiagnosticDigest | None = None,
+        action_ledger: "ActionLedger | None" = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.verifier = verifier
@@ -106,6 +111,12 @@ class RepairLoop:
         self.max_attempts = max_attempts
         self.session_logger = session_logger
         self.digest = digest or DiagnosticDigest(self.workspace_root)
+        self.action_ledger = action_ledger if action_ledger is not None else get_current_run()
+        self.verifier_id = (
+            self.action_ledger.verifier_id_for(self.verifier.command, "repair_loop")
+            if self.action_ledger
+            else ""
+        )
         self.comparator = ErrorComparator()
         self.blocker = RepeatedActionBlocker()
         self.transactions = TransactionWorkspace(self.workspace_root)
@@ -226,14 +237,32 @@ class RepairLoop:
     # -- helpers ---------------------------------------------------------------
 
     def _verify_and_digest(self) -> ErrorPacket:
+        if self.action_ledger:
+            self.action_ledger.log_verification_started(
+                self.verifier.command,
+                verifier_id=self.verifier_id,
+                source="repair_loop",
+                required=True,
+            )
         run = self.verifier.run()
-        return self.digest.run(
+        packet = self.digest.run(
             command=run.command,
             cwd=self.workspace_root,
             exit_code=run.exit_code,
             stdout=run.stdout,
             stderr=run.stderr,
         )
+        if self.action_ledger:
+            self.action_ledger.log_verification_result(
+                run.exit_code == 0 and not packet.root_diagnostics,
+                packet.summary,
+                command=run.command,
+                verifier_id=self.verifier_id,
+                source="repair_loop",
+                required=True,
+                exit_code=run.exit_code,
+            )
+        return packet
 
     def _build_context(
         self, primary: RepairError, history: list[PreviousAttempt]
@@ -321,6 +350,18 @@ class RepairLoop:
                 "note": note,
             },
         )
+        if self.action_ledger:
+            self.action_ledger.log_repair_attempt(
+                attempt_index=index,
+                outcome=outcome.value,
+                kept=kept,
+                files_changed=changed,
+                before_signature=before_signature,
+                after_signature=after_signature,
+                note=note,
+                verifier_id=self.verifier_id,
+                command=self.verifier.command,
+            )
 
     def _log(self, event_type: str, payload: dict) -> None:
         if self.session_logger:

@@ -131,9 +131,15 @@ def test_prd_acceptance_runner_records_exact_output_verdicts(tmp_path: Path):
 
     assert passed is True
     events = store.load_events(tmp_path, ledger.run_id)
-    assert sum(event["type"] == "verification_passed" for event in events) == 2
+    verification = [event for event in events if event["type"] == "verification_passed"]
+    assert len(verification) == 2
+    assert all(event["source"] == "prd_acceptance" for event in verification)
+    assert all(event["required"] is True for event in verification)
+    assert all(str(event["verifier_id"]).startswith("verifier_") for event in verification)
     calls = store.load_tool_calls(tmp_path, ledger.run_id)
     assert sum(record.get("phase") == "called" for record in calls) == 2
+    finished = [record for record in calls if record.get("phase") == "finished"]
+    assert all(record.get("original_tokens") is not None for record in finished)
 
 
 def test_prd_acceptance_runner_returns_failure_diagnostics(tmp_path: Path):
@@ -608,6 +614,46 @@ async def test_composite_final_includes_command_output_when_model_runs_verificat
     output = store.load_final_output(tmp_path, ledger.run_id)
     assert "$ python calc.py" in output
     assert "subtract(5, 2) = 3" in output
+
+
+@pytest.mark.asyncio
+async def test_composite_verify_rejects_unrelated_agent_run_command(
+    tmp_path: Path, monkeypatch
+):
+    ledger = start_run(tmp_path, "fix calc.py, then run the script")
+    set_current_run(ledger)
+    calls = {"n": 0}
+
+    async def _fake_agent(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            call_id = ledger.log_tool_call("edit_file", {"filepath": "calc.py"})
+            ledger.log_tool_result(call_id, "edit_file", True, "edited")
+            return AgentLoopResult(final="Edited.", changed_files=("calc.py",))
+        call_id = ledger.log_tool_call("run_command", {"command": "python other.py"})
+        ledger.log_tool_result(
+            call_id,
+            "run_command",
+            True,
+            "Command completed",
+            {"stdout": "ok\n", "exit_code": 0},
+        )
+        return AgentLoopResult(final="The script passed.")
+
+    monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent)
+    try:
+        plan = repl._operation_plan("fix calc.py, then run the script", tmp_path)
+        await repl._run_composite_request(plan, tmp_path, Console(record=True))
+        summary = ledger.finalize_from_evidence()
+    finally:
+        clear_current_run()
+
+    events = store.load_events(tmp_path, ledger.run_id)
+    failed = [event for event in events if event["type"] == "verification_failed"][-1]
+    assert summary["status"] == "partial"
+    assert failed["source"] == "composite_agent_verify"
+    assert failed["expected_command"] == "python calc.py"
+    assert failed["actual_command"] == "python other.py"
 
 
 @pytest.mark.asyncio

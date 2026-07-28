@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from shamsu.action_ledger.context import get_current_run
 from shamsu.agents.scaffold_filler import FillResult, ScaffoldFiller
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.registry import load_registry_entry
@@ -102,6 +103,7 @@ class ScaffoldPipeline:
             approval_func=lambda _request: True,
             timeout_seconds=self.build_timeout,
             session_logger=self.session_logger,
+            action_ledger=get_current_run(),
         )
         verifier = CommandVerifier(build_cmd, runner, target)
 

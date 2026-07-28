@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
+from shamsu.action_ledger.context import get_current_run
+from shamsu.skills.selector import (
+    render_skill_context,
+    select_skills_for_task,
+    selection_log_payload,
+)
+from shamsu.skills.types import SkillSelection
 from shamsu.types import RoutingDecision
 
 
@@ -22,15 +30,29 @@ class TaskPlan:
     required_tools: list[str] = field(default_factory=list)
     target_files: list[str] = field(default_factory=list)
     verification: list[str] = field(default_factory=list)
+    skill_selection: SkillSelection | None = None
     confidence: float = 1.0
 
 
-def build_task_plan(decision: RoutingDecision, user_request: str) -> TaskPlan:
+def build_task_plan(
+    decision: RoutingDecision,
+    user_request: str,
+    *,
+    workspace: Path | None = None,
+) -> TaskPlan:
     mode = _mode_for_intent(decision.intent)
     executor_role = _executor_for_intent(decision.intent)
     steps = _normalize_steps(decision.steps, decision.intent, user_request)
     required_tools = _dedupe(decision.needs_tools or _default_tools(decision.intent))
     target_files = _dedupe(decision.target_files)
+    skill_selection = select_skills_for_task(
+        workspace,
+        user_request,
+        intent=decision.intent,
+        required_tools=required_tools,
+        target_files=target_files,
+    )
+    _log_skill_selection(skill_selection)
     return TaskPlan(
         mode=mode,
         goal=user_request.strip(),
@@ -39,6 +61,7 @@ def build_task_plan(decision: RoutingDecision, user_request: str) -> TaskPlan:
         required_tools=required_tools,
         target_files=target_files,
         verification=_verification_for_intent(decision.intent),
+        skill_selection=skill_selection,
         confidence=decision.confidence,
     )
 
@@ -72,6 +95,9 @@ def render_task_handoff(plan: TaskPlan, agent_context: str = "") -> str:
         "- Run commands only through CommandRunner.",
         "- Do not claim success unless the write/patch/command result confirms it.",
     ]
+    skill_context = render_skill_context(plan.skill_selection) if plan.skill_selection else ""
+    if skill_context:
+        lines.extend(["", skill_context])
     if agent_context.strip():
         lines.extend(["", "## Deterministic Context", agent_context.strip()])
     return "\n".join(lines).strip()
@@ -93,8 +119,36 @@ def plan_log_payload(plan: TaskPlan) -> dict:
         "required_tools": plan.required_tools,
         "target_files": plan.target_files,
         "verification": plan.verification,
+        "skills": (
+            selection_log_payload(plan.skill_selection)
+            if plan.skill_selection is not None
+            else {"mode": "off", "selected": []}
+        ),
         "confidence": plan.confidence,
     }
+
+
+def _log_skill_selection(selection: SkillSelection) -> None:
+    ledger = get_current_run()
+    if ledger is None:
+        return
+    payload = selection_log_payload(selection)
+    selected_names = [
+        str(item.get("name"))
+        for item in payload.get("selected", [])
+        if isinstance(item, dict)
+    ]
+    ledger.log_event("skills_discovered", issues=payload.get("issues", []))
+    ledger.log_decision(
+        "select_skills",
+        reason_summary="Deterministically selected task skills from request and workspace evidence.",
+        evidence=[
+            f"mode:{payload.get('mode')}",
+            "selected:" + ",".join(selected_names),
+        ],
+        chosen_action=",".join(selected_names),
+        outcome="selected" if selected_names else "none",
+    )
 
 
 def _normalize_steps(raw_steps: list[dict], intent: str, user_request: str) -> list[HarnessStep]:

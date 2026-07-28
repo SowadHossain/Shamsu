@@ -39,7 +39,9 @@ TYPE_MAP = {
 
 def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
     entities: list[EntitySpec] = []
+    in_entity_container = False
     for heading, lines in parsed.sections.items():
+        normalized = _normalize_heading(heading)
         heading_entity = _entity_name_from_heading(heading)
         if heading_entity:
             entity = _parse_entity_section(heading_entity, lines)
@@ -48,7 +50,28 @@ def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
             # Do not parse field bullets inside a heading-style entity section
             # as independent compact entity declarations.
             continue
-        if "entit" not in heading.lower() and "data model" not in heading.lower():
+
+        if _is_entity_container_heading(normalized):
+            in_entity_container = True
+            for line in lines:
+                entity = _parse_entity_line(line)
+                if entity is not None:
+                    entities.append(entity)
+            continue
+
+        if _starts_numbered_heading(heading):
+            in_entity_container = False
+
+        if in_entity_container:
+            plain_entity = _entity_name_from_plain_heading(heading, lines)
+            if plain_entity:
+                entity = _parse_entity_section(plain_entity, lines)
+                if entity is not None:
+                    entities.append(entity)
+                continue
+
+        lowered_heading = normalized.lower()
+        if "entit" not in lowered_heading and "data model" not in lowered_heading:
             continue
         for line in lines:
             entity = _parse_entity_line(line)
@@ -69,8 +92,95 @@ def _entity_name_from_heading(heading: str) -> str:
     return _to_pascal_case(match.group("name"))
 
 
+def _entity_name_from_plain_heading(heading: str, lines: list[str]) -> str:
+    normalized = _normalize_heading(heading)
+    lowered = normalized.lower()
+    if not normalized or _is_entity_container_heading(normalized):
+        return ""
+    if _names_a_structural_section(normalized):
+        return ""
+    if len(lowered.split()) > 4:
+        return ""
+    if not _looks_like_field_section(lines):
+        return ""
+    return _to_pascal_case(normalized)
+
+
 def _normalize_heading(heading: str) -> str:
     return re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", heading).strip().rstrip(":")
+
+
+def _is_entity_container_heading(normalized_heading: str) -> bool:
+    lowered = normalized_heading.lower()
+    return (
+        "data model" in lowered
+        or "schema" in lowered
+        or "entit" in lowered
+        or "domain model" in lowered
+    )
+
+
+def _starts_numbered_heading(heading: str) -> bool:
+    return bool(re.match(r"^\d+(?:\.\d+)*\.?\s+", heading.strip()))
+
+
+_GENERIC_SECTION_HEADINGS = {
+    "overview",
+    "product overview",
+    "target users",
+    "core workflows",
+    "required stack",
+    "recommended technical stack",
+    "demo data",
+    "browser ui requirements",
+    "script requirements",
+    "test requirements",
+    "testing requirements",
+    "acceptance",
+    "acceptance criteria",
+}
+
+# `parsed.sections` is flat, so a "Data Model" container cannot be closed by
+# heading depth - every later section inherited it. "## Entities" followed by
+# "## API Endpoints" and "## Pages" (the ordinary PRD shape) therefore produced
+# entities named APIEndpoints and Pages, and Django models to match, because
+# their bullets lex as fields. These words name a structural section, never a
+# domain entity.
+_NON_ENTITY_SECTION_WORDS = (
+    "api",
+    "endpoint",
+    "route",
+    "page",
+    "screen",
+    "journey",
+    "workflow",
+    "requirement",
+    "criteria",
+    "acceptance",
+    "stack",
+    "deployment",
+    "milestone",
+)
+
+
+def _names_a_structural_section(normalized_heading: str) -> bool:
+    lowered = normalized_heading.lower()
+    if lowered in _GENERIC_SECTION_HEADINGS:
+        return True
+    return any(word in lowered.split() or f"{word}s" in lowered.split() for word in _NON_ENTITY_SECTION_WORDS)
+
+
+def _looks_like_field_section(lines: list[str]) -> bool:
+    parseable = 0
+    for line in lines:
+        cleaned = _strip_markdown(line).strip().lstrip("-*+\u2022 ").strip()
+        if not cleaned:
+            continue
+        if _parse_block_field(cleaned) is not None:
+            parseable += 1
+        if parseable >= 1:
+            return True
+    return False
 
 
 def _parse_entity_section(entity_name: str, lines: list[str]) -> EntitySpec | None:
@@ -115,7 +225,12 @@ def _parse_block_field(raw_field: str) -> EntityFieldSpec | None:
     """
     cleaned = raw_field.strip().lstrip("-*+\u2022 ").strip()
     if ":" not in cleaned:
-        return None
+        name = _to_snake_case(cleaned)
+        if not name or name == "id" or len(name) > 60:
+            return None
+        base_type = _block_base_type("", name)
+        django_type, kwargs = _block_field_type(base_type, name)
+        return EntityFieldSpec(name=name, django_type=django_type, kwargs=dict(kwargs))
     raw_name, raw_type = cleaned.split(":", 1)
     name = _to_snake_case(raw_name)
     if not name or name == "id":

@@ -266,11 +266,28 @@ def test_failed_command_controls_evidence_outcome_even_with_mutations(tmp_path: 
     assert ledger.evidence_outcome() == "failed"
 
 
-def test_successful_command_verifies_mutations(tmp_path: Path):
+def test_successful_unrelated_command_does_not_verify_mutations(tmp_path: Path):
     ledger = start_run(tmp_path, "build the app")
     ledger.log_mutation_finished("txn-1", "applied", ["package.json"])
     cmd_id = ledger.log_command_start("npm run build", tmp_path)
     ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 0, "built", "")
+
+    assert ledger.evidence_outcome() == "success_unverified"
+
+
+def test_verification_pass_verifies_mutations(tmp_path: Path):
+    ledger = start_run(tmp_path, "build the app")
+    ledger.log_mutation_finished("txn-1", "applied", ["package.json"])
+    cmd_id = ledger.log_command_start("npm run build", tmp_path)
+    ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 0, "built", "")
+    ledger.log_verification_result(
+        True,
+        "Build passed.",
+        command="npm run build",
+        source="unit",
+        required=True,
+        exit_code=0,
+    )
 
     assert ledger.evidence_outcome() == "success"
 
@@ -428,6 +445,96 @@ def test_huge_inline_event_fields_are_truncated(tmp_path: Path):
     last = events[-1]
     assert len(last["data"]) < 5000
     assert "truncated" in last["data"]
+
+
+def test_tool_result_token_telemetry_and_artifact_are_saved(tmp_path: Path):
+    ledger = start_run(tmp_path, "read a large file")
+    call_id = ledger.log_tool_call("read_file", {"filepath": "big.txt"})
+    full_result = '{"ok": true, "data": {"content": "' + ("token " * 2000) + '"}}'
+
+    ledger.log_tool_result(
+        call_id,
+        "read_file",
+        True,
+        "Read file.",
+        {"filepath": "big.txt"},
+        original_tokens=2200,
+        returned_tokens=600,
+        max_tokens=600,
+        truncated=True,
+        full_result_text=full_result,
+    )
+
+    finished = [
+        record for record in store.load_tool_calls(tmp_path, ledger.run_id)
+        if record.get("phase") == "finished"
+    ][0]
+    assert finished["original_tokens"] == 2200
+    assert finished["returned_tokens"] == 600
+    assert finished["max_tokens"] == 600
+    assert finished["truncated"] is True
+    assert finished["artifact_path"] == f"tool-results/{call_id}.json"
+    assert (ledger.run_dir / finished["artifact_path"]).read_text(encoding="utf-8") == full_result
+
+
+def test_tool_result_token_telemetry_defaults_when_not_provided(tmp_path: Path):
+    ledger = start_run(tmp_path, "run command")
+    call_id = ledger.log_tool_call("run_command", {"command": "python app.py"})
+
+    ledger.log_tool_result(call_id, "run_command", True, "Command exited with 0.", {"stdout": "ok"})
+
+    finished = [
+        record for record in store.load_tool_calls(tmp_path, ledger.run_id)
+        if record.get("phase") == "finished"
+    ][0]
+    assert isinstance(finished["original_tokens"], int)
+    assert finished["original_tokens"] > 0
+    assert finished["returned_tokens"] == finished["original_tokens"]
+    assert finished["truncated"] is False
+    assert finished["artifact_path"] == ""
+
+
+def test_verification_and_repair_telemetry_are_saved(tmp_path: Path):
+    ledger = start_run(tmp_path, "fix syntax")
+    verifier_id = ledger.verifier_id_for("python -m py_compile app.py", "unit")
+
+    ledger.log_verification_started(
+        "python -m py_compile app.py",
+        verifier_id=verifier_id,
+        source="unit",
+        required=True,
+        files=["app.py"],
+    )
+    ledger.log_verification_result(
+        False,
+        "Syntax error.",
+        command="python -m py_compile app.py",
+        verifier_id=verifier_id,
+        source="unit",
+        required=True,
+        files=["app.py"],
+        exit_code=1,
+    )
+    ledger.log_repair_attempt(
+        attempt_index=1,
+        outcome="SOLVED",
+        kept=True,
+        files_changed=["app.py"],
+        before_signature="before",
+        after_signature="exit=0",
+        verifier_id=verifier_id,
+        command="python -m py_compile app.py",
+    )
+
+    events = _events(ledger)
+    verification = [event for event in events if event["type"] == "verification_failed"][0]
+    repair = [event for event in events if event["type"] == "repair_attempt_finished"][0]
+    assert verification["verifier_id"] == verifier_id
+    assert verification["required"] is True
+    assert verification["exit_code"] == 1
+    assert repair["outcome"] == "SOLVED"
+    assert repair["kept"] is True
+    assert repair["files_changed"] == ["app.py"]
 
 
 # -- redaction ----------------------------------------------------------------
@@ -648,3 +755,90 @@ def test_evidence_finalizer_uses_specific_terminal_outcomes(tmp_path: Path):
     patch_unverified = start_run(tmp_path / "patch-unverified", "edit")
     patch_unverified.log_event("patch_apply_succeeded", files=["app.py"])
     assert patch_unverified.finalize_from_evidence()["status"] == "success_unverified"
+
+
+# -- Tier 1: full-fidelity model-call artifacts -----------------------------
+
+
+def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path):
+    """The deep log must hold the request as sent, the whole chain-of-thought,
+    and the whole response - previews alone cannot explain a bad answer."""
+    ledger = start_run(tmp_path, "add a healthcheck endpoint")
+    long_cot = "step " * 4000  # well past the old 4000-char clip
+    call_id = ledger.log_model_call_started(
+        "coder",
+        "deepseek-r1:7b",
+        system="You are SHAMSU.",
+        messages=[{"role": "user", "content": "add a healthcheck endpoint"}],
+        tools=[{"name": "write_file"}],
+    )
+    cot_path = ledger.log_model_thinking(call_id, "coder", "deepseek-r1:7b", long_cot)
+    ledger.log_model_call_finished(
+        "coder", "deepseek-r1:7b", "done" * 3000, call_id=call_id
+    )
+
+    prompt_text = (ledger.run_dir / "prompts" / f"{call_id}.txt").read_text(encoding="utf-8")
+    assert "===== SYSTEM =====" in prompt_text
+    assert "You are SHAMSU." in prompt_text
+    assert "add a healthcheck endpoint" in prompt_text
+    assert "write_file" in prompt_text  # tool schemas travel with the request
+
+    # The CoT round-trips in full rather than being truncated.
+    assert (ledger.run_dir / cot_path).read_text(encoding="utf-8") == long_cot.strip()
+
+    records = {
+        item["phase"]: item
+        for item in store.load_model_calls(tmp_path, ledger.run_id)
+    }
+    assert records["started"]["prompt_path"] == f"prompts/{call_id}.txt"
+    assert records["thinking"]["thinking_chars"] == len(long_cot.strip())
+    assert records["finished"]["response_path"] == f"responses/{call_id}.txt"
+    assert (ledger.run_dir / records["finished"]["response_path"]).read_text(
+        encoding="utf-8"
+    ) == "done" * 3000
+
+
+def test_compact_log_level_keeps_previews_and_writes_no_artifacts(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "compact")
+    ledger = start_run(tmp_path, "add a healthcheck endpoint")
+    call_id = ledger.log_model_call_started("coder", "m", "the prompt")
+    ledger.log_model_thinking(call_id, "coder", "m", "reasoning")
+    ledger.log_model_call_finished("coder", "m", "the answer", call_id=call_id)
+
+    assert not (ledger.run_dir / "prompts").exists()
+    assert not (ledger.run_dir / "cot").exists()
+    assert not (ledger.run_dir / "responses").exists()
+    started = store.load_model_calls(tmp_path, ledger.run_id)[0]
+    assert started["prompt_preview"] == "the prompt"
+    assert "prompt_path" not in started
+
+
+def test_untitled_thinking_traces_do_not_overwrite_each_other(tmp_path: Path):
+    """The plain completion path has no ledger call id, so every trace would
+    otherwise land on the same filename."""
+    ledger = start_run(tmp_path, "reason twice")
+    first = ledger.log_model_thinking("", "specialist", "m", "first trace")
+    second = ledger.log_model_thinking("", "specialist", "m", "second trace")
+
+    assert first != second
+    assert (ledger.run_dir / first).read_text(encoding="utf-8") == "first trace"
+    assert (ledger.run_dir / second).read_text(encoding="utf-8") == "second trace"
+
+
+def test_secrets_are_redacted_in_prompt_and_cot_artifacts(tmp_path: Path):
+    """Full-text capture removes truncation's accidental protection, so the
+    redactor has to cover unquoted secrets - the shape they take in a prompt."""
+    ledger = start_run(tmp_path, "deploy it")
+    call_id = ledger.log_model_call_started(
+        "coder",
+        "m",
+        messages=[{"role": "user", "content": "deploy with api_key=sk-livesecret9876"}],
+    )
+    ledger.log_model_thinking(call_id, "coder", "m", "I will reuse password=hunter2000 here")
+
+    prompt_text = (ledger.run_dir / "prompts" / f"{call_id}.txt").read_text(encoding="utf-8")
+    cot_text = (ledger.run_dir / "cot" / f"{call_id}.txt").read_text(encoding="utf-8")
+    assert "sk-livesecret9876" not in prompt_text
+    assert "[REDACTED]" in prompt_text
+    assert "hunter2000" not in cot_text
+    assert "[REDACTED]" in cot_text

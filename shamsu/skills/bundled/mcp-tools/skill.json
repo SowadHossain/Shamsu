@@ -1,0 +1,7 @@
+{
+  "version": "0.1.0",
+  "tags": ["mcp", "tools", "external"],
+  "triggers": ["mcp", "model context protocol", "external tool", "external server"],
+  "applies_to": ["qa", "code_edit", "generate"],
+  "context_budget_tokens": 800
+}

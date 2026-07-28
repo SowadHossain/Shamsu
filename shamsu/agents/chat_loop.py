@@ -833,6 +833,11 @@ class AgentChatLoop:
                     self.audit.log_tool_call(name, arguments)
                 ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
                 result = self.tools.execute(name, arguments)
+                raw_tool_json = result.to_json()
+                budgeted_tool_json, tool_budget = _budget_tool_result_json_with_meta(
+                    raw_tool_json,
+                    _TOOL_RESULT_MAX_TOKENS,
+                )
                 ran_any_tool = True
                 result_data = result.data if isinstance(result.data, dict) else {}
                 mcp_mutation = (
@@ -868,6 +873,11 @@ class AgentChatLoop:
                         result.data,
                         exception_class=str(result.data.get("exception_class", "")),
                         traceback_path=str(result.data.get("traceback_path", "")),
+                        original_tokens=tool_budget["original_tokens"],
+                        returned_tokens=tool_budget["returned_tokens"],
+                        max_tokens=tool_budget["max_tokens"],
+                        truncated=tool_budget["truncated"],
+                        full_result_text=raw_tool_json if tool_budget["truncated"] else "",
                     )
                 if self.progress:
                     self.progress.tool_result(name, summarize_tool_result(result), ok=result.ok)
@@ -876,7 +886,7 @@ class AgentChatLoop:
                 self.state.append_tool(
                     _tool_call_id(call, name),
                     name,
-                    _budget_tool_result_json(result.to_json(), _TOOL_RESULT_MAX_TOKENS),
+                    budgeted_tool_json,
                 )
                 if name.startswith("mcp__") and not result.ok:
                     self.state.append_user(
@@ -1176,18 +1186,27 @@ class AgentChatLoop:
             except Exception:
                 pass
         if self.action_ledger:
-            event_type = {
-                "verified": "verification_passed",
-                "failed": "verification_failed",
-                "unverifiable": "verification_unavailable",
-            }[outcome.status()]
-            self.action_ledger.log_event(
-                event_type,
-                command=outcome.command,
-                exit_code=outcome.exit_code,
-                files=list(written_files),
-                summary=outcome.summary,
-            )
+            verifier_id = self.action_ledger.verifier_id_for(outcome.command, "agent_chat_verify")
+            if outcome.unverifiable:
+                self.action_ledger.log_verification_unavailable(
+                    outcome.summary,
+                    command=outcome.command,
+                    verifier_id=verifier_id,
+                    source="agent_chat_verify",
+                    required=True,
+                    files=list(written_files),
+                )
+            else:
+                self.action_ledger.log_verification_result(
+                    outcome.verified,
+                    outcome.summary,
+                    command=outcome.command,
+                    verifier_id=verifier_id,
+                    source="agent_chat_verify",
+                    required=True,
+                    files=list(written_files),
+                    exit_code=outcome.exit_code,
+                )
         if outcome.unverifiable:
             return content
         if outcome.failed:
@@ -1302,14 +1321,33 @@ class AgentChatLoop:
             pass
 
     def _log_thinking(self, thinking: str, round_index: int) -> None:
-        """Persist the full reasoning trace to the session log (the visible
-        trace only shows a short glimpse). Best-effort; never breaks the loop."""
+        """Persist the full reasoning trace as a run artifact (the visible trace
+        only shows a short glimpse).
+
+        The untruncated text goes to the run's `cot/` folder via the
+        ActionLedger; the session event keeps metadata plus the path, so raw
+        reasoning stays out of the session timeline. Previously this clipped at
+        4000 chars, which lost precisely the long traces worth reading.
+        Best-effort; never breaks the loop."""
+        cot_path = ""
+        if self.action_ledger:
+            try:
+                cot_path = self.action_ledger.log_model_thinking(
+                    "", "agent-chat", self.model_name, thinking
+                )
+            except Exception:
+                pass
         if not self.session_logger:
             return
         try:
             self.session_logger.log(
                 "llm.thinking",
-                {"model": self.model_name, "round": round_index, "thinking": thinking[:4000]},
+                {
+                    "model": self.model_name,
+                    "round": round_index,
+                    "thinking_chars": len(thinking or ""),
+                    "cot_path": cot_path,
+                },
                 "Model reasoning trace",
                 workflow_id="agent-chat",
             )
@@ -1906,6 +1944,21 @@ def _budget_tool_result_json(text: str, max_tokens: int) -> str:
         if len(truncated) <= 100:
             break
     return truncated + hint
+
+
+def _budget_tool_result_json_with_meta(text: str, max_tokens: int) -> tuple[str, dict[str, Any]]:
+    original_tokens = count_tokens(text)
+    budgeted = _budget_tool_result_json(text, max_tokens)
+    returned_tokens = count_tokens(budgeted)
+    return (
+        budgeted,
+        {
+            "original_tokens": original_tokens,
+            "returned_tokens": returned_tokens,
+            "max_tokens": max_tokens,
+            "truncated": budgeted != text,
+        },
+    )
 
 
 def _get(value: Any, key: str, default: Any = None) -> Any:

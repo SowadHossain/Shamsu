@@ -274,6 +274,36 @@ def test_outside_folder_clause_is_scoped_and_allows_descendants(tmp_path: Path):
     assert result.ok is True
 
 
+def test_scoped_contract_allows_explicit_internal_artifacts_only(tmp_path: Path):
+    prompt = (
+        "Build the app in a folder named generated-app. "
+        "Do not modify anything outside generated-app except SHAMSU's own "
+        ".shamsu logs/state and managed .cbmignore."
+    )
+
+    derived = run_contract.derive(prompt, workspace=tmp_path)
+    allowed = run_contract.check(
+        derived,
+        changed_files=[
+            {"path": "generated-app/app.py", "change": "created"},
+            {"path": ".cbmignore", "change": "created"},
+            {"path": ".shamsu/runs/run_1/events.jsonl", "change": "created"},
+        ],
+    )
+    blocked = run_contract.check(
+        derived,
+        changed_files=[
+            {"path": "generated-app/app.py", "change": "created"},
+            {"path": "outside.txt", "change": "created"},
+        ],
+    )
+
+    assert derived.allowed_collateral_paths == (".shamsu", ".cbmignore")
+    assert allowed.ok is True
+    assert blocked.ok is False
+    assert any("outside.txt" in violation for violation in blocked.violations)
+
+
 def test_build_only_prompt_still_records_a_named_directory_scope(tmp_path: Path):
     prompt = (
         "Build the app in a new folder named output-app. "

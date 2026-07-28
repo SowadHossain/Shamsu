@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["ui", "ux", "responsive", "dashboard", "accessibility"],
+  "triggers": ["ui", "design", "responsive", "mobile", "browser", "screen", "layout", "dashboard"],
+  "applies_to": ["generate", "code_edit"],
+  "dependencies": ["developer"],
+  "context_budget_tokens": 900
+}

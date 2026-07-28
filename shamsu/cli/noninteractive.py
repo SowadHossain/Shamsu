@@ -80,6 +80,7 @@ _HEADLESS_COMMAND_HANDLERS: dict[str, str] = {
     "abstract": "_handle_abstract_inspection",
     "tasks": "_handle_tasks",
     "permissions": "_handle_permissions",
+    "skills": "_handle_skills_inspection",
     "mcp": "_handle_mcp_inspection",
 }
 
@@ -109,6 +110,17 @@ def _dispatch_slash_command(
         from shamsu.mcp.cli import handle_mcp_command
 
         handle_mcp_command(normalized, workspace, console)
+    elif handler_name == "_handle_skills_inspection":
+        parts = normalized.split()
+        subcommand = parts[1].lower() if len(parts) > 1 else "list"
+        if subcommand not in {"list", "status", "show", "explain"}:
+            return False, (
+                f"/skills {subcommand} is not available in headless mode. "
+                "Supported here: /skills list, /skills show <name>, /skills explain <prompt>."
+            )
+        from shamsu.skills.cli import handle_skills_command
+
+        handle_skills_command(normalized, workspace, console)
     elif handler_name == "_handle_abstract_inspection":
         parts = normalized.split()
         subcommand = parts[1].lower() if len(parts) > 1 else "status"
@@ -123,7 +135,11 @@ def _dispatch_slash_command(
         handler = getattr(repl, handler_name)
     if handler_name == "_handle_doctor":
         handler(workspace, console)
-    elif handler_name not in {"_handle_mcp_inspection", "_handle_abstract_inspection"}:
+    elif handler_name not in {
+        "_handle_mcp_inspection",
+        "_handle_abstract_inspection",
+        "_handle_skills_inspection",
+    }:
         handler(normalized, workspace, console)
     return True, ""
 

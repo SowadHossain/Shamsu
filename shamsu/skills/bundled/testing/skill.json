@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["testing", "verification", "acceptance", "pytest", "vitest", "playwright"],
+  "triggers": ["test", "tests", "testing", "verify", "acceptance", "pytest", "vitest", "playwright"],
+  "applies_to": ["test_gen", "bug_fix", "generate", "code_edit"],
+  "dependencies": ["developer"],
+  "context_budget_tokens": 900
+}

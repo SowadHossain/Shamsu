@@ -12,20 +12,36 @@ active model tier (see ``evals/__main__.py`` for the live baseline runner).
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import tempfile
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
+
+
+@dataclass(frozen=True)
+class CheckOutcome:
+    passed: bool
+    note: str = ""
+
 
 # A check is deterministic: given the final workspace and the agent's final
 # answer text, decide pass/fail. File-oriented cases ignore the text; QA cases
-# ignore the workspace.
-CheckFn = Callable[[Path, str], bool]
+# ignore the workspace. Richer cases can return CheckOutcome to preserve a
+# concise failure note in the benchmark report.
+CheckFn = Callable[[Path, str], bool | CheckOutcome]
 # A seed prepares the starting workspace (write files, etc.).
 SeedFn = Callable[[Path], None]
 # A driver runs a case's prompt against a workspace and returns the final answer.
 Driver = Callable[[Path, "EvalCase"], Awaitable[str]]
+# Progress events are intentionally plain dictionaries so CLI/reporting callers
+# can add fields without migrating a serialized schema.
+ProgressFn = Callable[[dict[str, object]], None]
+_DEFAULT_PROGRESS_INTERVAL_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +65,9 @@ class EvalResult:
     passed: bool
     final: str = ""
     error: str = ""
+    note: str = ""
+    workspace: str = ""
+    attempt_workspaces: tuple[str, ...] = ()
     duration_s: float = 0.0
     tags: tuple[str, ...] = ()
     # How many of `runs` attempts passed. Local models are stochastic: the same
@@ -81,6 +100,7 @@ class EvalResult:
 class EvalReport:
     results: list[EvalResult] = field(default_factory=list)
     tier: str = ""
+    artifacts_dir: str = ""
 
     @property
     def total(self) -> int:
@@ -104,6 +124,9 @@ async def run_evals(
     driver: Driver | None = None,
     tier: str = "",
     samples: int = 1,
+    artifacts_dir: Path | None = None,
+    progress: ProgressFn | None = None,
+    progress_interval_s: float = _DEFAULT_PROGRESS_INTERVAL_S,
 ) -> EvalReport:
     """Run each case in an isolated temp workspace and score it. A driver or
     check raising is recorded as a failed case (never aborts the run).
@@ -116,15 +139,85 @@ async def run_evals(
     commit produced PASS/FAIL/PASS on one case - so a baseline meant to justify
     "this change is safe" should use samples>=3.
     """
+    sample_count = max(1, samples)
+    run_artifacts_dir = _prepare_artifacts_dir(artifacts_dir) if artifacts_dir else None
+    _emit_progress(
+        progress,
+        "run_start",
+        cases=len(cases),
+        samples=sample_count,
+        total_attempts=len(cases) * sample_count,
+        artifacts_dir=str(run_artifacts_dir) if run_artifacts_dir else "",
+        tier=tier,
+    )
     results: list[EvalResult] = []
-    for case in cases:
+    for case_index, case in enumerate(cases):
         run = driver or case.driver or chat_loop_driver
-        results.append(await _run_case(case, run, max(1, samples)))
-    return EvalReport(results=results, tier=tier)
+        results.append(
+            await _run_case(
+                case,
+                run,
+                sample_count,
+                run_artifacts_dir,
+                progress=progress,
+                progress_interval_s=progress_interval_s,
+                case_index=case_index,
+                total_cases=len(cases),
+                total_attempts=len(cases) * sample_count,
+            )
+        )
+    report = EvalReport(
+        results=results,
+        tier=tier,
+        artifacts_dir=str(run_artifacts_dir) if run_artifacts_dir else "",
+    )
+    _emit_progress(
+        progress,
+        "run_finish",
+        passed=report.passed,
+        total=report.total,
+        pass_rate=report.pass_rate,
+    )
+    return report
 
 
-async def _run_case(case: EvalCase, driver: Driver, samples: int) -> EvalResult:
-    attempts = [await _run_one(case, driver) for _ in range(samples)]
+async def _run_case(
+    case: EvalCase,
+    driver: Driver,
+    samples: int,
+    artifacts_dir: Path | None,
+    *,
+    progress: ProgressFn | None = None,
+    progress_interval_s: float = _DEFAULT_PROGRESS_INTERVAL_S,
+    case_index: int = 0,
+    total_cases: int = 1,
+    total_attempts: int = 1,
+) -> EvalResult:
+    _emit_progress(
+        progress,
+        "case_start",
+        case=case.name,
+        case_index=case_index + 1,
+        total_cases=total_cases,
+        samples=samples,
+        long_running=case.long_running,
+    )
+    attempts: list[EvalResult] = []
+    for index in range(samples):
+        attempts.append(
+            await _run_one(
+                case,
+                driver,
+                sample_index=index,
+                samples=samples,
+                artifacts_dir=artifacts_dir,
+                progress=progress,
+                progress_interval_s=progress_interval_s,
+                case_index=case_index,
+                total_cases=total_cases,
+                total_attempts=total_attempts,
+            )
+        )
     passes = sum(1 for attempt in attempts if attempt.passed)
     # Majority, so one unlucky roll doesn't condemn a good change and one lucky
     # roll doesn't bless a bad one. With samples=1 this is the old behavior.
@@ -132,42 +225,224 @@ async def _run_case(case: EvalCase, driver: Driver, samples: int) -> EvalResult:
     # Surface a failing attempt's detail over a passing one's: when a case is
     # flaky, the failure is the interesting half.
     representative = next((a for a in attempts if not a.passed), attempts[0])
-    return EvalResult(
+    result = EvalResult(
         name=case.name,
         passed=passed,
         final=representative.final,
         error=representative.error,
+        note=representative.note,
+        workspace=representative.workspace,
+        attempt_workspaces=tuple(
+            attempt.workspace for attempt in attempts if attempt.workspace
+        ),
         duration_s=sum(attempt.duration_s for attempt in attempts),
         tags=case.tags,
         passes=passes,
         runs=samples,
     )
+    _emit_progress(
+        progress,
+        "case_finish",
+        case=case.name,
+        case_index=case_index + 1,
+        total_cases=total_cases,
+        passed=result.passed,
+        passes=passes,
+        runs=samples,
+        flaky=result.flaky,
+        duration_s=result.duration_s,
+    )
+    return result
 
 
-async def _run_one(case: EvalCase, driver: Driver) -> EvalResult:
+async def _run_one(
+    case: EvalCase,
+    driver: Driver,
+    *,
+    sample_index: int = 0,
+    samples: int = 1,
+    artifacts_dir: Path | None = None,
+    progress: ProgressFn | None = None,
+    progress_interval_s: float = _DEFAULT_PROGRESS_INTERVAL_S,
+    case_index: int = 0,
+    total_cases: int = 1,
+    total_attempts: int = 1,
+) -> EvalResult:
+    attempt_index = case_index * samples + sample_index + 1
+    if artifacts_dir is not None:
+        workspace = artifacts_dir / _safe_name(case.name) / f"sample_{sample_index + 1}"
+        workspace.mkdir(parents=True)
+        return await _run_one_in_workspace(
+            case,
+            driver,
+            workspace,
+            keep_workspace=True,
+            sample_index=sample_index,
+            samples=samples,
+            progress=progress,
+            progress_interval_s=progress_interval_s,
+            case_index=case_index,
+            total_cases=total_cases,
+            attempt_index=attempt_index,
+            total_attempts=total_attempts,
+        )
+
     # ignore_cleanup_errors: on Windows the agent may leave a handle briefly open.
     with tempfile.TemporaryDirectory(prefix="shamsu_eval_", ignore_cleanup_errors=True) as tmp:
         workspace = Path(tmp)
-        started = time.perf_counter()
-        try:
-            if case.seed is not None:
-                case.seed(workspace)
-            final = await driver(workspace, case)
-            passed = bool(case.check(workspace, final or ""))
-            error = ""
-        except Exception as exc:  # a broken case must not sink the whole run
-            final = ""
-            passed = False
-            error = f"{type(exc).__name__}: {exc}"
-        duration = time.perf_counter() - started
-    return EvalResult(
+        return await _run_one_in_workspace(
+            case,
+            driver,
+            workspace,
+            keep_workspace=False,
+            sample_index=sample_index,
+            samples=samples,
+            progress=progress,
+            progress_interval_s=progress_interval_s,
+            case_index=case_index,
+            total_cases=total_cases,
+            attempt_index=attempt_index,
+            total_attempts=total_attempts,
+        )
+
+
+async def _run_one_in_workspace(
+    case: EvalCase,
+    driver: Driver,
+    workspace: Path,
+    *,
+    keep_workspace: bool,
+    sample_index: int = 0,
+    samples: int = 1,
+    progress: ProgressFn | None = None,
+    progress_interval_s: float = _DEFAULT_PROGRESS_INTERVAL_S,
+    case_index: int = 0,
+    total_cases: int = 1,
+    attempt_index: int = 1,
+    total_attempts: int = 1,
+) -> EvalResult:
+    started = time.perf_counter()
+    _emit_progress(
+        progress,
+        "sample_start",
+        case=case.name,
+        case_index=case_index + 1,
+        total_cases=total_cases,
+        sample=sample_index + 1,
+        samples=samples,
+        attempt=attempt_index,
+        total_attempts=total_attempts,
+        workspace=str(workspace),
+        long_running=case.long_running,
+    )
+    try:
+        if case.seed is not None:
+            case.seed(workspace)
+        final = await _run_driver_with_heartbeat(
+            case,
+            driver,
+            workspace,
+            progress=progress,
+            progress_interval_s=progress_interval_s,
+            started=started,
+            sample_index=sample_index,
+            samples=samples,
+            case_index=case_index,
+            total_cases=total_cases,
+            attempt_index=attempt_index,
+            total_attempts=total_attempts,
+        )
+        outcome = case.check(workspace, final or "")
+        if isinstance(outcome, CheckOutcome):
+            passed = bool(outcome.passed)
+            note = outcome.note
+        else:
+            passed = bool(outcome)
+            note = ""
+        error = ""
+    except Exception as exc:  # a broken case must not sink the whole run
+        final = ""
+        passed = False
+        error = f"{type(exc).__name__}: {exc}"
+        note = ""
+    duration = time.perf_counter() - started
+    result = EvalResult(
         name=case.name,
         passed=passed,
         final=final or "",
         error=error,
+        note=note,
+        workspace=str(workspace) if keep_workspace else "",
         duration_s=duration,
         tags=case.tags,
     )
+    _emit_progress(
+        progress,
+        "sample_finish",
+        case=case.name,
+        case_index=case_index + 1,
+        total_cases=total_cases,
+        sample=sample_index + 1,
+        samples=samples,
+        attempt=attempt_index,
+        total_attempts=total_attempts,
+        passed=result.passed,
+        error=result.error,
+        note=result.note,
+        duration_s=result.duration_s,
+        workspace=result.workspace or str(workspace),
+    )
+    return result
+
+
+async def _run_driver_with_heartbeat(
+    case: EvalCase,
+    driver: Driver,
+    workspace: Path,
+    *,
+    progress: ProgressFn | None,
+    progress_interval_s: float,
+    started: float,
+    sample_index: int,
+    samples: int,
+    case_index: int,
+    total_cases: int,
+    attempt_index: int,
+    total_attempts: int,
+) -> str:
+    if progress is None or progress_interval_s <= 0 or not case.long_running:
+        return await driver(workspace, case)
+
+    task = asyncio.create_task(driver(workspace, case))
+    try:
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=progress_interval_s)
+            except TimeoutError:
+                _emit_progress(
+                    progress,
+                    "sample_heartbeat",
+                    case=case.name,
+                    case_index=case_index + 1,
+                    total_cases=total_cases,
+                    sample=sample_index + 1,
+                    samples=samples,
+                    attempt=attempt_index,
+                    total_attempts=total_attempts,
+                    elapsed_s=time.perf_counter() - started,
+                    workspace=str(workspace),
+                )
+    except asyncio.CancelledError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raise
+
+
+def _emit_progress(progress: ProgressFn | None, event: str, **payload: object) -> None:
+    if progress is None:
+        return
+    progress({"event": event, **payload})
 
 
 async def full_request_driver(workspace: Path, case: EvalCase) -> str:
@@ -232,11 +507,13 @@ def render_report(report: EvalReport) -> str:
     lines.append(f"- **Tier:** {tier}")
     lines.append(f"- **Pass rate:** {report.passed}/{report.total} ({pct}%)")
     lines.append(f"- **Samples per case:** {samples}" + ("" if samples > 1 else "  <- single-sample: a ±1 delta is noise, not signal"))
+    if report.artifacts_dir:
+        lines.append(f"- **Artifacts:** `{report.artifacts_dir}`")
     lines.append("")
     lines.append("| Case | Result | Time | Notes |")
     lines.append("|------|--------|------|-------|")
     for result in report.results:
-        note = result.error or ("" if result.passed else "check failed")
+        note = result.error or result.note or ("" if result.passed else "check failed")
         if result.flaky:
             # The most important thing this harness can tell you: the case is
             # not answering the same way twice, so neither a PASS nor a FAIL
@@ -280,3 +557,15 @@ def render_report(report: EvalReport) -> str:
 
 def _escape_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")[:160]
+
+
+def _prepare_artifacts_dir(root: Path) -> Path:
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    path = Path(root).resolve() / f"eval_{stamp}_{uuid.uuid4().hex[:8]}"
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def _safe_name(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in name)
+    return safe.strip("._") or "case"

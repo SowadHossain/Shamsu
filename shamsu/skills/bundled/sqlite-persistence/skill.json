@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["sqlite", "database", "persistence", "seed", "migration"],
+  "triggers": ["sqlite", "database", "persistence", "persist", "seed", "migration", "schema"],
+  "applies_to": ["generate", "code_edit", "bug_fix"],
+  "dependencies": ["developer"],
+  "context_budget_tokens": 900
+}

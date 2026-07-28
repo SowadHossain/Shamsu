@@ -15,7 +15,7 @@ from rich.console import Console
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import ActionLedger, start_run
 from shamsu.action_ledger import store
-from shamsu.agents.chat_loop import AgentChatLoop
+from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.diagnostics.types import DiagnosticRecord
 from shamsu.llm.manager import LLMManager
@@ -308,16 +308,22 @@ async def test_run_specialist_logs_context_preview_and_model_call(tmp_path: Path
 
 @pytest.mark.asyncio
 async def test_generate_structured_logs_model_call_and_context_preview(tmp_path: Path):
+    seen: dict[str, object] = {}
+
     class FakeLLM(LLMManager):
         async def _generate(self, model, system, prompt, **kwargs):
+            seen.update(kwargs)
             return '{"ok": true}'
 
     ledger = start_run(tmp_path, "write a project plan")
     llm = FakeLLM(action_ledger=ledger)
 
-    raw = await llm.generate_structured("coder", "system", "prompt", {"type": "object"})
+    raw = await llm.generate_structured(
+        "coder", "system", "prompt", {"type": "object"}, num_predict=4096
+    )
 
     assert raw == '{"ok": true}'
+    assert seen["num_predict"] == 4096
     model_calls = store.load_model_calls(tmp_path, ledger.run_id)
     assert [item["phase"] for item in model_calls] == ["started", "finished"]
     assert all(item["role"] == "coder" for item in model_calls)
@@ -377,3 +383,108 @@ def test_raw_model_reasoning_is_not_persisted_without_debug_opt_in(tmp_path: Pat
     assert event["payload"]["reasoning_available"] is True
     assert event["payload"]["thinking_chars"] > 0
     assert "thinking" not in event["payload"]
+
+
+# -- file.write route: a chat-shaped answer must not report success ----------
+
+
+@pytest.mark.asyncio
+async def test_file_write_route_without_a_tool_call_is_not_reported_success(
+    tmp_path: Path, monkeypatch
+):
+    """Live repro: "add a DELETE endpoint ..." landed on the file.write route,
+    the model answered with a markdown code fence instead of calling
+    edit_file/write_file, and the run still finished as "success" with zero
+    tool calls and zero changed files - nothing caught a mutation route that
+    made no mutation."""
+    from shamsu.cli import repl as repl_module
+
+    async def fake_agent_chat(*args, **kwargs):
+        return AgentLoopResult(final="```python\ndef delete_task(id):\n    ...\n```")
+
+    monkeypatch.setattr(repl_module, "_run_agent_chat", fake_agent_chat)
+
+    ledger = start_run(tmp_path, "create a new function in app.py")
+    set_current_run(ledger)
+    console = Console(file=StringIO(), force_terminal=False, width=120)
+    web_tool = WebTool(approval_func=lambda _request: False)
+    browser_tool = BrowserTool(tmp_path, approval_func=lambda _request: False)
+    try:
+        await repl_module._handle_request(
+            "create a new function in app.py", tmp_path, console, web_tool, browser_tool
+        )
+        repl_module._finish_current_run(tmp_path, ledger)
+    finally:
+        clear_current_run()
+
+    manifest = store.load_manifest(tmp_path, ledger.run_id)
+    assert manifest["status"] != "success"
+    types = [event["type"] for event in _events(ledger)]
+    assert "mutation_required_but_missing" in types
+
+
+@pytest.mark.asyncio
+async def test_file_write_route_with_a_real_change_still_succeeds(tmp_path: Path, monkeypatch):
+    """Regression guard for the fix above: a file.write turn that genuinely
+    changed a file must still report success."""
+    from shamsu.cli import repl as repl_module
+
+    async def fake_agent_chat(*args, **kwargs):
+        return AgentLoopResult(final="Added the function.", changed_files=("app.py",))
+
+    monkeypatch.setattr(repl_module, "_run_agent_chat", fake_agent_chat)
+
+    ledger = start_run(tmp_path, "create a new function in app.py")
+    set_current_run(ledger)
+    console = Console(file=StringIO(), force_terminal=False, width=120)
+    web_tool = WebTool(approval_func=lambda _request: False)
+    browser_tool = BrowserTool(tmp_path, approval_func=lambda _request: False)
+    try:
+        await repl_module._handle_request(
+            "create a new function in app.py", tmp_path, console, web_tool, browser_tool
+        )
+        repl_module._finish_current_run(tmp_path, ledger)
+    finally:
+        clear_current_run()
+
+    manifest = store.load_manifest(tmp_path, ledger.run_id)
+    assert manifest["status"] == "success"
+    types = [event["type"] for event in _events(ledger)]
+    assert "mutation_required_but_missing" not in types
+
+
+# -- a recovered patch retry must not fail the whole run ----------------------
+
+
+def test_evidence_outcome_recovers_when_a_retry_fixes_the_same_file(tmp_path: Path):
+    """Live repro: bug_fix's first diff was invalid (context mismatch), it
+    failed to apply, and an automatic retry then rewrote the file correctly
+    and it applied - confirmed independently with py_compile. The run was
+    still reported "failed" solely because a patch_apply_failed event existed
+    anywhere in the run's history, ignoring the later success for that same
+    file."""
+    ledger = start_run(tmp_path, "fix the syntax error")
+    ledger.log_event("patch_apply_failed", files=["webapp/broken.py"], error="context mismatch")
+    ledger.log_event("patch_apply_succeeded", files=["webapp/broken.py"])
+    ledger.log_verification_result(True, "compiles", command="py_compile", required=True)
+
+    assert ledger.evidence_outcome() == "success"
+
+
+def test_evidence_outcome_still_fails_when_a_patch_failure_is_never_recovered(tmp_path: Path):
+    """Regression guard: a genuinely unrecovered patch failure - no later
+    success for that file - must still fail the run."""
+    ledger = start_run(tmp_path, "fix the syntax error")
+    ledger.log_event("patch_apply_failed", files=["webapp/broken.py"], error="still broken")
+
+    assert ledger.evidence_outcome() == "failed"
+
+
+def test_evidence_outcome_fails_when_a_different_files_patch_never_recovers(tmp_path: Path):
+    """A later success for file A must not paper over an unrecovered failure
+    on unrelated file B in the same run."""
+    ledger = start_run(tmp_path, "fix two files")
+    ledger.log_event("patch_apply_failed", files=["b.py"], error="still broken")
+    ledger.log_event("patch_apply_succeeded", files=["a.py"])
+
+    assert ledger.evidence_outcome() == "failed"

@@ -225,10 +225,12 @@ def _default_python_bin() -> str:
 
 
 def _default_runner(workspace: Path, session_logger: SessionLogger | None) -> CommandRunnerLike:
+    from shamsu.action_ledger.context import get_current_run
     from shamsu.tools.executor import CommandRunner
 
     return CommandRunner(
         workspace,
         approval_func=lambda _request: True,
         session_logger=session_logger,
+        action_ledger=get_current_run(),
     )

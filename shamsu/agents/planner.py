@@ -29,6 +29,7 @@ so this never hard-depends on a capability the interface doesn't promise.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -171,9 +172,27 @@ async def _decide_needs_input(
     if not isinstance(data, dict):
         return False, "", []
     question = str(data.get("question") or "").strip()
-    if not (bool(data.get("needs_input")) and question):
+    if not (bool(data.get("needs_input")) and question) or _is_degenerate_question(question):
         return False, "", []
     return True, question, _options_from(data.get("options"))
+
+
+_DEGENERATE_QUESTION_RE = re.compile(
+    r"\b(do i need to ask|should i ask|need to ask (?:a|the) question|"
+    r"is there a question|any questions?\??$)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_degenerate_question(question: str) -> bool:
+    """A small model asked to decide *whether* to ask sometimes echoes that
+    meta-instruction back as the question itself - "Do I need to ask a
+    question before proceeding?" - instead of a real, concrete question about
+    the task (live repro: reproduced verbatim on two unrelated prompts).
+    That gives the user nothing to answer, so treat it the same as no
+    question at all - the same "junk output degrades to don't ask" rule this
+    function already applies to a missing/unparseable response."""
+    return bool(_DEGENERATE_QUESTION_RE.search(question))
 
 
 def _prompt_from_pack(pack: ContextPack, goal: str) -> str:

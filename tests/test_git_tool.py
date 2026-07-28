@@ -90,3 +90,37 @@ def test_git_diff_returns_diff_text(tmp_path):
     assert "-value = 1" in stdout
     assert "+value = 2" in stdout
     assert stderr == ""
+
+
+def test_warn_if_dirty_reports_in_workspace_changes(tmp_path):
+    runner = FakeRunner((0, " M app.py\n?? webapp/new.py\n", ""))
+
+    warning = GitTool(tmp_path, command_runner=runner).warn_if_dirty()
+
+    assert warning == "Workspace has uncommitted changes: app.py, webapp/new.py"
+
+
+def test_warn_if_dirty_ignores_parent_repo_changes(tmp_path):
+    """Live repro (2026-07-23): a workspace nested in a larger repo warned about
+    dozens of the PARENT repo's files (each shown by git with a `../` prefix,
+    plus the untracked workspace dir itself as `./`) on nearly every edit turn.
+    Those are noise before editing files *here*."""
+    parent_noise = (
+        0,
+        "?? ./\n M ../SHAMSU_QA_LOG.md\n?? ../.cbmignore\n?? ../wp7-taskflow/\n",
+        "",
+    )
+    runner = FakeRunner(parent_noise)
+
+    warning = GitTool(tmp_path, command_runner=runner).warn_if_dirty()
+
+    assert warning is None
+
+
+def test_warn_if_dirty_mixes_in_and_out_of_workspace(tmp_path):
+    """A real in-workspace change survives; parent-repo noise is dropped."""
+    runner = FakeRunner((0, " M app.py\n M ../parent.py\n?? ./\n", ""))
+
+    warning = GitTool(tmp_path, command_runner=runner).warn_if_dirty()
+
+    assert warning == "Workspace has uncommitted changes: app.py"

@@ -110,6 +110,26 @@ def test_mention_resolver_reads_quoted_path_with_spaces(tmp_path):
     assert "# Progress" in contexts[0].content
 
 
+def test_mention_resolver_ignores_python_decorators(tmp_path):
+    """Live repro (2026-07-23): replayed model-generated code containing
+    `@app.route("/tasks/<id>")` got parsed as an `@app.route` file mention and
+    derailed the whole turn into a "no workspace file matched" dump instead of
+    resuming the actual task. A decorator/call (`@name(` with no space) must
+    not be treated as a mention; a real mention immediately followed by a
+    parenthetical note must still work."""
+    resolver = MentionResolver(tmp_path)
+
+    contexts = resolver.resolve_all(
+        '@app.route("/tasks/<id>")\ndef delete_task(id):\n    pass'
+    )
+    assert contexts == []
+
+    (tmp_path / "app.py").write_text("app = 1\n", encoding="utf-8")
+    contexts = resolver.resolve_all("check @app.py (it has a bug)")
+    assert len(contexts) == 1
+    assert contexts[0].resolved
+
+
 def test_mention_resolver_rejects_path_escape(tmp_path):
     outside = tmp_path.parent / "outside-secret.txt"
     outside.write_text("secret", encoding="utf-8")

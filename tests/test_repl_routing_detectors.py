@@ -15,6 +15,7 @@ import pytest
 from shamsu.cli.repl import (
     _classify_route_label,
     _command_for_existing_script_request,
+    _enforce_investigative_question_decision,
     _extract_prd_path_from_prompt,
     _is_conversational_prompt,
     _looks_like_capabilities_question,
@@ -22,6 +23,7 @@ from shamsu.cli.repl import (
     _looks_like_direct_code_request,
     _looks_like_django_generation_request,
     _looks_like_file_write_request,
+    _looks_like_investigative_question,
     _looks_like_prd_build_request,
     _looks_like_prd_plan_request,
     _looks_like_vague_action_request,
@@ -29,6 +31,7 @@ from shamsu.cli.repl import (
     _looks_like_workspace_location_prompt,
     _looks_like_workspace_prd_request,
 )
+from shamsu.types import RoutingDecision
 
 
 @pytest.mark.parametrize(
@@ -108,6 +111,40 @@ def test_script_run_route_requires_existing_workspace_file(tmp_path: Path):
 
     assert _command_for_existing_script_request(prompt, tmp_path) == ""
     assert _classify_route_label(prompt, tmp_path) != "command.run"
+
+
+def test_explicit_backtick_command_is_not_replaced_by_inference(tmp_path: Path):
+    """The user named an exact command; inferring one from a filename inside it
+    ran `python ok.py` (executes the script) instead of the requested
+    `python -m py_compile ok.py` (compile check only)."""
+    (tmp_path / "ok.py").write_text("x = 1 + 1\nprint(x)\n", encoding="utf-8")
+
+    prompt = "Run `python -m py_compile ok.py` and tell me whether it succeeded."
+
+    command = _command_for_existing_script_request(prompt, tmp_path)
+    assert command == "python -m py_compile ok.py"
+    assert _classify_route_label(prompt, tmp_path) == "command.run"
+
+
+def test_explicit_command_outside_the_runner_allowlist_stands_down(tmp_path: Path):
+    """An explicit command that names no known runner is not executed by the
+    deterministic path; it falls through to the fully gated agent loop."""
+    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
+
+    prompt = "Run `rm -rf ok.py` now."
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == ""
+    assert _classify_route_label(prompt, tmp_path) != "command.run"
+
+
+def test_backticked_filename_still_infers_the_command(tmp_path: Path):
+    """A single backticked token is a filename, not a command, so inference
+    must still apply."""
+    (tmp_path / "qa_probe.py").write_text("print(5)\n", encoding="utf-8")
+
+    prompt = "Run `qa_probe.py` and tell me the command output."
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == "python qa_probe.py"
 
 
 @pytest.mark.parametrize(
@@ -314,3 +351,70 @@ def test_real_build_requests_are_unaffected_by_the_plan_guard(tmp_path: Path):
     assert _classify_route_label("build the app from the prd", workspace) == "prd.build"
     # "make hello.py" is still a file write, not a plan.
     assert _looks_like_file_write_request("make hello.py") is True
+
+
+# -- investigative-question routing guard (live repro 2026-07-23) --------------
+
+
+def _mutating_decision(intent: str) -> RoutingDecision:
+    return RoutingDecision(
+        intent=intent,
+        complexity="single",
+        steps=[{"id": 1, "specialist": intent, "task": "x"}],
+        needs_tools=["search"],
+        confidence=0.5,
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt, expected",
+    [
+        # Investigative questions - a change verb is absent, so these are asking,
+        # not requesting work. The live repro that started this: SHAMSU jumped
+        # into bug_fix and proposed an unrequested patch for the first one.
+        ("Look at webapp/utils.py. Is there a bug in the divide function?", True),
+        ("is there a bug in divide?", True),
+        ("does the divide function handle zero?", True),
+        ("what is wrong with this code?", True),
+        ("why does this crash?", True),
+        # Real work - an explicit change verb means do not downgrade.
+        ("fix the bug in utils.py", False),
+        ("can you fix the bug?", False),
+        ("add a delete endpoint to app.py", False),
+        ("please repair the divide function", False),
+        ("refactor the divide function", False),
+        ("update the readme", False),
+    ],
+)
+def test_looks_like_investigative_question(prompt: str, expected: bool):
+    assert _looks_like_investigative_question(prompt) is expected
+
+
+def test_investigative_question_downgrades_bug_fix_to_qa():
+    decision = _enforce_investigative_question_decision(
+        "Is there a bug in the divide function?", _mutating_decision("bug_fix")
+    )
+    assert decision.intent == "qa"
+
+
+def test_investigative_question_downgrades_code_edit_to_qa():
+    decision = _enforce_investigative_question_decision(
+        "does list_tasks return the right thing?", _mutating_decision("code_edit")
+    )
+    assert decision.intent == "qa"
+
+
+def test_real_fix_request_is_not_downgraded():
+    decision = _enforce_investigative_question_decision(
+        "fix the bug in the divide function", _mutating_decision("bug_fix")
+    )
+    assert decision.intent == "bug_fix"
+
+
+def test_investigative_guard_leaves_non_code_intents_alone():
+    # A question-shaped generate/test_gen intent keeps its own routing; only
+    # bug_fix and code_edit are in scope for this downgrade.
+    decision = _enforce_investigative_question_decision(
+        "is there a bug in divide?", _mutating_decision("generate")
+    )
+    assert decision.intent == "generate"

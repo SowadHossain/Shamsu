@@ -172,3 +172,88 @@ def test_run_clean_deletes_after_approval(tmp_path: Path):
 
     assert "Removed 1 run" in output.getvalue()
     assert store.list_run_ids(tmp_path) == []  # now actually removed
+
+
+# -- Log discoverability: /logs and /run narrative|prompt|cot ---------------
+
+
+def test_logs_command_points_at_both_logs_and_the_detail_level(tmp_path: Path):
+    from shamsu.cli.session_commands import handle_logs
+
+    console, output = _console()
+    handle_logs("logs", tmp_path, console)
+    output = output.getvalue()
+
+    assert "narrative.md" in output          # tier 2
+    assert "cot/model_NNNN.txt" in output    # tier 1
+    assert "prompts/model_NNNN.txt" in output
+    assert "full" in output                  # the active detail level
+    assert "SHAMSU_LOG_LEVEL" in output
+    # Nothing has run yet, so say so rather than printing an empty table.
+    assert "No runs recorded yet" in output
+
+
+def test_logs_command_lists_recent_runs_once_they_exist(tmp_path: Path):
+    from shamsu.cli.session_commands import handle_logs
+
+    start_run(tmp_path, "fix the login bug")
+    console, output = _console()
+    handle_logs("logs", tmp_path, console)
+    output = output.getvalue()
+
+    assert "Recent runs" in output
+    assert "fix the login bug" in output
+    assert "No runs recorded yet" not in output
+
+
+def test_logs_open_lists_every_path_including_the_layout_notes(tmp_path: Path):
+    from shamsu.cli.session_commands import handle_logs
+
+    console, output = _console()
+    handle_logs("logs open", tmp_path, console)
+    output = output.getvalue()
+
+    for label in ("runs", "sessions", "audit", "ledger config", "layout notes"):
+        assert label in output
+
+
+def test_run_narrative_prompt_and_cot_read_back_the_artifacts(tmp_path: Path):
+    from shamsu.action_ledger.context import clear_current_run, set_current_run
+    from shamsu.action_ledger.ledger import start_run
+    from shamsu.cli.request_lifecycle import finish_current_run
+    from shamsu.cli.session_commands import handle_run
+
+    ledger = start_run(tmp_path, "add a healthcheck endpoint")
+    set_current_run(ledger)
+    try:
+        call_id = ledger.log_model_call_started(
+            "coder", "m", system="You are SHAMSU.", messages=[{"role": "user", "content": "go"}]
+        )
+        ledger.log_model_thinking(call_id, "coder", "m", "First find the router module.")
+        ledger.record_final_response("Added a /health endpoint.")
+        finish_current_run(tmp_path, ledger)
+    finally:
+        clear_current_run()
+
+    narrative, narrative_out = _console()
+    handle_run("run narrative", tmp_path, narrative)
+    assert "add a healthcheck endpoint" in narrative_out.getvalue()
+
+    prompt, prompt_out = _console()
+    handle_run("run prompt", tmp_path, prompt)
+    assert "You are SHAMSU." in prompt_out.getvalue()
+
+    cot, cot_out = _console()
+    handle_run("run cot", tmp_path, cot)
+    assert "First find the router module." in cot_out.getvalue()
+
+
+def test_run_cot_explains_itself_when_nothing_was_captured(tmp_path: Path):
+    from shamsu.action_ledger.ledger import start_run
+    from shamsu.cli.session_commands import handle_run
+
+    start_run(tmp_path, "no reasoning here")
+    console, output = _console()
+    handle_run("run cot", tmp_path, console)
+
+    assert "No chain-of-thought artifacts" in output.getvalue()

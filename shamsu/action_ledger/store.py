@@ -285,6 +285,11 @@ def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
             errors.append(
                 f"tool call {record.get('tool_call_id', '')} references missing traceback {traceback_path}"
             )
+        artifact_path = str(record.get("artifact_path", ""))
+        if artifact_path and not (run_dir / artifact_path).is_file():
+            errors.append(
+                f"tool call {record.get('tool_call_id', '')} references missing artifact {artifact_path}"
+            )
     for record in groups["models"]:
         traceback_path = str(record.get("traceback_path", ""))
         if traceback_path and not (run_dir / traceback_path).is_file():

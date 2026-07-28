@@ -81,6 +81,7 @@ class RunContract:
     read_only: bool = False
     scoped_read_only: bool = False
     requested_paths: tuple[str, ...] = ()
+    allowed_collateral_paths: tuple[str, ...] = ()
     dry_run: bool = False
 
     @property
@@ -94,6 +95,7 @@ class RunContract:
             "read_only": self.read_only,
             "scoped_read_only": self.scoped_read_only,
             "requested_paths": list(self.requested_paths),
+            "allowed_collateral_paths": list(self.allowed_collateral_paths),
             "dry_run": self.dry_run,
         }
 
@@ -210,8 +212,20 @@ def derive(
         read_only=read_only.applies(prompt),
         scoped_read_only=read_only.is_scoped(prompt),
         requested_paths=requested_paths(prompt, workspace),
+        allowed_collateral_paths=allowed_collateral_paths(prompt),
         dry_run=bool(dry_run),
     )
+
+
+def allowed_collateral_paths(prompt: str) -> tuple[str, ...]:
+    """Workspace paths explicitly exempted from a scoped no-collateral clause."""
+    lowered = (prompt or "").lower()
+    allowed: list[str] = []
+    if ".shamsu" in lowered:
+        allowed.append(".shamsu")
+    if ".cbmignore" in lowered:
+        allowed.append(".cbmignore")
+    return tuple(allowed)
 
 
 def check(
@@ -230,6 +244,7 @@ def check(
     changed_paths = {_normalize(entry.get("path", "")) for entry in changed}
     changed_paths.discard("")
     wanted = {_normalize(path) for path in contract.requested_paths}
+    allowed_collateral = {_normalize(path) for path in contract.allowed_collateral_paths}
     planned = [dict(entry) for entry in planned_mutations]
     planned_paths = {
         _normalize(str(entry.get("path") or entry.get("filepath") or ""))
@@ -296,7 +311,11 @@ def check(
 
     if contract.scoped_read_only and wanted:
         collateral = sorted(
-            path for path in changed_paths if not any(within(path, scope) for scope in wanted)
+            path
+            for path in changed_paths
+            if not any(
+                within(path, scope) for scope in (wanted | allowed_collateral)
+            )
         )
         record(
             "only_requested_files_changed",

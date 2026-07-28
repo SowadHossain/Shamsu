@@ -21,6 +21,7 @@ Hard rules:
 - Propose the MINIMAL change that resolves this one error.
 - Do NOT claim the error is fixed, resolved, verified, or passing. You cannot
   verify anything; a separate verifier decides that after you.
+- A repair plan without `search`+`replace` or `full_content` is invalid.
 - Output a structured repair plan as JSON only, no prose outside the JSON.
 
 Output JSON schema:
@@ -31,6 +32,8 @@ Output JSON schema:
  "replace": string,  // its replacement
  "full_content": string}  // OR the complete new file if a search block is impractical
 Provide EITHER search+replace OR full_content, not both.
+If you cannot produce an edit from the shown content, set target_file to ""
+and explain the missing evidence in root_cause.
 """
 
 

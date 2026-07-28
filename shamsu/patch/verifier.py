@@ -21,9 +21,29 @@ def run_verification(command_runner: ICommandRunner, workspace_root: Path, comma
     if not command:
         return VerificationOutcome(ran=False, command="")
 
+    action_ledger = getattr(command_runner, "action_ledger", None)
+    verifier_id = ""
+    if action_ledger is not None:
+        verifier_id = action_ledger.verifier_id_for(command, "patch_verifier")
+        action_ledger.log_verification_started(
+            command,
+            verifier_id=verifier_id,
+            source="patch_verifier",
+            required=True,
+        )
     exit_code, stdout, stderr = command_runner.run(command, workspace_root)
     packet = getattr(command_runner, "last_error_packet", None)
     signature = packet.signature() if packet is not None else f"exit={exit_code}"
+    if action_ledger is not None:
+        action_ledger.log_verification_result(
+            exit_code == 0,
+            (packet.summary if packet is not None else ""),
+            command=command,
+            verifier_id=verifier_id,
+            source="patch_verifier",
+            required=True,
+            exit_code=exit_code,
+        )
     return VerificationOutcome(
         ran=True,
         command=command,

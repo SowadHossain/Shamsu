@@ -3,12 +3,13 @@ so the runner/scoring/reporting is provable without Ollama. The seed cases
 themselves are exercised live via `python -m evals`."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from evals.cases import SEED_CASES
-from evals.harness import EvalCase, EvalReport, EvalResult, render_report, run_evals
+from evals.harness import CheckOutcome, EvalCase, EvalReport, EvalResult, render_report, run_evals
 
 
 def _passing_case(name: str = "ok") -> EvalCase:
@@ -53,6 +54,21 @@ async def test_run_evals_scores_fail_on_check():
 
 
 @pytest.mark.asyncio
+async def test_run_evals_preserves_check_failure_note():
+    case = EvalCase(
+        name="noted",
+        prompt="p",
+        check=lambda _workspace, _final: CheckOutcome(False, "missing app build"),
+    )
+
+    report = await run_evals([case], driver=_driver_that_noops)
+
+    assert report.results[0].passed is False
+    assert report.results[0].note == "missing app build"
+    assert "missing app build" in report.render()
+
+
+@pytest.mark.asyncio
 async def test_run_evals_records_driver_exception_as_error():
     report = await run_evals([_passing_case()], driver=_driver_that_raises)
     result = report.results[0]
@@ -73,6 +89,26 @@ async def test_each_case_gets_an_isolated_workspace():
     await run_evals(cases, driver=_driver)
     assert len(seen) == 2
     assert seen[0] != seen[1]  # distinct temp dirs, no cross-contamination
+
+
+@pytest.mark.asyncio
+async def test_artifacts_dir_preserves_sample_workspaces(tmp_path: Path):
+    report = await run_evals(
+        [_passing_case()],
+        driver=_driver_that_writes,
+        samples=2,
+        artifacts_dir=tmp_path / "artifacts",
+    )
+
+    result = report.results[0]
+    assert Path(report.artifacts_dir).is_dir()
+    assert len(result.attempt_workspaces) == 2
+    assert result.workspace in result.attempt_workspaces
+    for workspace_text in result.attempt_workspaces:
+        workspace = Path(workspace_text)
+        assert (workspace / "seed.txt").is_file()
+        assert (workspace / "made.txt").is_file()
+    assert "Artifacts" in report.render()
 
 
 @pytest.mark.asyncio
@@ -108,6 +144,36 @@ def test_render_report_contains_rate_and_cases():
     assert "beta" in text and "FAIL" in text
     assert "gamma" in text and "ERROR" in text
     assert "Tier:** default" in text
+
+
+def test_report_to_dict_preserves_notes_and_sample_counts():
+    from evals.__main__ import report_to_dict
+
+    report = EvalReport(
+        results=[
+            EvalResult(
+                name="alpha",
+                passed=False,
+                note="missing target",
+                workspace="F:/tmp/sample",
+                attempt_workspaces=("F:/tmp/sample",),
+                passes=1,
+                runs=3,
+                duration_s=2.0,
+                tags=("prd",),
+            ),
+        ],
+        tier="light",
+        artifacts_dir="F:/tmp/eval",
+    )
+
+    data = report_to_dict(report)
+
+    assert data["tier"] == "light"
+    assert data["artifacts_dir"] == "F:/tmp/eval"
+    assert data["results"][0]["note"] == "missing target"
+    assert data["results"][0]["runs"] == 3
+    assert data["results"][0]["workspace"] == "F:/tmp/sample"
 
 
 def test_seed_cases_are_well_formed():
@@ -234,6 +300,79 @@ async def test_samples_runs_each_case_n_times():
     assert seen["n"] == 3
     assert report.results[0].passes == 3
     assert report.results[0].runs == 3
+
+
+@pytest.mark.asyncio
+async def test_run_evals_emits_live_progress_events(tmp_path: Path):
+    events: list[dict[str, object]] = []
+    case = _passing_case("progress")
+
+    report = await run_evals(
+        [case],
+        driver=_driver_that_writes,
+        samples=2,
+        artifacts_dir=tmp_path / "artifacts",
+        progress=events.append,
+    )
+
+    assert report.passed == 1
+    event_names = [str(event.get("event")) for event in events]
+    assert event_names.count("sample_start") == 2
+    assert event_names.count("sample_finish") == 2
+    assert event_names[0] == "run_start"
+    assert event_names[-1] == "run_finish"
+    assert any(
+        event.get("event") == "case_finish"
+        and event.get("case") == "progress"
+        and event.get("passes") == 2
+        for event in events
+    )
+    starts = [event for event in events if event.get("event") == "sample_start"]
+    assert starts[0]["attempt"] == 1
+    assert starts[1]["attempt"] == 2
+
+
+def test_cli_progress_formatter_is_human_readable():
+    from evals.__main__ import _format_progress_event
+
+    assert _format_progress_event(
+        {
+            "event": "sample_heartbeat",
+            "case": "prd_atlasdesk_long_fullstack",
+            "sample": 2,
+            "samples": 3,
+            "attempt": 5,
+            "total_attempts": 6,
+            "elapsed_s": 75,
+        }
+    ) == (
+        "[eval] still running after 1m15s: prd_atlasdesk_long_fullstack "
+        "sample 2/3 (attempt 5/6)"
+    )
+
+
+def test_cli_progress_sink_writes_artifact_jsonl(tmp_path: Path, capsys):
+    from evals.__main__ import _make_progress_sink
+
+    sink = _make_progress_sink()
+    sink(
+        {
+            "event": "run_start",
+            "cases": 1,
+            "samples": 1,
+            "total_attempts": 1,
+            "artifacts_dir": str(tmp_path),
+        }
+    )
+    sink({"event": "run_finish", "passed": 1, "total": 1, "pass_rate": 1.0})
+
+    stderr = capsys.readouterr().err
+    assert "[eval] running 1 case(s)" in stderr
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "progress.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["event"] for row in rows] == ["run_start", "run_finish"]
 
 
 @pytest.mark.asyncio
