@@ -2074,6 +2074,15 @@ class AgentToolRegistry:
             )
         code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
         data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
+        resolution = getattr(self.command_runner, "last_command_resolution", None)
+        if resolution is not None:
+            data["resolved_command"] = resolution.command
+            data["project_environment"] = {
+                "kind": resolution.environment_kind,
+                "project_root": resolution.project_root,
+                "interpreter": resolution.interpreter,
+                "bootstrapped": resolution.bootstraps_environment,
+            }
         packet = getattr(self.command_runner, "last_diagnostic_packet", None)
         if packet is not None:
             data["outcome_classification"] = packet.classification

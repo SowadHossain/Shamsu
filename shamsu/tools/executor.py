@@ -22,6 +22,7 @@ from shamsu.safety.commands import classify_command, redact
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+from shamsu.tools.project_env import CommandResolution, ProjectEnvironmentResolver
 from shamsu.types import ApprovalRequest, CommandRisk, TestRunResult
 
 BLOCKED_EXIT_CODE = 126
@@ -52,6 +53,7 @@ class CommandRunner(ICommandRunner):
         approval_manager: ApprovalManager | None = None,
         diagnostic_digest: DiagnosticDigest | None = None,
         action_ledger: ActionLedger | None = None,
+        environment_resolver: ProjectEnvironmentResolver | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -65,37 +67,85 @@ class CommandRunner(ICommandRunner):
             self.workspace_root, memory_adapter=CodebaseMemoryAdapter()
         )
         self.diagnostics_workspace = DiagnosticsWorkspace(self.workspace_root)
+        self.environment_resolver = environment_resolver or ProjectEnvironmentResolver(
+            self.workspace_root
+        )
         self.last_error_packet: ErrorPacket | None = None
         self.last_diagnostic_packet: ErrorPacket | None = None
         self.last_diagnostics_path = ""
+        self.last_command_resolution: CommandResolution | None = None
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
-        command = _platform_command(command)
+        requested_command = command
         self.last_error_packet = None
         self.last_diagnostic_packet = None
         self.last_diagnostics_path = ""
-        if self.session_logger:
-            self.session_logger.log(
-                "command.started",
-                {"command": command, "cwd": str(cwd)},
-                f"Command started: {command}",
-                workflow_id="command",
-            )
-        ledger_cmd_id = self.action_ledger.log_command_start(command, cwd) if self.action_ledger else ""
+        self.last_command_resolution = None
         try:
             validated_cwd = self._validate_cwd(cwd)
         except (SecurityError, ValueError) as exc:
+            ledger_cmd_id = (
+                self.action_ledger.log_command_start(requested_command, cwd)
+                if self.action_ledger
+                else ""
+            )
             if self.session_logger:
                 self.session_logger.log(
                     "command.failed",
-                    {"command": command, "error": str(exc)},
+                    {"command": requested_command, "error": str(exc)},
                     "Command rejected before execution",
                     workflow_id="command",
                 )
-            self.audit_logger.log("command_run", "error", details={"command": command, "stderr": str(exc)})
+            self.audit_logger.log(
+                "command_run",
+                "error",
+                details={"command": requested_command, "stderr": str(exc)},
+            )
             if self.action_ledger:
-                self.action_ledger.log_command_finish(ledger_cmd_id, command, cwd, WORKSPACE_EXIT_CODE, "", str(exc))
+                self.action_ledger.log_command_finish(
+                    ledger_cmd_id,
+                    requested_command,
+                    cwd,
+                    WORKSPACE_EXIT_CODE,
+                    "",
+                    str(exc),
+                )
             return WORKSPACE_EXIT_CODE, "", str(exc)
+
+        resolution = self.environment_resolver.resolve(requested_command, validated_cwd)
+        self.last_command_resolution = resolution
+        command = resolution.command
+        resolution_payload = resolution.to_dict()
+        if resolution.changed:
+            if self.session_logger:
+                self.session_logger.log(
+                    "command.environment_resolved",
+                    resolution_payload,
+                    f"Resolved command through {resolution.environment_kind}.",
+                    workflow_id="command",
+                )
+            if self.action_ledger:
+                self.action_ledger.log_event(
+                    "project_environment_resolved",
+                    **resolution_payload,
+                )
+        if self.session_logger:
+            self.session_logger.log(
+                "command.started",
+                {
+                    "command": command,
+                    "requested_command": requested_command,
+                    "cwd": str(validated_cwd),
+                    "environment": resolution.environment_kind,
+                },
+                f"Command started: {command}",
+                workflow_id="command",
+            )
+        ledger_cmd_id = (
+            self.action_ledger.log_command_start(command, validated_cwd)
+            if self.action_ledger
+            else ""
+        )
 
         risk = classify_command(command)
         if risk == CommandRisk.BLOCKED:

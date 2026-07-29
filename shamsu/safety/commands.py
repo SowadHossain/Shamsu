@@ -18,7 +18,9 @@ SAFE_COMMANDS = {
 }
 
 MEDIUM_COMMANDS = {
-    "pip install", "npm install", "poetry add",
+    "pip install", "pip3 install", "python -m pip install",
+    "python -m venv", "uv venv", "uv pip install",
+    "npm install", "poetry add",
     "git checkout", "git merge",
     "python manage.py migrate", "python manage.py makemigrations",
     "python manage.py runserver",
@@ -85,7 +87,9 @@ def is_auto_approvable_action(action_type: str) -> bool:
 _SHELL_WRITE_RE = re.compile(
     r"(?:^|\s)(?:>>?|[12]>>?|&>)\s*[^&|]"
     r"|\b(?:tee|out-file|set-content|add-content|new-item|remove-item|move-item|"
-    r"copy-item|touch|mkdir|rmdir|del|erase|move|copy|rm|mv|cp)\b",
+    r"copy-item|touch|mkdir|rmdir|del|erase|move|copy|rm|mv|cp)\b"
+    r"|\b(?:pip3?\s+install|python3?\s+-m\s+(?:pip\s+install|venv)|"
+    r"uv\s+(?:venv|sync|add|pip\s+install)|poetry\s+(?:add|install)|npm\s+install)\b",
     re.IGNORECASE,
 )
 
@@ -99,12 +103,33 @@ def classify_command(cmd: str) -> CommandRisk:
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, cmd, re.IGNORECASE):
             return CommandRisk.BLOCKED
-    normalized = cmd.strip()
+    normalized = _classification_view(cmd)
     if any(normalized.startswith(safe) for safe in SAFE_COMMANDS):
         return CommandRisk.SAFE
     if any(normalized.startswith(medium) for medium in MEDIUM_COMMANDS):
         return CommandRisk.MEDIUM
     return CommandRisk.MEDIUM  # unknown commands default to requiring approval
+
+
+def _classification_view(command: str) -> str:
+    """Normalize known project-environment wrappers without weakening policy."""
+    normalized = command.strip()
+    normalized = re.sub(r"^(?:poetry|uv)\s+run\s+", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(
+        r"""^(?:"[^"]*\.venv[\\/](?:Scripts|bin)[\\/]python(?:\.exe)?"
+        |[^\s"']*\.venv[\\/](?:Scripts|bin)[\\/]python(?:\.exe)?)""",
+        "python",
+        normalized,
+        flags=re.IGNORECASE | re.VERBOSE,
+    )
+    normalized = re.sub(
+        r"""^(?:"[^"]*\.venv[\\/](?:Scripts|bin)[\\/]pip(?:\.exe)?"
+        |[^\s"']*\.venv[\\/](?:Scripts|bin)[\\/]pip(?:\.exe)?)""",
+        "pip",
+        normalized,
+        flags=re.IGNORECASE | re.VERBOSE,
+    )
+    return normalized.lower()
 
 
 def redact(text: str) -> str:

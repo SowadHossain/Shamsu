@@ -80,10 +80,25 @@ class DevServerManager:
         if not is_dev_server_command(command):
             return DevServerResult(False, command, str(validated_cwd), message="Not a dev-server command.")
 
+        requested_command = command
+        resolution = self.command_runner.environment_resolver.resolve(command, validated_cwd)
+        self.command_runner.last_command_resolution = resolution
+        command = resolution.command
+        if resolution.changed and self.session_logger:
+            self.session_logger.log(
+                "command.environment_resolved",
+                resolution.to_dict(),
+                f"Resolved dev-server command through {resolution.environment_kind}.",
+                workflow_id="dev-server",
+            )
         approved, exit_code, message, approved_cwd = self.command_runner.validate_and_approve(
             command,
             validated_cwd,
-            description=f"Launch dev server: {command}",
+            description=(
+                f"Launch dev server: {command}"
+                if command == requested_command
+                else f"Launch dev server (requested `{requested_command}`): {command}"
+            ),
         )
         if not approved or approved_cwd is None:
             return DevServerResult(
