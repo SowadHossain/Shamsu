@@ -15,6 +15,7 @@ import pytest
 from shamsu.cli.repl import (
     _classify_route_label,
     _command_for_existing_script_request,
+    _direct_file_write_handoff,
     _enforce_investigative_question_decision,
     _extract_prd_path_from_prompt,
     _is_conversational_prompt,
@@ -32,6 +33,30 @@ from shamsu.cli.repl import (
     _looks_like_workspace_prd_request,
 )
 from shamsu.types import RoutingDecision
+
+
+def test_direct_file_write_handoff_includes_skills_and_append_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SHAMSU_SKILLS", "on")
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    handoff, plan = _direct_file_write_handoff(
+        "write pytest tests for src/calculator.py",
+        tmp_path,
+    )
+    selected = [item.skill.name for item in plan.skill_selection.selected]
+
+    assert plan.mode == "test_generation"
+    assert "append_file" in plan.required_tools
+    assert plan.target_files == ["src/calculator.py"]
+    assert {"developer", "testing"} <= set(selected)
+    assert "## Active SHAMSU Skills" in handoff
+    assert "### developer" in handoff
+    assert "### testing" in handoff
 
 
 @pytest.mark.parametrize(

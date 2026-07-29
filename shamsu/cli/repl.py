@@ -73,7 +73,12 @@ from shamsu.cli.session_commands import handle_run as _modular_handle_run
 from shamsu.cli.session_commands import handle_runs as _modular_handle_runs
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
-from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
+from shamsu.agents.task_harness import (
+    TaskPlan,
+    append_task_handoff,
+    build_task_plan,
+    plan_log_payload,
+)
 from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
@@ -4053,8 +4058,20 @@ async def _handle_request(
         )
         return
     if route_label == "file.write":
+        harness_input, direct_plan = _direct_file_write_handoff(
+            effective_input,
+            workspace,
+            agent_context,
+        )
+        _log_event(
+            session_logger,
+            "workflow.plan",
+            plan_log_payload(direct_plan),
+            f"Direct file route selected {direct_plan.mode} mode",
+            workflow_id=direct_plan.mode,
+        )
         result = await _run_agent_chat(
-            _append_agent_context(effective_input, agent_context),
+            harness_input,
             workspace,
             console,
             session_logger=session_logger,
@@ -4435,6 +4452,38 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
         needs_tools=["search"],
         confidence=0.35,
     )
+
+
+def _direct_file_write_handoff(
+    user_input: str,
+    workspace: Path,
+    agent_context: str = "",
+) -> tuple[str, TaskPlan]:
+    classified = _keyword_decision(user_input)
+    intent = classified.intent if classified.intent in {"code_edit", "test_gen", "doc_gen"} else "code_edit"
+    target = _extract_requested_file_path(user_input)
+    decision = RoutingDecision(
+        intent=intent,
+        complexity="single",
+        steps=[
+            {
+                "id": 1,
+                "specialist": "coder",
+                "task": "Inspect the target, apply the requested mutation, and verify it.",
+            }
+        ],
+        needs_tools=[
+            "read_file",
+            "edit_file",
+            "append_file",
+            "write_file",
+            "run_command",
+        ],
+        target_files=[target] if target else [],
+        confidence=1.0,
+    )
+    plan = build_task_plan(decision, user_input, workspace=workspace)
+    return append_task_handoff(user_input, plan, agent_context), plan
 
 
 _MUTATING_INTENTS = frozenset({"bug_fix", "code_edit", "doc_gen", "generate", "test_gen"})

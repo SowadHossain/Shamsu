@@ -325,7 +325,8 @@ class AgentToolRegistry:
                 "edit_file",
                 "Safely replace exact text in an EXISTING file (with approval + rollback backup). "
                 "Prefer this for small, targeted changes. old_string must match exactly once "
-                "unless replace_all=true. Use write_file only for new files or full rewrites.",
+                "unless replace_all=true. Use append_file to add content at the end of an existing "
+                "file, and write_file only for new files or full rewrites.",
                 {
                     "filepath": {"type": "string", "description": "Relative file path (must exist)."},
                     "old_string": {"type": "string", "description": "Exact text to replace."},
@@ -339,11 +340,23 @@ class AgentToolRegistry:
                 required=["filepath", "old_string", "new_string"],
             ),
             _tool_schema(
+                "append_file",
+                "Append content to the END of an EXISTING text file (with approval + rollback "
+                "backup). Use this when adding a new function, test, section, or block without "
+                "replacing existing text. A separating newline is added when needed. This never "
+                "creates a missing file; use write_file to create one.",
+                {
+                    "filepath": {"type": "string", "description": "Relative file path (must exist)."},
+                    "content": {"type": "string", "description": "Content to append."},
+                },
+                required=["filepath", "content"],
+            ),
+            _tool_schema(
                 "write_file",
                 "Create a new file or fully rewrite an existing one. Always pass the COMPLETE new "
                 "file content (it overwrites). For a small change to an existing file, prefer "
-                "edit_file. If a matching file already exists at a different path this refuses and "
-                "returns candidates rather than creating a duplicate.",
+                "edit_file or append_file. If a matching file already exists at a different path "
+                "this refuses and returns candidates rather than creating a duplicate.",
                 {
                     "filepath": {"type": "string", "description": "Relative file path."},
                     "content": {"type": "string", "description": "Complete file content."},
@@ -729,6 +742,11 @@ class AgentToolRegistry:
                     str(arguments.get("old_string") or ""),
                     str(arguments.get("new_string") or ""),
                     replace_all=_as_bool(arguments.get("replace_all")),
+                )
+            if name == "append_file":
+                return self.append_file(
+                    str(arguments.get("filepath") or ""),
+                    str(arguments.get("content") or ""),
                 )
             if name == "write_file":
                 # The model-facing tool always overwrites: small models forget an
@@ -1579,6 +1597,118 @@ class AgentToolRegistry:
                 "start_line": start_line,
                 "end_line": end_line,
                 "auto_disambiguated": auto_disambiguated,
+            },
+        )
+
+    def append_file(self, filepath: str, content: str) -> ToolResult:
+        if self._read_only:
+            return self._read_only_refusal("append to", filepath or "the file")
+        scoped = self._outside_allowed_scope(filepath)
+        if scoped is not None:
+            return scoped
+        normalized = _normalize_workspace_path(filepath)
+        if not normalized:
+            return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
+        if not content:
+            return ToolResult(
+                False,
+                "Missing content. Pass the text to append; the file was NOT changed.",
+                {"filepath": normalized, "candidates": []},
+            )
+        if self._dry_run is not None:
+            return self._planned(
+                "append",
+                normalized,
+                f"{len(content.splitlines())} line(s)",
+                len(content.encode("utf-8")),
+            )
+        try:
+            target = self.sandbox.validate(normalized)
+        except SecurityError as exc:
+            return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
+        if not target.is_file():
+            candidates = _find_path_candidates(self.workspace_root, normalized)
+            message = f"Cannot append: file does not exist: {normalized}."
+            if candidates:
+                message += (
+                    f" Candidates: {_format_path_candidates(candidates)}. "
+                    "Confirm the real path, then call append_file on it."
+                )
+            else:
+                message += " Use write_file to create it."
+            return ToolResult(False, message, {"filepath": normalized, "candidates": candidates})
+        try:
+            old_content = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return ToolResult(False, f"Could not read {normalized}: {exc}", {"filepath": normalized})
+
+        separator = "\n" if old_content and not old_content.endswith(("\n", "\r")) and not content.startswith(("\n", "\r")) else ""
+        appended_content = f"{separator}{content}"
+        new_content = f"{old_content}{appended_content}"
+        request = ApprovalRequest(
+            action_type="file_edit",
+            description=f"Append to file: {normalized}",
+            risk_level="medium",
+            preview=appended_content[:4000],
+            working_dir=str(self.workspace_root),
+            reason="The agent requested content be appended to an existing workspace file.",
+            target_paths=[normalized],
+        )
+        if not self.approval_manager.ask(request):
+            return ToolResult(False, "File append denied by user.", {"filepath": normalized})
+
+        transaction_id = self.transactions.begin(
+            reason=f"Agent append_file: {normalized}",
+            operations=[{"op": "edit_file", "path": normalized, "dest_path": "", "reason": "append"}],
+            destructive=False,
+        )
+        if self.action_ledger:
+            self.action_ledger.log_mutation_started(
+                transaction_id,
+                f"Agent append_file: {normalized}",
+            )
+        self.transactions.backup_file(transaction_id, normalized)
+        target.write_text(new_content, encoding="utf-8")
+        self.transactions.record_after(transaction_id, normalized)
+        diff_text = "".join(
+            difflib.unified_diff(
+                old_content.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=f"a/{normalized}",
+                tofile=f"b/{normalized}",
+            )
+        )
+        self.transactions.save_patch(transaction_id, diff_text)
+        manifest = self.transactions.finalize(transaction_id, "applied")
+        if self.action_ledger:
+            self.action_ledger.log_mutation_finished(
+                transaction_id,
+                "applied",
+                manifest.get("touched_files", []),
+                rollback_available=True,
+                operations=manifest.get("operations", []),
+                before_hashes=manifest.get("before_hashes", {}),
+                after_hashes=manifest.get("after_hashes", {}),
+                backups=manifest.get("backups", {}),
+                patch_path=f".shamsu/mutations/{transaction_id}/patch.diff",
+                verification=manifest.get("verification"),
+                abstract_index_state="stale",
+            )
+        _mark_code_memory_stale(self.workspace_root)
+        added, removed = _line_change_counts(old_content, new_content)
+        start_line = len(old_content.splitlines()) + 1
+        return ToolResult(
+            True,
+            f"Appended to {normalized}: +{added} -{removed} lines (starting at line {start_line}).",
+            {
+                "filepath": normalized,
+                "resolved_filepath": normalized,
+                "bytes_written": len(appended_content.encode("utf-8")),
+                "transaction_id": transaction_id,
+                "lines_added": added,
+                "lines_removed": removed,
+                "start_line": start_line,
+                "separator_added": bool(separator),
             },
         )
 

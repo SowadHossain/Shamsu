@@ -142,10 +142,12 @@ File tools:
   symbol or text but not the file. Use file_info to check a path before editing it.
 - Use edit_file for small, targeted changes: pass the exact old_string and new_string. It must
   match exactly once (or set replace_all=true).
+- Use append_file when adding content at the end of an existing file. Do not fake append by
+  passing an empty old_string to edit_file.
 - Use write_file only to create a new file or fully rewrite one, passing the COMPLETE content.
 - If the user asks you to create, write, save, generate, add, edit, or update a file,
-  your next action must be an edit_file/write_file tool call or a clarification question.
-- A file change only counts if the edit_file/write_file tool result says ok. If a tool result
+  your next action must be an edit_file/append_file/write_file tool call or a clarification question.
+- A file change only counts if the edit_file/append_file/write_file tool result says ok. If a tool result
   shows an error, the change did NOT happen: do not assume success, read the file if needed and
   call the tool again with the corrected content.
 - Never reply with conversational filler like "noted" or "ask me to continue". Either call a
@@ -228,7 +230,9 @@ _DEFERRED_ACTION_PATTERNS = (
     r"\bi('?ll| will)\b\s+(correct|retry|redo|do that|handle)\b",
 )
 
-_MUTATION_TOOL_NAMES = frozenset({"write_file", "edit_file", "move_file", "delete_file"})
+_MUTATION_TOOL_NAMES = frozenset(
+    {"write_file", "edit_file", "append_file", "move_file", "delete_file"}
+)
 
 _WORKSPACE_CHANGE_RE = re.compile(
     r"\b(create|write|build|implement|fix|edit|update|modify|change|add|remove|delete|rename|move|make)\b",
@@ -499,8 +503,12 @@ class AgentChatLoop:
             self.audit.log_final(final)
 
     def _audit_file_change(self, name: str, arguments: dict[str, Any], result: Any) -> None:
-        """Record write_file/edit_file changes (content + diff + rollback id)."""
-        if not self.audit or name not in {"write_file", "edit_file"} or not getattr(result, "ok", False):
+        """Record local text-file changes (content + diff + rollback id)."""
+        if (
+            not self.audit
+            or name not in {"write_file", "edit_file", "append_file"}
+            or not getattr(result, "ok", False)
+        ):
             return
         data = result.data if isinstance(result.data, dict) else {}
         filepath = str(arguments.get("filepath", ""))
@@ -508,6 +516,10 @@ class AgentChatLoop:
             content = str(arguments.get("content") or "")
             diff = "\n".join(f"+{line}" for line in content.splitlines())
             action = "create" if data.get("created") else "overwrite"
+        elif name == "append_file":
+            content = str(arguments.get("content") or "")
+            diff = "\n".join(f"+{line}" for line in content.splitlines())
+            action = "append"
         else:  # edit_file
             old = str(arguments.get("old_string") or "")
             new = str(arguments.get("new_string") or "")
@@ -777,7 +789,7 @@ class AgentChatLoop:
                         self.state.append_user(
                             "A required file mutation is still unconfirmed: "
                             f"{details}. Your NEXT response must call read_file plus a corrected "
-                            "edit_file, or write_file with the complete corrected file. Do not "
+                            "edit_file, append_file, or write_file with the complete corrected file. Do not "
                             "reply with a success summary until a mutation tool returns ok."
                         )
                         continue
@@ -913,7 +925,7 @@ class AgentChatLoop:
                         stopped=True,
                         changed_files=tuple(written_files),
                     )
-                if name in {"write_file", "edit_file"} and result.ok:
+                if name in {"write_file", "edit_file", "append_file"} and result.ok:
                     _data = result.data if isinstance(result.data, dict) else {}
                     written = str(
                         _data.get("resolved_filepath")
@@ -1015,7 +1027,7 @@ class AgentChatLoop:
                         f"read_file {arguments.get('filepath', '')} failed: {result.message}",
                         {"filepath": str(arguments.get("filepath", ""))},
                     )
-                if name == "write_file":
+                if name in {"write_file", "append_file"}:
                     filepath = str(arguments.get("filepath", "the file"))
                     if result.ok:
                         unconfirmed_failed_writes.pop(filepath, None)
@@ -1041,6 +1053,12 @@ class AgentChatLoop:
                     unconfirmed_failed_writes.pop(
                         str(arguments.get("filepath", "the file")), None
                     )
+                if name == "append_file" and not result.ok:
+                    correction = _append_failure_correction(
+                        str(arguments.get("filepath", "the file")),
+                        result.message,
+                    )
+                    self.state.append_user(correction)
                 if name == "write_file" and not result.ok:
                     # A write that did not land is the #1 cause of the model
                     # "hallucinating success" and then compiling half-written
@@ -1623,6 +1641,15 @@ def _write_failure_correction(filepath: str, message: str) -> str:
     )
 
 
+def _append_failure_correction(filepath: str, message: str) -> str:
+    return (
+        f"Your append_file call for {filepath} did NOT succeed: {message}. The file was NOT "
+        "changed. If the path is wrong, locate and read the existing file, then call append_file "
+        "with the corrected path. If the file does not exist, call write_file with its complete "
+        "initial content."
+    )
+
+
 def _edit_failure_correction(
     filepath: str,
     message: str,
@@ -1640,7 +1667,13 @@ def _edit_failure_correction(
     recovery is deterministic: make the match unique, or rewrite the whole file.
     """
     lowered = message.lower()
-    if old_string == new_string and old_string:
+    if not old_string and new_string:
+        how = (
+            "An empty old_string is not a valid replacement anchor. Since you are adding content "
+            "to the end of an existing file, call append_file with filepath and content=new_string. "
+            "Do not retry edit_file with an empty old_string."
+        )
+    elif old_string == new_string and old_string:
         how = (
             "old_string and new_string are identical, so this cannot fix anything. "
             "Call read_file, then use distinct exact strings; if quoting is difficult, use "
@@ -1762,7 +1795,7 @@ def _looks_like_read_stall(content: str) -> bool:
 def _failed_write_final(failed_writes: dict[str, str]) -> str:
     details = "; ".join(f"{path}: {message}" for path, message in failed_writes.items())
     return (
-        "I could not confirm the file edit. The latest write_file attempt failed, so the "
+        "I could not confirm the file edit. The latest mutation attempt failed, so the "
         f"file was not edited successfully. Details: {details}"
     )
 
@@ -1771,6 +1804,8 @@ def _describe_tool_call(name: str, arguments: dict[str, Any]) -> str:
     """A short human-readable label for a tool call, for live REPL activity."""
     if name == "write_file":
         return f"Writing {arguments.get('filepath', '?')}"
+    if name == "append_file":
+        return f"Appending to {arguments.get('filepath', '?')}"
     if name == "read_file":
         return f"Reading {arguments.get('filepath', '?')}"
     if name == "run_command":

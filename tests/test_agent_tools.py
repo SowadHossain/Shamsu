@@ -178,6 +178,10 @@ def test_execute_routes_new_tools(tmp_path: Path):
 
     assert registry.execute("find_file", {"query": "app.py"}).ok is True
     assert registry.execute("grep_files", {"query": "value"}).ok is True
+    assert registry.execute(
+        "append_file",
+        {"filepath": "app.py", "content": "extra = 7\n"},
+    ).ok is True
     assert registry.execute("ask_user", {"question": "Which one?"}).data["ask_user"] is True
 
 
@@ -186,4 +190,4 @@ def test_tool_schemas_expose_clarification_and_discovery_tools(tmp_path: Path):
 
     names = {schema["function"]["name"] for schema in registry.tool_schemas()}
 
-    assert {"find_file", "grep_files", "ask_user"}.issubset(names)
+    assert {"find_file", "grep_files", "append_file", "ask_user"}.issubset(names)

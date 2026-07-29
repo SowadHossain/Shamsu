@@ -203,7 +203,14 @@ def _executor_for_intent(intent: str) -> str:
 
 def _default_tools(intent: str) -> list[str]:
     if intent in {"code_edit", "bug_fix", "test_gen", "doc_gen"}:
-        return ["search_index", "read_file", "write_file", "run_command"]
+        return [
+            "search_index",
+            "read_file",
+            "edit_file",
+            "append_file",
+            "write_file",
+            "run_command",
+        ]
     if intent == "audit":
         return ["search_index", "read_file"]
     return ["search_index", "read_file"]

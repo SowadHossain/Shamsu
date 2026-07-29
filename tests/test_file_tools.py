@@ -3,11 +3,13 @@ loop's failed-read recovery. See shamsu/tools/agent_tools.py and
 shamsu/agents/chat_loop.py."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from shamsu.agents.chat_loop import AgentChatLoop
+from shamsu.audit.trail import SessionAuditLog
 from shamsu.tools.agent_tools import AgentToolRegistry
 
 
@@ -354,6 +356,54 @@ def test_write_file_reports_created_and_overwrote(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# append_file
+# ---------------------------------------------------------------------------
+
+
+def test_append_file_adds_separator_and_transaction_backup(tmp_path: Path):
+    _write(tmp_path, "calculator.py", "def add(a, b):\n    return a + b")
+    approvals = []
+    registry = AgentToolRegistry(
+        tmp_path,
+        approval_func=lambda request: approvals.append(request) or True,
+    )
+
+    result = registry.append_file(
+        "calculator.py",
+        "def subtract(a, b):\n    return a - b\n",
+    )
+
+    assert result.ok is True
+    assert result.data["separator_added"] is True
+    assert result.data["resolved_filepath"] == "calculator.py"
+    assert result.data["transaction_id"]
+    assert approvals[0].description == "Append to file: calculator.py"
+    assert approvals[0].target_paths == ["calculator.py"]
+    assert (tmp_path / "calculator.py").read_text(encoding="utf-8") == (
+        "def add(a, b):\n    return a + b\n"
+        "def subtract(a, b):\n    return a - b\n"
+    )
+    manifest = registry.transactions.load_manifest(result.data["transaction_id"])
+    assert manifest is not None
+    assert manifest["status"] == "applied"
+    assert manifest["backups"]["calculator.py"]
+
+
+def test_append_file_rejects_missing_file_and_read_only_request(tmp_path: Path):
+    registry = _registry(tmp_path)
+
+    missing = registry.append_file("missing.py", "value = 1\n")
+    registry.set_read_only(True)
+    blocked = registry.append_file("missing.py", "value = 1\n")
+
+    assert missing.ok is False
+    assert "does not exist" in missing.message
+    assert blocked.ok is False
+    assert blocked.data["read_only"] is True
+    assert not (tmp_path / "missing.py").exists()
+
+
+# ---------------------------------------------------------------------------
 # Agent loop failed-read recovery
 # ---------------------------------------------------------------------------
 
@@ -517,3 +567,55 @@ async def test_failed_edit_prose_is_forced_into_bounded_mutation_retry(tmp_path:
     assert result.changed_files == ("converter.py",)
     assert (tmp_path / "converter.py").read_text(encoding="utf-8") == "print('fixed')\n"
     assert client.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_empty_anchor_edit_recovers_with_append_file(tmp_path: Path):
+    _write(tmp_path, "calculator.py", "def add(a, b):\n    return a + b\n")
+    registry = _registry(tmp_path)
+    audit = SessionAuditLog(tmp_path, "append-recovery")
+    client = _ScriptedClient(
+        [
+            _tool_response(
+                "edit_file",
+                {
+                    "filepath": "calculator.py",
+                    "old_string": "",
+                    "new_string": "def subtract(a, b):\n    return a - b\n",
+                },
+            ),
+            _tool_response(
+                "append_file",
+                {
+                    "filepath": "calculator.py",
+                    "content": "def subtract(a, b):\n    return a - b\n",
+                },
+            ),
+            _text_response("Added subtract to calculator.py."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=registry,
+        llm=_NoPlanLLM(),
+        audit=audit,
+        use_long_term_memory=False,
+        use_planner=False,
+    )
+
+    result = await loop.run("Add a subtract(a, b) function to calculator.py.")
+
+    assert result.stopped is False
+    assert result.changed_files == ("calculator.py",)
+    assert "def subtract" in (tmp_path / "calculator.py").read_text(encoding="utf-8")
+    user_contents = [message.content for message in loop.state.all_messages if message.role == "user"]
+    assert any("call append_file" in content for content in user_contents)
+    records = [
+        json.loads(line)
+        for line in audit.session_path.read_text(encoding="utf-8").splitlines()
+    ]
+    change = next(record for record in records if record["event_type"] == "file.change")
+    assert change["action"] == "append"
+    assert change["filepath"] == "calculator.py"
+    assert change["transaction_id"]

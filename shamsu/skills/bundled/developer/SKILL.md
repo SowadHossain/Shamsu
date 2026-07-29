@@ -11,6 +11,9 @@ touch workspace files.
 - Make one bounded change at a time.
 - Prefer existing project conventions and helper APIs.
 - Use transactional file tools for mutations.
+- Use `edit_file` with a unique existing anchor for replacements, `append_file`
+  for content added at the end of an existing file, and `write_file` for new
+  files or intentional full rewrites.
 - Run the narrowest meaningful verifier after each mutation.
 - Treat command/test output as evidence, not decoration.
 - If verification fails, repair the first actionable root cause before broadening scope.
