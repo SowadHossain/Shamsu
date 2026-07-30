@@ -67,6 +67,47 @@ def test_clear_single_file_write_keeps_fast_route(tmp_path: Path):
     assert repl._classify_route_label("create hello.py", tmp_path) == "file.write"
 
 
+def test_package_install_and_import_probe_are_separate_mutating_and_verify_steps(
+    tmp_path: Path,
+):
+    prompt = (
+        "Install boltons==24.0.0 for this Python project. Then verify it imports "
+        "and report the exact Python executable and boltons module path used. "
+        "Do not use the global Python environment."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert [step.kind for step in plan.steps] == ["mutation", "verify", "summarize"]
+    assert plan.steps[0].instruction == "Install boltons==24.0.0 for this Python project"
+    assert "Do not use the global Python environment" in plan.steps[2].instruction
+    command = repl._composite_verification_command(plan, plan.steps[1])
+    assert command.startswith("python -c ")
+    assert "import boltons, sys" in command
+    assert "boltons.__file__" in command
+
+
+def test_single_package_install_routes_to_tool_calling_agent(tmp_path: Path):
+    prompt = "Install boltons==24.0.0 in this Python project."
+
+    assert repl._classify_route_label(prompt, tmp_path) == "package.install"
+
+
+def test_named_file_creation_keeps_followup_content_directives_in_one_turn(tmp_path: Path):
+    prompt = (
+        "Create SCOPE_NOTES.md from the retained documentation. "
+        "Add an Out of Scope heading, list excluded features, and cite the source page."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert len(plan.steps) == 1
+    assert plan.primary_route == "file.write"
+    assert plan.steps[0].instruction.startswith("Create SCOPE_NOTES.md")
+    assert "cite the source page" in plan.steps[0].instruction
+
+
 def test_special_single_run_routes_are_not_generalized(tmp_path: Path):
     (tmp_path / "index.html").write_text("<canvas></canvas>", encoding="utf-8")
 
@@ -576,6 +617,55 @@ async def test_composite_verify_runs_clear_script_when_model_only_describes_comm
     output = store.load_final_output(tmp_path, ledger.run_id)
     assert "$ python calc.py" in output
     assert "\n3" in output
+
+
+@pytest.mark.asyncio
+async def test_package_composite_owns_install_verify_and_summary_without_agent(
+    tmp_path: Path, monkeypatch
+):
+    ledger = start_run(tmp_path, "install and verify")
+    set_current_run(ledger)
+
+    async def _unexpected_agent(*args, **kwargs):
+        raise AssertionError("deterministic package flow must not call the model")
+
+    def _fake_install(command, workspace, console, session_logger, active_ledger):
+        call_id = active_ledger.log_tool_call("run_command", {"command": command})
+        active_ledger.log_tool_result(call_id, "run_command", True, "installed")
+        return SimpleNamespace(ok=True), "installed"
+
+    def _fake_verify(plan, step, workspace, console, session_logger, active_ledger):
+        command = repl._composite_verification_command(plan, step)
+        call_id = active_ledger.log_tool_call("run_command", {"command": command})
+        active_ledger.log_tool_result(call_id, "run_command", True, "verified")
+        verifier_id = active_ledger.verifier_id_for(command, "composite_fallback")
+        active_ledger.log_verification_result(
+            True,
+            "verified",
+            command=command,
+            verifier_id=verifier_id,
+            source="composite_fallback",
+            required=True,
+            exit_code=0,
+        )
+        return "verified", True
+
+    monkeypatch.setattr(repl, "_run_agent_chat", _unexpected_agent)
+    monkeypatch.setattr(repl, "_execute_package_install", _fake_install)
+    monkeypatch.setattr(repl, "_execute_deterministic_composite_verification", _fake_verify)
+    prompt = (
+        "Install boltons==24.0.0 for this Python project. Then verify it imports "
+        "and report the exact Python executable and boltons module path used."
+    )
+    try:
+        plan = repl._operation_plan(prompt, tmp_path)
+        result = await repl._run_composite_request(plan, tmp_path, Console(record=True))
+        summary = ledger.finalize_from_evidence()
+    finally:
+        clear_current_run()
+
+    assert result.final.startswith("Step 1 (mutation): success")
+    assert summary["status"] == "success"
 
 
 @pytest.mark.asyncio

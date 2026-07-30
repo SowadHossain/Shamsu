@@ -57,6 +57,7 @@ from shamsu.agents.freeform_generator import (
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.agents.plan_mode import PlanningWorkflow
+from shamsu.agents.planner import deterministic_user_decision
 from shamsu.cli.command_router import CommandRouter
 from shamsu.cli.arguments import parse_args
 from shamsu.cli.approval_ui import (
@@ -3793,8 +3794,11 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     ("workspace.location", lambda text, ws: _looks_like_workspace_location_prompt(text)),
     ("workspace.files", lambda text, ws: _looks_like_workspace_files_prompt(text)),
     ("prd.build", lambda text, ws: _looks_like_prd_build_request(text, ws)),
+    ("docs.ingest", lambda text, ws: _looks_like_docs_ingest_request(text)),
+    ("docs.query", lambda text, ws: _looks_like_docs_query_request(text)),
     ("file.read", lambda text, ws: _looks_like_file_read_request(text)),
     ("file.write", lambda text, ws: _looks_like_file_write_request(text)),
+    ("package.install", lambda text, ws: _looks_like_package_install_request(text)),
     ("command.run", lambda text, ws: _command_for_existing_script_request(text, ws) != ""),
     # A self-contained coding question ("write python for the first 100 primes")
     # is answered directly by the model - no planner, no tool loop, no timeout.
@@ -4047,6 +4051,26 @@ async def _handle_request(
     if route_label == "prd.build":
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
         return
+    if route_label == "docs.ingest":
+        await _run_agent_chat(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+            use_long_term_memory=False,
+            use_planner=False,
+        )
+        return
+    if route_label == "docs.query":
+        await _run_agent_chat(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+            use_long_term_memory=False,
+            use_planner=False,
+        )
+        return
     if route_label == "file.read":
         await _handle_file_read_request(
             effective_input,
@@ -4058,6 +4082,41 @@ async def _handle_request(
         )
         return
     if route_label == "file.write":
+        upfront = deterministic_user_decision(effective_input)
+        if upfront is not None:
+            _, question, options = upfront
+            pending = {
+                "question": question,
+                "options": options,
+                "allow_free_text": True,
+                "source": "direct_file_upfront",
+                "created_from_prompt": effective_input,
+            }
+            body = format_question(pending)
+            console.print(Panel(body, title="Need Input", border_style="cyan"))
+            if session_logger is not None:
+                try:
+                    session_logger.set_pending_question(pending)
+                except Exception as exc:
+                    swallowed.record("repl.direct_file_pending_question", exc)
+            if ledger is not None:
+                ledger.log_event(
+                    "run_needs_input",
+                    question=question,
+                    option_count=len(options),
+                    route="file.write",
+                )
+            emit_trace(
+                console,
+                session_logger,
+                workspace,
+                "clarification.needed",
+                question,
+                {"options": [option["label"] for option in options]},
+                level="normal",
+            )
+            _log_assistant_message(session_logger, body, workflow_id="clarification")
+            return
         harness_input, direct_plan = _direct_file_write_handoff(
             effective_input,
             workspace,
@@ -4070,6 +4129,17 @@ async def _handle_request(
             f"Direct file route selected {direct_plan.mode} mode",
             workflow_id=direct_plan.mode,
         )
+        required_tool_prefix = ""
+        if (
+            direct_plan.mode == "test_generation"
+            or direct_plan.document_context
+        ) and len(direct_plan.target_files) == 1:
+            try:
+                target_path = _resolve_workspace_file(direct_plan.target_files[0], workspace)
+            except SecurityError:
+                target_path = None
+            if target_path is not None and not target_path.exists():
+                required_tool_prefix = "write_file"
         result = await _run_agent_chat(
             harness_input,
             workspace,
@@ -4079,6 +4149,7 @@ async def _handle_request(
             user_request=effective_input,
             use_long_term_memory=False,
             use_planner=False,
+            required_tool_prefix=required_tool_prefix,
         )
         # This route is dispatched as a mutation request. A model can answer
         # with a chat-shaped code fence instead of calling a file tool - no
@@ -4093,6 +4164,14 @@ async def _handle_request(
         return
     if route_label == "command.run":
         _handle_run_existing_script_request(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+        )
+        return
+    if route_label == "package.install":
+        _handle_package_install_request(
             effective_input,
             workspace,
             console,
@@ -4461,7 +4540,25 @@ def _direct_file_write_handoff(
 ) -> tuple[str, TaskPlan]:
     classified = _keyword_decision(user_input)
     intent = classified.intent if classified.intent in {"code_edit", "test_gen", "doc_gen"} else "code_edit"
-    target = _extract_requested_file_path(user_input)
+    requested_target = _extract_requested_file_path(user_input)
+    target = requested_target
+    source_under_test = ""
+    if requested_target:
+        target_name = Path(requested_target).name.casefold()
+        target_suffix = Path(requested_target).suffix.casefold()
+        if target_suffix in {".md", ".rst", ".txt"}:
+            intent = "doc_gen"
+        elif (
+            target_name.startswith("test_")
+            or ".test." in target_name
+            or ".spec." in target_name
+        ):
+            intent = "test_gen"
+    if intent == "test_gen" and requested_target:
+        inferred_test_target = _test_output_path(requested_target)
+        if inferred_test_target != requested_target:
+            source_under_test = requested_target
+            target = inferred_test_target
     decision = RoutingDecision(
         intent=intent,
         complexity="single",
@@ -4483,7 +4580,60 @@ def _direct_file_write_handoff(
         confidence=1.0,
     )
     plan = build_task_plan(decision, user_input, workspace=workspace)
-    return append_task_handoff(user_input, plan, agent_context), plan
+    handoff = append_task_handoff(user_input, plan, agent_context)
+    semantic_contract = contract.derive(user_input, workspace=workspace)
+    if semantic_contract.required_python_symbols:
+        requirements = "\n".join(
+            f"- `{symbol}` must exist as a new function in `{path}`."
+            for path, symbol in semantic_contract.required_python_symbols
+        )
+        handoff += (
+            "\n\n## Explicit Edit Contract\n"
+            f"{requirements}\n"
+            "- Preserve existing functions and their behavior unless the user explicitly "
+            "asked to change them.\n"
+            "- Adding a function means inserting a new definition, not changing an existing "
+            "function's return expression.\n"
+            "- Re-read the edited file and confirm every named function exists before finishing."
+        )
+    if source_under_test:
+        source_path = workspace / source_under_test
+        try:
+            source_text = source_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            source_text = ""
+        source_excerpt = source_text[:12_000]
+        handoff += (
+            "\n\n## Test Generation Contract\n"
+            f"Source under test: {source_under_test}\n"
+            f"Required test output: {target}\n"
+            f"Create `{target}` with focused executable tests. Do not overwrite "
+            f"`{source_under_test}`. The harness will run the tests after the write."
+        )
+        if source_excerpt:
+            handoff += (
+                "\n\nSource snapshot:\n```text\n"
+                + source_excerpt
+                + ("\n[truncated]" if len(source_text) > len(source_excerpt) else "")
+                + "\n```"
+            )
+    return handoff, plan
+
+
+def _test_output_path(source: str) -> str:
+    """Derive a deterministic test target when the prompt names source code."""
+    normalized = source.replace("\\", "/").lstrip("./")
+    path = Path(normalized)
+    name = path.name.casefold()
+    if name.startswith("test_") or ".test." in name or ".spec." in name:
+        return normalized
+    suffix = path.suffix.casefold()
+    stem = path.stem
+    if suffix == ".py":
+        return f"tests/test_{stem}.py"
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        return f"tests/{stem}.test{path.suffix}"
+    return normalized
 
 
 _MUTATING_INTENTS = frozenset({"bug_fix", "code_edit", "doc_gen", "generate", "test_gen"})
@@ -4732,6 +4882,100 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
         return True
     return False
+
+
+def _looks_like_package_install_request(user_input: str) -> bool:
+    """Route explicit project dependency installs into the tool-calling loop."""
+    text = " ".join(user_input.strip().lower().split())
+    if not text:
+        return False
+    if re.search(
+        r"\b(?:pip3?|python3?\s+-m\s+pip|uv\s+pip|npm|pnpm|yarn)\s+install\b",
+        text,
+    ):
+        return True
+    if re.search(r"\b(?:install|add)\s+(?:a\s+|the\s+)?(?:package|dependency|library)\b", text):
+        return True
+    return bool(
+        re.match(r"^install\s+[a-z0-9_.-]+(?:\[[a-z0-9_,.-]+\])?(?:[<>=!~]=?[^\s,;]+)?\b", text)
+        and re.search(r"\b(?:python|project|workspace|dependency|package|library)\b", text)
+    )
+
+
+def _python_package_spec(user_input: str) -> str:
+    match = re.search(
+        r"\binstall\s+(?P<spec>[A-Za-z0-9_.-]+"
+        r"(?:\[[A-Za-z0-9_,.-]+\])?(?:[<>=!~]=?[A-Za-z0-9_.+!-]+)?)",
+        user_input,
+        re.IGNORECASE,
+    )
+    return match.group("spec") if match else ""
+
+
+def _package_install_command(user_input: str) -> str:
+    spec = _python_package_spec(user_input)
+    return f"python -m pip install {spec}" if spec else ""
+
+
+def _execute_package_install(
+    command: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    ledger: ActionLedger | None,
+) -> tuple[Any, str]:
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=ledger,
+    )
+    call_id = ledger.log_tool_call("run_command", {"command": command}) if ledger else ""
+    result = registry.execute("run_command", {"command": command})
+    if ledger:
+        ledger.log_tool_result(call_id, "run_command", result.ok, result.message, result.data)
+    resolved = str(result.data.get("resolved_command") or command)
+    environment = result.data.get("project_environment")
+    kind = str(environment.get("kind") or "") if isinstance(environment, dict) else ""
+    output = str(result.data.get("stdout") or result.data.get("stderr") or result.message).strip()
+    verdict = "succeeded" if result.ok else "failed"
+    headline = f"`{command}` {verdict}"
+    if kind:
+        headline += f" using `{kind}`"
+    body = f"{headline}\n\nResolved command:\n`{resolved}`"
+    if output:
+        body += f"\n\nOutput:\n```\n{output}\n```"
+    console.print(
+        Panel(
+            body,
+            title="Package Install",
+            border_style="green" if result.ok else "red",
+        )
+    )
+    return result, body
+
+
+def _handle_package_install_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> str:
+    command = _package_install_command(user_input)
+    if not command:
+        message = "I could not determine which Python package to install."
+        console.print(Panel(message, title="Package Install", border_style="yellow"))
+        _log_assistant_message(session_logger, message, workflow_id="package.install")
+        return message
+    result, body = _execute_package_install(
+        command,
+        workspace,
+        console,
+        session_logger,
+        get_current_run(),
+    )
+    _log_assistant_message(session_logger, body, workflow_id="package.install")
+    return body
 
 
 # -- Git request routing override -------------------------------------------
@@ -5832,6 +6076,77 @@ def _looks_like_file_read_request(user_input: str) -> bool:
     return "read_file" in raw or bool(words & read_verbs)
 
 
+def _looks_like_docs_ingest_request(user_input: str) -> bool:
+    """Recognize requests to retain provided docs for future coding tasks."""
+    text = user_input.strip().lower()
+    if not text:
+        return False
+    ingest_intent = any(
+        phrase in text
+        for phrase in (
+            "ingest ",
+            "import documentation",
+            "import docs",
+            "add as a reference",
+            "add this reference",
+            "register documentation",
+            "register docs",
+            "save as a reference",
+            "remember this documentation",
+            "remember these docs",
+        )
+    )
+    if not ingest_intent:
+        return False
+    source_signal = bool(_FILELIKE_RE.search(user_input)) or "http://" in text or "https://" in text
+    doc_signal = any(
+        word in text
+        for word in ("doc", "documentation", "reference", "manual", "guide", "library")
+    )
+    return source_signal and doc_signal
+
+
+def _looks_like_docs_query_request(user_input: str) -> bool:
+    """Recognize explicit questions/searches over previously registered docs."""
+    text = user_input.strip().lower()
+    if not text or _looks_like_docs_ingest_request(user_input):
+        return False
+    doc_signal = bool(
+        re.search(
+            r"\b(registered (?:doc|docs|document|documents)|documentation|docs|manual|"
+            r"library reference)\b",
+            text,
+        )
+    )
+    query_signal = any(
+        phrase in text
+        for phrase in (
+            "ask the ",
+            "according to ",
+            "look up in ",
+            "search docs",
+            "search the docs",
+            "search documentation",
+            "summarize the manual",
+            "summarise the manual",
+            "summarize the registered",
+            "summarise the registered",
+            "what do the docs",
+            "what does the manual",
+        )
+    )
+    return doc_signal and query_signal
+
+
+def _required_docs_tool(user_input: str) -> str:
+    text = user_input.lower()
+    if re.search(r"\b(summarize|summarise|summary)\b", text):
+        return "summarize_docs"
+    if re.search(r"\b(search|find|look up)\b", text):
+        return "search_docs"
+    return "ask_docs"
+
+
 # Self-contained "write me some code" asks that need no workspace context.
 # These must answer directly from the model (fast) instead of entering the
 # planner + tool loop, which used to only produce a plan and then time out on a
@@ -6410,6 +6725,16 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
         return False
     if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
         return True
+    explicit_path = _extract_prd_path_from_prompt(user_input)
+    if (
+        explicit_path
+        and _looks_like_file_write_request(user_input)
+        and _resolve_build_prd(user_input, workspace) is None
+    ):
+        # "Create NOTES.md from the PRD" names an output file, not the PRD to
+        # build. The explicit "prd" word used to bypass _resolve_build_prd's
+        # named-output protection and launch the full autonomous builder.
+        return False
     text = user_input.lower()
     words = re.sub(r"[^\w\s]", " ", text).split()
     has_build_verb = any(verb in text for verb in _PRD_BUILD_VERBS) or _has_fuzzy_word(
@@ -10033,15 +10358,52 @@ async def _run_composite_request(
             continue
 
         before_tools, before_events = _ledger_counts(workspace, ledger)
-        result = await _run_agent_chat(
-            _composite_step_prompt(plan, step, statuses, agent_context),
-            workspace,
-            console,
-            session_logger=session_logger,
-            auto_approve=is_long_running_enabled(workspace),
-            user_request=plan.prompt,
-            force_read_only=step.kind not in {"mutation", "git_mutate"},
+        step_output = ""
+        install_command = _package_install_command(step.instruction) if step.kind == "mutation" else ""
+        deterministic_verify = (
+            _composite_verification_command(plan, step)
+            if step.kind == "verify" and _python_package_spec(plan.prompt)
+            else ""
         )
+        if install_command:
+            install_result, step_output = _execute_package_install(
+                install_command,
+                workspace,
+                console,
+                session_logger,
+                ledger,
+            )
+            result = AgentLoopResult(
+                final=step_output,
+                stopped=not bool(install_result.ok),
+            )
+        elif deterministic_verify:
+            step_output, verify_ok = _execute_deterministic_composite_verification(
+                plan,
+                step,
+                workspace,
+                console,
+                session_logger,
+                ledger,
+            )
+            result = AgentLoopResult(final=step_output, stopped=not verify_ok)
+        elif step.kind == "summarize":
+            prior = [
+                f"Step {item['id']} ({item['kind']}): {item['status']}"
+                + (f"\n{item['output']}" if item.get("output") else "")
+                for item in statuses
+            ]
+            result = AgentLoopResult(final="\n".join(prior) or "No earlier step results.")
+        else:
+            result = await _run_agent_chat(
+                _composite_step_prompt(plan, step, statuses, agent_context),
+                workspace,
+                console,
+                session_logger=session_logger,
+                auto_approve=is_long_running_enabled(workspace),
+                user_request=plan.prompt,
+                force_read_only=step.kind not in {"mutation", "git_mutate"},
+            )
         last_result = result
         step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
 
@@ -10054,9 +10416,8 @@ async def _run_composite_request(
             _execute_composite_git_inspection(workspace, console, session_logger, ledger)
             step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
 
-        step_output = ""
         if step.kind == "verify" and "run_command" not in set(step_tools):
-            step_output = _execute_deterministic_composite_verification(
+            step_output, _verify_ok = _execute_deterministic_composite_verification(
                 plan, step, workspace, console, session_logger, ledger
             )
             step_tools, step_events = _ledger_delta(
@@ -10195,6 +10556,16 @@ def _composite_verification_command(
             return f"node {quoted}"
     if re.search(r"\b(?:run|rerun|re-run)\b.*\btests?\b", instruction):
         return "python -m pytest -q"
+    package_spec = _python_package_spec(plan.prompt)
+    if package_spec and re.search(r"\bimport(?:s|ed|ing)?\b", instruction):
+        module = re.split(r"[\[<>=!~]", package_spec, maxsplit=1)[0].replace("-", "_")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", module):
+            script = (
+                f"import {module}, sys; "
+                f"print(sys.executable); print({module}.__file__)"
+            )
+            quoted_script = subprocess.list2cmdline([script])
+            return f"python -c {quoted_script}"
     return ""
 
 
@@ -10205,10 +10576,10 @@ def _execute_deterministic_composite_verification(
     console: Console,
     session_logger: SessionLogger | None,
     ledger: ActionLedger | None,
-) -> str:
+) -> tuple[str, bool]:
     command = _composite_verification_command(plan, step)
     if not command:
-        return ""
+        return "", False
     registry = AgentToolRegistry(
         workspace,
         session_logger=session_logger,
@@ -10247,7 +10618,7 @@ def _execute_deterministic_composite_verification(
             border_style="green" if result.ok else "red",
         )
     )
-    return rendered
+    return rendered, bool(result.ok)
 
 
 def _latest_composite_command_record(
@@ -10356,10 +10727,12 @@ def _composite_step_outcome(
     evidence: list[str] = []
     matched = False
     if step.kind == "mutation":
-        matched = bool(
+        file_mutation = bool(
             set(tool_leaves)
             & {"write_file", "edit_file", "move_file", "delete_file", "create_directory"}
         ) or bool(changed_files)
+        package_install = bool(_package_install_command(str(getattr(step, "instruction", ""))))
+        matched = file_mutation or (package_install and "run_command" in tools)
         evidence = [f"changed:{path}" for path in changed_files]
     elif step.kind == "verify":
         if "verification_failed" in event_types:
@@ -10461,6 +10834,7 @@ async def _run_agent_chat(
     use_planner: bool = True,
     user_request: str | None = None,
     force_read_only: bool = False,
+    required_tool_prefix: str = "",
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -10487,6 +10861,13 @@ async def _run_agent_chat(
         force_read_only=force_read_only,
         allowed_write_paths=allowed_write_paths,
     )
+    if required_tool_prefix:
+        tools.require_tool_prefix(required_tool_prefix)
+        user_input = (
+            f"{user_input}\n\nRequired first action: call `{required_tool_prefix}` directly. "
+            "The harness has already supplied the necessary evidence. Do not substitute a "
+            "read, edit, append, search, or command tool."
+        )
     if _looks_like_mcp_request(safety_input):
         use_long_term_memory = False
         use_planner = False
@@ -10524,6 +10905,27 @@ async def _run_agent_chat(
                 + ". Do not run an `mcp` shell command and do not substitute a local tool."
                 + preference
             )
+    if _looks_like_docs_ingest_request(safety_input):
+        use_long_term_memory = False
+        use_planner = False
+        tools.require_tool_prefix("ingest_docs")
+        user_input = (
+            f"{user_input}\n\nDocumentation ingestion requirement: call `ingest_docs` directly "
+            "with the named workspace path or URL and the library name if the user supplied one. "
+            "Do not reproduce the documentation with write_file and do not claim it was retained "
+            "unless ingest_docs succeeds."
+        )
+    elif _looks_like_docs_query_request(safety_input):
+        use_long_term_memory = False
+        use_planner = False
+        required_docs_tool = _required_docs_tool(safety_input)
+        tools.require_tool_prefix(required_docs_tool)
+        user_input = (
+            f"{user_input}\n\nRegistered-document requirement: call `{required_docs_tool}` "
+            "directly with the user's question and document name when supplied. Use only its "
+            "citation-backed evidence, preserve citations in the answer, and say when the "
+            "registered documents do not contain enough evidence."
+        )
     # A dry run is the opposite instruction: keep going, change nothing. Writes
     # report a synthetic success and are recorded as planned actions instead.
     # The `--dry-run` flag sets the context recorder; prose ("dry run only:

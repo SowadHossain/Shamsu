@@ -65,7 +65,14 @@ def select_skills_for_task(
             continue
         matched = _metadata_match(skill, text)
         if matched:
-            _add(candidates, name, 30.0, f"matched skill metadata: {matched}")
+            is_reference = str(skill.metadata.get("kind") or "").lower() == "reference"
+            score = 92.0 if is_reference else 30.0
+            reason = (
+                f"named ingested reference matched: {matched}"
+                if is_reference
+                else f"matched skill metadata: {matched}"
+            )
+            _add(candidates, name, score, reason)
 
     candidates = _add_dependencies(candidates, catalog)
     selected, rejected = _resolve_conflicts_and_budget(candidates, catalog, max_skills, budget_tokens)

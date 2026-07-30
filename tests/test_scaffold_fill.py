@@ -97,6 +97,27 @@ def test_scaffold_filler_skips_holes_it_cannot_fill(tmp_path: Path):
     assert (target / "src/game/update.ts").read_text() == before
 
 
+def test_scaffold_filler_injects_generation_skill_context(tmp_path: Path):
+    entry, target = _scaffold_game_2d(tmp_path)
+    contract = extract_contract(parse_prd_text(PONG_PRD, markdown=True))
+    prompts: list[str] = []
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        prompts.append(user)
+        return _fake_fill_generate(system, user, schema)
+
+    result = ScaffoldFiller(
+        tmp_path,
+        generate,
+        skill_context="## Active SHAMSU Skills\n\n### developer\nKeep state updates deterministic.",
+    ).fill(entry, target, contract)
+
+    assert result.filled
+    assert prompts
+    assert all("## Generation Skill Guidance" in prompt for prompt in prompts)
+    assert all("Keep state updates deterministic." in prompt for prompt in prompts)
+
+
 # --- ScaffoldPipeline: fill + verify + DoD -----------------------------------
 
 class FakeRunner:

@@ -13,7 +13,7 @@ CandidateFinder = Callable[[str, Path], list[str]]
 
 _ACTION = (
     r"(?:read|open|inspect|show|compare|summari[sz]e|explain|search|look\s+up|"
-    r"browse|create|write|build|implement|fix|repair|edit|update|modify|change|"
+    r"browse|create|write|build|implement|install|fix|repair|edit|update|modify|change|"
     r"add|remove|delete|rename|move|run|rerun|re-run|test|verify|check|report|"
     r"return|start|launch|serve|commit|stage|push|pull)"
 )
@@ -31,6 +31,16 @@ _REFERENCE_RE = re.compile(
 _ORIGINAL_MARKER = "Original request: "
 _PLAN_MARKER = "\n\nOrdered operation plan:"
 _ANSWER_MARKER = "\n\n(Answering the earlier question"
+_FILE_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9_.-]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}",
+    re.IGNORECASE,
+)
+_CREATE_NAMED_FILE_RE = re.compile(
+    rf"^\s*(?:create|write|generate|make)\b(?:(?![.!?\n]).)*{_FILE_TOKEN_RE.pattern}",
+    re.IGNORECASE,
+)
+
+
 @dataclass(frozen=True)
 class OperationStep:
     id: int
@@ -135,12 +145,34 @@ def parse_operation_plan(
     if not steps:
         route = classify(prompt, workspace)
         steps = [OperationStep(id=1, kind="answer", route=route, instruction=prompt.strip())]
+    elif _is_single_named_file_creation(prompt, steps):
+        # "Create NOTES.md ... Add a Sources heading ..." is one artifact
+        # request. Splitting it makes the first turn lose the content contract
+        # and the second turn lose the target. Keep true multi-file and edit
+        # requests as separately evidenced steps.
+        steps = [
+            OperationStep(
+                id=1,
+                kind="mutation",
+                route="file.write",
+                instruction=prompt.strip().rstrip(".?!"),
+            )
+        ]
     return OperationPlan(
         prompt=prompt.strip(),
         candidates=tuple(_dedupe(candidates)),
         steps=tuple(steps),
         clauses=tuple(clauses),
     )
+
+
+def _is_single_named_file_creation(prompt: str, steps: list[OperationStep]) -> bool:
+    if len(steps) < 2 or not _CREATE_NAMED_FILE_RE.search(prompt):
+        return False
+    if any(step.kind != "mutation" or step.route != "file.write" for step in steps):
+        return False
+    targets = {match.group(0).replace("\\", "/").casefold() for match in _FILE_TOKEN_RE.finditer(prompt)}
+    return len(targets) == 1
 
 
 def recover_original_prompt(prompt: str) -> str:
@@ -159,7 +191,7 @@ def recover_original_prompt(prompt: str) -> str:
 # (and not a question) is context/location, not a step of its own.
 _STANDALONE_VERB_RE = re.compile(
     r"\b(?:read|open|inspect|show|explain|summari[sz]e|compare|search|browse|"
-    r"look\s+up|create|write|build|implement|fix|repair|edit|update|modify|"
+    r"look\s+up|create|write|build|implement|install|fix|repair|edit|update|modify|"
     r"change|add|remove|delete|rename|move|run|rerun|re-run|test|verify|compile|"
     r"check|start|launch|serve|commit|stage|push|pull|stash|checkout|report|return)\b",
     re.IGNORECASE,
@@ -250,7 +282,7 @@ def _operation_kind(clause: str) -> str:
     ):
         return "web"
     if not explicitly_read_only and re.search(
-        r"\b(create|write|build|implement|fix|repair|edit|update|modify|change|add|remove|delete|rename|move)\b",
+        r"\b(create|write|build|implement|install|fix|repair|edit|update|modify|change|add|remove|delete|rename|move)\b",
         action_text,
     ):
         return "mutation"

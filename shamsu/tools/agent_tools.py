@@ -14,6 +14,12 @@ from typing import Any
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.mcp.manager import MCPManager, get_shared_mcp_manager, summarize_mcp_result
 from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.retriever.documents import (
+    DOCUMENT_SOURCE_SUFFIXES,
+    DocumentError,
+    DocumentStore,
+    PreparedDocument,
+)
 from shamsu.retriever.search import SearchAgent
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
@@ -21,6 +27,14 @@ from shamsu.safety.commands import command_may_write_workspace, redact
 from shamsu.safety.dry_run import DryRunRecorder
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
+from shamsu.skills.ingest import (
+    MAX_REFERENCE_SOURCE_CHARS,
+    ReferenceIngestError,
+    is_web_reference,
+    prepare_reference,
+    validate_local_reference_path,
+)
+from shamsu.skills.loader import discover_skills
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitCommandResult, GitTool
 from shamsu.tools.path_resolve import (
@@ -124,6 +138,7 @@ class AgentToolRegistry:
         self.sandbox = Sandbox(self.workspace_root)
         self.workspace_tool = WorkspaceTool(self.workspace_root)
         self.transactions = TransactionWorkspace(self.workspace_root)
+        self.document_store = DocumentStore(self.workspace_root)
         self.action_ledger = action_ledger
         self.command_runner = CommandRunner(
             self.workspace_root,
@@ -416,6 +431,90 @@ class AgentToolRegistry:
                 "web_search). Requires user approval.",
                 {"url": {"type": "string", "description": "Absolute http(s) URL."}},
                 required=["url"],
+            ),
+            _tool_schema(
+                "ingest_docs",
+                "Register local Markdown, text, or PDF documentation, or one public documentation "
+                "URL. Small references become workspace skills; large sources and PDFs become "
+                "chunked, cited documents under .shamsu/documents. Future coding prompts that "
+                "name a registered library receive relevant excerpts automatically. URL fetching "
+                "and workspace writes require approval.",
+                {
+                    "source": {
+                        "type": "string",
+                        "description": "Workspace-relative .md/.txt/.pdf path or absolute http(s) URL.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Library/reference name used for future matching, e.g. react-query.",
+                        "default": "",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "description": "auto (default), reference for a small skill, or document for chunked retrieval.",
+                        "enum": ["auto", "reference", "document"],
+                        "default": "auto",
+                    },
+                },
+                required=["source"],
+            ),
+            _tool_schema(
+                "search_docs",
+                "Search registered documentation by meaning and keywords. Returns bounded excerpts "
+                "with document, page or line, and section citations. Use document to narrow the "
+                "search to a named manual/library. This tool is read-only.",
+                {
+                    "query": {"type": "string", "description": "Question or search terms."},
+                    "document": {
+                        "type": "string",
+                        "description": "Optional registered document name or id.",
+                        "default": "",
+                    },
+                    "top_k": {
+                        "type": "string",
+                        "description": "Maximum excerpts. Default 5, max 20.",
+                        "default": "5",
+                    },
+                },
+                required=["query"],
+            ),
+            _tool_schema(
+                "ask_docs",
+                "Retrieve citation-backed evidence from registered documentation for a question. "
+                "Answer only from the returned excerpts and cite each factual claim. This tool "
+                "is read-only and falls back to keyword/paged retrieval if embeddings are absent.",
+                {
+                    "question": {"type": "string", "description": "Question to answer from the docs."},
+                    "document": {
+                        "type": "string",
+                        "description": "Optional registered document name or id.",
+                        "default": "",
+                    },
+                    "top_k": {
+                        "type": "string",
+                        "description": "Maximum evidence excerpts. Default 6, max 20.",
+                        "default": "6",
+                    },
+                },
+                required=["question"],
+            ),
+            _tool_schema(
+                "summarize_docs",
+                "Create a bounded extractive map-reduce summary of one registered document. "
+                "The summary samples the full chunk set and retains page/section citations. "
+                "This tool is read-only.",
+                {
+                    "document": {
+                        "type": "string",
+                        "description": "Registered document name or id.",
+                    },
+                    "max_tokens": {
+                        "type": "string",
+                        "description": "Approximate output budget. Default 1200, max 3000.",
+                        "default": "1200",
+                    },
+                },
+                required=["document"],
             ),
 
             # -----------------------------------------------------------------
@@ -775,6 +874,34 @@ class AgentToolRegistry:
                 return self.web_search(str(arguments.get("query") or ""))
             if name == "fetch_url":
                 return self.fetch_url(str(arguments.get("url") or ""))
+            if name == "ingest_docs":
+                return self.ingest_docs(
+                    str(arguments.get("source") or ""),
+                    str(arguments.get("name") or ""),
+                    str(arguments.get("mode") or "auto"),
+                )
+            if name == "search_docs":
+                return self.search_docs(
+                    str(arguments.get("query") or ""),
+                    str(arguments.get("document") or ""),
+                    top_k=_as_int(arguments.get("top_k"), default=5, minimum=1, maximum=20),
+                )
+            if name == "ask_docs":
+                return self.ask_docs(
+                    str(arguments.get("question") or ""),
+                    str(arguments.get("document") or ""),
+                    top_k=_as_int(arguments.get("top_k"), default=6, minimum=1, maximum=20),
+                )
+            if name == "summarize_docs":
+                return self.summarize_docs(
+                    str(arguments.get("document") or ""),
+                    max_tokens=_as_int(
+                        arguments.get("max_tokens"),
+                        default=1200,
+                        minimum=100,
+                        maximum=3000,
+                    ),
+                )
 
             # -----------------------------------------------------------------
             # Git read tools
@@ -1773,6 +1900,595 @@ class AgentToolRegistry:
                 "url": result.final_url or url,
                 "title": result.title,
                 "text": (result.text or result.excerpt or "")[:12000],
+            },
+        )
+
+    def ingest_docs(self, source: str, name: str = "", mode: str = "auto") -> ToolResult:
+        """Persist documentation as a small skill or a chunked registered document."""
+        source = (source or "").strip()
+        name = (name or "").strip()
+        mode = (mode or "auto").strip().lower()
+        if not source:
+            return ToolResult(False, "ingest_docs needs a source path or URL.", {})
+        if mode not in {"auto", "reference", "document"}:
+            return ToolResult(
+                False,
+                "ingest_docs mode must be auto, reference, or document.",
+                {"source": source, "mode": mode},
+            )
+        if self._read_only:
+            return self._read_only_refusal("ingest documentation from", source)
+
+        source_kind = "url" if is_web_reference(source) else "local"
+        source_label = source
+        title = ""
+        source_path: Path | None = None
+        if source_kind == "url":
+            try:
+                fetched = self._get_web_tool().fetch(
+                    source,
+                    reason="The user asked SHAMSU to ingest this documentation as a reusable reference.",
+                )
+            except Exception as exc:
+                return ToolResult(False, f"Documentation fetch failed: {exc}", {"source": source})
+            if not fetched.approved:
+                return ToolResult(
+                    False,
+                    fetched.error or "Documentation fetch denied.",
+                    {"source": source, "source_kind": source_kind, "approval": "denied"},
+                )
+            if fetched.error:
+                return ToolResult(
+                    False,
+                    f"Documentation fetch failed: {fetched.error}",
+                    {"source": source, "source_kind": source_kind},
+                )
+            text = fetched.text or fetched.excerpt or ""
+            source_label = fetched.final_url or source
+            title = fetched.title or ""
+        else:
+            normalized_source = _normalize_workspace_path(source)
+            if not normalized_source:
+                return ToolResult(False, "Invalid documentation source path.", {"source": source})
+            try:
+                source_path = self.sandbox.validate(normalized_source)
+                if not source_path.is_file():
+                    raise ReferenceIngestError(
+                        f"Documentation source is not a file: {source_path.name}"
+                    )
+                if source_path.suffix.lower() not in DOCUMENT_SOURCE_SUFFIXES:
+                    supported = ", ".join(sorted(DOCUMENT_SOURCE_SUFFIXES))
+                    raise ReferenceIngestError(
+                        f"Documentation ingestion supports {supported} files."
+                    )
+                text = (
+                    ""
+                    if source_path.suffix.lower() == ".pdf"
+                    else source_path.read_text(encoding="utf-8")
+                )
+            except (SecurityError, ReferenceIngestError, OSError, UnicodeDecodeError) as exc:
+                return ToolResult(
+                    False,
+                    f"Could not ingest local documentation: {exc}",
+                    {"source": normalized_source, "source_kind": source_kind},
+                )
+            source_label = normalized_source
+            title = source_path.stem
+
+        use_document = mode == "document" or (
+            mode == "auto"
+            and (
+                (source_path is not None and source_path.suffix.lower() == ".pdf")
+                or len(text) > MAX_REFERENCE_SOURCE_CHARS
+            )
+        )
+        if mode == "reference" and source_path is not None and source_path.suffix.lower() == ".pdf":
+            return ToolResult(
+                False,
+                "PDF sources require mode=document or mode=auto.",
+                {"source": source_label, "source_kind": "pdf"},
+            )
+        if use_document:
+            try:
+                if source_path is not None and source_path.suffix.lower() == ".pdf":
+                    prepared_document = self.document_store.prepare_pdf(
+                        source_path,
+                        source=source_label,
+                        name=name,
+                        title=title,
+                    )
+                else:
+                    prepared_document = self.document_store.prepare_text(
+                        text,
+                        source=source_label,
+                        source_kind=source_kind,
+                        name=name,
+                        title=title,
+                    )
+            except DocumentError as exc:
+                return ToolResult(
+                    False,
+                    str(exc),
+                    {"source": source_label, "source_kind": source_kind, "mode": "document"},
+                )
+            return self._persist_document(prepared_document)
+
+        try:
+            if source_path is not None:
+                validate_local_reference_path(source_path)
+            prepared = prepare_reference(
+                text,
+                source=source_label,
+                source_kind=source_kind,
+                name=name,
+                title=title,
+            )
+        except ReferenceIngestError as exc:
+            return ToolResult(
+                False,
+                str(exc),
+                {"source": source_label, "source_kind": source_kind},
+            )
+
+        target_path = prepared.relative_path
+        scoped = self._outside_allowed_scope(target_path)
+        if scoped is not None:
+            return scoped
+        if self._dry_run is not None:
+            return self._planned(
+                "ingest documentation into",
+                target_path,
+                f"{prepared.display_name} from {prepared.source}",
+                len(prepared.skill_content.encode("utf-8")),
+            )
+
+        existing_skill = discover_skills(self.workspace_root).skills.get(prepared.skill_name)
+        if (
+            existing_skill is not None
+            and str(existing_skill.metadata.get("reference_content_hash") or "")
+            == prepared.content_hash
+            and existing_skill.source == "workspace"
+        ):
+            return ToolResult(
+                True,
+                f"Reference {prepared.display_name} is already current.",
+                {
+                    "skill_name": prepared.skill_name,
+                    "skill_path": target_path,
+                    "source": prepared.source,
+                    "source_kind": prepared.source_kind,
+                    "content_hash": prepared.content_hash,
+                    "unchanged": True,
+                    "triggers": list(prepared.triggers),
+                },
+            )
+
+        target = self.sandbox.validate(target_path)
+        exists = target.is_file()
+        old_content = ""
+        if exists:
+            try:
+                old_content = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                return ToolResult(
+                    False,
+                    f"Could not read existing reference skill: {exc}",
+                    {"skill_path": target_path},
+                )
+
+        request = ApprovalRequest(
+            action_type="file_edit" if exists else "file_write",
+            description=(
+                f"{'Update' if exists else 'Create'} workspace documentation reference: "
+                f"{prepared.display_name}"
+            ),
+            risk_level="medium",
+            preview=(
+                f"Source: {prepared.source}\nTarget: {target_path}\n\n"
+                f"{prepared.skill_content[:3500]}"
+            ),
+            working_dir=str(self.workspace_root),
+            reason="The user asked SHAMSU to retain documentation for future coding tasks.",
+            target_paths=[target_path],
+        )
+        if not self.approval_manager.ask(request):
+            return ToolResult(
+                False,
+                "Documentation ingestion write denied by user.",
+                {
+                    "source": prepared.source,
+                    "source_kind": prepared.source_kind,
+                    "skill_path": target_path,
+                    "approval": "denied",
+                },
+            )
+
+        transaction_id = self.transactions.begin(
+            reason=f"Agent ingest_docs: {prepared.display_name}",
+            operations=[
+                {
+                    "op": "edit_file" if exists else "create_file",
+                    "path": target_path,
+                    "dest_path": "",
+                    "reason": "workspace documentation reference",
+                }
+            ],
+            destructive=False,
+        )
+        if self.action_ledger:
+            self.action_ledger.log_mutation_started(
+                transaction_id,
+                f"Agent ingest_docs: {prepared.display_name}",
+            )
+        try:
+            self.transactions.backup_file(transaction_id, target_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(prepared.skill_content, encoding="utf-8")
+            self.transactions.record_after(transaction_id, target_path)
+            diff_text = "".join(
+                difflib.unified_diff(
+                    old_content.splitlines(keepends=True),
+                    prepared.skill_content.splitlines(keepends=True),
+                    fromfile=f"a/{target_path}" if exists else "/dev/null",
+                    tofile=f"b/{target_path}",
+                )
+            )
+            self.transactions.save_patch(transaction_id, diff_text)
+            manifest = self.transactions.finalize(transaction_id, "applied")
+        except Exception as exc:
+            self.transactions.finalize(transaction_id, "failed", str(exc))
+            return ToolResult(
+                False,
+                f"Documentation ingestion failed: {exc}",
+                {
+                    "source": prepared.source,
+                    "skill_path": target_path,
+                    "transaction_id": transaction_id,
+                },
+            )
+
+        if self.action_ledger:
+            self.action_ledger.log_mutation_finished(
+                transaction_id,
+                "applied",
+                manifest.get("touched_files", []),
+                rollback_available=True,
+                operations=manifest.get("operations", []),
+                before_hashes=manifest.get("before_hashes", {}),
+                after_hashes=manifest.get("after_hashes", {}),
+                backups=manifest.get("backups", {}),
+                patch_path=f".shamsu/mutations/{transaction_id}/patch.diff" if diff_text else "",
+                verification=manifest.get("verification"),
+                abstract_index_state="fresh",
+            )
+            self.action_ledger.log_event(
+                "docs_ingested",
+                skill_name=prepared.skill_name,
+                skill_path=target_path,
+                source=prepared.source,
+                source_kind=prepared.source_kind,
+                content_hash=prepared.content_hash,
+                source_chars=prepared.source_chars,
+                triggers=list(prepared.triggers),
+            )
+        if self.session_logger:
+            self.session_logger.log(
+                "docs.ingested",
+                {
+                    "skill_name": prepared.skill_name,
+                    "skill_path": target_path,
+                    "source": prepared.source,
+                    "source_kind": prepared.source_kind,
+                    "content_hash": prepared.content_hash,
+                    "source_chars": prepared.source_chars,
+                    "triggers": list(prepared.triggers),
+                    "transaction_id": transaction_id,
+                },
+                f"Ingested documentation reference: {prepared.display_name}",
+                workflow_id="docs-ingest",
+            )
+        return ToolResult(
+            True,
+            f"Ingested {prepared.display_name} documentation as workspace skill "
+            f"{prepared.skill_name}. Future tasks that name it can inject this reference.",
+            {
+                "skill_name": prepared.skill_name,
+                "display_name": prepared.display_name,
+                "skill_path": target_path,
+                "source": prepared.source,
+                "source_kind": prepared.source_kind,
+                "content_hash": prepared.content_hash,
+                "source_chars": prepared.source_chars,
+                "triggers": list(prepared.triggers),
+                "transaction_id": transaction_id,
+                "created": not exists,
+                "overwrote": exists,
+            },
+        )
+
+    def _persist_document(self, prepared: PreparedDocument) -> ToolResult:
+        record = prepared.record
+        target_path = prepared.relative_path
+        scoped = self._outside_allowed_scope(target_path)
+        if scoped is not None:
+            return scoped
+        if self._dry_run is not None:
+            return self._planned(
+                "register chunked documentation in",
+                target_path,
+                f"{record.name} from {record.source} ({len(record.chunks)} chunks)",
+                len(prepared.json_content.encode("utf-8")),
+            )
+
+        target = self.sandbox.validate(target_path)
+        exists = target.is_file()
+        old_content = ""
+        if exists:
+            try:
+                old_content = target.read_text(encoding="utf-8")
+                old_payload = json.loads(old_content)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return ToolResult(
+                    False,
+                    f"Could not read existing registered document: {exc}",
+                    {"document_path": target_path},
+                )
+            if str(old_payload.get("content_hash") or "") == record.content_hash:
+                return ToolResult(
+                    True,
+                    f"Registered document {record.name} is already current.",
+                    {
+                        "mode": "document",
+                        "document_id": record.document_id,
+                        "document_name": record.name,
+                        "document_path": target_path,
+                        "source": record.source,
+                        "source_kind": record.source_kind,
+                        "content_hash": record.content_hash,
+                        "chunks": len(record.chunks),
+                        "unchanged": True,
+                    },
+                )
+
+        preview_chunks = "\n\n".join(
+            f"[{chunk.citation}]\n{chunk.text[:800]}" for chunk in record.chunks[:3]
+        )
+        request = ApprovalRequest(
+            action_type="file_edit" if exists else "file_write",
+            description=(
+                f"{'Update' if exists else 'Register'} chunked document: {record.name}"
+            ),
+            risk_level="medium",
+            preview=(
+                f"Source: {record.source}\nTarget: {target_path}\n"
+                f"Chunks: {len(record.chunks)}\n\n{preview_chunks[:3500]}"
+            ),
+            working_dir=str(self.workspace_root),
+            reason="The user asked SHAMSU to retain documentation for cited retrieval.",
+            target_paths=[target_path],
+        )
+        if not self.approval_manager.ask(request):
+            return ToolResult(
+                False,
+                "Document registration write denied by user.",
+                {
+                    "mode": "document",
+                    "source": record.source,
+                    "document_path": target_path,
+                    "approval": "denied",
+                },
+            )
+
+        transaction_id = self.transactions.begin(
+            reason=f"Agent ingest_docs document: {record.name}",
+            operations=[
+                {
+                    "op": "edit_file" if exists else "create_file",
+                    "path": target_path,
+                    "dest_path": "",
+                    "reason": "registered chunked documentation",
+                }
+            ],
+            destructive=False,
+        )
+        if self.action_ledger:
+            self.action_ledger.log_mutation_started(
+                transaction_id,
+                f"Agent ingest_docs document: {record.name}",
+            )
+        try:
+            self.transactions.backup_file(transaction_id, target_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(prepared.json_content, encoding="utf-8")
+            self.transactions.record_after(transaction_id, target_path)
+            diff_text = "".join(
+                difflib.unified_diff(
+                    old_content.splitlines(keepends=True),
+                    prepared.json_content.splitlines(keepends=True),
+                    fromfile=f"a/{target_path}" if exists else "/dev/null",
+                    tofile=f"b/{target_path}",
+                )
+            )
+            self.transactions.save_patch(transaction_id, diff_text)
+            manifest = self.transactions.finalize(transaction_id, "applied")
+        except Exception as exc:
+            self.transactions.finalize(transaction_id, "failed", str(exc))
+            return ToolResult(
+                False,
+                f"Document registration failed: {exc}",
+                {
+                    "mode": "document",
+                    "source": record.source,
+                    "document_path": target_path,
+                    "transaction_id": transaction_id,
+                },
+            )
+
+        event_payload = {
+            "mode": "document",
+            "document_id": record.document_id,
+            "document_name": record.name,
+            "document_path": target_path,
+            "source": record.source,
+            "source_kind": record.source_kind,
+            "content_hash": record.content_hash,
+            "source_chars": record.source_chars,
+            "chunks": len(record.chunks),
+            "warnings": list(record.warnings),
+            "transaction_id": transaction_id,
+        }
+        if self.action_ledger:
+            self.action_ledger.log_mutation_finished(
+                transaction_id,
+                "applied",
+                manifest.get("touched_files", []),
+                rollback_available=True,
+                operations=manifest.get("operations", []),
+                before_hashes=manifest.get("before_hashes", {}),
+                after_hashes=manifest.get("after_hashes", {}),
+                backups=manifest.get("backups", {}),
+                patch_path=f".shamsu/mutations/{transaction_id}/patch.diff" if diff_text else "",
+                verification=manifest.get("verification"),
+                abstract_index_state="fresh",
+            )
+            self.action_ledger.log_event("docs_ingested", **event_payload)
+        if self.session_logger:
+            self.session_logger.log(
+                "docs.ingested",
+                event_payload,
+                f"Registered chunked documentation: {record.name}",
+                workflow_id="docs-ingest",
+            )
+        return ToolResult(
+            True,
+            f"Registered {record.name} as {len(record.chunks)} cited document chunks. "
+            "Use search_docs, ask_docs, or summarize_docs; named coding tasks receive "
+            "relevant excerpts automatically.",
+            {
+                **event_payload,
+                "created": not exists,
+                "overwrote": exists,
+            },
+        )
+
+    def search_docs(self, query: str, document: str = "", top_k: int = 5) -> ToolResult:
+        query = (query or "").strip()
+        document = (document or "").strip()
+        if not query:
+            return ToolResult(False, "search_docs needs a query.", {})
+        result = self.document_store.search(
+            query,
+            document=document,
+            top_k=top_k,
+            semantic=True,
+        )
+        hits = [hit.to_dict() for hit in result.hits]
+        if self.action_ledger:
+            self.action_ledger.log_event(
+                "docs_searched",
+                query=query[:500],
+                document=document,
+                matched_documents=list(result.matched_documents),
+                result_count=len(hits),
+                semantic_used=result.semantic_used,
+                semantic_error=result.semantic_error,
+                citations=[hit["citation"] for hit in hits],
+            )
+        if not result.matched_documents:
+            available = [record.name for record in self.document_store.load_all()]
+            return ToolResult(
+                False,
+                "No registered documents matched the requested document.",
+                {"document": document, "available_documents": available},
+            )
+        if not hits:
+            return ToolResult(
+                True,
+                f"No relevant excerpts found for {query!r}.",
+                {
+                    "query": query,
+                    "document": document,
+                    "matched_documents": list(result.matched_documents),
+                    "results": [],
+                    "semantic_used": result.semantic_used,
+                    "semantic_error": result.semantic_error,
+                },
+            )
+        fallback = (
+            " Semantic retrieval was unavailable, so keyword/paged retrieval was used."
+            if result.semantic_error
+            else ""
+        )
+        return ToolResult(
+            True,
+            f"Found {len(hits)} cited document excerpt(s).{fallback}",
+            {
+                "query": query,
+                "document": document,
+                "matched_documents": list(result.matched_documents),
+                "results": hits,
+                "semantic_used": result.semantic_used,
+                "semantic_error": result.semantic_error,
+            },
+        )
+
+    def ask_docs(self, question: str, document: str = "", top_k: int = 6) -> ToolResult:
+        result = self.search_docs(question, document, top_k=top_k)
+        if not result.ok:
+            return result
+        evidence = result.data.get("results", [])
+        result.data["answer_instruction"] = (
+            "Answer the user's question only from these excerpts. Cite the supplied citation "
+            "after every factual claim. If the excerpts do not contain the answer, say so."
+        )
+        result.data["question"] = question
+        return ToolResult(
+            True,
+            (
+                f"Retrieved {len(evidence)} citation-backed excerpt(s) for the question. "
+                "Synthesize the answer now using only this evidence."
+                if evidence
+                else "The registered documents did not contain evidence for this question."
+            ),
+            result.data,
+        )
+
+    def summarize_docs(self, document: str, max_tokens: int = 1200) -> ToolResult:
+        document = (document or "").strip()
+        if not document:
+            return ToolResult(False, "summarize_docs needs a document name or id.", {})
+        try:
+            summary = self.document_store.summarize(document, max_tokens=max_tokens)
+        except DocumentError as exc:
+            return ToolResult(
+                False,
+                str(exc),
+                {
+                    "document": document,
+                    "available_documents": [
+                        record.name for record in self.document_store.load_all()
+                    ],
+                },
+            )
+        if self.action_ledger:
+            self.action_ledger.log_event(
+                "docs_summarized",
+                document_name=summary.document_name,
+                covered_chunks=summary.covered_chunks,
+                total_chunks=summary.total_chunks,
+                citations=list(summary.citations),
+            )
+        return ToolResult(
+            True,
+            f"Summarized {summary.document_name} with cited coverage from "
+            f"{summary.covered_chunks} of {summary.total_chunks} chunks.",
+            {
+                "document_name": summary.document_name,
+                "summary": summary.text,
+                "covered_chunks": summary.covered_chunks,
+                "total_chunks": summary.total_chunks,
+                "citations": list(summary.citations),
+                "summary_kind": "bounded-extractive-map-reduce",
             },
         )
 

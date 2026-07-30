@@ -23,6 +23,8 @@ from shamsu.cli.repl import (
     _looks_like_code_edit_request,
     _looks_like_direct_code_request,
     _looks_like_django_generation_request,
+    _looks_like_docs_ingest_request,
+    _looks_like_docs_query_request,
     _looks_like_file_write_request,
     _looks_like_investigative_question,
     _looks_like_prd_build_request,
@@ -52,11 +54,42 @@ def test_direct_file_write_handoff_includes_skills_and_append_tool(
 
     assert plan.mode == "test_generation"
     assert "append_file" in plan.required_tools
-    assert plan.target_files == ["src/calculator.py"]
+    assert plan.target_files == ["tests/test_calculator.py"]
     assert {"developer", "testing"} <= set(selected)
     assert "## Active SHAMSU Skills" in handoff
     assert "### developer" in handoff
     assert "### testing" in handoff
+    assert "Source under test: src/calculator.py" in handoff
+    assert "Required test output: tests/test_calculator.py" in handoff
+    assert "def add(a, b):" in handoff
+
+
+def test_markdown_target_beats_test_word_inside_document_name(tmp_path: Path):
+    handoff, plan = _direct_file_write_handoff(
+        "Create SCOPE_NOTES.md from the Shamsu Test PRD documentation.",
+        tmp_path,
+    )
+
+    assert plan.mode == "documentation"
+    assert plan.executor_role == "doc_agent"
+    assert plan.target_files == ["SCOPE_NOTES.md"]
+    assert "Mode: documentation" in handoff
+
+
+def test_direct_python_add_handoff_preserves_existing_functions(tmp_path: Path):
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    handoff, plan = _direct_file_write_handoff(
+        "add a subtract(a,b) function to src/calculator.py",
+        tmp_path,
+    )
+
+    assert plan.target_files == ["src/calculator.py"]
+    assert "`subtract` must exist as a new function" in handoff
+    assert "Preserve existing functions and their behavior" in handoff
+    assert "not changing an existing function's return expression" in handoff
 
 
 @pytest.mark.parametrize(
@@ -231,6 +264,39 @@ def test_vague_action_request(text, expected):
 )
 def test_file_write_request(text, expected):
     assert _looks_like_file_write_request(text) is expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "ingest acme-docs.md as the Acme SDK reference",
+        "import documentation from https://docs.example.com/acme",
+        "register docs in references/acme.txt for future library tasks",
+    ],
+)
+def test_docs_ingestion_routes_to_dedicated_agent_tool(tmp_path: Path, prompt: str):
+    assert _looks_like_docs_ingest_request(prompt) is True
+    assert _classify_route_label(prompt, tmp_path) == "docs.ingest"
+
+
+def test_plain_doc_read_is_not_mistaken_for_ingestion(tmp_path: Path):
+    prompt = "read and summarize acme-docs.md"
+
+    assert _looks_like_docs_ingest_request(prompt) is False
+    assert _classify_route_label(prompt, tmp_path) != "docs.ingest"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "search the docs for webhook signature validation",
+        "according to the Acme manual, how long do tokens last?",
+        "summarize the registered document Acme Platform",
+    ],
+)
+def test_registered_document_queries_route_to_document_tools(tmp_path: Path, prompt: str):
+    assert _looks_like_docs_query_request(prompt) is True
+    assert _classify_route_label(prompt, tmp_path) == "docs.query"
 
 
 @pytest.mark.parametrize(

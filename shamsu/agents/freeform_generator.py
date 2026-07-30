@@ -25,19 +25,27 @@ from typing import Protocol
 from json_repair import repair_json
 
 from shamsu.action_ledger.context import get_current_run
-from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.prd.contract import PRDContract
-from shamsu.repair.loop import RepairLoop
 from shamsu.repair.prompt import enforce_final_response
-from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.types import RepairResult
-from shamsu.repair.verifiers import CommandVerifier
 from shamsu.safety.sandbox import Sandbox
 from shamsu.session.manager import SessionLogger
+from shamsu.skills.selector import (
+    render_skill_context,
+    select_skills_for_task,
+    selection_log_payload,
+)
+from shamsu.skills.types import SkillSelection
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import ProjectSpec
-from shamsu.verify.gate import default_verify_command
+from shamsu.verify.gate import (
+    AcceptanceCheck,
+    VerifyOutcome,
+    acceptance_checks_from_criteria,
+    default_verify_command,
+    verify_and_repair,
+)
 
 _MAX_FILES = 30
 _BUILD_TIMEOUT_SECONDS = 600
@@ -116,6 +124,8 @@ Rules:
 - Choose the simplest stack that satisfies the PRD (prefer the PRD's stated stack).
 - List the MINIMUM files needed to build and run it. Use relative paths only.
 - Include the build/dependency manifest (package.json / requirements.txt) when relevant.
+- For a non-trivial project, include focused unit tests for core PRD behavior and
+  make the manifest provide the test runner/dependency needed to execute them.
 - Planned paths must be files, not directories. Use extensions such as .js, .ts,
   .tsx, .json, .html, .css, .md unless the file is conventionally extensionless.
 - For Node/Vite/React projects, include a root index.html, package.json, and every
@@ -211,12 +221,15 @@ class FreeformGenerator:
         self.generation_timeout = generation_timeout
         self.sandbox = Sandbox(self.workspace_root)
         self.transactions = TransactionWorkspace(self.workspace_root)
+        self._skill_selection: SkillSelection | None = None
+        self._skill_context = ""
 
     def run(self, project: ProjectSpec, target_dir: Path | str) -> FreeformRunResult:
         contract: PRDContract | None = getattr(project, "prd_contract", None)
         target = self.sandbox.validate(target_dir)
         target.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.generation_timeout
+        self._prepare_generation_skills(project, contract)
 
         plan = self._plan(contract)
         if plan is None or not plan.files:
@@ -242,8 +255,17 @@ class FreeformGenerator:
                 error="no files generated",
             )
 
-        verify_command = _default_verify(plan.stack, contract, written)
-        if not verify_command:
+        acceptance_commands = acceptance_checks_from_criteria(
+            contract.acceptance_criteria if contract is not None else ()
+        )
+        verification = self._verify_project(
+            target,
+            written,
+            plan.stack,
+            contract,
+            acceptance_commands,
+        )
+        if verification.unverifiable:
             # Honest outcome: we cannot build-verify this stack, so we never
             # claim success. The files were generated and are on disk.
             msg = (
@@ -260,6 +282,56 @@ class FreeformGenerator:
                 error="no verifier for stack",
             )
 
+        repair_result = verification.repair_result
+        success = verification.verified
+        if not success:
+            regenerated = (
+                self._regenerate_failed_source_file(
+                    contract,
+                    plan,
+                    target,
+                    written,
+                    repair_result,
+                )
+                if repair_result is not None
+                else []
+            )
+            if regenerated:
+                written = list(dict.fromkeys([*written, *regenerated]))
+                verification = self._verify_project(
+                    target,
+                    written,
+                    plan.stack,
+                    contract,
+                    acceptance_commands,
+                )
+                repair_result = verification.repair_result
+                success = verification.verified
+        exit_code = verification.exit_code if verification.exit_code is not None else 1
+        final_message = enforce_final_response(verification.summary, exit_code)
+        return FreeformRunResult(
+            target_dir=target,
+            stack=plan.stack,
+            written_files=written,
+            verify_command=verification.command,
+            repair_result=repair_result,
+            exit_code=exit_code,
+            verified=verification.verified,
+            success=success,
+            final_message=final_message,
+            error="" if success else f"Build/verify failed (exit code {exit_code}).",
+        )
+
+    # -- helpers ---------------------------------------------------------------
+
+    def _verify_project(
+        self,
+        target: Path,
+        written: list[str],
+        stack: str,
+        contract: PRDContract | None,
+        acceptance_commands: tuple[AcceptanceCheck, ...],
+    ) -> VerifyOutcome:
         runner = self.command_runner or CommandRunner(
             self.workspace_root,
             approval_func=lambda _request: True,
@@ -267,52 +339,17 @@ class FreeformGenerator:
             session_logger=self.session_logger,
             action_ledger=get_current_run(),
         )
-        repair_result = self._run_repair_loop(target, verify_command, runner)
-
-        success = repair_result.exit_code == 0 and repair_result.success
-        if not success:
-            regenerated = self._regenerate_failed_source_file(
-                contract,
-                plan,
-                target,
-                written,
-                repair_result,
-            )
-            if regenerated:
-                written = list(dict.fromkeys([*written, *regenerated]))
-                repair_result = self._run_repair_loop(target, verify_command, runner)
-                success = repair_result.exit_code == 0 and repair_result.success
-        final_message = enforce_final_response(repair_result.final_message, repair_result.exit_code)
-        return FreeformRunResult(
-            target_dir=target,
-            stack=plan.stack,
-            written_files=written,
-            verify_command=verify_command,
-            repair_result=repair_result,
-            exit_code=repair_result.exit_code,
-            verified=True,
-            success=success,
-            final_message=final_message,
-            error="" if success else f"Build/verify failed (exit code {repair_result.exit_code}).",
-        )
-
-    # -- helpers ---------------------------------------------------------------
-
-    def _run_repair_loop(
-        self,
-        target: Path,
-        verify_command: str,
-        runner: CommandRunnerLike,
-    ) -> RepairResult:
-        verifier = CommandVerifier(verify_command, runner, target)
-        return RepairLoop(
+        return verify_and_repair(
             target,
-            verifier,
-            LLMProposer(self.generate),
+            written,
+            generate=self.generate,
+            command_runner=runner,
             max_attempts=self.max_repair_attempts,
+            stack=stack,
+            stack_hint=(contract.stack_hint if contract is not None else ""),
             session_logger=self.session_logger,
-            digest=DiagnosticDigest(target),
-        ).run()
+            acceptance_commands=acceptance_commands,
+        )
 
     def _regenerate_failed_source_file(
         self,
@@ -337,6 +374,7 @@ class FreeformGenerator:
                 continue
             prompt = (
                 f"{brief}\n\n"
+                f"{self._generation_skill_prompt()}"
                 f"## Stack\n{plan.stack or 'unspecified'}\n\n"
                 f"## Full file plan\n{plan_text}\n\n"
                 f"## Verifier failure\n{repair_result.final_message}\n"
@@ -374,7 +412,9 @@ class FreeformGenerator:
     def _plan(self, contract: PRDContract | None) -> GenerationPlan | None:
         brief = contract.render_brief() if contract is not None else "(no PRD contract)"
         prompt = (
-            f"{brief}\n\n## Task\nProduce the minimal file plan (JSON) to build and run this "
+            f"{brief}\n\n"
+            f"{self._generation_skill_prompt()}"
+            "## Task\nProduce the minimal file plan (JSON) to build and run this "
             "project from scratch."
         )
         try:
@@ -395,6 +435,11 @@ class FreeformGenerator:
         if not stack and contract is not None:
             stack = ", ".join(contract.required_stack or ([contract.stack_hint] if contract.stack_hint else []))
         normalized = _normalize_planned_files(files)
+        normalized = _ensure_required_test_plan(
+            normalized,
+            stack=stack,
+            contract=contract,
+        )
         if [file.path for file in normalized] != [file.path for file in _dedupe_files(files)]:
             self._log(
                 "freeform.plan_normalized",
@@ -516,6 +561,7 @@ class FreeformGenerator:
                 self._log("freeform.python_cli_hardened", {"files": touched})
                 written = list(dict.fromkeys([*written, *touched]))
 
+        written = self._harden_node_test_runner(target, written)
         if not _is_vite_react_project(plan.stack, contract, written):
             return written
         hardened = _vite_react_contract_files(contract, target.name)
@@ -543,11 +589,45 @@ class FreeformGenerator:
             )
         return list(dict.fromkeys([*written, *touched]))
 
+    def _harden_node_test_runner(self, target: Path, written: list[str]) -> list[str]:
+        """Make a harness-added Node test executable through the standard gate."""
+        if "tests/generated.test.mjs" not in written or "package.json" not in written:
+            return written
+        package_path = target / "package.json"
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return written
+        if not isinstance(package, dict):
+            return written
+        scripts = package.get("scripts")
+        if not isinstance(scripts, dict):
+            scripts = {}
+            package["scripts"] = scripts
+        current_test = scripts.get("test")
+        if isinstance(current_test, str) and current_test.strip() and "no test specified" not in current_test:
+            return written
+        scripts["test"] = "node --test"
+        content = json.dumps(package, indent=2) + "\n"
+        if self._write_project_file(
+            target,
+            "package.json",
+            content,
+            reason="Freeform: configure generated Node tests",
+            operation_reason="harness-owned test runner for non-trivial project",
+        ):
+            self._log(
+                "freeform.test_runner_hardened",
+                {"path": "package.json", "command": "node --test"},
+            )
+        return written
+
     def _generate_one(
         self, brief: str, plan: GenerationPlan, plan_text: str, planned: PlannedFile
     ) -> str | None:
         prompt = (
             f"{brief}\n\n"
+            f"{self._generation_skill_prompt()}"
             f"## Stack\n{plan.stack or 'unspecified'}\n\n"
             f"## Full file plan\n{plan_text}\n\n"
             f"## File to write now\n{planned.path} - {planned.purpose}\n\n"
@@ -567,6 +647,60 @@ class FreeformGenerator:
             if isinstance(content, str) and content.strip():
                 return _sanitize_generated_content(content, planned.path)
         return None
+
+    def _prepare_generation_skills(
+        self,
+        project: ProjectSpec,
+        contract: PRDContract | None,
+    ) -> None:
+        brief = contract.render_brief() if contract is not None else str(project)
+        stack_parts: list[str] = []
+        if contract is not None:
+            stack_parts.extend(contract.required_stack)
+            if contract.stack_hint:
+                stack_parts.append(contract.stack_hint)
+        selection = select_skills_for_task(
+            self.workspace_root,
+            f"Build the complete project from this PRD.\n{brief}",
+            intent="generate",
+            stack=", ".join(dict.fromkeys(stack_parts)),
+            required_tools=("write_file", "run_command"),
+        )
+        self._skill_selection = selection
+        self._skill_context = render_skill_context(selection)
+        payload = selection_log_payload(selection)
+        self._log("skills.discovered", payload)
+        if not selection.active or not self._skill_context:
+            return
+        selected = [item.skill for item in selection.selected]
+        self._log(
+            "skill_context_injected",
+            {
+                "phase": "freeform_generation",
+                "skills": [skill.name for skill in selected],
+                "sources": [skill.source for skill in selected],
+                "references": [
+                    {
+                        "name": skill.name,
+                        "source": skill.metadata.get("reference_source", ""),
+                        "path": str(skill.skill_path),
+                    }
+                    for skill in selected
+                    if str(skill.metadata.get("kind") or "").lower() == "reference"
+                ],
+                "budget_tokens": selection.budget_tokens,
+            },
+        )
+
+    def _generation_skill_prompt(self) -> str:
+        if not self._skill_context:
+            return ""
+        return (
+            "## Generation Skill Guidance\n"
+            "Apply these selected conventions when they support the PRD. They do not override "
+            "the PRD, safety rules, or verifier evidence.\n\n"
+            f"{self._skill_context}\n\n"
+        )
 
     def _log(self, event_type: str, payload: dict) -> None:
         if self.session_logger:
@@ -2662,6 +2796,73 @@ describe('generated PRD application', () => {
   });
 });
 """
+
+
+def _ensure_required_test_plan(
+    files: list[PlannedFile],
+    *,
+    stack: str,
+    contract: PRDContract | None,
+) -> list[PlannedFile]:
+    """Reserve an executable test artifact for non-trivial generated projects."""
+    if not _is_nontrivial_generation(files, contract) or _has_planned_test(files):
+        return files
+    stack_text = stack.lower()
+    if "python" in stack_text or any(file.path.endswith(".py") for file in files):
+        test = PlannedFile(
+            "tests/test_generated_behavior.py",
+            "Focused pytest coverage for core PRD behavior and public interfaces",
+        )
+    elif (
+        any(token in stack_text for token in ("node", "javascript", "typescript"))
+        or any(file.path == "package.json" for file in files)
+    ) and any(
+        file.path == "package.json" for file in files
+    ) and not ("react" in stack_text and "vite" in stack_text):
+        test = PlannedFile(
+            "tests/generated.test.mjs",
+            "Focused node:test coverage for core PRD behavior and public interfaces",
+        )
+    else:
+        # Framework-specific deterministic hardeners (for example React/Vite)
+        # own their test artifact and runner.
+        return files
+    return [*files, test]
+
+
+def _is_nontrivial_generation(
+    files: list[PlannedFile],
+    contract: PRDContract | None,
+) -> bool:
+    source_files = [
+        file
+        for file in files
+        if Path(file.path).suffix.lower()
+        in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+    ]
+    if len(source_files) >= 2:
+        return True
+    if contract is None:
+        return False
+    return bool(
+        len(contract.features) >= 2
+        or contract.required_tests
+        or len(contract.acceptance_criteria) >= 2
+    )
+
+
+def _has_planned_test(files: list[PlannedFile]) -> bool:
+    for file in files:
+        normalized = file.path.replace("\\", "/").lower()
+        name = normalized.rsplit("/", 1)[-1]
+        if (
+            normalized.startswith("tests/")
+            or name.startswith("test_")
+            or ".test." in name
+            or ".spec." in name
+        ):
+            return True
+    return False
 
 
 def _normalize_planned_files(files: list[PlannedFile]) -> list[PlannedFile]:

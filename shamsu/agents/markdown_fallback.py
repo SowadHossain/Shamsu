@@ -54,7 +54,7 @@ CODE_BLOCK_RE = re.compile(r"```(?P<lang>[\w.+-]*)[ \t]*\n(?P<code>.*?)```", re.
 PATH_RE = re.compile(
     r"(?:create|write|save|make|generate|add|edit|update|fix)"
     r"(?:\s+(?:a|the|file|script|component|module|test|tests))?"
-    r"\s+(?:as\s+|to\s+|at\s+|in\s+)?[\"']?(?P<path>[\w./\\ -]+\.[A-Za-z0-9_]+)[\"']?",
+    r"\s+(?:as\s+|to\s+|at\s+|in\s+)?[\"']?(?P<path>[\w./\\-]+\.[A-Za-z0-9_]+)[\"']?",
     re.I,
 )
 # Any file-looking token, wherever it sits in the sentence ("broken.py has a
@@ -191,6 +191,12 @@ class MarkdownWriteFallback:
 
 
 def _infer_path(user_input: str) -> str:
+    tokens = {
+        match.group("path").replace("\\", "/")
+        for match in FILE_TOKEN_RE.finditer(user_input or "")
+    }
+    if len(tokens) > 1:
+        return ""
     match = PATH_RE.search(user_input)
     return match.group("path").strip().replace("\\", "/") if match else ""
 

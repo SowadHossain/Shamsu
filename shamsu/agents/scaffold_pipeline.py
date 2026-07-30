@@ -29,6 +29,11 @@ from shamsu.repair.types import RepairResult
 from shamsu.repair.verifiers import CommandVerifier
 from shamsu.safety.approval import ask_approval
 from shamsu.session.manager import SessionLogger
+from shamsu.skills.selector import (
+    render_skill_context,
+    select_skills_for_task,
+    selection_log_payload,
+)
 from shamsu.tools.executor import CommandRunner
 from shamsu.types import ApprovalRequest, ProjectSpec
 from shamsu.verify import DoDRunResult, run_dod
@@ -93,8 +98,12 @@ class ScaffoldPipeline:
 
         fill_result: FillResult | None = None
         if self.generate is not None and getattr(project, "prd_contract", None) is not None:
+            skill_context = self._generation_skill_context(project, candidate)
             fill_result = ScaffoldFiller(
-                self.workspace_root, self.generate, session_logger=self.session_logger
+                self.workspace_root,
+                self.generate,
+                session_logger=self.session_logger,
+                skill_context=skill_context,
             ).fill(entry, target, project.prd_contract)
 
         build_cmd = entry.manifest.build_cmd or "npm run build"
@@ -152,6 +161,47 @@ class ScaffoldPipeline:
         if suitability is not None and suitability.candidate:
             return suitability.candidate
         return project.category or ""
+
+    def _generation_skill_context(self, project: ProjectSpec, candidate: str) -> str:
+        contract = project.prd_contract
+        selection = select_skills_for_task(
+            self.workspace_root,
+            f"Build the complete project from this PRD.\n{contract.render_brief()}",
+            intent="generate",
+            stack=candidate,
+            required_tools=("write_file", "run_command"),
+        )
+        payload = selection_log_payload(selection)
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_event("skills_discovered", **payload)
+        if self.session_logger:
+            self.session_logger.log(
+                "skills.discovered",
+                payload,
+                "Scaffold generation skills selected",
+                workflow_id="scaffold-fill",
+            )
+        context = render_skill_context(selection)
+        if not selection.active or not context:
+            return ""
+        selected = [item.skill for item in selection.selected]
+        injection = {
+            "phase": "scaffold_generation",
+            "skills": [skill.name for skill in selected],
+            "sources": [skill.source for skill in selected],
+            "budget_tokens": selection.budget_tokens,
+        }
+        if ledger:
+            ledger.log_event("skill_context_injected", **injection)
+        if self.session_logger:
+            self.session_logger.log(
+                "skill_context_injected",
+                injection,
+                "Scaffold generation skill context injected",
+                workflow_id="scaffold-fill",
+            )
+        return context
 
 
 def _error_summary(exit_code: int, dod_result: DoDRunResult) -> str:

@@ -94,7 +94,7 @@ def _pack(goal: str) -> ContextPack:
     )
 
 
-def test_decide_needs_input_discards_a_degenerate_question():
+def test_decide_needs_input_replaces_degenerate_auth_question_with_fallback():
     llm = _StructuredFakeLLM(
         "plan text",
         json.dumps({"needs_input": True, "question": "Do I need to ask a question before proceeding?"}),
@@ -102,6 +102,21 @@ def test_decide_needs_input_discards_a_degenerate_question():
 
     needs_input, question, options = asyncio.run(
         _decide_needs_input(llm, _pack("add authentication"), "add authentication")
+    )
+
+    assert needs_input is True
+    assert "authentication approach" in question
+    assert [option["label"] for option in options] == ["Server sessions", "JWT", "OAuth/OIDC"]
+
+
+def test_decide_needs_input_discards_a_degenerate_question_without_fallback():
+    llm = _StructuredFakeLLM(
+        "plan text",
+        json.dumps({"needs_input": True, "question": "Do I need to ask a question before proceeding?"}),
+    )
+
+    needs_input, question, options = asyncio.run(
+        _decide_needs_input(llm, _pack("add input validation"), "add input validation")
     )
 
     assert needs_input is False

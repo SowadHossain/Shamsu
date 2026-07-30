@@ -62,7 +62,7 @@ class TestGenerationWorkflow:
         self.command_runner = command_runner
         self.memory_service = memory_service or MemoryService(self.workspace_root)
 
-    async def run(self, request: str, run_after_apply: bool = False) -> TestGenerationResult:
+    async def run(self, request: str, run_after_apply: bool = True) -> TestGenerationResult:
         pack, plan_text = await self._build_pack(request)
         response = await self.llm.run_specialist("test_gen", pack)
         diff_text = _clean_diff(response.raw)
@@ -92,6 +92,20 @@ class TestGenerationWorkflow:
         if run_after_apply:
             runner = self.command_runner or CommandRunner(self.workspace_root)
             test_result = runner.run_tests(self.workspace_root)
+            if test_result.failed:
+                return TestGenerationResult(
+                    request=request,
+                    pack=pack,
+                    diff_text=diff_text,
+                    changed_files=changed_files,
+                    applied=True,
+                    test_result=test_result,
+                    error=(
+                        f"Generated tests ran but {test_result.failed} failed. "
+                        "See the test output for details."
+                    ),
+                    plan=plan_text,
+                )
 
         return TestGenerationResult(
             request=request,

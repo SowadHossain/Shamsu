@@ -15,13 +15,14 @@ before the run, checked against filesystem evidence after it.
       -> FAIL if anything else changed
 
 Deliberately narrow. It only asserts things the prompt states outright - which
-files were named, whether changes were forbidden - because a check that guesses
-at intent produces false failures, and a validation layer nobody trusts is
-worse than none. Semantic correctness of file CONTENT is out of scope; that
-needs the verify gate or a human.
+files were named, whether changes were forbidden, and explicitly named Python
+symbols - because a check that guesses at intent produces false failures, and a
+validation layer nobody trusts is worse than none. General semantic correctness
+of file content remains the verify gate's job.
 """
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,23 @@ _WRITE_VERB_RE = re.compile(
     r"(?:e|es|ed|ing)?\b",
     re.IGNORECASE,
 )
+_PYTHON_FUNCTION_REQUEST_RE = re.compile(
+    r"\b(?:add|create|write|implement|define)\s+"
+    r"(?:(?:a|an|the)\s+)?"
+    r"(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+"
+    r"(?:function|method)\s+(?:to|in|inside)\s+"
+    r"(?P<path>(?:[A-Za-z]:[\\/])?[\w][\w./\\-]*\.py)\b",
+    re.IGNORECASE,
+)
+_TEST_SOURCE_PREPOSITION_RE = re.compile(
+    r"\b(?:write|generate|create|add)\s+(?:pytest\s+)?tests?\s+for\s+$",
+    re.IGNORECASE,
+)
+_TEST_GENERATION_RE = re.compile(
+    r"\b(?:write|generate|create|add)\s+(?:pytest\s+)?tests?\s+for\s+"
+    r"(?P<path>(?:[A-Za-z]:[\\/])?[\w][\w./\\-]*\.(?:py|js|jsx|ts|tsx|mjs|cjs))\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -81,13 +99,18 @@ class RunContract:
     read_only: bool = False
     scoped_read_only: bool = False
     requested_paths: tuple[str, ...] = ()
+    required_python_symbols: tuple[tuple[str, str], ...] = ()
     allowed_collateral_paths: tuple[str, ...] = ()
     dry_run: bool = False
 
     @property
     def has_expectations(self) -> bool:
         return bool(
-            self.read_only or self.scoped_read_only or self.requested_paths or self.dry_run
+            self.read_only
+            or self.scoped_read_only
+            or self.requested_paths
+            or self.required_python_symbols
+            or self.dry_run
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -95,6 +118,10 @@ class RunContract:
             "read_only": self.read_only,
             "scoped_read_only": self.scoped_read_only,
             "requested_paths": list(self.requested_paths),
+            "required_python_symbols": [
+                {"path": path, "symbol": symbol}
+                for path, symbol in self.required_python_symbols
+            ],
             "allowed_collateral_paths": list(self.allowed_collateral_paths),
             "dry_run": self.dry_run,
         }
@@ -152,13 +179,23 @@ _SOURCE_PREPOSITION_RE = re.compile(
 )
 # Spec/source documents are inputs to a build, never its output.
 _SOURCE_FILENAME_RE = re.compile(r"(?:^|/)(?:prd|readme|spec|requirements?)\b", re.IGNORECASE)
+_SOURCE_PREDICATE_RE = re.compile(
+    r"^\s+(?:declares?|defines?|contains?|documents?|describes?|shows?|lists?|"
+    r"specifies?|says?|has|uses)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_source_reference(text: str, token_start: int, candidate: str) -> bool:
     if _SOURCE_FILENAME_RE.search(candidate):
         return True
     preceding = text[:token_start]
-    return bool(_SOURCE_PREPOSITION_RE.search(preceding))
+    following = text[token_start + len(candidate) :]
+    return bool(
+        _SOURCE_PREPOSITION_RE.search(preceding)
+        or _TEST_SOURCE_PREPOSITION_RE.search(preceding)
+        or _SOURCE_PREDICATE_RE.search(following)
+    )
 
 
 def _requested_path(candidate: str, workspace: Path | None) -> str:
@@ -208,13 +245,56 @@ def derive(
     prompt: str, *, dry_run: bool = False, workspace: Path | None = None
 ) -> RunContract:
     """Read the prompt's checkable promises. Never touches the model."""
+    paths = list(requested_paths(prompt, workspace))
+    for path in generated_test_paths(prompt, workspace):
+        if path not in paths:
+            paths.append(path)
     return RunContract(
         read_only=read_only.applies(prompt),
         scoped_read_only=read_only.is_scoped(prompt),
-        requested_paths=requested_paths(prompt, workspace),
+        requested_paths=tuple(paths),
+        required_python_symbols=required_python_symbols(prompt, workspace),
         allowed_collateral_paths=allowed_collateral_paths(prompt),
         dry_run=bool(dry_run),
     )
+
+
+def generated_test_paths(
+    prompt: str,
+    workspace: Path | None = None,
+) -> tuple[str, ...]:
+    """Return deterministic test outputs implied by an explicit source path."""
+    outputs: list[str] = []
+    for match in _TEST_GENERATION_RE.finditer(read_only.strip(prompt or "")):
+        source = _requested_path(match.group("path"), workspace)
+        path = Path(source)
+        name = path.name.casefold()
+        if name.startswith("test_") or ".test." in name or ".spec." in name:
+            output = source
+        elif path.suffix.casefold() == ".py":
+            output = f"tests/test_{path.stem}.py"
+        else:
+            output = f"tests/{path.stem}.test{path.suffix}"
+        if output not in outputs:
+            outputs.append(output)
+    return tuple(outputs)
+
+
+def required_python_symbols(
+    prompt: str,
+    workspace: Path | None = None,
+) -> tuple[tuple[str, str], ...]:
+    """Return Python functions the prompt explicitly requires in a named file."""
+    text = read_only.strip(prompt or "")
+    seen: list[tuple[str, str]] = []
+    for match in _PYTHON_FUNCTION_REQUEST_RE.finditer(text):
+        item = (
+            _requested_path(match.group("path"), workspace),
+            match.group("symbol"),
+        )
+        if item not in seen:
+            seen.append(item)
+    return tuple(seen)
 
 
 def allowed_collateral_paths(prompt: str) -> tuple[str, ...]:
@@ -234,6 +314,7 @@ def check(
     changed_files: Iterable[dict[str, str]],
     planned_mutations: Iterable[dict[str, Any]] = (),
     outcome: str = "",
+    workspace: Path | None = None,
 ) -> ContractResult:
     """Compare the contract against what the filesystem shows actually happened.
 
@@ -326,7 +407,7 @@ def check(
             + " but these also changed: " + ", ".join(collateral),
         )
 
-    terminal_without_execution = outcome in {
+    terminal_without_execution = not changed_paths and outcome in {
         "denied",
         "cancelled",
         "timed_out",
@@ -347,6 +428,55 @@ def check(
                 else "these were written instead: " + ", ".join(sorted(changed_paths))
             ),
         )
+
+    if (
+        contract.required_python_symbols
+        and not contract.read_only
+        and not contract.dry_run
+        and not terminal_without_execution
+    ):
+        if workspace is None:
+            record(
+                "requested_python_symbols_exist",
+                False,
+                "workspace was not provided for Python symbol validation",
+            )
+        else:
+            root = Path(workspace).resolve()
+            missing_symbols: list[str] = []
+            invalid_files: list[str] = []
+            for relative_path, symbol in contract.required_python_symbols:
+                candidate = (root / relative_path).resolve()
+                try:
+                    candidate.relative_to(root)
+                    tree = ast.parse(candidate.read_text(encoding="utf-8"))
+                except (OSError, SyntaxError, UnicodeError, ValueError):
+                    invalid_files.append(relative_path)
+                    continue
+                defined = {
+                    node.name
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                }
+                if symbol not in defined:
+                    missing_symbols.append(f"{relative_path}:{symbol}")
+            passed = not missing_symbols and not invalid_files
+            detail_parts: list[str] = []
+            if invalid_files:
+                detail_parts.append(
+                    "unreadable or invalid Python: " + ", ".join(sorted(invalid_files))
+                )
+            if missing_symbols:
+                detail_parts.append(
+                    "missing requested symbols: " + ", ".join(sorted(missing_symbols))
+                )
+            record(
+                "requested_python_symbols_exist",
+                passed,
+                "all explicitly requested Python symbols exist"
+                if passed
+                else "; ".join(detail_parts),
+            )
 
     return ContractResult(
         ok=not violations,

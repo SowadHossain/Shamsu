@@ -247,6 +247,19 @@ class CommandRunner(ICommandRunner):
             redact(completed.stdout or ""),
             redact(completed.stderr or ""),
         )
+        if result[0] == 0:
+            state_path = self.environment_resolver.persist_resolution(resolution)
+            if state_path is not None and self.action_ledger:
+                try:
+                    relative_state = state_path.relative_to(self.workspace_root).as_posix()
+                except ValueError:
+                    relative_state = str(state_path)
+                self.action_ledger.log_event(
+                    "project_environment_persisted",
+                    path=relative_state,
+                    environment_kind=resolution.environment_kind,
+                    interpreter=resolution.interpreter,
+                )
         if self.session_logger:
             self.session_logger.log(
                 "command.finished",

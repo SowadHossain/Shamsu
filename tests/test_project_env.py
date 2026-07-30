@@ -102,6 +102,20 @@ def test_bare_install_bootstraps_local_venv_before_install(tmp_path: Path):
     )
 
 
+def test_invalid_install_version_flag_is_removed_before_venv_resolution(tmp_path: Path):
+    resolution = _resolver(tmp_path).resolve(
+        "pip3 install --version boltons==24.0.0",
+        tmp_path,
+    )
+
+    interpreter = tmp_path / ".venv" / "bin" / "python"
+    assert resolution.requested_command == "pip3 install --version boltons==24.0.0"
+    assert resolution.command == (
+        f"/runtime/python -m venv {shlex.quote(str(tmp_path / '.venv'))} && "
+        f"{shlex.quote(str(interpreter))} -m pip install boltons==24.0.0"
+    )
+
+
 def test_poetry_project_uses_poetry_run_without_creating_shamsu_state(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text(
         "[tool.poetry]\nname='demo'\nversion='0.1.0'\n",
@@ -206,6 +220,7 @@ def test_denied_install_does_not_create_environment(tmp_path: Path):
     assert ".venv" in approvals[0].preview
     assert runner.last_command_resolution is not None
     assert runner.last_command_resolution.bootstraps_environment is True
+    assert not (tmp_path / ".shamsu" / "project-environment.json").exists()
 
 
 def test_command_runner_installs_only_through_created_project_venv(tmp_path: Path):
@@ -231,6 +246,11 @@ def test_command_runner_installs_only_through_created_project_venv(tmp_path: Pat
     assert approvals and ".venv" in approvals[0].preview
     assert runner.last_command_resolution is not None
     assert runner.last_command_resolution.environment_kind == "bootstrap-venv"
+    state_path = tmp_path / ".shamsu" / "project-environment.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["schema_version"] == 1
+    assert state["environment_kind"] == "bootstrap-venv"
+    assert state["interpreter"] == str(interpreter)
     events = [
         json.loads(line)
         for line in ledger.events_path.read_text(encoding="utf-8").splitlines()
@@ -238,3 +258,26 @@ def test_command_runner_installs_only_through_created_project_venv(tmp_path: Pat
     resolved = next(event for event in events if event["type"] == "project_environment_resolved")
     assert resolved["bootstraps_environment"] is True
     assert resolved["requested_command"] == "pip install --no-index pip"
+    assert any(event["type"] == "project_environment_persisted" for event in events)
+
+
+def test_persisted_project_interpreter_is_reused_without_active_environment(
+    tmp_path: Path,
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "requirements.txt").write_text("", encoding="utf-8")
+    custom = project / "env"
+    interpreter = custom / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    resolver = _resolver(tmp_path, environ={"VIRTUAL_ENV": str(custom)})
+    first = resolver.resolve("python app.py", project)
+
+    state_path = resolver.persist_resolution(first)
+    second = _resolver(tmp_path).resolve("python app.py", project)
+
+    assert state_path == project / ".shamsu" / "project-environment.json"
+    assert second.environment_kind == "project-venv"
+    assert second.interpreter == str(interpreter)
+    assert second.command == f"{shlex.quote(str(interpreter))} app.py"

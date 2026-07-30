@@ -453,6 +453,44 @@ async def test_file_write_route_with_a_real_change_still_succeeds(tmp_path: Path
     assert "mutation_required_but_missing" not in types
 
 
+@pytest.mark.asyncio
+async def test_file_write_route_asks_before_unspecified_auth_approach(
+    tmp_path: Path, monkeypatch
+):
+    from shamsu.cli import repl as repl_module
+    from shamsu.session.manager import SessionManager
+
+    async def agent_chat_must_not_run(*args, **kwargs):
+        raise AssertionError("the executor must not run before the user chooses an auth approach")
+
+    monkeypatch.setattr(repl_module, "_run_agent_chat", agent_chat_must_not_run)
+
+    logger = SessionManager(tmp_path).create_session("Auth choice")
+    ledger = start_run(tmp_path, "Add authentication to app.py.")
+    set_current_run(ledger)
+    console = Console(file=StringIO(), force_terminal=False, width=120, record=True)
+    web_tool = WebTool(approval_func=lambda _request: False)
+    browser_tool = BrowserTool(tmp_path, approval_func=lambda _request: False)
+    try:
+        await repl_module._handle_request(
+            "Add authentication to app.py.",
+            tmp_path,
+            console,
+            web_tool,
+            browser_tool,
+            session_logger=logger,
+        )
+    finally:
+        clear_current_run()
+
+    pending = logger.get_pending_question()
+    assert pending["question"] == "Which authentication approach should I implement?"
+    assert pending["source"] == "direct_file_upfront"
+    assert "Server sessions" in console.export_text()
+    assert "run_needs_input" in [event["type"] for event in _events(ledger)]
+    assert "Which authentication approach" in ledger.narrative_path.read_text(encoding="utf-8")
+
+
 # -- a recovered patch retry must not fail the whole run ----------------------
 
 

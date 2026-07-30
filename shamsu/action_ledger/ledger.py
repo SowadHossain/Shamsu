@@ -481,7 +481,7 @@ class ActionLedger:
         for tool, (failure_index, record) in latest.items():
             if bool(record.get("ok")):
                 continue
-            if tool not in {"read_file", "edit_file", "write_file"}:
+            if tool not in {"read_file", "edit_file", "append_file", "write_file"}:
                 return True
             failed_args = arguments.get(str(record.get("tool_call_id", "")), {})
             failed_path = str(failed_args.get("filepath") or "").replace("\\", "/")
@@ -489,7 +489,7 @@ class ActionLedger:
             for later in records[failure_index + 1 :]:
                 if later.get("phase") != "finished" or not bool(later.get("ok")):
                     continue
-                if later.get("tool") not in {"edit_file", "write_file"}:
+                if later.get("tool") not in {"edit_file", "append_file", "write_file"}:
                     continue
                 later_args = arguments.get(str(later.get("tool_call_id", "")), {})
                 later_path = str(later_args.get("filepath") or "").replace("\\", "/")

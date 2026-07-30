@@ -15,6 +15,7 @@ from shamsu.agents.freeform_generator import (
     FreeformGenerator,
     PlannedFile,
     _default_verify,
+    _ensure_required_test_plan,
     _normalize_planned_files,
     _sanitize_generated_content,
 )
@@ -63,7 +64,15 @@ class FakeRunner:
 
     def run(self, command: str, cwd) -> tuple[int, str, str]:
         self.commands.append(command)
-        return (self._exit_code, "", "" if self._exit_code == 0 else "syntax error")
+        outputs = {
+            "node scripts/seed.mjs": "seeded 6 records\n",
+            "node scripts/status.mjs": "open 3 high 2 overdue 1\n",
+        }
+        return (
+            self._exit_code,
+            outputs.get(command, ""),
+            "" if self._exit_code == 0 else "syntax error",
+        )
 
 
 class CompileRunner:
@@ -73,6 +82,16 @@ class CompileRunner:
 
     def run(self, command: str, cwd) -> tuple[int, str, str]:
         self.commands.append(command)
+        if "py_compile" not in command:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                shell=True,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            return completed.returncode, completed.stdout, completed.stderr
         source = (Path(cwd) / self.filename).read_text(encoding="utf-8", errors="replace")
         try:
             compile(source, self.filename, "exec")
@@ -91,8 +110,13 @@ def _python_generate(stack: str = "python", files=None):
         if "planning a small project" in system:
             return json.dumps({"stack": stack, "files": files})
         if "writing ONE file" in system:
-            if "requirements.txt" in user.split("## File to write now", 1)[-1][:60]:
+            current_file = user.split("## File to write now", 1)[-1][:100]
+            if "requirements.txt" in current_file:
                 return json.dumps({"content": "flask\n"})
+            if "tests/test_generated_behavior.py" in current_file:
+                return json.dumps(
+                    {"content": "def test_generated_behavior():\n    assert True\n"}
+                )
             return json.dumps({"content": "print('hi')\n"})
         return ""
 
@@ -135,10 +159,46 @@ def test_freeform_generates_and_verifies_python_project(tmp_path: Path):
 
     assert result.success is True
     assert result.verified is True
-    assert set(result.written_files) == {"app.py", "requirements.txt"}
+    assert set(result.written_files) == {
+        "app.py",
+        "requirements.txt",
+        "tests/test_generated_behavior.py",
+    }
     assert (tmp_path / "cms" / "app.py").read_text() == "print('hi')\n"
     assert "py_compile" in result.verify_command
     assert "passed" in result.final_message.lower()
+
+
+def test_nontrivial_python_plan_gets_a_harness_owned_test_target():
+    contract = PRDContract(
+        stack_hint="python",
+        features=["create records", "search records"],
+    )
+
+    planned = _ensure_required_test_plan(
+        [
+            PlannedFile("app.py", "application"),
+            PlannedFile("requirements.txt", "dependencies"),
+        ],
+        stack="python",
+        contract=contract,
+    )
+
+    assert planned[-1].path == "tests/test_generated_behavior.py"
+    assert "pytest" in planned[-1].purpose
+
+
+def test_existing_test_plan_is_not_duplicated():
+    files = [
+        PlannedFile("app.py", "application"),
+        PlannedFile("tests/test_app.py", "tests"),
+    ]
+
+    assert _ensure_required_test_plan(
+        files,
+        stack="python",
+        contract=PRDContract(required_tests=["test app"]),
+    ) == files
 
 
 def test_freeform_unverified_when_no_verifier(tmp_path: Path):
@@ -187,15 +247,18 @@ def test_freeform_skips_timed_out_file_generation(tmp_path: Path):
     def generate(system: str, user: str, schema: dict) -> str:
         if "planning a small project" in system:
             return json.dumps({"stack": "python", "files": files})
-        if "slow.py" in user.split("## File to write now", 1)[-1][:80]:
+        current_file = user.split("## File to write now", 1)[-1][:100]
+        if "slow.py" in current_file:
             raise TimeoutError("too slow")
+        if "tests/test_generated_behavior.py" in current_file:
+            return json.dumps({"content": "def test_generated_behavior():\n    assert True\n"})
         return json.dumps({"content": "print('ok')\n"})
 
     gen = FreeformGenerator(tmp_path, generate, command_runner=FakeRunner(0))
     result = gen.run(project, tmp_path / "cms")
 
     assert result.success is True
-    assert result.written_files == ["app.py"]
+    assert result.written_files == ["app.py", "tests/test_generated_behavior.py"]
     assert not (tmp_path / "cms" / "slow.py").exists()
 
 
@@ -208,6 +271,8 @@ def test_freeform_regenerates_source_when_strict_repair_has_no_edit(tmp_path: Pa
         if "planning a small project" in system:
             return json.dumps({"stack": "python", "files": [{"path": "app.py", "purpose": "entry"}]})
         if "writing ONE file" in system:
+            if "tests/test_generated_behavior.py" in user.split("## File to write now", 1)[-1][:100]:
+                return json.dumps({"content": "def test_generated_behavior():\n    assert True\n"})
             return json.dumps({"content": "def main():\n    print(f'{value[\n"})
         if "STRICT DEBUG MODE" in system:
             return json.dumps({"root_cause": "truncated file", "target_file": "app.py"})
@@ -246,6 +311,8 @@ def test_freeform_hardens_explicit_python_cli_prd(tmp_path: Path):
         if "ledgerlite.json" in user.split("## File to write now", 1)[-1][:80]:
             return json.dumps({"content": "[]\n"})
         if "writing ONE file" in system:
+            if "tests/test_generated_behavior.py" in user.split("## File to write now", 1)[-1][:100]:
+                return json.dumps({"content": "def test_generated_behavior():\n    assert True\n"})
             return json.dumps({"content": "print(f'{value[\n"})
         return ""
 
@@ -402,7 +469,7 @@ def test_freeform_hardens_vite_react_project_before_verify(tmp_path: Path):
     assert "@types/zod" not in package["devDependencies"]
     assert "@vitejs/plugin-react" in package["devDependencies"]
     assert "demo-admin" in (tmp_path / "ops" / "src" / "data.ts").read_text()
-    assert runner.commands == ["npm install && npm run build"]
+    assert runner.commands == ["npm install", "npm run build", "npm test"]
     events = [
         json.loads(line)
         for line in ledger.events_path.read_text(encoding="utf-8").splitlines()
@@ -410,8 +477,132 @@ def test_freeform_hardens_vite_react_project_before_verify(tmp_path: Path):
     hardened = next(event for event in events if event["type"] == "freeform_vite_react_hardened")
     assert hardened["skill"] == "react-vite"
     assert hardened["hook"] == "vite-react-contract-foundation"
+    verification_events = [event for event in events if event["type"] == "verification_step"]
+    assert [event["stage"] for event in verification_events] == ["setup", "build", "test"]
+    assert all(event["passed"] for event in verification_events)
     mutation_log = (ledger.mutations_dir / "mutations.jsonl").read_text(encoding="utf-8")
     assert "react-vite skill deterministic" in mutation_log
+
+
+def test_freeform_generation_injects_selected_skills_into_model_prompts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SHAMSU_SKILLS", "on")
+    project = _vite_project()
+    prompts: list[tuple[str, str]] = []
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        prompts.append((system, user))
+        if "planning a small project" in system:
+            return json.dumps(
+                {
+                    "stack": "TypeScript React Vite",
+                    "files": [
+                        {"path": "package.json", "purpose": "manifest"},
+                        {"path": "src/App.tsx", "purpose": "dashboard"},
+                    ],
+                }
+            )
+        if "package.json" in user.split("## File to write now", 1)[-1][:80]:
+            return json.dumps(
+                {
+                    "content": json.dumps(
+                        {
+                            "scripts": {"build": "vite build"},
+                            "dependencies": {},
+                            "devDependencies": {},
+                        }
+                    )
+                }
+            )
+        return json.dumps({"content": "export default function App() { return null }\n"})
+
+    ledger = start_run(tmp_path, "build a React Vite dashboard")
+    set_current_run(ledger)
+    try:
+        result = FreeformGenerator(
+            tmp_path,
+            generate,
+            command_runner=FakeRunner(0),
+        ).run(project, tmp_path / "ops")
+    finally:
+        clear_current_run()
+
+    assert result.success is True
+    generation_prompts = [
+        user
+        for system, user in prompts
+        if "planning a small project" in system or "writing ONE file" in system
+    ]
+    assert generation_prompts
+    assert all("## Generation Skill Guidance" in prompt for prompt in generation_prompts)
+    assert all("### react-vite" in prompt for prompt in generation_prompts)
+    events = [
+        json.loads(line)
+        for line in ledger.events_path.read_text(encoding="utf-8").splitlines()
+    ]
+    discovered = next(event for event in events if event["type"] == "skills_discovered")
+    injected = next(event for event in events if event["type"] == "skill_context_injected")
+    selected_names = [item["name"] for item in discovered["selected"]]
+    assert "react-vite" in selected_names
+    assert injected["phase"] == "freeform_generation"
+    assert "react-vite" in injected["skills"]
+
+
+def test_freeform_skills_ab_mode_changes_only_skill_guidance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    project = _vite_project()
+
+    def run_mode(mode: str) -> list[str]:
+        monkeypatch.setenv("SHAMSU_SKILLS", mode)
+        prompts: list[str] = []
+
+        def generate(system: str, user: str, schema: dict) -> str:
+            prompts.append(user)
+            if "planning a small project" in system:
+                return json.dumps(
+                    {
+                        "stack": "TypeScript React Vite",
+                        "files": [
+                            {"path": "package.json", "purpose": "manifest"},
+                            {"path": "src/App.tsx", "purpose": "dashboard"},
+                        ],
+                    }
+                )
+            if "package.json" in user.split("## File to write now", 1)[-1][:80]:
+                return json.dumps(
+                    {
+                        "content": json.dumps(
+                            {
+                                "scripts": {"build": "vite build"},
+                                "dependencies": {},
+                                "devDependencies": {},
+                            }
+                        )
+                    }
+                )
+            return json.dumps(
+                {"content": "export default function App() { return null }\n"}
+            )
+
+        result = FreeformGenerator(
+            tmp_path,
+            generate,
+            command_runner=FakeRunner(0),
+        ).run(project, tmp_path / f"ops-{mode}")
+        assert result.success is True
+        return prompts
+
+    off_prompts = run_mode("off")
+    on_prompts = run_mode("on")
+
+    assert off_prompts and on_prompts
+    assert all("## Generation Skill Guidance" not in prompt for prompt in off_prompts)
+    assert all("## Generation Skill Guidance" in prompt for prompt in on_prompts)
+    assert any("### react-vite" in prompt for prompt in on_prompts)
 
 
 def test_freeform_hardens_atlasdesk_root_scripts_and_incident_filters(tmp_path: Path):

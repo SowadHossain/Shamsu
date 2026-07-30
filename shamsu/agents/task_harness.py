@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from shamsu.action_ledger.context import get_current_run
+from shamsu.retriever.documents import DocumentStore
 from shamsu.skills.selector import (
     render_skill_context,
     select_skills_for_task,
@@ -31,6 +32,8 @@ class TaskPlan:
     target_files: list[str] = field(default_factory=list)
     verification: list[str] = field(default_factory=list)
     skill_selection: SkillSelection | None = None
+    document_context: str = ""
+    document_hits: tuple[dict, ...] = field(default_factory=tuple)
     confidence: float = 1.0
 
 
@@ -53,6 +56,11 @@ def build_task_plan(
         target_files=target_files,
     )
     _log_skill_selection(skill_selection)
+    document_context = ""
+    document_hits: tuple[dict, ...] = ()
+    if workspace is not None:
+        document_context, hits = DocumentStore(workspace).relevant_context(user_request)
+        document_hits = tuple(hit.to_dict() for hit in hits)
     return TaskPlan(
         mode=mode,
         goal=user_request.strip(),
@@ -62,6 +70,8 @@ def build_task_plan(
         target_files=target_files,
         verification=_verification_for_intent(decision.intent),
         skill_selection=skill_selection,
+        document_context=document_context,
+        document_hits=document_hits,
         confidence=decision.confidence,
     )
 
@@ -95,9 +105,23 @@ def render_task_handoff(plan: TaskPlan, agent_context: str = "") -> str:
         "- Run commands only through CommandRunner.",
         "- Do not claim success unless the write/patch/command result confirms it.",
     ]
+    if plan.document_context:
+        lines.extend(
+            [
+                "- The Registered Document Evidence below has already been retrieved from the "
+                "source. Use it directly; do not read the original document again unless the "
+                "needed fact is absent from these excerpts.",
+                "- When the requested target does not exist, create it with write_file. Do not "
+                "probe a new target with edit_file or append_file first.",
+            ]
+        )
     skill_context = render_skill_context(plan.skill_selection) if plan.skill_selection else ""
     if skill_context:
         lines.extend(["", skill_context])
+        _log_skill_context_injected(plan.skill_selection)
+    if plan.document_context:
+        lines.extend(["", plan.document_context])
+        _log_document_context_injected(plan.document_hits)
     if agent_context.strip():
         lines.extend(["", "## Deterministic Context", agent_context.strip()])
     return "\n".join(lines).strip()
@@ -124,6 +148,10 @@ def plan_log_payload(plan: TaskPlan) -> dict:
             if plan.skill_selection is not None
             else {"mode": "off", "selected": []}
         ),
+        "documents": {
+            "injected": list(plan.document_hits),
+            "count": len(plan.document_hits),
+        },
         "confidence": plan.confidence,
     }
 
@@ -148,6 +176,46 @@ def _log_skill_selection(selection: SkillSelection) -> None:
         ],
         chosen_action=",".join(selected_names),
         outcome="selected" if selected_names else "none",
+    )
+
+
+def _log_skill_context_injected(selection: SkillSelection) -> None:
+    ledger = get_current_run()
+    if ledger is None or not selection.active:
+        return
+    selected = [item.skill for item in selection.selected]
+    ledger.log_event(
+        "skill_context_injected",
+        skills=[skill.name for skill in selected],
+        sources=[skill.source for skill in selected],
+        references=[
+            {
+                "name": skill.name,
+                "source": skill.metadata.get("reference_source", ""),
+                "path": str(skill.skill_path),
+            }
+            for skill in selected
+            if str(skill.metadata.get("kind") or "").lower() == "reference"
+        ],
+    )
+
+
+def _log_document_context_injected(hits: tuple[dict, ...]) -> None:
+    ledger = get_current_run()
+    if ledger is None or not hits:
+        return
+    ledger.log_event(
+        "document_context_injected",
+        chunks=[
+            {
+                "chunk_id": hit.get("chunk_id", ""),
+                "document_name": hit.get("document_name", ""),
+                "citation": hit.get("citation", ""),
+                "score": hit.get("score", 0.0),
+                "match_kind": hit.get("match_kind", ""),
+            }
+            for hit in hits
+        ],
     )
 
 

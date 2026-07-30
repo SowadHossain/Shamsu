@@ -17,6 +17,9 @@ touch workspace files.
 - Run Python and package commands normally through `run_command`; the command
   harness selects an existing project environment or creates a local `.venv`
   before a bare package install.
+- When the user asks to retain a small library guide, use `ingest_docs` instead
+  of copying it with a generic file tool. For external API facts that have not
+  been ingested, use `web_search` and `fetch_url` rather than guessing.
 - Run the narrowest meaningful verifier after each mutation.
 - Treat command/test output as evidence, not decoration.
 - If verification fails, repair the first actionable root cause before broadening scope.

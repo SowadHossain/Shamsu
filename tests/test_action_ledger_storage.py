@@ -249,6 +249,24 @@ def test_creating_requested_path_recovers_initial_missing_read(tmp_path: Path):
     assert ledger.evidence_outcome() == "success"
 
 
+def test_write_file_recovers_failed_edit_and_append_attempts_for_same_path(tmp_path: Path):
+    ledger = start_run(tmp_path, "create notes.md")
+    edit_call = ledger.log_tool_call(
+        "edit_file", {"filepath": "notes.md", "old_string": "", "new_string": "hello"}
+    )
+    ledger.log_tool_result(edit_call, "edit_file", False, "Missing old_string.")
+    append_call = ledger.log_tool_call(
+        "append_file", {"filepath": "notes.md", "content": "hello"}
+    )
+    ledger.log_tool_result(append_call, "append_file", False, "File does not exist.")
+    write_call = ledger.log_tool_call(
+        "write_file", {"filepath": "notes.md", "content": "hello"}
+    )
+    ledger.log_tool_result(write_call, "write_file", True, "Created notes.md")
+
+    assert ledger.evidence_outcome() == "success"
+
+
 def test_later_pass_recovers_an_earlier_verification_failure(tmp_path: Path):
     ledger = start_run(tmp_path, "repair and rerun")
     ledger.log_event("verification_failed", command="python app.py")

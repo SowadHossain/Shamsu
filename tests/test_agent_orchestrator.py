@@ -98,6 +98,19 @@ def test_orchestrator_deduplicates_at_and_plain_filename_context(tmp_path):
     assert result.context.count("# @qa_probe.py (file)") == 1
 
 
+def test_mutation_with_file_mentions_continues_to_coding_workflow(tmp_path):
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "schema.sql").write_text("CREATE TABLE items (id INTEGER);\n", encoding="utf-8")
+
+    result = AgentOrchestrator(tmp_path).run(
+        "Fix the wiring bugs in app.py and schema.sql."
+    )
+
+    assert result.handled is False
+    assert result.action == ""
+    assert "# @app.py (file)" in result.context
+
+
 def test_mention_resolver_reads_quoted_path_with_spaces(tmp_path):
     docs = tmp_path / "agent context"
     docs.mkdir()

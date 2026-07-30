@@ -322,6 +322,7 @@ async def run_prompt(
             changed_files=changed_now,
             planned_mutations=recorder.as_dicts() if recorder is not None else [],
             outcome=ledger.evidence_outcome(),
+            workspace=root,
         )
         manifest_now = ledger_store.load_manifest(root, ledger.run_id) or {}
         if manifest_now.get("status") == "running":
@@ -462,6 +463,7 @@ def _build_result(
         changed_files=changed,
         planned_mutations=planned_mutations,
         outcome=result_status,
+        workspace=workspace,
     )
     if result_status == "dry_run":
         # Report what the agent PLANNED, which is the question a dry run asks.
