@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from rich.console import Console
 
 from shamsu.cli import repl
+from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.prd.contract import extract_contract
 from shamsu.prd.execution import (
     block_milestone,
@@ -25,7 +26,6 @@ from shamsu.prd.execution import (
     validate_model_preflight,
 )
 from shamsu.prd.parser import parse_prd_text
-from shamsu.patch.transactions import TransactionWorkspace
 
 
 def _contract():

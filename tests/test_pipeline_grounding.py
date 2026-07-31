@@ -21,16 +21,15 @@ import pytest
 
 from shamsu.cli.repl import (
     _append_demo_login_docs,
+    _bugfix_request_has_actionable_target,
     _extract_dev_command,
     _looks_like_dev_server_failure,
     _looks_like_dev_server_prompt,
-    _bugfix_request_has_actionable_target,
     _looks_like_prd_build_request,
     _looks_like_prd_context_question,
     _requests_demo_login,
     _seed_django_demo_login,
 )
-
 
 # ─── PRD GROUNDING ────────────────────────────────────────────────────────────
 
@@ -277,8 +276,9 @@ async def test_model_timeout_stops_loop(tmp_path, monkeypatch):
 
 def test_prd_parse_happens_before_template_build(tmp_path, monkeypatch):
     """_handle_prd_build_request must call parse_prd_file before scaffold."""
-    from shamsu.cli import repl as repl_mod
     from rich.console import Console
+
+    from shamsu.cli import repl as repl_mod
 
     prd = tmp_path / "prd.md"
     prd.write_text("# Game\n\n## Overview\nA multiplayer racing game.\n", encoding="utf-8")
@@ -315,6 +315,7 @@ def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, mo
     """A complex Node+CLI PRD must produce files via FullDjangoPipeline's
     freeform path, not a chat answer that merely describes the work."""
     from rich.console import Console
+
     from shamsu.agents.full_pipeline import FullPipelineResult
     from shamsu.cli import repl as repl_mod
 
@@ -369,6 +370,7 @@ def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, mo
 
 def test_freeform_prd_build_validates_acceptance_and_downgrades(tmp_path, monkeypatch):
     from rich.console import Console
+
     from shamsu.agents.full_pipeline import FullPipelineResult
     from shamsu.cli import repl as repl_mod
 
@@ -474,6 +476,7 @@ def test_acceptance_failure_hint_explains_subcommand_options():
 
 def test_structured_validation_rewrite_applies_complete_source_file(tmp_path, monkeypatch):
     from rich.console import Console
+
     from shamsu.cli import repl as repl_mod
 
     target = tmp_path / "ledgerlite.py"

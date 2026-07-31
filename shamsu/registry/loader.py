@@ -6,8 +6,14 @@ from typing import Any
 
 import yaml
 
-from shamsu.registry.schema import Category, DefinitionOfDone, DoDItem, Hole, Manifest, RegistryEntry
-
+from shamsu.registry.schema import (
+    Category,
+    DefinitionOfDone,
+    DoDItem,
+    Hole,
+    Manifest,
+    RegistryEntry,
+)
 
 TEMPLATES_ROOT = Path(__file__).resolve().parents[1] / "templates"
 

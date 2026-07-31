@@ -21,7 +21,6 @@ from shamsu.context.manager import (
 )
 from shamsu.types import ContextPack, SearchResult
 
-
 # ─── Existing tokenizer tests ────────────────────────────────────────────────
 
 def test_count_tokens_uses_vendored_tokenizer_when_available():

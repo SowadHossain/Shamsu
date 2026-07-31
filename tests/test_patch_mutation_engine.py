@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
-import shutil
 from pathlib import Path
 
 import pytest
@@ -13,8 +13,8 @@ from shamsu.patch import git_apply
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.file_mutations import FileMutationOps
 from shamsu.patch.safety import MutationSafetyError, is_secret_file, validate_mutation_path
-from shamsu.patch.trash import TrashWorkspace
 from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.patch.trash import TrashWorkspace
 from shamsu.safety.sandbox import Sandbox
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 

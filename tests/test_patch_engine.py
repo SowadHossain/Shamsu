@@ -9,7 +9,6 @@ from shamsu.patch.engine import PatchEngine, parse_unified_diff
 from shamsu.patch.preview import print_diff_preview
 from shamsu.safety.sandbox import Sandbox
 
-
 VALID_DIFF = """--- a/app/models.py
 +++ b/app/models.py
 @@ -1,3 +1,4 @@

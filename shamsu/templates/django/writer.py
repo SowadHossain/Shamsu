@@ -4,19 +4,19 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+from shamsu.patch.rollback import rollback_transaction
+from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.prd.state import (
     GenerationState,
     create_generation_state,
     load_generation_state,
     mark_step_done,
     mark_step_failed,
-    mark_step_skipped,
     mark_step_running,
+    mark_step_skipped,
     save_generation_state,
     state_path,
 )
-from shamsu.patch.rollback import rollback_transaction
-from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.sandbox import Sandbox

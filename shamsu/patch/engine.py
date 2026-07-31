@@ -21,8 +21,8 @@ from shamsu.patch.safety import (
     validate_mutation_path,
 )
 from shamsu.patch.sanitize import sanitize_model_diff
-from shamsu.patch.trash import TrashWorkspace
 from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.patch.trash import TrashWorkspace
 from shamsu.patch.types import (
     ChangeRequestError,
     MutationResult,

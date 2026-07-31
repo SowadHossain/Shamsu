@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from io import StringIO
+from types import SimpleNamespace
 
 from rich.console import Console
-
-from types import SimpleNamespace
 
 from shamsu.ui.progress import ProgressReporter, summarize_tool_result
 

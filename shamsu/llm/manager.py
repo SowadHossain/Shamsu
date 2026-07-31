@@ -26,6 +26,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
@@ -39,7 +40,6 @@ from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role, model_is_reasoning
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
-from pathlib import Path
 
 OLLAMA_BASE_URL = "http://localhost:11434"
 LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}

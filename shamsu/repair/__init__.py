@@ -19,14 +19,13 @@ from shamsu.repair.kinds import (
 )
 from shamsu.repair.loop import Applier, FileApplier, Proposer, RepairLoop, Verifier, VerifyRun
 from shamsu.repair.plan_schema import REPAIR_PLAN_JSON_SCHEMA
-from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.prompt import (
     build_debug_prompt,
     build_final_message,
     contains_unverified_success_claim,
     enforce_final_response,
 )
-from shamsu.repair.verifiers import CommandVerifier, DjangoTestVerifier
+from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.types import (
     DebugContext,
     InspectedSnippet,
@@ -35,6 +34,7 @@ from shamsu.repair.types import (
     RepairPlan,
     RepairResult,
 )
+from shamsu.repair.verifiers import CommandVerifier, DjangoTestVerifier
 
 __all__ = [
     "Applier",

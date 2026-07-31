@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from shamsu.abstract.service import AbstractService
 from shamsu.agents.plan_mode import workspace_source_files
 from shamsu.indexer.policy import ensure_cbm_ignore, workspace_manifest
 from shamsu.indexer.walker import FileWalker
@@ -9,7 +10,6 @@ from shamsu.llm.manager import _context_preview
 from shamsu.retriever.semantic import SemanticIndex
 from shamsu.tools.workspace import WorkspaceTool
 from shamsu.types import ContextPack
-from shamsu.abstract.service import AbstractService
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 
 

@@ -5,8 +5,8 @@ from io import StringIO
 from rich.console import Console
 
 from shamsu.cli import repl
-from shamsu.runtime.ollama import RuntimeStatus
 from shamsu.runtime.models import required_model_names
+from shamsu.runtime.ollama import RuntimeStatus
 
 
 def _console_output() -> tuple[Console, StringIO]:
@@ -157,7 +157,7 @@ def test_models_tier_switches_and_persists_choice(monkeypatch, tmp_path):
     rendered = output.getvalue()
     assert "Switched to light tier" in rendered
     assert (tmp_path / ".shamsu" / "model_tier.json").exists()
-    from shamsu.runtime.models import active_tier, ModelTier
+    from shamsu.runtime.models import ModelTier, active_tier
 
     assert active_tier() is ModelTier.LIGHT
 

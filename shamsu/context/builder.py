@@ -14,9 +14,9 @@ function and when to upgrade to a real tokenizer.
 """
 from __future__ import annotations
 
+from shamsu.context.budget import TOTAL_BUDGET_DEFAULT, count_tokens
 from shamsu.interfaces import IContextBuilder
 from shamsu.types import ContextPack, SearchResult
-from shamsu.context.budget import count_tokens, TOTAL_BUDGET_DEFAULT
 
 # Budget allocation — fractions of the total token budget.
 # See ENGINEERING_HARNESS.md Stage 0 for the rationale.

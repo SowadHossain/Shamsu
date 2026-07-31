@@ -15,7 +15,6 @@ from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.executor import WORKSPACE_EXIT_CODE, CommandRunner
 
-
 DEV_COMMAND_PATTERNS = (
     r"\bnpm(?:\s+--workspace\s+\S+)?\s+run\s+dev\b",
     r"\bnpm\s+run\s+dev\b",

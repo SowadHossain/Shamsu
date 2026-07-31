@@ -29,7 +29,6 @@ from shamsu.session.manager import SessionManager
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.types import LLMResponse
 
-
 FIXTURE_SERVER = Path(__file__).parent / "fixtures" / "mcp_echo_server.py"
 
 

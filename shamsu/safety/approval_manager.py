@@ -4,9 +4,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import asdict
 
-from shamsu.safety.approval import ask_approval
 from shamsu.action_ledger.context import get_current_run
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.safety.approval import ask_approval
 from shamsu.safety.commands import is_auto_approvable_action
 from shamsu.safety.permission_store import PermissionMemory
 from shamsu.session.manager import SessionLogger

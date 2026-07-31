@@ -5,7 +5,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9_-]+")
 
 

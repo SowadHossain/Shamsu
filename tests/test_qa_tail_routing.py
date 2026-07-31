@@ -20,7 +20,6 @@ from shamsu.cli.repl import (
 )
 from shamsu.types import RoutingDecision
 
-
 # --- work that used to silently land in QA (the bug) --------------------------
 
 

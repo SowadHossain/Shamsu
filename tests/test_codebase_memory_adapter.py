@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from shamsu.abstract.types import AdapterResult
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter, is_local_uri
 

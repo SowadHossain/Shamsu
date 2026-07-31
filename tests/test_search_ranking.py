@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from shamsu.retriever.search import NullSearchAgent, SearchAgent
 
 

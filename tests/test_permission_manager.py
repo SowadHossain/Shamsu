@@ -7,11 +7,11 @@ from io import StringIO
 from rich.console import Console
 
 import shamsu.safety.approval as approval_module
+from shamsu.cli.repl import _install_console_status_tracker
 from shamsu.safety.approval import ask_approval_menu, ask_remember_choice
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import is_auto_approvable_action
 from shamsu.safety.permission_store import PermissionMemory
-from shamsu.cli.repl import _install_console_status_tracker
 from shamsu.types import ApprovalRequest
 
 

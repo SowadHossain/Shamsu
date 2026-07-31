@@ -15,11 +15,11 @@ from typing import Any
 import ollama
 
 from shamsu.action_ledger.ledger import ActionLedger
-from shamsu.audit import SessionAuditLog
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.clarification import format_question
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
 from shamsu.agents.planner import create_plan
+from shamsu.audit import SessionAuditLog
 from shamsu.context.budget import (
     RESERVE_OUTPUT_TOKENS,
     SAFETY_MARGIN_TOKENS,
@@ -28,7 +28,6 @@ from shamsu.context.budget import (
 )
 from shamsu.context.builder import ContextBuilder
 from shamsu.context.manager import ContextBudgetManager
-from shamsu.safety import read_only
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
 from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
@@ -38,6 +37,7 @@ from shamsu.runtime.models import (
     model_is_reasoning,
     model_supports_native_tools,
 )
+from shamsu.safety import read_only
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.ui.progress import ProgressReporter, summarize_tool_args, summarize_tool_result

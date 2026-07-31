@@ -7,13 +7,15 @@ from pathlib import Path
 
 import pytest
 
+from shamsu.abstract.service import AbstractService
+from shamsu.memory.service import MemoryService
 from shamsu.runtime.doctor import (
     DoctorCheck,
     DoctorReport,
     check_ancestor_workspace,
     check_codebase_memory,
-    check_editable_install,
     check_cookbook,
+    check_editable_install,
     check_nested_workspaces,
     check_ollama,
     check_path_manifest,
@@ -23,15 +25,13 @@ from shamsu.runtime.doctor import (
     find_ancestor_workspace,
     find_nested_workspaces,
     format_report,
-    run_first_run_checks,
     run_doctor,
+    run_first_run_checks,
     write_first_run_report,
 )
 from shamsu.runtime.ollama import RuntimeStatus
-from shamsu.abstract.service import AbstractService
-from shamsu.memory.service import MemoryService
-from tests.test_graphiti_memory import FakeGraphitiAdapter
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
+from tests.test_graphiti_memory import FakeGraphitiAdapter
 
 
 def test_check_editable_install_ok_when_package_is_inside_repo_root():

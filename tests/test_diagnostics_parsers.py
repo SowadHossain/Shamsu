@@ -8,7 +8,6 @@ from shamsu.diagnostics.parsers import (
     typescript_fallback,
 )
 
-
 # -- TypeScript / tsc -------------------------------------------------------
 
 def test_parses_tsc_file_line_column_errors():

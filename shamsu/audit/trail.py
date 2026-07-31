@@ -19,8 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from shamsu.safety.commands import redact
 from shamsu.action_ledger.context import get_current_run
+from shamsu.safety.commands import redact
 
 AUDIT_DIR_NAME = "audit"
 EVENTS_FILE = "events.jsonl"

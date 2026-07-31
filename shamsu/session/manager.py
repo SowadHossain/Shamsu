@@ -14,8 +14,8 @@ from typing import Any
 
 from filelock import FileLock
 
-from shamsu.safety.commands import redact
 from shamsu.action_ledger.context import get_current_run
+from shamsu.safety.commands import redact
 from shamsu.safety.sandbox import Sandbox
 from shamsu.types import ContextPack
 

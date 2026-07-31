@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 ROOT = Path(__file__).resolve().parents[1]
 UNIX_SCRIPTS = tuple(ROOT / "scripts" / name for name in (
     "install.sh",

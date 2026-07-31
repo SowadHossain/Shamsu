@@ -6,7 +6,6 @@ import os
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-
 mcp = FastMCP(
     "SHAMSU MCP integration fixture",
     host="127.0.0.1",

@@ -1,10 +1,10 @@
 """Django project setup helpers."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
 import re
 import sys
+from dataclasses import dataclass, field
+from pathlib import Path
 
 from shamsu.interfaces import ICommandRunner
 from shamsu.safety.commands import redact

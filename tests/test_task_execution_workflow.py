@@ -8,7 +8,12 @@ from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.task_execution_workflow import TaskExecutionWorkflow
 from shamsu.diagnostics.types import ErrorPacket
 from shamsu.patch.engine import PatchEngine
-from shamsu.taskmaster.service import STATUS_DEFERRED, STATUS_DONE, STATUS_PENDING, TaskmasterService
+from shamsu.taskmaster.service import (
+    STATUS_DEFERRED,
+    STATUS_DONE,
+    STATUS_PENDING,
+    TaskmasterService,
+)
 from shamsu.types import ContextPack, LLMResponse
 from tests.test_taskmaster_service import FakeTaskmasterAdapter, _write_prd
 

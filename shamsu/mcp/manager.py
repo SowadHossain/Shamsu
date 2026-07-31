@@ -35,7 +35,6 @@ from shamsu.mcp.config import (
 from shamsu.mcp.types import MCPServerStatus, MCPTool
 from shamsu.session.manager import SessionLogger
 
-
 T = TypeVar("T")
 _SHARED_MANAGERS: dict[Path, "MCPManager"] = {}
 

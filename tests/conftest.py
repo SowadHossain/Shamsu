@@ -43,8 +43,8 @@ class _AlwaysOpenMemoryService:
 
 @pytest.fixture(autouse=True)
 def _graphiti_memory_gate_open(monkeypatch):
-    from shamsu.agents import orchestrator as orchestrator_module
     from shamsu.agents import chat_loop as chat_loop_module
+    from shamsu.agents import orchestrator as orchestrator_module
     from shamsu.llm import manager as manager_module
 
     monkeypatch.setattr(orchestrator_module, "MemoryService", _AlwaysOpenMemoryService)

@@ -4,7 +4,12 @@ import os
 from pathlib import Path
 
 from shamsu.tools import dev_server
-from shamsu.tools.dev_server import DevServerManager, extract_dev_command_from_sentence, infer_dev_url, is_dev_server_command
+from shamsu.tools.dev_server import (
+    DevServerManager,
+    extract_dev_command_from_sentence,
+    infer_dev_url,
+    is_dev_server_command,
+)
 
 
 def test_npm_run_dev_is_detected_as_long_running():

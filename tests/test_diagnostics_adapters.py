@@ -10,7 +10,6 @@ from shamsu.diagnostics.adapters import (
     sarif,
 )
 
-
 # -- native structured output -------------------------------------------------
 
 def test_native_json_parses_eslint_style_array():
@@ -54,8 +53,9 @@ def test_native_json_returns_none_for_plain_text():
 def test_native_json_preferred_over_fallback_parser_in_digest():
     """External tool policy #1: native structured output wins over any
     fallback parser when the tool already emitted it."""
-    from shamsu.diagnostics.digest import DiagnosticDigest
     from pathlib import Path
+
+    from shamsu.diagnostics.digest import DiagnosticDigest
 
     payload = json.dumps(
         [{"filePath": "src/app.ts", "messages": [{"ruleId": "no-unused-vars", "severity": 2, "message": "unused", "line": 1, "column": 1}]}]
@@ -135,8 +135,9 @@ def test_reviewdog_errorformat_used_when_no_tool_specific_parser_matches():
     """External tool policy #2/#3: the errorformat-style adapter is used to
     fill gaps a tool-specific fallback parser doesn't cover, and only when a
     native/SARIF parse did not already succeed."""
-    from shamsu.diagnostics.digest import DiagnosticDigest
     from pathlib import Path
+
+    from shamsu.diagnostics.digest import DiagnosticDigest
 
     digest = DiagnosticDigest(Path("."))
     packet = digest.run("make build", ".", 1, "", "path/to/file.py:10:4: something broke")

@@ -8,7 +8,6 @@ from shamsu.cli.repl import _handle_diagnostics
 from shamsu.diagnostics import doctor as diagnostics_doctor
 from shamsu.diagnostics.setup import DiagnosticsWorkspace
 
-
 # -- 32. /diagnostics status shows helper availability ------------------------
 
 def test_diagnostics_doctor_status_reports_helper_availability(tmp_path: Path):

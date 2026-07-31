@@ -19,7 +19,7 @@ from shamsu.interfaces import IContextBuilder, ILLMManager, IPatchEngine, ISearc
 from shamsu.llm.council import run_council, should_convene_council
 from shamsu.llm.manager import LLMManager
 from shamsu.memory.service import MemoryService
-from shamsu.patch.engine import PatchEngine, parse_file_patches, parse_unified_diff, _apply_hunks
+from shamsu.patch.engine import PatchEngine, _apply_hunks, parse_file_patches, parse_unified_diff
 from shamsu.patch.sanitize import sanitize_model_diff
 from shamsu.patch.types import apply_diff_with_result
 from shamsu.safety.sandbox import Sandbox, SecurityError

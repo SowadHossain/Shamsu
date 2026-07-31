@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from shamsu.abstract.service import AbstractService
 from shamsu.action_ledger import store as action_ledger_store
 from shamsu.action_ledger.context import get_current_run
 from shamsu.action_ledger.ledger import ActionLedger
-from shamsu.abstract.service import AbstractService
 from shamsu.session.manager import SessionLogger
 
 

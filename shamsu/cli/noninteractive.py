@@ -14,19 +14,19 @@ from typing import Any, Literal, Sequence
 from rich.console import Console
 
 from shamsu.action_ledger import store as ledger_store
-from shamsu.indexer.policy import DEFAULT_EXCLUDED_FILES, walk_workspace_files
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import start_run
-from shamsu.runtime.models import initialize_model_tier
+from shamsu.indexer.policy import DEFAULT_EXCLUDED_FILES, walk_workspace_files
 from shamsu.memory.queue import flush_memory_queues
+from shamsu.runtime.models import initialize_model_tier
 from shamsu.safety.approval_context import approval_override
-from shamsu.safety.dry_run import DryRunRecorder, dry_run as dry_run_context
-from shamsu.verify import contract as run_contract
+from shamsu.safety.dry_run import DryRunRecorder
+from shamsu.safety.dry_run import dry_run as dry_run_context
 from shamsu.session.manager import SessionManager
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.web import WebTool
 from shamsu.types import ApprovalRequest
-
+from shamsu.verify import contract as run_contract
 
 ApprovalMode = Literal["allow", "deny"]
 

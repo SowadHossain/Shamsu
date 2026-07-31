@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 from shamsu.session.manager import SessionLogger
 
-
 FOLLOWUP_WEB = {
     "check on the web",
     "look it up",

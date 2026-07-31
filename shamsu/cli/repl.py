@@ -40,58 +40,73 @@ from shamsu.action_ledger.config import load_config as load_action_ledger_config
 from shamsu.action_ledger.context import clear_current_run, get_current_run, set_current_run
 from shamsu.action_ledger.ledger import ActionLedger, start_run
 from shamsu.agents.audit_workflow import AuditWorkflow
-from shamsu.diagnostics import doctor as diagnostics_doctor
-from shamsu.diagnostics import setup as diagnostics_setup
-from shamsu.diagnostics.digest import DiagnosticDigest
-from shamsu.diagnostics.setup import DiagnosticsWorkspace
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
 from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult, _thinking_preview
+from shamsu.agents.clarification import classify_reply, format_question, resolve_answer
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
 from shamsu.agents.freeform_generator import (
     FILE_CONTENT_SCHEMA,
-    _loads as _loads_freeform_json,
     _sanitize_generated_content,
+)
+from shamsu.agents.freeform_generator import (
+    _loads as _loads_freeform_json,
 )
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.agents.plan_mode import PlanningWorkflow
 from shamsu.agents.planner import deterministic_user_decision
-from shamsu.cli.command_router import CommandRouter
-from shamsu.cli.arguments import parse_args
-from shamsu.cli.approval_ui import (
-    get_permission_memory as _get_permission_memory,
-    make_approval_manager,
-)
-from shamsu.cli.request_lifecycle import (
-    finish_current_run as _finish_current_run,
-    log_assistant_message as _log_assistant_message,
-    log_event as _log_event,
-)
-from shamsu.cli.session_commands import handle_logs as _modular_handle_logs
-from shamsu.cli.session_commands import handle_run as _modular_handle_run
-from shamsu.cli.session_commands import handle_runs as _modular_handle_runs
-from shamsu.context.manager import ContextBudgetManager
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
+from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.task_harness import (
     TaskPlan,
     append_task_handoff,
     build_task_plan,
     plan_log_payload,
 )
-from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
+from shamsu.audit import SessionAuditLog
+from shamsu.cli.approval_ui import (
+    get_permission_memory as _get_permission_memory,
+)
+from shamsu.cli.approval_ui import (
+    make_approval_manager,
+)
+from shamsu.cli.arguments import parse_args
+from shamsu.cli.command_router import CommandRouter
+from shamsu.cli.request_lifecycle import (
+    finish_current_run as _finish_current_run,
+)
+from shamsu.cli.request_lifecycle import (
+    log_assistant_message as _log_assistant_message,
+)
+from shamsu.cli.request_lifecycle import (
+    log_event as _log_event,
+)
+from shamsu.cli.session_commands import handle_logs as _modular_handle_logs
+from shamsu.cli.session_commands import handle_run as _modular_handle_run
+from shamsu.cli.session_commands import handle_runs as _modular_handle_runs
+from shamsu.context.manager import ContextBudgetManager
+from shamsu.context.progress import render_progress_checklist
 from shamsu.core.coordinator import Coordinator
+from shamsu.diagnostics import doctor as diagnostics_doctor
+from shamsu.diagnostics import setup as diagnostics_setup
+from shamsu.diagnostics import swallowed
+from shamsu.diagnostics.digest import DiagnosticDigest
+from shamsu.diagnostics.setup import DiagnosticsWorkspace
 from shamsu.indexer.policy import walk_workspace_files
 from shamsu.llm.manager import LLMManager, LLMStalledError, ModelPullProgress
-from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.memory.queue import flush_memory_queues, get_memory_queue
-from shamsu.context.progress import render_progress_checklist
+from shamsu.memory.service import REQUIRED_MEMORY_MESSAGE, MemoryService
+from shamsu.patch import git_apply as patch_git_apply
+from shamsu.patch import types as patch_types
+from shamsu.patch.engine import PatchEngine
+from shamsu.patch.preview import print_diff_preview
+from shamsu.patch.rollback import latest_undoable_transaction, rollback_transaction
+from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.plans.store import parse_plan_steps, read_plan
 from shamsu.prd.contract import extract_contract
-from shamsu.verify import contract
-from shamsu.verify.gate import default_verify_command, stack_of, verify_only
-from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.execution import (
     attach_task_id,
     block_milestone,
@@ -108,34 +123,19 @@ from shamsu.prd.execution import (
     render_preflight_context,
     validate_model_preflight,
 )
+from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
 from shamsu.prd.project import build_project_spec, is_static_frontend_prd
 from shamsu.prd.requirements import compile_requirement_ledger, save_prd_execution_artifacts
 from shamsu.prd.state import create_generation_state, save_generation_state, state_path
 from shamsu.registry.schema import Category
 from shamsu.registry.suitability import templates_enabled
-from shamsu.plans.store import parse_plan_steps, read_plan
+from shamsu.retriever.search import NullSearchAgent, SearchAgent
 from shamsu.routing.operations import (
     OperationPlan,
     OperationStep,
     parse_operation_plan,
     recover_original_prompt,
 )
-from shamsu.retriever.search import NullSearchAgent, SearchAgent
-from shamsu.tasks.state import (
-    MilestoneTask,
-    advance_phase,
-    create_task,
-    list_task_ids,
-    load_task,
-    mark_step_done,
-    mark_step_failed,
-    mark_step_blocked,
-    mark_step_running,
-    save_task,
-)
-from shamsu.taskmaster.service import TaskmasterService
-from shamsu.taskmaster.types import TaskmasterTask
-from shamsu.skills.cli import handle_skills_command
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
 from shamsu.runtime.models import (
     DEFAULT_TIER,
@@ -161,20 +161,36 @@ from shamsu.safety import dry_run, read_only
 from shamsu.safety.approval import ask_approval, ask_approval_menu, ask_tier_choice
 from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
 from shamsu.safety.sandbox import Sandbox, SecurityError
-from shamsu.patch import git_apply as patch_git_apply
-from shamsu.patch import types as patch_types
-from shamsu.patch.engine import PatchEngine
-from shamsu.patch.preview import print_diff_preview
-from shamsu.diagnostics import swallowed
-from shamsu.patch.rollback import latest_undoable_transaction, rollback_transaction
-from shamsu.patch.transactions import TransactionWorkspace
-from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
 from shamsu.session.memory import is_affirmative, is_negative
+from shamsu.skills.cli import handle_skills_command
+from shamsu.taskmaster.service import TaskmasterService
+from shamsu.taskmaster.types import TaskmasterTask
+from shamsu.tasks.state import (
+    MilestoneTask,
+    advance_phase,
+    create_task,
+    list_task_ids,
+    load_task,
+    mark_step_blocked,
+    mark_step_done,
+    mark_step_failed,
+    mark_step_running,
+    save_task,
+)
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
-from shamsu.tools.dev_server import DevServerManager, extract_dev_command_from_sentence, infer_dev_command, is_dev_server_command
+from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+from shamsu.tools.dev_server import (
+    DevServerManager,
+    extract_dev_command_from_sentence,
+    infer_dev_command,
+    is_dev_server_command,
+)
+from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
+from shamsu.tools.executor import CommandRunner
+from shamsu.tools.git import GitTool
 from shamsu.tools.web import (
     WebFetchResult,
     WebSearchFetchResult,
@@ -183,14 +199,7 @@ from shamsu.tools.web import (
     WebTool,
     build_evidence_answer_prompt,
 )
-from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
-from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
-from shamsu.tools.executor import CommandRunner
-from shamsu.tools.git import GitTool
 from shamsu.tools.workspace import MentionResolver, WorkspaceTool
-from shamsu.ui.progress import ProgressReporter
-from shamsu.ui.trace import emit_trace, read_trace_mode, write_trace_mode
-from shamsu.agents.clarification import classify_reply, format_question, resolve_answer
 from shamsu.types import (
     ApprovalRequest,
     ContextPack,
@@ -200,6 +209,10 @@ from shamsu.types import (
     TaskStepStatus,
     ToolResult,
 )
+from shamsu.ui.progress import ProgressReporter
+from shamsu.ui.trace import emit_trace, read_trace_mode, write_trace_mode
+from shamsu.verify import contract
+from shamsu.verify.gate import default_verify_command, stack_of, verify_only
 
 if sys.platform == "win32":
     from prompt_toolkit.output.win32 import NoConsoleScreenBufferError

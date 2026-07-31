@@ -6,12 +6,11 @@ from pathlib import Path
 
 from evals.harness import CheckOutcome, EvalCase
 from evals.prd_fixtures import (
+    PRD_BENCHMARK_FIXTURES,
     PRDArtifactExpectation,
     PRDBenchmarkFixture,
-    PRD_BENCHMARK_FIXTURES,
     load_fixture_text,
 )
-
 
 SETUP_TIMEOUT_S = 180.0
 ACCEPTANCE_TIMEOUT_S = 90.0

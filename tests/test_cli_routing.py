@@ -8,7 +8,8 @@ from rich.console import Console
 
 from shamsu.cli import repl
 from shamsu.tools.django import DjangoCommandResult, DjangoSetupResult
-from shamsu.types import ContextPack, LLMResponse, SearchResult, TestRunResult as ShamsuTestRunResult
+from shamsu.types import ContextPack, LLMResponse, SearchResult
+from shamsu.types import TestRunResult as ShamsuTestRunResult
 
 
 class FakeSearch:

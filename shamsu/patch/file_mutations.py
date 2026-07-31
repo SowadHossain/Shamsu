@@ -18,8 +18,8 @@ from pathlib import Path
 
 from shamsu.abstract.context import _names as _names_from
 from shamsu.patch.safety import MutationSafetyError, validate_mutation_path
-from shamsu.patch.trash import TrashWorkspace
 from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.patch.trash import TrashWorkspace
 from shamsu.safety.sandbox import Sandbox
 
 

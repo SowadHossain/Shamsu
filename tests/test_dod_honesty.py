@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from shamsu.prd.contract import PRDContract
 from shamsu.registry.schema import (
     Category,
     DefinitionOfDone,
@@ -10,7 +11,6 @@ from shamsu.registry.schema import (
     Manifest,
     RegistryEntry,
 )
-from shamsu.prd.contract import PRDContract
 from shamsu.verify import build_prd_checklist, run_dod
 
 

@@ -6,7 +6,8 @@ import pytest
 
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.patch.engine import PatchEngine
-from shamsu.types import ContextPack, LLMResponse, SearchResult, TestRunResult as ShamsuTestRunResult
+from shamsu.types import ContextPack, LLMResponse, SearchResult
+from shamsu.types import TestRunResult as ShamsuTestRunResult
 
 
 class FakeSearch:
