@@ -373,6 +373,15 @@ def _asks_prd_files(text: str) -> bool:
 
 def _should_show_mentions(text: str, mentions: list[MentionContext]) -> bool:
     lowered = text.lower()
+    if not read_only.applies(text) and re.search(
+        r"\b(create|write|build|implement|fix|repair|edit|update|modify|change|"
+        r"add|remove|delete|rename|move)\b",
+        lowered,
+    ):
+        # Mention resolution is context for a mutation, never the terminal
+        # action. In particular, one unsupported/ambiguous mention must not
+        # turn "fix these files" into a read-only context dump.
+        return False
     if any(item.kind == "ambiguous" or item.error for item in mentions):
         return True
     return any(

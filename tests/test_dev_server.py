@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from shamsu.tools import dev_server
@@ -40,6 +41,36 @@ def test_dev_server_launches_detached_without_waiting(monkeypatch, tmp_path: Pat
     assert result.pid == 1234
     assert result.url == "http://localhost:5173/"
     assert calls == [("npm run dev", tmp_path.resolve())]
+
+
+def test_python_dev_server_uses_existing_project_venv(monkeypatch, tmp_path: Path):
+    calls = []
+    interpreter = (
+        tmp_path / ".venv" / "Scripts" / "python.exe"
+        if os.name == "nt"
+        else tmp_path / ".venv" / "bin" / "python"
+    )
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("", encoding="utf-8")
+    (tmp_path / "manage.py").write_text("", encoding="utf-8")
+
+    class FakeProcess:
+        pid = 1235
+
+    monkeypatch.setattr(
+        dev_server,
+        "_launch_detached",
+        lambda command, cwd: calls.append((command, cwd)) or FakeProcess(),
+    )
+    monkeypatch.setattr(dev_server, "_pid_alive", lambda pid: True)
+
+    result = DevServerManager(tmp_path, approval_func=lambda _request: True).start(
+        "python manage.py runserver"
+    )
+
+    assert result.launched is True
+    assert str(interpreter) in result.command
+    assert calls == [(result.command, tmp_path.resolve())]
 
 
 def test_dev_server_denied_command_does_not_launch(monkeypatch, tmp_path: Path):

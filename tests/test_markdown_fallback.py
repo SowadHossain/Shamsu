@@ -208,3 +208,23 @@ def test_two_existing_files_mentioned_is_ambiguous(tmp_path: Path):
     # No unique target -> the comment-path inference path, which finds none.
     assert result.handled is False
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "a"
+
+
+def test_multi_file_fix_never_invents_a_prose_prefixed_path(tmp_path: Path):
+    for path, content in (
+        ("client/frontend.js", "fetch('/api/todos');\n"),
+        ("server.js", "app.get('/api/tasks', handler);\n"),
+        ("repository.py", "TABLE = 'missing_tasks'\n"),
+        ("schema.sql", "CREATE TABLE tasks (id INTEGER);\n"),
+    ):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    result = _fallback(tmp_path).maybe_write(
+        "Fix the wiring bugs across client/frontend.js, server.js, repository.py, and schema.sql.",
+        "```javascript\napp.get('/api/todos', handler);\n```",
+    )
+
+    assert result.handled is False
+    assert not (tmp_path / "wiring bugs across client" / "frontend.js").exists()

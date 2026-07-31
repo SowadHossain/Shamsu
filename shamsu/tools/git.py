@@ -89,8 +89,17 @@ class GitTool:
         status = self.status(cwd)
         if not status.is_git_repo:
             return "Workspace is not a git repository."
-        if status.is_dirty:
-            files = ", ".join(status.changed_files)
+        # When the workspace is a subdirectory of a larger repo, `git status`
+        # walks up and reports the PARENT repo's changes - dozens of unrelated
+        # files, each shown with a `../` prefix (and the untracked workspace
+        # dir itself as `./`). Those are noise before editing files *here*, and
+        # they printed on nearly every mutating turn. Only warn about changes
+        # inside this workspace, which a mutation might actually clobber.
+        in_workspace = [
+            file for file in status.changed_files if _is_inside_workspace(file)
+        ]
+        if in_workspace:
+            files = ", ".join(in_workspace)
             return f"Workspace has uncommitted changes: {files}"
         return None
 
@@ -341,6 +350,20 @@ class GitTool:
             stderr=stderr,
             message=f"Git command exited with {code}.",
         )
+
+
+def _is_inside_workspace(status_path: str) -> bool:
+    """A `git status --short` path is inside the current workspace unless it
+    climbs out with `../` or names the untracked workspace dir itself (`./`).
+    git emits forward slashes on every OS, so this needs no os.sep handling."""
+    path = status_path.strip().strip('"')
+    # A rename shows "old -> new"; judge by the destination.
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1].strip()
+    normalized = path.replace("\\", "/")
+    if normalized in {".", "./"}:
+        return False
+    return not normalized.startswith("../")
 
 
 def _failed_result(command: str, message: str) -> GitCommandResult:

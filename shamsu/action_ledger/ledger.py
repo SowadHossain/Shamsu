@@ -4,16 +4,26 @@ Storage layout (see agent context/prompts/audit_log.md):
 
     <workspace>/.shamsu/runs/<run-id>/
         manifest.json
+        narrative.md
         events.jsonl
         decisions.jsonl
         tool-calls.jsonl
         model-calls.jsonl
+        prompts/model_NNNN.txt
+        cot/model_NNNN.txt
+        responses/model_NNNN.txt
         commands/cmd_NNN.stdout.log, cmd_NNN.stderr.log
         diagnostics/error_packet_NNN.json
+        tool-results/tool_NNNN.json
         mutations/mutations.jsonl
         context-preview.json
         final-output.md
         summary.json
+
+The JSONL rows stay small: full prompt / chain-of-thought / response text is
+spilled to prompts/, cot/ and responses/ and referenced by relative path, the
+same way commands/ and tool-results/ already work. Set `log_level` to
+`compact` (or SHAMSU_LOG_LEVEL=compact) to keep previews only.
 
 Every write path funnels through _append_jsonl / _write_json / _write_text,
 which redact before touching disk - this is the single enforcement point for
@@ -31,9 +41,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shamsu.action_ledger.config import DEFAULT_CONFIG, load_config
+from shamsu.action_ledger.config import DEFAULT_CONFIG, load_config, wants_full_artifacts
 from shamsu.action_ledger.ids import new_run_id
 from shamsu.action_ledger.redaction import redact_text, redact_value
+from shamsu.context.budget import count_tokens
 from shamsu.safety.sandbox import Sandbox
 
 if TYPE_CHECKING:
@@ -41,6 +52,7 @@ if TYPE_CHECKING:
 
 PREVIEW_CHARS = 800
 MAX_LIST_ITEMS = 20
+TOOL_RESULT_ARTIFACT_TOKEN_THRESHOLD = 1000
 SCHEMA_VERSION = 2
 TERMINAL_OUTCOMES = frozenset(
     {
@@ -87,6 +99,7 @@ class ActionLedger:
         self.run_dir = self.sandbox.validate(Path(".shamsu") / "runs" / self.run_id)
         self.config = config or load_config(self.workspace)
         self.enabled = bool(self.config.get("enabled", True))
+        self.full_artifacts = wants_full_artifacts(self.config)
         self._max_inline = int(self.config.get("max_inline_event_size", DEFAULT_CONFIG["max_inline_event_size"]))
         self._event_seq = self._count_lines(self.events_path)
         self._decision_seq = self._count_lines(self.decisions_path)
@@ -130,6 +143,26 @@ class ActionLedger:
         return self.run_dir / "diagnostics"
 
     @property
+    def tool_results_dir(self) -> Path:
+        return self.run_dir / "tool-results"
+
+    @property
+    def prompts_dir(self) -> Path:
+        return self.run_dir / "prompts"
+
+    @property
+    def cot_dir(self) -> Path:
+        return self.run_dir / "cot"
+
+    @property
+    def responses_dir(self) -> Path:
+        return self.run_dir / "responses"
+
+    @property
+    def narrative_path(self) -> Path:
+        return self.run_dir / "narrative.md"
+
+    @property
     def mutations_dir(self) -> Path:
         return self.run_dir / "mutations"
 
@@ -170,12 +203,16 @@ class ActionLedger:
 
     def _initialize_run_layout(self) -> None:
         """Create the canonical artifact set before any activity is recorded."""
-        for directory in (
+        directories = [
             self.commands_dir,
             self.diagnostics_dir,
+            self.tool_results_dir,
             self.mutations_dir,
             self.contexts_dir,
-        ):
+        ]
+        if self.full_artifacts:
+            directories.extend([self.prompts_dir, self.cot_dir, self.responses_dir])
+        for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
         for path in (
             self.events_path,
@@ -288,18 +325,32 @@ class ActionLedger:
                 {
                     "type": str(event.get("type", "")),
                     "command": str(event.get("command", "")),
+                    "verifier_id": str(event.get("verifier_id", "")),
+                    "source": str(event.get("source", "")),
+                    "required": bool(event.get("required", False)),
                     "exit_code": event.get("exit_code"),
                 }
                 for event in events
-                if event.get("type") in {"verification_started", "verification_passed", "verification_failed"}
+                if event.get("type")
+                in {
+                    "verification_started",
+                    "verification_passed",
+                    "verification_failed",
+                    "verification_unavailable",
+                }
             ],
             "artifacts": {
                 "events": "events.jsonl",
                 "decisions": "decisions.jsonl",
                 "tool_calls": "tool-calls.jsonl",
+                "tool_results": "tool-results/",
                 "model_calls": "model-calls.jsonl",
+                "prompts": "prompts/",
+                "cot": "cot/",
+                "responses": "responses/",
                 "contexts": "contexts/",
                 "mutations": "mutations/mutations.jsonl",
+                "narrative": "narrative.md",
                 "final_output": "final-output.md",
             },
         }
@@ -347,11 +398,12 @@ class ActionLedger:
         event_types = [str(event.get("type", "")) for event in events]
         mutations = self._read_jsonl(self.mutations_dir / "mutations.jsonl")
         mutation_statuses = [str(item.get("status", "")) for item in mutations]
+        mutation_seen = bool(mutations) or "patch_apply_succeeded" in event_types
+        verification_passed = "verification_passed" in event_types
         failure_event_seen = any(
             event_type in event_types
             for event_type in {
                 "patch_validation_failed",
-                "patch_apply_failed",
                 "mutation_required_but_missing",
                 "contract_failed",
                 "agent_stopped",
@@ -378,14 +430,15 @@ class ActionLedger:
             or failure_event_seen
             or bad_mutation_seen
             or self._has_unrecovered_tool_failure()
+            or self._has_unrecovered_patch_failure(events)
         ):
             outcome = "failed"
+        elif mutation_seen and verification_passed:
+            outcome = "success"
+        elif mutation_seen:
+            outcome = "success_unverified"
         elif self._has_successful_command(events):
             outcome = "success"
-        elif any(
-            event_type in event_types for event_type in {"mutation_finished", "patch_apply_succeeded"}
-        ) and "verification_passed" not in event_types:
-            outcome = "success_unverified"
         else:
             outcome = "success"
         return outcome
@@ -428,7 +481,7 @@ class ActionLedger:
         for tool, (failure_index, record) in latest.items():
             if bool(record.get("ok")):
                 continue
-            if tool not in {"read_file", "edit_file", "write_file"}:
+            if tool not in {"read_file", "edit_file", "append_file", "write_file"}:
                 return True
             failed_args = arguments.get(str(record.get("tool_call_id", "")), {})
             failed_path = str(failed_args.get("filepath") or "").replace("\\", "/")
@@ -436,7 +489,7 @@ class ActionLedger:
             for later in records[failure_index + 1 :]:
                 if later.get("phase") != "finished" or not bool(later.get("ok")):
                     continue
-                if later.get("tool") not in {"edit_file", "write_file"}:
+                if later.get("tool") not in {"edit_file", "append_file", "write_file"}:
                     continue
                 later_args = arguments.get(str(later.get("tool_call_id", "")), {})
                 later_path = str(later_args.get("filepath") or "").replace("\\", "/")
@@ -455,9 +508,26 @@ class ActionLedger:
             event_type = str(event.get("type", ""))
             if event_type not in {"verification_failed", "verification_passed"}:
                 continue
-            key = str(event.get("command") or "__general__")
+            key = str(event.get("verifier_id") or event.get("command") or "__general__")
             latest[key] = event_type == "verification_passed"
         return any(not passed for passed in latest.values())
+
+    @staticmethod
+    def _has_unrecovered_patch_failure(events: list[dict[str, Any]]) -> bool:
+        """A bugfix retry that fixes an invalid first diff must not fail the
+        whole run: only a file whose LAST patch attempt in this run failed
+        counts. Without this, one bad diff followed by a successful rewrite of
+        the same file - the normal bugfix retry path - still reported the run
+        as failed even though the file was correctly fixed and verified."""
+        latest: dict[str, bool] = {}
+        for event in events:
+            event_type = str(event.get("type", ""))
+            if event_type not in {"patch_apply_failed", "patch_apply_succeeded"}:
+                continue
+            succeeded = event_type == "patch_apply_succeeded"
+            for file in event.get("files") or ["__unknown__"]:
+                latest[str(file)] = succeeded
+        return any(not succeeded for succeeded in latest.values())
 
     # -- generic event timeline ---------------------------------------------
 
@@ -536,6 +606,7 @@ class ActionLedger:
         }
         self._append_jsonl(self.tool_calls_path, record)
         self.log_event("tool_called", tool_call_id=call_id, tool=name)
+        self._narrative("append_tool_call", name, arguments or {})
         return call_id
 
     def log_tool_result(
@@ -548,9 +619,32 @@ class ActionLedger:
         status: str = "",
         exception_class: str = "",
         traceback_path: str = "",
+        original_tokens: int | None = None,
+        returned_tokens: int | None = None,
+        max_tokens: int | None = None,
+        truncated: bool | None = None,
+        artifact_path: str = "",
+        full_result_text: str = "",
     ) -> None:
         if not self.enabled:
             return
+        result_text = full_result_text or _tool_result_text(ok, message, data)
+        original_tokens = (
+            int(original_tokens)
+            if original_tokens is not None
+            else count_tokens(result_text)
+        )
+        returned_tokens = (
+            int(returned_tokens)
+            if returned_tokens is not None
+            else original_tokens
+        )
+        truncated = bool(truncated) if truncated is not None else returned_tokens < original_tokens
+        artifact_path = artifact_path or self._write_tool_result_artifact(
+            call_id,
+            result_text,
+            truncated or original_tokens > TOOL_RESULT_ARTIFACT_TOKEN_THRESHOLD,
+        )
         record = {
             **self._correlation(call_id, self.root_operation_id),
             "tool_call_id": call_id,
@@ -568,17 +662,49 @@ class ActionLedger:
             "diagnostics_path": (
                 str(data.get("diagnostics_path", "")) if isinstance(data, dict) else ""
             ),
+            "original_tokens": original_tokens,
+            "returned_tokens": returned_tokens,
+            "max_tokens": max_tokens,
+            "truncated": bool(truncated) if truncated is not None else False,
+            "artifact_path": artifact_path,
         }
         self._append_jsonl(self.tool_calls_path, record)
-        self.log_event("tool_finished", tool_call_id=call_id, tool=name, ok=bool(ok))
+        self._narrative("append_tool_result", name, bool(ok), message)
+        self.log_event(
+            "tool_finished",
+            tool_call_id=call_id,
+            tool=name,
+            ok=bool(ok),
+            original_tokens=original_tokens,
+            returned_tokens=returned_tokens,
+            truncated=bool(truncated) if truncated is not None else False,
+            artifact_path=artifact_path,
+        )
 
     # -- model calls ------------------------------------------------------------
 
-    def log_model_call_started(self, role: str, model: str, prompt: str = "") -> str:
+    def log_model_call_started(
+        self,
+        role: str,
+        model: str,
+        prompt: str = "",
+        *,
+        system: str = "",
+        messages: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Record a model call, capturing the request exactly as sent.
+
+        `system`/`messages`/`tools` are what actually goes over the wire on the
+        chat path; passing them makes the stored prompt the real thing rather
+        than a reconstruction. `prompt` alone still works for the completion
+        path. The full text lands in prompts/<call_id>.txt; the JSONL row keeps
+        the hash, a preview, and the path."""
         if not self.enabled:
             return ""
         call_id = self._next_id("_model_call_seq", "model", 4)
         self._model_started[call_id] = time.perf_counter()
+        request_text = _format_request(prompt, system, messages, tools)
         record: dict[str, Any] = {
             **self._correlation(call_id, self.root_operation_id),
             "model_call_id": call_id,
@@ -587,10 +713,15 @@ class ActionLedger:
             "role": role,
             "model": model,
             "phase": "started",
-            "prompt_sha256": hashlib.sha256((prompt or "").encode("utf-8")).hexdigest(),
+            "prompt_sha256": hashlib.sha256(request_text.encode("utf-8")).hexdigest(),
+            "prompt_chars": len(request_text),
+            "message_count": len(messages or []),
+            "tool_count": len(tools or []),
         }
-        if self.config.get("log_model_prompts", False):
-            record["prompt_preview"] = _preview(prompt or "")
+        if self.full_artifacts:
+            record["prompt_path"] = self._write_artifact(self.prompts_dir, call_id, request_text)
+        if self.config.get("log_model_prompts", True):
+            record["prompt_preview"] = _preview(request_text)
         self._append_jsonl(self.model_calls_path, record)
         # Produces the catalog's "planner_model_called"/"coder_model_called"
         # for those roles, and an analogous name for every other specialist.
@@ -636,6 +767,9 @@ class ActionLedger:
             "traceback_path": traceback_path,
             "meta": self._compact(meta or {}),
         }
+        if self.full_artifacts and response:
+            record["response_path"] = self._write_artifact(self.responses_dir, call_id, response)
+        record["response_chars"] = len(response or "")
         if self.config.get("log_model_responses", True):
             record["response_preview"] = _preview(response or "")
         self._append_jsonl(self.model_calls_path, record)
@@ -647,6 +781,52 @@ class ActionLedger:
             duration_ms=record["duration_ms"],
             error=error,
         )
+
+    def log_model_thinking(
+        self,
+        call_id: str,
+        role: str,
+        model: str,
+        thinking: str,
+    ) -> str:
+        """Capture a reasoning model's full chain-of-thought.
+
+        Written untruncated to cot/<call_id>.txt and referenced by path - the
+        previous 4000-char clip meant a long reasoning trace was never
+        recoverable, which is exactly when you need it. Returns the relative
+        path, or "" when there was no reasoning or artifacts are off.
+
+        This is debug evidence only: like everything else under runs/, it is
+        never read back into a model prompt (see the module docstring)."""
+        if not self.enabled:
+            return ""
+        thinking = (thinking or "").strip()
+        if not thinking:
+            return ""
+        cot_path = ""
+        if self.full_artifacts:
+            cot_path = self._write_artifact(self.cot_dir, call_id or "model_unknown", thinking)
+        record = {
+            **self._correlation(call_id or self.root_operation_id, self.root_operation_id),
+            "model_call_id": call_id,
+            "run_id": self.run_id,
+            "timestamp": _now(),
+            "role": role,
+            "model": model,
+            "phase": "thinking",
+            "thinking_chars": len(thinking),
+            "cot_path": cot_path,
+        }
+        self._append_jsonl(self.model_calls_path, record)
+        self.log_event(
+            "model_thinking_captured",
+            model_call_id=call_id,
+            role=role,
+            model=model,
+            thinking_chars=len(thinking),
+            cot_path=cot_path,
+        )
+        return cot_path
 
     # -- commands ------------------------------------------------------------
 
@@ -804,11 +984,115 @@ class ActionLedger:
 
     # -- verification ------------------------------------------------------------
 
-    def log_verification_started(self, command: str) -> None:
-        self.log_event("verification_started", command=command)
+    def verifier_id_for(self, command: str, source: str = "") -> str:
+        command = (command or "").strip()
+        source = (source or "").strip()
+        if not command and not source:
+            return ""
+        digest = hashlib.sha256(f"{source}\0{command}".encode("utf-8")).hexdigest()
+        return f"verifier_{digest[:12]}"
 
-    def log_verification_result(self, passed: bool, summary: str = "") -> None:
-        self.log_event("verification_passed" if passed else "verification_failed", summary=summary)
+    def log_verification_started(
+        self,
+        command: str,
+        *,
+        verifier_id: str = "",
+        source: str = "",
+        transaction_id: str = "",
+        required: bool = False,
+        files: list[str] | None = None,
+        **fields: Any,
+    ) -> None:
+        verifier_id = verifier_id or self.verifier_id_for(command, source)
+        self.log_event(
+            "verification_started",
+            command=command,
+            verifier_id=verifier_id,
+            source=source,
+            transaction_id=transaction_id,
+            required=bool(required),
+            files=list(files or []),
+            **fields,
+        )
+
+    def log_verification_result(
+        self,
+        passed: bool,
+        summary: str = "",
+        *,
+        command: str = "",
+        verifier_id: str = "",
+        source: str = "",
+        transaction_id: str = "",
+        required: bool = False,
+        files: list[str] | None = None,
+        exit_code: int | None = None,
+        **fields: Any,
+    ) -> None:
+        verifier_id = verifier_id or self.verifier_id_for(command, source)
+        self.log_event(
+            "verification_passed" if passed else "verification_failed",
+            command=command,
+            verifier_id=verifier_id,
+            source=source,
+            transaction_id=transaction_id,
+            required=bool(required),
+            files=list(files or []),
+            exit_code=exit_code,
+            summary=summary,
+            **fields,
+        )
+
+    def log_verification_unavailable(
+        self,
+        summary: str = "",
+        *,
+        command: str = "",
+        verifier_id: str = "",
+        source: str = "",
+        transaction_id: str = "",
+        required: bool = False,
+        files: list[str] | None = None,
+        **fields: Any,
+    ) -> None:
+        verifier_id = verifier_id or self.verifier_id_for(command, source)
+        self.log_event(
+            "verification_unavailable",
+            command=command,
+            verifier_id=verifier_id,
+            source=source,
+            transaction_id=transaction_id,
+            required=bool(required),
+            files=list(files or []),
+            summary=summary,
+            **fields,
+        )
+
+    def log_repair_attempt(
+        self,
+        *,
+        attempt_index: int,
+        outcome: str,
+        kept: bool,
+        files_changed: list[str] | None = None,
+        before_signature: str = "",
+        after_signature: str = "",
+        note: str = "",
+        verifier_id: str = "",
+        command: str = "",
+    ) -> None:
+        self.log_event(
+            "repair_attempt_finished",
+            attempt_index=attempt_index,
+            outcome=outcome,
+            kept=bool(kept),
+            files_changed=list(files_changed or []),
+            before_signature=before_signature,
+            after_signature=after_signature,
+            note=note,
+            verifier_id=verifier_id,
+            command=command,
+        )
 
     # -- context preview / memory / classification --------------------------
 
@@ -931,6 +1215,57 @@ class ActionLedger:
                     error="Run ended before the model call returned.",
                 )
 
+    def _write_tool_result_artifact(
+        self,
+        call_id: str,
+        full_result_text: str,
+        truncated: bool,
+    ) -> str:
+        if not truncated or not full_result_text:
+            return ""
+        safe_call_id = "".join(char for char in call_id if char.isalnum() or char in {"-", "_"})
+        path = self.tool_results_dir / f"{safe_call_id or 'tool_result'}.json"
+        self._write_text(path, full_result_text)
+        return str(path.relative_to(self.run_dir).as_posix())
+
+    def _narrative(self, method: str, *args: Any) -> None:
+        """Mirror one step into this run's readable narrative (tier 2).
+
+        Tools are recorded here rather than from the trace because every
+        execution path logs them here. Imported lazily so the action_ledger
+        package carries no UI dependency at import time; best-effort, because a
+        narrative failure must never break a run."""
+        if not self.enabled:
+            return
+        try:
+            from shamsu.ui.narrative import NarrativeWriter
+
+            writer = NarrativeWriter(self.run_dir, run_id=self.run_id)
+            getattr(writer, method)(*args)
+        except Exception:
+            pass
+
+    def _write_artifact(self, directory: Path, call_id: str, text: str) -> str:
+        """Spill one full-fidelity text artifact and return its relative path.
+        Goes through _write_text, so it is redacted like everything else."""
+        if not text:
+            return ""
+        safe_call_id = "".join(char for char in (call_id or "") if char.isalnum() or char in {"-", "_"})
+        stem = safe_call_id or "model_unknown"
+        path = directory / f"{stem}.txt"
+        # Callers without a ledger call id (the plain completion path) all land
+        # on the same stem, so never let a second trace silently overwrite one.
+        suffix = 2
+        while path.exists():
+            path = directory / f"{stem}_{suffix}.txt"
+            suffix += 1
+        try:
+            self._write_text(path, text)
+        except OSError:
+            # Artifact capture is best-effort; a full disk must not kill the run.
+            return ""
+        return str(path.relative_to(self.run_dir).as_posix())
+
     # -- internal: storage helpers (single redaction/enforcement point) ----------
 
     def _compact(self, value: Any) -> Any:
@@ -1026,6 +1361,72 @@ def _truncate(text: str, limit: int) -> str:
     return f"{text[:limit]}... [truncated {len(text) - limit} chars]"
 
 
+def _format_request(
+    prompt: str,
+    system: str = "",
+    messages: list[dict[str, Any]] | None = None,
+    tools: list[dict[str, Any]] | None = None,
+) -> str:
+    """Render a model request as readable text: system prompt, every message in
+    order (including assistant tool calls), the raw prompt, then the tool
+    schemas. Plain sections rather than JSON so the file can be read directly."""
+    if not system and not messages and not tools:
+        return prompt or ""
+    sections: list[str] = []
+    if system:
+        sections.append(f"===== SYSTEM =====\n{system}")
+    for index, message in enumerate(messages or []):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role", "?"))
+        block = [f"===== MESSAGE {index} ({role}) =====", str(message.get("content", "") or "")]
+        name = str(message.get("name", "") or "")
+        if name:
+            block.insert(1, f"[name: {name}]")
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            block.append(f"--- tool_calls ---\n{json.dumps(tool_calls, indent=2, default=str)}")
+        sections.append("\n".join(block))
+    if prompt:
+        sections.append(f"===== PROMPT =====\n{prompt}")
+    if tools:
+        sections.append(f"===== TOOL SCHEMAS =====\n{json.dumps(tools, indent=2, default=str)}")
+    return "\n\n".join(sections)
+
+
+def _tool_result_text(ok: bool, message: str, data: Any) -> str:
+    return json.dumps(
+        {
+            "ok": bool(ok),
+            "message": message,
+            "data": data if data is not None else {},
+        },
+        ensure_ascii=True,
+        default=str,
+    )
+
+
+def _open_narrative(ledger: ActionLedger, prompt: str) -> None:
+    """Start this run's readable narrative (tier 2 of the log).
+
+    `start_run` is the single entry point every caller - interactive REPL and
+    headless CLI alike - uses to begin a turn, so opening here needs no changes
+    at the dozen dispatch sites. Imported lazily to keep the action_ledger
+    package free of a UI dependency at import time. Best-effort by design."""
+    if not ledger.enabled:
+        return
+    try:
+        from shamsu.ui.narrative import NarrativeWriter, write_layout_readme
+
+        session_dir = None
+        if ledger.session_id:
+            session_dir = ledger.workspace / ".shamsu" / "sessions" / ledger.session_id
+        NarrativeWriter(ledger.run_dir, session_dir, run_id=ledger.run_id).open_turn(prompt)
+        write_layout_readme(ledger.workspace)
+    except Exception:
+        pass
+
+
 def start_run(
     workspace: Path,
     prompt: str,
@@ -1041,6 +1442,7 @@ def start_run(
         turn_id=turn_id,
     )
     ledger.start(prompt)
+    _open_narrative(ledger, prompt)
     if session_logger is not None:
         session_logger.log(
             "run.linked",

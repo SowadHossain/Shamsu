@@ -269,6 +269,18 @@ def test_dry_run_file_creation_does_not_hijack_either(prd_workspace: Path):
     assert repl._looks_like_prd_build_request(DRY_RUN_PROMPT, prd_workspace) is False
 
 
+def test_creating_a_named_file_from_prd_content_does_not_launch_the_product_builder(
+    prd_workspace: Path,
+):
+    prompt = (
+        "Create IMPLEMENTATION_NOTES.md from the TaskFlow PRD documentation. "
+        "Include an Out of Scope heading."
+    )
+
+    assert repl._looks_like_prd_build_request(prompt, prd_workspace) is False
+    assert repl._classify_route_label(prompt, prd_workspace) == "file.write"
+
+
 def test_a_real_prd_build_request_still_routes_to_prd_build(prd_workspace: Path):
     """The hijack fix must not cost the feature: an actual build request, with
     or without naming the PRD, still reaches the builder."""

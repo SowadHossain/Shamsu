@@ -1,0 +1,9 @@
+{
+  "version": "0.1.0",
+  "tags": ["react", "vite", "typescript", "frontend", "vitest"],
+  "triggers": ["react", "vite", "tsx", "dashboard", "frontend", "spa"],
+  "applies_to": ["generate", "code_edit", "bug_fix", "test_gen"],
+  "dependencies": ["developer"],
+  "checks": ["npm test -- --run", "npm run build"],
+  "context_budget_tokens": 1100
+}

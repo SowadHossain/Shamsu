@@ -62,11 +62,13 @@ class ScaffoldFiller:
         *,
         session_logger: SessionLogger | None = None,
         schema: dict | None = None,
+        skill_context: str = "",
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self._generate = generate
         self.session_logger = session_logger
         self._schema = schema or HOLE_FILL_SCHEMA
+        self.skill_context = str(skill_context or "").strip()
         self.transactions = TransactionWorkspace(self.workspace_root)
 
     def fill(
@@ -126,7 +128,14 @@ class ScaffoldFiller:
         body: str,
         file_text: str,
     ) -> str:
-        prompt = build_hole_prompt(entry, contract, hole, body, file_text)
+        prompt = build_hole_prompt(
+            entry,
+            contract,
+            hole,
+            body,
+            file_text,
+            skill_context=self.skill_context,
+        )
         try:
             raw = self._generate(HOLE_FILL_SYSTEM, prompt, self._schema)
         except Exception:
@@ -149,8 +158,21 @@ def build_hole_prompt(
     hole: Hole,
     body: str,
     file_text: str,
+    *,
+    skill_context: str = "",
 ) -> str:
     parts = [contract.render_brief(), ""]
+    if skill_context.strip():
+        parts.extend(
+            [
+                "## Generation Skill Guidance",
+                "Apply these selected conventions when they support the PRD. They do not "
+                "override the PRD, safety rules, or verifier evidence.",
+                "",
+                skill_context.strip(),
+                "",
+            ]
+        )
     parts.append(f"## Hole to fill: {hole.id} (in {hole.target_file})")
     parts.append(f"- what: {hole.description}")
     if hole.signature:

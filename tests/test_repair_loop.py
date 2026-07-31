@@ -4,6 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from shamsu.action_ledger.context import clear_current_run, set_current_run
+from shamsu.action_ledger.ledger import start_run
+from shamsu.action_ledger import store
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.repair.comparator import ErrorComparator, RepairOutcome
 from shamsu.repair.import_resolver import suggest_import_fix
@@ -91,6 +94,25 @@ def test_jsx_error_classified_and_carries_location(tmp_path: Path):
     assert errors[0].kind is ErrorKind.JSX_ERROR
     assert errors[0].file == "src/ui/App.tsx"
     assert errors[0].line == 12
+
+
+def test_py_compile_syntax_error_becomes_repairable_root(tmp_path: Path):
+    log = (
+        '  File "ledgerlite.py", line 94\n'
+        "    f.write('id,category,amount,note\n"
+        "            ^\n"
+        "SyntaxError: unterminated string literal (detected at line 94)\n"
+    )
+
+    packet = DiagnosticDigest(tmp_path).run("python -m py_compile ledgerlite.py", tmp_path, 1, "", log)
+    errors = repair_errors_from_packet(packet)
+    primary = select_primary_error(errors)
+
+    assert packet.parser_chain == ["python_fallback"]
+    assert primary is not None
+    assert primary.kind is ErrorKind.SYNTAX_ERROR
+    assert primary.file == "ledgerlite.py"
+    assert primary.line == 94
 
 
 def test_npm_missing_script_parsed(tmp_path: Path):
@@ -279,6 +301,35 @@ def test_loop_logs_attempt_signatures(tmp_path: Path):
     assert attempt.outcome is RepairOutcome.SOLVED
 
 
+def test_loop_writes_repair_attempt_to_action_ledger(tmp_path: Path):
+    _write_ts_project(tmp_path)
+    ledger = start_run(tmp_path, "repair the project")
+    set_current_run(ledger)
+    try:
+        verifier = ScriptedVerifier("tsc", [(2, TSC_ERR), (0, "")])
+        plan = RepairPlan(
+            root_cause="missing export",
+            target_file="src/app.ts",
+            full_content="export const foo = 1;\n",
+        )
+        result = RepairLoop(tmp_path, verifier, ScriptedProposer([plan]), max_attempts=2).run()
+    finally:
+        clear_current_run()
+
+    events = store.load_events(tmp_path, ledger.run_id)
+    repair_events = [event for event in events if event.get("type") == "repair_attempt_finished"]
+    verification_events = [
+        event for event in events
+        if event.get("type") in {"verification_passed", "verification_failed"}
+    ]
+    assert result.success is True
+    assert repair_events[-1]["outcome"] == "SOLVED"
+    assert repair_events[-1]["kept"] is True
+    assert repair_events[-1]["verifier_id"].startswith("verifier_")
+    assert verification_events
+    assert all(event.get("verifier_id") for event in verification_events)
+
+
 def test_loop_debug_context_carries_import_suggestion(tmp_path: Path):
     (tmp_path / "src" / "ui").mkdir(parents=True)
     (tmp_path / "src" / "ui" / "index.ts").write_text('import { Hud } from "./ui/Hud";\n')
@@ -372,6 +423,29 @@ def test_llm_proposer_returns_none_without_edit():
         return '{"root_cause": "x", "target_file": "a.ts"}'
 
     assert LLMProposer(generate).propose(_debug_context()) is None
+
+
+def test_llm_proposer_retries_diagnosis_only_plan():
+    responses = [
+        '{"root_cause": "unterminated string literal", "target_file": "ledgerlite.py"}',
+        (
+            '{"root_cause": "unterminated string literal", '
+            '"target_file": "ledgerlite.py", "search": "bad", "replace": "good"}'
+        ),
+    ]
+    prompts: list[str] = []
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        prompts.append(user)
+        return responses[min(len(prompts) - 1, len(responses) - 1)]
+
+    plan = LLMProposer(generate).propose(_debug_context())
+
+    assert plan is not None
+    assert plan.search == "bad"
+    assert plan.replace == "good"
+    assert len(prompts) == 2
+    assert "Previous invalid repair JSON" in prompts[1]
 
 
 def test_llm_proposer_survives_generate_exception():

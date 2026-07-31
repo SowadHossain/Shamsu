@@ -3,12 +3,19 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
-import pdfplumber
-
-from shamsu.prd.document import normalize_pdf_pages
-from shamsu.prd.parser import MarkdownPRDParser, parse_prd_text
 from shamsu.types import ParsedPRD
+
+
+class _LazyPdfPlumber:
+    def open(self, *args: Any, **kwargs: Any):
+        import pdfplumber as module
+
+        return module.open(*args, **kwargs)
+
+
+pdfplumber = _LazyPdfPlumber()
 
 
 class PRDParseError(Exception):
@@ -47,17 +54,23 @@ class PRDInputParser:
         path = Path(file_path)
         suffix = path.suffix.lower()
         if suffix in {".md", ".markdown"}:
+            from shamsu.prd.parser import MarkdownPRDParser
+
             parsed = MarkdownPRDParser().parse(path)
             parsed.source_path = str(path.resolve())
             parsed.source_kind = "markdown"
             return parsed
         if suffix == ".txt":
+            from shamsu.prd.parser import parse_prd_text
+
             raw_text = path.read_text(encoding="utf-8")
             parsed = parse_prd_text(raw_text, fallback_title=path.stem)
             parsed.source_path = str(path.resolve())
             parsed.source_kind = "text"
             return parsed
         if suffix == ".pdf":
+            from shamsu.prd.parser import parse_prd_text
+
             document = _extract_pdf_document(path)
             parsed = parse_prd_text(
                 document.text,
@@ -76,6 +89,8 @@ class PRDInputParser:
 
 
 def _extract_pdf_document(path: Path):
+    from shamsu.prd.document import normalize_pdf_pages
+
     try:
         with pdfplumber.open(path) as pdf:
             page_text = [(page.extract_text() or "").strip() for page in pdf.pages]

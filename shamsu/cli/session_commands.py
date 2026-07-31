@@ -9,9 +9,15 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from shamsu.action_ledger import store
-from shamsu.action_ledger.config import load_config
+from shamsu.action_ledger.config import (
+    DEFAULT_LOG_LEVEL,
+    LOG_LEVEL_ENV_VAR,
+    config_path,
+    load_config,
+)
 from shamsu.safety.approval import ask_approval
 from shamsu.types import ApprovalRequest
 
@@ -94,6 +100,119 @@ def _summary(workspace: Path, run_id: str, console: Console) -> None:
     console.print(Panel("\n".join(lines), title=f"Run {run_id}"))
 
 
+def _narrative(workspace: Path, run_id: str, console: Console) -> None:
+    """Print the readable story of a run - tier 2 of the log."""
+    path = store.runs_dir(workspace) / run_id / "narrative.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        console.print(
+            f"[yellow]No narrative recorded for {run_id}.[/yellow]\n"
+            "[dim]Runs from before the narrative log predate this; new runs write it "
+            "automatically.[/dim]"
+        )
+        return
+    # Text(), not rich's Markdown renderer: Markdown emits box-drawing glyphs a
+    # legacy Windows console cannot encode, and log text containing "[REDACTED]"
+    # would otherwise be parsed as console markup.
+    console.print(Text(text))
+    console.print(f"[dim]{path}[/dim]")
+
+
+def _model_artifacts(workspace: Path, run_id: str, kind: str, console: Console) -> None:
+    """Print a run's captured prompts or chain-of-thought - tier 1 of the log,
+    in model-call order."""
+    directory = store.runs_dir(workspace) / run_id / ("prompts" if kind == "prompt" else "cot")
+    paths = sorted(directory.glob("*.txt")) if directory.is_dir() else []
+    if not paths:
+        label = "prompt" if kind == "prompt" else "chain-of-thought"
+        console.print(
+            f"[yellow]No {label} artifacts for {run_id}.[/yellow]\n"
+            "[dim]Reasoning is only captured when the model produces it, and no "
+            f"artifacts are written under {LOG_LEVEL_ENV_VAR}=compact.[/dim]"
+        )
+        return
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[red]Could not read {path.name}: {exc}[/red]")
+            continue
+        console.print(Panel(Text(text), title=f"{run_id} / {directory.name}/{path.name}"))
+    console.print(f"[dim]{directory}[/dim]")
+
+
+def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
+    """Signpost to this project's two logs.
+
+    SHAMSU writes both inside the workspace it worked on: the deep log (every
+    prompt, chain-of-thought and response) and the narrative log (the readable
+    story). Someone who wants to know "what did it actually do" should be able
+    to find that without reading source."""
+    parts = user_input.split(maxsplit=1)
+    subcommand = parts[1].strip().lower() if len(parts) > 1 else ""
+    root = Path(workspace).resolve() / ".shamsu"
+    runs_root = store.runs_dir(workspace)
+    run_example = runs_root / "<run-id>"
+    session_example = root / "sessions" / "<session-id>"
+    level = load_config(workspace).get("log_level", DEFAULT_LOG_LEVEL)
+
+    lines = [
+        f"Logs for this project live in [bold]{root}[/bold]",
+        "",
+        f"[bold]Narrative log[/bold] - the readable story",
+        f"  this request             {run_example / 'narrative.md'}",
+        f"  whole conversation       {session_example / 'narrative.md'}",
+        "",
+        f"[bold]Deep log[/bold] - everything the model saw and produced",
+        f"  {run_example}",
+        "    prompts/model_NNNN.txt    the full prompt as sent",
+        "    cot/model_NNNN.txt        the full chain-of-thought",
+        "    responses/model_NNNN.txt  the full model response",
+        "    tool-calls.jsonl          every tool call, arguments and result",
+        "    commands/                 stdout and stderr of every command",
+        "    mutations/                file changes, with rollback ids",
+        "",
+        f"[bold]Detail level[/bold]  {level}"
+        + (
+            "  (everything captured)"
+            if level == "full"
+            else "  (previews only - no artifact files)"
+        ),
+        f"  change with            {LOG_LEVEL_ENV_VAR}=full|compact",
+        "",
+        "[bold]Read them here[/bold]",
+        "  /run narrative         the story of the last run",
+        "  /run prompt            what the model was actually sent",
+        "  /run cot               what the model was thinking",
+        "  /runs                  list recent runs",
+        "  /logs open             show every path",
+    ]
+    console.print(Panel("\n".join(lines), title="SHAMSU logs"))
+
+    if subcommand == "open":
+        for label, path in (
+            ("runs", runs_root),
+            ("sessions", root / "sessions"),
+            ("audit", root / "audit"),
+            ("ledger config", config_path(workspace)),
+            ("layout notes", root / "README.md"),
+        ):
+            console.print(f"  {label:<14} {path}")
+        return
+
+    recent = store.list_runs(workspace, limit=5)
+    if not recent:
+        console.print("[dim]No runs recorded yet - the next request creates one.[/dim]")
+        return
+    table = Table(title="Recent runs")
+    for label in ("Run ID", "Status", "Prompt"):
+        table.add_column(label)
+    for item in recent:
+        table.add_row(item.run_id, item.status, item.prompt_preview[:60])
+    console.print(table)
+
+
 def handle_run(
     user_input: str,
     workspace: Path,
@@ -115,6 +234,9 @@ def handle_run(
         "diff",
         "export",
         "validate",
+        "narrative",
+        "prompt",
+        "cot",
     }:
         run_id = _resolve(workspace, argument, console)
     if subcommand == "last" and not run_id:
@@ -124,6 +246,12 @@ def handle_run(
         _summary(workspace, run_id, console)
         return
     if not run_id and subcommand not in {"clean"}:
+        return
+    if subcommand == "narrative":
+        _narrative(workspace, run_id, console)
+        return
+    if subcommand in {"prompt", "cot"}:
+        _model_artifacts(workspace, run_id, subcommand, console)
         return
     if subcommand == "timeline":
         events = store.load_events(workspace, run_id)

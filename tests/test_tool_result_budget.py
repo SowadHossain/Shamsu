@@ -2,7 +2,7 @@
 is capped BEFORE it enters chat history so it can't blow the window mid-loop."""
 from __future__ import annotations
 
-from shamsu.agents.chat_loop import _budget_tool_result_json
+from shamsu.agents.chat_loop import _budget_tool_result_json, _budget_tool_result_json_with_meta
 from shamsu.context.budget import count_tokens
 
 
@@ -35,3 +35,14 @@ def test_budget_keeps_leading_content():
     big = "IMPORTANT_HEADER " + ("filler " * 5000)
     out = _budget_tool_result_json(big, 200)
     assert out.startswith("IMPORTANT_HEADER")
+
+
+def test_budget_metadata_records_truncation_and_token_counts():
+    big = "IMPORTANT_HEADER " + ("filler " * 5000)
+    out, meta = _budget_tool_result_json_with_meta(big, 200)
+
+    assert out.startswith("IMPORTANT_HEADER")
+    assert meta["original_tokens"] > meta["returned_tokens"]
+    assert meta["returned_tokens"] <= 200
+    assert meta["max_tokens"] == 200
+    assert meta["truncated"] is True

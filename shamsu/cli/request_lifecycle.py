@@ -49,6 +49,31 @@ def finish_current_run(workspace: Path, ledger: ActionLedger) -> None:
     manifest = action_ledger_store.load_manifest(workspace, ledger.run_id)
     if manifest and manifest.get("status") == "running":
         ledger.finalize_from_evidence()
+    _close_run_narrative(workspace, ledger)
+
+
+def _close_run_narrative(workspace: Path, ledger: ActionLedger) -> None:
+    """Seal this turn's narrative and fold it into the session roll-up.
+
+    The single close point for both interactive and headless callers, mirroring
+    `start_run`'s single open point. Best-effort: the narrative is observability,
+    never a reason to fail a finished run."""
+    if not ledger.enabled:
+        return
+    try:
+        from shamsu.ui.narrative import NarrativeWriter
+
+        summary = action_ledger_store.load_summary(workspace, ledger.run_id) or {}
+        manifest = action_ledger_store.load_manifest(workspace, ledger.run_id) or {}
+        session_dir = None
+        if ledger.session_id:
+            session_dir = Path(workspace) / ".shamsu" / "sessions" / ledger.session_id
+        NarrativeWriter(ledger.run_dir, session_dir, run_id=ledger.run_id).close_turn(
+            final=action_ledger_store.load_final_output(workspace, ledger.run_id),
+            status=str(summary.get("status") or manifest.get("status") or "unknown"),
+        )
+    except Exception:
+        pass
 
 
 def _refresh_code_memory_after_mutations(workspace: Path, ledger: ActionLedger) -> None:

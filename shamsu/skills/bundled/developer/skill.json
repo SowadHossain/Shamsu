@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["coding", "bugfix", "refactor", "docs", "tests"],
+  "triggers": ["build", "create", "implement", "fix", "edit", "update", "write", "add", "debug"],
+  "applies_to": ["code_edit", "bug_fix", "test_gen", "doc_gen", "generate"],
+  "allowed_tools": ["search_index", "read_file", "write_file", "edit_file", "run_command"],
+  "context_budget_tokens": 900
+}

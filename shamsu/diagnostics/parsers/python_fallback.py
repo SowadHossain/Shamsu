@@ -6,9 +6,11 @@ import re
 from shamsu.diagnostics.types import DiagnosticRecord
 
 FRAME_RE = re.compile(r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>\S+)')
+SYNTAX_FRAME_RE = re.compile(r'^\s*File "(?P<file>[^"]+)", line (?P<line>\d+)\s*$')
 FINAL_EXCEPTION_RE = re.compile(r"^(?P<etype>[A-Za-z_][\w.]*(?:Error|Exception|Warning)):\s*(?P<message>.*)$")
 
 VENDOR_MARKERS = ("site-packages", "/.venv/", "\\.venv\\", "\\Lib\\", "/lib/python")
+SYNTAX_EXCEPTION_TYPES = {"SyntaxError", "IndentationError", "TabError"}
 
 
 def _is_user_frame(file_path: str) -> bool:
@@ -18,6 +20,10 @@ def _is_user_frame(file_path: str) -> bool:
 
 def parse_python_traceback(text: str) -> list[DiagnosticRecord]:
     lines = text.splitlines()
+    syntax_records = _parse_syntax_error_block(lines)
+    if syntax_records:
+        return syntax_records
+
     frames: list[tuple[str, int, str]] = []
     final_exception: tuple[str, str] | None = None
 
@@ -63,3 +69,50 @@ def _looks_like_traceback_context(lines: list[str], index: int) -> bool:
     follows a Traceback block, not an arbitrary log line mentioning "Error"."""
     window = lines[max(0, index - 15):index]
     return any("Traceback (most recent call last)" in line for line in window)
+
+
+def _parse_syntax_error_block(lines: list[str]) -> list[DiagnosticRecord]:
+    for index, line in enumerate(lines):
+        frame_match = SYNTAX_FRAME_RE.match(line)
+        if not frame_match:
+            continue
+        exception_index = _next_exception_line(lines, index + 1)
+        if exception_index is None:
+            continue
+        exc_match = FINAL_EXCEPTION_RE.match(lines[exception_index].strip())
+        if not exc_match:
+            continue
+        etype = exc_match.group("etype")
+        if etype not in SYNTAX_EXCEPTION_TYPES:
+            continue
+
+        file_path = frame_match.group("file")
+        line_no = int(frame_match.group("line"))
+        message = exc_match.group("message").strip()
+        raw_lines = lines[index : exception_index + 1]
+        caret_line = next((item for item in raw_lines if "^" in item), "")
+        column = caret_line.index("^") + 1 if "^" in caret_line else None
+        return [
+            DiagnosticRecord(
+                tool="python",
+                language="python",
+                severity="error",
+                category="syntax_error",
+                code=etype,
+                message=message,
+                file=file_path,
+                line=line_no,
+                column=column,
+                raw_excerpt="\n".join(raw_lines),
+                parser_name="python_fallback",
+                confidence=0.92,
+            )
+        ]
+    return []
+
+
+def _next_exception_line(lines: list[str], start: int) -> int | None:
+    for index in range(start, min(len(lines), start + 8)):
+        if FINAL_EXCEPTION_RE.match(lines[index].strip()):
+            return index
+    return None

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
-from shamsu.agents.planner import create_plan
+from shamsu.agents.planner import _decide_needs_input, _is_degenerate_question, create_plan
 from shamsu.context.builder import ContextBuilder
 from shamsu.types import ContextPack, LLMResponse, SearchResult
 
@@ -56,3 +57,89 @@ def test_create_plan_includes_the_goal_in_the_request():
     )
 
     assert "fix the bug in app.py" in result.pack.user_request
+
+
+# -- degenerate clarification question guard ----------------------------------
+
+
+def test_is_degenerate_question_rejects_the_live_repro_phrasing():
+    """Live repro (2026-07-23): a small model asked to decide whether to ask a
+    clarifying question echoed the meta-instruction back verbatim as the
+    question itself, on two unrelated prompts (auth scheme, delete-backup)."""
+    assert _is_degenerate_question("Do I need to ask a question before proceeding?")
+    assert _is_degenerate_question("Should I ask a question here?")
+
+
+def test_is_degenerate_question_accepts_a_real_concrete_question():
+    assert not _is_degenerate_question(
+        "Which authentication method should this app use: sessions, JWT, or OAuth?"
+    )
+    assert not _is_degenerate_question("Which file did you mean: users.db or users.db.bak?")
+
+
+class _StructuredFakeLLM(_FakeLLM):
+    def __init__(self, raw: str, structured_raw: str) -> None:
+        super().__init__(raw)
+        self.structured_raw = structured_raw
+        self.structured_calls: list[tuple[str, str, str]] = []
+
+    async def generate_structured(self, role, system, prompt, schema, **kwargs):
+        self.structured_calls.append((role, system, prompt))
+        return self.structured_raw
+
+
+def _pack(goal: str) -> ContextPack:
+    return ContextBuilder().pack(
+        results=_result(goal), request=goal, task_id="plan-decision", step_id=1, specialist="planner"
+    )
+
+
+def test_decide_needs_input_replaces_degenerate_auth_question_with_fallback():
+    llm = _StructuredFakeLLM(
+        "plan text",
+        json.dumps({"needs_input": True, "question": "Do I need to ask a question before proceeding?"}),
+    )
+
+    needs_input, question, options = asyncio.run(
+        _decide_needs_input(llm, _pack("add authentication"), "add authentication")
+    )
+
+    assert needs_input is True
+    assert "authentication approach" in question
+    assert [option["label"] for option in options] == ["Server sessions", "JWT", "OAuth/OIDC"]
+
+
+def test_decide_needs_input_discards_a_degenerate_question_without_fallback():
+    llm = _StructuredFakeLLM(
+        "plan text",
+        json.dumps({"needs_input": True, "question": "Do I need to ask a question before proceeding?"}),
+    )
+
+    needs_input, question, options = asyncio.run(
+        _decide_needs_input(llm, _pack("add input validation"), "add input validation")
+    )
+
+    assert needs_input is False
+    assert question == ""
+    assert options == []
+
+
+def test_decide_needs_input_keeps_a_real_question():
+    llm = _StructuredFakeLLM(
+        "plan text",
+        json.dumps(
+            {
+                "needs_input": True,
+                "question": "Which authentication method should this use?",
+                "options": [{"label": "Sessions"}, {"label": "JWT"}],
+            }
+        ),
+    )
+
+    needs_input, question, options = asyncio.run(
+        _decide_needs_input(llm, _pack("add authentication"), "add authentication")
+    )
+
+    assert needs_input is True
+    assert question == "Which authentication method should this use?"
+    assert [option["label"] for option in options] == ["Sessions", "JWT"]

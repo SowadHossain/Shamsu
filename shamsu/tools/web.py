@@ -24,15 +24,13 @@ import yaml
 
 from shamsu import __version__
 
-try:
-    import trafilatura
-except ModuleNotFoundError:  # pragma: no cover - exercised when old/global launchers miss deps
-    trafilatura = None
-
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
+
+_TRAFILATURA_NOT_LOADED = object()
+trafilatura: Any = _TRAFILATURA_NOT_LOADED
 
 DEFAULT_USER_AGENT = f"SHAMSU/{__version__} (+local coding agent)"
 DEFAULT_SEARXNG_URL = "http://localhost:8095"
@@ -1187,6 +1185,14 @@ def _simplify_search_query(query: str) -> str:
 
 
 def _extract_readable_text(html: str, url: str) -> tuple[str | None, str]:
+    global trafilatura
+    if trafilatura is _TRAFILATURA_NOT_LOADED:
+        try:
+            import trafilatura as trafilatura_module
+        except ModuleNotFoundError:  # pragma: no cover - old/global launcher missing deps
+            trafilatura = None
+        else:
+            trafilatura = trafilatura_module
     if trafilatura is None:
         return None, "none"
     extracted = trafilatura.extract(

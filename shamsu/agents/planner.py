@@ -29,6 +29,7 @@ so this never hard-depends on a capability the interface doesn't promise.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -158,22 +159,86 @@ async def _decide_needs_input(
     support on this LLM, a raise, junk output - degrades to "don't ask", which
     is exactly the old behavior.
     """
+    deterministic = deterministic_user_decision(goal)
     generate = getattr(llm, "generate_structured", None)
     if not callable(generate):
-        return False, "", []
+        return deterministic or (False, "", [])
     try:
         raw = await generate(
             "planner", DECISION_SYSTEM, _prompt_from_pack(pack, goal), DECISION_SCHEMA
         )
     except Exception:
-        return False, "", []
+        return deterministic or (False, "", [])
     data = _loads(raw)
     if not isinstance(data, dict):
-        return False, "", []
+        return deterministic or (False, "", [])
     question = str(data.get("question") or "").strip()
-    if not (bool(data.get("needs_input")) and question):
-        return False, "", []
+    if not (bool(data.get("needs_input")) and question) or _is_degenerate_question(question):
+        return deterministic or (False, "", [])
     return True, question, _options_from(data.get("options"))
+
+
+_ADD_AUTH_RE = re.compile(
+    r"\b(add|build|create|implement|introduce|set\s*up)\b"
+    r"(?:(?![.!?\n]).){0,80}\b(auth|authentication|login|sign[ -]?in)\b",
+    re.IGNORECASE,
+)
+_AUTH_APPROACH_RE = re.compile(
+    r"\b(jwt|json web token|session(?:-based)?|cookie(?:-based)?|oauth2?|oidc|"
+    r"openid connect|saml|basic auth|api key|passkey|magic link|"
+    r"firebase auth|auth0|clerk|supabase auth|nextauth|auth\.js)\b",
+    re.IGNORECASE,
+)
+
+
+def deterministic_user_decision(
+    goal: str,
+) -> tuple[bool, str, list[dict[str, str]]] | None:
+    """Catch a narrow expensive choice that small planners make inconsistently.
+
+    This intentionally does not classify generic "auth" work. Fixes, audits,
+    and tasks that name an approach still go through the normal planner. Only
+    an explicit request to introduce authentication with no scheme selected is
+    stopped before execution.
+    """
+    if not _ADD_AUTH_RE.search(goal) or _AUTH_APPROACH_RE.search(goal):
+        return None
+    return (
+        True,
+        "Which authentication approach should I implement?",
+        [
+            {
+                "label": "Server sessions",
+                "description": "Store login state on the server and use a secure session cookie.",
+            },
+            {
+                "label": "JWT",
+                "description": "Use signed tokens for stateless API authentication.",
+            },
+            {
+                "label": "OAuth/OIDC",
+                "description": "Delegate sign-in to an external identity provider.",
+            },
+        ],
+    )
+
+
+_DEGENERATE_QUESTION_RE = re.compile(
+    r"\b(do i need to ask|should i ask|need to ask (?:a|the) question|"
+    r"is there a question|any questions?\??$)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_degenerate_question(question: str) -> bool:
+    """A small model asked to decide *whether* to ask sometimes echoes that
+    meta-instruction back as the question itself - "Do I need to ask a
+    question before proceeding?" - instead of a real, concrete question about
+    the task (live repro: reproduced verbatim on two unrelated prompts).
+    That gives the user nothing to answer, so treat it the same as no
+    question at all - the same "junk output degrades to don't ask" rule this
+    function already applies to a missing/unparseable response."""
+    return bool(_DEGENERATE_QUESTION_RE.search(question))
 
 
 def _prompt_from_pack(pack: ContextPack, goal: str) -> str:

@@ -318,7 +318,10 @@ class LLMManager(ILLMManager):
         self, model: str, system: str, prompt: str,
         temperature: float = 0.1, json_schema: dict | None = None,
         keep_alive: str = "10m", num_ctx: int = 8192,
+        num_predict: int | None = None,
         _estimated_tokens: int = 0,
+        _ledger_call_id: str = "",
+        _role: str = "",
     ) -> str:
         payload = {
             "model": model,
@@ -333,39 +336,52 @@ class LLMManager(ILLMManager):
             },
             "keep_alive": keep_alive,
         }
+        if num_predict is not None:
+            payload["options"]["num_predict"] = int(num_predict)
         if json_schema is not None:
             payload["format"] = json_schema   # Ollama-native structured output
         text, thinking, prompt_eval_count = await self._stream_completion(model, payload)
         # Capture the reasoning trace (surfaced/logged, kept out of the text).
-        self._log_thinking(model, thinking)
+        self._log_thinking(model, thinking, _ledger_call_id, _role)
         # Calibrate future token estimates with Ollama's ground-truth count.
         if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
             self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
         return text
 
-    def _log_thinking(self, model: str, thinking: str) -> None:
+    def _log_thinking(
+        self, model: str, thinking: str, call_id: str = "", role: str = ""
+    ) -> None:
         """Record a reasoning model's chain-of-thought trace if it produced one.
 
-        Kept out of the returned text on purpose (answers/diffs must stay clean),
-        but logged AND handed to `on_thinking` so the REPL can show it - logging
-        it to the session file alone made reasoning invisible to the person
+        Kept out of the returned text on purpose (answers/diffs must stay clean).
+        The FULL trace goes to the run's `cot/` artifact via the ActionLedger;
+        the session event deliberately carries only metadata plus the path, so
+        raw reasoning never lands in the session timeline that other views read
+        back. Also handed to `on_thinking` so the REPL can show a glimpse -
+        logging it to a file alone made reasoning invisible to the person
         actually watching. Best-effort: never breaks a generation on a
         logging/display failure."""
         thinking = (thinking or "").strip()
         if not thinking:
             return
+        cot_path = ""
+        if self.action_ledger:
+            try:
+                cot_path = self.action_ledger.log_model_thinking(
+                    call_id, role or "specialist", model, thinking
+                )
+            except Exception:
+                pass
         if self.session_logger:
             try:
-                payload = {
-                    "model": model,
-                    "thinking_chars": len(thinking),
-                    "reasoning_available": True,
-                }
-                if self.action_ledger and self.action_ledger.config.get("debug_full_trace", False):
-                    payload["thinking"] = thinking[:4000]
                 self.session_logger.log(
                     "llm.thinking",
-                    payload,
+                    {
+                        "model": model,
+                        "thinking_chars": len(thinking),
+                        "reasoning_available": True,
+                        "cot_path": cot_path,
+                    },
                     "Model reasoning metadata",
                     workflow_id="reasoning",
                 )
@@ -415,10 +431,15 @@ class LLMManager(ILLMManager):
                 "Chat tool request sent to local model",
                 workflow_id=workflow_id,
             )
-        prompt_preview = "\n".join(str(item.get("content", "")) for item in messages[-8:])
         ledger_call_id = ""
         if self.action_ledger:
-            ledger_call_id = self.action_ledger.log_model_call_started(role, model, prompt_preview)
+            # Hand over the real request - system prompt, every message, and the
+            # tool schemas - instead of a reconstruction from the last 8
+            # messages, which silently dropped exactly the context needed to
+            # explain why a model answered the way it did.
+            ledger_call_id = self.action_ledger.log_model_call_started(
+                role, model, messages=messages, tools=tools
+            )
         started = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=_blocking_timeout()) as client:
@@ -463,7 +484,14 @@ class LLMManager(ILLMManager):
             )
         return data
     async def generate_structured(
-        self, role: str, system: str, prompt: str, schema: dict, *, temperature: float = 0.1
+        self,
+        role: str,
+        system: str,
+        prompt: str,
+        schema: dict,
+        *,
+        temperature: float = 0.1,
+        num_predict: int | None = None,
     ) -> str:
         """Schema-constrained generation for a given role's model. Public seam
         used by the scaffold/freeform hole-fill and the strict repair proposer.
@@ -480,6 +508,7 @@ class LLMManager(ILLMManager):
                     "endpoint": self.base_url,
                     "structured": True,
                     "schema_keys": sorted((schema or {}).keys()),
+                    "num_predict": num_predict,
                 },
                 f"Structured request sent to {role}",
                 workflow_id=workflow_id,
@@ -487,7 +516,9 @@ class LLMManager(ILLMManager):
         ledger_call_id = ""
         prompt_text = f"{system}\n\n{prompt}".strip()
         if self.action_ledger:
-            ledger_call_id = self.action_ledger.log_model_call_started(role, model, prompt_text)
+            ledger_call_id = self.action_ledger.log_model_call_started(
+                role, model, prompt, system=system
+            )
             self.action_ledger.log_context_preview(
                 {
                     "task_id": workflow_id,
@@ -505,7 +536,14 @@ class LLMManager(ILLMManager):
         started = time.perf_counter()
         try:
             raw = await self._generate(
-                model, system, prompt, temperature=temperature, json_schema=schema
+                model,
+                system,
+                prompt,
+                temperature=temperature,
+                json_schema=schema,
+                num_predict=num_predict,
+                _ledger_call_id=ledger_call_id,
+                _role=role,
             )
         except BaseException as exc:
             if self.action_ledger:
@@ -567,10 +605,13 @@ class LLMManager(ILLMManager):
             )
         router_call_id = ""
         if self.action_ledger:
-            router_call_id = self.action_ledger.log_model_call_started("router", self.router_model, user_msg)
+            router_call_id = self.action_ledger.log_model_call_started(
+                "router", self.router_model, user_msg, system=ROUTER_SYSTEM_PROMPT
+            )
         raw = await self._generate(
             self.router_model, ROUTER_SYSTEM_PROMPT, user_msg,
             temperature=0.0, json_schema=ROUTING_JSON_SCHEMA, keep_alive="-1",
+            _ledger_call_id=router_call_id, _role="router",
         )
         if self.action_ledger:
             self.action_ledger.log_model_call_finished(
@@ -696,6 +737,7 @@ class LLMManager(ILLMManager):
             raw = await self._generate(
                 model_name, "", prompt, temperature=temp,
                 _estimated_tokens=estimated_tokens,
+                _ledger_call_id=ledger_call_id, _role=specialist,
             )
         except Exception as exc:
             if self.action_ledger:
@@ -739,6 +781,8 @@ class LLMManager(ILLMManager):
         on_token: Callable[[str], None],
         temperature: float = 0.1, keep_alive: str = "10m", num_ctx: int = 8192,
         _estimated_tokens: int = 0,
+        _ledger_call_id: str = "",
+        _role: str = "",
     ) -> str:
         payload = {
             "model": model,
@@ -756,7 +800,7 @@ class LLMManager(ILLMManager):
         # Reasoning stays out of the visible answer tokens: `on_token` only ever
         # sees "response" chunks, never "thinking" ones.
         text, thinking, prompt_eval_count = await self._stream_completion(model, payload, on_token)
-        self._log_thinking(model, thinking)
+        self._log_thinking(model, thinking, _ledger_call_id, _role)
         # Same calibration as the non-streaming path (see _generate) - the
         # final streamed chunk carries the same ground-truth prompt_eval_count.
         if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
@@ -819,6 +863,7 @@ class LLMManager(ILLMManager):
             raw = await self._generate_stream(
                 model_name, "", prompt, on_token, temperature=temp,
                 _estimated_tokens=estimated_tokens,
+                _ledger_call_id=ledger_call_id, _role=specialist,
             )
         except Exception as exc:
             if self.action_ledger:

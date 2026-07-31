@@ -150,6 +150,18 @@ class MentionResolver:
     def resolve_all(self, text: str) -> list[MentionContext]:
         contexts = []
         for match in MENTION_RE.finditer(text):
+            # A Python decorator (`@app.route(...)`, `@property`) sits at the
+            # start of a line just like a real mention does, and the greedy
+            # path group happily matches its dotted name. Live repro: replayed
+            # model-generated code containing `@app.route(...)` got parsed as
+            # `@app.route`, "resolved" against workspace files, and derailed
+            # the whole turn into a file dump instead of the actual task.
+            # Only the unquoted bare-path form can collide with code syntax,
+            # and only with no space before the paren - a real mention
+            # followed by a parenthetical note ("@app.py (see below)") always
+            # has one; a decorator or call never does.
+            if match.group("path") and text[match.end() : match.end() + 1] == "(":
+                continue
             raw = match.group("double") or match.group("single") or match.group("path") or ""
             contexts.append(self.resolve(raw.strip("\"'")))
         return contexts

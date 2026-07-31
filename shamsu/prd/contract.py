@@ -167,14 +167,22 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
         summary_lines = _section_lines(parsed, "overview", exact=True)
     summary = " ".join(summary_lines[:2])
 
-    mechanics = _section_lines(parsed, "mechanics", "gameplay", "functional requirements")
+    mechanics = _section_lines(parsed, "mechanics", "gameplay", "functional requirements", "core workflows")
     controls = _section_lines(parsed, "controls", "input") or _scan_controls(lowered)
-    screens = _section_lines(parsed, "screens", "frontend pages", "pages")
-    acceptance = _section_lines(parsed, "acceptance criteria", exact=True)
+    screens = _section_lines(parsed, "screens", "frontend pages", "pages", "browser ui requirements")
+    acceptance = _section_lines(parsed, "acceptance criteria", "acceptance", exact=True)
     constraints = _section_lines(
         parsed, "constraints", "non-functional requirements", "performance requirements"
     )
-    feature_lines = _section_lines(parsed, "features", "functional requirements")
+    feature_lines = _section_lines(
+        parsed,
+        "features",
+        "functional requirements",
+        "core workflows",
+        "browser ui requirements",
+        "script requirements",
+        "demo data",
+    )
     if not feature_lines:
         feature_lines = [line for line in summary_lines if line.startswith(("-", "*", "\u2022"))]
 
@@ -200,8 +208,9 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
         parsed, "accessibility requirements", "responsive design requirements", "performance requirements",
         "audit and logging requirements", "date and time handling",
     )
-    tests = _section_lines(parsed, "testing requirements", "authentication tests", "authorization tests",
-                           "task tests", "category tests", "profile tests", "database tests")
+    tests = _section_lines(parsed, "testing requirements", "test requirements", "authentication tests",
+                           "authorization tests", "task tests", "category tests", "profile tests",
+                           "database tests")
     out_of_scope = _section_lines(parsed, "out of scope for initial release", exact=True)
     entities = [asdict(entity) for entity in extract_entities(parsed)]
     endpoints = _extract_api_endpoints(parsed)

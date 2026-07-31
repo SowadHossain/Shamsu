@@ -50,9 +50,29 @@ class LLMProposer:
             # loop and never a fabricated success.
             return None
         plan = _parse_plan(raw or "")
-        if plan is None or not plan.has_edit:
+        if plan is None:
             return None
+        if not plan.has_edit:
+            plan = self._retry_no_edit_plan(user, raw or "")
+            if plan is None or not plan.has_edit:
+                return None
         return plan
+
+    def _retry_no_edit_plan(self, user: str, raw: str) -> RepairPlan | None:
+        retry_user = (
+            f"{user}\n\n"
+            "## Previous invalid repair JSON\n"
+            f"{_preview(raw)}\n\n"
+            "That JSON diagnosed the failure but did not include an edit. Return corrected "
+            "JSON only. You MUST include either non-empty search+replace or non-empty "
+            "full_content for one shown file. If no edit is possible from the shown content, "
+            "return target_file as an empty string."
+        )
+        try:
+            retry_raw = self._generate(self._system, retry_user, self._schema)
+        except Exception:
+            return None
+        return _parse_plan(retry_raw or "")
 
 
 def _parse_plan(raw: str) -> RepairPlan | None:
@@ -84,3 +104,10 @@ def _loads(text: str) -> object | None:
         return json.loads(repair_json(text))
     except Exception:
         return None
+
+
+def _preview(text: str, limit: int = 1200) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[:limit].rstrip() + "\n...<truncated>"

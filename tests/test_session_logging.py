@@ -278,3 +278,25 @@ def test_project_spec_helper_still_has_generation_order():
     )
 
     assert spec.generation_order
+
+
+def test_session_thinking_event_carries_a_pointer_not_raw_reasoning(tmp_path):
+    """The session timeline is read back by summaries and search, so raw
+    chain-of-thought must live in the run artifact and only be referenced here."""
+    from shamsu.action_ledger.ledger import start_run
+    from shamsu.agents.chat_loop import AgentChatLoop
+
+    logger = SessionManager(tmp_path).create_session()
+    ledger = start_run(tmp_path, "reason about it", session_logger=logger)
+    loop = AgentChatLoop.__new__(AgentChatLoop)
+    loop.session_logger = logger
+    loop.action_ledger = ledger
+    loop.model_name = "deepseek-r1:7b"
+
+    loop._log_thinking("a very long private reasoning trace " * 500, round_index=1)
+
+    event = [item for item in logger.tail(20) if item["event_type"] == "llm.thinking"][-1]
+    assert "thinking" not in event["payload"]
+    assert event["payload"]["thinking_chars"] > 4000
+    cot_path = event["payload"]["cot_path"]
+    assert cot_path and (ledger.run_dir / cot_path).exists()

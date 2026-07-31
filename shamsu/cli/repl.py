@@ -49,9 +49,15 @@ from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult, _thinking_pr
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
+from shamsu.agents.freeform_generator import (
+    FILE_CONTENT_SCHEMA,
+    _loads as _loads_freeform_json,
+    _sanitize_generated_content,
+)
 from shamsu.agents.full_pipeline import FullDjangoPipeline, FullPipelineResult
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.agents.plan_mode import PlanningWorkflow
+from shamsu.agents.planner import deterministic_user_decision
 from shamsu.cli.command_router import CommandRouter
 from shamsu.cli.arguments import parse_args
 from shamsu.cli.approval_ui import (
@@ -63,11 +69,17 @@ from shamsu.cli.request_lifecycle import (
     log_assistant_message as _log_assistant_message,
     log_event as _log_event,
 )
+from shamsu.cli.session_commands import handle_logs as _modular_handle_logs
 from shamsu.cli.session_commands import handle_run as _modular_handle_run
 from shamsu.cli.session_commands import handle_runs as _modular_handle_runs
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.agents.qa_workflow import NO_LIVE_TOOLS_NOTICE, QAWorkflow
-from shamsu.agents.task_harness import append_task_handoff, build_task_plan, plan_log_payload
+from shamsu.agents.task_harness import (
+    TaskPlan,
+    append_task_handoff,
+    build_task_plan,
+    plan_log_payload,
+)
 from shamsu.agents.task_execution_workflow import TaskExecutionResult, TaskExecutionWorkflow
 from shamsu.agents.test_generation_workflow import TestGenerationWorkflow
 from shamsu.core.coordinator import Coordinator
@@ -78,9 +90,26 @@ from shamsu.memory.queue import flush_memory_queues, get_memory_queue
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
 from shamsu.verify import contract
-from shamsu.verify.gate import default_verify_command, verify_only
+from shamsu.verify.gate import default_verify_command, stack_of, verify_only
 from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
+from shamsu.prd.execution import (
+    attach_task_id,
+    block_milestone,
+    checkpoint_milestone,
+    first_incomplete_milestone_index,
+    initialize_prd_execution,
+    load_milestone_preflight,
+    mark_milestone_running,
+    milestone_lines_from_state,
+    model_preflight_schema,
+    record_milestone_preflight,
+    record_milestone_repair,
+    record_milestone_rollback,
+    render_preflight_context,
+    validate_model_preflight,
+)
 from shamsu.prd.project import build_project_spec, is_static_frontend_prd
+from shamsu.prd.requirements import compile_requirement_ledger, save_prd_execution_artifacts
 from shamsu.prd.state import create_generation_state, save_generation_state, state_path
 from shamsu.registry.schema import Category
 from shamsu.registry.suitability import templates_enabled
@@ -100,11 +129,13 @@ from shamsu.tasks.state import (
     load_task,
     mark_step_done,
     mark_step_failed,
+    mark_step_blocked,
     mark_step_running,
     save_task,
 )
 from shamsu.taskmaster.service import TaskmasterService
 from shamsu.taskmaster.types import TaskmasterTask
+from shamsu.skills.cli import handle_skills_command
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
 from shamsu.runtime.models import (
     DEFAULT_TIER,
@@ -135,7 +166,7 @@ from shamsu.patch import types as patch_types
 from shamsu.patch.engine import PatchEngine
 from shamsu.patch.preview import print_diff_preview
 from shamsu.diagnostics import swallowed
-from shamsu.patch.rollback import latest_undoable_transaction
+from shamsu.patch.rollback import latest_undoable_transaction, rollback_transaction
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
@@ -200,6 +231,7 @@ _RUN_SUBCOMMANDS = frozenset(
     {
         "last", "show", "timeline", "decisions", "tools", "commands",
         "context", "diff", "validate", "export", "clean",
+        "narrative", "prompt", "cot",
     }
 )
 
@@ -277,6 +309,10 @@ SYSTEM_COMMANDS = (
     "/sessions search ",
     "/permissions list",
     "/permissions clear",
+    "/skills",
+    "/skills list",
+    "/skills show ",
+    "/skills explain ",
     "/mcp status",
     "/mcp servers",
     "/mcp tools ",
@@ -338,8 +374,13 @@ SYSTEM_COMMANDS = (
     "/patch clean-trash",
     "/log",
     "/log tail",
+    "/logs",
+    "/logs open",
     "/runs",
     "/run last",
+    "/run narrative ",
+    "/run prompt ",
+    "/run cot ",
     "/run show ",
     "/run timeline ",
     "/run decisions ",
@@ -472,6 +513,9 @@ def _print_help(console: Console) -> None:
                     "  /sessions search <query>  Search titles, summaries, messages, memory",
                     "  /permissions list         Show remembered 'always allow' decisions",
                     "  /permissions clear        Forget all remembered approval decisions",
+                    "  /skills list              Show bundled, user, and workspace skills",
+                    "  /skills show <name>       Show one skill's instructions and policy",
+                    "  /skills explain <prompt>  Preview deterministic skill selection",
                     "  /mcp status              Connect to configured external MCP servers",
                     "  /mcp tools [server]      List discovered external tools",
                     "  /mcp config              Show MCP config locations and safe settings",
@@ -516,6 +560,8 @@ def _print_help(console: Console) -> None:
                     "  /trace on|off|verbose|raw Set the visible working trace (raw = debug: route, plan, tool calls/outputs, raw content)",
                     "  /debug on|off             Toggle a rich debug trace (route, model, plan, tool calls, tool outputs, file changes)",
                     "  /log tail                 Show recent session events",
+                    "  /logs                     Where this project's logs live, and the detail level",
+                    "  /logs open                Show every log path under .shamsu",
                     "  /audit-log tail [n]       Tail the detailed per-step audit trail (.shamsu/audit)",
                     "  /audit-log show <session> Show one session's full audit trail",
                     "  /audit-log grep <query>   Search the audit trail",
@@ -523,6 +569,9 @@ def _print_help(console: Console) -> None:
                     "  /audit-log open           Show the audit log locations",
                     "  /runs [n]                 List recent ActionLedger runs (local debug/audit log)",
                     "  /run last                 Show the latest run's summary",
+                    "  /run narrative [run-id]   Read a run's story: prompt, tools used, what it did",
+                    "  /run prompt [run-id]      Show the full prompts the model was sent",
+                    "  /run cot [run-id]         Show the full chain-of-thought the model produced",
                     "  /run show <run-id>        Show a run's manifest and summary",
                     "  /run timeline <run-id>    Show a run's chronological events",
                     "  /run decisions <run-id>   Show a run's decision summaries",
@@ -776,7 +825,11 @@ def _pipeline_generate(session_logger: SessionLogger | None):
         async def _call() -> str:
             return await asyncio.wait_for(
                 LLMManager(session_logger=session_logger, action_ledger=ledger).generate_structured(
-                    "coder", system, user, schema
+                    "coder",
+                    system,
+                    user,
+                    schema,
+                    num_predict=_structured_num_predict_for(system, schema),
                 ),
                 timeout=timeout_seconds,
             )
@@ -793,6 +846,32 @@ def _pipeline_generate(session_logger: SessionLogger | None):
             raise TimeoutError(f"Freeform model call timed out after {timeout_seconds:.0f}s") from exc
 
     return _generate
+
+
+def _freeform_num_predict() -> int:
+    raw = os.environ.get("SHAMSU_FREEFORM_NUM_PREDICT", "8192")
+    try:
+        value = int(raw)
+    except ValueError:
+        return 8192
+    return max(1024, value)
+
+
+def _structured_num_predict_for(system: str, schema: dict) -> int:
+    if "STRICT DEBUG MODE" in (system or ""):
+        return _env_int_at_least("SHAMSU_REPAIR_NUM_PREDICT", 1024, 256)
+    properties = (schema or {}).get("properties")
+    if isinstance(properties, dict) and "files" in properties:
+        return _env_int_at_least("SHAMSU_FREEFORM_PLAN_NUM_PREDICT", 2048, 512)
+    return _freeform_num_predict()
+
+
+def _env_int_at_least(name: str, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return max(minimum, value)
 
 
 def _parse_generate_prd_args(user_input: str) -> tuple[str, str]:
@@ -1929,6 +2008,7 @@ def _handle_run(
 # Temporary compatibility re-exports while callers migrate from repl.py.
 _handle_runs = _modular_handle_runs
 _handle_run = _modular_handle_run
+_handle_logs = _modular_handle_logs
 
 
 _ROOT_CAUSE_EXPLANATIONS = {
@@ -3566,11 +3646,39 @@ def _extract_requested_file_path(user_input: str) -> str | None:
     return None
 
 
+_BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_KNOWN_RUNNER_RE = re.compile(
+    r"^(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)\b", re.IGNORECASE
+)
+
+
+def _explicit_command_in_prompt(user_input: str) -> str:
+    """Return a backtick-quoted command the user spelled out, if there is one.
+
+    A single backticked token is a filename ("run `app.py`"), not a command, so
+    only a multi-token span counts. Used to stand down from command inference.
+    """
+    for match in _BACKTICK_SPAN_RE.finditer(str(user_input or "")):
+        candidate = match.group(1).strip()
+        if candidate and len(candidate.split()) > 1:
+            return candidate
+    return ""
+
+
 def _command_for_existing_script_request(user_input: str, workspace: Path) -> str:
     text = str(user_input or "")
     lowered = text.lower()
     if not re.search(r"\b(?:run|execute|launch)\b", lowered):
         return ""
+    # This path exists to infer an unstated command from a filename. When the
+    # user spelled the command out, inferring one from a filename inside it runs
+    # something they did not ask for - "run `python -m py_compile ok.py`" became
+    # `python ok.py`, which executes the script instead of compile-checking it.
+    # Honor the explicit command when it names a known runner (same allowlist as
+    # _composite_verification_command); otherwise stand down rather than guess.
+    explicit = _explicit_command_in_prompt(text)
+    if explicit:
+        return explicit if _KNOWN_RUNNER_RE.match(explicit) else ""
     requested = _extract_requested_file_path(text)
     if not requested:
         return ""
@@ -3612,20 +3720,41 @@ def _handle_run_existing_script_request(
     )
     call_id = ledger.log_tool_call("run_command", {"command": command}) if ledger else ""
     if ledger:
-        ledger.log_event("verification_started", command=command, source="direct_script_run")
+        verifier_id = ledger.verifier_id_for(command, "direct_script_run")
+        ledger.log_verification_started(
+            command,
+            verifier_id=verifier_id,
+            source="direct_script_run",
+            required=True,
+        )
+    else:
+        verifier_id = ""
     result = registry.execute("run_command", {"command": command})
     if ledger:
         ledger.log_tool_result(call_id, "run_command", result.ok, result.message, result.data)
-        ledger.log_event(
-            "verification_passed" if result.ok else "verification_failed",
+        ledger.log_verification_result(
+            bool(result.ok),
+            result.message,
             command=command,
+            verifier_id=verifier_id,
             source="direct_script_run",
+            required=True,
             exit_code=result.data.get("exit_code"),
         )
     stdout = str(result.data.get("stdout") or "").strip()
     stderr = str(result.data.get("stderr") or "").strip()
     output = stdout or stderr or result.message
-    body = f"Command output:\n```\n{output}\n```" if result.ok else f"Command failed:\n```\n{output}\n```"
+    # State the outcome, not just the bytes. "Run X and tell me whether it
+    # succeeded" was answered with a bare output fence - and a command like
+    # py_compile prints nothing on success, so that fence was empty and the
+    # question went unanswered. The exit code is known here; say it.
+    exit_code = result.data.get("exit_code")
+    verdict = "succeeded" if result.ok else "failed"
+    headline = f"`{command}` {verdict}"
+    if exit_code is not None:
+        headline += f" (exit {exit_code})"
+    label = "Command output" if result.ok else "Command failed"
+    body = f"{headline}\n\n{label}:\n```\n{output}\n```" if output else headline
     console.print(Panel(body, title=f"$ {command}", border_style="green" if result.ok else "red"))
     _log_assistant_message(session_logger, body, workflow_id="command.run")
     return body
@@ -3665,8 +3794,11 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     ("workspace.location", lambda text, ws: _looks_like_workspace_location_prompt(text)),
     ("workspace.files", lambda text, ws: _looks_like_workspace_files_prompt(text)),
     ("prd.build", lambda text, ws: _looks_like_prd_build_request(text, ws)),
+    ("docs.ingest", lambda text, ws: _looks_like_docs_ingest_request(text)),
+    ("docs.query", lambda text, ws: _looks_like_docs_query_request(text)),
     ("file.read", lambda text, ws: _looks_like_file_read_request(text)),
     ("file.write", lambda text, ws: _looks_like_file_write_request(text)),
+    ("package.install", lambda text, ws: _looks_like_package_install_request(text)),
     ("command.run", lambda text, ws: _command_for_existing_script_request(text, ws) != ""),
     # A self-contained coding question ("write python for the first 100 primes")
     # is answered directly by the model - no planner, no tool loop, no timeout.
@@ -3919,6 +4051,26 @@ async def _handle_request(
     if route_label == "prd.build":
         await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
         return
+    if route_label == "docs.ingest":
+        await _run_agent_chat(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+            use_long_term_memory=False,
+            use_planner=False,
+        )
+        return
+    if route_label == "docs.query":
+        await _run_agent_chat(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+            use_long_term_memory=False,
+            use_planner=False,
+        )
+        return
     if route_label == "file.read":
         await _handle_file_read_request(
             effective_input,
@@ -3930,8 +4082,66 @@ async def _handle_request(
         )
         return
     if route_label == "file.write":
-        await _run_agent_chat(
-            _append_agent_context(effective_input, agent_context),
+        upfront = deterministic_user_decision(effective_input)
+        if upfront is not None:
+            _, question, options = upfront
+            pending = {
+                "question": question,
+                "options": options,
+                "allow_free_text": True,
+                "source": "direct_file_upfront",
+                "created_from_prompt": effective_input,
+            }
+            body = format_question(pending)
+            console.print(Panel(body, title="Need Input", border_style="cyan"))
+            if session_logger is not None:
+                try:
+                    session_logger.set_pending_question(pending)
+                except Exception as exc:
+                    swallowed.record("repl.direct_file_pending_question", exc)
+            if ledger is not None:
+                ledger.log_event(
+                    "run_needs_input",
+                    question=question,
+                    option_count=len(options),
+                    route="file.write",
+                )
+            emit_trace(
+                console,
+                session_logger,
+                workspace,
+                "clarification.needed",
+                question,
+                {"options": [option["label"] for option in options]},
+                level="normal",
+            )
+            _log_assistant_message(session_logger, body, workflow_id="clarification")
+            return
+        harness_input, direct_plan = _direct_file_write_handoff(
+            effective_input,
+            workspace,
+            agent_context,
+        )
+        _log_event(
+            session_logger,
+            "workflow.plan",
+            plan_log_payload(direct_plan),
+            f"Direct file route selected {direct_plan.mode} mode",
+            workflow_id=direct_plan.mode,
+        )
+        required_tool_prefix = ""
+        if (
+            direct_plan.mode == "test_generation"
+            or direct_plan.document_context
+        ) and len(direct_plan.target_files) == 1:
+            try:
+                target_path = _resolve_workspace_file(direct_plan.target_files[0], workspace)
+            except SecurityError:
+                target_path = None
+            if target_path is not None and not target_path.exists():
+                required_tool_prefix = "write_file"
+        result = await _run_agent_chat(
+            harness_input,
             workspace,
             console,
             session_logger=session_logger,
@@ -3939,10 +4149,29 @@ async def _handle_request(
             user_request=effective_input,
             use_long_term_memory=False,
             use_planner=False,
+            required_tool_prefix=required_tool_prefix,
         )
+        # This route is dispatched as a mutation request. A model can answer
+        # with a chat-shaped code fence instead of calling a file tool - no
+        # tool call, no approval, no file touched - and without this check the
+        # run had no failure evidence at all, so it fell through to the
+        # default "success" outcome despite doing nothing.
+        changed_files = list(getattr(result, "changed_files", ()) or ())
+        if not changed_files:
+            ledger = get_current_run()
+            if ledger:
+                ledger.log_event("mutation_required_but_missing", route="file.write")
         return
     if route_label == "command.run":
         _handle_run_existing_script_request(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+        )
+        return
+    if route_label == "package.install":
+        _handle_package_install_request(
             effective_input,
             workspace,
             console,
@@ -4086,6 +4315,22 @@ async def _handle_request(
                 original_intent=original_intent,
                 selected_intent=decision.intent,
             )
+    intent_before_investigative = decision.intent
+    decision = _enforce_investigative_question_decision(effective_input, decision)
+    if decision.intent != intent_before_investigative:
+        _log_event(
+            session_logger,
+            "routing.investigative_question_override",
+            {"original_intent": intent_before_investigative, "selected_intent": decision.intent},
+            "Answered an investigative question instead of proposing an unrequested change",
+            workflow_id="qa",
+        )
+        if ledger is not None:
+            ledger.log_event(
+                "routing_investigative_question_override",
+                original_intent=intent_before_investigative,
+                selected_intent=decision.intent,
+            )
     _print_decision(decision, console, verbose=_trace_mode(workspace) == "verbose")
     emit_trace(
         console,
@@ -4096,7 +4341,7 @@ async def _handle_request(
         {"confidence": f"{decision.confidence:.2f}"},
         level="normal",
     )
-    task_plan = build_task_plan(decision, effective_input)
+    task_plan = build_task_plan(decision, effective_input, workspace=workspace)
     harness_input = append_task_handoff(effective_input, task_plan, agent_context)
 
     try:
@@ -4288,6 +4533,109 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
     )
 
 
+def _direct_file_write_handoff(
+    user_input: str,
+    workspace: Path,
+    agent_context: str = "",
+) -> tuple[str, TaskPlan]:
+    classified = _keyword_decision(user_input)
+    intent = classified.intent if classified.intent in {"code_edit", "test_gen", "doc_gen"} else "code_edit"
+    requested_target = _extract_requested_file_path(user_input)
+    target = requested_target
+    source_under_test = ""
+    if requested_target:
+        target_name = Path(requested_target).name.casefold()
+        target_suffix = Path(requested_target).suffix.casefold()
+        if target_suffix in {".md", ".rst", ".txt"}:
+            intent = "doc_gen"
+        elif (
+            target_name.startswith("test_")
+            or ".test." in target_name
+            or ".spec." in target_name
+        ):
+            intent = "test_gen"
+    if intent == "test_gen" and requested_target:
+        inferred_test_target = _test_output_path(requested_target)
+        if inferred_test_target != requested_target:
+            source_under_test = requested_target
+            target = inferred_test_target
+    decision = RoutingDecision(
+        intent=intent,
+        complexity="single",
+        steps=[
+            {
+                "id": 1,
+                "specialist": "coder",
+                "task": "Inspect the target, apply the requested mutation, and verify it.",
+            }
+        ],
+        needs_tools=[
+            "read_file",
+            "edit_file",
+            "append_file",
+            "write_file",
+            "run_command",
+        ],
+        target_files=[target] if target else [],
+        confidence=1.0,
+    )
+    plan = build_task_plan(decision, user_input, workspace=workspace)
+    handoff = append_task_handoff(user_input, plan, agent_context)
+    semantic_contract = contract.derive(user_input, workspace=workspace)
+    if semantic_contract.required_python_symbols:
+        requirements = "\n".join(
+            f"- `{symbol}` must exist as a new function in `{path}`."
+            for path, symbol in semantic_contract.required_python_symbols
+        )
+        handoff += (
+            "\n\n## Explicit Edit Contract\n"
+            f"{requirements}\n"
+            "- Preserve existing functions and their behavior unless the user explicitly "
+            "asked to change them.\n"
+            "- Adding a function means inserting a new definition, not changing an existing "
+            "function's return expression.\n"
+            "- Re-read the edited file and confirm every named function exists before finishing."
+        )
+    if source_under_test:
+        source_path = workspace / source_under_test
+        try:
+            source_text = source_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            source_text = ""
+        source_excerpt = source_text[:12_000]
+        handoff += (
+            "\n\n## Test Generation Contract\n"
+            f"Source under test: {source_under_test}\n"
+            f"Required test output: {target}\n"
+            f"Create `{target}` with focused executable tests. Do not overwrite "
+            f"`{source_under_test}`. The harness will run the tests after the write."
+        )
+        if source_excerpt:
+            handoff += (
+                "\n\nSource snapshot:\n```text\n"
+                + source_excerpt
+                + ("\n[truncated]" if len(source_text) > len(source_excerpt) else "")
+                + "\n```"
+            )
+    return handoff, plan
+
+
+def _test_output_path(source: str) -> str:
+    """Derive a deterministic test target when the prompt names source code."""
+    normalized = source.replace("\\", "/").lstrip("./")
+    path = Path(normalized)
+    name = path.name.casefold()
+    if name.startswith("test_") or ".test." in name or ".spec." in name:
+        return normalized
+    suffix = path.suffix.casefold()
+    stem = path.stem
+    if suffix == ".py":
+        return f"tests/test_{stem}.py"
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        return f"tests/{stem}.test{path.suffix}"
+    return normalized
+
+
 _MUTATING_INTENTS = frozenset({"bug_fix", "code_edit", "doc_gen", "generate", "test_gen"})
 
 
@@ -4304,6 +4652,50 @@ def _enforce_read_only_decision(
     decision: RoutingDecision,
 ) -> RoutingDecision:
     if decision.intent not in _MUTATING_INTENTS or not _explicitly_read_only(user_input):
+        return decision
+    return RoutingDecision(
+        intent="qa",
+        complexity="single",
+        steps=[{"id": 1, "specialist": "qa", "task": user_input}],
+        needs_tools=["search"],
+        confidence=1.0,
+    )
+
+
+# Change verbs that unambiguously mean "modify the code". Their presence vetoes
+# the investigative-question downgrade: "fix the bug in X" is work even though
+# a small-model router and a question detector could both trip over it.
+_MUTATION_VERB_RE = re.compile(
+    r"\b(fix|repair|resolve|correct|patch|refactor|rewrite|implement|add|remove|"
+    r"delete|rename|update|modify|change|replace|create|make|build|generate|"
+    r"write|edit|install|configure)\b"
+)
+
+
+def _looks_like_investigative_question(user_input: str) -> bool:
+    """A question ABOUT code - "is there a bug in divide?", "does this handle
+    zero?" - that a small-model router misclassifies as bug_fix/code_edit and
+    then "answers" by proposing an unrequested patch (live repro 2026-07-23).
+    The user asked a question, not for a change. Conservative: any explicit
+    change verb anywhere means it is real work and this returns False, so only
+    pure questions with zero mutation intent are downgraded."""
+    raw = user_input.strip().lower()
+    if not raw:
+        return False
+    if _MUTATION_VERB_RE.search(raw):
+        return False
+    return _prefers_qa_answer(user_input)
+
+
+def _enforce_investigative_question_decision(
+    user_input: str,
+    decision: RoutingDecision,
+) -> RoutingDecision:
+    # Only mutating code intents; generate/doc_gen/test_gen have their own
+    # strong signals and are left alone.
+    if decision.intent not in {"bug_fix", "code_edit"}:
+        return decision
+    if not _looks_like_investigative_question(user_input):
         return decision
     return RoutingDecision(
         intent="qa",
@@ -4490,6 +4882,100 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
         return True
     return False
+
+
+def _looks_like_package_install_request(user_input: str) -> bool:
+    """Route explicit project dependency installs into the tool-calling loop."""
+    text = " ".join(user_input.strip().lower().split())
+    if not text:
+        return False
+    if re.search(
+        r"\b(?:pip3?|python3?\s+-m\s+pip|uv\s+pip|npm|pnpm|yarn)\s+install\b",
+        text,
+    ):
+        return True
+    if re.search(r"\b(?:install|add)\s+(?:a\s+|the\s+)?(?:package|dependency|library)\b", text):
+        return True
+    return bool(
+        re.match(r"^install\s+[a-z0-9_.-]+(?:\[[a-z0-9_,.-]+\])?(?:[<>=!~]=?[^\s,;]+)?\b", text)
+        and re.search(r"\b(?:python|project|workspace|dependency|package|library)\b", text)
+    )
+
+
+def _python_package_spec(user_input: str) -> str:
+    match = re.search(
+        r"\binstall\s+(?P<spec>[A-Za-z0-9_.-]+"
+        r"(?:\[[A-Za-z0-9_,.-]+\])?(?:[<>=!~]=?[A-Za-z0-9_.+!-]+)?)",
+        user_input,
+        re.IGNORECASE,
+    )
+    return match.group("spec") if match else ""
+
+
+def _package_install_command(user_input: str) -> str:
+    spec = _python_package_spec(user_input)
+    return f"python -m pip install {spec}" if spec else ""
+
+
+def _execute_package_install(
+    command: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    ledger: ActionLedger | None,
+) -> tuple[Any, str]:
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(workspace, session_logger, console),
+        action_ledger=ledger,
+    )
+    call_id = ledger.log_tool_call("run_command", {"command": command}) if ledger else ""
+    result = registry.execute("run_command", {"command": command})
+    if ledger:
+        ledger.log_tool_result(call_id, "run_command", result.ok, result.message, result.data)
+    resolved = str(result.data.get("resolved_command") or command)
+    environment = result.data.get("project_environment")
+    kind = str(environment.get("kind") or "") if isinstance(environment, dict) else ""
+    output = str(result.data.get("stdout") or result.data.get("stderr") or result.message).strip()
+    verdict = "succeeded" if result.ok else "failed"
+    headline = f"`{command}` {verdict}"
+    if kind:
+        headline += f" using `{kind}`"
+    body = f"{headline}\n\nResolved command:\n`{resolved}`"
+    if output:
+        body += f"\n\nOutput:\n```\n{output}\n```"
+    console.print(
+        Panel(
+            body,
+            title="Package Install",
+            border_style="green" if result.ok else "red",
+        )
+    )
+    return result, body
+
+
+def _handle_package_install_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> str:
+    command = _package_install_command(user_input)
+    if not command:
+        message = "I could not determine which Python package to install."
+        console.print(Panel(message, title="Package Install", border_style="yellow"))
+        _log_assistant_message(session_logger, message, workflow_id="package.install")
+        return message
+    result, body = _execute_package_install(
+        command,
+        workspace,
+        console,
+        session_logger,
+        get_current_run(),
+    )
+    _log_assistant_message(session_logger, body, workflow_id="package.install")
+    return body
 
 
 # -- Git request routing override -------------------------------------------
@@ -5590,6 +6076,77 @@ def _looks_like_file_read_request(user_input: str) -> bool:
     return "read_file" in raw or bool(words & read_verbs)
 
 
+def _looks_like_docs_ingest_request(user_input: str) -> bool:
+    """Recognize requests to retain provided docs for future coding tasks."""
+    text = user_input.strip().lower()
+    if not text:
+        return False
+    ingest_intent = any(
+        phrase in text
+        for phrase in (
+            "ingest ",
+            "import documentation",
+            "import docs",
+            "add as a reference",
+            "add this reference",
+            "register documentation",
+            "register docs",
+            "save as a reference",
+            "remember this documentation",
+            "remember these docs",
+        )
+    )
+    if not ingest_intent:
+        return False
+    source_signal = bool(_FILELIKE_RE.search(user_input)) or "http://" in text or "https://" in text
+    doc_signal = any(
+        word in text
+        for word in ("doc", "documentation", "reference", "manual", "guide", "library")
+    )
+    return source_signal and doc_signal
+
+
+def _looks_like_docs_query_request(user_input: str) -> bool:
+    """Recognize explicit questions/searches over previously registered docs."""
+    text = user_input.strip().lower()
+    if not text or _looks_like_docs_ingest_request(user_input):
+        return False
+    doc_signal = bool(
+        re.search(
+            r"\b(registered (?:doc|docs|document|documents)|documentation|docs|manual|"
+            r"library reference)\b",
+            text,
+        )
+    )
+    query_signal = any(
+        phrase in text
+        for phrase in (
+            "ask the ",
+            "according to ",
+            "look up in ",
+            "search docs",
+            "search the docs",
+            "search documentation",
+            "summarize the manual",
+            "summarise the manual",
+            "summarize the registered",
+            "summarise the registered",
+            "what do the docs",
+            "what does the manual",
+        )
+    )
+    return doc_signal and query_signal
+
+
+def _required_docs_tool(user_input: str) -> str:
+    text = user_input.lower()
+    if re.search(r"\b(summarize|summarise|summary)\b", text):
+        return "summarize_docs"
+    if re.search(r"\b(search|find|look up)\b", text):
+        return "search_docs"
+    return "ask_docs"
+
+
 # Self-contained "write me some code" asks that need no workspace context.
 # These must answer directly from the model (fast) instead of entering the
 # planner + tool loop, which used to only produce a plan and then time out on a
@@ -6168,6 +6725,16 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
         return False
     if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
         return True
+    explicit_path = _extract_prd_path_from_prompt(user_input)
+    if (
+        explicit_path
+        and _looks_like_file_write_request(user_input)
+        and _resolve_build_prd(user_input, workspace) is None
+    ):
+        # "Create NOTES.md from the PRD" names an output file, not the PRD to
+        # build. The explicit "prd" word used to bypass _resolve_build_prd's
+        # named-output protection and launch the full autonomous builder.
+        return False
     text = user_input.lower()
     words = re.sub(r"[^\w\s]", " ", text).split()
     has_build_verb = any(verb in text for verb in _PRD_BUILD_VERBS) or _has_fuzzy_word(
@@ -6237,9 +6804,39 @@ def _extract_prd_milestones(parsed) -> list[str]:
     return milestones
 
 
+def _milestone_executor_enabled() -> bool:
+    raw = os.environ.get("SHAMSU_MILESTONE_EXECUTOR", "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
+def _compiled_prd_milestones(parsed) -> list[str]:
+    try:
+        ledger = compile_requirement_ledger(extract_contract(parsed))
+    except Exception:
+        return []
+    milestones: list[str] = []
+    for milestone in ledger.milestones:
+        requirement_preview = ", ".join(milestone.requirement_ids[:8])
+        if len(milestone.requirement_ids) > 8:
+            requirement_preview += f", +{len(milestone.requirement_ids) - 8} more"
+        suffix = f" [{requirement_preview}]" if requirement_preview else ""
+        milestones.append(f"{milestone.id}: {milestone.title}{suffix}")
+    return milestones
+
+
+def _prd_milestones_for_execution(parsed) -> tuple[list[str], str]:
+    explicit = _extract_prd_milestones(parsed)
+    if explicit:
+        return explicit, "explicit_prd"
+    if not _milestone_executor_enabled():
+        return [], "disabled"
+    compiled = _compiled_prd_milestones(parsed)
+    return compiled, "compiled_requirement_ledger" if compiled else "none"
+
+
 def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None:
     section_names = list(parsed.sections.keys())
-    milestones = _extract_prd_milestones(parsed)
+    milestones, milestone_source = _prd_milestones_for_execution(parsed)
     lines = [
         f"File: {relative_path.as_posix()}",
         f"Title: {parsed.title}",
@@ -6248,7 +6845,11 @@ def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None
     ]
     if milestones:
         lines.append("")
-        lines.append("Milestones detected:")
+        lines.append(
+            "Milestones detected:"
+            if milestone_source == "explicit_prd"
+            else "Compiled requirement milestones:"
+        )
         lines.extend(f"  - {item}" for item in milestones[:12])
         if len(milestones) > 12:
             lines.append(f"  ... {len(milestones) - 12} more")
@@ -6699,6 +7300,8 @@ async def _handle_prd_build_request(
             workspace,
             console,
             session_logger=session_logger,
+            prd_text=parsed.raw_text or "",
+            acceptance=acceptance,
         )
         return
     if getattr(strategy, "value", strategy) == "django":
@@ -6787,7 +7390,37 @@ async def _handle_prd_build_request(
         "[green]Building now - I'll read the PRD and write files in your workspace. "
         "Type `exit` to stop.[/green]"
     )
-    milestones = _extract_prd_milestones(parsed)
+    milestones, milestone_source = _prd_milestones_for_execution(parsed)
+    prd_execution_root_path: Path | None = None
+    prd_execution_state: dict[str, Any] = {}
+    start_milestone_index = 0
+    if milestones and milestone_source == "compiled_requirement_ledger":
+        contract_obj = getattr(project, "prd_contract", None) or extract_contract(parsed)
+        prd_execution_root_path, prd_execution_state = initialize_prd_execution(
+            workspace,
+            user_input,
+            contract_obj,
+            prd_path=relative_path.as_posix(),
+        )
+        milestones = milestone_lines_from_state(prd_execution_state)
+        start_milestone_index = first_incomplete_milestone_index(prd_execution_state)
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_event(
+                "prd_milestone_graph_compiled",
+                source=milestone_source,
+                milestones=len(milestones),
+                artifact="milestones.json",
+                execution_dir=prd_execution_root_path.relative_to(workspace).as_posix(),
+            )
+        if start_milestone_index >= len(milestones):
+            console.print(
+                "[green]All compiled PRD milestones already have checkpoints. "
+                "Running the final verifier over recorded changes.[/green]"
+            )
+            changed = list(prd_execution_state.get("changed_files") or [])
+            await _verify_completed_plan(changed, workspace, console, session_logger)
+            return
     if not milestones:
         result = await _run_agent_chat(
             _build_prd_build_request(
@@ -6860,19 +7493,68 @@ async def _handle_prd_build_request(
             await _verify_completed_plan(changed_files, workspace, console, session_logger)
         return
 
-    task = _create_prd_build_task(user_input, parsed.title, milestones)
+    task: MilestoneTask | None = None
+    if prd_execution_state.get("task_id"):
+        try:
+            task = load_task(workspace, str(prd_execution_state["task_id"]))
+        except Exception:
+            task = None
+    if task is None:
+        task = _create_prd_build_task(user_input, parsed.title, milestones)
+    for previous_index in range(start_milestone_index):
+        task = mark_step_done(task, previous_index + 1, "Resumed from PRD execution checkpoint.")
     save_task(task, workspace)
+    if prd_execution_root_path is not None and not prd_execution_state.get("task_id"):
+        prd_execution_state = attach_task_id(
+            prd_execution_root_path,
+            prd_execution_state,
+            task.task_id,
+        )
     console.print(f"[dim]Tracking PRD build task: {task.task_id}[/dim]")
+    if start_milestone_index:
+        console.print(
+            f"[dim]Resuming at milestone {start_milestone_index + 1}/{len(milestones)} "
+            f"from {prd_execution_root_path.relative_to(workspace).as_posix()}[/dim]"
+        )
     prd_brief = _prd_brief(parsed)
-    changed_files: list[str] = []
-    for index, milestone in enumerate(milestones):
+    changed_files: list[str] = list(prd_execution_state.get("changed_files") or [])
+    for index in range(start_milestone_index, len(milestones)):
+        milestone = milestones[index]
         step = task.steps[index]
+        milestone_id = _milestone_id_from_line(milestone)
+        preflight: dict[str, Any] = {}
+        if prd_execution_root_path is not None:
+            preflight = load_milestone_preflight(prd_execution_root_path, milestone_id)
+            prd_execution_state = mark_milestone_running(
+                prd_execution_root_path,
+                prd_execution_state,
+                milestone_id,
+            )
+            preflight, prd_execution_state = await _prepare_prd_milestone_preflight(
+                prd_execution_root_path,
+                prd_execution_state,
+                milestone_id,
+                preflight,
+                workspace,
+                console,
+                session_logger,
+            )
+        milestone_transaction_baseline = _prd_transaction_snapshot(workspace)
+        milestone_changed_baseline = list(changed_files)
         task = mark_step_running(task, step.id)
         save_task(task, workspace)
         console.print(f"[dim]  -> Milestone {index + 1}/{len(milestones)}: {milestone}[/dim]")
         try:
             result = await _run_agent_chat(
-                _build_prd_milestone_request(parsed.title, relative_path, prd_brief, milestones, index + 1, len(milestones)),
+                _build_prd_milestone_request(
+                    parsed.title,
+                    relative_path,
+                    prd_brief,
+                    milestones,
+                    index + 1,
+                    len(milestones),
+                    preflight=preflight,
+                ),
                 workspace,
                 console,
                 session_logger=session_logger,
@@ -6883,12 +7565,197 @@ async def _handle_prd_build_request(
             )
         except Exception as exc:
             task = mark_step_failed(task, step.id, str(exc))
+            if prd_execution_root_path is not None:
+                prd_execution_state, rollback_result = _rollback_failed_prd_milestone(
+                    prd_execution_root_path,
+                    prd_execution_state,
+                    milestone_id,
+                    preflight,
+                    _prd_transactions_since(workspace, milestone_transaction_baseline),
+                    workspace,
+                    console,
+                    preserved_changed_files=milestone_changed_baseline,
+                )
+                prd_execution_state = checkpoint_milestone(
+                    prd_execution_root_path,
+                    prd_execution_state,
+                    milestone_id,
+                    evidence=_prd_rollback_evidence(rollback_result),
+                    status="failed",
+                    message=str(exc),
+                )
             save_task(task, workspace)
             raise
-        for path in getattr(result, "changed_files", ()) or ():
+        milestone_changed = list(getattr(result, "changed_files", ()) or ())
+        for path in milestone_changed:
             if path not in changed_files:
                 changed_files.append(path)
-        task = mark_step_done(task, step.id, "Agent completed this milestone build pass.")
+        if prd_execution_root_path is not None and getattr(result, "awaiting_user", False):
+            reason = getattr(result, "final", "") or "Agent requested user input."
+            prd_execution_state = block_milestone(
+                prd_execution_root_path,
+                prd_execution_state,
+                milestone_id,
+                reason,
+            )
+            task = mark_step_blocked(task, step.id, reason)
+            save_task(task, workspace)
+            console.print(
+                Panel(
+                    f"PRD milestone {milestone_id} is blocked for user input.",
+                    title="PRD Build Paused",
+                    border_style="yellow",
+                )
+            )
+            return
+        if prd_execution_root_path is not None and getattr(result, "stopped", False):
+            reason = getattr(result, "final", "") or "Agent stopped before completing the milestone."
+            prd_execution_state, rollback_result = _rollback_failed_prd_milestone(
+                prd_execution_root_path,
+                prd_execution_state,
+                milestone_id,
+                preflight,
+                _prd_transactions_since(workspace, milestone_transaction_baseline),
+                workspace,
+                console,
+                preserved_changed_files=milestone_changed_baseline,
+            )
+            checkpoint_changed = _prd_checkpoint_changed_after_rollback(
+                milestone_changed,
+                rollback_result,
+            )
+            prd_execution_state = checkpoint_milestone(
+                prd_execution_root_path,
+                prd_execution_state,
+                milestone_id,
+                changed_files=checkpoint_changed,
+                evidence=[
+                    *[f"changed:{path}" for path in checkpoint_changed],
+                    *_prd_rollback_evidence(rollback_result),
+                ],
+                status="failed",
+                message=reason,
+            )
+            task = mark_step_failed(task, step.id, reason)
+            save_task(task, workspace)
+            console.print(
+                Panel(
+                    f"PRD milestone {milestone_id} failed: {reason[:500]}",
+                    title="PRD Build Paused",
+                    border_style="red",
+                )
+            )
+            return
+        step_done_message = "Agent completed this milestone build pass."
+        if prd_execution_root_path is not None:
+            checkpoint_status, verification = await _verify_prd_milestone(
+                milestone_id,
+                preflight,
+                milestone_changed,
+                workspace,
+                console,
+                session_logger,
+            )
+            if checkpoint_status == "failed" and _prd_milestone_repair_enabled():
+                checkpoint_status, verification, milestone_changed, prd_execution_state = (
+                    await _repair_failed_prd_milestone(
+                        prd_execution_root_path,
+                        prd_execution_state,
+                        milestone_id,
+                        preflight,
+                        verification,
+                        milestone_changed,
+                        workspace,
+                        console,
+                        session_logger,
+                        parsed.title,
+                        relative_path,
+                        prd_brief,
+                        milestones,
+                        index + 1,
+                        len(milestones),
+                    )
+                )
+                for path in milestone_changed:
+                    if path not in changed_files:
+                        changed_files.append(path)
+            if checkpoint_status == "blocked":
+                reason = str(verification.get("summary") or "Milestone repair requested user input.")
+                prd_execution_state = block_milestone(
+                    prd_execution_root_path,
+                    prd_execution_state,
+                    milestone_id,
+                    reason,
+                )
+                task = mark_step_blocked(task, step.id, reason)
+                save_task(task, workspace)
+                console.print(
+                    Panel(
+                        f"PRD milestone {milestone_id} is blocked for user input.",
+                        title="PRD Build Paused",
+                        border_style="yellow",
+                    )
+                )
+                return
+            rollback_result: dict[str, Any] = {}
+            if checkpoint_status == "failed":
+                prd_execution_state, rollback_result = _rollback_failed_prd_milestone(
+                    prd_execution_root_path,
+                    prd_execution_state,
+                    milestone_id,
+                    preflight,
+                    _prd_transactions_since(workspace, milestone_transaction_baseline),
+                    workspace,
+                    console,
+                    preserved_changed_files=milestone_changed_baseline,
+                )
+                milestone_changed = _prd_checkpoint_changed_after_rollback(
+                    milestone_changed,
+                    rollback_result,
+                )
+            evidence = [f"changed:{path}" for path in milestone_changed]
+            verification_status = str(verification.get("status") or "")
+            if verification.get("command"):
+                evidence.append(f"verification:{verification_status}:{verification['command']}")
+            elif verification_status:
+                evidence.append(f"verification:{verification_status}")
+            evidence.extend(_prd_rollback_evidence(rollback_result))
+            if not evidence:
+                evidence = ["agent_completed_milestone_pass_without_verifier"]
+            prd_execution_state = checkpoint_milestone(
+                prd_execution_root_path,
+                prd_execution_state,
+                milestone_id,
+                changed_files=milestone_changed,
+                evidence=evidence,
+                status=checkpoint_status,
+                message=str(verification.get("summary") or "Agent completed this milestone build pass."),
+                verification=verification,
+            )
+            ledger = get_current_run()
+            if ledger:
+                ledger.log_event(
+                    "prd_milestone_checkpointed",
+                    milestone_id=milestone_id,
+                    status=checkpoint_status,
+                    changed_files=milestone_changed,
+                    verification_status=verification_status,
+                    execution_dir=prd_execution_root_path.relative_to(workspace).as_posix(),
+                )
+            if checkpoint_status == "failed":
+                task = mark_step_failed(
+                    task,
+                    step.id,
+                    str(verification.get("summary") or "Milestone verification failed."),
+                )
+                save_task(task, workspace)
+                return
+            step_done_message = (
+                "Milestone verified."
+                if checkpoint_status == "verified"
+                else "Milestone implemented, but no deterministic verifier was available."
+            )
+        task = mark_step_done(task, step.id, step_done_message)
         if index < len(milestones) - 1:
             if not advance_phase(task, f"milestone-{index + 2}"):
                 save_task(task, workspace)
@@ -6897,7 +7764,19 @@ async def _handle_prd_build_request(
         save_task(task, workspace)
     console.print(f"[green]PRD milestone build flow complete. Task: {task.task_id}[/green]")
     # Integration check across everything the milestones built (mirrors /proceed).
-    await _verify_completed_plan(changed_files, workspace, console, session_logger)
+    verified = await _verify_completed_plan(changed_files, workspace, console, session_logger)
+    if verified and prd_execution_root_path is not None:
+        for milestone in list(prd_execution_state.get("milestones") or []):
+            if not isinstance(milestone, dict):
+                continue
+            prd_execution_state = checkpoint_milestone(
+                prd_execution_root_path,
+                prd_execution_state,
+                str(milestone.get("id") or ""),
+                status="verified",
+                evidence=["final_verifier_passed"],
+                message="Final verifier passed after compiled PRD milestone build.",
+            )
 
 
 def _log_prd_contract_summary(project: Any) -> None:
@@ -6935,6 +7814,16 @@ def _log_prd_contract_summary(project: Any) -> None:
         )
     except OSError:
         pass
+    requirement_count = 0
+    milestone_count = 0
+    if contract is not None:
+        try:
+            requirement_ledger = compile_requirement_ledger(contract)
+            requirement_artifacts = save_prd_execution_artifacts(contract, ledger.run_dir)
+            requirement_count = len(requirement_ledger.requirements)
+            milestone_count = len(requirement_ledger.milestones)
+        except Exception:
+            requirement_artifacts = {}
     ledger.log_event(
         "prd_contract_extracted",
         project=getattr(project, "project_name", ""),
@@ -6947,6 +7836,13 @@ def _log_prd_contract_summary(project: Any) -> None:
         warnings=list(getattr(contract, "extraction_warnings", []) or []),
         artifact="prd-contract.json",
     )
+    if requirement_count or milestone_count:
+        ledger.log_event(
+            "prd_requirement_ledger_compiled",
+            requirements=requirement_count,
+            milestones=milestone_count,
+            artifacts=requirement_artifacts,
+        )
 
 
 def _prd_target_directory(user_input: str, project: Any) -> str:
@@ -6985,6 +7881,8 @@ async def _run_freeform_prd_build(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None = None,
+    prd_text: str = "",
+    acceptance: list[tuple[str, str]] | None = None,
 ) -> FullPipelineResult:
     """Run the structured template-free PRD pipeline.
 
@@ -7032,8 +7930,19 @@ async def _run_freeform_prd_build(
         generate=_pipeline_generate(session_logger),
     ).run(prd_path, target_dir=target_dir)
 
-    _print_full_pipeline_result(result, console)
     written = list(result.written_files or [])
+    acceptance_items = list(acceptance or [])
+    if result.success and acceptance_items:
+        result = await _validate_freeform_prd_result(
+            result,
+            prd_text,
+            acceptance_items,
+            console,
+            session_logger=session_logger,
+        )
+        written = list(result.written_files or [])
+
+    _print_full_pipeline_result(result, console)
     if ledger:
         if written:
             ledger.log_event(
@@ -7058,6 +7967,232 @@ async def _run_freeform_prd_build(
         )
     _log_assistant_message(session_logger, message, workflow_id="prd-build")
     return result
+
+
+async def _validate_freeform_prd_result(
+    result: FullPipelineResult,
+    prd_text: str,
+    acceptance: list[tuple[str, str]],
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> FullPipelineResult:
+    written = tuple(path.replace("\\", "/") for path in (result.written_files or []) if path)
+    repair_targets = _source_repair_targets(written)
+    ledger = get_current_run()
+    if not written:
+        error = "PRD validation failed: the freeform build reported no generated files."
+        if ledger:
+            ledger.log_event("prd_freeform_validation_finished", success=False, error=error)
+        return replace(result, success=False, error=error)
+
+    target = result.target_dir
+    passed, failures = _run_prd_validation(
+        prd_text,
+        written,
+        acceptance,
+        target,
+        console,
+        session_logger=session_logger,
+    )
+    for repair_attempt in range(1, 3):
+        if passed:
+            break
+        rewritten = await _structured_validation_rewrite(
+            prd_text,
+            failures,
+            repair_targets,
+            target,
+            console,
+            session_logger=session_logger,
+        )
+        if rewritten:
+            passed, failures = _run_prd_validation(
+                prd_text,
+                written,
+                acceptance,
+                target,
+                console,
+                session_logger=session_logger,
+            )
+            continue
+        if not repair_targets:
+            break
+        repair_prompt = (
+            f"Validation-guided PRD repair pass {repair_attempt}/2. Fix every failed check below "
+            "while preserving every requirement and every working feature from the authoritative PRD. "
+            "Read the current file before writing it. Do not remove working behavior to fix one check. "
+            "Make a complete correction and run verification. Do not ask for confirmation.\n"
+            f"Modify ONLY: {', '.join(repair_targets)}.\n\n"
+            f"Authoritative PRD:\n{prd_text}\n\n"
+            "Current validation failures:\n"
+            + "\n\n".join(failures)
+        )
+        await _run_agent_chat(
+            repair_prompt,
+            target,
+            console,
+            session_logger=session_logger,
+            force_long_running=True,
+            auto_approve=True,
+            allowed_write_paths=repair_targets,
+            use_long_term_memory=False,
+            use_planner=False,
+        )
+        passed, failures = _run_prd_validation(
+            prd_text,
+            written,
+            acceptance,
+            target,
+            console,
+            session_logger=session_logger,
+        )
+
+    if ledger:
+        ledger.log_event(
+            "prd_freeform_validation_finished",
+            success=passed,
+            failures=failures[:5],
+        )
+    if passed:
+        return result
+    error = "PRD validation failed: " + (failures[0] if failures else "acceptance checks failed")
+    return replace(result, success=False, error=error)
+
+
+_VALIDATION_REPAIR_EXTENSIONS = frozenset(
+    {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css", ".json"}
+)
+_VALIDATION_REPAIR_JSON_FILES = frozenset(
+    {
+        "package.json",
+        "tsconfig.json",
+        "vite.config.json",
+        "biome.json",
+        "eslint.config.json",
+    }
+)
+
+VALIDATION_REWRITE_SYSTEM = """You are SHAMSU performing a validation-guided full-file rewrite.
+Output ONLY JSON: {"content": "<the complete corrected file contents>"}.
+Rules:
+- Rewrite exactly one existing source file.
+- Preserve working behavior unless it conflicts with the PRD.
+- Fix the listed validation failures against the authoritative PRD.
+- Return the complete file from first line to last line, not a patch.
+- No Markdown fences or prose outside JSON.
+- For CLIs, implement the exact failing command syntax. If an option appears
+  after a subcommand, accept it there; do not put it only on the root parser.
+"""
+
+
+def _source_repair_targets(paths: tuple[str, ...]) -> tuple[str, ...]:
+    targets: list[str] = []
+    for path in paths:
+        suffix = Path(path).suffix.lower()
+        if suffix == ".json" and Path(path).name.lower() not in _VALIDATION_REPAIR_JSON_FILES:
+            continue
+        if suffix in _VALIDATION_REPAIR_EXTENSIONS and path not in targets:
+            targets.append(path)
+    return tuple(targets)
+
+
+async def _structured_validation_rewrite(
+    prd_text: str,
+    failures: list[str],
+    target_paths: tuple[str, ...],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> list[str]:
+    if not target_paths or not failures:
+        return []
+    ledger = get_current_run()
+    llm = LLMManager(session_logger=session_logger, action_ledger=ledger)
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(
+            workspace, session_logger, console, lambda _request: True
+        ),
+        action_ledger=ledger,
+    )
+    registry.set_allowed_write_paths(target_paths)
+    changed: list[str] = []
+    timeout_seconds = float(os.environ.get("SHAMSU_VALIDATION_REPAIR_TIMEOUT_SECONDS", "120"))
+    num_predict = _env_int_at_least("SHAMSU_VALIDATION_REPAIR_NUM_PREDICT", 4096, 1024)
+    for path in target_paths[:2]:
+        target = (workspace / path).resolve()
+        try:
+            target.relative_to(workspace)
+            current = target.read_text(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
+        prompt = _validation_rewrite_prompt(path, current, prd_text, failures)
+        try:
+            raw = await asyncio.wait_for(
+                llm.generate_structured(
+                    "coder",
+                    VALIDATION_REWRITE_SYSTEM,
+                    prompt,
+                    FILE_CONTENT_SCHEMA,
+                    num_predict=num_predict,
+                ),
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            if ledger:
+                ledger.log_event(
+                    "prd_validation_rewrite_failed",
+                    target=path,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            continue
+        data = _loads_freeform_json(raw or "")
+        if not isinstance(data, dict) or not isinstance(data.get("content"), str):
+            continue
+        content = _sanitize_generated_content(str(data["content"]), path)
+        if not _valid_validation_rewrite(path, current, content):
+            if ledger:
+                ledger.log_event("prd_validation_rewrite_rejected", target=path)
+            continue
+        call_id = ledger.log_tool_call("write_file", {"filepath": path}) if ledger else ""
+        result = registry.execute("write_file", {"filepath": path, "content": content})
+        if ledger:
+            ledger.log_tool_result(call_id, "write_file", result.ok, result.message, result.data)
+        if result.ok:
+            changed.append(path)
+    return changed
+
+
+def _validation_rewrite_prompt(
+    path: str,
+    current: str,
+    prd_text: str,
+    failures: list[str],
+) -> str:
+    failure_text = "\n\n".join(failures[:8])
+    return (
+        f"## File to rewrite\n{path}\n\n"
+        f"## Authoritative PRD\n{prd_text}\n\n"
+        f"## Validation failures to fix\n{failure_text}\n\n"
+        f"## Current file content\n{current}\n\n"
+        '## Task\nReturn JSON {"content": "..."} with the complete corrected file.'
+    )
+
+
+def _valid_validation_rewrite(path: str, current: str, content: str) -> bool:
+    if not content.strip() or content == current:
+        return False
+    current_lines = max(1, len(current.splitlines()))
+    new_lines = len(content.splitlines())
+    if new_lines * 2 < current_lines:
+        return False
+    if Path(path).suffix.lower() == ".py":
+        try:
+            compile(content, path, "exec")
+        except SyntaxError:
+            return False
+    return True
 
 
 async def _run_django_prd_build(
@@ -7200,14 +8335,23 @@ async def _run_django_prd_build(
         )
         if not touched:
             ledger.log_event("mutation_required_but_missing", route="prd.build", target=target_dir)
-        elif result.success:
-            ledger.log_event("verification_passed", command="django setup and test", source="prd_pipeline")
         else:
-            ledger.log_event(
-                "verification_failed",
-                command="django setup and test",
+            verifier_id = ledger.verifier_id_for("django setup and test", "prd_pipeline")
+            ledger.log_verification_started(
+                "django setup and test",
+                verifier_id=verifier_id,
                 source="prd_pipeline",
-                error=result.error,
+                required=True,
+                files=touched,
+            )
+            ledger.log_verification_result(
+                bool(result.success),
+                "" if result.success else result.error,
+                command="django setup and test",
+                verifier_id=verifier_id,
+                source="prd_pipeline",
+                required=True,
+                files=touched,
             )
 
     _print_full_pipeline_result(result, console)
@@ -7401,9 +8545,16 @@ def _run_prd_acceptance_commands(
     lines: list[str] = []
     for command, expected in acceptance:
         if ledger:
-            ledger.log_event("verification_started", command=command, source="prd_acceptance")
+            verifier_id = ledger.verifier_id_for(command, "prd_acceptance")
+            ledger.log_verification_started(
+                command,
+                verifier_id=verifier_id,
+                source="prd_acceptance",
+                required=True,
+            )
             call_id = ledger.log_tool_call("run_command", {"command": command})
         else:
+            verifier_id = ""
             call_id = ""
         result = registry.execute("run_command", {"command": command})
         stdout = str(result.data.get("stdout", "")).strip()
@@ -7412,10 +8563,14 @@ def _run_prd_acceptance_commands(
         all_passed = all_passed and passed
         if ledger:
             ledger.log_tool_result(call_id, "run_command", passed, result.message, result.data)
-            ledger.log_event(
-                "verification_passed" if passed else "verification_failed",
+            ledger.log_verification_result(
+                passed,
+                result.message,
                 command=command,
+                verifier_id=verifier_id,
                 source="prd_acceptance",
+                required=True,
+                files=[],
                 expected_stdout=expected,
                 actual_stdout=stdout,
                 exit_code=result.data.get("exit_code"),
@@ -7424,9 +8579,11 @@ def _run_prd_acceptance_commands(
         detail = stdout or str(result.data.get("stderr", "")).strip() or result.message
         lines.append(f"{verdict}  {command}\n{detail}")
         if not passed and failure_details is not None:
+            hint = _acceptance_failure_hint(command, detail)
             failure_details.append(
                 f"Failed command: {command}\nExpected stdout: {expected or '(exit 0)'}\n"
                 f"Actual result:\n{detail}"
+                + (f"\nRepair hint: {hint}" if hint else "")
             )
     summary = (
         "PRD acceptance passed.\n" if all_passed else "PRD acceptance failed.\n"
@@ -7443,6 +8600,27 @@ def _run_prd_acceptance_commands(
     if log_assistant:
         _log_assistant_message(session_logger, summary, workflow_id="prd-build")
     return all_passed
+
+
+def _acceptance_failure_hint(command: str, detail: str) -> str:
+    if "unrecognized arguments:" not in (detail or "").lower():
+        return ""
+    try:
+        parts = shlex.split(command, posix=os.name != "nt")
+    except ValueError:
+        parts = []
+    option_tokens = [part for part in parts[2:] if part.startswith("-")]
+    if option_tokens:
+        return (
+            "The acceptance command passes options after the subcommand "
+            f"({', '.join(option_tokens)}). In argparse, add those options to each "
+            "subparser that needs them or parse the command manually; a root parser "
+            "option alone will reject this command shape."
+        )
+    return (
+        "Implement the exact acceptance command syntax; argparse root options do not "
+        "automatically work after a subcommand."
+    )
 
 
 def _run_prd_validation(
@@ -7524,10 +8702,20 @@ def _run_prd_conformance_checks(
         command = "prd:function-contract"
         lines.append(f"{'PASS' if passed else 'FAIL'}  named Python functions\n{detail}")
         if ledger:
-            ledger.log_event(
-                "verification_passed" if passed else "verification_failed",
-                command=command,
+            verifier_id = ledger.verifier_id_for(command, "prd_conformance")
+            ledger.log_verification_started(
+                command,
+                verifier_id=verifier_id,
                 source="prd_conformance",
+                required=True,
+            )
+            ledger.log_verification_result(
+                passed,
+                detail,
+                command=command,
+                verifier_id=verifier_id,
+                source="prd_conformance",
+                required=True,
                 detail=detail,
             )
         if not passed and failure_details is not None:
@@ -7563,9 +8751,16 @@ def _run_prd_conformance_checks(
         for label, parts, expected_words in probes:
             command = subprocess.list2cmdline(parts)
             if ledger:
-                ledger.log_event("verification_started", command=command, source="prd_conformance")
+                verifier_id = ledger.verifier_id_for(command, "prd_conformance")
+                ledger.log_verification_started(
+                    command,
+                    verifier_id=verifier_id,
+                    source="prd_conformance",
+                    required=True,
+                )
                 call_id = ledger.log_tool_call("run_command", {"command": command})
             else:
+                verifier_id = ""
                 call_id = ""
             result = registry.execute("run_command", {"command": command})
             stdout = str(result.data.get("stdout") or "")
@@ -7576,10 +8771,13 @@ def _run_prd_conformance_checks(
             all_passed = all_passed and passed
             if ledger:
                 ledger.log_tool_result(call_id, "run_command", passed, result.message, result.data)
-                ledger.log_event(
-                    "verification_passed" if passed else "verification_failed",
+                ledger.log_verification_result(
+                    passed,
+                    combined,
                     command=command,
+                    verifier_id=verifier_id,
                     source="prd_conformance",
+                    required=True,
                     detail=combined,
                 )
             detail = combined or result.message
@@ -7625,8 +8823,11 @@ def _build_prd_milestone_request(
     milestones: list[str],
     milestone_index: int,
     milestone_count: int,
+    preflight: dict[str, Any] | None = None,
 ) -> str:
     checklist = render_progress_checklist(milestones, milestone_index - 1, header="Milestones")
+    preflight_context = render_preflight_context(preflight or {})
+    preflight_block = f"\n\n{preflight_context}" if preflight_context else ""
     return (
         f"{PRD_BUILD_FRAMING}\n\n"
         f"Project: {title}\n"
@@ -7639,6 +8840,7 @@ def _build_prd_milestone_request(
         "complete runnable files. Verify with run_command when possible.\n\n"
         f"{prd_brief}\n\n"
         f"{checklist}"
+        f"{preflight_block}"
     )
 
 
@@ -7655,6 +8857,162 @@ def _create_prd_build_task(user_request: str, title: str, milestones: list[str])
         for index, milestone in enumerate(milestones)
     ]
     return create_task(user_request=user_request, steps=steps, phase="milestone-1")
+
+
+def _milestone_id_from_line(line: str) -> str:
+    match = re.match(r"^\s*(M-\d{3})\b", line)
+    if match:
+        return match.group(1)
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", line.strip()).strip("-").upper()
+    return f"M-CUSTOM-{slug[:24] or 'MILESTONE'}"
+
+
+def _prd_model_preflight_enabled() -> bool:
+    raw = os.environ.get("SHAMSU_PRD_MODEL_PREFLIGHT", "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
+def _prd_milestone_repair_enabled() -> bool:
+    raw = os.environ.get("SHAMSU_PRD_MILESTONE_REPAIR", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def _prd_milestone_rollback_enabled(preflight: dict[str, Any]) -> bool:
+    raw = os.environ.get("SHAMSU_PRD_MILESTONE_ROLLBACK", "1").strip().lower()
+    if raw in {"0", "false", "no", "off", "disabled"}:
+        return False
+    policy = str(preflight.get("rollback_policy") or "").strip().lower()
+    if not policy:
+        return False
+    disabled_tokens = ("no rollback", "do not rollback", "do not roll back", "keep changes")
+    if any(token in policy for token in disabled_tokens):
+        return False
+    return "rollback" in policy or "roll back" in policy
+
+
+def _prd_milestone_repair_budget(preflight: dict[str, Any]) -> int:
+    cap = _env_int_at_least("SHAMSU_PRD_REPAIR_MAX_ATTEMPTS", 2, 0)
+    try:
+        requested = int(preflight.get("attempt_budget", 2))
+    except (TypeError, ValueError, AttributeError):
+        requested = 2
+    return min(max(0, requested), cap)
+
+
+PRD_MODEL_PREFLIGHT_SYSTEM = """You are SHAMSU preparing one bounded PRD milestone.
+Return ONLY JSON matching the schema.
+Do not invent requirements, tools, or shell commands.
+You may narrow active_skills and allowed_tools to the provided allowlists.
+You may add safe relative expected files when they are clearly needed for this milestone.
+Keep notes short and operational."""
+
+
+async def _prepare_prd_milestone_preflight(
+    root: Path,
+    state: dict[str, Any],
+    milestone_id: str,
+    deterministic_preflight: dict[str, Any],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not _prd_model_preflight_enabled():
+        preflight = dict(deterministic_preflight)
+        preflight.setdefault("preflight_source", "deterministic")
+        return preflight, state
+
+    ledger = get_current_run()
+    if ledger:
+        ledger.log_event("prd_model_preflight_started", milestone_id=milestone_id)
+    try:
+        raw = await asyncio.wait_for(
+            LLMManager(session_logger=session_logger, action_ledger=ledger).generate_structured(
+                "planner",
+                PRD_MODEL_PREFLIGHT_SYSTEM,
+                _build_prd_model_preflight_prompt(deterministic_preflight, workspace),
+                model_preflight_schema(),
+                temperature=0.0,
+                num_predict=_env_int_at_least("SHAMSU_PRD_PREFLIGHT_NUM_PREDICT", 768, 256),
+            ),
+            timeout=float(os.environ.get("SHAMSU_PRD_PREFLIGHT_TIMEOUT_SECONDS", "45")),
+        )
+        candidate = _loads_freeform_json(raw or "")
+        preflight, errors = validate_model_preflight(deterministic_preflight, candidate)
+    except Exception as exc:
+        errors = [f"{type(exc).__name__}: {exc}"]
+        preflight, _ = validate_model_preflight(deterministic_preflight, None)
+
+    state = record_milestone_preflight(root, state, milestone_id, preflight, validation_errors=errors)
+    source = str(preflight.get("preflight_source") or "deterministic")
+    if ledger:
+        ledger.log_event(
+            "prd_model_preflight_finished",
+            milestone_id=milestone_id,
+            source=source,
+            accepted=source == "model",
+            validation_errors=errors,
+            expected_files=list(preflight.get("expected_files") or []),
+            active_skills=list(preflight.get("active_skills") or []),
+        )
+    if errors:
+        console.print(
+            f"[dim]Model preflight for {milestone_id} was rejected; using deterministic preflight.[/dim]"
+        )
+    elif source == "model":
+        console.print(f"[dim]Model preflight accepted for {milestone_id}.[/dim]")
+    return preflight, state
+
+
+def _build_prd_model_preflight_prompt(preflight: dict[str, Any], workspace: Path) -> str:
+    payload = {
+        "compiled_preflight": {
+            "milestone_id": preflight.get("milestone_id"),
+            "title": preflight.get("title"),
+            "requirement_ids": list(preflight.get("requirement_ids") or []),
+            "active_skills_allowlist": list(preflight.get("active_skills") or []),
+            "allowed_tools_allowlist": list(preflight.get("allowed_tools") or []),
+            "expected_files": list(preflight.get("expected_files") or []),
+            "verifier": preflight.get("verifier"),
+            "attempt_budget": preflight.get("attempt_budget"),
+            "rollback_policy": preflight.get("rollback_policy"),
+            "requirements": [
+                {
+                    "id": item.get("id"),
+                    "kind": item.get("kind"),
+                    "text": item.get("text"),
+                    "verification": item.get("verification"),
+                    "implementing_files": list(item.get("implementing_files") or []),
+                }
+                for item in list(preflight.get("requirements") or [])[:16]
+                if isinstance(item, dict)
+            ],
+        },
+        "workspace_file_sample": _workspace_file_inventory_for_preflight(workspace),
+        "rules": [
+            "Return the same milestone_id.",
+            "Return exactly the same requirement_ids set.",
+            "Use only skills from active_skills_allowlist.",
+            "Use only tools from allowed_tools_allowlist.",
+            "Expected files must be safe relative file paths.",
+            "Verifier is a short strategy label, not a shell command.",
+        ],
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=True)
+
+
+def _workspace_file_inventory_for_preflight(workspace: Path, limit: int = 80) -> list[str]:
+    try:
+        files = walk_workspace_files(workspace, limit=limit)
+    except Exception:
+        return []
+    result: list[str] = []
+    root = workspace.resolve()
+    for path in files[:limit]:
+        try:
+            result.append(Path(path).resolve().relative_to(root).as_posix())
+        except (OSError, TypeError, ValueError):
+            result.append(str(path).replace("\\", "/"))
+    return result
 
 
 # --- Plan mode: plan -> review -> proceed -------------------------------------
@@ -7993,11 +9351,11 @@ async def _verify_completed_plan(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None,
-) -> None:
+) -> bool | None:
     """Run one deterministic lightweight verifier over everything the plan
     changed and report an honest verdict. Best-effort: never raises."""
     if not changed_files:
-        return
+        return None
     try:
         outcome = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -8009,7 +9367,7 @@ async def _verify_completed_plan(
             ),
         )
     except Exception:
-        return
+        return None
     if outcome.unverifiable:
         # E2: lightweight mode has no verifier for this stack (a node build
         # needs `npm install`), which used to mean a PERMANENT shrug - JS/TS
@@ -8025,7 +9383,7 @@ async def _verify_completed_plan(
             console.print(
                 "[dim]No deterministic verifier available for these changes - left UNVERIFIED.[/dim]"
             )
-            return
+            return None
         request = ApprovalRequest(
             action_type="run_command",
             description="Run the full verifier (includes dependency install) to confirm the plan's changes.",
@@ -8041,7 +9399,7 @@ async def _verify_completed_plan(
             console.print(
                 "[dim]Skipped the full verifier - the plan's changes are left UNVERIFIED.[/dim]"
             )
-            return
+            return None
         try:
             with console.status("Running the full verifier (install + build)...", spinner="dots"):
                 heavy = await asyncio.get_event_loop().run_in_executor(
@@ -8055,9 +9413,10 @@ async def _verify_completed_plan(
                 )
         except Exception:
             console.print("[dim]The full verifier errored - left UNVERIFIED.[/dim]")
-            return
+            return None
         if heavy.verified:
             console.print(Panel(heavy.summary, title="Plan verified (full build)", border_style="green"))
+            return True
         else:
             console.print(
                 Panel(
@@ -8067,9 +9426,10 @@ async def _verify_completed_plan(
                     border_style="red",
                 )
             )
-        return
+        return False
     if outcome.verified:
         console.print(Panel(outcome.summary, title="Plan verified", border_style="green"))
+        return True
     else:
         console.print(
             Panel(
@@ -8079,6 +9439,615 @@ async def _verify_completed_plan(
                 border_style="red",
             )
         )
+        return False
+
+
+async def _verify_prd_milestone(
+    milestone_id: str,
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> tuple[str, dict[str, Any]]:
+    """Return the milestone checkpoint status plus compact verifier evidence."""
+    verifier_files = _milestone_verifier_files(preflight, changed_files, workspace)
+    if not verifier_files:
+        expected_files = _preflight_expected_files(preflight)
+        missing = _missing_expected_files(expected_files, workspace)
+        if expected_files and len(missing) == len(expected_files):
+            summary = (
+                "Milestone produced no verifier inputs and none of its expected files exist: "
+                + ", ".join(missing[:8])
+            )
+            verification = _milestone_verification_payload(
+                "failed",
+                files=[],
+                summary=summary,
+            )
+            _log_prd_milestone_verification(milestone_id, verification)
+            console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
+            return "failed", verification
+        summary = "No deterministic verifier is available for this milestone (UNVERIFIED)."
+        verification = _milestone_verification_payload(
+            "unverifiable",
+            files=[],
+            summary=summary,
+            unverifiable=True,
+        )
+        _log_prd_milestone_verification(milestone_id, verification)
+        console.print(f"[dim]{summary}[/dim]")
+        return "implemented", verification
+
+    stack = _milestone_stack(verifier_files, preflight)
+    stack_hint = _milestone_stack_hint(preflight)
+    try:
+        outcome = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: verify_only(
+                workspace,
+                verifier_files,
+                stack=stack,
+                stack_hint=stack_hint,
+                lightweight=True,
+                session_logger=session_logger,
+            ),
+        )
+    except Exception as exc:
+        summary = f"Milestone verifier errored before producing a verdict: {exc}"
+        verification = _milestone_verification_payload(
+            "failed",
+            files=verifier_files,
+            summary=summary,
+        )
+        _log_prd_milestone_verification(milestone_id, verification)
+        console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
+        return "failed", verification
+
+    verification = _milestone_verification_payload(
+        outcome.status(),
+        files=verifier_files,
+        summary=outcome.summary,
+        verified=outcome.verified,
+        unverifiable=outcome.unverifiable,
+        exit_code=outcome.exit_code,
+        command=outcome.command,
+    )
+    _log_prd_milestone_verification(milestone_id, verification)
+    if outcome.verified:
+        console.print(Panel(outcome.summary, title=f"Milestone {milestone_id} verified", border_style="green"))
+        return "verified", verification
+    if outcome.unverifiable:
+        console.print(f"[dim]{outcome.summary}[/dim]")
+        return "implemented", verification
+    console.print(
+        Panel(
+            f"{outcome.summary}\nStopping before the next PRD milestone.",
+            title=f"Milestone {milestone_id} UNVERIFIED",
+            border_style="red",
+        )
+    )
+    return "failed", verification
+
+
+async def _repair_failed_prd_milestone(
+    root: Path,
+    state: dict[str, Any],
+    milestone_id: str,
+    preflight: dict[str, Any],
+    verification: dict[str, Any],
+    milestone_changed: list[str],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+    title: str,
+    relative_path: Path,
+    prd_brief: str,
+    milestones: list[str],
+    milestone_index: int,
+    milestone_count: int,
+) -> tuple[str, dict[str, Any], list[str], dict[str, Any]]:
+    budget = _prd_milestone_repair_budget(preflight)
+    if budget <= 0:
+        return "failed", verification, milestone_changed, state
+
+    ledger = get_current_run()
+    if ledger:
+        ledger.log_event(
+            "prd_milestone_repair_budget_started",
+            milestone_id=milestone_id,
+            attempts=budget,
+            verification_status=verification.get("status"),
+        )
+    console.print(
+        f"[dim]Milestone {milestone_id} verifier failed; starting up to {budget} repair pass(es).[/dim]"
+    )
+    latest_status = "failed"
+    latest_verification = dict(verification)
+    all_changed = list(dict.fromkeys(milestone_changed))
+    for attempt in range(1, budget + 1):
+        state = record_milestone_repair(
+            root,
+            state,
+            milestone_id,
+            attempt=attempt,
+            phase="started",
+            status="repairing",
+            changed_files=all_changed,
+            verification=latest_verification,
+            message=str(latest_verification.get("summary") or "Milestone verification failed."),
+        )
+        if ledger:
+            ledger.log_event(
+                "prd_milestone_repair_started",
+                milestone_id=milestone_id,
+                attempt=attempt,
+                attempts=budget,
+                verification_status=latest_verification.get("status"),
+            )
+        try:
+            result = await _run_agent_chat(
+                _build_prd_milestone_repair_request(
+                    title,
+                    relative_path,
+                    prd_brief,
+                    milestones,
+                    milestone_index,
+                    milestone_count,
+                    preflight,
+                    latest_verification,
+                    all_changed,
+                    attempt,
+                    budget,
+                ),
+                workspace,
+                console,
+                session_logger=session_logger,
+                force_long_running=True,
+                auto_approve=True,
+                allowed_write_paths=_prd_milestone_repair_write_scope(
+                    preflight, all_changed, workspace
+                )
+                or None,
+                use_long_term_memory=False,
+                use_planner=False,
+            )
+        except Exception as exc:
+            latest_status = "failed"
+            latest_verification = _milestone_verification_payload(
+                "failed",
+                files=all_changed,
+                summary=f"Milestone repair attempt errored: {exc}",
+            )
+            state = record_milestone_repair(
+                root,
+                state,
+                milestone_id,
+                attempt=attempt,
+                phase="finished",
+                status=latest_status,
+                changed_files=[],
+                verification=latest_verification,
+                message=latest_verification["summary"],
+            )
+            if ledger:
+                ledger.log_event(
+                    "prd_milestone_repair_finished",
+                    milestone_id=milestone_id,
+                    attempt=attempt,
+                    status=latest_status,
+                    changed_files=[],
+                    verification_status=latest_verification.get("status"),
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+            break
+        repair_changed = list(getattr(result, "changed_files", ()) or ())
+        all_changed = list(dict.fromkeys([*all_changed, *repair_changed]))
+        if getattr(result, "awaiting_user", False):
+            latest_status = "blocked"
+            latest_verification = _milestone_verification_payload(
+                "blocked",
+                files=all_changed,
+                summary=getattr(result, "final", "") or "Milestone repair requested user input.",
+            )
+            state = record_milestone_repair(
+                root,
+                state,
+                milestone_id,
+                attempt=attempt,
+                phase="finished",
+                status=latest_status,
+                changed_files=repair_changed,
+                verification=latest_verification,
+                message=latest_verification["summary"],
+            )
+            if ledger:
+                ledger.log_event(
+                    "prd_milestone_repair_finished",
+                    milestone_id=milestone_id,
+                    attempt=attempt,
+                    status=latest_status,
+                    changed_files=repair_changed,
+                    verification_status=latest_verification.get("status"),
+                )
+            break
+        if getattr(result, "stopped", False):
+            latest_status = "failed"
+            latest_verification = _milestone_verification_payload(
+                "failed",
+                files=all_changed,
+                summary=getattr(result, "final", "") or "Milestone repair stopped before completion.",
+            )
+            state = record_milestone_repair(
+                root,
+                state,
+                milestone_id,
+                attempt=attempt,
+                phase="finished",
+                status=latest_status,
+                changed_files=repair_changed,
+                verification=latest_verification,
+                message=latest_verification["summary"],
+            )
+            if ledger:
+                ledger.log_event(
+                    "prd_milestone_repair_finished",
+                    milestone_id=milestone_id,
+                    attempt=attempt,
+                    status=latest_status,
+                    changed_files=repair_changed,
+                    verification_status=latest_verification.get("status"),
+                )
+            break
+
+        latest_status, latest_verification = await _verify_prd_milestone(
+            milestone_id,
+            preflight,
+            all_changed,
+            workspace,
+            console,
+            session_logger,
+        )
+        state = record_milestone_repair(
+            root,
+            state,
+            milestone_id,
+            attempt=attempt,
+            phase="finished",
+            status=latest_status,
+            changed_files=repair_changed,
+            verification=latest_verification,
+            message=str(latest_verification.get("summary") or "Milestone repair pass completed."),
+        )
+        if ledger:
+            ledger.log_event(
+                "prd_milestone_repair_finished",
+                milestone_id=milestone_id,
+                attempt=attempt,
+                status=latest_status,
+                changed_files=repair_changed,
+                verification_status=latest_verification.get("status"),
+            )
+        if latest_status != "failed":
+            break
+
+    return latest_status, latest_verification, all_changed, state
+
+
+def _prd_milestone_repair_write_scope(
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    workspace: Path,
+) -> tuple[str, ...]:
+    expected = _preflight_expected_files(preflight)
+    scope = _workspace_relative_paths([*expected, *changed_files], workspace)
+    return tuple(scope)
+
+
+def _build_prd_milestone_repair_request(
+    title: str,
+    relative_path: Path,
+    prd_brief: str,
+    milestones: list[str],
+    milestone_index: int,
+    milestone_count: int,
+    preflight: dict[str, Any],
+    verification: dict[str, Any],
+    changed_files: list[str],
+    attempt: int,
+    budget: int,
+) -> str:
+    verifier_lines = [
+        f"- status: {verification.get('status') or 'failed'}",
+        f"- command: {verification.get('command') or 'not available'}",
+        f"- exit_code: {verification.get('exit_code')}",
+        f"- files: {', '.join(verification.get('files') or []) or 'none'}",
+        f"- summary: {verification.get('summary') or 'Verification failed.'}",
+    ]
+    changed = ", ".join(changed_files) if changed_files else "none recorded yet"
+    return (
+        f"Repair PRD milestone {milestone_index}/{milestone_count}: {milestones[milestone_index - 1]}\n"
+        f"Repair attempt {attempt}/{budget} for milestone {preflight.get('milestone_id') or ''}.\n\n"
+        "The milestone verifier failed. Fix the current milestone only, preserve every completed "
+        "milestone, and do not ask the user unless a real blocker prevents progress.\n\n"
+        f"## Project\n{title}\n\n"
+        f"## PRD source\n{relative_path.as_posix()}\n\n"
+        f"## PRD brief\n{prd_brief}\n\n"
+        f"{render_preflight_context(preflight)}\n\n"
+        "## Failed verifier\n"
+        + "\n".join(verifier_lines)
+        + "\n\n"
+        f"Changed files so far: {changed}\n\n"
+        "Read the implicated files before editing. Make the smallest complete fix that satisfies "
+        "the milestone requirements, then run the verifier or the closest focused check before "
+        "finishing. Report only what changed and the verification result."
+    )
+
+
+def _prd_transaction_snapshot(workspace: Path) -> set[str]:
+    try:
+        return set(TransactionWorkspace(workspace).list_transaction_ids())
+    except Exception:
+        return set()
+
+
+def _prd_transactions_since(workspace: Path, before: set[str]) -> list[str]:
+    try:
+        store = TransactionWorkspace(workspace)
+        candidates: list[tuple[str, str]] = []
+        for transaction_id in store.list_transaction_ids():
+            if transaction_id in before:
+                continue
+            manifest = store.load_manifest(transaction_id) or {}
+            if manifest.get("status") == "rolled_back":
+                continue
+            created_at = str(manifest.get("created_at") or "")
+            candidates.append((created_at, transaction_id))
+        return [transaction_id for _created_at, transaction_id in sorted(candidates)]
+    except Exception:
+        return []
+
+
+def _rollback_failed_prd_milestone(
+    root: Path,
+    state: dict[str, Any],
+    milestone_id: str,
+    preflight: dict[str, Any],
+    transaction_ids: list[str],
+    workspace: Path,
+    console: Console,
+    *,
+    preserved_changed_files: list[str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    policy = str(preflight.get("rollback_policy") or "")
+    if not _prd_milestone_rollback_enabled(preflight):
+        return state, {
+            "attempted": False,
+            "status": "disabled",
+            "policy": policy,
+            "transaction_ids": list(transaction_ids),
+            "message": "Milestone rollback policy did not request rollback.",
+        }
+    if not transaction_ids:
+        return state, {
+            "attempted": False,
+            "status": "no_transactions",
+            "policy": policy,
+            "transaction_ids": [],
+            "message": "No mutation transactions were recorded for this failed milestone.",
+        }
+
+    ledger = get_current_run()
+    if ledger:
+        ledger.log_event(
+            "prd_milestone_rollback_started",
+            milestone_id=milestone_id,
+            transaction_ids=list(transaction_ids),
+            policy=policy,
+        )
+    state = record_milestone_rollback(
+        root,
+        state,
+        milestone_id,
+        phase="started",
+        status="rolling_back",
+        transaction_ids=transaction_ids,
+        policy=policy,
+        message="Rolling back failed milestone transactions.",
+    )
+    store = TransactionWorkspace(workspace)
+    restored_files: list[str] = []
+    failed_transactions: list[dict[str, Any]] = []
+    for transaction_id in reversed(transaction_ids):
+        manifest = store.load_manifest(transaction_id) or {}
+        touched = [
+            str(path)
+            for path in list(manifest.get("touched_files") or [])
+            if str(path)
+        ]
+        ok, message = rollback_transaction(workspace, transaction_id)
+        if ledger:
+            ledger.log_rollback(transaction_id, ok, message)
+        if ok:
+            restored_files.extend(touched)
+        else:
+            failed_transactions.append(
+                {"transaction_id": transaction_id, "message": message}
+            )
+
+    status = "rolled_back" if not failed_transactions else "rollback_failed"
+    message = (
+        f"Rolled back {len(transaction_ids)} failed milestone transaction(s)."
+        if status == "rolled_back"
+        else f"Rollback failed for {len(failed_transactions)} transaction(s)."
+    )
+    state = record_milestone_rollback(
+        root,
+        state,
+        milestone_id,
+        phase="finished",
+        status=status,
+        transaction_ids=transaction_ids,
+        restored_files=restored_files,
+        failed_transactions=failed_transactions,
+        policy=policy,
+        message=message,
+        preserved_changed_files=preserved_changed_files,
+    )
+    if ledger:
+        ledger.log_event(
+            "prd_milestone_rollback_finished",
+            milestone_id=milestone_id,
+            status=status,
+            transaction_ids=list(transaction_ids),
+            restored_files=list(dict.fromkeys(restored_files)),
+            failed_transactions=failed_transactions,
+        )
+    border = "yellow" if status == "rolled_back" else "red"
+    console.print(Panel(message, title=f"Milestone {milestone_id} rollback", border_style=border))
+    return state, {
+        "attempted": True,
+        "status": status,
+        "policy": policy,
+        "transaction_ids": list(transaction_ids),
+        "restored_files": list(dict.fromkeys(restored_files)),
+        "failed_transactions": failed_transactions,
+        "message": message,
+    }
+
+
+def _prd_checkpoint_changed_after_rollback(
+    changed_files: list[str],
+    rollback_result: dict[str, Any],
+) -> list[str]:
+    if rollback_result.get("attempted") and rollback_result.get("status") == "rolled_back":
+        return []
+    return list(dict.fromkeys(changed_files))
+
+
+def _prd_rollback_evidence(rollback_result: dict[str, Any]) -> list[str]:
+    if not rollback_result:
+        return []
+    status = str(rollback_result.get("status") or "")
+    if status in {"disabled", "no_transactions"}:
+        return [f"rollback:{status}"]
+    transaction_ids = list(rollback_result.get("transaction_ids") or [])
+    suffix = ",".join(str(item) for item in transaction_ids[:6])
+    if len(transaction_ids) > 6:
+        suffix += f",+{len(transaction_ids) - 6}"
+    return [f"rollback:{status}:{suffix}" if suffix else f"rollback:{status}"]
+
+
+def _milestone_verifier_files(
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    workspace: Path,
+) -> list[str]:
+    changed = _workspace_relative_paths(changed_files, workspace)
+    if changed:
+        return changed
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    return [path for path in expected if (workspace / path).is_file()]
+
+
+def _preflight_expected_files(preflight: dict[str, Any]) -> list[str]:
+    values = preflight.get("expected_files") if isinstance(preflight, dict) else []
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(path) for path in values if str(path)))
+
+
+def _missing_expected_files(expected_files: list[str], workspace: Path) -> list[str]:
+    return [
+        path
+        for path in _workspace_relative_paths(expected_files, workspace)
+        if not (workspace / path).is_file()
+    ]
+
+
+def _workspace_relative_paths(paths: list[str], workspace: Path) -> list[str]:
+    workspace = workspace.resolve()
+    normalized: list[str] = []
+    for path in paths:
+        text = str(path).strip()
+        if not text or not _safe_verifier_path_text(text):
+            continue
+        candidate = Path(text)
+        try:
+            absolute = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+            relative = absolute.relative_to(workspace)
+        except (OSError, ValueError):
+            continue
+        normalized.append(relative.as_posix())
+    return list(dict.fromkeys(normalized))
+
+
+def _safe_verifier_path_text(path: str) -> bool:
+    unsafe = set("\r\n;&|<>`$\"'")
+    return not any(char in unsafe or char.isspace() for char in path)
+
+
+def _milestone_stack(verifier_files: list[str], preflight: dict[str, Any]) -> str:
+    stack = stack_of(verifier_files)
+    if stack:
+        return stack
+    hint = _milestone_stack_hint(preflight)
+    if any(token in hint for token in ("react", "vite", "node", "npm")):
+        return "node"
+    if any(token in hint for token in ("python", "django")):
+        return "python"
+    return ""
+
+
+def _milestone_stack_hint(preflight: dict[str, Any]) -> str:
+    if not isinstance(preflight, dict):
+        return ""
+    parts: list[str] = []
+    verifier = str(preflight.get("verifier") or "")
+    if verifier:
+        parts.append(verifier)
+    parts.extend(str(skill) for skill in preflight.get("active_skills") or [])
+    parts.extend(str(path) for path in preflight.get("expected_files") or [])
+    return " ".join(parts).lower()
+
+
+def _milestone_verification_payload(
+    status: str,
+    *,
+    files: list[str],
+    summary: str,
+    verified: bool = False,
+    unverifiable: bool = False,
+    exit_code: int | None = None,
+    command: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "verified": verified,
+        "unverifiable": unverifiable,
+        "exit_code": exit_code,
+        "command": command,
+        "files": list(dict.fromkeys(files)),
+        "summary": summary,
+    }
+
+
+def _log_prd_milestone_verification(
+    milestone_id: str,
+    verification: dict[str, Any],
+) -> None:
+    ledger = get_current_run()
+    if not ledger:
+        return
+    status = str(verification.get("status") or "unknown")
+    ledger.log_event(
+        f"prd_milestone_verification_{status}",
+        milestone_id=milestone_id,
+        command=verification.get("command") or "",
+        files=list(verification.get("files") or []),
+        exit_code=verification.get("exit_code"),
+        summary=str(verification.get("summary") or "")[:500],
+    )
 
 
 def _create_plan_task(task: str, steps: list[str]) -> MilestoneTask:
@@ -8389,15 +10358,52 @@ async def _run_composite_request(
             continue
 
         before_tools, before_events = _ledger_counts(workspace, ledger)
-        result = await _run_agent_chat(
-            _composite_step_prompt(plan, step, statuses, agent_context),
-            workspace,
-            console,
-            session_logger=session_logger,
-            auto_approve=is_long_running_enabled(workspace),
-            user_request=plan.prompt,
-            force_read_only=step.kind not in {"mutation", "git_mutate"},
+        step_output = ""
+        install_command = _package_install_command(step.instruction) if step.kind == "mutation" else ""
+        deterministic_verify = (
+            _composite_verification_command(plan, step)
+            if step.kind == "verify" and _python_package_spec(plan.prompt)
+            else ""
         )
+        if install_command:
+            install_result, step_output = _execute_package_install(
+                install_command,
+                workspace,
+                console,
+                session_logger,
+                ledger,
+            )
+            result = AgentLoopResult(
+                final=step_output,
+                stopped=not bool(install_result.ok),
+            )
+        elif deterministic_verify:
+            step_output, verify_ok = _execute_deterministic_composite_verification(
+                plan,
+                step,
+                workspace,
+                console,
+                session_logger,
+                ledger,
+            )
+            result = AgentLoopResult(final=step_output, stopped=not verify_ok)
+        elif step.kind == "summarize":
+            prior = [
+                f"Step {item['id']} ({item['kind']}): {item['status']}"
+                + (f"\n{item['output']}" if item.get("output") else "")
+                for item in statuses
+            ]
+            result = AgentLoopResult(final="\n".join(prior) or "No earlier step results.")
+        else:
+            result = await _run_agent_chat(
+                _composite_step_prompt(plan, step, statuses, agent_context),
+                workspace,
+                console,
+                session_logger=session_logger,
+                auto_approve=is_long_running_enabled(workspace),
+                user_request=plan.prompt,
+                force_read_only=step.kind not in {"mutation", "git_mutate"},
+            )
         last_result = result
         step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
 
@@ -8410,9 +10416,8 @@ async def _run_composite_request(
             _execute_composite_git_inspection(workspace, console, session_logger, ledger)
             step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
 
-        step_output = ""
         if step.kind == "verify" and "run_command" not in set(step_tools):
-            step_output = _execute_deterministic_composite_verification(
+            step_output, _verify_ok = _execute_deterministic_composite_verification(
                 plan, step, workspace, console, session_logger, ledger
             )
             step_tools, step_events = _ledger_delta(
@@ -8420,6 +10425,15 @@ async def _run_composite_request(
             )
         if step.kind == "verify" and not step_output:
             step_output = _composite_command_output(workspace, ledger, before_tools)
+        if step.kind == "verify" and "run_command" in set(step_tools):
+            step_events = _ensure_composite_agent_verification_event(
+                plan,
+                step,
+                workspace,
+                ledger,
+                before_tools,
+                step_events,
+            )
 
         status, evidence = _composite_step_outcome(step, result, step_tools, step_events)
         record = {**step.to_dict(), "status": status, "evidence": evidence}
@@ -8542,6 +10556,16 @@ def _composite_verification_command(
             return f"node {quoted}"
     if re.search(r"\b(?:run|rerun|re-run)\b.*\btests?\b", instruction):
         return "python -m pytest -q"
+    package_spec = _python_package_spec(plan.prompt)
+    if package_spec and re.search(r"\bimport(?:s|ed|ing)?\b", instruction):
+        module = re.split(r"[\[<>=!~]", package_spec, maxsplit=1)[0].replace("-", "_")
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", module):
+            script = (
+                f"import {module}, sys; "
+                f"print(sys.executable); print({module}.__file__)"
+            )
+            quoted_script = subprocess.list2cmdline([script])
+            return f"python -c {quoted_script}"
     return ""
 
 
@@ -8552,10 +10576,10 @@ def _execute_deterministic_composite_verification(
     console: Console,
     session_logger: SessionLogger | None,
     ledger: ActionLedger | None,
-) -> str:
+) -> tuple[str, bool]:
     command = _composite_verification_command(plan, step)
     if not command:
-        return ""
+        return "", False
     registry = AgentToolRegistry(
         workspace,
         session_logger=session_logger,
@@ -8564,14 +10588,25 @@ def _execute_deterministic_composite_verification(
     )
     call_id = ledger.log_tool_call("run_command", {"command": command}) if ledger else ""
     if ledger:
-        ledger.log_event("verification_started", command=command, source="composite_fallback")
+        verifier_id = ledger.verifier_id_for(command, "composite_fallback")
+        ledger.log_verification_started(
+            command,
+            verifier_id=verifier_id,
+            source="composite_fallback",
+            required=True,
+        )
+    else:
+        verifier_id = ""
     result = registry.execute("run_command", {"command": command})
     if ledger:
         ledger.log_tool_result(call_id, "run_command", result.ok, result.message, result.data)
-        ledger.log_event(
-            "verification_passed" if result.ok else "verification_failed",
+        ledger.log_verification_result(
+            bool(result.ok),
+            result.message,
             command=command,
+            verifier_id=verifier_id,
             source="composite_fallback",
+            required=True,
             exit_code=result.data.get("exit_code"),
         )
     output = str(result.data.get("stdout") or result.data.get("stderr") or result.message).strip()
@@ -8583,17 +10618,16 @@ def _execute_deterministic_composite_verification(
             border_style="green" if result.ok else "red",
         )
     )
-    return rendered
+    return rendered, bool(result.ok)
 
 
-def _composite_command_output(
+def _latest_composite_command_record(
     workspace: Path,
     ledger: ActionLedger | None,
     before_tools: int,
-) -> str:
-    """Render the latest command evidence produced during a composite step."""
+) -> tuple[str, bool, str, dict[str, Any]] | None:
     if ledger is None:
-        return ""
+        return None
     records = action_ledger_store.load_tool_calls(workspace, ledger.run_id)[before_tools:]
     finished = next(
         (
@@ -8604,7 +10638,7 @@ def _composite_command_output(
         None,
     )
     if finished is None:
-        return ""
+        return None
     call_id = finished.get("tool_call_id")
     called = next(
         (
@@ -8617,10 +10651,66 @@ def _composite_command_output(
     arguments = called.get("arguments") if isinstance(called, dict) else {}
     command = str(arguments.get("command") or "") if isinstance(arguments, dict) else ""
     data = finished.get("data") if isinstance(finished.get("data"), dict) else {}
-    output = str(data.get("stdout") or data.get("stderr") or finished.get("message") or "").strip()
+    return command, bool(finished.get("ok")), str(finished.get("message") or ""), data
+
+
+def _composite_command_output(
+    workspace: Path,
+    ledger: ActionLedger | None,
+    before_tools: int,
+) -> str:
+    """Render the latest command evidence produced during a composite step."""
+    record = _latest_composite_command_record(workspace, ledger, before_tools)
+    if record is None:
+        return ""
+    command, _ok, message, data = record
+    output = str(data.get("stdout") or data.get("stderr") or message or "").strip()
     if not command and not output:
         return ""
     return f"$ {command}\n{output}".strip()
+
+
+def _ensure_composite_agent_verification_event(
+    plan: OperationPlan,
+    step: OperationStep,
+    workspace: Path,
+    ledger: ActionLedger | None,
+    before_tools: int,
+    step_events: set[str],
+) -> set[str]:
+    """Promote an agent-run command in a verify step into verifier evidence."""
+    if ledger is None or step_events & {"verification_passed", "verification_failed"}:
+        return step_events
+    record = _latest_composite_command_record(workspace, ledger, before_tools)
+    if record is None:
+        return step_events
+    command, ok, message, data = record
+    expected = _composite_verification_command(plan, step)
+    passed = ok and (not expected or command.strip() == expected.strip())
+    if ok and expected and command.strip() != expected.strip():
+        message = f"Expected verifier `{expected}`, but agent ran `{command}`."
+    verifier_command = expected or command
+    verifier_id = ledger.verifier_id_for(verifier_command, "composite_agent_verify")
+    ledger.log_verification_started(
+        verifier_command,
+        verifier_id=verifier_id,
+        source="composite_agent_verify",
+        required=True,
+    )
+    ledger.log_verification_result(
+        passed,
+        message,
+        command=verifier_command,
+        verifier_id=verifier_id,
+        source="composite_agent_verify",
+        required=True,
+        exit_code=data.get("exit_code"),
+        actual_command=command,
+        expected_command=expected,
+    )
+    updated = set(step_events)
+    updated.add("verification_passed" if passed else "verification_failed")
+    return updated
 
 
 def _composite_step_outcome(
@@ -8637,17 +10727,18 @@ def _composite_step_outcome(
     evidence: list[str] = []
     matched = False
     if step.kind == "mutation":
-        matched = bool(
+        file_mutation = bool(
             set(tool_leaves)
             & {"write_file", "edit_file", "move_file", "delete_file", "create_directory"}
         ) or bool(changed_files)
+        package_install = bool(_package_install_command(str(getattr(step, "instruction", ""))))
+        matched = file_mutation or (package_install and "run_command" in tools)
         evidence = [f"changed:{path}" for path in changed_files]
     elif step.kind == "verify":
         if "verification_failed" in event_types:
             return "failed", ["event:verification_failed"]
         matched = (
             "verification_passed" in event_types
-            or "run_command" in tools
             or any(_mcp_tool_provides_read_evidence(name) for name in successful_tools)
         )
         evidence = ["event:verification_passed"] if "verification_passed" in event_types else []
@@ -8743,6 +10834,7 @@ async def _run_agent_chat(
     use_planner: bool = True,
     user_request: str | None = None,
     force_read_only: bool = False,
+    required_tool_prefix: str = "",
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -8769,6 +10861,13 @@ async def _run_agent_chat(
         force_read_only=force_read_only,
         allowed_write_paths=allowed_write_paths,
     )
+    if required_tool_prefix:
+        tools.require_tool_prefix(required_tool_prefix)
+        user_input = (
+            f"{user_input}\n\nRequired first action: call `{required_tool_prefix}` directly. "
+            "The harness has already supplied the necessary evidence. Do not substitute a "
+            "read, edit, append, search, or command tool."
+        )
     if _looks_like_mcp_request(safety_input):
         use_long_term_memory = False
         use_planner = False
@@ -8806,6 +10905,27 @@ async def _run_agent_chat(
                 + ". Do not run an `mcp` shell command and do not substitute a local tool."
                 + preference
             )
+    if _looks_like_docs_ingest_request(safety_input):
+        use_long_term_memory = False
+        use_planner = False
+        tools.require_tool_prefix("ingest_docs")
+        user_input = (
+            f"{user_input}\n\nDocumentation ingestion requirement: call `ingest_docs` directly "
+            "with the named workspace path or URL and the library name if the user supplied one. "
+            "Do not reproduce the documentation with write_file and do not claim it was retained "
+            "unless ingest_docs succeeds."
+        )
+    elif _looks_like_docs_query_request(safety_input):
+        use_long_term_memory = False
+        use_planner = False
+        required_docs_tool = _required_docs_tool(safety_input)
+        tools.require_tool_prefix(required_docs_tool)
+        user_input = (
+            f"{user_input}\n\nRegistered-document requirement: call `{required_docs_tool}` "
+            "directly with the user's question and document name when supplied. Use only its "
+            "citation-backed evidence, preserve citations in the answer, and say when the "
+            "registered documents do not contain enough evidence."
+        )
     # A dry run is the opposite instruction: keep going, change nothing. Writes
     # report a synthetic success and are recorded as planned actions instead.
     # The `--dry-run` flag sets the context recorder; prose ("dry run only:
@@ -10234,6 +12354,9 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input.startswith("permissions"):
             _handle_permissions(normalized_input, workspace, console)
             continue
+        if lowered_input == "skills" or lowered_input.startswith("skills "):
+            handle_skills_command(normalized_input, workspace, console)
+            continue
         if lowered_input == "mcp" or lowered_input.startswith("mcp "):
             from shamsu.mcp.cli import handle_mcp_command
 
@@ -10313,6 +12436,11 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("patch"):
             _handle_patch(normalized_input, workspace, console, session_logger=session_logger)
+            continue
+        # Checked before "log": /logs is the signpost to the log files on disk,
+        # /log tails this session's event stream. Two different things.
+        if lowered_input == "logs" or lowered_input.startswith("logs "):
+            _handle_logs(normalized_input, workspace, console)
             continue
         if lowered_input == "log" or lowered_input.startswith("log "):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

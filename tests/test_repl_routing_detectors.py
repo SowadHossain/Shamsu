@@ -15,13 +15,18 @@ import pytest
 from shamsu.cli.repl import (
     _classify_route_label,
     _command_for_existing_script_request,
+    _direct_file_write_handoff,
+    _enforce_investigative_question_decision,
     _extract_prd_path_from_prompt,
     _is_conversational_prompt,
     _looks_like_capabilities_question,
     _looks_like_code_edit_request,
     _looks_like_direct_code_request,
     _looks_like_django_generation_request,
+    _looks_like_docs_ingest_request,
+    _looks_like_docs_query_request,
     _looks_like_file_write_request,
+    _looks_like_investigative_question,
     _looks_like_prd_build_request,
     _looks_like_prd_plan_request,
     _looks_like_vague_action_request,
@@ -29,6 +34,62 @@ from shamsu.cli.repl import (
     _looks_like_workspace_location_prompt,
     _looks_like_workspace_prd_request,
 )
+from shamsu.types import RoutingDecision
+
+
+def test_direct_file_write_handoff_includes_skills_and_append_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("SHAMSU_SKILLS", "on")
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    handoff, plan = _direct_file_write_handoff(
+        "write pytest tests for src/calculator.py",
+        tmp_path,
+    )
+    selected = [item.skill.name for item in plan.skill_selection.selected]
+
+    assert plan.mode == "test_generation"
+    assert "append_file" in plan.required_tools
+    assert plan.target_files == ["tests/test_calculator.py"]
+    assert {"developer", "testing"} <= set(selected)
+    assert "## Active SHAMSU Skills" in handoff
+    assert "### developer" in handoff
+    assert "### testing" in handoff
+    assert "Source under test: src/calculator.py" in handoff
+    assert "Required test output: tests/test_calculator.py" in handoff
+    assert "def add(a, b):" in handoff
+
+
+def test_markdown_target_beats_test_word_inside_document_name(tmp_path: Path):
+    handoff, plan = _direct_file_write_handoff(
+        "Create SCOPE_NOTES.md from the Shamsu Test PRD documentation.",
+        tmp_path,
+    )
+
+    assert plan.mode == "documentation"
+    assert plan.executor_role == "doc_agent"
+    assert plan.target_files == ["SCOPE_NOTES.md"]
+    assert "Mode: documentation" in handoff
+
+
+def test_direct_python_add_handoff_preserves_existing_functions(tmp_path: Path):
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    handoff, plan = _direct_file_write_handoff(
+        "add a subtract(a,b) function to src/calculator.py",
+        tmp_path,
+    )
+
+    assert plan.target_files == ["src/calculator.py"]
+    assert "`subtract` must exist as a new function" in handoff
+    assert "Preserve existing functions and their behavior" in handoff
+    assert "not changing an existing function's return expression" in handoff
 
 
 @pytest.mark.parametrize(
@@ -110,6 +171,40 @@ def test_script_run_route_requires_existing_workspace_file(tmp_path: Path):
     assert _classify_route_label(prompt, tmp_path) != "command.run"
 
 
+def test_explicit_backtick_command_is_not_replaced_by_inference(tmp_path: Path):
+    """The user named an exact command; inferring one from a filename inside it
+    ran `python ok.py` (executes the script) instead of the requested
+    `python -m py_compile ok.py` (compile check only)."""
+    (tmp_path / "ok.py").write_text("x = 1 + 1\nprint(x)\n", encoding="utf-8")
+
+    prompt = "Run `python -m py_compile ok.py` and tell me whether it succeeded."
+
+    command = _command_for_existing_script_request(prompt, tmp_path)
+    assert command == "python -m py_compile ok.py"
+    assert _classify_route_label(prompt, tmp_path) == "command.run"
+
+
+def test_explicit_command_outside_the_runner_allowlist_stands_down(tmp_path: Path):
+    """An explicit command that names no known runner is not executed by the
+    deterministic path; it falls through to the fully gated agent loop."""
+    (tmp_path / "ok.py").write_text("x = 1\n", encoding="utf-8")
+
+    prompt = "Run `rm -rf ok.py` now."
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == ""
+    assert _classify_route_label(prompt, tmp_path) != "command.run"
+
+
+def test_backticked_filename_still_infers_the_command(tmp_path: Path):
+    """A single backticked token is a filename, not a command, so inference
+    must still apply."""
+    (tmp_path / "qa_probe.py").write_text("print(5)\n", encoding="utf-8")
+
+    prompt = "Run `qa_probe.py` and tell me the command output."
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == "python qa_probe.py"
+
+
 @pytest.mark.parametrize(
     "text, expected",
     [
@@ -169,6 +264,39 @@ def test_vague_action_request(text, expected):
 )
 def test_file_write_request(text, expected):
     assert _looks_like_file_write_request(text) is expected
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "ingest acme-docs.md as the Acme SDK reference",
+        "import documentation from https://docs.example.com/acme",
+        "register docs in references/acme.txt for future library tasks",
+    ],
+)
+def test_docs_ingestion_routes_to_dedicated_agent_tool(tmp_path: Path, prompt: str):
+    assert _looks_like_docs_ingest_request(prompt) is True
+    assert _classify_route_label(prompt, tmp_path) == "docs.ingest"
+
+
+def test_plain_doc_read_is_not_mistaken_for_ingestion(tmp_path: Path):
+    prompt = "read and summarize acme-docs.md"
+
+    assert _looks_like_docs_ingest_request(prompt) is False
+    assert _classify_route_label(prompt, tmp_path) != "docs.ingest"
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "search the docs for webhook signature validation",
+        "according to the Acme manual, how long do tokens last?",
+        "summarize the registered document Acme Platform",
+    ],
+)
+def test_registered_document_queries_route_to_document_tools(tmp_path: Path, prompt: str):
+    assert _looks_like_docs_query_request(prompt) is True
+    assert _classify_route_label(prompt, tmp_path) == "docs.query"
 
 
 @pytest.mark.parametrize(
@@ -314,3 +442,70 @@ def test_real_build_requests_are_unaffected_by_the_plan_guard(tmp_path: Path):
     assert _classify_route_label("build the app from the prd", workspace) == "prd.build"
     # "make hello.py" is still a file write, not a plan.
     assert _looks_like_file_write_request("make hello.py") is True
+
+
+# -- investigative-question routing guard (live repro 2026-07-23) --------------
+
+
+def _mutating_decision(intent: str) -> RoutingDecision:
+    return RoutingDecision(
+        intent=intent,
+        complexity="single",
+        steps=[{"id": 1, "specialist": intent, "task": "x"}],
+        needs_tools=["search"],
+        confidence=0.5,
+    )
+
+
+@pytest.mark.parametrize(
+    "prompt, expected",
+    [
+        # Investigative questions - a change verb is absent, so these are asking,
+        # not requesting work. The live repro that started this: SHAMSU jumped
+        # into bug_fix and proposed an unrequested patch for the first one.
+        ("Look at webapp/utils.py. Is there a bug in the divide function?", True),
+        ("is there a bug in divide?", True),
+        ("does the divide function handle zero?", True),
+        ("what is wrong with this code?", True),
+        ("why does this crash?", True),
+        # Real work - an explicit change verb means do not downgrade.
+        ("fix the bug in utils.py", False),
+        ("can you fix the bug?", False),
+        ("add a delete endpoint to app.py", False),
+        ("please repair the divide function", False),
+        ("refactor the divide function", False),
+        ("update the readme", False),
+    ],
+)
+def test_looks_like_investigative_question(prompt: str, expected: bool):
+    assert _looks_like_investigative_question(prompt) is expected
+
+
+def test_investigative_question_downgrades_bug_fix_to_qa():
+    decision = _enforce_investigative_question_decision(
+        "Is there a bug in the divide function?", _mutating_decision("bug_fix")
+    )
+    assert decision.intent == "qa"
+
+
+def test_investigative_question_downgrades_code_edit_to_qa():
+    decision = _enforce_investigative_question_decision(
+        "does list_tasks return the right thing?", _mutating_decision("code_edit")
+    )
+    assert decision.intent == "qa"
+
+
+def test_real_fix_request_is_not_downgraded():
+    decision = _enforce_investigative_question_decision(
+        "fix the bug in the divide function", _mutating_decision("bug_fix")
+    )
+    assert decision.intent == "bug_fix"
+
+
+def test_investigative_guard_leaves_non_code_intents_alone():
+    # A question-shaped generate/test_gen intent keeps its own routing; only
+    # bug_fix and code_edit are in scope for this downgrade.
+    decision = _enforce_investigative_question_decision(
+        "is there a bug in divide?", _mutating_decision("generate")
+    )
+    assert decision.intent == "generate"

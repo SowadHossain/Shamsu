@@ -68,7 +68,9 @@ def test_workflow_proceeds_when_no_decision_is_needed(tmp_path: Path):
     # approval prompt would block on stdin under pytest.
     engine = PatchEngine(tmp_path, approval_manager=ApprovalManager(lambda _r: False, None))
     result = asyncio.run(
-        CodeEditWorkflow(tmp_path, search=_NoHitsSearch(), llm=llm, patch_engine=engine).run("add auth")
+        CodeEditWorkflow(tmp_path, search=_NoHitsSearch(), llm=llm, patch_engine=engine).run(
+            "add JWT auth"
+        )
     )
 
     assert result.needs_input is False

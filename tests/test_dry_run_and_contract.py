@@ -165,6 +165,96 @@ def test_contract_normalizes_absolute_workspace_target_to_relative_path(tmp_path
     assert contract.scoped_read_only is True
 
 
+def test_contract_derives_an_explicitly_requested_python_function(tmp_path: Path):
+    contract = run_contract.derive(
+        "add a subtract(a,b) function to src/calculator.py",
+        workspace=tmp_path,
+    )
+
+    assert contract.requested_paths == ("src/calculator.py",)
+    assert contract.required_python_symbols == (("src/calculator.py", "subtract"),)
+
+
+def test_contract_treats_tested_source_as_input_and_derives_test_output(tmp_path: Path):
+    contract = run_contract.derive(
+        "write pytest tests for src/calculator.py",
+        workspace=tmp_path,
+    )
+
+    assert contract.requested_paths == ("tests/test_calculator.py",)
+    result = run_contract.check(
+        contract,
+        changed_files=[{"path": "tests/test_calculator.py", "change": "created"}],
+        workspace=tmp_path,
+    )
+    assert result.ok is True
+
+
+def test_contract_rejects_a_changed_python_file_missing_the_requested_function(
+    tmp_path: Path,
+):
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    contract = run_contract.derive(
+        "add a subtract(a,b) function to src/calculator.py",
+        workspace=tmp_path,
+    )
+
+    result = run_contract.check(
+        contract,
+        changed_files=[{"path": "src/calculator.py", "change": "modified"}],
+        workspace=tmp_path,
+    )
+
+    assert result.ok is False
+    assert any("src/calculator.py:subtract" in item for item in result.violations)
+
+
+def test_failed_outcome_still_reports_semantic_violations_when_files_changed(
+    tmp_path: Path,
+):
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    contract = run_contract.derive(
+        "add a subtract(a,b) function to src/calculator.py",
+        workspace=tmp_path,
+    )
+
+    result = run_contract.check(
+        contract,
+        changed_files=[{"path": "src/calculator.py", "change": "modified"}],
+        outcome="failed",
+        workspace=tmp_path,
+    )
+
+    assert result.ok is False
+    assert any("requested_python_symbols_exist" in item for item in result.violations)
+
+
+def test_contract_accepts_the_explicitly_requested_python_function(tmp_path: Path):
+    target = tmp_path / "src" / "calculator.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "def add(a, b):\n    return a + b\n\n"
+        "def subtract(a, b):\n    return a - b\n",
+        encoding="utf-8",
+    )
+    contract = run_contract.derive(
+        "add a subtract(a,b) function to src/calculator.py",
+        workspace=tmp_path,
+    )
+
+    result = run_contract.check(
+        contract,
+        changed_files=[{"path": "src/calculator.py", "change": "modified"}],
+        workspace=tmp_path,
+    )
+
+    assert result.ok is True
+
+
 def test_contract_ignores_files_that_are_only_being_read():
     """"Inspect qa_probe.py" names a file but requests no change to it -
     demanding it be written would fail every read-only run."""
@@ -274,6 +364,36 @@ def test_outside_folder_clause_is_scoped_and_allows_descendants(tmp_path: Path):
     assert result.ok is True
 
 
+def test_scoped_contract_allows_explicit_internal_artifacts_only(tmp_path: Path):
+    prompt = (
+        "Build the app in a folder named generated-app. "
+        "Do not modify anything outside generated-app except SHAMSU's own "
+        ".shamsu logs/state and managed .cbmignore."
+    )
+
+    derived = run_contract.derive(prompt, workspace=tmp_path)
+    allowed = run_contract.check(
+        derived,
+        changed_files=[
+            {"path": "generated-app/app.py", "change": "created"},
+            {"path": ".cbmignore", "change": "created"},
+            {"path": ".shamsu/runs/run_1/events.jsonl", "change": "created"},
+        ],
+    )
+    blocked = run_contract.check(
+        derived,
+        changed_files=[
+            {"path": "generated-app/app.py", "change": "created"},
+            {"path": "outside.txt", "change": "created"},
+        ],
+    )
+
+    assert derived.allowed_collateral_paths == (".shamsu", ".cbmignore")
+    assert allowed.ok is True
+    assert blocked.ok is False
+    assert any("outside.txt" in violation for violation in blocked.violations)
+
+
 def test_build_only_prompt_still_records_a_named_directory_scope(tmp_path: Path):
     prompt = (
         "Build the app in a new folder named output-app. "
@@ -351,6 +471,16 @@ def test_a_source_file_is_not_a_write_target():
     # A spec/PRD/readme filename is never a target on its own.
     assert run_contract.requested_paths("implement the app from spec.md") == ()
     assert run_contract.requested_paths("based on README.md write app.py") == ("app.py",)
+
+
+def test_file_describing_expected_state_is_evidence_not_a_write_target():
+    prompt = (
+        "Edit repository.py because schema.sql declares tasks. "
+        "Replace only the incorrect table reference and do not modify any other files."
+    )
+
+    assert run_contract.requested_paths(prompt) == ("repository.py",)
+    assert run_contract.requested_paths("Edit schema.sql to declare tasks.") == ("schema.sql",)
 
 
 def test_stack_names_are_not_write_targets():

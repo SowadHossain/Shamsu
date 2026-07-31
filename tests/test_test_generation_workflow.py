@@ -99,6 +99,32 @@ async def test_test_generation_workflow_applies_valid_diff_and_can_run_tests(tmp
     assert "pytest-compatible tests" in llm.pack.user_request
 
 
+@pytest.mark.asyncio
+async def test_test_generation_workflow_reports_generated_test_failures(tmp_path: Path):
+    (tmp_path / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    diff = """--- /dev/null
++++ b/tests/test_app.py
+@@ -0,0 +1,2 @@
++def test_wrong():
++    assert False
+"""
+    runner = FakeCommandRunner(
+        ShamsuTestRunResult(passed=0, failed=1, raw_output="1 failed")
+    )
+
+    result = await TestGenerationWorkflow(
+        workspace_root=tmp_path,
+        search=FakeSearch(),
+        llm=FakeLLM(diff),
+        patch_engine=PatchEngine(tmp_path, approval_func=lambda _request: True),
+        command_runner=runner,
+    ).run("write tests for add")
+
+    assert result.applied is True
+    assert result.test_result is not None
+    assert "1 failed" in result.error
+
+
 class FakeSpecialistAwareLLM:
     """Returns a different canned response per specialist, so the planner's
     output can be distinguished from the test_gen specialist's own response."""

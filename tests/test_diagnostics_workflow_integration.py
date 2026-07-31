@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -118,6 +119,22 @@ def test_command_runner_digest_failure_never_breaks_command_execution(tmp_path: 
 
     assert code == 0
     assert "hi" in stdout
+
+
+def test_command_runner_replaces_undecodable_output_bytes(tmp_path: Path):
+    runner = CommandRunner(tmp_path, approval_func=lambda _r: True)
+    command = (
+        f"\"{sys.executable}\" -c "
+        "\"import sys; "
+        "sys.stdout.buffer.write(bytes([0x81])); "
+        "sys.stderr.buffer.write(bytes([0x82]))\""
+    )
+
+    code, stdout, stderr = runner.run(command, tmp_path)
+
+    assert code == 0
+    assert "\ufffd" in stdout
+    assert "\ufffd" in stderr
 
 
 # -- 28. bugfix workflow uses ErrorPacket before the LLM call -----------------

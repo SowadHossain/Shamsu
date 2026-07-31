@@ -118,6 +118,9 @@ def emit_trace(
             _truncate(redact(message), _MAX_MESSAGE_CHARS),
             workflow_id="trace",
         )
+    # The narrative log records every event at full detail, independently of the
+    # console mode below: `/trace quiet` must silence the terminal, not the file.
+    _append_to_narrative(event_type, message, payload)
     mode = read_trace_mode(workspace)
     if console is None or not should_emit(mode, level):
         return
@@ -125,7 +128,7 @@ def emit_trace(
     console.print(f"[{style}]{format_trace_line(event_type, message, payload, mode)}[/{style}]")
 
 
-_EVENT_LABELS = {
+EVENT_LABELS = {
     "route.detected": "Route",
     "plan.created": "Plan",
     "assistant.content": "Model",
@@ -145,6 +148,10 @@ _EVENT_LABELS = {
     "workflow.finished": "Done",
 }
 
+# Shared with shamsu.ui.narrative so the narrative log and the console use the
+# same wording for the same event.
+_EVENT_LABELS = EVENT_LABELS
+
 _EVENT_STYLES = {
     "route.detected": "cyan",
     "plan.created": "cyan",
@@ -160,6 +167,38 @@ _EVENT_STYLES = {
     "workflow.blocked": "yellow",
     "workflow.finished": "green",
 }
+
+
+def narrative_for_current_run() -> "Any | None":
+    """Build a NarrativeWriter for the run in flight, or None when there isn't
+    one (no active run, or the ledger is disabled).
+
+    Imported lazily: shamsu.ui.narrative imports this module for EVENT_LABELS,
+    so a module-level import here would cycle.
+    """
+    from shamsu.action_ledger.context import get_current_run
+    from shamsu.ui.narrative import NarrativeWriter
+
+    ledger = get_current_run()
+    if ledger is None or not getattr(ledger, "enabled", False):
+        return None
+    session_dir = None
+    session_id = str(getattr(ledger, "session_id", "") or "")
+    if session_id:
+        session_dir = Path(ledger.workspace) / ".shamsu" / "sessions" / session_id
+    return NarrativeWriter(ledger.run_dir, session_dir, run_id=ledger.run_id)
+
+
+def _append_to_narrative(
+    event_type: str, message: str, payload: dict[str, Any] | None
+) -> None:
+    try:
+        writer = narrative_for_current_run()
+        if writer is not None:
+            writer.append(event_type, message, payload)
+    except Exception:
+        # The narrative is an observability nicety; never break a run for it.
+        pass
 
 
 def _sanitize_value(value: Any) -> str:

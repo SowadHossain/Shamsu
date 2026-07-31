@@ -230,6 +230,54 @@ async def test_planner_decision_asks_before_any_work_happens(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_unspecified_auth_approach_is_deterministic_even_when_planner_misses(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("Deterministic auth")
+    llm = StructuredPlannerLLM({"needs_input": False})
+    loop = AgentChatLoop(
+        tmp_path,
+        client=NeverCalledClient(),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=llm,
+        session_logger=logger,
+    )
+
+    result = await loop.run("Add authentication to app.py.")
+
+    assert result.awaiting_user is True
+    assert "Which authentication approach" in result.final
+    assert "Server sessions" in result.final
+    assert "JWT" in result.final
+    assert logger.get_pending_question()["source"] == "planner_upfront"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "task_prompt",
+    [
+        "Add JWT authentication to app.py.",
+        "Fix the authentication bug in app.py.",
+        "Explain how authentication works in app.py.",
+    ],
+)
+async def test_auth_tasks_with_a_decided_approach_or_no_design_choice_continue(
+    tmp_path: Path, task_prompt: str
+):
+    llm = StructuredPlannerLLM({"needs_input": False})
+    client = FakeOllamaClient()
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=llm,
+    )
+
+    result = await loop.run(task_prompt)
+
+    assert result.awaiting_user is False
+    assert client.messages_seen
+
+
+@pytest.mark.asyncio
 async def test_a_clear_task_is_not_interrupted(tmp_path: Path):
     """The other half of the threshold: asking about everything is its own
     failure. needs_input=false must go straight to work."""

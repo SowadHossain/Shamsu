@@ -367,6 +367,159 @@ def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, mo
     assert calls["target_dir"] == "atlasops-freeform"
 
 
+def test_freeform_prd_build_validates_acceptance_and_downgrades(tmp_path, monkeypatch):
+    from rich.console import Console
+    from shamsu.agents.full_pipeline import FullPipelineResult
+    from shamsu.cli import repl as repl_mod
+
+    prd = tmp_path / "prd.md"
+    prd.write_text(
+        "# LedgerLite\n\n"
+        "## Acceptance\n"
+        "- `python ledgerlite.py list` prints `No expenses yet`.\n",
+        encoding="utf-8",
+    )
+    project = SimpleNamespace(
+        project_name="ledgerlite-app",
+        category="utility",
+        archetype=SimpleNamespace(value="utility"),
+    )
+    validation_calls: list[dict[str, object]] = []
+    repair_calls: list[dict[str, object]] = []
+
+    async def fake_pipeline_run(self, prd_path, target_dir=None):
+        target = tmp_path / str(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "ledgerlite.py").write_text("print('wrong')\n", encoding="utf-8")
+        return FullPipelineResult(
+            prd_path=Path(prd_path),
+            target_dir=target,
+            project=project,
+            written_files=["ledgerlite.py"],
+            success=True,
+        )
+
+    def fake_validation(prd_text, output_scope, acceptance, workspace, console, session_logger=None):
+        validation_calls.append(
+            {
+                "prd_text": prd_text,
+                "output_scope": output_scope,
+                "acceptance": acceptance,
+                "workspace": workspace,
+            }
+        )
+        return False, ["Failed command: python ledgerlite.py list"]
+
+    async def fake_repair(user_input, workspace, console, **kwargs):
+        repair_calls.append(
+            {
+                "user_input": user_input,
+                "workspace": workspace,
+                "allowed_write_paths": kwargs.get("allowed_write_paths"),
+            }
+        )
+        return SimpleNamespace(changed_files=["ledgerlite.py"])
+
+    async def no_structured_rewrite(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(repl_mod, "_build_search_agent", lambda *args, **kwargs: (None, False))
+    monkeypatch.setattr(repl_mod.FullDjangoPipeline, "run", fake_pipeline_run)
+    monkeypatch.setattr(repl_mod, "_run_prd_validation", fake_validation)
+    monkeypatch.setattr(repl_mod, "_structured_validation_rewrite", no_structured_rewrite)
+    monkeypatch.setattr(repl_mod, "_run_agent_chat", fake_repair)
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=120)
+    result = asyncio.run(
+        repl_mod._run_freeform_prd_build(
+            "build the product from prd.md in a new folder named ledgerlite-app",
+            prd,
+            project,
+            tmp_path,
+            console,
+            prd_text=prd.read_text(encoding="utf-8"),
+            acceptance=[("python ledgerlite.py list", "No expenses yet")],
+        )
+    )
+
+    assert result.success is False
+    assert "PRD validation failed" in result.error
+    assert validation_calls[0]["workspace"] == tmp_path / "ledgerlite-app"
+    assert validation_calls[0]["output_scope"] == ("ledgerlite.py",)
+    assert repair_calls
+    assert repair_calls[0]["workspace"] == tmp_path / "ledgerlite-app"
+    assert repair_calls[0]["allowed_write_paths"] == ("ledgerlite.py",)
+
+
+def test_source_repair_targets_exclude_runtime_json_data():
+    from shamsu.cli import repl as repl_mod
+
+    assert repl_mod._source_repair_targets(
+        ("ledgerlite.py", "ledgerlite.json", "package.json", "README.md", "report.csv")
+    ) == ("ledgerlite.py", "package.json")
+
+
+def test_acceptance_failure_hint_explains_subcommand_options():
+    from shamsu.cli import repl as repl_mod
+
+    hint = repl_mod._acceptance_failure_hint(
+        "python ledgerlite.py seed --db data.json",
+        "ledgerlite.py: error: unrecognized arguments: --db data.json",
+    )
+
+    assert "after the subcommand" in hint
+    assert "subparser" in hint
+
+
+def test_structured_validation_rewrite_applies_complete_source_file(tmp_path, monkeypatch):
+    from rich.console import Console
+    from shamsu.cli import repl as repl_mod
+
+    target = tmp_path / "ledgerlite.py"
+    target.write_text("print('old')\n", encoding="utf-8")
+
+    class FakeLLM:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def generate_structured(self, role, system, prompt, schema, **kwargs):
+            assert "Validation failures to fix" in prompt
+            return '{"content": "print(\\"new\\")\\n"}'
+
+    monkeypatch.setattr(repl_mod, "LLMManager", FakeLLM)
+
+    changed = asyncio.run(
+        repl_mod._structured_validation_rewrite(
+            "PRD",
+            ["acceptance failed"],
+            ("ledgerlite.py",),
+            tmp_path,
+            Console(record=True),
+        )
+    )
+
+    assert changed == ["ledgerlite.py"]
+    assert target.read_text(encoding="utf-8") == 'print("new")\n'
+
+
+def test_freeform_generation_budgets_keep_repair_short(monkeypatch):
+    from shamsu.cli import repl as repl_mod
+    from shamsu.repair.prompt import STRICT_DEBUG_SYSTEM
+
+    monkeypatch.setenv("SHAMSU_FREEFORM_NUM_PREDICT", "9000")
+    monkeypatch.setenv("SHAMSU_REPAIR_NUM_PREDICT", "700")
+
+    assert repl_mod._structured_num_predict_for(
+        STRICT_DEBUG_SYSTEM,
+        {"type": "object", "properties": {"target_file": {"type": "string"}}},
+    ) == 700
+    assert repl_mod._structured_num_predict_for(
+        "You are SHAMSU writing ONE file",
+        {"type": "object", "properties": {"content": {"type": "string"}}},
+    ) == 9000
+
+
 def test_bugfix_request_requires_concrete_target_before_workflow():
     assert not _bugfix_request_has_actionable_target("fix a code for me")
     assert _bugfix_request_has_actionable_target("fix app.py")

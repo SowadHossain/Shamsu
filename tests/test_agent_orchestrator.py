@@ -98,6 +98,19 @@ def test_orchestrator_deduplicates_at_and_plain_filename_context(tmp_path):
     assert result.context.count("# @qa_probe.py (file)") == 1
 
 
+def test_mutation_with_file_mentions_continues_to_coding_workflow(tmp_path):
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "schema.sql").write_text("CREATE TABLE items (id INTEGER);\n", encoding="utf-8")
+
+    result = AgentOrchestrator(tmp_path).run(
+        "Fix the wiring bugs in app.py and schema.sql."
+    )
+
+    assert result.handled is False
+    assert result.action == ""
+    assert "# @app.py (file)" in result.context
+
+
 def test_mention_resolver_reads_quoted_path_with_spaces(tmp_path):
     docs = tmp_path / "agent context"
     docs.mkdir()
@@ -108,6 +121,26 @@ def test_mention_resolver_reads_quoted_path_with_spaces(tmp_path):
     assert contexts[0].resolved
     assert contexts[0].path.as_posix() == "agent context/PROGRESS.md"
     assert "# Progress" in contexts[0].content
+
+
+def test_mention_resolver_ignores_python_decorators(tmp_path):
+    """Live repro (2026-07-23): replayed model-generated code containing
+    `@app.route("/tasks/<id>")` got parsed as an `@app.route` file mention and
+    derailed the whole turn into a "no workspace file matched" dump instead of
+    resuming the actual task. A decorator/call (`@name(` with no space) must
+    not be treated as a mention; a real mention immediately followed by a
+    parenthetical note must still work."""
+    resolver = MentionResolver(tmp_path)
+
+    contexts = resolver.resolve_all(
+        '@app.route("/tasks/<id>")\ndef delete_task(id):\n    pass'
+    )
+    assert contexts == []
+
+    (tmp_path / "app.py").write_text("app = 1\n", encoding="utf-8")
+    contexts = resolver.resolve_all("check @app.py (it has a bug)")
+    assert len(contexts) == 1
+    assert contexts[0].resolved
 
 
 def test_mention_resolver_rejects_path_escape(tmp_path):

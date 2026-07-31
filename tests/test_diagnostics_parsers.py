@@ -114,6 +114,24 @@ def test_python_traceback_ignores_error_like_lines_outside_traceback_context():
     assert python_fallback.parse_python_traceback(text) == []
 
 
+def test_parses_py_compile_syntax_error_block():
+    text = (
+        '  File "ledgerlite.py", line 94\n'
+        "    f.write('id,category,amount,note\n"
+        "            ^\n"
+        "SyntaxError: unterminated string literal (detected at line 94)\n"
+    )
+
+    records = python_fallback.parse_python_traceback(text)
+
+    assert len(records) == 1
+    assert records[0].category == "syntax_error"
+    assert records[0].code == "SyntaxError"
+    assert records[0].file == "ledgerlite.py"
+    assert records[0].line == 94
+    assert "unterminated string literal" in records[0].message
+
+
 # -- pytest ------------------------------------------------------------------
 
 def test_parses_pytest_failed_summary_line():

@@ -1,6 +1,8 @@
 """Phase 1: PRDContract extraction + template suitability / strategy routing."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from shamsu.prd.contract import PRDContract, extract_contract
 from shamsu.prd.parser import parse_prd_text
 from shamsu.prd.project import build_project_spec
@@ -69,6 +71,20 @@ def test_contract_extracts_pong_details():
     assert any("score" in c.lower() or "point" in c.lower() for c in contract.acceptance_criteria)
 
 
+def test_contract_extracts_acceptance_section_alias():
+    parsed = parse_prd_text(
+        "# Expense CLI\n\n"
+        "## Acceptance\n"
+        "- `python ledgerlite.py seed --db data.json` prints `seeded 4 expenses`.\n",
+        markdown=True,
+    )
+    contract = extract_contract(parsed)
+
+    assert contract.acceptance_criteria == [
+        "`python ledgerlite.py seed --db data.json` prints `seeded 4 expenses`."
+    ]
+
+
 def test_contract_roundtrips_through_dict():
     contract = extract_contract(parse_prd_text(PONG_PRD, markdown=True))
     restored = PRDContract.from_dict(contract.to_dict())
@@ -101,3 +117,17 @@ def test_build_project_spec_attaches_contract_and_suitability():
     spec = build_project_spec(parse_prd_text(PONG_PRD, markdown=True))
     assert isinstance(spec.prd_contract, PRDContract)
     assert spec.suitability is not None
+
+
+def test_contract_keeps_long_prd_workflows_scripts_tests_and_entities():
+    prd_text = Path("evals/fixtures/prds/atlasdesk_long.md").read_text(encoding="utf-8")
+    contract = extract_contract(parse_prd_text(prd_text, markdown=True))
+
+    assert contract.project_kind == "web_app"
+    assert {"react", "vite", "node", "typescript", "sqlite"} <= set(contract.required_stack)
+    assert {"Incident", "Note", "HealthMetric"} <= {
+        str(entity.get("name")) for entity in contract.entities
+    }
+    assert any("Seed realistic demo data" in item for item in contract.features)
+    assert any("scripts/seed.mjs" in item for item in contract.features)
+    assert any("status-count computation" in item for item in contract.required_tests)
