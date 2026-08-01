@@ -309,7 +309,8 @@ class CommandRunner(ICommandRunner):
             raw_log_path = ""
             if self.action_ledger and operation_id:
                 stream = "stderr" if stderr else "stdout"
-                raw_log_path = f"commands/{operation_id}.{stream}.log"
+                raw_path = self.action_ledger.commands_dir / f"{operation_id}.{stream}.log"
+                raw_log_path = str(raw_path.relative_to(self.action_ledger.run_dir).as_posix())
             elif self.session_logger:
                 raw_log_path = str(self.session_logger.events_path)
             packet = self.diagnostic_digest.run(command, cwd, exit_code, stdout, stderr, raw_log_path=raw_log_path)

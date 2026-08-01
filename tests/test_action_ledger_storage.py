@@ -39,6 +39,7 @@ def test_start_run_creates_complete_canonical_artifact_layout(tmp_path: Path):
     assert ledger.diagnostics_dir.is_dir()
     assert ledger.contexts_dir.is_dir()
     assert store.load_context_records(tmp_path, ledger.run_id) == []
+    assert {path.name for path in ledger.run_dir.iterdir()} == {"report.md", ".evidence"}
 
 
 def test_start_run_writes_manifest_json(tmp_path: Path):
@@ -432,13 +433,27 @@ def test_command_stdout_stderr_saved_as_separate_files(tmp_path: Path):
     assert stderr_path.read_text(encoding="utf-8") == "an error occurred"
 
 
-def test_command_finished_event_references_stdout_stderr_paths(tmp_path: Path):
+def test_essential_command_output_stays_inline_for_short_successes(tmp_path: Path):
     ledger = start_run(tmp_path, "run the build")
     cmd_id = ledger.log_command_start("npm run build", tmp_path)
     event = ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 0, "out", "err")
 
-    assert event["stdout_path"] == f"commands/{cmd_id}.stdout.log"
-    assert event["stderr_path"] == f"commands/{cmd_id}.stderr.log"
+    assert event["stdout_path"] == ""
+    assert event["stderr_path"] == ""
+    assert event["stdout_preview"] == "out"
+    assert event["stderr_preview"] == "err"
+    assert not (ledger.commands_dir / f"{cmd_id}.stdout.log").exists()
+    assert not (ledger.commands_dir / f"{cmd_id}.stderr.log").exists()
+
+
+def test_verbose_command_event_references_separate_output_files(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
+    ledger = start_run(tmp_path, "run the build")
+    cmd_id = ledger.log_command_start("npm run build", tmp_path)
+    event = ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 0, "out", "err")
+
+    assert event["stdout_path"] == f".evidence/commands/{cmd_id}.stdout.log"
+    assert event["stderr_path"] == f".evidence/commands/{cmd_id}.stderr.log"
 
 
 def test_huge_command_output_not_embedded_in_events_jsonl(tmp_path: Path):
@@ -491,7 +506,7 @@ def test_tool_result_token_telemetry_and_artifact_are_saved(tmp_path: Path):
     assert finished["returned_tokens"] == 600
     assert finished["max_tokens"] == 600
     assert finished["truncated"] is True
-    assert finished["artifact_path"] == f"tool-results/{call_id}.json"
+    assert finished["artifact_path"] == f".evidence/tool-results/{call_id}.json"
     assert (ledger.run_dir / finished["artifact_path"]).read_text(encoding="utf-8") == full_result
 
 
@@ -558,7 +573,8 @@ def test_verification_and_repair_telemetry_are_saved(tmp_path: Path):
 # -- redaction ----------------------------------------------------------------
 
 
-def test_api_keys_are_redacted(tmp_path: Path):
+def test_api_keys_are_redacted(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "do a thing")
     cmd_id = ledger.log_command_start("printenv", tmp_path)
     ledger.log_command_finish(cmd_id, "printenv", tmp_path, 0, 'api_key = "sk-abcdefghijklmnopqrstuvwxyz123456"', "")
@@ -581,7 +597,8 @@ def test_env_style_secrets_are_redacted(tmp_path: Path):
     assert "[REDACTED]" in raw_text
 
 
-def test_private_keys_are_redacted(tmp_path: Path):
+def test_private_keys_are_redacted(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "do a thing")
     key_block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1234567890\n-----END RSA PRIVATE KEY-----"
     cmd_id = ledger.log_command_start("cat id_rsa", tmp_path)
@@ -592,7 +609,8 @@ def test_private_keys_are_redacted(tmp_path: Path):
     assert "[REDACTED]" in stdout
 
 
-def test_authorization_headers_are_redacted(tmp_path: Path):
+def test_authorization_headers_are_redacted(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "do a thing")
     cmd_id = ledger.log_command_start("curl -v https://api.example.com", tmp_path)
     ledger.log_command_finish(
@@ -666,7 +684,8 @@ def test_v2_records_have_correlation_fields_and_global_sequence(tmp_path: Path):
     assert len(sequences) == len(set(sequences))
 
 
-def test_context_records_are_preserved_per_model_call(tmp_path: Path):
+def test_context_records_are_preserved_per_model_call(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "answer twice")
     first_call = ledger.log_model_call_started("qa", "fake", "first")
     ledger.log_context_preview(
@@ -685,6 +704,15 @@ def test_context_records_are_preserved_per_model_call(tmp_path: Path):
     assert [item["task_id"] for item in contexts] == ["t1", "t2"]
     assert [item["model_call_id"] for item in contexts] == [first_call, second_call]
     assert store.load_context_preview(tmp_path, ledger.run_id)["task_id"] == "t2"
+
+
+def test_essential_context_keeps_only_the_latest_preview(tmp_path: Path):
+    ledger = start_run(tmp_path, "answer twice")
+    ledger.log_context_preview({"task_id": "t1", "specialist": "qa", "snippets": []})
+    ledger.log_context_preview({"task_id": "t2", "specialist": "coder", "snippets": []})
+
+    assert list(ledger.contexts_dir.glob("context_*.json")) == []
+    assert store.load_context_records(tmp_path, ledger.run_id)[0]["task_id"] == "t2"
 
 
 def test_terminal_failure_cannot_be_overwritten_by_success_response(tmp_path: Path):
@@ -778,9 +806,10 @@ def test_evidence_finalizer_uses_specific_terminal_outcomes(tmp_path: Path):
 # -- Tier 1: full-fidelity model-call artifacts -----------------------------
 
 
-def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path):
+def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path, monkeypatch):
     """The deep log must hold the request as sent, the whole chain-of-thought,
     and the whole response - previews alone cannot explain a bad answer."""
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "add a healthcheck endpoint")
     long_cot = "step " * 4000  # well past the old 4000-char clip
     call_id = ledger.log_model_call_started(
@@ -795,7 +824,7 @@ def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path):
         "coder", "deepseek-r1:7b", "done" * 3000, call_id=call_id
     )
 
-    prompt_text = (ledger.run_dir / "prompts" / f"{call_id}.txt").read_text(encoding="utf-8")
+    prompt_text = (ledger.prompts_dir / f"{call_id}.txt").read_text(encoding="utf-8")
     assert "===== SYSTEM =====" in prompt_text
     assert "You are SHAMSU." in prompt_text
     assert "add a healthcheck endpoint" in prompt_text
@@ -808,32 +837,33 @@ def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path):
         item["phase"]: item
         for item in store.load_model_calls(tmp_path, ledger.run_id)
     }
-    assert records["started"]["prompt_path"] == f"prompts/{call_id}.txt"
+    assert records["started"]["prompt_path"] == f".evidence/prompts/{call_id}.txt"
     assert records["thinking"]["thinking_chars"] == len(long_cot.strip())
-    assert records["finished"]["response_path"] == f"responses/{call_id}.txt"
+    assert records["finished"]["response_path"] == f".evidence/responses/{call_id}.txt"
     assert (ledger.run_dir / records["finished"]["response_path"]).read_text(
         encoding="utf-8"
     ) == "done" * 3000
 
 
-def test_compact_log_level_keeps_previews_and_writes_no_artifacts(tmp_path: Path, monkeypatch):
+def test_essential_log_level_keeps_previews_and_writes_no_model_artifacts(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SHAMSU_LOG_LEVEL", "compact")
     ledger = start_run(tmp_path, "add a healthcheck endpoint")
     call_id = ledger.log_model_call_started("coder", "m", "the prompt")
     ledger.log_model_thinking(call_id, "coder", "m", "reasoning")
     ledger.log_model_call_finished("coder", "m", "the answer", call_id=call_id)
 
-    assert not (ledger.run_dir / "prompts").exists()
-    assert not (ledger.run_dir / "cot").exists()
-    assert not (ledger.run_dir / "responses").exists()
+    assert not ledger.prompts_dir.exists()
+    assert not ledger.cot_dir.exists()
+    assert not ledger.responses_dir.exists()
     started = store.load_model_calls(tmp_path, ledger.run_id)[0]
     assert started["prompt_preview"] == "the prompt"
     assert "prompt_path" not in started
 
 
-def test_untitled_thinking_traces_do_not_overwrite_each_other(tmp_path: Path):
+def test_untitled_thinking_traces_do_not_overwrite_each_other(tmp_path: Path, monkeypatch):
     """The plain completion path has no ledger call id, so every trace would
     otherwise land on the same filename."""
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "reason twice")
     first = ledger.log_model_thinking("", "specialist", "m", "first trace")
     second = ledger.log_model_thinking("", "specialist", "m", "second trace")
@@ -843,9 +873,10 @@ def test_untitled_thinking_traces_do_not_overwrite_each_other(tmp_path: Path):
     assert (ledger.run_dir / second).read_text(encoding="utf-8") == "second trace"
 
 
-def test_secrets_are_redacted_in_prompt_and_cot_artifacts(tmp_path: Path):
+def test_secrets_are_redacted_in_prompt_and_cot_artifacts(tmp_path: Path, monkeypatch):
     """Full-text capture removes truncation's accidental protection, so the
     redactor has to cover unquoted secrets - the shape they take in a prompt."""
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "deploy it")
     call_id = ledger.log_model_call_started(
         "coder",
@@ -854,8 +885,8 @@ def test_secrets_are_redacted_in_prompt_and_cot_artifacts(tmp_path: Path):
     )
     ledger.log_model_thinking(call_id, "coder", "m", "I will reuse password=hunter2000 here")
 
-    prompt_text = (ledger.run_dir / "prompts" / f"{call_id}.txt").read_text(encoding="utf-8")
-    cot_text = (ledger.run_dir / "cot" / f"{call_id}.txt").read_text(encoding="utf-8")
+    prompt_text = (ledger.prompts_dir / f"{call_id}.txt").read_text(encoding="utf-8")
+    cot_text = (ledger.cot_dir / f"{call_id}.txt").read_text(encoding="utf-8")
     assert "sk-livesecret9876" not in prompt_text
     assert "[REDACTED]" in prompt_text
     assert "hunter2000" not in cot_text

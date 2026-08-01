@@ -156,7 +156,8 @@ Other `run` flags: `--session`, `--new-session`, `--dry-run`, `--timeout`.
 Every prompt writes a run bundle under `<workspace>\.shamsu\runs\<run-id>\`:
 `manifest.json`, `events.jsonl`, `decisions.jsonl`, `tool-calls.jsonl`,
 `model-calls.jsonl`, `mutations/mutations.jsonl`, `context-preview.json`,
-`contexts/`, `final-output.md`, `summary.json`. Inspect with `/runs` and
+`.evidence/contexts/`, `.evidence/final-output.md`, `.evidence/summary.json`,
+plus a human-readable `report.md`. Inspect with `/runs` and
 `/run show|timeline|decisions|tools|commands|context|diff|validate` **inside the
 REPL** — see the known bug in §8 about slash commands in headless mode.
 

@@ -4,16 +4,17 @@ Mirrors the `.shamsu/<feature>/config.json` pattern used by
 shamsu.diagnostics.setup.DiagnosticsWorkspace and shamsu.memory.service -
 JSON file, defaults merged in, no schema library.
 
-`log_level` picks how much of each model call survives to disk:
+`log_level` selects one of two human-reviewable modes:
 
-    full     - the complete prompt (system + messages + tool schemas), the
-               complete chain-of-thought, and the complete response are each
-               written to their own file under the run directory. The default:
-               a debug log that omits the prompt cannot explain a bad answer.
-    compact  - inline previews only, no artifact files. Smaller runs.
+    essential - the default. A concise Markdown report plus compact machine
+                evidence. Per-model prompt, reasoning, response, and context
+                files are not written.
+    verbose   - a detailed Markdown report plus full redacted evidence for
+                deep debugging.
 
-`SHAMSU_LOG_LEVEL` overrides the stored value for one process, so dropping to
-`compact` never requires editing a file.
+The legacy names `compact` and `full` remain accepted as aliases for
+`essential` and `verbose`. `SHAMSU_LOG_LEVEL` overrides the stored value for
+one process.
 """
 from __future__ import annotations
 
@@ -22,8 +23,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-LOG_LEVELS = ("full", "compact")
-DEFAULT_LOG_LEVEL = "full"
+LOG_LEVELS = ("essential", "verbose")
+LOG_LEVEL_ALIASES = {"compact": "essential", "full": "verbose"}
+DEFAULT_LOG_LEVEL = "essential"
 LOG_LEVEL_ENV_VAR = "SHAMSU_LOG_LEVEL"
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -51,15 +53,22 @@ def resolve_log_level(config: dict[str, Any] | None = None) -> str:
     """Env wins over the stored value; an unrecognized value falls back to the
     default rather than silently disabling artifact capture."""
     from_env = os.environ.get(LOG_LEVEL_ENV_VAR, "").strip().lower()
+    from_env = LOG_LEVEL_ALIASES.get(from_env, from_env)
     if from_env in LOG_LEVELS:
         return from_env
     stored = str((config or {}).get("log_level", DEFAULT_LOG_LEVEL)).strip().lower()
+    stored = LOG_LEVEL_ALIASES.get(stored, stored)
     return stored if stored in LOG_LEVELS else DEFAULT_LOG_LEVEL
 
 
 def wants_full_artifacts(config: dict[str, Any] | None = None) -> bool:
-    """True when full prompt/CoT/response text should be spilled to files."""
-    return resolve_log_level(config) == "full"
+    """True when full prompt/reasoning/response evidence should be retained."""
+    return resolve_log_level(config) == "verbose"
+
+
+def wants_verbose_report(config: dict[str, Any] | None = None) -> bool:
+    """True when the human-readable report should include deep details."""
+    return resolve_log_level(config) == "verbose"
 
 
 def load_config(workspace: Path) -> dict[str, Any]:

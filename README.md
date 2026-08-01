@@ -736,11 +736,18 @@ Internal patch review:
 
 Session logging:
 
-- Session logs are local JSONL files under the active workspace.
-- Prompts, routing decisions, context packs, LLM calls, approvals, patches,
-  commands, web lookups, browser actions, PRD planning, and Django generation
-  events are logged.
-- Log payloads are redacted and large strings are truncated by default.
+- Every request writes one human-readable
+  `.shamsu/runs/<run-id>/report.md`; conversation roll-ups use
+  `.shamsu/sessions/<session-id>/report.md`.
+- `essential` is the default log mode. Its report contains the prompt,
+  approach, tools, changed files, verification, errors, and final answer while
+  omitting per-model raw prompt, reasoning, response, and context files.
+- `verbose` expands that same report with model exchanges, emitted reasoning
+  traces, context, tool payloads, command output, and decisions. Full redacted
+  machine evidence is retained under the run's hidden `.evidence/` folder.
+- Use `/logs mode essential` or `/logs mode verbose`; `SHAMSU_LOG_LEVEL` can
+  override the mode for one process. `/logs` shows the active mode and paths.
+- Log payloads are redacted, and large inline strings are truncated.
 - Exports are meant to be shareable debugging bundles, not raw source dumps.
 
 Important limitation:
@@ -748,8 +755,8 @@ Important limitation:
 - This is not a full OS sandbox.
 - This is not Docker isolation.
 - User-facing arbitrary shell execution is still not exposed as a REPL command.
-- Session logs are redacted metadata by default, not a forensic or compliance
-  audit system.
+- Reports and evidence are debugging aids, not a forensic or compliance audit
+  system.
 
 ## Troubleshooting
 

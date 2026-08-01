@@ -1,20 +1,21 @@
-"""Human-readable narrative log - "what actually happened" for one turn.
+"""Human-readable run report - "what actually happened" for one turn.
 
-Tier 2 of SHAMSU's logging. Where `.shamsu/runs/<run-id>/` holds the machine
-evidence (the full prompt, the full chain-of-thought, every tool payload), this
-renders the same turn as a short markdown story: the prompt that came in, the
-route taken, each tool call and what it did, then the answer.
+Every run exposes one `report.md` as its primary log. In essential mode it is a
+concise account of the prompt, approach, tools, mutations, verification, and
+answer. Verbose mode expands the same report with model exchanges, reasoning
+traces, context, tool payloads, and command output. Machine evidence lives in
+the sibling `.evidence/` directory rather than crowding the run root.
 
 It exists because that story was previously only ever printed to the console by
 `/trace verbose` and then lost. Two consequences shape this module:
 
 * Detail is NOT tied to console verbosity. `emit_trace` gates *printing* on the
-  workspace trace mode; the narrative is always written in full. `/trace quiet`
-  silences the terminal, never the file.
+  workspace trace mode; the configured log mode controls the report. `/trace
+  quiet` silences the terminal, never the file.
 * Two destinations, both inside the workspace's own `.shamsu/`::
 
-      runs/<run-id>/narrative.md          this turn
-      sessions/<session-id>/narrative.md  every turn, appended when it closes
+      runs/<run-id>/report.md          this turn
+      sessions/<session-id>/report.md  every turn, appended when it closes
 
   The session roll-up is appended once, on close, rather than incrementally -
   concurrent runs then cannot interleave half-written turns into it.
@@ -26,21 +27,39 @@ ever read back into a model prompt.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from shamsu.action_ledger.config import resolve_log_level
 from shamsu.safety.commands import redact
 from shamsu.ui.trace import EVENT_LABELS
 
-NARRATIVE_FILE = "narrative.md"
+NARRATIVE_FILE = "report.md"
 
-# The narrative is a summary, not a payload dump - the deep log already holds
-# the untruncated text, and this stays readable.
+# Keep inline prose readable. Verbose payloads use collapsible detail blocks and
+# remain bounded; the redacted artifact files retain the full text.
 _MAX_PROMPT_CHARS = 4000
 _MAX_ANSWER_CHARS = 4000
 _MAX_MESSAGE_CHARS = 600
 _MAX_VALUE_CHARS = 200
+_MAX_VERBOSE_BLOCK_CHARS = 50000
+
+_ESSENTIAL_EVENTS = frozenset(
+    {
+        "route.detected",
+        "plan.created",
+        "clarification.needed",
+        "clarification.answered",
+        "tool.salvaged",
+        "verify.result",
+        "workflow.blocked",
+        "workflow.finished",
+        "run.timed_out",
+        "run.cancelled",
+    }
+)
 
 # Trace events that add nothing to a human narrative, plus the tool events:
 # those are recorded from the ActionLedger instead (see append_tool_call), which
@@ -62,7 +81,7 @@ _INTERESTING_KEYS = (
 
 
 class NarrativeWriter:
-    """Appends the readable story of one run to `narrative.md`.
+    """Appends the readable story of one run to `report.md`.
 
     Path-based on purpose: it never imports the ActionLedger or SessionLogger,
     so it can be pointed at any run/session directory (and tested) without
@@ -74,10 +93,13 @@ class NarrativeWriter:
         run_dir: Path,
         session_dir: Path | None = None,
         run_id: str = "",
+        log_level: str = "essential",
     ) -> None:
         self.run_dir = Path(run_dir)
         self.session_dir = Path(session_dir) if session_dir is not None else None
         self.run_id = run_id or self.run_dir.name
+        self.log_level = resolve_log_level({"log_level": log_level})
+        self.verbose = self.log_level == "verbose"
 
     @property
     def path(self) -> Path:
@@ -94,7 +116,11 @@ class NarrativeWriter:
     def open_turn(self, prompt: str, route: str = "") -> None:
         """Start this run's narrative with the prompt that triggered it."""
         lines = [
-            f"## {_now()} - {self.run_id}",
+            "# SHAMSU Run Report",
+            "",
+            f"- **Run:** `{self.run_id}`",
+            f"- **Started:** {_now()}",
+            f"- **Mode:** {self.log_level}",
             "",
             "**Prompt**",
             "",
@@ -112,6 +138,8 @@ class NarrativeWriter:
         """Add one step. Called for every trace event, at every level."""
         if event_type in _SKIP_EVENTS:
             return
+        if not self.verbose and event_type not in _ESSENTIAL_EVENTS:
+            return
         line = _render_step(event_type, message, payload)
         if line:
             self._append(line + "\n")
@@ -125,13 +153,138 @@ class NarrativeWriter:
         target = _tool_target(arguments)
         suffix = f" - {target}" if target else ""
         self._append(f"- **Tool** `{redact(str(name))}`{_clip(suffix, _MAX_VALUE_CHARS)}\n")
+        if self.verbose and arguments:
+            self._append(_details("Arguments", arguments))
 
-    def append_tool_result(self, name: str, ok: bool, message: str = "") -> None:
+    def append_tool_result(
+        self,
+        name: str,
+        ok: bool,
+        message: str = "",
+        data: Any = None,
+    ) -> None:
         """Record what the tool actually did."""
         outcome = "ok" if ok else "FAILED"
         text = " ".join(_clip(redact(str(message or "")), _MAX_MESSAGE_CHARS).split())
         detail = f": {text}" if text else ""
         self._append(f"  - {outcome}{detail}\n")
+        if self.verbose and data not in (None, {}, [], ""):
+            self._append(_details("Result data", data))
+
+    def append_decision(self, record: dict[str, Any]) -> None:
+        decision = redact(str(record.get("decision", "decision")))
+        chosen = redact(str(record.get("chosen_action", "")))
+        reason = redact(str(record.get("reason_summary", "")))
+        line = f"- **Decision** `{decision}`"
+        if chosen:
+            line += f" -> `{chosen}`"
+        if reason:
+            line += f": {_clip(' '.join(reason.split()), _MAX_MESSAGE_CHARS)}"
+        self._append(line + "\n")
+        if self.verbose:
+            self._append(_details("Decision evidence", record))
+
+    def append_model_call(
+        self,
+        call_id: str,
+        role: str,
+        model: str,
+        request_text: str,
+    ) -> None:
+        if not self.verbose:
+            return
+        self._append(
+            f"- **Model call** `{redact(call_id)}` - role `{redact(role)}`, "
+            f"model `{redact(model)}`\n"
+        )
+        self._append(_details_text("Prompt sent to model", request_text))
+
+    def append_model_reasoning(
+        self,
+        call_id: str,
+        role: str,
+        model: str,
+        reasoning: str,
+    ) -> None:
+        if self.verbose and reasoning:
+            self._append(_details_text(f"Reasoning trace for {call_id}", reasoning))
+
+    def append_model_result(
+        self,
+        call_id: str,
+        role: str,
+        model: str,
+        response: str,
+        error: str,
+        duration_ms: float | None,
+    ) -> None:
+        if not self.verbose:
+            return
+        outcome = "FAILED" if error else "completed"
+        duration = f" in {duration_ms:.0f} ms" if isinstance(duration_ms, (int, float)) else ""
+        self._append(f"  - Model `{redact(call_id)}` {outcome}{duration}\n")
+        if error:
+            self._append(_details_text("Model error", error))
+        elif response:
+            self._append(_details_text("Model response", response))
+
+    def append_context(self, record: dict[str, Any]) -> None:
+        if not self.verbose:
+            return
+        context_id = redact(str(record.get("context_id", "context")))
+        tokens = record.get("token_estimate", "unknown")
+        snippets = len(record.get("snippets") or [])
+        self._append(
+            f"- **Context** `{context_id}` - {tokens} estimated tokens, "
+            f"{snippets} snippet(s)\n"
+        )
+        self._append(_details("Context payload", record))
+
+    def append_command(
+        self,
+        command: str,
+        exit_code: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        outcome = "passed" if exit_code == 0 else "FAILED"
+        self._append(
+            f"- **Command** `{redact(command)}` - {outcome} (exit {exit_code})\n"
+        )
+        if self.verbose and stdout:
+            self._append(_details_text("stdout", stdout))
+        if self.verbose and stderr:
+            self._append(_details_text("stderr", stderr))
+
+    def append_mutation(
+        self,
+        status: str,
+        files: list[str],
+        error: str,
+        transaction_id: str,
+    ) -> None:
+        rendered_files = ", ".join(f"`{redact(str(path))}`" for path in files) or "none"
+        self._append(f"- **Files changed** ({redact(status)}): {rendered_files}\n")
+        if error:
+            self._append(f"  - Error: {_clip(redact(error), _MAX_MESSAGE_CHARS)}\n")
+        if self.verbose and transaction_id:
+            self._append(f"  - Transaction: `{redact(transaction_id)}`\n")
+
+    def append_verification(
+        self,
+        passed: bool,
+        command: str,
+        summary: str,
+        exit_code: int | None,
+        files: list[str],
+    ) -> None:
+        outcome = "passed" if passed else "FAILED"
+        target = f" `{redact(command)}`" if command else ""
+        exit_text = f" (exit {exit_code})" if exit_code is not None else ""
+        detail = f": {_clip(redact(summary), _MAX_MESSAGE_CHARS)}" if summary else ""
+        self._append(f"- **Verification**{target} - {outcome}{exit_text}{detail}\n")
+        if self.verbose and files:
+            self._append(f"  - Files: {', '.join(f'`{redact(str(path))}`' for path in files)}\n")
 
     def close_turn(self, final: str = "", status: str = "") -> None:
         """Finish the turn with the answer, then fold it into the session
@@ -139,21 +292,25 @@ class NarrativeWriter:
         roll-up from gaining duplicate copies of the same turn."""
         if self._is_closed():
             return
-        lines = ["", "**Answer**", ""]
+        lines = ["", "## Result", "", f"- **Status:** {status or 'unknown'}", "", "**Answer**", ""]
         answer = _clip(redact(str(final or "")), _MAX_ANSWER_CHARS).strip()
         lines.append(answer if answer else "_(no final answer recorded)_")
         lines.extend(
             [
                 "",
-                f"_Status: {status or 'unknown'} - full detail: "
-                f"runs/{self.run_id}/ (prompts/, cot/, responses/)_",
+                (
+                    "_Verbose human detail and raw redacted evidence are available "
+                    f"under `runs/{self.run_id}/.evidence/`._"
+                    if self.verbose
+                    else "_Essential mode omits per-model raw artifacts._"
+                ),
                 "",
                 _CLOSED_MARKER,
                 "",
             ]
         )
         self._append("\n".join(lines))
-        self._roll_up_to_session()
+        self._roll_up_to_session(answer, status)
 
     # -- io (best-effort throughout) ---------------------------------------
 
@@ -182,7 +339,7 @@ class NarrativeWriter:
         except OSError:
             return False
 
-    def _roll_up_to_session(self) -> None:
+    def _roll_up_to_session(self, answer: str, status: str) -> None:
         session_path = self.session_path
         if session_path is None:
             return
@@ -191,14 +348,27 @@ class NarrativeWriter:
                 # No such session (headless run without a session logger);
                 # the per-run narrative is still complete on its own.
                 return
-            block = self.path.read_text(encoding="utf-8")
+            report = self.path.read_text(encoding="utf-8")
         except OSError:
             return
-        if not block.strip():
+        if not report.strip():
             return
+        prompt_section = report.split("**What SHAMSU did**", 1)[0].rstrip()
+        block = "\n".join(
+            [
+                prompt_section,
+                "",
+                f"- **Status:** {status or 'unknown'}",
+                f"- **Report:** `runs/{self.run_id}/report.md`",
+                "",
+                "**Answer**",
+                "",
+                _clip(answer, 1200) if answer else "_(no final answer recorded)_",
+            ]
+        )
         try:
             with session_path.open("a", encoding="utf-8") as handle:
-                handle.write(block.replace(_CLOSED_MARKER, "").rstrip() + "\n\n---\n\n")
+                handle.write(block.rstrip() + "\n\n---\n\n")
         except OSError:
             pass
 
@@ -211,50 +381,42 @@ _LAYOUT_README = """# .shamsu/
 SHAMSU's workspace-local state and logs. Safe to delete: nothing here is needed
 to run SHAMSU again, and none of it is ever fed back into a model prompt.
 
-Two logs are written for every request.
+Every request produces one human-readable report.
 
-## Narrative log - the readable story
+## Human-readable reports
 
-    runs/<run-id>/narrative.md          one request
-    sessions/<session-id>/narrative.md  the whole conversation
+    runs/<run-id>/report.md          one request
+    sessions/<session-id>/report.md  concise conversation roll-up
 
-The prompt that came in, the route taken, each tool call and what it did, then
-the answer. Start here. Written in full even when `/trace quiet` silences the
-console.
+The report contains the prompt, approach, tools, changed files, verification,
+errors, and final answer. Start here. It is written even when `/trace quiet`
+silences the console.
 
-## Deep log - everything the model saw and produced
+## Machine evidence
 
     runs/<run-id>/
-      prompts/model_NNNN.txt    the full prompt as sent (system + messages + tool schemas)
-      cot/model_NNNN.txt        the full chain-of-thought, untruncated
-      responses/model_NNNN.txt  the full model response
-      model-calls.jsonl         one row per call, with paths to the three above
-      tool-calls.jsonl          every tool call, its arguments and its result
-      tool-results/             full result payloads too large to inline
-      commands/                 stdout and stderr of every command run
-      mutations/mutations.jsonl file changes, with rollback transaction ids
-      contexts/                 the context packs built for each call
-      decisions.jsonl           routing and planning decisions, with reasons
-      events.jsonl              the machine-readable timeline
-      summary.json, manifest.json, final-output.md
+      report.md               human-readable report
+      .evidence/              internal redacted machine records
 
 Run ids sort chronologically, so the newest run is the last folder.
 
 ## Reading it from the REPL
 
     /logs              where everything is, and the current detail level
-    /run narrative     the story of the last run
-    /run prompt        what the model was actually sent
-    /run cot           what the model was thinking
+    /run report        the story of the last run
     /runs              list recent runs
     /run export <id>   zip one run up to share
 
 ## Detail level
 
-Full capture is the default. `SHAMSU_LOG_LEVEL=compact` keeps inline previews
-but writes no `prompts/`, `cot/` or `responses/` files; the same value can be
-set as `log_level` in `action_ledger/config.json`. Runs older than
-`retention_days` (30) are removed by `/run clean`.
+`essential` is the default: a concise report and compact evidence without
+per-model prompt, reasoning, response, or context files. `verbose` expands the
+same report with model calls, reasoning traces, tool payloads, command output,
+decisions, and context details while retaining full redacted evidence.
+
+Change it with `/logs mode essential|verbose` or `SHAMSU_LOG_LEVEL`.
+The legacy names `compact` and `full` remain accepted as aliases. Runs older
+than `retention_days` (30) are removed by `/run clean`.
 
 ## Secrets
 
@@ -275,7 +437,7 @@ def write_layout_readme(workspace: Path) -> Path | None:
     """Explain the .shamsu folder, in the folder itself.
 
     Someone who opens `.shamsu/` in a file browser should not have to guess what
-    `cot/` or `model-calls.jsonl` are. Written once and then left alone, so a
+    the report and evidence folders are. Written once and then left alone, so a
     user's own edits survive. Best-effort; returns the path, or None."""
     root = Path(workspace).resolve() / ".shamsu"
     path = root / "README.md"
@@ -287,6 +449,22 @@ def write_layout_readme(workspace: Path) -> Path | None:
         return path
     except OSError:
         return None
+
+
+def _details(title: str, value: Any) -> str:
+    rendered = json.dumps(value, indent=2, ensure_ascii=True, default=str)
+    return _details_text(title, rendered, language="json")
+
+
+def _details_text(title: str, text: str, language: str = "text") -> str:
+    safe_title = redact(str(title))
+    safe_text = _clip(redact(str(text or "")), _MAX_VERBOSE_BLOCK_CHARS)
+    return (
+        f"  <details>\n"
+        f"  <summary>{safe_title}</summary>\n\n"
+        f"  ```{language}\n{safe_text}\n  ```\n"
+        f"  </details>\n"
+    )
 
 
 def _render_step(event_type: str, message: str, payload: dict[str, Any] | None) -> str:

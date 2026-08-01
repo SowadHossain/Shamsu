@@ -20,6 +20,22 @@ def runs_dir(workspace: Path) -> Path:
     return Path(workspace).resolve() / ".shamsu" / "runs"
 
 
+def artifact_path(workspace: Path, run_id: str, relative: str | Path) -> Path:
+    """Return a new-layout evidence path, falling back to a legacy run path."""
+    run_root = runs_dir(workspace) / run_id
+    relative = Path(relative)
+    modern = run_root / ".evidence" / relative
+    legacy = run_root / relative
+    return modern if modern.exists() or not legacy.exists() else legacy
+
+
+def report_path(workspace: Path, run_id: str) -> Path:
+    run_root = runs_dir(workspace) / run_id
+    modern = run_root / "report.md"
+    legacy = run_root / "narrative.md"
+    return modern if modern.exists() or not legacy.exists() else legacy
+
+
 def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -90,40 +106,40 @@ def resolve_run_id(workspace: Path, query: str) -> str | None:
 
 
 def load_manifest(workspace: Path, run_id: str) -> dict[str, Any] | None:
-    return _read_json(runs_dir(workspace) / run_id / "manifest.json")
+    return _read_json(artifact_path(workspace, run_id, "manifest.json"))
 
 
 def load_summary(workspace: Path, run_id: str) -> dict[str, Any] | None:
-    return _read_json(runs_dir(workspace) / run_id / "summary.json")
+    return _read_json(artifact_path(workspace, run_id, "summary.json"))
 
 
 def load_events(workspace: Path, run_id: str) -> list[dict[str, Any]]:
-    return _read_jsonl(runs_dir(workspace) / run_id / "events.jsonl")
+    return _read_jsonl(artifact_path(workspace, run_id, "events.jsonl"))
 
 
 def load_decisions(workspace: Path, run_id: str) -> list[dict[str, Any]]:
-    return _read_jsonl(runs_dir(workspace) / run_id / "decisions.jsonl")
+    return _read_jsonl(artifact_path(workspace, run_id, "decisions.jsonl"))
 
 
 def load_tool_calls(workspace: Path, run_id: str) -> list[dict[str, Any]]:
-    return _read_jsonl(runs_dir(workspace) / run_id / "tool-calls.jsonl")
+    return _read_jsonl(artifact_path(workspace, run_id, "tool-calls.jsonl"))
 
 
 def load_model_calls(workspace: Path, run_id: str) -> list[dict[str, Any]]:
-    return _read_jsonl(runs_dir(workspace) / run_id / "model-calls.jsonl")
+    return _read_jsonl(artifact_path(workspace, run_id, "model-calls.jsonl"))
 
 
 def load_mutations(workspace: Path, run_id: str) -> list[dict[str, Any]]:
-    return _read_jsonl(runs_dir(workspace) / run_id / "mutations" / "mutations.jsonl")
+    return _read_jsonl(artifact_path(workspace, run_id, Path("mutations") / "mutations.jsonl"))
 
 
 def load_context_preview(workspace: Path, run_id: str) -> dict[str, Any] | None:
-    return _read_json(runs_dir(workspace) / run_id / "context-preview.json")
+    return _read_json(artifact_path(workspace, run_id, "context-preview.json"))
 
 
 def load_context_records(workspace: Path, run_id: str) -> list[dict[str, Any]]:
     """Load every v2 context artifact, falling back to the legacy latest preview."""
-    context_dir = runs_dir(workspace) / run_id / "contexts"
+    context_dir = artifact_path(workspace, run_id, "contexts")
     records = [
         record
         for path in sorted(context_dir.glob("context_*.json"))
@@ -152,7 +168,7 @@ def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
     terminal = str(manifest.get("status", "")) != "running"
     if terminal and load_summary(workspace, run_id) is None:
         errors.append("terminal run is missing summary.json")
-    if terminal and not (run_dir / "final-output.md").exists():
+    if terminal and not artifact_path(workspace, run_id, "final-output.md").exists():
         errors.append("terminal run is missing final-output.md")
 
     groups = {
@@ -164,11 +180,11 @@ def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
         "contexts": load_context_records(workspace, run_id),
     }
     jsonl_paths = {
-        "events": run_dir / "events.jsonl",
-        "decisions": run_dir / "decisions.jsonl",
-        "tools": run_dir / "tool-calls.jsonl",
-        "models": run_dir / "model-calls.jsonl",
-        "mutations": run_dir / "mutations" / "mutations.jsonl",
+        "events": artifact_path(workspace, run_id, "events.jsonl"),
+        "decisions": artifact_path(workspace, run_id, "decisions.jsonl"),
+        "tools": artifact_path(workspace, run_id, "tool-calls.jsonl"),
+        "models": artifact_path(workspace, run_id, "model-calls.jsonl"),
+        "mutations": artifact_path(workspace, run_id, Path("mutations") / "mutations.jsonl"),
     }
     for name, path in jsonl_paths.items():
         if not path.exists():
@@ -285,10 +301,10 @@ def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
             errors.append(
                 f"tool call {record.get('tool_call_id', '')} references missing traceback {traceback_path}"
             )
-        artifact_path = str(record.get("artifact_path", ""))
-        if artifact_path and not (run_dir / artifact_path).is_file():
+        result_artifact_path = str(record.get("artifact_path", ""))
+        if result_artifact_path and not (run_dir / result_artifact_path).is_file():
             errors.append(
-                f"tool call {record.get('tool_call_id', '')} references missing artifact {artifact_path}"
+                f"tool call {record.get('tool_call_id', '')} references missing artifact {result_artifact_path}"
             )
     for record in groups["models"]:
         traceback_path = str(record.get("traceback_path", ""))
@@ -309,7 +325,7 @@ def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
 
 
 def load_final_output(workspace: Path, run_id: str) -> str:
-    path = runs_dir(workspace) / run_id / "final-output.md"
+    path = artifact_path(workspace, run_id, "final-output.md")
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
@@ -346,8 +362,8 @@ def export_run(workspace: Path, run_id: str) -> Path:
     for decision in decisions:
         report_lines.append(f"- **{decision.get('decision')}**: {redact_text(str(decision.get('reason_summary', '')))}")
     report_lines.extend(["", "## Summary", "", f"```json\n{json.dumps(redact_value(summary), indent=2)}\n```", ""])
-    report_path = export_dir / "report.md"
-    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+    generated_report_path = export_dir / "report.md"
+    generated_report_path.write_text("\n".join(report_lines), encoding="utf-8")
 
     zip_path = export_dir / f"{run_id}.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -355,7 +371,11 @@ def export_run(workspace: Path, run_id: str) -> Path:
             if path.is_dir() or path.is_relative_to(export_dir):
                 continue
             archive.write(path, arcname=str(path.relative_to(run_dir).as_posix()))
-        archive.write(report_path, arcname="report.md")
+        # New runs already contain the human report at this archive path. The
+        # generated fallback keeps legacy runs exportable without duplicating
+        # the same member name in modern archives.
+        if not (run_dir / "report.md").is_file():
+            archive.write(generated_report_path, arcname="report.md")
     return zip_path
 
 

@@ -51,7 +51,7 @@ pins the semantics for these specific failures, using the verbatim prompts.
 | **Workspace indexing** | Incremental SQLite + FTS5 index at `.shamsu/index.db`. Skips rehash on unchanged size/mtime, skips symbol rebuild on unchanged hash, cleans stale rows on move/delete. Runs transparently — no manual `/index` needed. |
 | **Search & retrieval** | FTS5 over-fetch plus additive re-ranking: path match, symbol match, lazily-built `rank_bm25` recency layer, and caller-supplied `boost_paths`. |
 | **Context engineering** | Snippet packing, middle truncation, budget accounting with a vendored Qwen3 tokenizer (char/4 fallback offline). No full-codebase prompting. |
-| **Run/artifact ledger** | Every prompt writes `manifest.json`, `events.jsonl`, `decisions.jsonl`, `tool-calls.jsonl`, `model-calls.jsonl`, `mutations/`, `contexts/`, `context-preview.json`, `final-output.md`, `summary.json`. Verified complete on every fresh run. |
+| **Run/artifact ledger** | Every prompt writes one human-readable `report.md`; compact machine evidence lives under `.evidence/`. Essential mode is concise by default, while verbose mode adds model, reasoning, context, tool, and command details. |
 | **Mutation ledger + rollback** | Every file mutation records a backup and a patch; `/undo` restores. Verified: the dogfood run that wrongly overwrote `qa_probe.py` had a recoverable backup. |
 | **Safety layer** | Workspace sandbox, path-traversal blocking, dangerous-command denylist, secret redaction, tiered permission memory. `run_command`/`file_delete`/`web_search`/`mcp_tool` are never auto-approvable. |
 | **Sessions** | Workspace-local sessions, resume, redacted JSONL events, rename/close/export to ZIP. |

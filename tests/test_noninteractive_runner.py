@@ -179,8 +179,8 @@ async def test_summary_indexes_route_tools_context_and_output(tmp_path: Path):
     assert summary["route"] == "workspace.location"
     assert summary["tools"] == []
     assert summary["changed_files"] == []
-    assert summary["artifacts"]["contexts"] == "contexts/"
-    assert summary["artifacts"]["final_output"] == "final-output.md"
+    assert summary["artifacts"]["contexts"] == ".evidence/contexts/"
+    assert summary["artifacts"]["final_output"] == ".evidence/final-output.md"
 
 
 def test_nested_pipeline_approvals_are_projected_into_headless_result():

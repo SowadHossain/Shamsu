@@ -174,20 +174,19 @@ def test_run_clean_deletes_after_approval(tmp_path: Path):
     assert store.list_run_ids(tmp_path) == []  # now actually removed
 
 
-# -- Log discoverability: /logs and /run narrative|prompt|cot ---------------
+# -- Log discoverability: /logs and /run report|prompt|cot ------------------
 
 
-def test_logs_command_points_at_both_logs_and_the_detail_level(tmp_path: Path):
+def test_logs_command_points_at_human_report_and_the_detail_level(tmp_path: Path):
     from shamsu.cli.session_commands import handle_logs
 
     console, output = _console()
     handle_logs("logs", tmp_path, console)
     output = output.getvalue()
 
-    assert "narrative.md" in output          # tier 2
-    assert "cot/model_NNNN.txt" in output    # tier 1
-    assert "prompts/model_NNNN.txt" in output
-    assert "full" in output                  # the active detail level
+    assert "report.md" in output
+    assert ".evidence" in output
+    assert "essential" in output
     assert "SHAMSU_LOG_LEVEL" in output
     # Nothing has run yet, so say so rather than printing an empty table.
     assert "No runs recorded yet" in output
@@ -217,12 +216,25 @@ def test_logs_open_lists_every_path_including_the_layout_notes(tmp_path: Path):
         assert label in output
 
 
-def test_run_narrative_prompt_and_cot_read_back_the_artifacts(tmp_path: Path):
+def test_logs_mode_updates_workspace_config_for_the_next_run(tmp_path: Path):
+    from shamsu.action_ledger.config import load_config
+    from shamsu.cli.session_commands import handle_logs
+
+    console, output = _console()
+    handle_logs("logs mode verbose", tmp_path, console)
+
+    assert load_config(tmp_path)["log_level"] == "verbose"
+    assert "Log mode set to verbose" in output.getvalue()
+    assert start_run(tmp_path, "inspect deeply").log_level == "verbose"
+
+
+def test_run_report_prompt_and_cot_read_back_verbose_artifacts(tmp_path: Path, monkeypatch):
     from shamsu.action_ledger.context import clear_current_run, set_current_run
     from shamsu.action_ledger.ledger import start_run
     from shamsu.cli.request_lifecycle import finish_current_run
     from shamsu.cli.session_commands import handle_run
 
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "add a healthcheck endpoint")
     set_current_run(ledger)
     try:
@@ -235,9 +247,9 @@ def test_run_narrative_prompt_and_cot_read_back_the_artifacts(tmp_path: Path):
     finally:
         clear_current_run()
 
-    narrative, narrative_out = _console()
-    handle_run("run narrative", tmp_path, narrative)
-    assert "add a healthcheck endpoint" in narrative_out.getvalue()
+    report, report_out = _console()
+    handle_run("run report", tmp_path, report)
+    assert "add a healthcheck endpoint" in report_out.getvalue()
 
     prompt, prompt_out = _console()
     handle_run("run prompt", tmp_path, prompt)

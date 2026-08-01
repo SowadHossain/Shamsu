@@ -17,6 +17,7 @@ from shamsu.action_ledger.config import (
     LOG_LEVEL_ENV_VAR,
     config_path,
     load_config,
+    save_config,
 )
 from shamsu.safety.approval import ask_approval
 from shamsu.types import ApprovalRequest
@@ -101,14 +102,14 @@ def _summary(workspace: Path, run_id: str, console: Console) -> None:
 
 
 def _narrative(workspace: Path, run_id: str, console: Console) -> None:
-    """Print the readable story of a run - tier 2 of the log."""
-    path = store.runs_dir(workspace) / run_id / "narrative.md"
+    """Print the readable report for a run."""
+    path = store.report_path(workspace, run_id)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         console.print(
-            f"[yellow]No narrative recorded for {run_id}.[/yellow]\n"
-            "[dim]Runs from before the narrative log predate this; new runs write it "
+            f"[yellow]No report recorded for {run_id}.[/yellow]\n"
+            "[dim]Runs from before the human report predate this; new runs write it "
             "automatically.[/dim]"
         )
         return
@@ -122,14 +123,17 @@ def _narrative(workspace: Path, run_id: str, console: Console) -> None:
 def _model_artifacts(workspace: Path, run_id: str, kind: str, console: Console) -> None:
     """Print a run's captured prompts or chain-of-thought - tier 1 of the log,
     in model-call order."""
-    directory = store.runs_dir(workspace) / run_id / ("prompts" if kind == "prompt" else "cot")
+    evidence = store.runs_dir(workspace) / run_id / ".evidence"
+    directory = evidence / ("prompts" if kind == "prompt" else "reasoning")
+    if not directory.is_dir():
+        directory = store.runs_dir(workspace) / run_id / ("prompts" if kind == "prompt" else "cot")
     paths = sorted(directory.glob("*.txt")) if directory.is_dir() else []
     if not paths:
         label = "prompt" if kind == "prompt" else "chain-of-thought"
         console.print(
             f"[yellow]No {label} artifacts for {run_id}.[/yellow]\n"
-            "[dim]Reasoning is only captured when the model produces it, and no "
-            f"artifacts are written under {LOG_LEVEL_ENV_VAR}=compact.[/dim]"
+            "[dim]Full model prompt and reasoning artifacts are only written under "
+            f"{LOG_LEVEL_ENV_VAR}=verbose; reasoning also depends on model support.[/dim]"
         )
         return
     for path in paths:
@@ -143,12 +147,7 @@ def _model_artifacts(workspace: Path, run_id: str, kind: str, console: Console) 
 
 
 def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
-    """Signpost to this project's two logs.
-
-    SHAMSU writes both inside the workspace it worked on: the deep log (every
-    prompt, chain-of-thought and response) and the narrative log (the readable
-    story). Someone who wants to know "what did it actually do" should be able
-    to find that without reading source."""
+    """Show or configure the project's human-readable run reports."""
     parts = user_input.split(maxsplit=1)
     subcommand = parts[1].strip().lower() if len(parts) > 1 else ""
     root = Path(workspace).resolve() / ".shamsu"
@@ -157,34 +156,46 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
     session_example = root / "sessions" / "<session-id>"
     level = load_config(workspace).get("log_level", DEFAULT_LOG_LEVEL)
 
+    if subcommand.startswith("mode"):
+        _, _, requested = subcommand.partition(" ")
+        requested = requested.strip().lower()
+        aliases = {"compact": "essential", "full": "verbose"}
+        requested = aliases.get(requested, requested)
+        if requested not in {"essential", "verbose"}:
+            console.print("[red]Usage: /logs mode essential|verbose[/red]")
+            return
+        config = load_config(workspace)
+        config["log_level"] = requested
+        save_config(workspace, config)
+        console.print(
+            f"[green]Log mode set to {requested}.[/green] "
+            "[dim]It applies to the next run.[/dim]"
+        )
+        return
+
     lines = [
         f"Logs for this project live in [bold]{root}[/bold]",
         "",
-        f"[bold]Narrative log[/bold] - the readable story",
-        f"  this request             {run_example / 'narrative.md'}",
-        f"  whole conversation       {session_example / 'narrative.md'}",
+        "[bold]Human-readable report[/bold]",
+        f"  this request             {run_example / 'report.md'}",
+        f"  whole conversation       {session_example / 'report.md'}",
         "",
-        f"[bold]Deep log[/bold] - everything the model saw and produced",
-        f"  {run_example}",
-        "    prompts/model_NNNN.txt    the full prompt as sent",
-        "    cot/model_NNNN.txt        the full chain-of-thought",
-        "    responses/model_NNNN.txt  the full model response",
-        "    tool-calls.jsonl          every tool call, arguments and result",
-        "    commands/                 stdout and stderr of every command",
-        "    mutations/                file changes, with rollback ids",
+        "[bold]Internal evidence[/bold]",
+        f"  {run_example / '.evidence'}",
         "",
         f"[bold]Detail level[/bold]  {level}"
         + (
-            "  (everything captured)"
-            if level == "full"
-            else "  (previews only - no artifact files)"
+            "  (detailed readable report + full redacted evidence)"
+            if level == "verbose"
+            else "  (concise readable report + compact evidence)"
         ),
-        f"  change with            {LOG_LEVEL_ENV_VAR}=full|compact",
+        "  change with            /logs mode essential|verbose",
+        f"  process override       {LOG_LEVEL_ENV_VAR}=essential|verbose",
         "",
         "[bold]Read them here[/bold]",
-        "  /run narrative         the story of the last run",
-        "  /run prompt            what the model was actually sent",
-        "  /run cot               what the model was thinking",
+        "  /run report            the report for the last run",
+        "  /run prompt            verbose-mode model prompt evidence",
+        "  /run cot               verbose-mode reasoning evidence",
         "  /runs                  list recent runs",
         "  /logs open             show every path",
     ]
@@ -234,6 +245,7 @@ def handle_run(
         "diff",
         "export",
         "validate",
+        "report",
         "narrative",
         "prompt",
         "cot",
@@ -247,7 +259,7 @@ def handle_run(
         return
     if not run_id and subcommand not in {"clean"}:
         return
-    if subcommand == "narrative":
+    if subcommand in {"report", "narrative"}:
         _narrative(workspace, run_id, console)
         return
     if subcommand in {"prompt", "cot"}:

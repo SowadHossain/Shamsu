@@ -280,12 +280,13 @@ def test_project_spec_helper_still_has_generation_order():
     assert spec.generation_order
 
 
-def test_session_thinking_event_carries_a_pointer_not_raw_reasoning(tmp_path):
+def test_session_thinking_event_carries_a_pointer_not_raw_reasoning(tmp_path, monkeypatch):
     """The session timeline is read back by summaries and search, so raw
     chain-of-thought must live in the run artifact and only be referenced here."""
     from shamsu.action_ledger.ledger import start_run
     from shamsu.agents.chat_loop import AgentChatLoop
 
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     logger = SessionManager(tmp_path).create_session()
     ledger = start_run(tmp_path, "reason about it", session_logger=logger)
     loop = AgentChatLoop.__new__(AgentChatLoop)

@@ -186,7 +186,12 @@ def narrative_for_current_run() -> "Any | None":
     session_id = str(getattr(ledger, "session_id", "") or "")
     if session_id:
         session_dir = Path(ledger.workspace) / ".shamsu" / "sessions" / session_id
-    return NarrativeWriter(ledger.run_dir, session_dir, run_id=ledger.run_id)
+    return NarrativeWriter(
+        ledger.run_dir,
+        session_dir,
+        run_id=ledger.run_id,
+        log_level=getattr(ledger, "log_level", "essential"),
+    )
 
 
 def _append_to_narrative(

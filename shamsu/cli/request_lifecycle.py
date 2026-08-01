@@ -68,7 +68,12 @@ def _close_run_narrative(workspace: Path, ledger: ActionLedger) -> None:
         session_dir = None
         if ledger.session_id:
             session_dir = Path(workspace) / ".shamsu" / "sessions" / ledger.session_id
-        NarrativeWriter(ledger.run_dir, session_dir, run_id=ledger.run_id).close_turn(
+        NarrativeWriter(
+            ledger.run_dir,
+            session_dir,
+            run_id=ledger.run_id,
+            log_level=ledger.log_level,
+        ).close_turn(
             final=action_ledger_store.load_final_output(workspace, ledger.run_id),
             status=str(summary.get("status") or manifest.get("status") or "unknown"),
         )

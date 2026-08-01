@@ -3,27 +3,29 @@
 Storage layout (see agent context/prompts/audit_log.md):
 
     <workspace>/.shamsu/runs/<run-id>/
-        manifest.json
-        narrative.md
-        events.jsonl
-        decisions.jsonl
-        tool-calls.jsonl
-        model-calls.jsonl
-        prompts/model_NNNN.txt
-        cot/model_NNNN.txt
-        responses/model_NNNN.txt
-        commands/cmd_NNN.stdout.log, cmd_NNN.stderr.log
-        diagnostics/error_packet_NNN.json
-        tool-results/tool_NNNN.json
-        mutations/mutations.jsonl
-        context-preview.json
-        final-output.md
-        summary.json
+        report.md
+        .evidence/
+            manifest.json
+            events.jsonl
+            decisions.jsonl
+            tool-calls.jsonl
+            model-calls.jsonl
+            prompts/model_NNNN.txt
+            reasoning/model_NNNN.txt
+            responses/model_NNNN.txt
+            commands/cmd_NNN.stdout.log, cmd_NNN.stderr.log
+            diagnostics/error_packet_NNN.json
+            tool-results/tool_NNNN.json
+            mutations/mutations.jsonl
+            context-preview.json
+            final-output.md
+            summary.json
 
-The JSONL rows stay small: full prompt / chain-of-thought / response text is
-spilled to prompts/, cot/ and responses/ and referenced by relative path, the
-same way commands/ and tool-results/ already work. Set `log_level` to
-`compact` (or SHAMSU_LOG_LEVEL=compact) to keep previews only.
+The JSONL rows stay small. In verbose mode, full prompt / reasoning / response
+text is spilled to `.evidence/prompts/`, `.evidence/reasoning/`, and
+`.evidence/responses/` and referenced by relative path, the same way command
+and large tool results work. `essential` is the default; set `log_level` to
+`verbose` (or `SHAMSU_LOG_LEVEL=verbose`) for full evidence.
 
 Every write path funnels through _append_jsonl / _write_json / _write_text,
 which redact before touching disk - this is the single enforcement point for
@@ -41,7 +43,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from shamsu.action_ledger.config import DEFAULT_CONFIG, load_config, wants_full_artifacts
+from shamsu.action_ledger.config import (
+    DEFAULT_CONFIG,
+    load_config,
+    resolve_log_level,
+    wants_full_artifacts,
+)
 from shamsu.action_ledger.ids import new_run_id
 from shamsu.action_ledger.redaction import redact_text, redact_value
 from shamsu.context.budget import count_tokens
@@ -53,6 +60,7 @@ if TYPE_CHECKING:
 PREVIEW_CHARS = 800
 MAX_LIST_ITEMS = 20
 TOOL_RESULT_ARTIFACT_TOKEN_THRESHOLD = 1000
+COMMAND_INLINE_CHARS = 4000
 SCHEMA_VERSION = 2
 TERMINAL_OUTCOMES = frozenset(
     {
@@ -99,6 +107,7 @@ class ActionLedger:
         self.run_dir = self.sandbox.validate(Path(".shamsu") / "runs" / self.run_id)
         self.config = config or load_config(self.workspace)
         self.enabled = bool(self.config.get("enabled", True))
+        self.log_level = resolve_log_level(self.config)
         self.full_artifacts = wants_full_artifacts(self.config)
         self._max_inline = int(self.config.get("max_inline_event_size", DEFAULT_CONFIG["max_inline_event_size"]))
         self._event_seq = self._count_lines(self.events_path)
@@ -115,72 +124,76 @@ class ActionLedger:
     # -- paths ----------------------------------------------------------------
 
     @property
+    def evidence_dir(self) -> Path:
+        return self.run_dir / ".evidence"
+
+    @property
     def manifest_path(self) -> Path:
-        return self.run_dir / "manifest.json"
+        return self.evidence_dir / "manifest.json"
 
     @property
     def events_path(self) -> Path:
-        return self.run_dir / "events.jsonl"
+        return self.evidence_dir / "events.jsonl"
 
     @property
     def decisions_path(self) -> Path:
-        return self.run_dir / "decisions.jsonl"
+        return self.evidence_dir / "decisions.jsonl"
 
     @property
     def tool_calls_path(self) -> Path:
-        return self.run_dir / "tool-calls.jsonl"
+        return self.evidence_dir / "tool-calls.jsonl"
 
     @property
     def model_calls_path(self) -> Path:
-        return self.run_dir / "model-calls.jsonl"
+        return self.evidence_dir / "model-calls.jsonl"
 
     @property
     def commands_dir(self) -> Path:
-        return self.run_dir / "commands"
+        return self.evidence_dir / "commands"
 
     @property
     def diagnostics_dir(self) -> Path:
-        return self.run_dir / "diagnostics"
+        return self.evidence_dir / "diagnostics"
 
     @property
     def tool_results_dir(self) -> Path:
-        return self.run_dir / "tool-results"
+        return self.evidence_dir / "tool-results"
 
     @property
     def prompts_dir(self) -> Path:
-        return self.run_dir / "prompts"
+        return self.evidence_dir / "prompts"
 
     @property
     def cot_dir(self) -> Path:
-        return self.run_dir / "cot"
+        return self.evidence_dir / "reasoning"
 
     @property
     def responses_dir(self) -> Path:
-        return self.run_dir / "responses"
+        return self.evidence_dir / "responses"
 
     @property
     def narrative_path(self) -> Path:
-        return self.run_dir / "narrative.md"
+        return self.run_dir / "report.md"
 
     @property
     def mutations_dir(self) -> Path:
-        return self.run_dir / "mutations"
+        return self.evidence_dir / "mutations"
 
     @property
     def context_preview_path(self) -> Path:
-        return self.run_dir / "context-preview.json"
+        return self.evidence_dir / "context-preview.json"
 
     @property
     def contexts_dir(self) -> Path:
-        return self.run_dir / "contexts"
+        return self.evidence_dir / "contexts"
 
     @property
     def final_output_path(self) -> Path:
-        return self.run_dir / "final-output.md"
+        return self.evidence_dir / "final-output.md"
 
     @property
     def summary_path(self) -> Path:
-        return self.run_dir / "summary.json"
+        return self.evidence_dir / "summary.json"
 
     # -- lifecycle --------------------------------------------------------------
 
@@ -211,7 +224,13 @@ class ActionLedger:
             self.contexts_dir,
         ]
         if self.full_artifacts:
-            directories.extend([self.prompts_dir, self.cot_dir, self.responses_dir])
+            directories.extend(
+                [
+                    self.prompts_dir,
+                    self.cot_dir,
+                    self.responses_dir,
+                ]
+            )
         for directory in directories:
             directory.mkdir(parents=True, exist_ok=True)
         for path in (
@@ -340,21 +359,22 @@ class ActionLedger:
                 }
             ],
             "artifacts": {
-                "events": "events.jsonl",
-                "decisions": "decisions.jsonl",
-                "tool_calls": "tool-calls.jsonl",
-                "tool_results": "tool-results/",
-                "model_calls": "model-calls.jsonl",
-                "prompts": "prompts/",
-                "cot": "cot/",
-                "responses": "responses/",
-                "contexts": "contexts/",
-                "mutations": "mutations/mutations.jsonl",
-                "narrative": "narrative.md",
-                "final_output": "final-output.md",
+                "events": ".evidence/events.jsonl",
+                "decisions": ".evidence/decisions.jsonl",
+                "tool_calls": ".evidence/tool-calls.jsonl",
+                "tool_results": ".evidence/tool-results/",
+                "model_calls": ".evidence/model-calls.jsonl",
+                "prompts": ".evidence/prompts/",
+                "reasoning": ".evidence/reasoning/",
+                "responses": ".evidence/responses/",
+                "contexts": ".evidence/contexts/",
+                "mutations": ".evidence/mutations/mutations.jsonl",
+                "report": "report.md",
+                "final_output": ".evidence/final-output.md",
             },
         }
         self._write_json(self.summary_path, summary)
+        self._narrative("close_turn", final_output, status)
         return summary
 
     def fail(self, error: str) -> dict[str, Any]:
@@ -366,7 +386,7 @@ class ActionLedger:
         self._write_text(self.final_output_path, final_output or "")
         self.log_event(
             "final_response_written",
-            final_output_path="final-output.md",
+            final_output_path=".evidence/final-output.md",
             preview=_preview(final_output or ""),
         )
         summary = self._read_json(self.summary_path)
@@ -584,6 +604,7 @@ class ActionLedger:
         }
         self._append_jsonl(self.decisions_path, record)
         self.log_event("decision_recorded", decision_id=record["decision_id"], decision=decision, outcome=outcome)
+        self._narrative("append_decision", record)
         return record
 
     # -- tool calls ------------------------------------------------------------
@@ -669,7 +690,7 @@ class ActionLedger:
             "artifact_path": artifact_path,
         }
         self._append_jsonl(self.tool_calls_path, record)
-        self._narrative("append_tool_result", name, bool(ok), message)
+        self._narrative("append_tool_result", name, bool(ok), message, data)
         self.log_event(
             "tool_finished",
             tool_call_id=call_id,
@@ -723,6 +744,7 @@ class ActionLedger:
         if self.config.get("log_model_prompts", True):
             record["prompt_preview"] = _preview(request_text)
         self._append_jsonl(self.model_calls_path, record)
+        self._narrative("append_model_call", call_id, role, model, request_text)
         # Produces the catalog's "planner_model_called"/"coder_model_called"
         # for those roles, and an analogous name for every other specialist.
         self.log_event(f"{role}_model_called", role=role, model=model)
@@ -773,6 +795,15 @@ class ActionLedger:
         if self.config.get("log_model_responses", True):
             record["response_preview"] = _preview(response or "")
         self._append_jsonl(self.model_calls_path, record)
+        self._narrative(
+            "append_model_result",
+            call_id,
+            role,
+            model,
+            response or "",
+            error,
+            record["duration_ms"],
+        )
         self.log_event(
             "model_call_failed" if error else "model_response_received",
             model_call_id=call_id,
@@ -818,6 +849,7 @@ class ActionLedger:
             "cot_path": cot_path,
         }
         self._append_jsonl(self.model_calls_path, record)
+        self._narrative("append_model_reasoning", call_id, role, model, thinking)
         self.log_event(
             "model_thinking_captured",
             model_call_id=call_id,
@@ -851,18 +883,36 @@ class ActionLedger:
             return {}
         stdout_path = self.commands_dir / f"{cmd_id}.stdout.log"
         stderr_path = self.commands_dir / f"{cmd_id}.stderr.log"
-        self._write_text(stdout_path, stdout or "")
-        self._write_text(stderr_path, stderr or "")
-        return self.log_event(
+        keep_output_files = self.full_artifacts or exit_code != 0 or any(
+            len(text or "") > COMMAND_INLINE_CHARS for text in (stdout, stderr)
+        )
+        stdout_relative = ""
+        stderr_relative = ""
+        if keep_output_files:
+            self._write_text(stdout_path, stdout or "")
+            self._write_text(stderr_path, stderr or "")
+            stdout_relative = str(stdout_path.relative_to(self.run_dir).as_posix())
+            stderr_relative = str(stderr_path.relative_to(self.run_dir).as_posix())
+        event = self.log_event(
             "command_finished",
             cmd_id=cmd_id,
             command=command,
             cwd=str(cwd),
             exit_code=exit_code,
-            stdout_path=str(stdout_path.relative_to(self.run_dir).as_posix()),
-            stderr_path=str(stderr_path.relative_to(self.run_dir).as_posix()),
+            stdout_preview=_preview(stdout or "", COMMAND_INLINE_CHARS),
+            stderr_preview=_preview(stderr or "", COMMAND_INLINE_CHARS),
+            stdout_path=stdout_relative,
+            stderr_path=stderr_relative,
             diagnostics_path=diagnostics_path,
         )
+        self._narrative(
+            "append_command",
+            command,
+            exit_code,
+            stdout or "",
+            stderr or "",
+        )
+        return event
 
     # -- diagnostics ------------------------------------------------------------
 
@@ -978,6 +1028,13 @@ class ActionLedger:
             touched_files=list(touched_files or []),
             rollback_available=bool(rollback_available),
         )
+        self._narrative(
+            "append_mutation",
+            status,
+            list(touched_files or []),
+            error,
+            transaction_id,
+        )
 
     def log_rollback(self, transaction_id: str, ok: bool, message: str = "") -> None:
         self.log_event("rollback_performed", transaction_id=transaction_id, ok=bool(ok), message=message)
@@ -1041,6 +1098,14 @@ class ActionLedger:
             exit_code=exit_code,
             summary=summary,
             **fields,
+        )
+        self._narrative(
+            "append_verification",
+            passed,
+            command,
+            summary,
+            exit_code,
+            list(files or []),
         )
 
     def log_verification_unavailable(
@@ -1107,14 +1172,18 @@ class ActionLedger:
             **preview,
         }
         context_path = self.contexts_dir / f"{context_id}.json"
-        self._write_json(context_path, record)
+        context_relative = ""
+        if self.full_artifacts:
+            self._write_json(context_path, record)
+            context_relative = str(context_path.relative_to(self.run_dir).as_posix())
         # Backward-compatible latest pointer for old readers and exports.
         self._write_json(self.context_preview_path, record)
+        self._narrative("append_context", record)
         self.log_event(
             "context_pack_built",
             context_id=context_id,
             model_call_id=model_call_id,
-            context_path=str(context_path.relative_to(self.run_dir).as_posix()),
+            context_path=context_relative or ".evidence/context-preview.json",
             task_id=preview.get("task_id"),
             specialist=preview.get("specialist"),
             token_estimate=preview.get("token_estimate"),
@@ -1240,7 +1309,15 @@ class ActionLedger:
         try:
             from shamsu.ui.narrative import NarrativeWriter
 
-            writer = NarrativeWriter(self.run_dir, run_id=self.run_id)
+            session_dir = None
+            if self.session_id:
+                session_dir = self.workspace / ".shamsu" / "sessions" / self.session_id
+            writer = NarrativeWriter(
+                self.run_dir,
+                session_dir,
+                run_id=self.run_id,
+                log_level=self.log_level,
+            )
             getattr(writer, method)(*args)
         except Exception:
             pass
@@ -1421,7 +1498,12 @@ def _open_narrative(ledger: ActionLedger, prompt: str) -> None:
         session_dir = None
         if ledger.session_id:
             session_dir = ledger.workspace / ".shamsu" / "sessions" / ledger.session_id
-        NarrativeWriter(ledger.run_dir, session_dir, run_id=ledger.run_id).open_turn(prompt)
+        NarrativeWriter(
+            ledger.run_dir,
+            session_dir,
+            run_id=ledger.run_id,
+            log_level=ledger.log_level,
+        ).open_turn(prompt)
         write_layout_readme(ledger.workspace)
     except Exception:
         pass

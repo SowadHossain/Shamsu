@@ -417,16 +417,19 @@ def _build_result(
     run_dir = ledger_store.runs_dir(workspace) / run_id
     artifact_paths = {
         "run_dir": run_dir,
-        "manifest": run_dir / "manifest.json",
-        "events": run_dir / "events.jsonl",
-        "decisions": run_dir / "decisions.jsonl",
-        "tool_calls": run_dir / "tool-calls.jsonl",
-        "model_calls": run_dir / "model-calls.jsonl",
-        "mutations": run_dir / "mutations" / "mutations.jsonl",
-        "context_preview": run_dir / "context-preview.json",
-        "contexts": run_dir / "contexts",
-        "final_output": run_dir / "final-output.md",
-        "summary": run_dir / "summary.json",
+        "report": ledger_store.report_path(workspace, run_id),
+        "manifest": ledger_store.artifact_path(workspace, run_id, "manifest.json"),
+        "events": ledger_store.artifact_path(workspace, run_id, "events.jsonl"),
+        "decisions": ledger_store.artifact_path(workspace, run_id, "decisions.jsonl"),
+        "tool_calls": ledger_store.artifact_path(workspace, run_id, "tool-calls.jsonl"),
+        "model_calls": ledger_store.artifact_path(workspace, run_id, "model-calls.jsonl"),
+        "mutations": ledger_store.artifact_path(
+            workspace, run_id, Path("mutations") / "mutations.jsonl"
+        ),
+        "context_preview": ledger_store.artifact_path(workspace, run_id, "context-preview.json"),
+        "contexts": ledger_store.artifact_path(workspace, run_id, "contexts"),
+        "final_output": ledger_store.artifact_path(workspace, run_id, "final-output.md"),
+        "summary": ledger_store.artifact_path(workspace, run_id, "summary.json"),
     }
     operations = [
         str(event.get("task_type", ""))

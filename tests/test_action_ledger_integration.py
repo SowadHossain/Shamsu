@@ -68,7 +68,8 @@ class FakePlannerLLM:
 
 
 @pytest.mark.asyncio
-async def test_agent_chat_loop_logs_tool_calls_into_action_ledger(tmp_path: Path):
+async def test_agent_chat_loop_logs_tool_calls_into_action_ledger(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
     ledger = start_run(tmp_path, "list the files here")
     tools = AgentToolRegistry(tmp_path, action_ledger=ledger)
     llm = FakePlannerLLM()

@@ -99,7 +99,7 @@ def test_emit_trace_verbose_shows_sanitized_args(tmp_path: Path):
     assert output.count("z") <= 305
 
 
-# -- Tier 2: the narrative log ----------------------------------------------
+# -- Human-readable run reports ---------------------------------------------
 
 
 def _finished_run(tmp_path: Path, prompt: str = "add a healthcheck endpoint"):
@@ -124,30 +124,30 @@ def _finished_run(tmp_path: Path, prompt: str = "add a healthcheck endpoint"):
     return ledger, logger
 
 
-def test_narrative_records_prompt_tools_and_answer(tmp_path: Path):
+def test_report_records_prompt_tools_and_answer(tmp_path: Path):
     ledger, _logger = _finished_run(tmp_path)
-    narrative = (ledger.run_dir / "narrative.md").read_text(encoding="utf-8")
+    narrative = ledger.narrative_path.read_text(encoding="utf-8")
 
     assert "add a healthcheck endpoint" in narrative       # the prompt
     assert "write_file" in narrative                        # the tool it used
     assert "app/health.py" in narrative                     # what it used it on
     assert "Wrote 12 lines" in narrative                    # what happened
     assert "Added a /health endpoint." in narrative         # the answer
-    assert "Status: success" in narrative
+    assert "**Status:** success" in narrative
 
 
-def test_narrative_is_written_in_full_even_when_console_is_quiet(tmp_path: Path):
+def test_report_is_written_even_when_console_is_quiet(tmp_path: Path):
     """Trace mode gates printing, never capture: `/trace quiet` must not cost
     you the log."""
     write_trace_mode(tmp_path, "quiet")
     ledger, _logger = _finished_run(tmp_path)
 
-    narrative = (ledger.run_dir / "narrative.md").read_text(encoding="utf-8")
+    narrative = ledger.narrative_path.read_text(encoding="utf-8")
     assert "write_file" in narrative
     assert "Added a /health endpoint." in narrative
 
 
-def test_session_narrative_rolls_up_turns_in_order_without_interleaving(tmp_path: Path):
+def test_session_report_rolls_up_turns_in_order_without_interleaving(tmp_path: Path):
     from shamsu.action_ledger.context import clear_current_run, set_current_run
     from shamsu.action_ledger.ledger import start_run
     from shamsu.cli.request_lifecycle import finish_current_run
@@ -164,16 +164,16 @@ def test_session_narrative_rolls_up_turns_in_order_without_interleaving(tmp_path
             clear_current_run()
 
     roll_up = (
-        tmp_path / ".shamsu" / "sessions" / logger.session_id / "narrative.md"
+        tmp_path / ".shamsu" / "sessions" / logger.session_id / "report.md"
     ).read_text(encoding="utf-8")
     assert roll_up.index("first task") < roll_up.index("second task")
     assert roll_up.count("finished first task") == 1
     assert roll_up.count("finished second task") == 1
 
 
-def test_narrative_redacts_secrets_from_the_prompt(tmp_path: Path):
+def test_report_redacts_secrets_from_the_prompt(tmp_path: Path):
     ledger, _logger = _finished_run(tmp_path, prompt="deploy with api_key=sk-livesecret9876")
-    narrative = (ledger.run_dir / "narrative.md").read_text(encoding="utf-8")
+    narrative = ledger.narrative_path.read_text(encoding="utf-8")
 
     assert "sk-livesecret9876" not in narrative
     assert "[REDACTED]" in narrative
@@ -183,14 +183,16 @@ def test_layout_readme_explains_the_folder_and_survives_edits(tmp_path: Path):
     from shamsu.ui.narrative import write_layout_readme
 
     path = write_layout_readme(tmp_path)
-    assert path is not None and "narrative.md" in path.read_text(encoding="utf-8")
+    assert path is not None and "report.md" in path.read_text(encoding="utf-8")
+    assert "essential" in path.read_text(encoding="utf-8")
+    assert "verbose" in path.read_text(encoding="utf-8")
 
     path.write_text("my own notes", encoding="utf-8")
     write_layout_readme(tmp_path)
     assert path.read_text(encoding="utf-8") == "my own notes"
 
 
-def test_narrative_closes_even_when_the_run_finished_early(tmp_path: Path):
+def test_report_closes_even_when_the_run_finished_early(tmp_path: Path):
     """The headless CLI finishes the ledger itself and only then calls
     finish_current_run (shamsu/cli/noninteractive.py), so closing the narrative
     must not depend on finalize_from_evidence having run."""
@@ -208,15 +210,15 @@ def test_narrative_closes_even_when_the_run_finished_early(tmp_path: Path):
     finally:
         clear_current_run()
 
-    narrative = (ledger.run_dir / "narrative.md").read_text(encoding="utf-8")
+    narrative = ledger.narrative_path.read_text(encoding="utf-8")
     assert "headless answer" in narrative
-    assert "Status: success" in narrative
+    assert "**Status:** success" in narrative
     assert (
-        tmp_path / ".shamsu" / "sessions" / logger.session_id / "narrative.md"
+        tmp_path / ".shamsu" / "sessions" / logger.session_id / "report.md"
     ).exists()
 
 
-def test_narrative_records_tools_from_the_ledger_on_every_path(tmp_path: Path):
+def test_report_records_tools_from_the_ledger_on_every_path(tmp_path: Path):
     """Tool steps come from the ActionLedger, not the trace: only the chat loop
     emits tool trace events, so a composite/scaffold run would otherwise show
     the plan and the answer with no tools in between."""
@@ -228,14 +230,14 @@ def test_narrative_records_tools_from_the_ledger_on_every_path(tmp_path: Path):
     failed = ledger.log_tool_call("run_command", {"command": "python hello.py"})
     ledger.log_tool_result(failed, "run_command", False, "Command exited with 1.")
 
-    narrative = (ledger.run_dir / "narrative.md").read_text(encoding="utf-8")
+    narrative = ledger.narrative_path.read_text(encoding="utf-8")
     assert "write_file" in narrative and "filepath=hello.py" in narrative
     assert "Created hello.py (+1 lines)." in narrative
     assert "run_command" in narrative and "command=python hello.py" in narrative
     assert "FAILED" in narrative
 
 
-def test_narrative_does_not_double_record_chat_loop_tools(tmp_path: Path):
+def test_report_does_not_double_record_chat_loop_tools(tmp_path: Path):
     """The chat loop emits tool trace events AND logs to the ledger; only one
     of the two may reach the narrative."""
     from shamsu.action_ledger.context import clear_current_run, set_current_run
@@ -258,6 +260,46 @@ def test_narrative_does_not_double_record_chat_loop_tools(tmp_path: Path):
     finally:
         clear_current_run()
 
-    narrative = (ledger.run_dir / "narrative.md").read_text(encoding="utf-8")
+    narrative = ledger.narrative_path.read_text(encoding="utf-8")
     assert narrative.count("write_file") == 1
     assert narrative.count("Wrote app.py") == 1
+
+
+def test_verbose_report_contains_model_context_and_command_details(tmp_path: Path, monkeypatch):
+    from shamsu.action_ledger.ledger import start_run
+
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
+    ledger = start_run(tmp_path, "diagnose the build")
+    call_id = ledger.log_model_call_started("coder", "m", "inspect app.py")
+    ledger.log_context_preview(
+        {"task_id": "t1", "specialist": "coder", "token_estimate": 42, "snippets": []},
+        model_call_id=call_id,
+    )
+    ledger.log_model_thinking(call_id, "coder", "m", "Inspect the failing file first.")
+    ledger.log_model_call_finished("coder", "m", "Use a guarded lookup.", call_id=call_id)
+    command_id = ledger.log_command_start("pytest -q", tmp_path)
+    ledger.log_command_finish(command_id, "pytest -q", tmp_path, 1, "one passed", "one failed")
+    ledger.finish("Fixed and verified.", status="success")
+
+    report = ledger.narrative_path.read_text(encoding="utf-8")
+    assert "Prompt sent to model" in report
+    assert "Inspect the failing file first." in report
+    assert "Context payload" in report
+    assert "stdout" in report and "one passed" in report
+    assert "stderr" in report and "one failed" in report
+
+
+def test_essential_report_omits_verbose_model_payloads(tmp_path: Path):
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "answer concisely")
+    call_id = ledger.log_model_call_started("qa", "m", "private model prompt")
+    ledger.log_model_thinking(call_id, "qa", "m", "private reasoning trace")
+    ledger.log_model_call_finished("qa", "m", "private model response", call_id=call_id)
+    ledger.finish("Public answer.", status="success")
+
+    report = ledger.narrative_path.read_text(encoding="utf-8")
+    assert "Public answer." in report
+    assert "private model prompt" not in report
+    assert "private reasoning trace" not in report
+    assert "private model response" not in report

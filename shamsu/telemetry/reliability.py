@@ -490,7 +490,11 @@ def _record_data_gaps(
 
 def _locators_from_path(path: Path, *, recursive: bool) -> list[tuple[Path, list[str]]]:
     found: list[tuple[Path, list[str]]] = []
-    if path.is_dir() and (path / "manifest.json").is_file() and path.parent.name == "runs":
+    if (
+        path.is_dir()
+        and ((path / ".evidence" / "manifest.json").is_file() or (path / "manifest.json").is_file())
+        and path.parent.name == "runs"
+    ):
         return [(path.parent.parent.parent, [path.name])]
     run_root = _runs_dir_from_path(path)
     if run_root is not None:
