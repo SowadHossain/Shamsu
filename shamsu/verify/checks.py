@@ -7,7 +7,6 @@ from urllib.parse import urlparse
 
 from shamsu.tools.executor import CommandRunner
 
-
 CheckReturn = tuple[bool, str]
 
 

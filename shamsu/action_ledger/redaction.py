@@ -12,7 +12,6 @@ from typing import Any
 from shamsu.patch.safety import is_secret_file
 from shamsu.safety.commands import redact
 
-
 _SECRET_KEYS = frozenset(
     {
         "access_token",

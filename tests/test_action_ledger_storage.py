@@ -4,9 +4,9 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from shamsu.action_ledger import store
 from shamsu.action_ledger.ids import new_run_id
 from shamsu.action_ledger.ledger import ActionLedger, start_run
-from shamsu.action_ledger import store
 
 
 def _events(ledger: ActionLedger) -> list[dict]:

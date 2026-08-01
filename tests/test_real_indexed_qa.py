@@ -9,8 +9,7 @@ from shamsu.abstract.service import AbstractService
 from shamsu.cli import repl
 from shamsu.cli.repl import _build_workspace_qa_workflow, _handle_request
 from shamsu.tools.browser import BrowserTool
-from shamsu.tools.web import WebTool
-from shamsu.tools.web import SearchHit, WebSearchResult
+from shamsu.tools.web import SearchHit, WebSearchResult, WebTool
 from shamsu.types import LLMResponse
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 from tests.test_search_ranking import FakeCodebaseMemorySearchAdapter

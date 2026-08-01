@@ -17,7 +17,12 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from shamsu.llm.manager import OLLAMA_BASE_URL
-from shamsu.runtime.models import ALL_MODEL_SPECS, active_tier, is_allowed_model, required_model_names
+from shamsu.runtime.models import (
+    ALL_MODEL_SPECS,
+    active_tier,
+    is_allowed_model,
+    required_model_names,
+)
 from shamsu.runtime.session_registry import (
     clear_ollama_ownership,
     live_session_pids,

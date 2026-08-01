@@ -8,6 +8,7 @@ not a one-time Day 1 task.
 from __future__ import annotations
 
 import re
+
 from shamsu.types import CommandRisk
 
 SAFE_COMMANDS = {

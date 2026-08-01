@@ -7,14 +7,13 @@ from pathlib import Path
 
 from shamsu.cli.repl import (
     _build_prd_milestone_request,
-    _prd_milestones_for_execution,
     _plan_step_request,
     _prd_brief,
+    _prd_milestones_for_execution,
 )
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.parser import parse_prd_text
 from shamsu.types import ParsedPRD
-
 
 # ---------------------------------------------------------------------------
 # render_progress_checklist

@@ -4,11 +4,11 @@ from __future__ import annotations
 import difflib
 import json
 import re
-import traceback
 import shutil
+import traceback
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from collections.abc import Iterable
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger

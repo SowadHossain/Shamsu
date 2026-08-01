@@ -6,8 +6,8 @@ from pathlib import Path
 
 from rich.console import Console
 
-from shamsu.action_ledger.ledger import start_run
 from shamsu.action_ledger import store
+from shamsu.action_ledger.ledger import start_run
 from shamsu.cli.repl import _handle_run, _handle_runs
 
 

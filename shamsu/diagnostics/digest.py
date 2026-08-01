@@ -27,8 +27,8 @@ from shamsu.diagnostics.adapters import native_json, reviewdog_errorformat, sari
 from shamsu.diagnostics.parsers import (
     generic_fallback,
     node_runtime_fallback,
-    python_fallback,
     pytest_fallback,
+    python_fallback,
     typescript_fallback,
 )
 from shamsu.diagnostics.types import DiagnosticRecord, ErrorPacket

@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "prds"
 
 

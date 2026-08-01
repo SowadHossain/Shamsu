@@ -9,13 +9,12 @@ from pathlib import Path
 from rich.console import Console
 
 import shamsu.memory.service as memory_service
-from shamsu.memory.queue import get_memory_queue
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.cli.repl import _bugfix_report_from_last_failure, _handle_sessions
+from shamsu.memory.queue import get_memory_queue
 from shamsu.session.manager import SessionManager, generate_title_from_prompt
 from shamsu.session.memory import ConversationMemory, is_affirmative, is_negative
-
 
 # --------------------------------------------------------------------------
 # 1. Session creation + default state.json

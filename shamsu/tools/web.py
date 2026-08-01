@@ -1,15 +1,15 @@
 """Permission-gated web search, page fetch, and evidence helpers."""
 from __future__ import annotations
 
-import os
 import ipaddress
+import os
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
 import subprocess
 import time
-import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -23,7 +23,6 @@ import httpx
 import yaml
 
 from shamsu import __version__
-
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.session.manager import SessionLogger

@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-
 SkillSource = Literal["bundled", "user", "workspace"]
 SkillMode = Literal["off", "shadow", "on"]
 

@@ -20,7 +20,12 @@ from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.repair.action_blocker import RepeatedActionBlocker, action_signature
 from shamsu.repair.comparator import ErrorComparator, RepairOutcome
 from shamsu.repair.import_resolver import suggest_import_fix
-from shamsu.repair.kinds import ErrorKind, RepairError, repair_errors_from_packet, select_primary_error
+from shamsu.repair.kinds import (
+    ErrorKind,
+    RepairError,
+    repair_errors_from_packet,
+    select_primary_error,
+)
 from shamsu.repair.prompt import build_final_message, enforce_final_response
 from shamsu.repair.types import (
     DebugContext,

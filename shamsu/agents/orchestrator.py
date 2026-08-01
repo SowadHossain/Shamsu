@@ -8,11 +8,16 @@ from pathlib import Path
 from shamsu.abstract.service import AbstractService
 from shamsu.action_ledger.context import get_current_run
 from shamsu.agents.rewrite_fallback import mentioned_workspace_files
-from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
+from shamsu.memory.service import REQUIRED_MEMORY_MESSAGE, MemoryService
+from shamsu.safety import read_only
 from shamsu.session.manager import SessionLogger
 from shamsu.session.memory import ConversationMemory
-from shamsu.safety import read_only
-from shamsu.tools.workspace import MentionContext, MentionResolver, WorkspaceTool, render_mention_context
+from shamsu.tools.workspace import (
+    MentionContext,
+    MentionResolver,
+    WorkspaceTool,
+    render_mention_context,
+)
 
 
 @dataclass(frozen=True)

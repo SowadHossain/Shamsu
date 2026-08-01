@@ -4,9 +4,9 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+from shamsu.action_ledger import store
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import start_run
-from shamsu.action_ledger import store
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.repair.comparator import ErrorComparator, RepairOutcome
 from shamsu.repair.import_resolver import suggest_import_fix
@@ -17,14 +17,13 @@ from shamsu.repair.kinds import (
     select_primary_error,
 )
 from shamsu.repair.loop import RepairLoop, VerifyRun
-from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.prompt import (
     contains_unverified_success_claim,
     enforce_final_response,
 )
+from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.types import DebugContext, RepairPlan
 from shamsu.repair.verifiers import CommandVerifier
-
 
 # --- fakes --------------------------------------------------------------------
 

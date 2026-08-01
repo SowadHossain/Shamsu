@@ -217,7 +217,7 @@ def test_bare_plan_and_plan_off_are_real_commands():
     """Bare `/plan` arms plan mode. It used to normalize to `plan` with an empty
     task and print a usage error, so there was no mode to enter at all."""
     from shamsu.cli.command_router import CommandRouter
-    from shamsu.cli.repl import SYSTEM_COMMANDS, _PLAN_MODE_OFF_COMMANDS
+    from shamsu.cli.repl import _PLAN_MODE_OFF_COMMANDS, SYSTEM_COMMANDS
 
     router = CommandRouter(SYSTEM_COMMANDS)
     assert router.route("/plan").valid

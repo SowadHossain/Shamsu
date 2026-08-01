@@ -13,7 +13,6 @@ from rich.console import Console
 
 from shamsu.cli import repl
 
-
 # --- Pure classifier behavior ---------------------------------------------
 
 

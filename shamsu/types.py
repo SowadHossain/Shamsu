@@ -13,8 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, Literal, Any
-
+from typing import Any, Literal, Optional
 
 # ─────────────────────────────────────────────────────────────────────────
 # Retrieval (Dev A owns the producers, everyone consumes)

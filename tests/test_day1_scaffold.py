@@ -6,11 +6,11 @@ them. Run with: pytest tests/test_day1_scaffold.py -v
 """
 import pytest
 
-from shamsu.context.builder import ContextBuilder, _truncate_middle, _deduplicate
-from shamsu.safety.sandbox import Sandbox, SecurityError
-from shamsu.safety.commands import classify_command, redact
-from shamsu.types import SearchResult, CommandRisk, ContextPack
+from shamsu.context.builder import ContextBuilder, _deduplicate, _truncate_middle
 from shamsu.llm.manager import LLMManager
+from shamsu.safety.commands import classify_command, redact
+from shamsu.safety.sandbox import Sandbox, SecurityError
+from shamsu.types import CommandRisk, ContextPack, SearchResult
 
 
 class TestContextBuilder:

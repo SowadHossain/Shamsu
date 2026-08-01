@@ -13,10 +13,15 @@ from pathlib import Path
 from typing import Optional
 
 from shamsu.types import (
-    SearchResult, ContextPack, LLMResponse, RoutingDecision,
-    ApprovalRequest, CommandRisk, ParsedPRD, TestRunResult,
+    ApprovalRequest,
+    CommandRisk,
+    ContextPack,
+    LLMResponse,
+    ParsedPRD,
+    RoutingDecision,
+    SearchResult,
+    TestRunResult,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────
 # Dev A owns: indexer/, retriever/, patch/, storage/

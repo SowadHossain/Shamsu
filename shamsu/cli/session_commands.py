@@ -160,11 +160,11 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
     lines = [
         f"Logs for this project live in [bold]{root}[/bold]",
         "",
-        f"[bold]Narrative log[/bold] - the readable story",
+        "[bold]Narrative log[/bold] - the readable story",
         f"  this request             {run_example / 'narrative.md'}",
         f"  whole conversation       {session_example / 'narrative.md'}",
         "",
-        f"[bold]Deep log[/bold] - everything the model saw and produced",
+        "[bold]Deep log[/bold] - everything the model saw and produced",
         f"  {run_example}",
         "    prompts/model_NNNN.txt    the full prompt as sent",
         "    cot/model_NNNN.txt        the full chain-of-thought",

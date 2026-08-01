@@ -10,7 +10,6 @@ from shamsu.agents.full_pipeline import FullDjangoPipeline
 from shamsu.tools.django import DjangoSetupResult
 from shamsu.types import TestRunResult as ShamsuTestRunResult
 
-
 FIXTURES = Path("tests/fixtures/prds")
 
 
