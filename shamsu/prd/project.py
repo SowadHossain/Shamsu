@@ -49,11 +49,19 @@ def _mentions_html_css_js(text: str) -> bool:
     return "html" in text and ("css" in text or "javascript" in text or " js" in text or "js." in text)
 
 
-def is_static_frontend_prd(parsed: ParsedPRD) -> bool:
+def is_static_frontend_prd(parsed: ParsedPRD, request_text: str = "") -> bool:
     """True when the PRD explicitly asks for a static HTML/CSS/JS frontend and
     shows no backend/framework/database signals. Used to stop the planner from
-    defaulting to a generic Django CRUD project on a small frontend PRD."""
+    defaulting to a generic Django CRUD project on a small frontend PRD.
+
+    A request that names a backend itself always wins: "build this as a Django
+    project" produced a static `index.html` because this gate ran first and
+    only ever read the document.
+    """
     text = f"{parsed.title}\n{parsed.raw_text}".lower()
+    request_lowered = (request_text or "").lower()
+    if any(phrase in request_lowered for phrase in _BACKEND_FRAMEWORK_PHRASES):
+        return False
     signal = _mentions_html_css_js(text) or any(phrase in text for phrase in _STATIC_FRONTEND_PHRASES)
     if not signal:
         return False
@@ -105,15 +113,29 @@ def _build_static_frontend_spec(parsed: ParsedPRD) -> ProjectSpec:
     )
 
 
-def build_project_spec(parsed: ParsedPRD) -> ProjectSpec:
+def build_project_spec(
+    parsed: ParsedPRD,
+    request_text: str = "",
+    extra_entities: list | None = None,
+) -> ProjectSpec:
     # Grounding gate: a PRD that explicitly asks for static HTML/CSS/JS (and
     # shows no backend signals) must not become a generic Django CRUD project.
-    if is_static_frontend_prd(parsed):
+    if is_static_frontend_prd(parsed, request_text):
         return _build_static_frontend_spec(parsed)
-    contract = extract_contract(parsed)
+    # `request_text` carries the user's own instruction so an explicit "build
+    # this as a Django project" outranks whatever stack the document implies.
+    contract = extract_contract(
+        parsed, request_text=request_text, extra_entities=extra_entities
+    )
     project_name = _to_snake_case(parsed.title)
     app_name = _default_app_name(project_name)
     entities = extract_entities(parsed)
+    if extra_entities:
+        known = {entity.name.lower() for entity in entities}
+        entities = [
+            *entities,
+            *[item for item in extra_entities if item.name.lower() not in known],
+        ]
     extraction_error = _entity_extraction_error(parsed, entities)
     if extraction_error:
         contract.extraction_warnings.append(extraction_error)

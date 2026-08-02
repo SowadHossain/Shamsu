@@ -12,14 +12,23 @@ from shamsu.runtime.models import (
 )
 
 
-def test_default_tier_uses_deepseek_r1_for_thinking_and_qwen_coder_for_code():
+def test_default_tier_uses_qwen3_for_thinking_and_qwen_coder_for_code():
     assert active_tier() is DEFAULT_TIER
-    # Thinking/qa/planner roles run on DeepSeek R1 Distill Qwen 7B; coding stays
-    # qwen2.5-coder. The router runs on the fast instruct (coding) anchor to skip
-    # the reasoning model's per-turn chain-of-thought (G13).
-    assert model_for_role("qa") == "deepseek-r1:7b"
+    # Thinking/qa/planner roles run on Qwen3 8B (replaced deepseek-r1:7b, which
+    # could not do native tool calls, so every planner/router call depended on
+    # the output salvager); coding stays qwen2.5-coder. The router runs on the
+    # fast instruct (coding) anchor to skip the reasoning model's per-turn
+    # chain-of-thought (G13).
+    assert model_for_role("qa") == "qwen3:8b"
     assert model_for_role("coder") == "qwen2.5-coder:7b-instruct"
     assert model_for_role("router") == "qwen2.5-coder:7b-instruct"
+
+
+def test_default_thinking_anchor_does_native_tools_and_reasoning():
+    from shamsu.runtime.models import model_is_reasoning, model_supports_native_tools
+
+    assert model_supports_native_tools("qwen3:8b") is True
+    assert model_is_reasoning("qwen3:8b") is True
 
 
 def test_light_tier_uses_small_cpu_friendly_models(tmp_path):

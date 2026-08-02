@@ -102,6 +102,22 @@ def test_skill_context_renders_selected_instructions(tmp_path: Path):
     assert "Why selected:" in rendered
 
 
+def test_skill_selection_does_not_treat_react_loop_as_react_framework(tmp_path: Path):
+    selection = select_skills_for_task(
+        tmp_path,
+        "Fix the required Django test through the ReAct tool loop in "
+        "canvas-lite-react-loop-build-v4",
+        intent="bug_fix",
+        target_files=["backend/core/tests/test_canvas.py"],
+    )
+    names = {item.skill.name for item in selection.selected}
+
+    assert "developer" in names
+    assert "testing" in names
+    assert "react-vite" not in names
+    assert "ui-designer" not in names
+
+
 def test_task_handoff_includes_skills_when_enabled(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("SHAMSU_SKILLS", "on")
     decision = RoutingDecision(intent="code_edit", complexity="single", confidence=0.8)

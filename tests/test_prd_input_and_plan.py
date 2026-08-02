@@ -78,6 +78,74 @@ def test_empty_pdf_gets_friendly_error(monkeypatch, tmp_path):
         raise AssertionError("Expected PRDParseError")
 
 
+def test_pdf_ocr_only_processes_pages_without_usable_native_text(monkeypatch, tmp_path):
+    prd = tmp_path / "mixed.pdf"
+    prd.write_bytes(b"%PDF mocked")
+
+    class Page:
+        def __init__(self, text):
+            self.text = text
+
+        def extract_text(self):
+            return self.text
+
+        def extract_tables(self):
+            return []
+
+    class Pdf:
+        pages = [Page("# Native Overview\nEnough native text for this page."), Page("")]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    requested: list[int] = []
+
+    def fake_ocr(_path, pages):
+        requested.extend(pages)
+        return ["## Roles\nAdministrator manages accounts."]
+
+    monkeypatch.setattr("shamsu.prd.input.pdfplumber.open", lambda _path: Pdf())
+    monkeypatch.setattr("shamsu.prd.input._ocr_pdf_pages", fake_ocr)
+
+    parsed = parse_prd_file(prd)
+
+    assert requested == [2]
+    assert "Native Overview" in parsed.raw_text
+    assert "Administrator manages accounts" in parsed.raw_text
+    assert parsed.extraction_confidence <= 0.82
+    assert any("OCR fallback supplied text" in item for item in parsed.extraction_warnings)
+
+
+def test_pdf_prefixed_prd_title_wins_over_incidental_plain_heading(monkeypatch, tmp_path):
+    prd = tmp_path / "brief.pdf"
+    prd.write_bytes(b"%PDF mocked")
+
+    class Page:
+        def extract_text(self):
+            return "PRD: Orbit Desk\n1. Overview\nAdmin\nBuild the workspace."
+
+        def extract_tables(self):
+            return []
+
+    class Pdf:
+        pages = [Page()]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr("shamsu.prd.input.pdfplumber.open", lambda _path: Pdf())
+
+    parsed = parse_prd_file(prd)
+
+    assert parsed.title == "Orbit Desk"
+
+
 def test_handle_parse_prd_accepts_txt(tmp_path):
     prd = tmp_path / "PROJECT.txt"
     prd.write_text("Project\n\nEntities\nTask: title (text)", encoding="utf-8")

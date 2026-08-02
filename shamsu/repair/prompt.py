@@ -16,8 +16,9 @@ You are fixing ONE root-cause error at a time in a real project.
 
 Hard rules:
 - Fix ONLY the single error described below. Ignore downstream/cascade errors.
-- You may edit ONLY files whose content is shown to you here. If you need a
-  file you cannot see, say so and stop - do NOT guess its contents.
+- You may edit ONLY files listed under `Editable repair targets`. Other shown
+  files are read-only evidence. If you need a file you cannot see, say so and
+  stop - do NOT guess its contents.
 - Propose the MINIMAL change that resolves this one error.
 - Do NOT claim the error is fixed, resolved, verified, or passing. You cannot
   verify anything; a separate verifier decides that after you.
@@ -27,7 +28,6 @@ Hard rules:
 Output JSON schema:
 {"root_cause": string,
  "target_file": string,
- "inspected_files": [string],
  "search": string,   // exact snippet to replace (preferred)
  "replace": string,  // its replacement
  "full_content": string}  // OR the complete new file if a search block is impractical
@@ -51,15 +51,46 @@ def build_debug_prompt(context: DebugContext) -> str:
         f"- raw: {error.raw_block}"
     )
 
+    if error.code.endswith("IntegrityError") or "constraint failed" in error.message.lower():
+        parts.append("## Deterministic database-failure guidance")
+        parts.append(
+            "The verifier's named database field/constraint is authoritative evidence. "
+            "When the editable file is a test, repair the fixture values or relationship "
+            "arguments at the failing line. Do not stop merely because an inherited framework "
+            "field is not redeclared in the local model. Use an exact search+replace from the "
+            "editable snippet."
+        )
+        constraint_match = re.search(
+            r"constraint failed:\s*[\w.]+\.(?P<field>[A-Za-z_]\w*)",
+            error.message,
+            re.IGNORECASE,
+        )
+        if constraint_match:
+            field = constraint_match.group("field")
+            fixture_field = field.removesuffix("_id")
+            parts.append(
+                f"Constraint field: `{field}`. The edit must directly set or change the "
+                f"fixture field `{fixture_field}`; changing unrelated values will leave this "
+                "verifier error unchanged. A patch that only changes another field is invalid."
+            )
+
     if context.import_suggestion:
         parts.append("## Deterministic resolver suggestion (verified on disk)")
         parts.append(context.import_suggestion)
 
+    if context.editable_files:
+        parts.append("## Editable repair targets")
+        parts.extend(f"- {file_path}" for file_path in context.editable_files)
+    else:
+        parts.append("## Editable repair targets\n(none)")
+
     if context.inspected:
-        parts.append("## Inspected files (you may edit ONLY these)")
+        parts.append("## Inspected evidence")
+        editable = set(context.editable_files)
         for snippet in context.inspected:
+            access = "EDITABLE" if snippet.file in editable else "READ ONLY"
             parts.append(
-                f"### {snippet.file} (lines {snippet.line_start}-{snippet.line_end})\n"
+                f"### {snippet.file} [{access}] (lines {snippet.line_start}-{snippet.line_end})\n"
                 f"{snippet.content}"
             )
     else:
@@ -73,6 +104,7 @@ def build_debug_prompt(context: DebugContext) -> str:
                 f"{i}. changed [{files}] -> {attempt.outcome.value}"
                 + (f" ({attempt.note})" if attempt.note else "")
             )
+
 
     parts.append("## Verification command")
     parts.append(context.verify_command or "(none provided)")

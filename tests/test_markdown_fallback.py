@@ -142,6 +142,109 @@ def test_no_blocks_or_no_target_is_not_handled(tmp_path: Path):
     assert fallback.maybe_write("what is a closure?", "```python\nx=1\n```").handled is False
 
 
+def test_comment_only_file_fences_do_not_create_empty_implementations(tmp_path: Path):
+    result = _fallback(tmp_path).maybe_write(
+        "create the project files",
+        "```python\n# backend/manage.py\n```\n```python\n# backend/core/models.py\n```",
+    )
+
+    assert result.handled is False
+    assert not (tmp_path / "backend" / "manage.py").exists()
+    assert not (tmp_path / "backend" / "core" / "models.py").exists()
+
+
+def test_scoped_single_target_recovers_filename_less_source_fence(tmp_path: Path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo/backend/manage.py",))
+    fallback = MarkdownWriteFallback(tools)
+
+    result = fallback.maybe_write(
+        "Implement the milestone using examples.py and settings.py.",
+        """```python
+from django.core.management import execute_from_command_line
+execute_from_command_line([])
+```""",
+    )
+
+    assert result.handled is True
+    assert result.tool_result is not None and result.tool_result.ok is True
+    assert (tmp_path / "demo/backend/manage.py").is_file()
+
+
+def test_scoped_target_outranks_other_existing_files_named_in_prompt(tmp_path: Path):
+    source = tmp_path / "demo/models.py"
+    target = tmp_path / "demo/test_models.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("class User:\n    pass\n", encoding="utf-8")
+    target.write_text("OLD = True\n", encoding="utf-8")
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo/test_models.py",))
+
+    result = MarkdownWriteFallback(tools).maybe_write(
+        "Read demo/models.py and update only demo/test_models.py.",
+        "```python\nfrom demo.models import User\n\ndef test_user():\n    assert User is not None\n```",
+    )
+
+    assert result.handled is True
+    assert result.tool_result is not None and result.tool_result.ok is True
+    assert source.read_text(encoding="utf-8") == "class User:\n    pass\n"
+    assert "test_user" in target.read_text(encoding="utf-8")
+
+
+def test_scoped_empty_init_fence_creates_package_marker(tmp_path: Path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo/backend/core/migrations/__init__.py",))
+    fallback = MarkdownWriteFallback(tools)
+
+    result = fallback.maybe_write(
+        "Implement the required package marker.",
+        """```python
+# backend/core/migrations/__init__.py
+```""",
+    )
+
+    assert result.handled is True
+    assert result.tool_result is not None and result.tool_result.ok is True
+    assert (tmp_path / "demo/backend/core/migrations/__init__.py").read_text() == ""
+
+
+def test_fallback_respects_focused_repair_tool_allowlist(tmp_path: Path):
+    target = tmp_path / "demo/settings.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo/settings.py",))
+    tools.set_allowed_tools(("read_file", "edit_file", "append_file"))
+
+    result = MarkdownWriteFallback(tools).maybe_write(
+        "Repair demo/settings.py without rewriting it.",
+        "```python\nVALUE = 2\n```",
+    )
+
+    assert result.handled is True
+    assert "edit_file or append_file" in result.summary
+    assert target.read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_append_only_fallback_requires_append_to_scoped_target(tmp_path: Path):
+    target = tmp_path / "demo/models.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("class Existing:\n    pass\n", encoding="utf-8")
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo/models.py",))
+    tools.set_allowed_tools(("read_file", "append_file"))
+
+    result = MarkdownWriteFallback(tools).maybe_write(
+        "Append the missing model declarations.",
+        "```python\nclass Submission:\n    pass\n```",
+    )
+
+    assert result.handled is True
+    assert "must call append_file" in result.summary
+    assert "demo/models.py" in result.summary
+    assert target.read_text(encoding="utf-8") == "class Existing:\n    pass\n"
+
+
 def test_lying_fence_tags_cannot_write_the_run_command_into_the_file(tmp_path: Path):
     """Observed live: the fix in a bare ``` fence, `python3 broken.py` inside a
     ```python fence. Trusting the tag wrote the RUN COMMAND into broken.py and
@@ -228,3 +331,41 @@ def test_multi_file_fix_never_invents_a_prose_prefixed_path(tmp_path: Path):
 
     assert result.handled is False
     assert not (tmp_path / "wiring bugs across client" / "frontend.js").exists()
+
+
+def test_named_multi_file_proposal_becomes_valid_workspace_writes(tmp_path: Path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo",))
+    fallback = MarkdownWriteFallback(tools)
+
+    result = fallback.maybe_write(
+        "Implement the authentication milestone in demo.",
+        "Add the following code to `demo/core/views.py`:\n"
+        "```python\nfrom django.http import JsonResponse\n\ndef login_view(request):\n"
+        "    return JsonResponse({'ok': True})\n```\n"
+        "Create `demo/core/urls.py`:\n"
+        "```python\nfrom django.urls import path\nfrom .views import login_view\n\n"
+        "urlpatterns = [path('login/', login_view)]\n```",
+    )
+
+    assert result.handled is True
+    assert result.tool_results is not None
+    assert all(item.ok for item in result.tool_results)
+    assert (tmp_path / "demo/core/views.py").is_file()
+    assert (tmp_path / "demo/core/urls.py").is_file()
+
+
+def test_named_multi_file_proposal_skips_invalid_python(tmp_path: Path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_write_paths(("demo",))
+    fallback = MarkdownWriteFallback(tools)
+
+    result = fallback.maybe_write(
+        "Implement files in demo.",
+        "Create `demo/broken.py`:\n```python\nthis is ! invalid\n```\n"
+        "Create `demo/valid.py`:\n```python\nVALUE = 1\n```",
+    )
+
+    assert result.handled is True
+    assert not (tmp_path / "demo/broken.py").exists()
+    assert (tmp_path / "demo/valid.py").read_text(encoding="utf-8") == "VALUE = 1\n"

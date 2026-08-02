@@ -1,4 +1,5 @@
 """Generated-project documentation renderers."""
+
 from __future__ import annotations
 
 from shamsu.types import ProjectSpec
@@ -56,10 +57,13 @@ python manage.py runserver
 def render_pipeline_summary(result) -> str:
     project_name = result.project.project_name if result.project else "unknown"
     generated = "\n".join(f"- {path}" for path in (result.written_files or [])) or "- none"
-    diagnostics = "\n".join(
-        f"- {item.file_path}: {item.symbol} - {item.message}"
-        for item in (result.diagnostics or [])
-    ) or "- none"
+    diagnostics = (
+        "\n".join(
+            f"- {item.file_path}: {item.symbol} - {item.message}"
+            for item in (result.diagnostics or [])
+        )
+        or "- none"
+    )
     setup = "not run"
     if result.setup_result:
         setup = "ok" if result.setup_result.ok else "failed"
@@ -72,7 +76,13 @@ def render_pipeline_summary(result) -> str:
     dod = "not run"
     if getattr(result, "dod_result", None):
         failures = result.dod_result.required_failures
-        dod = "ok" if not failures else "failed: " + ", ".join(item.item_id for item in failures)
+        unverified = result.dod_result.required_unverified
+        if failures:
+            dod = "failed: " + ", ".join(item.item_id for item in failures)
+        elif unverified:
+            dod = "unverified: " + ", ".join(item.item_id for item in unverified)
+        else:
+            dod = "ok"
     preview = getattr(result, "preview_url", "") or "not available"
     return f"""# SHAMSU Generation Summary
 

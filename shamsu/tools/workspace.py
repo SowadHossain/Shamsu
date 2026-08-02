@@ -36,6 +36,22 @@ MENTION_RE = re.compile(
     r"(?<!\S)@(?:(?P<double>\"[^\"]+\")|(?P<single>'[^']+')|(?P<path>[\w./\\-]+))"
 )
 MAX_FILE_CHARS = 6000
+# Documents SHAMSU can extract text from rather than read as plain text.
+DOCUMENT_EXTENSIONS = {".pdf"}
+
+
+def extract_document_text(path: Path) -> str:
+    """Plain text of a document SHAMSU knows how to parse (currently PDF)."""
+    # Lazy: pdf extraction (via pdfplumber) is heavy and rarely needed.
+    from shamsu.prd.input import parse_prd_file
+
+    return parse_prd_file(path).raw_text
+
+
+def _truncate(text: str, max_chars: int) -> str:
+    if len(text) > max_chars:
+        return f"{text[:max_chars]}\n... [truncated {len(text) - max_chars} chars]"
+    return text
 
 
 @dataclass(frozen=True)
@@ -96,6 +112,12 @@ class WorkspaceTool:
         target = self.sandbox.validate(path_text)
         if not target.is_file():
             raise ValueError(f"Not a file: {path_text}")
+        if target.suffix.lower() in DOCUMENT_EXTENSIONS:
+            # SHAMSU already extracts these for @-mentions and PRD builds, so
+            # refusing them here stranded any turn told to "read the PRD": live
+            # 2026-08-02 the plan route asked the user what `canvas lite.pdf`
+            # was rather than reading the document sitting in the workspace.
+            return _truncate(extract_document_text(target), max_chars)
         if target.suffix.lower() not in TEXT_EXTENSIONS and target.name not in {"Dockerfile", "Makefile"}:
             raise ValueError(f"Not a supported text file: {path_text}")
         text = target.read_text(encoding="utf-8", errors="replace")
@@ -136,6 +158,23 @@ class WorkspaceTool:
             suggestions.append(f'@"{rel}"' if " " in rel else f"@{rel}")
         return suggestions
 
+    def names_in_text(self, text: str, limit: int = 10) -> list[Path]:
+        """Workspace files whose filename appears verbatim in *text*.
+
+        Matching on the whole name (not a token regex) is what makes this work
+        for names containing spaces, e.g. `canvas lite.pdf`.
+        """
+        lowered = " ".join(str(text or "").lower().split())
+        if not lowered:
+            return []
+        hits: list[Path] = []
+        for path in self._walk_files_and_dirs():
+            if path.is_file() and path.name.lower() in lowered:
+                hits.append(path)
+                if len(hits) >= limit:
+                    break
+        return hits
+
     def _walk_files_and_dirs(self) -> list[Path]:
         results = walk_workspace_paths(self.workspace_root)
         return sorted(results, key=lambda item: item.relative_to(self.workspace_root).as_posix().lower())
@@ -163,8 +202,45 @@ class MentionResolver:
             if match.group("path") and text[match.end() : match.end() + 1] == "(":
                 continue
             raw = match.group("double") or match.group("single") or match.group("path") or ""
-            contexts.append(self.resolve(raw.strip("\"'")))
+            mention = raw.strip("\"'")
+            if match.group("path"):
+                # An unquoted mention of a filename containing spaces
+                # (`@canvas lite.pdf`) stops at the first space and resolves
+                # to nothing - or to the wrong file. If absorbing the next
+                # word(s) yields a real workspace path, that longer name is
+                # what the user meant. Observed live 2026-08-01: the PRD
+                # `canvas lite.pdf` was read as `canvas`, derailing the build.
+                extended = self._extend_unquoted_mention(mention, text[match.end() :])
+                if extended is not None:
+                    mention = extended
+            contexts.append(self.resolve(mention))
         return contexts
+
+    def _extend_unquoted_mention(self, base: str, following: str) -> str | None:
+        """Return `base` plus following words when only the longer form names a
+        real file. None leaves the original mention untouched."""
+        if self._resolves(base):
+            return None
+        candidate = base
+        rest = following
+        for _ in range(3):
+            word = re.match(r"[ \t]([\w][\w.\\/-]*)", rest)
+            if word is None:
+                return None
+            candidate = f"{candidate} {word.group(1)}"
+            rest = rest[word.end() :]
+            if self._resolves(candidate):
+                return candidate
+        return None
+
+    def _resolves(self, raw: str) -> bool:
+        try:
+            target = self.sandbox.validate(raw)
+        except SecurityError:
+            return False
+        if target.exists():
+            return True
+        return len(self.tool.find_files(raw)) == 1
 
     def resolve(self, mention: str) -> MentionContext:
         raw = mention.lstrip("@").strip()
@@ -196,14 +272,7 @@ class MentionResolver:
         return MentionContext(mention=mention, workspace_root=self.workspace_root, path=rel, kind="file", content=content)
 
     def _read_pdf(self, path: Path, max_chars: int = MAX_FILE_CHARS) -> str:
-        # Lazy import: pdf extraction (via pdfplumber) is heavy and only needed
-        # when a PDF is actually mentioned.
-        from shamsu.prd.input import parse_prd_file
-
-        text = parse_prd_file(path).raw_text
-        if len(text) > max_chars:
-            return f"{text[:max_chars]}\n... [truncated {len(text) - max_chars} chars]"
-        return text
+        return _truncate(extract_document_text(path), max_chars)
 
 
 def render_mention_context(contexts: list[MentionContext]) -> str:

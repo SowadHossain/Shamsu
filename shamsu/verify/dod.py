@@ -1,4 +1,5 @@
 """Definition-of-Done runner."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -33,7 +34,8 @@ class DoDRunResult:
     @property
     def required_failures(self) -> list[DoDCheckResult]:
         return [
-            result for result in self.results
+            result
+            for result in self.results
             if not result.passed and result.severity == "required" and result.verified
         ]
 
@@ -42,8 +44,16 @@ class DoDRunResult:
         return [result for result in self.results if not result.verified]
 
     @property
+    def required_unverified(self) -> list[DoDCheckResult]:
+        return [
+            result
+            for result in self.results
+            if not result.verified and result.severity == "required"
+        ]
+
+    @property
     def ok(self) -> bool:
-        return not self.required_failures
+        return not self.required_failures and not self.required_unverified
 
 
 def run_dod(
@@ -90,6 +100,7 @@ def run_dod(
                 "category": entry.category.value,
                 "ok": run.ok,
                 "required_failures": [failure.item_id for failure in run.required_failures],
+                "required_unverified": [item.item_id for item in run.required_unverified],
             },
             "Definition of Done finished",
             workflow_id="dod",

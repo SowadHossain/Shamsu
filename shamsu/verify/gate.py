@@ -4,21 +4,27 @@ The model may write code, but it does not decide whether that code is done.
 This module discovers deterministic project checks, executes them in a stable
 order, and reports an honest verified / failed / unverifiable verdict.
 """
+
 from __future__ import annotations
 
 import json
 import os
 import re
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.repair.loop import RepairLoop, VerifyRun
 from shamsu.repair.proposer_llm import GenerateJSON, LLMProposer
 from shamsu.repair.types import RepairResult
+from shamsu.verify import semantic
 from shamsu.session.manager import SessionLogger
 from shamsu.verify.wiring import WIRING_COMMAND, has_wiring_surface, verify_wiring
+
+if TYPE_CHECKING:
+    from shamsu.action_ledger.ledger import ActionLedger
 
 
 class CommandRunnerLike(Protocol):
@@ -158,12 +164,7 @@ def default_verify_command(
     has_package_json = any(f.endswith("package.json") for f in changed_files)
     has_requirements = any(f.endswith("requirements.txt") for f in changed_files)
 
-    is_node = (
-        has_package_json
-        or "node" in stack_l
-        or "node" in hint
-        or "vite" in stack_l
-    )
+    is_node = has_package_json or "node" in stack_l or "node" in hint or "vite" in stack_l
     if is_node:
         return "" if lightweight else "npm install && npm run build"
 
@@ -194,6 +195,8 @@ def build_verification_plan(
     stack_text = f"{stack} {stack_hint}".lower()
     is_node = _is_node_project(workspace_path, changed, stack_text)
     is_python = _is_python_project(workspace_path, changed, stack_text)
+    is_rust = _is_rust_project(workspace_path, changed, stack_text)
+    is_go = _is_go_project(workspace_path, changed, stack_text)
 
     steps: list[VerificationStep] = []
     project_roots: list[Path] = []
@@ -217,6 +220,14 @@ def build_verification_plan(
                 lightweight=lightweight,
             )
         )
+    if is_rust:
+        rust_root = _project_root(workspace_path, changed, ("Cargo.toml",))
+        project_roots.append(rust_root)
+        steps.extend(_rust_steps(rust_root, lightweight=lightweight))
+    if is_go:
+        go_root = _project_root(workspace_path, changed, ("go.mod",))
+        project_roots.append(go_root)
+        steps.extend(_go_steps(go_root, lightweight=lightweight))
     unique_roots = list(dict.fromkeys(project_roots))
     project_root = unique_roots[0] if len(unique_roots) == 1 else workspace_path
     if has_wiring_surface(project_root):
@@ -266,6 +277,10 @@ def stack_of(changed_files: list[str]) -> str:
         return "django"
     if any(f.endswith((".py", "requirements.txt")) for f in changed_files):
         return "python"
+    if any(f.endswith("Cargo.toml") or f.endswith(".rs") for f in changed_files):
+        return "rust"
+    if any(f.endswith("go.mod") or f.endswith(".go") for f in changed_files):
+        return "go"
     return ""
 
 
@@ -310,6 +325,7 @@ def verify_and_repair(
     lightweight: bool = False,
     session_logger: SessionLogger | None = None,
     acceptance_commands: Sequence[str | AcceptanceCheck] = (),
+    action_ledger: "ActionLedger | None" = None,
 ) -> VerifyOutcome:
     """Execute a plan, repair its first required failure, then rerun the plan."""
     workspace_path = Path(workspace).resolve()
@@ -336,6 +352,8 @@ def verify_and_repair(
         max_attempts=max_attempts,
         session_logger=session_logger,
         digest=DiagnosticDigest(failed_step.cwd),
+        editable_files=_repair_editable_files(workspace_path, failed_step.cwd, changed_files),
+        action_ledger=action_ledger,
     ).run()
     if not repair_result.success or repair_result.exit_code != 0:
         return _outcome_from_results(
@@ -355,6 +373,21 @@ def verify_and_repair(
     )
 
 
+def _repair_editable_files(
+    workspace: Path, repair_root: Path, changed_files: Sequence[str]
+) -> list[str]:
+    """Translate run-owned changes into the failed verifier's working directory."""
+    editable: list[str] = []
+    for file_path in changed_files:
+        raw = Path(str(file_path).replace("\\", "/"))
+        target = raw.resolve() if raw.is_absolute() else (workspace / raw).resolve()
+        try:
+            editable.append(target.relative_to(repair_root.resolve()).as_posix())
+        except ValueError:
+            continue
+    return editable
+
+
 def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationStep]:
     package_path = project_root / "package.json"
     if not package_path.is_file():
@@ -365,7 +398,7 @@ def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationSt
         return [
             VerificationStep(
                 "syntax",
-                'node -e "JSON.parse(require(\'fs\').readFileSync(\'package.json\', \'utf8\'))"',
+                "node -e \"JSON.parse(require('fs').readFileSync('package.json', 'utf8'))\"",
                 project_root,
                 reason="package.json must be valid JSON",
             )
@@ -386,10 +419,38 @@ def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationSt
     elif not (project_root / "node_modules").is_dir():
         return []
 
-    if _real_npm_script(scripts.get("build")):
-        checks.append(
-            VerificationStep("build", "npm run build", project_root, reason="project build script")
-        )
+    _append_node_script_step(
+        checks,
+        scripts,
+        ("typecheck", "check"),
+        stage="compile",
+        project_root=project_root,
+        reason="project typecheck/check script",
+    )
+    _append_node_script_step(
+        checks,
+        scripts,
+        ("build",),
+        stage="build",
+        project_root=project_root,
+        reason="project build script",
+    )
+    _append_node_script_step(
+        checks,
+        scripts,
+        ("db:migrate", "migrate"),
+        stage="migration",
+        project_root=project_root,
+        reason="project-declared database migration",
+    )
+    _append_node_script_step(
+        checks,
+        scripts,
+        ("db:seed", "seed"),
+        stage="seed",
+        project_root=project_root,
+        reason="project-declared seed command",
+    )
     test_script = scripts.get("test")
     if _real_npm_script(test_script):
         checks.append(
@@ -400,6 +461,22 @@ def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationSt
                 reason="project test script",
             )
         )
+    _append_node_script_step(
+        checks,
+        scripts,
+        ("test:integration", "integration"),
+        stage="integration",
+        project_root=project_root,
+        reason="project integration test script",
+    )
+    _append_node_script_step(
+        checks,
+        scripts,
+        ("test:e2e", "e2e", "test:browser", "browser:check", "smoke"),
+        stage="browser",
+        project_root=project_root,
+        reason="project browser/end-to-end check",
+    )
     if _real_npm_script(scripts.get("lint")):
         checks.append(
             VerificationStep(
@@ -412,7 +489,7 @@ def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationSt
         )
 
     # Setup alone proves dependency resolution, not application correctness.
-    if not any(step.stage != "setup" for step in checks):
+    if not any(step.required and step.stage != "setup" for step in checks):
         return []
     return checks
 
@@ -427,13 +504,34 @@ def _python_steps(
 ) -> list[VerificationStep]:
     checks: list[VerificationStep] = []
     requirements = project_root / "requirements.txt"
+    has_pytest = _has_pytest(project_root)
     if requirements.is_file() and not lightweight:
+        test_dependency = " pytest" if has_pytest else ""
         checks.append(
             VerificationStep(
                 "setup",
-                f"{python_bin} -m pip install -r requirements.txt",
+                f"{python_bin} -m pip install -r requirements.txt{test_dependency}",
                 project_root,
-                reason="install project-declared dependencies",
+                reason="install project dependencies and required verification tooling",
+            )
+        )
+    elif not lightweight and _is_installable_python_project(project_root):
+        test_dependency = " pytest" if has_pytest else ""
+        checks.append(
+            VerificationStep(
+                "setup",
+                f"{python_bin} -m pip install -e .{test_dependency}",
+                project_root,
+                reason="install the Python project and required verification tooling",
+            )
+        )
+    elif not lightweight and has_pytest:
+        checks.append(
+            VerificationStep(
+                "setup",
+                f"{python_bin} -m pip install pytest",
+                project_root,
+                reason="install the harness-required Python test runner",
             )
         )
 
@@ -450,15 +548,74 @@ def _python_steps(
         )
 
     if (project_root / "manage.py").is_file():
-        checks.append(
-            VerificationStep(
-                "test",
-                f"{python_bin} manage.py test",
-                project_root,
-                reason="Django project test suite",
-            )
+        checks.extend(
+            [
+                VerificationStep(
+                    "framework",
+                    f"{python_bin} manage.py check",
+                    project_root,
+                    reason="Django system checks",
+                ),
+                VerificationStep(
+                    "migration",
+                    f"{python_bin} manage.py makemigrations --check --dry-run",
+                    project_root,
+                    reason="Django model changes must have migrations",
+                ),
+            ]
         )
-    elif _has_pytest(project_root):
+        if not lightweight:
+            checks.append(
+                VerificationStep(
+                    "migration",
+                    f"{python_bin} manage.py migrate --noinput",
+                    project_root,
+                    reason="apply Django migrations to the verification database",
+                )
+            )
+        seed_command = _django_seed_command(project_root)
+        if seed_command:
+            checks.append(
+                VerificationStep(
+                    "seed",
+                    f"{python_bin} manage.py {seed_command}",
+                    project_root,
+                    reason="project-declared Django seed command",
+                )
+            )
+        # Syntax and system checks both pass on a change that does nothing -
+        # a route appended outside `urlpatterns` parses, and `check` is happy.
+        # This stage boots the project and asserts the routes it declares
+        # actually resolve and serve.
+        if semantic.should_probe(list(changed), project_root):
+            try:
+                semantic.write_probe(project_root)
+            except OSError:
+                pass
+            else:
+                checks.append(
+                    VerificationStep(
+                        "semantic",
+                        semantic.django_probe_command(python_bin),
+                        project_root,
+                        reason="declared routes must resolve and serve",
+                    )
+                )
+        # `manage.py test` exits 1 with "NO TESTS RAN" when a project has no
+        # tests yet, which the gate read as a failing test suite and used to
+        # fail the milestone - absence reported as breakage. Run the suite only
+        # once tests exist; a milestone that is supposed to ADD tests is judged
+        # separately by the behaviour-test evidence check.
+        if _has_python_tests(project_root):
+            checks.append(
+                VerificationStep(
+                    "test",
+                    f"{python_bin} manage.py test",
+                    project_root,
+                    reason="Django project test suite",
+                )
+            )
+    elif has_pytest:
         checks.append(
             VerificationStep(
                 "test",
@@ -479,6 +636,60 @@ def _python_steps(
                 reason="project lint configuration",
             )
         )
+    return checks
+
+
+def _rust_steps(project_root: Path, *, lightweight: bool) -> list[VerificationStep]:
+    if not (project_root / "Cargo.toml").is_file():
+        return []
+    checks: list[VerificationStep] = []
+    if not lightweight:
+        checks.append(
+            VerificationStep(
+                "setup", "cargo fetch", project_root, reason="fetch Cargo dependencies"
+            )
+        )
+    checks.extend(
+        [
+            VerificationStep("compile", "cargo check", project_root, reason="compile Rust project"),
+            VerificationStep("test", "cargo test", project_root, reason="Rust project test suite"),
+            VerificationStep(
+                "lint",
+                "cargo clippy --all-targets --all-features -- -D warnings",
+                project_root,
+                required=False,
+                reason="Rust clippy checks",
+            ),
+        ]
+    )
+    return checks
+
+
+def _go_steps(project_root: Path, *, lightweight: bool) -> list[VerificationStep]:
+    if not (project_root / "go.mod").is_file():
+        return []
+    checks: list[VerificationStep] = []
+    if not lightweight:
+        checks.append(
+            VerificationStep(
+                "setup",
+                "go mod download",
+                project_root,
+                reason="download Go module dependencies",
+            )
+        )
+    checks.extend(
+        [
+            VerificationStep("test", "go test ./...", project_root, reason="Go project test suite"),
+            VerificationStep(
+                "lint",
+                "go vet ./...",
+                project_root,
+                required=False,
+                reason="Go vet checks",
+            ),
+        ]
+    )
     return checks
 
 
@@ -602,6 +813,32 @@ def _unverifiable_outcome() -> VerifyOutcome:
     )
 
 
+def _has_python_tests(project_root: Path) -> bool:
+    """True when the project actually contains a test to run.
+
+    A `tests.py` holding only Django's default `from django.test import
+    TestCase` stub defines no test, and running it reports NO TESTS RAN.
+    """
+    try:
+        candidates = [
+            *project_root.rglob("tests.py"),
+            *project_root.rglob("test_*.py"),
+            *project_root.rglob("tests/*.py"),
+        ]
+    except OSError:
+        return False
+    for path in candidates:
+        if "__pycache__" in path.parts or path.name == "__init__.py":
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if re.search(r"^\s*(?:def test_|class \w*Test)", content, re.MULTILINE):
+            return True
+    return False
+
+
 def _is_node_project(_workspace: Path, changed: Sequence[str], stack_text: str) -> bool:
     return (
         "node" in stack_text
@@ -616,6 +853,22 @@ def _is_python_project(_workspace: Path, changed: Sequence[str], stack_text: str
         "python" in stack_text
         or "django" in stack_text
         or any(path.endswith((".py", "requirements.txt", "pyproject.toml")) for path in changed)
+    )
+
+
+def _is_rust_project(workspace: Path, changed: Sequence[str], stack_text: str) -> bool:
+    return (
+        "rust" in stack_text
+        or any(path.endswith(("Cargo.toml", ".rs")) for path in changed)
+        or (workspace / "Cargo.toml").is_file()
+    )
+
+
+def _is_go_project(workspace: Path, changed: Sequence[str], stack_text: str) -> bool:
+    return (
+        re.search(r"(?:^|\s)go(?:\s|$)", stack_text) is not None
+        or any(path.endswith(("go.mod", ".go")) for path in changed)
+        or (workspace / "go.mod").is_file()
     )
 
 
@@ -671,6 +924,45 @@ def _real_npm_script(value: object) -> bool:
     return "no test specified" not in lowered and "exit 1" not in lowered
 
 
+def _append_node_script_step(
+    checks: list[VerificationStep],
+    scripts: dict,
+    names: Sequence[str],
+    *,
+    stage: str,
+    project_root: Path,
+    reason: str,
+    required: bool = True,
+) -> None:
+    for name in names:
+        if not _real_npm_script(scripts.get(name)):
+            continue
+        checks.append(
+            VerificationStep(
+                stage,
+                f"npm run {name}",
+                project_root,
+                required=required,
+                reason=reason,
+            )
+        )
+        return
+
+
+def _django_seed_command(project_root: Path) -> str:
+    candidates: list[str] = []
+    for commands_dir in project_root.glob("*/management/commands"):
+        if not commands_dir.is_dir():
+            continue
+        for path in commands_dir.glob("*.py"):
+            if path.name == "__init__.py":
+                continue
+            name = path.stem
+            if name == "seed" or name.startswith("seed_") or name.endswith("_seed"):
+                candidates.append(name)
+    return sorted(candidates)[0] if candidates else ""
+
+
 def _node_test_command(script: str) -> str:
     lowered = script.lower()
     if re.search(r"\bvitest\b", lowered) and not re.search(r"\bvitest\s+run\b", lowered):
@@ -681,10 +973,7 @@ def _node_test_command(script: str) -> str:
 
 
 def _has_pytest(project_root: Path) -> bool:
-    if any(
-        (project_root / name).is_file()
-        for name in ("pytest.ini", "tox.ini", "conftest.py")
-    ):
+    if any((project_root / name).is_file() for name in ("pytest.ini", "tox.ini", "conftest.py")):
         return True
     tests_dir = project_root / "tests"
     if tests_dir.is_dir() and any(tests_dir.rglob("test_*.py")):
@@ -698,6 +987,28 @@ def _has_pytest(project_root: Path) -> bool:
         if "pytest" in text:
             return True
     return False
+
+
+def _is_installable_python_project(project_root: Path) -> bool:
+    if (project_root / "setup.py").is_file():
+        return True
+    setup_cfg = project_root / "setup.cfg"
+    try:
+        if setup_cfg.is_file() and "[metadata]" in setup_cfg.read_text(
+            encoding="utf-8", errors="replace"
+        ).lower():
+            return True
+    except OSError:
+        pass
+    pyproject = project_root / "pyproject.toml"
+    try:
+        with pyproject.open("rb") as handle:
+            payload = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    tool = payload.get("tool")
+    poetry = tool.get("poetry") if isinstance(tool, dict) else None
+    return bool(payload.get("project") or payload.get("build-system") or poetry)
 
 
 def _python_lint_command(project_root: Path, python_bin: str) -> str:

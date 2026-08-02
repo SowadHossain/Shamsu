@@ -1,6 +1,7 @@
 """Tests for the verify gate (shamsu/verify/gate.py) and its honesty wiring into
 the autonomous chat loop. The gate's contract: never report success unless the
 change was verified, or is explicitly unverifiable."""
+
 from __future__ import annotations
 
 import json
@@ -139,6 +140,48 @@ def test_node_placeholder_test_script_is_not_a_gate(tmp_path: Path):
     assert [step.stage for step in plan.steps] == ["setup", "build"]
 
 
+def test_node_plan_runs_declared_lifecycle_and_browser_checks_in_order(tmp_path: Path):
+    (tmp_path / "package.json").write_text(
+        json.dumps(
+            {
+                "scripts": {
+                    "typecheck": "tsc --noEmit",
+                    "build": "vite build",
+                    "db:migrate": "node scripts/migrate.mjs",
+                    "seed": "node scripts/seed.mjs",
+                    "test": "vitest run",
+                    "test:integration": "vitest run integration",
+                    "test:e2e": "playwright test",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    plan = build_verification_plan(tmp_path, ["package.json"], lightweight=False)
+
+    assert [step.stage for step in plan.steps] == [
+        "setup",
+        "compile",
+        "build",
+        "migration",
+        "seed",
+        "test",
+        "integration",
+        "browser",
+    ]
+    assert [step.command for step in plan.steps] == [
+        "npm install",
+        "npm run typecheck",
+        "npm run build",
+        "npm run db:migrate",
+        "npm run seed",
+        "npm test",
+        "npm run test:integration",
+        "npm run test:e2e",
+    ]
+
+
 def test_python_plan_discovers_setup_syntax_tests_and_lint(tmp_path: Path):
     (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
     (tmp_path / "requirements.txt").write_text("pytest\nruff\n", encoding="utf-8")
@@ -156,7 +199,7 @@ def test_python_plan_discovers_setup_syntax_tests_and_lint(tmp_path: Path):
 
     assert [step.stage for step in plan.steps] == ["setup", "syntax", "test", "lint"]
     assert [step.command for step in plan.steps] == [
-        "python -m pip install -r requirements.txt",
+        "python -m pip install -r requirements.txt pytest",
         "python -m py_compile app.py",
         "python -m pytest",
         "python -m ruff check .",
@@ -164,11 +207,38 @@ def test_python_plan_discovers_setup_syntax_tests_and_lint(tmp_path: Path):
     assert plan.steps[-1].required is False
 
 
+def test_python_plan_provisions_pytest_for_standard_library_project(tmp_path: Path):
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "requirements.txt").write_text(
+        "# Standard-library-only project.\n", encoding="utf-8"
+    )
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
+
+    plan = build_verification_plan(
+        tmp_path,
+        ["app.py", "requirements.txt", "tests/test_app.py"],
+        python_bin="python",
+        lightweight=False,
+    )
+
+    assert [step.stage for step in plan.steps] == ["setup", "syntax", "test"]
+    assert plan.steps[0].command == "python -m pip install -r requirements.txt pytest"
+
+
 def test_django_plan_uses_manage_py_test_from_nested_project(tmp_path: Path):
     project = tmp_path / "backend"
     project.mkdir()
     (project / "manage.py").write_text("print('manage')\n", encoding="utf-8")
     (project / "views.py").write_text("VALUE = 1\n", encoding="utf-8")
+    # The suite step is only planned once tests exist - `manage.py test` exits
+    # 1 with NO TESTS RAN on a project without any.
+    (project / "tests.py").write_text(
+        "from django.test import TestCase\n\n\nclass ViewTest(TestCase):\n"
+        "    def test_value(self):\n        pass\n",
+        encoding="utf-8",
+    )
 
     plan = build_verification_plan(
         tmp_path,
@@ -179,9 +249,64 @@ def test_django_plan_uses_manage_py_test_from_nested_project(tmp_path: Path):
 
     assert [step.command for step in plan.steps] == [
         "python -m py_compile manage.py views.py",
+        "python manage.py check",
+        "python manage.py makemigrations --check --dry-run",
+        # Routes/views changed, so the behavioural probe runs before the suite.
+        "python -c \"exec(open('.shamsu_probe.py').read())\"",
         "python manage.py test",
     ]
     assert all(step.cwd == project for step in plan.steps)
+
+
+def test_django_full_plan_applies_migrations_and_declared_seed_command(tmp_path: Path):
+    project = tmp_path / "backend"
+    command_dir = project / "core" / "management" / "commands"
+    command_dir.mkdir(parents=True)
+    (project / "manage.py").write_text("print('manage')\n", encoding="utf-8")
+    (command_dir / "seed_demo.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    plan = build_verification_plan(
+        tmp_path,
+        ["backend/manage.py", "backend/core/management/commands/seed_demo.py"],
+        stack="django",
+        python_bin="python",
+        lightweight=False,
+    )
+
+    assert "python manage.py migrate --noinput" in plan.commands
+    assert "python manage.py seed_demo" in plan.commands
+    assert plan.commands.index("python manage.py migrate --noinput") < plan.commands.index(
+        "python manage.py seed_demo"
+    )
+
+
+def test_rust_and_go_manifests_get_stack_owned_verification_plans(tmp_path: Path):
+    rust = tmp_path / "rust"
+    rust.mkdir()
+    (rust / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\n", encoding="utf-8")
+    rust_plan = build_verification_plan(
+        tmp_path,
+        ["rust/Cargo.toml", "rust/src/main.rs"],
+        lightweight=False,
+    )
+    assert rust_plan.commands == (
+        "cargo fetch",
+        "cargo check",
+        "cargo test",
+        "cargo clippy --all-targets --all-features -- -D warnings",
+    )
+    assert rust_plan.steps[-1].required is False
+
+    go = tmp_path / "go"
+    go.mkdir()
+    (go / "go.mod").write_text("module example.com/demo\n\ngo 1.22\n", encoding="utf-8")
+    go_plan = build_verification_plan(
+        tmp_path,
+        ["go/go.mod", "go/main.go"],
+        lightweight=False,
+    )
+    assert go_plan.commands == ("go mod download", "go test ./...", "go vet ./...")
+    assert go_plan.steps[-1].required is False
 
 
 # ---------------------------------------------------------------------------
@@ -282,9 +407,7 @@ def test_verify_only_optional_lint_failure_does_not_hide_acceptance(tmp_path: Pa
 def test_verify_only_acceptance_output_is_required_evidence(tmp_path: Path):
     (tmp_path / "app.py").write_text("print('wrong')\n", encoding="utf-8")
     runner = _FakeRunner((0, "", ""), (0, "wrong\n", ""))
-    check = acceptance_checks_from_criteria(
-        ["`python app.py` prints `expected output`."]
-    )[0]
+    check = acceptance_checks_from_criteria(["`python app.py` prints `expected output`."])[0]
 
     outcome = verify_only(
         tmp_path,
@@ -335,7 +458,9 @@ def test_verify_and_repair_reruns_whole_plan_after_test_recovers(tmp_path: Path)
     (tests_dir / "test_app.py").write_text("def test_ok(): assert True\n", encoding="utf-8")
     runner = _FakeRunner(
         (0, "", ""),
+        (0, "", ""),
         (1, "", "transient test failure"),
+        (0, "", ""),
         (0, "", ""),
         (0, "", ""),
         (0, "", ""),
@@ -353,9 +478,20 @@ def test_verify_and_repair_reruns_whole_plan_after_test_recovers(tmp_path: Path)
 
     assert outcome.verified is True
     assert outcome.repair_result is not None
-    assert [command for command, _cwd in runner.calls].count(
-        outcome.steps[-1].step.command
-    ) == 3
+    assert [command for command, _cwd in runner.calls].count(outcome.steps[-1].step.command) == 3
+
+
+def test_repair_editable_files_are_relative_to_failed_step_cwd(tmp_path: Path):
+    from shamsu.verify.gate import _repair_editable_files
+
+    backend = tmp_path / "backend"
+    backend.mkdir()
+
+    assert _repair_editable_files(
+        tmp_path,
+        backend,
+        ["backend/core/tests/test_canvas.py", "frontend/src/App.tsx"],
+    ) == ["core/tests/test_canvas.py"]
 
 
 def test_verify_outcome_status_values():
@@ -391,7 +527,9 @@ async def test_maybe_verify_appends_failure_note(tmp_path: Path, monkeypatch):
         chat_loop_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(
-            verified=False, exit_code=1, command="python -m py_compile a.py",
+            verified=False,
+            exit_code=1,
+            command="python -m py_compile a.py",
             summary="Verification FAILED: `python -m py_compile a.py` (exit 1).",
         ),
     )
@@ -407,7 +545,9 @@ async def test_maybe_verify_appends_verified_note(tmp_path: Path, monkeypatch):
         chat_loop_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(
-            verified=True, exit_code=0, command="python -m py_compile a.py",
+            verified=True,
+            exit_code=0,
+            command="python -m py_compile a.py",
             summary="Verification passed: `python -m py_compile a.py` (exit 0).",
         ),
     )
@@ -429,7 +569,9 @@ async def test_maybe_verify_unverifiable_leaves_answer_untouched(tmp_path: Path,
 
 
 @pytest.mark.asyncio
-async def test_maybe_verify_runs_lightweight_check_when_not_long_running(tmp_path: Path, monkeypatch):
+async def test_maybe_verify_runs_lightweight_check_when_not_long_running(
+    tmp_path: Path, monkeypatch
+):
     monkeypatch.setattr(
         chat_loop_module,
         "verify_only",

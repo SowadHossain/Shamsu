@@ -184,8 +184,12 @@ _ADD_AUTH_RE = re.compile(
     re.IGNORECASE,
 )
 _AUTH_APPROACH_RE = re.compile(
-    r"\b(jwt|json web token|session(?:-based)?|cookie(?:-based)?|oauth2?|oidc|"
-    r"openid connect|saml|basic auth|api key|passkey|magic link|"
+    # Plurals must match. The option this very question offers is labelled
+    # "Server sessions", and `\bsession\b` does not match "sessions", so
+    # answering it left the request still unspecified and the question was
+    # asked again on the next turn, indefinitely (observed live 2026-08-02).
+    r"\b(jwt|json web tokens?|sessions?(?:-based)?|cookies?(?:-based)?|oauth2?|oidc|"
+    r"openid connect|saml|basic auth|api keys?|passkeys?|magic links?|"
     r"firebase auth|auth0|clerk|supabase auth|nextauth|auth\.js)\b",
     re.IGNORECASE,
 )

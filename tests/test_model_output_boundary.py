@@ -77,6 +77,52 @@ def test_salvages_ask_user_json_from_plain_text():
     assert "{" not in turn.text
 
 
+def test_truncated_code_fence_does_not_swallow_a_later_tool_call():
+    """The 2026-08-01 live blocker, pinned. A 7B repair reply held a cut-off
+    Python fence whose `{` never closed, followed by a valid run_command call.
+    The single-pass brace scan gave up at the unbalanced brace and lost the
+    call, so the loop saw NO tool calls, nagged, and the milestone failed with
+    the correct fix sitting unused in the reply."""
+    content = (
+        "The error is due to the missing `BASE_DIR` variable in `settings.py`.\n\n"
+        "```python\n"
+        "import os\n"
+        "BASE_DIR = os.path.dirname(os.path.abspath(__file__))\n"
+        "\n"
+        "TEMPLATES = [\n"
+        "    {\n"
+        "        'BACKEND': 'django.template.backends.django.DjangoTemplates',\n"
+        "        'DIRS': [],\n"
+        "        'APP_DIRS': True,\n"
+        "```\n\n"
+        "Now, let's run the verifier again.\n\n"
+        "```json\n"
+        '{"name": "run_command", "arguments": {"command": "python manage.py check"}}\n'
+        "```\n"
+    )
+
+    turn = parse_model_turn(_resp(content), REGISTERED)
+
+    assert [c.name for c in turn.tool_calls] == ["run_command"]
+    assert turn.tool_calls[0].arguments == {"command": "python manage.py check"}
+
+
+def test_unbalanced_brace_recovery_does_not_invent_calls_from_code():
+    """Recovery must not turn ordinary truncated code into a tool call."""
+    content = (
+        "Here is the config so far:\n\n"
+        "```python\n"
+        "SETTINGS = {\n"
+        "    'name': 'demo',\n"
+        "    'nested': {'a': 1},\n"
+        "```\n"
+    )
+
+    turn = parse_model_turn(_resp(content), REGISTERED)
+
+    assert turn.tool_calls == []
+
+
 def test_salvages_json_embedded_in_prose_and_fences():
     content = (
         "Sure, let me open that file for you.\n"
@@ -91,6 +137,73 @@ def test_salvages_json_embedded_in_prose_and_fences():
     # The now-empty json fence is cleaned away.
     assert "```" not in turn.text
     assert "let me open that file" in turn.text
+
+
+def test_salvages_small_model_commented_tool_fences():
+    content = """Create the model.\n\n```python
+# write_file
+{"filepath":"app/models.py","content":"VALUE = 1\\n"}
+```\n\nThen verify.\n\n```python
+# run_command
+python -m py_compile app/models.py
+```"""
+
+    turn = parse_model_turn(_resp(content), REGISTERED)
+
+    assert [call.name for call in turn.tool_calls] == ["write_file", "run_command"]
+    assert turn.tool_calls[0].arguments == {
+        "filepath": "app/models.py",
+        "content": "VALUE = 1\n",
+    }
+    assert turn.tool_calls[1].arguments == {
+        "command": "python -m py_compile app/models.py"
+    }
+    assert "# write_file" not in turn.text
+    assert "# run_command" not in turn.text
+
+
+def test_repairs_double_escaped_multiline_write_content():
+    content = r'''{"name":"write_file","arguments":{"filepath":"app.py","content":"import os\\n\\nprint('ok')\\n"}}'''
+
+    turn = parse_model_turn(_resp(content), REGISTERED)
+
+    assert turn.tool_calls[0].arguments["content"] == "import os\n\nprint('ok')\n"
+
+
+def test_double_escaped_layout_preserves_escapes_inside_source_strings():
+    response = {
+        "message": {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "write",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": {
+                            "filepath": "app.py",
+                            "content": r'import os\nprint("\\n")\n',
+                        },
+                    },
+                }
+            ],
+        }
+    }
+
+    turn = parse_model_turn(response, REGISTERED)
+
+    assert turn.tool_calls[0].arguments["content"] == 'import os\nprint("\\n")\n'
+
+
+def test_does_not_execute_ordinary_commented_source_fence():
+    content = """```python
+# models.py
+VALUE = 1
+```"""
+
+    turn = parse_model_turn(_resp(content), REGISTERED)
+
+    assert turn.tool_calls == []
+    assert "VALUE = 1" in turn.text
 
 
 def test_repairs_malformed_json_tool_call():

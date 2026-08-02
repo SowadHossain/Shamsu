@@ -67,7 +67,16 @@ async def test_agent_loop_reports_changed_files(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_mutation_request_cannot_finish_on_model_done_without_tool(tmp_path: Path):
-    client = _ScriptedClient([_text_response("Done, fixed app.py.")])
+    client = _ScriptedClient(
+        [
+            # One response per missing-mutation recovery attempt, plus the
+            # first: prose can never finish a mutation request, however many
+            # times the model insists it is done.
+            _text_response("Done, fixed app.py."),
+            _text_response("The fix should now work."),
+            _text_response("app.py is already correct."),
+        ]
+    )
     loop = AgentChatLoop(
         tmp_path,
         client=client,
@@ -80,6 +89,38 @@ async def test_mutation_request_cannot_finish_on_model_done_without_tool(tmp_pat
     assert result.stopped is True
     assert "no file mutation succeeded" in result.final
     assert "No file was changed" in result.final
+
+
+@pytest.mark.asyncio
+async def test_prose_after_read_gets_one_bounded_mutation_tool_recovery(tmp_path: Path):
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    client = _ScriptedClient(
+        [
+            _tool_response("read_file", {"filepath": "app.py"}),
+            _text_response("The value needs to be changed to 2."),
+            _tool_response(
+                "edit_file",
+                {
+                    "filepath": "app.py",
+                    "old_string": "VALUE = 1",
+                    "new_string": "VALUE = 2",
+                },
+            ),
+            _text_response("Done."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=_NoPlanLLM(),
+    )
+
+    result = await loop.run("fix app.py so VALUE is 2")
+
+    assert result.stopped is False
+    assert result.changed_files == ("app.py",)
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "VALUE = 2\n"
 
 
 @pytest.mark.asyncio

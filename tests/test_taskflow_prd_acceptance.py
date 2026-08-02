@@ -160,3 +160,53 @@ def test_pdf_schema_tables_map_to_entities_in_document_order():
         field for field in contract.entities[1]["fields"] if field["name"] == "category"
     )
     assert category_field["kwargs"]["on_delete"] == "SET_NULL"
+
+
+def test_compact_plain_text_contract_selects_a_compatible_project_adapter():
+    parsed = parse_prd_text(
+        "\n".join(
+            [
+                "PRD: Orbit Desk",
+                "1. Overview",
+                "A full-stack web application for shared workspaces.",
+                "4. Users & Roles",
+                "• Admin: manages all workspaces.",
+                "• Member: works in assigned workspaces.",
+                "5. Tech Stack",
+                "Backend: Django",
+                "Frontend: React",
+                "Database: SQLite",
+                "6. Data Model",
+                "Workspace",
+                "• id, name, owner_id (FK → User), created_at",
+                "Membership",
+                "• id, workspace_id (FK), user_id (FK), joined_at",
+                "7.1 Authentication",
+                "Login and logout are required.",
+                "7.2 Admin Flows",
+                "Create and archive a workspace.",
+                "8. API Surface",
+                "POST",
+                "/api/workspaces",
+                "9. Permissions Rules",
+                "Members can only access assigned workspaces.",
+                "10. Acceptance Criteria (Definition of Done)",
+                "An admin can create a workspace.",
+                "Automated tests cover permissions.",
+            ]
+        )
+    )
+
+    contract = extract_contract(parsed)
+    spec = build_project_spec(parsed)
+
+    assert contract.title == "Orbit Desk"
+    assert contract.roles == ["Admin", "Member"]
+    assert {item["name"] for item in contract.entities} == {"Workspace", "Membership"}
+    assert {item["path"] for item in contract.api_endpoints} == {"/api/workspaces"}
+    assert contract.authentication_rules == ["Login and logout are required."]
+    assert contract.authorization_rules == ["Members can only access assigned workspaces."]
+    assert contract.required_tests == ["Automated tests cover permissions."]
+    assert spec.generation_ready is True
+    assert spec.suitability.strategy.value == "freeform"
+    assert "React" in spec.suitability.conflicts[0] or "SPA" in spec.suitability.conflicts[0]

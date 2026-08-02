@@ -29,6 +29,9 @@ dependencies = [
     # PRD parsing
     "mistletoe>=1.3",
     "pdfplumber>=0.10",
+    "pypdfium2>=5.0",
+    "rapidocr>=3.9,<4",
+    "onnxruntime>=1.20",
 
     # Caching
     "diskcache>=5.6",

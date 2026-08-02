@@ -114,6 +114,50 @@ def test_python_traceback_ignores_error_like_lines_outside_traceback_context():
     assert python_fallback.parse_python_traceback(text) == []
 
 
+def test_parses_final_exception_of_a_deep_django_traceback():
+    """A `manage.py check` settings failure has 25+ frame lines between the
+    Traceback header and the final NameError; the parser must still connect
+    them (the old 15-line window did not, leaving repair with no diagnostics)."""
+    frames = "".join(
+        f'  File "/project/.venv/Lib/site-packages/django/mod{i}.py", line {i + 1}, in step{i}\n'
+        f"    call_{i}()\n"
+        for i in range(14)
+    )
+    text = (
+        "Traceback (most recent call last):\n"
+        '  File "manage.py", line 22, in <module>\n'
+        "    main()\n"
+        + frames
+        + '  File "backend/config/settings.py", line 15, in <module>\n'
+        "    'DIRS': [BASE_DIR / 'templates'],\n"
+        "NameError: name 'BASE_DIR' is not defined\n"
+    )
+
+    records = python_fallback.parse_python_traceback(text)
+
+    assert len(records) == 1
+    assert records[0].code == "NameError"
+    assert records[0].file == "backend/config/settings.py"
+    assert records[0].line == 15
+
+
+def test_error_line_far_below_an_unrelated_traceback_is_still_ignored():
+    text = (
+        "Traceback (most recent call last):\n"
+        '  File "app.py", line 1, in <module>\n'
+        "    boom()\n"
+        "ValueError: handled earlier\n"
+        "server restarted\n"
+        "request served\n"
+        "log line mentioning ConnectionError: transient blip\n"
+    )
+
+    records = python_fallback.parse_python_traceback(text)
+
+    assert len(records) == 1
+    assert records[0].code == "ValueError"
+
+
 def test_parses_py_compile_syntax_error_block():
     text = (
         '  File "ledgerlite.py", line 94\n'

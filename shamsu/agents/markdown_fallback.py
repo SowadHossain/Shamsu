@@ -107,23 +107,89 @@ class MarkdownWriteFallback:
             (match.group("lang").strip().lower(), match.group("code"))
             for match in CODE_BLOCK_RE.finditer(assistant_content or "")
         ]
+        if blocks and not self.tools.is_tool_allowed("write_file"):
+            append_target = self.tools.sole_allowed_write_path()
+            if (
+                append_target
+                and self.tools.is_tool_allowed("append_file")
+                and not self.tools.is_tool_allowed("edit_file")
+            ):
+                return FallbackResult(
+                    True,
+                    "Do not show the source as a code block. Your NEXT response must call "
+                    f"append_file with filepath={append_target!r} and content containing only "
+                    "the required new declarations. Do not call run_command before append_file "
+                    "returns ok; the harness runs verification afterward.",
+                )
+            return FallbackResult(
+                True,
+                "write_file is unavailable for this focused repair. Read the target and use "
+                "edit_file or append_file so unrelated content is preserved.",
+            )
         # An existing file token is stronger evidence than the permissive
         # verb-led parser. For example, "fix the bug in qa_probe.py" used to
         # infer the new filename "bug in qa_probe.py" and create the wrong file.
-        path = self._existing_file_mentioned(user_input) or _infer_path(user_input)
+        path = (
+            self.tools.sole_allowed_write_path()
+            or self._existing_file_mentioned(user_input)
+            or _infer_path(user_input)
+        )
+        inferred_blocks = _infer_named_blocks(assistant_content or "")
+        if inferred_blocks and (not path or not Path(path).suffix or len(inferred_blocks) > 1):
+            results: list[ToolResult] = []
+            skipped = 0
+            for block_path, block_code in inferred_blocks:
+                code = block_code.rstrip() + "\n"
+                target = self._resolve(block_path)
+                if target is None or not _valid_source_for_path(block_path, code):
+                    skipped += 1
+                    continue
+                if target.is_file() and not _plausible_replacement(target, code):
+                    skipped += 1
+                    continue
+                results.append(
+                    self.tools.write_file(
+                        block_path,
+                        code,
+                        overwrite=target.is_file(),
+                    )
+                )
+            if results:
+                ok_count = sum(1 for result in results if result.ok)
+                summary = (
+                    f"Markdown fallback applied {ok_count}/{len(results)} explicit file block(s)"
+                    + (f" and skipped {skipped} unsafe/incomplete block(s)." if skipped else ".")
+                )
+                return FallbackResult(True, summary, results[-1], results)
         if not path or not blocks:
             inferred_blocks = _infer_block_paths([code for _lang, code in blocks])
             if not inferred_blocks:
                 return FallbackResult(False)
-            results = [
-                self.tools.write_file(block_path, block_code.rstrip() + "\n", overwrite=True)
-                for block_path, block_code in inferred_blocks
-            ]
+            results = []
+            for block_path, block_code in inferred_blocks:
+                code = block_code.rstrip() + "\n"
+                target = self._resolve(block_path)
+                if target is None or not _valid_source_for_path(block_path, code):
+                    continue
+                if target.is_file() and not _plausible_replacement(target, code):
+                    continue
+                results.append(
+                    self.tools.write_file(block_path, code, overwrite=target.is_file())
+                )
+            if not results:
+                return FallbackResult(False)
             ok_count = sum(1 for result in results if result.ok)
             summary = f"Markdown fallback wrote {ok_count}/{len(results)} file(s)."
             return FallbackResult(True, summary, results[-1] if results else None, results)
         content_blocks = _content_blocks_for(path, blocks)
         if not content_blocks:
+            if (
+                self.tools.sole_allowed_write_path()
+                and Path(path).name == "__init__.py"
+                and _only_empty_package_marker_blocks(blocks, path)
+            ):
+                result = self.tools.write_file(path, "", overwrite=False)
+                return FallbackResult(True, result.message, result)
             # The assistant only showed usage/verification commands. There is
             # no proposed file content to salvage, so let the successful tool
             # result and verification gate finish the turn normally.
@@ -298,10 +364,70 @@ def _infer_block_paths(blocks: list[str]) -> list[tuple[str, str]]:
         path = _path_from_comment(lines[0])
         if not path:
             continue
-        inferred.append((path, "\n".join(lines[1:])))
+        code = "\n".join(lines[1:])
+        if not code.strip():
+            continue
+        inferred.append((path, code))
     return inferred
+
+
+def _infer_named_blocks(content: str) -> list[tuple[str, str]]:
+    """Bind code fences to the explicit path immediately introducing each fence."""
+    inferred: list[tuple[str, str]] = []
+    previous_end = 0
+    for match in CODE_BLOCK_RE.finditer(content):
+        block = match.group("code")
+        lines = block.strip().splitlines()
+        if not lines or _is_run_command_block(block):
+            previous_end = match.end()
+            continue
+        path = _path_from_comment(lines[0])
+        code = "\n".join(lines[1:]) if path else block.strip()
+        if not path:
+            introduction = content[previous_end : match.start()][-500:]
+            candidates = [
+                item.group("path").replace("\\", "/")
+                for item in FILE_TOKEN_RE.finditer(introduction)
+            ]
+            path = candidates[-1] if candidates else ""
+        if path and code.strip():
+            inferred.append((path, code))
+        previous_end = match.end()
+    return inferred
+
+
+def _valid_source_for_path(path: str, code: str) -> bool:
+    extension = Path(path).suffix.lower()
+    if extension == ".py":
+        return _parses_as_python(code)
+    if extension == ".json":
+        import json
+
+        try:
+            json.loads(code)
+        except json.JSONDecodeError:
+            return False
+    return bool(code.strip())
 
 
 def _path_from_comment(line: str) -> str:
     match = re.match(r"\s*(?://|#|/\*)\s*(?P<path>[\w./\\ -]+\.[A-Za-z0-9_]+)", line)
     return match.group("path").strip().replace("\\", "/") if match else ""
+
+
+def _only_empty_package_marker_blocks(
+    blocks: list[tuple[str, str]],
+    target: str,
+) -> bool:
+    """True when a scoped model response explicitly represents an empty __init__.py."""
+    target = target.replace("\\", "/")
+    for _lang, block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if len(lines) != 1:
+            return False
+        path = _path_from_comment(lines[0])
+        if not path or not (target == path or target.endswith("/" + path)):
+            return False
+    return True

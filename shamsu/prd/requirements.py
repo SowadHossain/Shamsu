@@ -1,13 +1,17 @@
 """Deterministic PRD requirement ledger compiler."""
+
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from shamsu.prd.contract import PRDContract
+
+MAX_REQUIREMENTS_PER_MILESTONE = 4
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,20 @@ def compile_requirement_ledger(contract: PRDContract) -> RequirementLedger:
     _extend(records, "MECH", "mechanic", contract.mechanics, "mechanics", contract)
     _extend(records, "SCREEN", "screen", contract.screens, "screens", contract)
     _extend(records, "DATA", "entity", _entity_requirements(contract), "entities", contract)
+    _extend(records, "ROLE", "role", contract.roles, "roles", contract)
     _extend(records, "AUTH", "auth", contract.authentication_rules, "authentication", contract)
+    _extend(
+        records,
+        "AUTHZ",
+        "authorization",
+        contract.authorization_rules,
+        "authorization",
+        contract,
+    )
+    _extend(records, "FLOW", "workflow", contract.user_journeys, "user_journeys", contract)
+    _extend(
+        records, "API", "interface", _endpoint_requirements(contract), "api_endpoints", contract
+    )
     _extend(
         records,
         "PERSIST",
@@ -90,8 +107,19 @@ def compile_requirement_ledger(contract: PRDContract) -> RequirementLedger:
     )
     _extend(records, "TEST", "test", contract.required_tests, "required_tests", contract)
     _extend(records, "ACC", "acceptance", contract.acceptance_criteria, "acceptance", contract)
+    _extend(records, "CONS", "constraint", contract.constraints, "constraints", contract)
+    _extend(
+        records,
+        "SCOPE",
+        "out_of_scope",
+        contract.out_of_scope,
+        "out_of_scope",
+        contract,
+        scope="out",
+    )
     deduped = _dedupe_records(records)
-    milestones = _assign_milestones(deduped)
+    executable_records = [record for record in deduped if record.scope == "in"]
+    milestones, milestone_assignment = _expanded_milestones(executable_records)
     by_id = {milestone.id: milestone for milestone in milestones}
     assigned_records = [
         RequirementRecord(
@@ -104,7 +132,7 @@ def compile_requirement_ledger(contract: PRDContract) -> RequirementLedger:
             scope=record.scope,
             status=record.status,
             verification=record.verification or _verification_for(record),
-            milestone_id=_milestone_for(record),
+            milestone_id=milestone_assignment.get(record.id, ""),
             implementing_files=_expected_files_for(record, contract),
             evidence=list(record.evidence),
         )
@@ -117,14 +145,25 @@ def compile_requirement_ledger(contract: PRDContract) -> RequirementLedger:
             requirement_ids=[
                 record.id for record in assigned_records if record.milestone_id == milestone.id
             ],
-            dependencies=list(milestone.dependencies),
+            dependencies=[
+                dependency for dependency in milestone.dependencies if dependency in by_id
+            ],
             active_skills=list(milestone.active_skills),
-            expected_files=_milestone_expected_files(milestone.id, assigned_records),
+            expected_files=sorted(
+                dict.fromkeys(
+                    [
+                        *_architecture_expected_files_for_milestone(milestone.id, contract),
+                        *_milestone_expected_files(milestone.id, assigned_records),
+                    ]
+                )
+            ),
             verifier=milestone.verifier,
             acceptance_conditions=[
                 record.id
                 for record in assigned_records
-                if record.milestone_id == milestone.id and record.kind == "acceptance"
+                if record.milestone_id == milestone.id
+                and record.scope == "in"
+                and record.priority == "must"
             ],
             attempt_budget=milestone.attempt_budget,
             rollback_policy=milestone.rollback_policy,
@@ -141,6 +180,17 @@ def compile_requirement_ledger(contract: PRDContract) -> RequirementLedger:
     )
 
 
+def is_complex_prd_contract(
+    contract: PRDContract,
+    ledger: RequirementLedger | None = None,
+) -> bool:
+    """Return whether a PRD needs durable milestone execution."""
+    compiled = ledger or compile_requirement_ledger(contract)
+    if contract.requires_full_stack:
+        return True
+    return len(compiled.requirements) >= 6 and len(compiled.milestones) >= 2
+
+
 def compile_prd_execution_artifacts(contract: PRDContract) -> PRDExecutionArtifacts:
     requirement_ledger = compile_requirement_ledger(contract)
     architecture = {
@@ -151,6 +201,8 @@ def compile_prd_execution_artifacts(contract: PRDContract) -> PRDExecutionArtifa
         "stack_hint": contract.stack_hint,
         "required_stack": list(contract.required_stack),
         "architecture": list(contract.architecture),
+        "components": _architecture_components(contract),
+        "source_authoring": "react_tool_loop",
         "assumptions": list(contract.assumptions),
         "warnings": list(contract.extraction_warnings),
     }
@@ -267,6 +319,8 @@ def _extend(
     items: list[str],
     source: str,
     contract: PRDContract,
+    *,
+    scope: str = "in",
 ) -> None:
     for index, item in enumerate(items, start=1):
         text = str(item).strip()
@@ -279,6 +333,7 @@ def _extend(
                 text=text,
                 source=source,
                 source_refs=_source_refs_for(contract, source),
+                scope=scope,
                 verification=_verification_for_text(kind, text),
             )
         )
@@ -294,7 +349,25 @@ def _entity_requirements(contract: PRDContract) -> list[str]:
             str(field.get("name") if isinstance(field, dict) else field)
             for field in list(entity.get("fields") or [])
         ]
+        if entity.get("inferred"):
+            # Designed, not specified. Name the entity so it still gets built,
+            # but do not emit the `: fields ...` form the validator enforces -
+            # an invented field going missing must not fail a milestone.
+            rows.append(f"{name}: entity with designed fields")
+            continue
         rows.append(f"{name}: fields {', '.join(field for field in fields if field)}")
+    return rows
+
+
+def _endpoint_requirements(contract: PRDContract) -> list[str]:
+    rows: list[str] = []
+    for endpoint in contract.api_endpoints:
+        method = str(endpoint.get("method") or "").upper().strip()
+        path = str(endpoint.get("path") or "").strip()
+        if not method or not path:
+            continue
+        access = "authenticated" if endpoint.get("auth_required", True) else "public"
+        rows.append(f"{method} {path} ({access})")
     return rows
 
 
@@ -362,10 +435,69 @@ def _assign_milestones(records: list[RequirementRecord]) -> list[MilestoneRecord
     return [milestone for milestone in order if milestone.id in needed]
 
 
+def _expanded_milestones(
+    records: list[RequirementRecord],
+) -> tuple[list[MilestoneRecord], dict[str, str]]:
+    base_milestones = _assign_milestones(records)
+    records_by_base = {
+        milestone.id: [record for record in records if _milestone_for(record) == milestone.id]
+        for milestone in base_milestones
+    }
+    chunk_ids: dict[str, list[str]] = {}
+    for milestone in base_milestones:
+        chunk_count = max(
+            1,
+            (len(records_by_base[milestone.id]) + MAX_REQUIREMENTS_PER_MILESTONE - 1)
+            // MAX_REQUIREMENTS_PER_MILESTONE,
+        )
+        base_number = int(milestone.id.removeprefix("M-"))
+        chunk_ids[milestone.id] = [
+            milestone.id,
+            *[f"M-{base_number * 100 + chunk_index:03d}" for chunk_index in range(1, chunk_count)],
+        ]
+
+    expanded: list[MilestoneRecord] = []
+    assignment: dict[str, str] = {}
+    for milestone in base_milestones:
+        chunks = [
+            records_by_base[milestone.id][index : index + MAX_REQUIREMENTS_PER_MILESTONE]
+            for index in range(
+                0, len(records_by_base[milestone.id]), MAX_REQUIREMENTS_PER_MILESTONE
+            )
+        ]
+        ids = chunk_ids[milestone.id]
+        for index, (chunk_id, chunk) in enumerate(zip(ids, chunks, strict=True)):
+            if index:
+                dependencies = [ids[index - 1]]
+            else:
+                dependencies = [
+                    chunk_ids[dependency][-1]
+                    for dependency in milestone.dependencies
+                    if dependency in chunk_ids
+                ]
+            title = milestone.title
+            if len(chunks) > 1:
+                title = f"{title} (part {index + 1}/{len(chunks)})"
+            expanded.append(
+                MilestoneRecord(
+                    id=chunk_id,
+                    title=title,
+                    requirement_ids=[],
+                    dependencies=dependencies,
+                    active_skills=list(milestone.active_skills),
+                    verifier=milestone.verifier,
+                    attempt_budget=milestone.attempt_budget,
+                    rollback_policy=milestone.rollback_policy,
+                )
+            )
+            assignment.update({record.id: chunk_id for record in chunk})
+    return expanded, assignment
+
+
 def _milestone_for(record: RequirementRecord) -> str:
-    if record.kind in {"entity", "auth", "security"}:
+    if record.kind in {"entity", "role", "auth", "authorization", "security"}:
         return "M-001"
-    if record.kind in {"feature", "mechanic", "screen", "nonfunctional"}:
+    if record.kind in {"feature", "mechanic", "screen", "workflow", "interface", "nonfunctional"}:
         return "M-002"
     if record.kind in {"persistence"} or _mentions_script_or_seed(record.text):
         return "M-003"
@@ -390,23 +522,100 @@ def _verification_for_text(kind: str, text: str) -> str:
 
 
 def _expected_files_for(record: RequirementRecord, contract: PRDContract) -> list[str]:
-    lowered = record.text.lower()
-    files: list[str] = []
-    if _is_react_stack(contract):
-        if record.kind in {"feature", "mechanic", "screen", "nonfunctional"}:
-            files.extend(["src/App.tsx", "src/styles.css"])
-        if record.kind in {"entity", "persistence"}:
-            files.extend(["src/data.ts", "scripts/seed.mjs", "scripts/status.mjs"])
-        if record.kind in {"test", "acceptance"}:
-            files.extend(["src/app.test.ts", "package.json"])
-        if "seed" in lowered:
-            files.append("scripts/seed.mjs")
-        if "status" in lowered:
-            files.append("scripts/status.mjs")
-    elif "python" in " ".join(contract.required_stack).lower() or contract.stack_hint == "python":
-        if record.kind in {"feature", "mechanic", "acceptance", "test"}:
-            files.append(_python_entrypoint(contract))
-    return sorted(dict.fromkeys(files))
+    # The requirement compiler does not own application architecture. Mapping
+    # every React feature to App.tsx and every entity to src/data.ts caused
+    # unrelated workflows to collapse into a generic dashboard. Expected files
+    # are now supplied by the milestone agent after it inspects the project, or
+    # inferred from files explicitly named by the PRD.
+    del contract
+    matches = re.findall(
+        r"(?:^|[\s`'\"])([A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)+\.[A-Za-z0-9]+)",
+        record.text,
+    )
+    return sorted(dict.fromkeys(path.replace("\\", "/") for path in matches))
+
+
+def _architecture_components(contract: PRDContract) -> list[dict[str, Any]]:
+    """Describe component ownership without generating framework source files."""
+    stack = " ".join([contract.stack_hint, *contract.required_stack]).lower()
+    components: list[dict[str, Any]] = []
+    if any(token in stack for token in ("react", "vite", "vue", "svelte", "frontend")):
+        components.append(
+            {
+                "id": "frontend",
+                "root": "frontend",
+                "required": True,
+                "responsibility": "browser UI and API client",
+            }
+        )
+    if any(token in stack for token in ("django", "fastapi", "flask", "express", "backend")):
+        components.append(
+            {
+                "id": "backend",
+                "root": "backend",
+                "required": True,
+                "responsibility": "API, authentication, and domain logic",
+            }
+        )
+    if any(token in stack for token in ("sqlite", "postgres", "mysql", "database")):
+        components.append(
+            {
+                "id": "database",
+                "root": "backend" if any(item["id"] == "backend" for item in components) else ".",
+                "required": True,
+                "responsibility": "persistent application state owned by the backend",
+            }
+        )
+    if not components:
+        components.append(
+            {
+                "id": "application",
+                "root": ".",
+                "required": True,
+                "responsibility": "primary application",
+            }
+        )
+    return components
+
+
+def _architecture_expected_files_for_milestone(
+    milestone_id: str,
+    contract: PRDContract,
+) -> list[str]:
+    """Give small models a framework file map without authoring source code."""
+    stack = " ".join([contract.stack_hint, *contract.required_stack]).lower()
+    number = int(milestone_id.removeprefix("M-") or 0)
+    foundation = number == 1 or 100 <= number < 200
+    product = number == 2 or 200 <= number < 300
+    release = number in {3, 4} or 300 <= number < 500
+    paths: list[str] = []
+    if "django" in stack and (foundation or release):
+        paths.extend(
+            [
+                "backend/manage.py",
+                "backend/requirements.txt",
+                "backend/config/__init__.py",
+                "backend/config/settings.py",
+                "backend/config/urls.py",
+                "backend/core/__init__.py",
+                "backend/core/apps.py",
+                "backend/core/models.py",
+                "backend/core/migrations/__init__.py",
+            ]
+        )
+    if any(token in stack for token in ("react", "vite")) and (product or release):
+        typed = "typescript" in stack or "tsx" in stack
+        extension = "tsx" if typed else "jsx"
+        paths.extend(
+            [
+                "frontend/package.json",
+                "frontend/index.html",
+                f"frontend/src/main.{extension}",
+                f"frontend/src/App.{extension}",
+                "frontend/src/styles.css",
+            ]
+        )
+    return paths
 
 
 def _milestone_expected_files(

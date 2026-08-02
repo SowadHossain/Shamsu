@@ -10,6 +10,7 @@ from shamsu.prd.contract import extract_contract
 from shamsu.prd.parser import parse_prd_text
 from shamsu.prd.project import build_project_spec
 from shamsu.prd.requirements import (
+    MAX_REQUIREMENTS_PER_MILESTONE,
     compile_prd_execution_artifacts,
     compile_requirement_ledger,
     render_requirement_summary,
@@ -28,7 +29,7 @@ def test_compile_requirement_ledger_assigns_stable_ids_and_milestones():
     assert any("scripts/seed.mjs" in record.text for record in ledger.requirements)
     assert any(record.verification == "run acceptance command" for record in ledger.requirements)
     assert {"M-001", "M-002", "M-003", "M-004"} <= {milestone.id for milestone in ledger.milestones}
-    assert all(record.milestone_id for record in ledger.requirements)
+    assert all(record.milestone_id for record in ledger.requirements if record.scope == "in")
     assert any(record.implementing_files for record in ledger.requirements)
     assert any(milestone.active_skills for milestone in ledger.milestones)
 
@@ -47,6 +48,104 @@ def test_requirement_summary_is_compact_and_auditable():
     assert "Requirement ledger: Demo" in summary
     assert "FEAT-001" in summary
     assert "ACC-001" in summary
+
+
+def test_requirement_ledger_includes_cross_cutting_project_contract():
+    contract = extract_contract(
+        parse_prd_text(
+            "PRD: Orbit Desk\n"
+            "1. Overview\nA full-stack web application.\n"
+            "4. Users & Roles\n• Admin: manages workspaces.\n"
+            "6. Data Model\nWorkspace\n• id, name, owner_id (FK → User)\n"
+            "7.2 Admin Flows\nCreate a workspace.\n"
+            "8. API Surface\nPOST\n/api/workspaces\n"
+            "9. Permissions Rules\nOnly admins create workspaces.\n"
+            "10. Acceptance Criteria\nAn admin can create a workspace.\n"
+            "11. Non-Goals\nRealtime collaboration.\n"
+        )
+    )
+
+    ledger = compile_requirement_ledger(contract)
+    kinds = {record.kind for record in ledger.requirements}
+    out_of_scope = [record for record in ledger.requirements if record.kind == "out_of_scope"]
+
+    assert {"entity", "role", "workflow", "interface", "authorization", "acceptance"} <= kinds
+    assert out_of_scope and out_of_scope[0].scope == "out"
+    assert all(not record.milestone_id for record in out_of_scope)
+    milestone_ids = {milestone.id for milestone in ledger.milestones}
+    assert all(
+        dependency in milestone_ids
+        for milestone in ledger.milestones
+        for dependency in milestone.dependencies
+    )
+
+
+def test_oversized_milestones_are_chained_into_small_model_sized_capsules():
+    contract = extract_contract(
+        parse_prd_text(
+            "# Workflow Suite\n\n## Features\n"
+            + "\n".join(f"- Implement workflow {index}." for index in range(1, 30))
+            + "\n\n## Acceptance\n- The production build passes.\n",
+            markdown=True,
+        )
+    )
+
+    ledger = compile_requirement_ledger(contract)
+    workflow_milestones = [
+        milestone
+        for milestone in ledger.milestones
+        if milestone.id == "M-002" or milestone.id.startswith("M-2")
+    ]
+
+    assert len(workflow_milestones) == 8
+    assert all(
+        len(milestone.requirement_ids) <= MAX_REQUIREMENTS_PER_MILESTONE
+        for milestone in ledger.milestones
+    )
+    assert workflow_milestones[1].dependencies == [workflow_milestones[0].id]
+    assert workflow_milestones[2].dependencies == [workflow_milestones[1].id]
+
+
+def test_compiled_milestones_have_binding_conditions_without_generic_react_file_guesses():
+    contract = extract_contract(
+        parse_prd_text(
+            "# Canvas Lite\n\n"
+            "## Tech Stack\n- Django\n- React\n- SQLite\n\n"
+            "## Data Model\nCourse\n- id, title\n\n"
+            "## Features\n- A teacher creates a course.\n- A student submits an assignment.\n",
+            markdown=True,
+        )
+    )
+
+    ledger = compile_requirement_ledger(contract)
+
+    assert ledger.milestones
+    assert all(milestone.acceptance_conditions for milestone in ledger.milestones)
+    assert all(not record.implementing_files for record in ledger.requirements)
+    foundation = next(milestone for milestone in ledger.milestones if milestone.id == "M-001")
+    product = next(milestone for milestone in ledger.milestones if milestone.id == "M-002")
+    assert "backend/manage.py" in foundation.expected_files
+    assert "backend/core/models.py" in foundation.expected_files
+    assert "frontend/package.json" in product.expected_files
+    assert "frontend/src/App.jsx" in product.expected_files
+
+
+def test_architecture_artifact_declares_component_ownership_and_react_authoring():
+    contract = extract_contract(
+        parse_prd_text(
+            "# Canvas Lite\n\n## Tech Stack\n- Django\n- React\n- SQLite\n",
+            markdown=True,
+        )
+    )
+
+    architecture = compile_prd_execution_artifacts(contract).architecture
+
+    assert architecture["source_authoring"] == "react_tool_loop"
+    assert {item["id"] for item in architecture["components"]} == {
+        "frontend",
+        "backend",
+        "database",
+    }
 
 
 def test_prd_contract_logging_writes_requirement_artifact(tmp_path: Path):

@@ -12,6 +12,23 @@ from shamsu.session.manager import SessionLogger
 # replay the entire history into the model.
 HYDRATE_MAX_MESSAGES = 80
 
+# Harness-authored status text, not model output. Replaying it teaches the
+# model that a turn ends in this text and it starts producing the text instead
+# of acting - observed live 2026-08-02, where a session accumulated ten
+# identical "could you provide the full path" turns and then wrote nothing for
+# the rest of its life. Old turns are still summarized elsewhere.
+_HARNESS_STATUS_PREFIXES = (
+    "i did not complete the requested workspace change",
+    "i said i would take an action",
+    "local ai failed safely",
+    "the model call timed out",
+    "shamsu is ready",
+)
+
+# How many times the same assistant answer may be replayed before the rest are
+# dropped. Repetition is what the model latches onto.
+_MAX_REPEATED_HYDRATED = 2
+
 
 @dataclass
 class ChatMessage:
@@ -78,11 +95,14 @@ class ChatState:
         history = self._messages[1:]
         if not history:
             return [], 1
+        # ``max_tokens`` is the budget for the complete message list, not just
+        # conversation history. Charge the always-present system prompt first.
+        history_budget = max(0, max_tokens - token_counter(self.system_prompt))
         used = 0
         start_rel = len(history)
         for i in range(len(history) - 1, -1, -1):
             cost = token_counter(history[i].content)
-            if start_rel != len(history) and used + cost > max_tokens:
+            if start_rel != len(history) and used + cost > history_budget:
                 break
             used += cost
             start_rel = i
@@ -171,9 +191,18 @@ class ChatState:
         self._hydrate_records(events, key_content="content")
 
     def _hydrate_records(self, records: list[dict[str, Any]], key_content: str) -> None:
+        seen_assistant: dict[str, int] = {}
         for payload in records:
             role = str(payload.get("role", "")).strip()
             content = str(payload.get(key_content, ""))
+            if role == "assistant":
+                # Drop repeats of an identical answer. A model that stalled the
+                # same way five times must not be shown five examples of it.
+                key = " ".join(content.strip().lower().split())
+                if key:
+                    seen_assistant[key] = seen_assistant.get(key, 0) + 1
+                    if seen_assistant[key] > _MAX_REPEATED_HYDRATED:
+                        continue
             if role in {"user", "assistant", "tool"} and _should_hydrate_chat_message(role, content):
                 self._append(
                     ChatMessage(
@@ -196,8 +225,6 @@ def _should_hydrate_chat_message(role: str, content: str) -> bool:
     if role != "assistant":
         return True
     normalized = " ".join(content.strip().lower().split())
-    blocked_status_messages = {
-        "shamsu is ready.",
-        "shamsu is ready",
-    }
-    return normalized not in blocked_status_messages
+    if not normalized:
+        return True
+    return not normalized.startswith(_HARNESS_STATUS_PREFIXES)

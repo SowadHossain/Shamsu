@@ -141,6 +141,58 @@ def test_clearing_the_scope_restores_normal_writes(tools, tmp_path: Path):
     assert tools.execute("write_file", {"filepath": "existing.py", "content": "x = 2\n"}).ok is True
 
 
+def test_project_read_scope_hides_files_from_previous_builds(tools, tmp_path: Path):
+    (tmp_path / "old-build").mkdir()
+    (tmp_path / "old-build" / "schema.sql").write_text("legacy", encoding="utf-8")
+    tools.set_allowed_read_paths(["new-build"])
+
+    listing = tools.execute("list_files", {"path": "."})
+    missing = tools.execute("read_file", {"filepath": "schema.sql"})
+
+    assert listing.ok is True
+    assert "new-build" in str(listing.data["listing"])
+    assert "old-build" not in str(listing.data["listing"])
+    assert missing.ok is False
+    assert missing.data["candidates"] == []
+    assert "old-build/schema.sql" not in missing.message
+
+
+def test_project_read_scope_resolves_short_paths_inside_active_root(tools, tmp_path: Path):
+    root = tmp_path / "new-build"
+    root.mkdir()
+    (root / "package.json").write_text('{"name":"new"}', encoding="utf-8")
+    tools.set_allowed_read_paths(["new-build"])
+
+    result = tools.execute("read_file", {"filepath": "package.json"})
+
+    assert result.ok is True
+    assert result.data["resolved_filepath"] == "new-build/package.json"
+    assert '"name":"new"' in result.data["content"]
+    listing = tools.execute("list_files", {"path": "."})
+    assert listing.ok is True
+    assert "new-build/package.json" in listing.data["listing"]
+
+
+def test_project_scope_resolves_short_write_paths_inside_active_root(tools, tmp_path: Path):
+    tools.set_allowed_write_paths(["new-build"])
+    tools.set_allowed_read_paths(["new-build"])
+
+    result = tools.execute("write_file", {"filepath": "models.py", "content": "VALUE = 1\n"})
+
+    assert result.ok is True
+    assert result.data["resolved_filepath"] == "new-build/models.py"
+    assert (tmp_path / "new-build" / "models.py").is_file()
+
+
+def test_named_file_write_scope_does_not_remap_unrelated_short_path(tools):
+    tools.set_allowed_write_paths(["notes.md"])
+
+    result = tools.execute("write_file", {"filepath": "models.py", "content": "VALUE = 1\n"})
+
+    assert result.ok is False
+    assert "allowed changes only to notes.md" in result.message
+
+
 # --- the contract -------------------------------------------------------------
 
 
@@ -259,6 +311,36 @@ def test_contract_ignores_files_that_are_only_being_read():
     """"Inspect qa_probe.py" names a file but requests no change to it -
     demanding it be written would fail every read-only run."""
     assert run_contract.derive("Inspect qa_probe.py and tell me what it does.").requested_paths == ()
+
+
+def test_contract_ignores_manage_py_inside_quoted_verifier_command():
+    derived = run_contract.derive(
+        "Update test_canvas.py, then run 'python manage.py test' from backend."
+    )
+
+    assert derived.requested_paths == ("test_canvas.py",)
+
+
+def test_delete_contract_excludes_canonical_reference_and_matches_qualified_target():
+    prompt = (
+        "The accidental file 'test_canvas.py' at the project root is a duplicate. "
+        "The canonical file is 'backend/core/tests/test_canvas.py'. "
+        "Delete only the accidental file and keep the canonical file."
+    )
+    derived = run_contract.derive(prompt)
+
+    result = run_contract.check(
+        derived,
+        changed_files=[
+            {
+                "path": "canvas-lite-react-loop-build-v4-2026-08-01/test_canvas.py",
+                "change": "deleted",
+            }
+        ],
+    )
+
+    assert derived.requested_paths == ("test_canvas.py",)
+    assert result.ok is True
 
 
 def test_contract_fails_the_run_that_built_the_wrong_product():
@@ -471,6 +553,47 @@ def test_a_source_file_is_not_a_write_target():
     # A spec/PRD/readme filename is never a target on its own.
     assert run_contract.requested_paths("implement the app from spec.md") == ()
     assert run_contract.requested_paths("based on README.md write app.py") == ("app.py",)
+    assert run_contract.requested_paths(
+        "Read `canvas lite.pdf` and build the app in a folder named `canvas-lite-build`."
+    ) == ("canvas-lite-build",)
+    assert run_contract.requested_paths(
+        "Read the PRD file `canvas lite.pdf` and continue building in a folder named `canvas-lite-build`."
+    ) == ("canvas-lite-build",)
+
+
+def test_source_marker_inside_a_compound_basename_is_still_a_source():
+    """`CANVAS_LITE_PRD.pdf` was counted as an unwritten output in the
+    2026-08-01 dogfood: underscores are word characters, so a plain \\b never
+    saw the PRD marker. The marker must count anywhere in the basename."""
+    assert run_contract.requested_paths(
+        "Build the app from CANVAS_LITE_PRD.pdf and create backend/models.py."
+    ) == ("backend/models.py",)
+    assert run_contract.requested_paths(
+        "Implement my-app-spec.md by creating app.py"
+    ) == ("app.py",)
+    # "spec" inside an ordinary word is not a marker.
+    assert run_contract.requested_paths("Create inspector.py") == ("inspector.py",)
+
+
+def test_document_formats_are_never_write_targets():
+    assert run_contract.requested_paths(
+        "Build the canvas app described in canvas-lite.pdf. Create manage.py."
+    ) == ("manage.py",)
+
+
+def test_unquoted_runner_command_arguments_are_not_write_targets():
+    """"then run python manage.py check" named manage.py as a phantom output in
+    the 2026-08-01 dogfood; only the QUOTED runner-command mask existed."""
+    assert run_contract.requested_paths(
+        "Create backend/models.py, then run python manage.py check"
+    ) == ("backend/models.py",)
+    assert run_contract.requested_paths(
+        "Fix the model fields and verify by running python -m pytest tests/test_models.py"
+    ) == ()
+    # A real target after a prose mention of a runner is kept.
+    assert run_contract.requested_paths(
+        "Build the game with python and save it as game.py"
+    ) == ("game.py",)
 
 
 def test_file_describing_expected_state_is_evidence_not_a_write_target():
@@ -481,6 +604,9 @@ def test_file_describing_expected_state_is_evidence_not_a_write_target():
 
     assert run_contract.requested_paths(prompt) == ("repository.py",)
     assert run_contract.requested_paths("Edit schema.sql to declare tasks.") == ("schema.sql",)
+    assert run_contract.requested_paths(
+        "Fix `database/schema.sql` so the existing INSERT in database/seed.sql is valid."
+    ) == ("database/schema.sql",)
 
 
 def test_stack_names_are_not_write_targets():

@@ -1,0 +1,27 @@
+{
+  "version": "0.1.0",
+  "tags": ["postgres", "mysql", "sql", "database", "migration", "transaction"],
+  "triggers": [
+    "postgres",
+    "postgresql",
+    "psql",
+    "psycopg",
+    "mysql",
+    "mariadb",
+    "sql server",
+    "mssql",
+    "cockroachdb",
+    "supabase",
+    "neon",
+    "rds",
+    "database url",
+    "connection string",
+    "foreign key",
+    "index",
+    "transaction"
+  ],
+  "applies_to": ["generate", "code_edit", "bug_fix"],
+  "dependencies": ["developer"],
+  "conflicts": ["sqlite-persistence"],
+  "context_budget_tokens": 1000
+}

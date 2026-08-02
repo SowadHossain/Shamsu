@@ -62,7 +62,7 @@ _DOTFILE_RE = re.compile(
 )
 _NAMED_DIRECTORY_RE = re.compile(
     r"\b(?:new\s+)?(?:folder|directory)\s+(?:named|called)\s+"
-    r"(?P<path>[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)",
+    r"[\x60\"']?(?P<path>[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)[\x60\"']?",
     re.IGNORECASE,
 )
 # Verbs that make a named file the TARGET of the request rather than a
@@ -174,14 +174,58 @@ def _normalize(path: str) -> str:
 # preposition, so only the genuinely source-marking phrases stay here.
 _SOURCE_PREPOSITION_RE = re.compile(
     r"\b(?:from|per|using|described\s+in|defined\s+in|based\s+on|"
-    r"according\s+to|read|reading|see|refer\s+to|referenced\s+in)\s+$",
+    r"according\s+to|read|reading|see|refer\s+to|referenced\s+in|"
+    r"(?:existing\s+)?(?:insert|query|declaration|definition|configuration|schema)\s+in)\s+$",
     re.IGNORECASE,
 )
-# Spec/source documents are inputs to a build, never its output.
-_SOURCE_FILENAME_RE = re.compile(r"(?:^|/)(?:prd|readme|spec|requirements?)\b", re.IGNORECASE)
+# Spec/source documents are inputs to a build, never its output. The marker
+# word can sit anywhere in the basename separated by _ - . or / (a `\b` alone
+# misses `CANVAS_LITE_PRD.pdf` because underscores are word characters - that
+# exact name was counted as an unwritten output in the 2026-08-01 dogfood).
+_SOURCE_FILENAME_RE = re.compile(
+    r"(?:^|[/_\-. ])(?:prd|readme|spec|requirements?)(?:[/_\-. ]|$)", re.IGNORECASE
+)
+# Document formats SHAMSU reads but never writes; a .pdf named in a build
+# prompt is requirements input, not a deliverable.
+_NON_OUTPUT_EXTENSIONS = {".pdf", ".docx", ".doc"}
 _SOURCE_PREDICATE_RE = re.compile(
     r"^\s+(?:declares?|defines?|contains?|documents?|describes?|shows?|lists?|"
     r"specifies?|says?|has|uses)\b",
+    re.IGNORECASE,
+)
+_QUOTED_SOURCE_PREFIX_RE = re.compile(
+    r"\b(?:from|using|read|reading|see|refer\s+to)\s+[\x60\"'][^\x60\"']*$",
+    re.IGNORECASE,
+)
+_QUOTED_RUNNER_COMMAND_RE = re.compile(
+    r"(?P<quote>[`'\"])(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)\b"
+    r"[^`'\"\n]*(?P=quote)",
+    re.IGNORECASE,
+)
+# A file token sitting in the argument position of an UNQUOTED runner command
+# ("then run python manage.py check") is the command's input, not a file the
+# prompt asks to be written; without this, manage.py became a phantom requested
+# output. Matched against the text immediately before the token: an execution
+# verb, a runner, then only command-shaped tokens (flags, dotted/slashed
+# paths, or another runner name) - a bare prose word in between ("with python
+# and save it as game.py") breaks the chain so real targets are kept.
+_RUNNER_COMMAND_PREFIX_RE = re.compile(
+    r"\b(?:run(?:ning)?|rerun|re-run|execut(?:e|ing)|invok(?:e|ing)|via|with)\s+"
+    r"(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)\b"
+    r"(?:\s+(?:-{1,2}[\w=-]+|[\w.\\/-]*[./\\][\w.\\/-]*|python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)){0,4}"
+    r"\s+$",
+    re.IGNORECASE,
+)
+_SOURCE_DOCUMENT_PREFIX_RE = re.compile(
+    r"\b(?:read|open|inspect|use|using|from)\b[^.!?\n]{0,80}"
+    r"\b(?:prd|product\s+requirements?|requirements?\s+document|spec(?:ification)?)\b"
+    r"[^.!?\n]{0,40}$",
+    re.IGNORECASE,
+)
+_PROTECTED_PATH_PREFIX_RE = re.compile(
+    r"\b(?:canonical|protected|preserved|retained)\b[^.!?\n]{0,60}"
+    r"(?:file|path)?\s*(?:is|:)?\s*['\"`]?$"
+    r"|\b(?:keep|preserve|retain|leave)\b[^.!?\n]{0,50}$",
     re.IGNORECASE,
 )
 
@@ -193,8 +237,12 @@ def _is_source_reference(text: str, token_start: int, candidate: str) -> bool:
     following = text[token_start + len(candidate) :]
     return bool(
         _SOURCE_PREPOSITION_RE.search(preceding)
+        or _QUOTED_SOURCE_PREFIX_RE.search(preceding)
+        or _SOURCE_DOCUMENT_PREFIX_RE.search(preceding)
         or _TEST_SOURCE_PREPOSITION_RE.search(preceding)
         or _SOURCE_PREDICATE_RE.search(following)
+        or _PROTECTED_PATH_PREFIX_RE.search(preceding)
+        or _RUNNER_COMMAND_PREFIX_RE.search(preceding)
     )
 
 
@@ -217,7 +265,7 @@ def requested_paths(prompt: str, workspace: Path | None = None) -> tuple[str, ..
     input, not an output, and is excluded - otherwise a PRD build fails its own
     contract for not "writing" the PRD it was reading.
     """
-    text = read_only.strip(prompt or "")
+    text = _QUOTED_RUNNER_COMMAND_RE.sub(" ", read_only.strip(prompt or ""))
     if not _WRITE_VERB_RE.search(text):
         return ()
     spans: list[tuple[int, str]] = [
@@ -234,6 +282,7 @@ def requested_paths(prompt: str, workspace: Path | None = None) -> tuple[str, ..
         if (
             candidate in seen
             or _normalize(candidate) in _NON_PATH_FILE_TOKENS
+            or Path(candidate).suffix.lower() in _NON_OUTPUT_EXTENSIONS
             or _is_source_reference(text, position, candidate)
         ):
             continue
@@ -334,7 +383,11 @@ def check(
     planned_paths.discard("")
 
     def within(path: str, scope: str) -> bool:
-        return path == scope or path.startswith(scope.rstrip("/") + "/")
+        if path == scope or path.startswith(scope.rstrip("/") + "/"):
+            return True
+        # A user may name a sole project-root file by basename while the tool
+        # records its path under an explicitly named project directory.
+        return "/" not in scope and path.endswith("/" + scope)
 
     def covered(scope: str, paths: set[str]) -> bool:
         return any(within(path, scope) for path in paths)

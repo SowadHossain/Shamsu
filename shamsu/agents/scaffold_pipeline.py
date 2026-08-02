@@ -10,6 +10,7 @@ Success is ground truth only: the build exits 0 AND the Definition of Done
 passes. With no model available it still scaffolds, verifies once, and runs the
 DoD honestly (no PRD adaptation, no false success).
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -210,4 +211,7 @@ def _error_summary(exit_code: int, dod_result: DoDRunResult) -> str:
     failures = dod_result.required_failures if dod_result else []
     if failures:
         return "Required DoD failed: " + ", ".join(failure.item_id for failure in failures)
+    unverified = dod_result.required_unverified if dod_result else []
+    if unverified:
+        return "Required DoD unverified: " + ", ".join(item.item_id for item in unverified)
     return ""

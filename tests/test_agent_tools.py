@@ -31,6 +31,62 @@ def test_write_file_rejects_paths_outside_workspace(tmp_path: Path):
     assert not (tmp_path.parent / "escape.py").exists()
 
 
+def test_write_file_rejects_empty_non_package_source(tmp_path: Path):
+    target = tmp_path / "views.py"
+    target.write_text("def index():\n    return 1\n", encoding="utf-8")
+    registry = _registry(tmp_path)
+
+    result = registry.write_file("views.py", "", overwrite=True)
+
+    assert result.ok is False
+    assert result.data["content_missing"] is True
+    assert target.read_text(encoding="utf-8") == "def index():\n    return 1\n"
+
+
+def test_write_file_allows_empty_package_marker(tmp_path: Path):
+    registry = _registry(tmp_path)
+
+    result = registry.write_file("core/__init__.py", "")
+
+    assert result.ok is True
+    assert (tmp_path / "core/__init__.py").read_text(encoding="utf-8") == ""
+
+
+def test_allowed_tools_filter_schemas_and_execution(tmp_path: Path):
+    registry = _registry(tmp_path)
+    registry.set_allowed_tools({"read_file", "write_file"})
+
+    names = {schema["function"]["name"] for schema in registry.tool_schemas()}
+
+    assert names == {"read_file", "write_file"}
+    blocked = registry.execute("ask_user", {"question": "Which file?"})
+    assert blocked.ok is False
+    assert "not allowed" in blocked.message
+
+
+def test_short_write_path_resolves_to_sole_scoped_file(tmp_path: Path):
+    target = tmp_path / "demo/backend/core/models.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    registry = _registry(tmp_path)
+    registry.set_allowed_write_paths(("demo/backend/core/models.py",))
+
+    result = registry.append_file("backend/core/models.py", "VALUE = 2\n")
+
+    assert result.ok is True
+    assert result.data["resolved_filepath"] == "demo/backend/core/models.py"
+
+
+def test_cwdless_django_command_resolves_unique_scoped_manage_directory(tmp_path: Path):
+    manage = tmp_path / "demo/backend/manage.py"
+    manage.parent.mkdir(parents=True)
+    manage.write_text("print('manage')\n", encoding="utf-8")
+    registry = _registry(tmp_path)
+    registry.set_allowed_read_paths(("demo",))
+
+    assert registry._scoped_command_cwd("python manage.py check", ".") == "demo/backend"
+
+
 def test_list_files_reports_not_a_directory(tmp_path: Path):
     (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
     registry = _registry(tmp_path)
@@ -48,6 +104,20 @@ def test_run_command_omits_diagnostics_on_success(tmp_path: Path):
     assert result.ok is True
     assert result.data["exit_code"] == 0
     assert "diagnostics" not in result.data
+
+
+def test_run_command_reports_generated_workspace_files(tmp_path: Path):
+    registry = _registry(tmp_path)
+    command = (
+        f'"{sys.executable}" -c "from pathlib import Path; '
+        "Path('generated.py').write_text('VALUE = 1\\n')\""
+    )
+
+    result = registry.run_command(command)
+
+    assert result.ok is True
+    assert result.data["touched_files"] == ["generated.py"]
+    assert result.data["deleted_files"] == []
 
 
 def test_run_command_surfaces_diagnostics_on_failure(tmp_path: Path):

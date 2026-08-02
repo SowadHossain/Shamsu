@@ -85,6 +85,25 @@ def test_contract_extracts_acceptance_section_alias():
     ]
 
 
+def test_contract_joins_ocr_wrapped_acceptance_and_drops_corrupted_noise():
+    parsed = parse_prd_text(
+        "# Canvas Lite\n\n"
+        "## Acceptance Criteria\n"
+        "- An admin can create a course and assign it to the\n"
+        "teacher account.\n"
+        "- A student can submit work.\n"
+        "- bs a sg s ss a as s s ss n error, not a crash.\n",
+        markdown=True,
+    )
+
+    contract = extract_contract(parsed)
+
+    assert contract.acceptance_criteria == [
+        "An admin can create a course and assign it to the teacher account.",
+        "A student can submit work.",
+    ]
+
+
 def test_contract_roundtrips_through_dict():
     contract = extract_contract(parse_prd_text(PONG_PRD, markdown=True))
     restored = PRDContract.from_dict(contract.to_dict())

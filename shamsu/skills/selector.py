@@ -20,6 +20,14 @@ _PRD_RE = re.compile(r"\b(prd|product requirements?|acceptance|build the complet
 _REACT_RE = re.compile(r"\b(react|vite|tsx|jsx|frontend|spa|dashboard)\b", re.I)
 _UI_RE = re.compile(r"\b(ui|ux|design|responsive|mobile|browser|screen|layout|dashboard)\b", re.I)
 _SQLITE_RE = re.compile(r"\b(sqlite|database|persistence|persist|seed|migration|schema)\b", re.I)
+# Server SQL engines. Scored above sqlite-persistence and declared as its
+# conflict, so "add a postgres migration" does not also load SQLite/JSON
+# fallback advice, which contradicts it on types, constraints and DDL.
+_SQL_SERVER_RE = re.compile(
+    r"\b(postgres(?:ql)?|psql|psycopg|mysql|mariadb|mssql|sql server|cockroachdb|"
+    r"supabase|neon|rds|database_url|connection string)\b",
+    re.I,
+)
 _TEST_RE = re.compile(r"\b(test|tests|testing|vitest|pytest|playwright|acceptance|verify|build)\b", re.I)
 _MCP_RE = re.compile(r"\b(mcp|model context protocol|external tool|external server)\b", re.I)
 
@@ -43,17 +51,25 @@ def select_skills_for_task(
 
     catalog = catalog or discover_skills(workspace)
     text = _selection_text(request, stack, required_tools, target_files, workspace)
+    # ReAct describes the agent control loop, not the React web framework.
+    framework_text = re.sub(
+        r"\breact(?:[-_\s]+tool)?[-_\s]+loop\b", "", text, flags=re.I
+    )
     candidates: dict[str, tuple[float, list[str]]] = {}
 
     if intent in _CODING_INTENTS or _looks_like_coding_request(text):
         _add(candidates, "developer", 100.0, "default for coding work")
     if _PRD_RE.search(text):
         _add(candidates, "prd-planner", 85.0, "PRD or acceptance evidence requested")
-    if _REACT_RE.search(text) or _workspace_has_any(workspace, ("package.json", "vite.config.ts")):
+    if _REACT_RE.search(framework_text) or _workspace_has_any(
+        workspace, ("package.json", "vite.config.ts")
+    ):
         _add(candidates, "react-vite", 75.0, "React/Vite/frontend evidence detected")
     if _UI_RE.search(text):
         _add(candidates, "ui-designer", 55.0, "UI or responsive design work requested")
-    if _SQLITE_RE.search(text):
+    if _SQL_SERVER_RE.search(text):
+        _add(candidates, "sql-databases", 70.0, "server SQL engine named in the request")
+    elif _SQLITE_RE.search(text):
         _add(candidates, "sqlite-persistence", 55.0, "persistence, seed, or database work requested")
     if _TEST_RE.search(text):
         _add(candidates, "testing", 45.0, "test or acceptance verification requested")
@@ -63,7 +79,8 @@ def select_skills_for_task(
     for name, skill in catalog.skills.items():
         if name in candidates:
             continue
-        matched = _metadata_match(skill, text)
+        match_text = framework_text if name == "react-vite" else text
+        matched = _metadata_match(skill, match_text)
         if matched:
             is_reference = str(skill.metadata.get("kind") or "").lower() == "reference"
             score = 92.0 if is_reference else 30.0
@@ -168,7 +185,18 @@ def _resolve_conflicts_and_budget(
         if skill is None:
             rejected.append({"name": name, "reason": "not installed"})
             continue
-        conflict = next((item.skill.name for item in selected if item.skill.name in skill.conflicts), "")
+        # Symmetric: a conflict declared by either side excludes the pair.
+        # Checking only the incoming skill's list let `sqlite-persistence`
+        # in alongside `sql-databases`, which had declared the conflict but
+        # was selected first - so both sets of contradictory advice shipped.
+        conflict = next(
+            (
+                item.skill.name
+                for item in selected
+                if item.skill.name in skill.conflicts or name in item.skill.conflicts
+            ),
+            "",
+        )
         if conflict:
             rejected.append({"name": name, "reason": f"conflicts with {conflict}"})
             continue
@@ -187,7 +215,7 @@ def _resolve_conflicts_and_budget(
 def _metadata_match(skill: SkillPackage, text: str) -> str:
     for item in (*skill.triggers, *skill.applies_to, *skill.tags):
         needle = item.strip().lower()
-        if needle and needle in text:
+        if needle and re.search(rf"(?<![\w-]){re.escape(needle)}(?![\w-])", text):
             return item
     return ""
 

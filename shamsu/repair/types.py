@@ -32,6 +32,7 @@ class DebugContext:
     primary_error: RepairError
     verify_command: str
     inspected: list[InspectedSnippet] = field(default_factory=list)
+    editable_files: list[str] = field(default_factory=list)
     previous_attempts: list[PreviousAttempt] = field(default_factory=list)
     import_suggestion: str = ""
 

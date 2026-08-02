@@ -53,6 +53,7 @@ def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
 
         if _is_entity_container_heading(normalized):
             in_entity_container = True
+            entities.extend(_parse_compact_entity_blocks(lines))
             for line in lines:
                 entity = _parse_entity_line(line)
                 if entity is not None:
@@ -216,6 +217,72 @@ def _parse_entity_section(entity_name: str, lines: list[str]) -> EntitySpec | No
     return EntitySpec(name=entity_name, fields=fields, relationships=relationships)
 
 
+def _parse_compact_entity_blocks(lines: list[str]) -> list[EntitySpec]:
+    """Parse OCR/plain-text schemas where entity names and CSV fields alternate."""
+    entities: list[EntitySpec] = []
+    index = 0
+    while index < len(lines):
+        cleaned = lines[index].strip().lstrip("-*+• ").strip()
+        merged = re.match(
+            r"^(?P<name>[A-Z][A-Za-z0-9]{1,30})\s+(?P<fields>id\s*,.+)$",
+            cleaned,
+        )
+        if merged:
+            entity = _entity_from_compact_fields(merged.group("name"), merged.group("fields"))
+            if entity:
+                entities.append(entity)
+            index += 1
+            continue
+        if not re.fullmatch(r"[A-Z][A-Za-z0-9 ]{1,30}", cleaned):
+            index += 1
+            continue
+        following = lines[index + 1].strip().lstrip("-*+• ").strip() if index + 1 < len(lines) else ""
+        if "," not in following:
+            index += 1
+            continue
+        entity = _entity_from_compact_fields(cleaned, following)
+        if entity:
+            entities.append(entity)
+        index += 2
+    return entities
+
+
+def _entity_from_compact_fields(name: str, field_line: str) -> EntitySpec | None:
+    fields: list[EntityFieldSpec] = []
+    relationships: list[str] = []
+    for fragment in re.split(r",\s*(?![^()]*\))", field_line):
+        match = re.match(
+            r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\((?P<details>[^)]*)\))?",
+            fragment.strip(),
+        )
+        if not match:
+            continue
+        field_name = match.group("name")
+        if field_name.lower() == "id":
+            continue
+        details = (match.group("details") or "").strip()
+        details = re.sub(
+            r"\bFK\s*(?:->|→)\s*([A-Za-z][A-Za-z0-9_]*)",
+            r"references \1",
+            details,
+            flags=re.IGNORECASE,
+        )
+        if field_name.lower().endswith("_id") and re.fullmatch(
+            r"FK(?:\s*,.*)?", details, re.IGNORECASE
+        ):
+            details = f"references {field_name[:-3]}"
+        raw = f"{field_name}: {details}" if details else field_name
+        field = _parse_block_field(raw)
+        if field is None:
+            continue
+        fields.append(field)
+        if field.django_type == "ForeignKey":
+            relationships.append(f"belongs_to:{field.kwargs.get('to', '')}")
+    if not fields:
+        return None
+    return EntitySpec(_to_pascal_case(name), fields, relationships)
+
+
 def _parse_block_field(raw_field: str) -> EntityFieldSpec | None:
     """Parse common PRD field bullets, e.g.
 
@@ -306,6 +373,8 @@ def _parse_values_choices(raw_type: str) -> list[str]:
 
 
 def _block_base_type(lowered: str, name: str) -> str:
+    if name.endswith("_at") or name in {"timestamp", "due_date"}:
+        return "datetime"
     if name == "email" or "valid email" in lowered:
         return "email"
     if "datetime" in lowered or "date time" in lowered:

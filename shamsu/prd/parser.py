@@ -23,9 +23,26 @@ PLAIN_HEADING_RE = re.compile(
 NUMBERED_HEADING_RE = re.compile(
     r"^(?P<number>\d+(?:\.\d+)*)\.?\s+(?P<title>[A-Z][^.!?]{1,100})$"
 )
+PRD_TITLE_RE = re.compile(
+    r"^(?:prd|product requirements?(?: document)?)\s*[:\-]\s*(?P<title>.+)$",
+    re.IGNORECASE,
+)
 LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 
 TOP_LEVEL_NUMBERED_HEADINGS = {
+    "overview",
+    "goals",
+    "non goals",
+    "users and roles",
+    "tech stack",
+    "data model",
+    "core features and user flows",
+    "api surface",
+    "permissions rules",
+    "permissions and authorization",
+    "frontend routes and screens",
+    "seed data",
+    "deliverables",
     "product overview",
     "product goals",
     "target users",
@@ -109,6 +126,11 @@ def parse_prd_text(
         line = raw_line.strip()
         page = line_pages[index] if line_pages and index < len(line_pages) else 0
         if not line:
+            continue
+
+        prefixed_title = PRD_TITLE_RE.match(line)
+        if prefixed_title and title == fallback_title and not sections:
+            title = prefixed_title.group("title").strip()
             continue
 
         heading = HEADING_RE.match(line)
@@ -210,8 +232,13 @@ def _match_numbered_heading(
         return None
     if "." in match.group("number"):
         return match
-    title = match.group("title").strip().rstrip(":").lower()
-    if title in TOP_LEVEL_NUMBERED_HEADINGS and int(match.group("number")) > last_top_level_number:
+    raw_title = match.group("title").lower().replace("&", " and ")
+    title = re.sub(r"[^a-z0-9]+", " ", raw_title).strip()
+    known_heading = any(
+        title == candidate or title.startswith(f"{candidate} ")
+        for candidate in TOP_LEVEL_NUMBERED_HEADINGS
+    )
+    if known_heading and int(match.group("number")) > last_top_level_number:
         return match
     return None
 

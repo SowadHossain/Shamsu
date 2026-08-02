@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,9 @@ COMPLETED_STATUSES = {"implemented", "verified"}
 MAX_MODEL_PREFLIGHT_LIST_ITEMS = 24
 
 _BASE_ALLOWED_TOOLS = {
-    "ask_user",
+    "append_file",
+    "file_info",
+    "find_file",
     "grep_files",
     "list_files",
     "read_file",
@@ -73,10 +76,11 @@ def initialize_prd_execution(
     contract: PRDContract,
     *,
     prd_path: str = "",
+    execution_key: str = "",
 ) -> tuple[Path, dict[str, Any]]:
     """Create or load the durable execution state for a PRD contract."""
     ledger = compile_requirement_ledger(contract)
-    root = prd_execution_root(workspace, ledger.contract_hash)
+    root = prd_execution_root(workspace, ledger.contract_hash, execution_key=execution_key)
     root.mkdir(parents=True, exist_ok=True)
     save_prd_execution_artifacts(contract, root)
     _write_preflights(root, ledger)
@@ -87,13 +91,21 @@ def initialize_prd_execution(
         state = _merge_state(existing, ledger, user_request, prd_path)
     else:
         state = _new_state(ledger, user_request, prd_path)
+    state["execution_key"] = execution_key
     _write_json(path, state)
     return root, state
 
 
-def prd_execution_root(workspace: Path, contract_hash: str) -> Path:
+def prd_execution_root(
+    workspace: Path,
+    contract_hash: str,
+    *,
+    execution_key: str = "",
+) -> Path:
     safe_hash = "".join(ch for ch in contract_hash if ch in "0123456789abcdef")[:16]
     safe_hash = safe_hash or "unknown-contract"
+    if execution_key:
+        safe_hash = f"{safe_hash}-{sha256(execution_key.encode('utf-8')).hexdigest()[:12]}"
     return Sandbox(workspace).validate(Path(".shamsu") / EXECUTIONS_DIRNAME / safe_hash)
 
 
@@ -500,6 +512,7 @@ def render_preflight_context(preflight: dict[str, Any]) -> str:
     lines = [
         "## Milestone Preflight",
         f"Milestone: {preflight.get('milestone_id', '')} - {preflight.get('title', '')}",
+        f"Project root: {preflight.get('project_root') or '.'}",
         f"Preflight source: {preflight.get('preflight_source') or 'deterministic'}",
         "Requirement IDs: " + ", ".join(preflight.get("requirement_ids") or []),
         "Active skills: " + ", ".join(preflight.get("active_skills") or []),

@@ -227,6 +227,12 @@ async def test_winerror_32_stops_chat_loop(tmp_path):
         client=fake_client,
         tools=fake_tools,
         max_tool_rounds=10,
+        # Hermetic: without these the planner makes a REAL model call, and a
+        # thinking model that (reasonably) asks "what kind of game?" for this
+        # vague prompt ends the turn on a clarification before any write is
+        # attempted - so the WinError path under test never runs.
+        use_planner=False,
+        use_long_term_memory=False,
     )
     result = await loop.run("write game.ts")
     assert result.stopped
@@ -301,6 +307,17 @@ def test_prd_parse_happens_before_template_build(tmp_path, monkeypatch):
 
     monkeypatch.setattr(repl_mod.FullDjangoPipeline, "run", fake_pipeline_run)
 
+    # Templates are off by default, so this request falls through to the
+    # freeform milestone build, whose agent turns hit a REAL Ollama. Stub them:
+    # the assertion below is only about parse ordering, and leaving them live
+    # made this test take minutes and stall the suite.
+    async def fake_agent_chat(*_args, **_kwargs):
+        from shamsu.agents.chat_loop import AgentLoopResult
+
+        return AgentLoopResult(final="stopped for test", stopped=True)
+
+    monkeypatch.setattr(repl_mod, "_run_agent_chat", fake_agent_chat)
+
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
     asyncio.run(repl_mod._handle_prd_build_request(
@@ -311,11 +328,9 @@ def test_prd_parse_happens_before_template_build(tmp_path, monkeypatch):
     assert parse_calls[0] == str(prd)
 
 
-def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, monkeypatch):
-    """A complex Node+CLI PRD must produce files via FullDjangoPipeline's
-    freeform path, not a chat answer that merely describes the work."""
+def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
+    """A bespoke full-stack PRD must use scoped, checkpointed ReAct turns."""
     from rich.console import Console
-    from shamsu.agents.full_pipeline import FullPipelineResult
     from shamsu.cli import repl as repl_mod
 
     prd = tmp_path / "prd.md"
@@ -335,23 +350,38 @@ def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, mo
         encoding="utf-8",
     )
 
-    calls: dict[str, object] = {}
+    calls: list[tuple[str, dict[str, object]]] = []
 
-    async def fake_pipeline_run(self, prd_path, target_dir=None):
-        calls["pipeline"] = True
-        calls["target_dir"] = target_dir
-        return FullPipelineResult(
-            prd_path=Path(prd_path),
-            target_dir=tmp_path / str(target_dir),
-            written_files=["package.json"],
-            success=True,
+    async def fail_pipeline_run(self, prd_path, target_dir=None):
+        raise AssertionError("interactive PRD builds must not use bulk generation")
+
+    async def fake_react(prompt, *_args, **kwargs):
+        calls.append((prompt, kwargs))
+        return SimpleNamespace(
+            changed_files=["atlasops-freeform/src/current.ts"],
+            stopped=False,
+            awaiting_user=False,
+            final="done",
         )
 
-    async def fail_plain_chat(*_args, **_kwargs):
-        raise AssertionError("freeform PRD build fell through to plain chat")
+    async def fake_verify(*_args, **_kwargs):
+        return "verified", {
+            "status": "verified",
+            "verified": True,
+            "unverifiable": False,
+            "exit_code": 0,
+            "command": "focused-check",
+            "files": ["atlasops-freeform/src/current.ts"],
+            "summary": "Verification passed.",
+        }
 
-    monkeypatch.setattr(repl_mod.FullDjangoPipeline, "run", fake_pipeline_run)
-    monkeypatch.setattr(repl_mod, "_run_agent_chat", fail_plain_chat)
+    async def fake_final_verify(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(repl_mod.FullDjangoPipeline, "run", fail_pipeline_run)
+    monkeypatch.setattr(repl_mod, "_run_agent_chat", fake_react)
+    monkeypatch.setattr(repl_mod, "_verify_prd_milestone", fake_verify)
+    monkeypatch.setattr(repl_mod, "_verify_completed_plan", fake_final_verify)
 
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
@@ -363,8 +393,16 @@ def test_freeform_prd_build_uses_structured_pipeline_not_plain_chat(tmp_path, mo
         )
     )
 
-    assert calls["pipeline"] is True
-    assert calls["target_dir"] == "atlasops-freeform"
+    assert calls
+    assert all(call[1]["allowed_write_paths"] == ("atlasops-freeform",) for call in calls)
+    assert all(
+        call[1]["user_request"]
+        == "Implement the current coding milestone inside project root atlasops-freeform."
+        for call in calls
+    )
+    assert all("Project root: atlasops-freeform" in call[0] for call in calls)
+    assert any("## Active SHAMSU Skills" in call[0] for call in calls)
+    assert any("Use this skill for coding" in call[0] for call in calls)
 
 
 def test_freeform_prd_build_validates_acceptance_and_downgrades(tmp_path, monkeypatch):

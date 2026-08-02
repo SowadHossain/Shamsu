@@ -160,6 +160,20 @@ def _assess_django(contract: PRDContract, archetype: Archetype) -> TemplateSuita
             must_change=["derive architecture, schema, UI, CLI, and tests from the PRD"],
             fit_score=0.0,
         )
+    spa_stack = requested_stack & {"react", "vite", "typescript"}
+    if spa_stack:
+        return TemplateSuitability(
+            strategy=GenerationStrategy.FREEFORM,
+            candidate="",
+            reason=(
+                f"{label} requires a separate {', '.join(sorted(spa_stack))} frontend; "
+                "build through the project harness instead of the server-rendered Django writer."
+            ),
+            matches=[f"{label} backend", "entity-backed product"],
+            conflicts=["The deterministic Django writer does not create the required SPA frontend."],
+            must_change=["derive backend, frontend, database, integration, and tests from the PRD"],
+            fit_score=0.0,
+        )
     if _contract_requires_cli(contract):
         return TemplateSuitability(
             strategy=GenerationStrategy.FREEFORM,

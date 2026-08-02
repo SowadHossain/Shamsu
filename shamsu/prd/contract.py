@@ -5,6 +5,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from shamsu.prd import headings as _headings
 from shamsu.prd.extractor import extract_entities
 from shamsu.types import ParsedPRD
 
@@ -156,12 +157,30 @@ class PRDContract:
         return "\n".join(lines)
 
 
-def extract_contract(parsed: ParsedPRD) -> PRDContract:
+def extract_contract(
+    parsed: ParsedPRD,
+    *,
+    resolve_headings: bool = True,
+    request_text: str = "",
+    extra_entities: list[Any] | None = None,
+) -> PRDContract:
+    # Section matching below is by heading name, so a PRD that words its
+    # headings differently is invisible to every lookup. Fold the ones that
+    # merely reword a known section onto the canonical name first. Idempotent:
+    # headings that already match are left alone, so callers that resolved
+    # headings themselves (including via the model) lose nothing.
+    if resolve_headings:
+        parsed, _ = _headings.resolve_parsed_headings(parsed)
     raw = parsed.raw_text or ""
     lowered = raw.lower()
+    # The user's own instruction is part of the specification. A PRD that names
+    # no framework used to fall through to a Node scaffold and run npm even
+    # when the request said "build this as a Django project" - the request text
+    # never reached stack detection at all.
+    stack_text = f"{lowered}\n{(request_text or '').lower()}" if request_text else lowered
     game_type = _detect_game_type(lowered)
     project_kind = _detect_kind(lowered, game_type)
-    stack_hint = _detect_stack(lowered)
+    stack_hint = _detect_stack(stack_text)
     summary_lines = _section_lines(parsed, "product summary", exact=True)
     if not summary_lines:
         summary_lines = _section_lines(parsed, "overview", exact=True)
@@ -170,7 +189,7 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
     mechanics = _section_lines(parsed, "mechanics", "gameplay", "functional requirements", "core workflows")
     controls = _section_lines(parsed, "controls", "input") or _scan_controls(lowered)
     screens = _section_lines(parsed, "screens", "frontend pages", "pages", "browser ui requirements")
-    acceptance = _section_lines(parsed, "acceptance criteria", "acceptance", exact=True)
+    acceptance = _section_lines(parsed, "acceptance criteria", "acceptance")
     constraints = _section_lines(
         parsed, "constraints", "non-functional requirements", "performance requirements"
     )
@@ -179,6 +198,10 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
         "features",
         "functional requirements",
         "core workflows",
+        "core features and user flows",
+        "admin flows",
+        "teacher flows",
+        "student flows",
         "browser ui requirements",
         "script requirements",
         "demo data",
@@ -188,13 +211,26 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
 
     roles = _role_names(parsed)
     authentication = _section_lines(
-        parsed, "user registration", "user login", "logout", "authentication and authorization",
+        parsed, "authentication", "user registration", "user login", "logout", "authentication and authorization",
         "protected routes", "authentication security", "password security",
     )
     authorization = _section_lines(
-        parsed, "ownership validation", "unauthorized requests", "authorization security"
+        parsed,
+        "ownership validation",
+        "unauthorized requests",
+        "authorization security",
+        "permissions rules",
+        "permissions and authorization",
     )
-    journeys = _section_lines(parsed, "main user journey", "new user journey", "returning user journey")
+    journeys = _section_lines(
+        parsed,
+        "main user journey",
+        "new user journey",
+        "returning user journey",
+        "admin flows",
+        "teacher flows",
+        "student flows",
+    )
     persistence = _section_lines(
         parsed, "database requirements", "database schema", "sqlite-specific requirements",
         "database characteristics", "database file", "foreign keys", "transactions", "backups",
@@ -207,20 +243,41 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
     nonfunctional = _section_lines(
         parsed, "accessibility requirements", "responsive design requirements", "performance requirements",
         "audit and logging requirements", "date and time handling",
+        # A section named exactly this fed only `constraints`, so a PRD with a
+        # "Non-Functional Requirements" heading reported none of them.
+        "non functional requirements",
     )
     tests = _section_lines(parsed, "testing requirements", "test requirements", "authentication tests",
                            "authorization tests", "task tests", "category tests", "profile tests",
                            "database tests")
-    out_of_scope = _section_lines(parsed, "out of scope for initial release", exact=True)
-    entities = [asdict(entity) for entity in extract_entities(parsed)]
+    if not tests:
+        tests = [line for line in acceptance if re.search(r"\btests?\b|\bcoverage\b", line, re.I)]
+    out_of_scope = _section_lines(
+        parsed,
+        "out of scope for initial release",
+        "out of scope",
+        "non goals",
+    )
+    parsed_entities = extract_entities(parsed)
+    # `extra_entities` carries entities the document named but never defined,
+    # recovered separately. Parsed definitions always win on a name clash.
+    if extra_entities:
+        known = {entity.name.lower() for entity in parsed_entities}
+        parsed_entities = [
+            *parsed_entities,
+            *[item for item in extra_entities if item.name.lower() not in known],
+        ]
+    entities = [asdict(entity) for entity in parsed_entities]
     endpoints = _extract_api_endpoints(parsed)
 
     architecture: list[str] = []
     for phrase in ("full-stack", "full stack", "backend api", "sqlite", "responsive user interface"):
         if phrase in lowered:
             architecture.append(phrase)
-    required_stack = [name for name, pattern in _STACK_PATTERNS if re.search(pattern, lowered)]
-    if re.search(r"\bsqlite\b", lowered):
+    required_stack = [
+        name for name, pattern in _STACK_PATTERNS if re.search(pattern, stack_text)
+    ]
+    if re.search(r"\bsqlite\b", stack_text):
         required_stack.append("sqlite")
     assumptions: list[str] = []
     if project_kind == "web_app" and architecture and not stack_hint:
@@ -239,7 +296,7 @@ def extract_contract(parsed: ParsedPRD) -> PRDContract:
         mechanics=_dedupe(_clean_items(mechanics))[:40],
         controls=_dedupe(_clean_items(controls))[:20],
         screens=_dedupe(_clean_items(screens))[:30],
-        acceptance_criteria=_dedupe(_clean_items(acceptance))[:60],
+        acceptance_criteria=_dedupe(_clean_acceptance_items(acceptance))[:60],
         constraints=_dedupe(_clean_items(constraints))[:30],
         features=_dedupe(_clean_items(feature_lines or mechanics))[:40],
         stack_hint=stack_hint,
@@ -291,15 +348,23 @@ def _section_lines(
 
 
 def _normalize_heading(heading: str) -> str:
-    return _HEADING_NUMBER_RE.sub("", heading.strip()).rstrip(":").lower()
+    value = _HEADING_NUMBER_RE.sub("", heading.strip()).rstrip(":").lower()
+    value = value.replace("&", " and ").replace("-", " ")
+    return " ".join(re.sub(r"[^a-z0-9()]+", " ", value).split())
 
 
 def _role_names(parsed: ParsedPRD) -> list[str]:
     roles: list[str] = []
-    for heading in parsed.sections:
+    for heading, lines in parsed.sections.items():
         normalized = _normalize_heading(heading)
         if normalized in {"regular user", "administrator", "admin", "user"}:
             roles.append(normalized.title())
+        if normalized not in {"users and roles", "user roles", "roles"}:
+            continue
+        for line in lines:
+            candidate = line.strip().lstrip("-*+• ").split(":", 1)[0].strip()
+            if re.fullmatch(r"[A-Za-z][A-Za-z /-]{1,30}", candidate) and len(candidate.split()) <= 3:
+                roles.append(candidate.title())
     return _dedupe(roles)
 
 
@@ -308,8 +373,13 @@ def _extract_api_endpoints(parsed: ParsedPRD) -> list[dict[str, Any]]:
     seen: set[tuple[str, str]] = set()
     for heading, lines in parsed.sections.items():
         context = " ".join([heading, *lines]).lower()
-        for line in lines:
-            match = _ENDPOINT_RE.search(line)
+        for index, line in enumerate(lines):
+            candidate = line
+            if re.fullmatch(r"GET|POST|PUT|PATCH|DELETE", line.strip(), re.IGNORECASE):
+                following = lines[index + 1].strip() if index + 1 < len(lines) else ""
+                if following.startswith("/"):
+                    candidate = f"{line.strip()} {following}"
+            match = _ENDPOINT_RE.search(candidate)
             if not match:
                 continue
             method = match.group(1).upper()
@@ -364,6 +434,12 @@ def _detect_kind(lowered: str, game_type: str) -> str:
         return "api"
     if re.search(r"\bcli\b|command[- ]line|terminal tool", lowered):
         return "cli"
+    if _any(lowered, ("python package", "npm package", "software library", "sdk", "reusable library")):
+        return "library"
+    if _any(lowered, ("data pipeline", "etl", "data analysis", "notebook", "dataset")):
+        return "data_project"
+    if _any(lowered, ("frontend only", "front-end only", "static site", "static website")):
+        return "frontend"
     if _any(lowered, ("microservice", "worker", "daemon", "background service", "cron")):
         return "service"
     return "unknown"
@@ -387,6 +463,28 @@ def _clean_items(items: list[str]) -> list[str]:
         if value and value.lower() not in {"test:", "fields:", "constraints:", "indexes:"}:
             cleaned.append(value)
     return cleaned
+
+
+def _clean_acceptance_items(items: list[str]) -> list[str]:
+    joined: list[str] = []
+    for raw in _clean_items(items):
+        if (
+            joined
+            and not re.search(r"[.!?;:`]$", joined[-1])
+            and raw[:1].islower()
+        ):
+            joined[-1] = f"{joined[-1]} {raw}"
+        else:
+            joined.append(raw)
+    return [item for item in joined if not _looks_like_ocr_garbage(item)]
+
+
+def _looks_like_ocr_garbage(text: str) -> bool:
+    words = re.findall(r"[A-Za-z]+", text)
+    if len(words) < 8:
+        return False
+    short = sum(len(word) <= 2 for word in words)
+    return short / len(words) >= 0.5
 
 
 def _any(text: str, needles: tuple[str, ...]) -> bool:

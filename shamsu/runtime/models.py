@@ -5,7 +5,7 @@ Three hardware tiers, same role contract (router/qa/planner/... -> a
 "thinking" model; coder/bugfix/tests/... -> a "coding" model):
 
   light   - 8GB RAM, no GPU. Tiny models, CPU-friendly.
-  default - the 8GB cookbook (deepseek-r1:7b + qwen2.5-coder:7b-instruct).
+  default - the 8GB cookbook (qwen3:8b + qwen2.5-coder:7b-instruct).
   heavy   - 16GB+ RAM machines. Coder is allowed to 14B since there is no
             dedicated ~12B code model; the thinking anchor stays at 12B.
 
@@ -90,13 +90,14 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
     ),
     ModelTier.DEFAULT: (
         ModelSpec(
-            "deepseek-r1:7b",
+            "qwen3:8b",
             _THINKING_ROLES,
             max_vram_gb=8.0,
             notes="Thinking/text anchor for routing, planning, review, docs, and chat. "
-            "Ollama tag for DeepSeek-R1-Distill-Qwen-7B; the coder anchor stays "
-            "a qwen2.5-coder.",
-            supports_native_tools=False,
+            "Replaces deepseek-r1:7b: Qwen3 does native tool calling, so planner and "
+            "router calls no longer depend on the output salvager, and it keeps a "
+            "separate thinking channel. The coder anchor stays a qwen2.5-coder.",
+            supports_native_tools=True,
             is_reasoning=True,
         ),
         ModelSpec(
@@ -140,9 +141,10 @@ MODEL_SPECS: tuple[ModelSpec, ...] = TIER_MODEL_SPECS[ModelTier.DEFAULT]
 # role anchor for any tier. Older default thinking anchors live here so they
 # stay first-class known models for anyone who kept them installed.
 _ALLOWED_EXTRA_SPECS: tuple[ModelSpec, ...] = (
-    ModelSpec("qwen3:8b", roles=(), required=False, max_vram_gb=8.0,
-              notes="Former default thinking anchor; kept allowed for existing installs.",
-              supports_native_tools=True, is_reasoning=True),
+    ModelSpec("deepseek-r1:7b", roles=(), required=False, max_vram_gb=8.0,
+              notes="Former default thinking anchor; kept allowed for existing installs. "
+                    "No native tool calling - every call relied on the output salvager.",
+              supports_native_tools=False, is_reasoning=True),
     ModelSpec("gemma3:4b", roles=(), required=False, max_vram_gb=4.0,
               notes="Former default thinking anchor; kept allowed for existing installs.",
               supports_native_tools=False),

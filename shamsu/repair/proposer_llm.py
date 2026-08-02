@@ -50,23 +50,22 @@ class LLMProposer:
             # loop and never a fabricated success.
             return None
         plan = _parse_plan(raw or "")
-        if plan is None:
-            return None
-        if not plan.has_edit:
-            plan = self._retry_no_edit_plan(user, raw or "")
+        if plan is None or not plan.has_edit:
+            plan = self._retry_invalid_plan(user, raw or "")
             if plan is None or not plan.has_edit:
                 return None
         return plan
 
-    def _retry_no_edit_plan(self, user: str, raw: str) -> RepairPlan | None:
+    def _retry_invalid_plan(self, user: str, raw: str) -> RepairPlan | None:
         retry_user = (
             f"{user}\n\n"
             "## Previous invalid repair JSON\n"
             f"{_preview(raw)}\n\n"
-            "That JSON diagnosed the failure but did not include an edit. Return corrected "
-            "JSON only. You MUST include either non-empty search+replace or non-empty "
-            "full_content for one shown file. If no edit is possible from the shown content, "
-            "return target_file as an empty string."
+            "That response was malformed, omitted required fields, or diagnosed the failure "
+            "without an edit. Return corrected JSON only with root_cause, target_file, search, "
+            "replace, and full_content keys. You MUST include either non-empty search+replace "
+            "or non-empty full_content for one shown editable file. Set the unused edit mode "
+            "to an empty string."
         )
         try:
             retry_raw = self._generate(self._system, retry_user, self._schema)

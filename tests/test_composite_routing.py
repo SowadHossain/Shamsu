@@ -108,6 +108,26 @@ def test_named_file_creation_keeps_followup_content_directives_in_one_turn(tmp_p
     assert "cite the source page" in plan.steps[0].instruction
 
 
+def test_exactly_one_file_keeps_pronoun_based_content_directives_atomic(tmp_path: Path):
+    prompt = (
+        "Create exactly one file: `src/schema.py`. "
+        "Use the write tool immediately. "
+        "Implement the complete domain model in this one file with validation and timestamps."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert len(plan.steps) == 1
+    assert plan.primary_route == "file.write"
+    assert "complete domain model" in plan.steps[0].instruction
+
+
+def test_single_file_creation_still_splits_required_verification(tmp_path: Path):
+    plan = repl._operation_plan("Create app.py, then run it", tmp_path)
+
+    assert [step.kind for step in plan.steps] == ["mutation", "verify"]
+
+
 def test_special_single_run_routes_are_not_generalized(tmp_path: Path):
     (tmp_path / "index.html").write_text("<canvas></canvas>", encoding="utf-8")
 
@@ -302,6 +322,46 @@ def test_clarification_resume_recovers_original_composite_request(tmp_path: Path
     assert recovered.startswith(original)
     assert "app.py" in recovered
     assert [step.kind for step in rebuilt.steps] == ["mutation", "verify", "git_inspect"]
+
+
+def test_clarification_resume_recovers_original_from_per_step_contract(tmp_path: Path):
+    """A pending ask_user raised DURING a composite step stores the per-step
+    contract, not the whole-plan wrapper. Its answer must still unwrap to the
+    original request - the unrecognized wrapper used to re-route the internal
+    contract (with its "Do not modify any files" line) as a fresh prompt,
+    stripping the user's mutation intent into QA (observed live 2026-08-01)."""
+    original = "edit app.py, run it, then show the diff"
+    plan = repl._operation_plan(original, tmp_path)
+    step_prompt = repl._composite_step_prompt(plan, plan.steps[0], [], "")
+    resumed = step_prompt + '\n\n(Answering the earlier question "Which value?": 42)'
+
+    recovered = recover_original_prompt(resumed)
+
+    assert recovered.startswith(original)
+    assert '(Answering the earlier question "Which value?": 42)' in recovered
+    assert "one step at a time" not in recovered
+
+
+def test_targeted_continuation_is_not_shredded_into_composite_steps(tmp_path: Path):
+    plan = repl._operation_plan(
+        "Continue the milestone: fix BASE_DIR in backend/settings.py, then verify the app",
+        tmp_path,
+    )
+
+    assert not plan.is_composite
+    assert len(plan.steps) == 1
+    assert plan.steps[0].kind == "mutation"
+    assert plan.steps[0].route != "qa"
+
+
+def test_multi_artifact_continuation_still_gets_per_step_evidence(tmp_path: Path):
+    plan = repl._operation_plan(
+        "Continue the build: create models.py, create views.py, create urls.py, "
+        "then commit the result",
+        tmp_path,
+    )
+
+    assert plan.is_composite
 
 
 @pytest.mark.asyncio
@@ -516,6 +576,58 @@ def test_descriptive_context_sentence_is_not_its_own_step(tmp_path: Path):
 
     assert plan.is_composite is False
     assert "calc.py" in plan.steps[0].instruction
+
+
+def test_quoted_single_file_repair_keeps_read_edit_and_verify_atomic(tmp_path: Path):
+    prompt = (
+        "Fix the missing table in `database/schema.sql` so the existing INSERT in "
+        "database/seed.sql is valid. Read both files first. Add the declaration, preserve "
+        "existing tables, and edit only the real schema file. Then run verification and "
+        "report its result."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert len(plan.steps) == 1
+    assert plan.primary_route == "file.write"
+    assert "run verification" in plan.steps[0].instruction
+
+
+def test_delete_only_duplicate_preserves_exact_paths_in_one_react_turn(tmp_path: Path):
+    (tmp_path / "canvas-lite-react-loop-build-v4-2026-08-01").mkdir()
+    prompt = (
+        "In the existing project folder 'canvas-lite-react-loop-build-v4-2026-08-01', "
+        "fix one file-topology bug. The accidental file 'test_canvas.py' at the project root is a duplicate. "
+        "The canonical file is 'backend/core/tests/test_canvas.py'. Read both paths, "
+        "delete only the accidental duplicate, keep the canonical file, and verify it is gone. "
+        "Do not change application behavior or any other file."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert len(plan.steps) == 1
+    assert plan.primary_route == "file.write"
+    assert "canvas-lite-react-loop-build-v4-2026-08-01" in plan.steps[0].instruction
+    assert "backend/core/tests/test_canvas.py" in plan.steps[0].instruction
+
+    handoff, direct = repl._direct_file_write_handoff(prompt, tmp_path)
+    assert direct.mode == "code_edit"
+    assert direct.target_files == [
+        "canvas-lite-react-loop-build-v4-2026-08-01/test_canvas.py"
+    ]
+    assert "delete_file" in direct.required_tools
+    assert "File Deletion Contract" in handoff
+
+
+def test_negated_change_constraint_does_not_become_mutation_step(tmp_path: Path):
+    plan = repl._operation_plan(
+        "Verify the duplicate is gone. Do not change application behavior or any other file.",
+        tmp_path,
+    )
+
+    assert plan.steps[0].kind == "verify"
 
 
 def test_genuine_multi_action_prompt_still_splits(tmp_path: Path):
@@ -785,6 +897,35 @@ async def test_second_mutation_step_is_not_credited_for_the_first(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_failed_step_blocks_its_dependents(tmp_path: Path, monkeypatch):
+    """A FAILED step must stop the chain: in the 2026-08-01 dogfood, dependents
+    of a failed step still ran blind against the broken state."""
+    ledger = start_run(tmp_path, "edit app.py, run it, then show the diff")
+    set_current_run(ledger)
+
+    calls = {"n": 0}
+
+    async def _fake_agent(*args, **kwargs):
+        calls["n"] += 1
+        return AgentLoopResult(final="Could not apply the edit.", stopped=True)
+
+    monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent)
+    try:
+        plan = repl._operation_plan("edit app.py, run it, then show the diff", tmp_path)
+        await repl._run_composite_request(plan, tmp_path, Console(record=True))
+    finally:
+        clear_current_run()
+
+    assert calls["n"] == 1, "dependents of a failed step must not run"
+    events = store.load_events(tmp_path, ledger.run_id)
+    finished = [e for e in events if e["type"] == "operation_step_finished"]
+    assert [e["status"] for e in finished] == ["failed", "not_run", "not_run"]
+    assert any(
+        "dependency_failed" in str(e.get("evidence", "")) for e in finished[1:]
+    )
+
+
+@pytest.mark.asyncio
 async def test_composite_stops_after_a_step_asks_the_user(tmp_path: Path, monkeypatch):
     """A step awaiting input must not let later steps run blind on a guess."""
     ledger = start_run(tmp_path, "edit app.py, then run it")
@@ -807,3 +948,117 @@ async def test_composite_stops_after_a_step_asks_the_user(tmp_path: Path, monkey
     events = store.load_events(tmp_path, ledger.run_id)
     finished = [e for e in events if e["type"] == "operation_step_finished"]
     assert finished[-1]["status"] == "not_run"
+
+
+@pytest.mark.asyncio
+async def test_plan_route_keeps_the_users_own_request(tmp_path: Path, monkeypatch):
+    """Live 2026-08-02: the plan route replaced the user's prompt with a canned
+    "Read X and produce a plan", so a detailed request for an ordered Django
+    feature breakdown reached the model as nothing but a filename - and came
+    back as a generic "convert the PDF with pdftotext" pipeline."""
+    (tmp_path / "canvas lite.pdf").write_bytes(b"%PDF-1.4 fixture")
+    captured: dict[str, object] = {}
+
+    class _Orchestrator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def run(self, prompt):
+            return SimpleNamespace(handled=False, effective_input=prompt, context="", action="")
+
+    async def _fake_agent(prompt, *args, **kwargs):
+        captured["prompt"] = prompt
+        return AgentLoopResult(final="plan text")
+
+    monkeypatch.setattr(repl, "AgentOrchestrator", _Orchestrator)
+    monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent)
+
+    await repl._handle_request(
+        "plan a Canvas LMS Lite app from @canvas lite.pdf. Build the Django foundation "
+        "with a User model that has roles first, then login and logout, then courses.",
+        tmp_path,
+        Console(record=True),
+        object(),
+        object(),
+    )
+
+    prompt = str(captured.get("prompt", ""))
+    assert "User model that has roles" in prompt
+    assert "then login and logout, then courses" in prompt
+    assert "canvas lite.pdf" in prompt
+    assert "Do NOT write any code" in prompt
+
+
+def test_instruction_and_its_file_list_stay_one_step(tmp_path: Path):
+    """Live 2026-08-02: "Build ONLY the Django foundation... Create: <8 files>"
+    split into a targetless step 1 (which failed) and a step 2 holding the
+    entire file list (which then never ran). The specification belongs to the
+    instruction it specifies."""
+    prompt = (
+        "Build ONLY the Django project foundation for Canvas LMS Lite inside the folder "
+        "canvas_lms_lite. Create: canvas_lms_lite/manage.py, canvas_lms_lite/config/settings.py, "
+        "canvas_lms_lite/core/models.py. Verify by running python manage.py check."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+    kinds = [step.kind for step in plan.steps]
+    first = plan.steps[0].instruction
+
+    assert kinds == ["mutation", "verify"]
+    assert "Build ONLY the Django project foundation" in first
+    assert "canvas_lms_lite/manage.py" in first
+    assert "canvas_lms_lite/core/models.py" in first
+
+
+def test_two_independent_targeted_mutations_still_split(tmp_path: Path):
+    """A first clause that already names its own target is a real step."""
+    plan = repl._operation_plan(
+        "edit greet in greeting.py, and update main.py to call greet", tmp_path
+    )
+
+    assert [step.kind for step in plan.steps] == ["mutation", "mutation"]
+
+
+def test_dotted_module_paths_are_not_counted_as_files(tmp_path: Path):
+    """Live 2026-08-02: "Import AbstractUser from django.contrib.auth.models"
+    contributed two phantom file targets, so a ONE-file request looked like
+    three and was shredded into composite steps."""
+    from shamsu.routing.operations import file_targets
+
+    text = (
+        "Create the file canvas_lms_lite/core/models.py. Import AbstractUser from "
+        "django.contrib.auth.models and models from django.db."
+    )
+
+    assert file_targets(text) == {"canvas_lms_lite/core/models.py"}
+
+
+def test_single_file_creation_with_import_instructions_stays_one_step(tmp_path: Path):
+    prompt = (
+        "Create the file canvas_lms_lite/core/models.py. It must contain a Django custom "
+        "user model. Import AbstractUser from django.contrib.auth.models and models from "
+        "django.db. Write the complete file now with write_file."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert plan.primary_route == "file.write"
+
+
+def test_single_file_spec_with_trailing_write_imperative_stays_one_step(tmp_path: Path):
+    """Live 2026-08-02: a full settings.py spec ending "Write the complete file
+    now with write_file" split into spec (which wrote a 35-byte stub) and a
+    targetless "write it" step (which failed holding the real content)."""
+    prompt = (
+        "Create canvas_lms_lite/config/settings.py for the project. It must define BASE_DIR "
+        "with pathlib, INSTALLED_APPS including core, and AUTH_USER_MODEL = core.User. "
+        "Write the complete file now with write_file."
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert len(plan.steps) == 1
+    assert "AUTH_USER_MODEL" in plan.steps[0].instruction
+    assert "Write the complete file now" in plan.steps[0].instruction

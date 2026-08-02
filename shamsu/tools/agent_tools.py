@@ -12,6 +12,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.indexer.policy import walk_workspace_files
 from shamsu.mcp.manager import MCPManager, get_shared_mcp_manager, summarize_mcp_result
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.retriever.documents import (
@@ -185,8 +186,14 @@ class AgentToolRegistry:
         # other direction, so instead the named targets stay writable and
         # everything else is denied - which is exactly what the user said.
         self._allowed_write_paths: set[str] | None = None
+        # Long-running project builds need a narrower evidence boundary than
+        # the workspace itself. Without it, a model can discover similarly
+        # named files from old builds and repair the wrong project.
+        self._allowed_read_paths: set[str] | None = None
         self._user_request = ""
         self._required_tool_prefix = ""
+        self._allowed_tool_names: set[str] | None = None
+        self._resolved_read_aliases: dict[str, str] = {}
 
     def set_read_only(self, read_only: bool) -> None:
         self._read_only = bool(read_only)
@@ -201,12 +208,125 @@ class AgentToolRegistry:
             return
         self._allowed_write_paths = {_normalize_workspace_path(p).lower() for p in paths if p}
 
+    def sole_allowed_write_path(self) -> str:
+        """Return the exact orchestrator-owned mutation target, when unique."""
+        allowed = self._allowed_write_paths
+        return next(iter(allowed)) if allowed is not None and len(allowed) == 1 else ""
+
+    def allowed_write_paths(self) -> list[str]:
+        """Return the orchestrator-owned mutation scope for repair handoffs."""
+        return sorted(self._allowed_write_paths or ())
+
+    def set_allowed_read_paths(self, paths: Iterable[str] | None) -> None:
+        """Restrict local discovery and reads to project paths."""
+        if paths is None:
+            self._allowed_read_paths = None
+            return
+        self._allowed_read_paths = {
+            _normalize_workspace_path(p).lower() for p in paths if _normalize_workspace_path(p)
+        }
+
+    def has_scoped_reads(self) -> bool:
+        return self._allowed_read_paths is not None
+
+    def _inside_allowed_read_scope(self, path: str) -> bool:
+        allowed = self._allowed_read_paths
+        if allowed is None:
+            return True
+        clean = _normalize_workspace_path(path) or path
+        try:
+            normalized = self.sandbox.validate(clean).relative_to(self.workspace_root).as_posix().lower()
+        except (SecurityError, ValueError):
+            normalized = clean.lower()
+        return any(
+            normalized == item or normalized.startswith(item.rstrip("/") + "/")
+            for item in allowed
+        )
+
+    def _scoped_read_path(self, path: str) -> str:
+        """Resolve a short model path inside the sole active project root."""
+        normalized = _normalize_workspace_path(path) or path
+        allowed = self._allowed_read_paths
+        if allowed is None or self._inside_allowed_read_scope(normalized):
+            return normalized
+        if len(allowed) == 1 and normalized not in {"", "."}:
+            root = next(iter(allowed)).rstrip("/")
+            return f"{root}/{normalized.lstrip('/')}"
+        return normalized
+
+    def _scoped_write_path(self, path: str) -> str:
+        """Resolve a short write path under an explicitly scoped project root."""
+        normalized = _normalize_workspace_path(path) or path
+        allowed = self._allowed_write_paths
+        if allowed is None:
+            return normalized
+        if any(
+            normalized.lower() == item
+            or normalized.lower().startswith(item.rstrip("/") + "/")
+            for item in allowed
+        ):
+            return normalized
+        # Only project runs set the same single root for both reads and writes.
+        # A normal scoped edit such as allowed_write_paths={"notes.md"} must
+        # still reject an unrelated short path instead of nesting it below a
+        # filename.
+        if len(allowed) == 1 and allowed == self._allowed_read_paths:
+            root = next(iter(allowed)).rstrip("/")
+            return f"{root}/{normalized.lstrip('/')}"
+        if len(allowed) == 1:
+            target = next(iter(allowed)).rstrip("/")
+            short = normalized.lower().lstrip("/")
+            if target == short or target.endswith("/" + short):
+                return target
+        return normalized
+
+    def _scoped_candidates(self, candidates: Iterable[str]) -> list[str]:
+        return [candidate for candidate in candidates if self._inside_allowed_read_scope(candidate)]
+
+    def _resolved_read_path(self, path: str) -> str:
+        """Reuse a path that a prior read safely resolved from the same alias."""
+        normalized = _normalize_workspace_path(path) or path
+        try:
+            requested = self.sandbox.validate(normalized)
+        except SecurityError:
+            return normalized
+        if requested.exists():
+            return normalized
+        resolved = self._resolved_read_aliases.get(normalized.lower(), "")
+        if not resolved or not self._inside_allowed_read_scope(resolved):
+            return normalized
+        try:
+            target = self.sandbox.validate(resolved)
+        except SecurityError:
+            return normalized
+        return resolved if target.is_file() else normalized
+
     def set_user_request(self, request: str) -> None:
         self._user_request = str(request or "")
 
     def require_tool_prefix(self, prefix: str | None) -> None:
         """Prevent an explicit tool request from being replaced by a shell guess."""
         self._required_tool_prefix = str(prefix or "")
+
+    def set_allowed_tools(self, names: Iterable[str] | None) -> None:
+        """Restrict model-visible and executable tools for an orchestrated step."""
+        if names is None:
+            self._allowed_tool_names = None
+            return
+        self._allowed_tool_names = {str(name) for name in names if str(name)}
+
+    def _tool_is_allowed(self, name: str) -> bool:
+        allowed = self._allowed_tool_names
+        if allowed is None:
+            return True
+        return name in allowed or any(
+            pattern.endswith("*") and name.startswith(pattern[:-1])
+            for pattern in allowed
+        )
+
+    def is_tool_allowed(self, name: str) -> bool:
+        """Public capability check for harness-owned fallback paths."""
+        return self._tool_is_allowed(name)
 
     def _outside_allowed_scope(self, path: str) -> ToolResult | None:
         allowed = self._allowed_write_paths
@@ -792,10 +912,26 @@ class AgentToolRegistry:
                 required=["question"],
             ),
         ]
-        return local_schemas + self._mcp.tool_schemas()
+        schemas = local_schemas + self._mcp.tool_schemas()
+        return [
+            schema
+            for schema in schemas
+            if self._tool_is_allowed(
+                str((schema.get("function") or {}).get("name") or "")
+            )
+        ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         try:
+            if not self._tool_is_allowed(name):
+                return ToolResult(
+                    False,
+                    f"Tool {name} is not allowed for the current orchestrated step.",
+                    {
+                        "blocked_tool": name,
+                        "allowed_tools": sorted(self._allowed_tool_names or []),
+                    },
+                )
             if (
                 self._required_tool_prefix
                 and not name.startswith(self._required_tool_prefix)
@@ -1260,11 +1396,42 @@ class AgentToolRegistry:
         )
 
     def list_files(self, path: str = ".") -> ToolResult:
-        target = self.sandbox.validate(path)
+        normalized = _normalize_workspace_path(path) or "."
+        if self._allowed_read_paths is not None and normalized == ".":
+            roots = sorted(self._allowed_read_paths)
+            existing = []
+            for root in roots:
+                target = self.sandbox.validate(root)
+                if target.is_dir():
+                    files = [
+                        f"[file] {root}/{str(relative).replace(chr(92), '/')}"
+                        for relative in _walk_workspace_files(target)
+                    ]
+                    if len(files) > 120:
+                        hidden = len(files) - 120
+                        files = [*files[:120], f"... {hidden} more file(s) not shown"]
+                    existing.append(
+                        f"{root}/\n" + ("\n".join(files) if files else "(empty)")
+                    )
+                else:
+                    existing.append(f"{root}/ (not created yet)")
+            return ToolResult(
+                True,
+                "Listed files inside the active project scope.",
+                {"path": ".", "listing": "\n".join(existing), "read_scope": roots},
+            )
+        normalized = self._scoped_read_path(normalized)
+        if not self._inside_allowed_read_scope(normalized):
+            return ToolResult(
+                False,
+                f"Refused to list {path}: it is outside the active project read scope.",
+                {"path": path, "read_scope": sorted(self._allowed_read_paths or ())},
+            )
+        target = self.sandbox.validate(normalized)
         if not target.is_dir():
-            return ToolResult(False, f"Not a directory: {path}", {"path": path})
+            return ToolResult(False, f"Not a directory: {normalized}", {"path": normalized})
         listing = WorkspaceTool(target).list_files().render()
-        return ToolResult(True, "Listed files.", {"path": path, "listing": listing})
+        return ToolResult(True, "Listed files.", {"path": normalized, "listing": listing})
 
     def read_file(
         self,
@@ -1275,6 +1442,17 @@ class AgentToolRegistry:
         normalized = _normalize_workspace_path(filepath)
         if not normalized:
             return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
+        normalized = self._scoped_read_path(normalized)
+        if not self._inside_allowed_read_scope(normalized):
+            return ToolResult(
+                False,
+                f"Refused to read {filepath}: it is outside the active project read scope.",
+                {
+                    "filepath": filepath,
+                    "candidates": [],
+                    "read_scope": sorted(self._allowed_read_paths or ()),
+                },
+            )
 
         if PurePosixPath(normalized).suffix.lower() == ".pdf":
             return self._read_pdf(normalized)
@@ -1301,7 +1479,7 @@ class AgentToolRegistry:
             resolved = ci.relative_to(self.workspace_root).as_posix()
             return self._read_existing_file(normalized, resolved, ci, start_line, end_line)
 
-        candidates = _find_path_candidates(self.workspace_root, normalized)
+        candidates = self._scoped_candidates(_find_path_candidates(self.workspace_root, normalized))
         # Auto-resolve ONLY when there is exactly one candidate. This is a
         # read-only operation, so guessing is cheap and reversible; with two or
         # more matches we never silently pick one (see acceptance criteria).
@@ -1396,6 +1574,7 @@ class AgentToolRegistry:
             else:
                 data["truncated"] = False
         data["content"] = content
+        self._resolved_read_aliases[asked.lower()] = resolved
 
         if resolved != asked:
             message = f"Read file (resolved '{asked}' -> '{resolved}')."
@@ -1407,6 +1586,13 @@ class AgentToolRegistry:
         normalized = _normalize_workspace_path(filepath)
         if not normalized:
             return ToolResult(False, "Missing filepath.", {"filepath": filepath, "candidates": []})
+        normalized = self._scoped_read_path(normalized)
+        if not self._inside_allowed_read_scope(normalized):
+            return ToolResult(
+                False,
+                f"Refused to inspect {filepath}: it is outside the active project read scope.",
+                {"filepath": filepath, "candidates": []},
+            )
         try:
             target = self.sandbox.validate(normalized)
         except SecurityError as exc:
@@ -1443,7 +1629,7 @@ class AgentToolRegistry:
 
         ci = _path_exists_case_insensitive(self.workspace_root, normalized)
         resolved = ci.relative_to(self.workspace_root).as_posix() if ci is not None else ""
-        candidates = _find_path_candidates(self.workspace_root, normalized)
+        candidates = self._scoped_candidates(_find_path_candidates(self.workspace_root, normalized))
         message = f"No file or directory at {normalized}."
         if resolved:
             message += f" A case-insensitive match exists: {resolved}."
@@ -1472,7 +1658,9 @@ class AgentToolRegistry:
         normalized = _normalize_workspace_path(query)
         if not normalized:
             return ToolResult(False, "Missing query.", {"query": query, "matches": []})
-        matches = _find_files_by_query(self.workspace_root, normalized, limit)
+        matches = self._scoped_candidates(
+            _find_files_by_query(self.workspace_root, normalized, limit)
+        )
         message = (
             f"Found {len(matches)} file(s) matching '{normalized}'."
             if matches
@@ -1499,8 +1687,26 @@ class AgentToolRegistry:
                 f'Missing or placeholder query "{str(query).strip()}". Pass a concrete symbol or text string to grep_files.',
                 {"query": query, "matches": []},
             )
+        normalized_path = _normalize_workspace_path(path) or "."
+        if self._allowed_read_paths is not None and normalized_path == ".":
+            roots = sorted(self._allowed_read_paths)
+            if len(roots) == 1:
+                normalized_path = roots[0]
+            else:
+                return ToolResult(
+                    False,
+                    "Pass one active project root as the grep path.",
+                    {"query": query, "matches": [], "read_scope": roots},
+                )
+        normalized_path = self._scoped_read_path(normalized_path)
+        if not self._inside_allowed_read_scope(normalized_path):
+            return ToolResult(
+                False,
+                f"Refused to search {path}: it is outside the active project read scope.",
+                {"query": query, "matches": []},
+            )
         try:
-            base = self.sandbox.validate(_normalize_workspace_path(path) or ".")
+            base = self.sandbox.validate(normalized_path)
         except SecurityError as exc:
             return ToolResult(False, str(exc), {"query": query, "matches": []})
         if not base.exists():
@@ -1557,6 +1763,7 @@ class AgentToolRegistry:
     ) -> ToolResult:
         if self._read_only:
             return self._read_only_refusal("edit", filepath or "the file")
+        filepath = self._resolved_read_path(self._scoped_write_path(filepath))
         scoped = self._outside_allowed_scope(filepath)
         if scoped is not None:
             return scoped
@@ -1582,7 +1789,9 @@ class AgentToolRegistry:
 
         # Edits never auto-resolve to a different file: show candidates, fail safe.
         if not target.is_file():
-            candidates = _find_path_candidates(self.workspace_root, normalized)
+            candidates = self._scoped_candidates(
+                _find_path_candidates(self.workspace_root, normalized)
+            )
             message = f"Cannot edit: file does not exist: {normalized}."
             if candidates:
                 message += (
@@ -1614,7 +1823,11 @@ class AgentToolRegistry:
             return ToolResult(
                 False,
                 f"old_string not found in {normalized}. The file was NOT changed. {hint}",
-                {"filepath": normalized, "matches": 0},
+                {
+                    "filepath": normalized,
+                    "matches": 0,
+                    "current_excerpt": _edit_recovery_excerpt(content, old_string),
+                },
             )
         auto_disambiguated = False
         if count > 1 and not replace_all:
@@ -1648,6 +1861,8 @@ class AgentToolRegistry:
                 {"filepath": normalized, "matches": count},
             )
 
+        if not replace_all:
+            new_string = _indent_multiline_replacement(content, old_string, new_string)
         if replace_all:
             new_content = content.replace(old_string, new_string)
             replacements = count
@@ -1730,6 +1945,7 @@ class AgentToolRegistry:
     def append_file(self, filepath: str, content: str) -> ToolResult:
         if self._read_only:
             return self._read_only_refusal("append to", filepath or "the file")
+        filepath = self._resolved_read_path(self._scoped_write_path(filepath))
         scoped = self._outside_allowed_scope(filepath)
         if scoped is not None:
             return scoped
@@ -1754,7 +1970,9 @@ class AgentToolRegistry:
         except SecurityError as exc:
             return ToolResult(False, str(exc), {"filepath": normalized, "candidates": []})
         if not target.is_file():
-            candidates = _find_path_candidates(self.workspace_root, normalized)
+            candidates = self._scoped_candidates(
+                _find_path_candidates(self.workspace_root, normalized)
+            )
             message = f"Cannot append: file does not exist: {normalized}."
             if candidates:
                 message += (
@@ -2503,7 +2721,12 @@ class AgentToolRegistry:
         """
         if self._read_only:
             return self._read_only_refusal("move", source or "the file")
+        source = self._scoped_write_path(source)
+        destination = self._scoped_write_path(destination)
         scoped = self._outside_allowed_scope(source)
+        if scoped is not None:
+            return scoped
+        scoped = self._outside_allowed_scope(destination)
         if scoped is not None:
             return scoped
         if self._dry_run is not None:
@@ -2580,6 +2803,7 @@ class AgentToolRegistry:
         """
         if self._read_only:
             return self._read_only_refusal("delete", filepath or "the file")
+        filepath = self._scoped_write_path(filepath)
         scoped = self._outside_allowed_scope(filepath)
         if scoped is not None:
             return scoped
@@ -2632,6 +2856,7 @@ class AgentToolRegistry:
     def write_file(self, filepath: str, content: str, overwrite: bool = False) -> ToolResult:
         if self._read_only:
             return self._read_only_refusal("write", filepath or "the file")
+        filepath = self._resolved_read_path(self._scoped_write_path(filepath))
         scoped = self._outside_allowed_scope(filepath)
         if scoped is not None:
             return scoped
@@ -2644,6 +2869,14 @@ class AgentToolRegistry:
         normalized = _normalize_workspace_path(filepath)
         if not normalized:
             return ToolResult(False, "Missing filepath.", {})
+        if not str(content or "").strip() and PurePosixPath(normalized).name != "__init__.py":
+            return ToolResult(
+                False,
+                f"Refusing an empty write to {normalized}. The content argument is missing or "
+                "blank, so this would erase/create a hollow source file. Provide the complete "
+                "file content. Empty writes are allowed only for __init__.py package markers.",
+                {"filepath": normalized, "content_missing": True},
+            )
         try:
             target = self.sandbox.validate(normalized)
         except SecurityError as exc:
@@ -2662,7 +2895,9 @@ class AgentToolRegistry:
         # (e.g. write src/App.tsx while client/src/App.tsx exists), refuse and
         # surface candidates instead of silently scattering a second copy.
         if not exists:
-            strong = _strong_path_candidates(self.workspace_root, normalized)
+            strong = self._scoped_candidates(
+                _strong_path_candidates(self.workspace_root, normalized)
+            )
             if strong:
                 return ToolResult(
                     False,
@@ -2788,8 +3023,26 @@ class AgentToolRegistry:
                     "actionable": False,
                 },
             )
-        code, stdout, stderr = self.command_runner.run(command, self.sandbox.validate(cwd))
-        data: dict[str, Any] = {"exit_code": code, "stdout": stdout, "stderr": stderr}
+        effective_cwd = self._scoped_command_cwd(command, cwd)
+        before_files = _workspace_file_snapshot(self.workspace_root)
+        code, stdout, stderr = self.command_runner.run(
+            command, self.sandbox.validate(effective_cwd)
+        )
+        after_files = _workspace_file_snapshot(self.workspace_root)
+        touched_files = sorted(
+            path
+            for path in set(before_files) | set(after_files)
+            if before_files.get(path) != after_files.get(path)
+        )
+        data: dict[str, Any] = {
+            "exit_code": code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "cwd": effective_cwd,
+        }
+        if touched_files:
+            data["touched_files"] = touched_files
+            data["deleted_files"] = [path for path in touched_files if path not in after_files]
         resolution = getattr(self.command_runner, "last_command_resolution", None)
         if resolution is not None:
             data["resolved_command"] = resolution.command
@@ -2819,6 +3072,26 @@ class AgentToolRegistry:
             data["diagnostics"] = self.command_runner.last_error_packet.to_model_context()
 
         return ToolResult(code == 0, f"Command exited with {code}.", data)
+
+    def _scoped_command_cwd(self, command: str, cwd: str) -> str:
+        """Resolve cwd-less framework commands beside their unique scoped entry point."""
+        normalized = _normalize_workspace_path(cwd) or "."
+        if normalized != "." or not re.search(r"(?:^|\s)manage\.py(?:\s|$)", command):
+            return normalized
+        candidates: list[str] = []
+        for path in walk_workspace_files(self.workspace_root):
+            if path.name != "manage.py":
+                continue
+            try:
+                relative = path.relative_to(self.workspace_root).as_posix()
+            except ValueError:
+                continue
+            if self._inside_allowed_read_scope(relative):
+                candidates.append(relative)
+        if len(candidates) != 1:
+            return normalized
+        parent = Path(candidates[0]).parent.as_posix()
+        return parent if parent != "." else "."
 
     def search_index(self, query: str) -> ToolResult:
         from shamsu.abstract.service import AbstractService
@@ -3101,6 +3374,60 @@ def _nearby_edit_hint(content: str, old_string: str) -> str:
                 "Match the exact text and whitespace (read a line range first if unsure)."
             )
     return "Read the file to copy the exact text, including whitespace."
+
+
+def _edit_recovery_excerpt(content: str, old_string: str, *, max_chars: int = 4000) -> str:
+    """Return bounded current source near a failed edit's closest anchor."""
+    if len(content) <= max_chars:
+        return content
+    probe_lines = [line.strip() for line in old_string.splitlines() if line.strip()]
+    file_lines = content.splitlines()
+    center = 0
+    if probe_lines:
+        stripped = [line.strip() for line in file_lines]
+        close = difflib.get_close_matches(probe_lines[0], stripped, n=1, cutoff=0.45)
+        if close:
+            center = stripped.index(close[0])
+    start = max(0, center - 30)
+    excerpt = "\n".join(file_lines[start : start + 80])
+    return excerpt[:max_chars]
+
+
+def _indent_multiline_replacement(content: str, old_string: str, new_string: str) -> str:
+    """Carry line indentation when a model replaces an in-line anchor with a block."""
+    if "\n" not in new_string or "\n" in old_string:
+        return new_string
+    index = content.find(old_string)
+    if index < 0:
+        return new_string
+    line_start = content.rfind("\n", 0, index) + 1
+    prefix = content[line_start:index]
+    if not prefix or prefix.strip():
+        return new_string
+    lines = new_string.split("\n")
+    return "\n".join(
+        [
+            lines[0],
+            *[
+                prefix + line if line and not line.startswith((" ", "\t")) else line
+                for line in lines[1:]
+            ],
+        ]
+    )
+
+
+def _workspace_file_snapshot(workspace_root: Path) -> dict[str, tuple[int, int]]:
+    """Capture a cheap manifest for detecting command-generated workspace changes."""
+    snapshot: dict[str, tuple[int, int]] = {}
+    root = workspace_root.resolve()
+    for path in walk_workspace_files(root):
+        try:
+            stat = path.stat()
+            relative = path.relative_to(root).as_posix()
+        except (OSError, ValueError):
+            continue
+        snapshot[relative] = (stat.st_size, stat.st_mtime_ns)
+    return snapshot
 
 
 def _edit_context_candidates(

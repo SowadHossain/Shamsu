@@ -17,8 +17,10 @@ from shamsu.repair.kinds import (
     select_primary_error,
 )
 from shamsu.repair.loop import RepairLoop, VerifyRun
+from shamsu.repair.plan_schema import REPAIR_PLAN_JSON_SCHEMA
 from shamsu.repair.proposer_llm import LLMProposer
 from shamsu.repair.prompt import (
+    build_debug_prompt,
     contains_unverified_success_claim,
     enforce_final_response,
 )
@@ -184,6 +186,24 @@ def test_comparator_worse_improved_unchanged_different():
     assert cmp.compare([_err("a")], [_err("b")], 1) is RepairOutcome.DIFFERENT
 
 
+def test_comparator_keeps_patch_when_same_test_advances_to_later_failure():
+    before = RepairError(
+        "python manage.py test", 1, "django test", ErrorKind.UNKNOWN,
+        "core/tests/test_canvas.py", 17, None, "IntegrityError",
+        "test_enrollment_creation", "", "unique username", "", "error",
+    )
+    after = RepairError(
+        "python manage.py test", 1, "django test", ErrorKind.UNKNOWN,
+        "core/tests/test_canvas.py", 19, None, "AttributeError",
+        "test_enrollment_creation", "", "no attribute user", "", "error",
+    )
+
+    outcome = ErrorComparator().compare([before], [after], 1)
+
+    assert outcome is RepairOutcome.ADVANCED
+    assert ErrorComparator.is_progress(outcome)
+
+
 # --- deterministic import resolver -------------------------------------------
 
 def test_import_resolver_suggests_corrected_relative_path(tmp_path: Path):
@@ -274,6 +294,7 @@ def test_loop_blocks_repeated_identical_patch(tmp_path: Path):
     # second is blocked, so the model is only asked at most twice, not 5 times.
     assert proposer.calls <= 2
     assert "different strategy" in result.stopped_reason or result.stopped_reason
+    assert "full_content rewrite" in proposer.seen[1].previous_attempts[0].note
 
 
 def test_loop_refuses_to_edit_uninspected_file(tmp_path: Path):
@@ -286,6 +307,151 @@ def test_loop_refuses_to_edit_uninspected_file(tmp_path: Path):
     assert result.success is False
     assert "uninspected" in result.stopped_reason
     assert not (tmp_path / "src" / "secret.ts").exists()
+
+
+def test_loop_shows_local_test_dependency_as_read_only_evidence(tmp_path: Path):
+    tests_dir = tmp_path / "core" / "tests"
+    tests_dir.mkdir(parents=True)
+    test_file = tests_dir / "test_canvas.py"
+    test_file.write_text(
+        "from ..models import Course\n\n"
+        "def test_course():\n"
+        "    Course.objects.create(title='Demo')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "core" / "models.py").write_text(
+        "class Course:\n"
+        "    title = 'required'\n"
+        "    teacher = 'required'\n",
+        encoding="utf-8",
+    )
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "core/tests/test_canvas.py", line 4, in test_course\n'
+        "    Course.objects.create(title='Demo')\n"
+        "django.db.utils.IntegrityError: NOT NULL constraint failed: core_course.teacher_id\n"
+    )
+    verifier = ScriptedVerifier("python manage.py test", [(1, traceback), (0, "")])
+    plan = RepairPlan(
+        root_cause="teacher is required",
+        target_file="core/tests/test_canvas.py",
+        search="Course.objects.create(title='Demo')",
+        replace="Course.objects.create(title='Demo', teacher=teacher)",
+    )
+    proposer = ScriptedProposer([plan])
+
+    result = RepairLoop(
+        tmp_path,
+        verifier,
+        proposer,
+        max_attempts=2,
+        editable_files=["core/tests/test_canvas.py"],
+    ).run()
+
+    assert result.success is True
+    assert proposer.seen[0].editable_files == ["core/tests/test_canvas.py"]
+    inspected = {snippet.file for snippet in proposer.seen[0].inspected}
+    assert "core/tests/test_canvas.py" in inspected
+    assert "core/models.py" in inspected
+
+
+def test_loop_refuses_to_edit_read_only_dependency(tmp_path: Path):
+    tests_dir = tmp_path / "core" / "tests"
+    tests_dir.mkdir(parents=True)
+    (tests_dir / "test_canvas.py").write_text(
+        "from ..models import Course\n\ndef test_course():\n    assert Course\n",
+        encoding="utf-8",
+    )
+    models = tmp_path / "core" / "models.py"
+    models.write_text("class Course:\n    pass\n", encoding="utf-8")
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "core/tests/test_canvas.py", line 4, in test_course\n'
+        "    assert Course\n"
+        "RuntimeError: broken fixture\n"
+    )
+    verifier = ScriptedVerifier("python manage.py test", [(1, traceback)])
+    plan = RepairPlan(
+        root_cause="change production model",
+        target_file="core/models.py",
+        full_content="class Course:\n    changed = True\n",
+    )
+
+    result = RepairLoop(
+        tmp_path,
+        verifier,
+        ScriptedProposer([plan]),
+        max_attempts=1,
+        editable_files=["core/tests/test_canvas.py"],
+    ).run()
+
+    assert result.success is False
+    assert "read-only evidence" in result.stopped_reason
+    assert models.read_text(encoding="utf-8") == "class Course:\n    pass\n"
+
+
+def test_loop_rejects_unrelated_field_change_for_named_constraint(tmp_path: Path):
+    tests_dir = tmp_path / "core" / "tests"
+    tests_dir.mkdir(parents=True)
+    target = tests_dir / "test_users.py"
+    target.write_text(
+        'def test_users():\n    User.objects.create(email="student@example.com")\n',
+        encoding="utf-8",
+    )
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "core/tests/test_users.py", line 2, in test_users\n'
+        '    User.objects.create(email="student@example.com")\n'
+        "sqlite3.IntegrityError: UNIQUE constraint failed: core_user.username\n"
+    )
+    wrong = RepairPlan(
+        root_cause="duplicate username",
+        target_file="core/tests/test_users.py",
+        search='email="student@example.com"',
+        replace='email="student_1@example.com"',
+    )
+    proposer = ScriptedProposer([wrong])
+    verifier = ScriptedVerifier("python manage.py test", [(1, traceback), (0, "")])
+
+    result = RepairLoop(
+        tmp_path,
+        verifier,
+        proposer,
+        max_attempts=1,
+        editable_files=["core/tests/test_users.py"],
+    ).run()
+
+    assert result.success is True
+    assert result.attempts[0].files_changed == ["core/tests/test_users.py"]
+    assert result.attempts[0].kept is True
+    repaired = target.read_text(encoding="utf-8")
+    assert "username='test_username_2'" in repaired
+    assert 'student_1@example.com' not in repaired
+
+
+def test_loop_shows_local_javascript_test_dependency_as_read_only(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    test_file = src / "course.test.ts"
+    test_file.write_text(
+        "import { createCourse } from './course'\ncreateCourse()\n",
+        encoding="utf-8",
+    )
+    (src / "course.ts").write_text("export function createCourse() {}\n", encoding="utf-8")
+    verifier = ScriptedVerifier("npm test", [(2, "src/course.test.ts(2,1): error TS2304: Cannot find name 'teacher'.")])
+    proposer = ScriptedProposer([None])
+
+    RepairLoop(
+        tmp_path,
+        verifier,
+        proposer,
+        max_attempts=1,
+        editable_files=["src/course.test.ts"],
+    ).run()
+
+    inspected = {snippet.file for snippet in proposer.seen[0].inspected}
+    assert inspected == {"src/course.test.ts", "src/course.ts"}
+    assert proposer.seen[0].editable_files == ["src/course.test.ts"]
 
 
 def test_loop_logs_attempt_signatures(tmp_path: Path):
@@ -401,6 +567,18 @@ def test_llm_proposer_parses_json_plan():
     assert plan.replace == "export const foo"
 
 
+def test_repair_schema_requires_an_edit_and_does_not_echo_inspected_files():
+    assert "inspected_files" not in REPAIR_PLAN_JSON_SCHEMA["properties"]
+    assert REPAIR_PLAN_JSON_SCHEMA["additionalProperties"] is False
+    assert set(REPAIR_PLAN_JSON_SCHEMA["required"]) == {
+        "root_cause",
+        "target_file",
+        "search",
+        "replace",
+        "full_content",
+    }
+
+
 def test_llm_proposer_repairs_malformed_json():
     # Trailing prose + missing brace: json_repair should still recover it.
     def generate(system: str, user: str, schema: dict) -> str:
@@ -446,6 +624,55 @@ def test_llm_proposer_retries_diagnosis_only_plan():
     assert plan.replace == "good"
     assert len(prompts) == 2
     assert "Previous invalid repair JSON" in prompts[1]
+
+
+def test_llm_proposer_retries_incomplete_plan_without_target():
+    responses = [
+        '{"search": "bad"}',
+        (
+            '{"root_cause": "x", "target_file": "a.py", "search": "bad", '
+            '"replace": "good", "full_content": ""}'
+        ),
+    ]
+
+    def generate(system: str, user: str, schema: dict) -> str:
+        return responses.pop(0)
+
+    plan = LLMProposer(generate).propose(_debug_context())
+
+    assert plan is not None
+    assert plan.target_file == "a.py"
+    assert plan.search == "bad"
+
+
+def test_integrity_error_prompt_treats_named_constraint_as_fixture_evidence():
+    error = RepairError(
+        "python manage.py test",
+        1,
+        "django test",
+        ErrorKind.UNKNOWN,
+        "core/tests/test_canvas.py",
+        17,
+        None,
+        "sqlite3.IntegrityError",
+        "test_enrollment_creation",
+        "",
+        "UNIQUE constraint failed: core_user.username",
+        "sqlite3.IntegrityError: UNIQUE constraint failed: core_user.username",
+        "error",
+    )
+    prompt = build_debug_prompt(
+        DebugContext(
+            primary_error=error,
+            verify_command="python manage.py test",
+            editable_files=["core/tests/test_canvas.py"],
+        )
+    )
+
+    assert "named database field/constraint is authoritative evidence" in prompt
+    assert "repair the fixture values or relationship arguments" in prompt
+    assert "Constraint field: `username`" in prompt
+    assert "fixture field `username`" in prompt
 
 
 def test_llm_proposer_survives_generate_exception():

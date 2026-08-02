@@ -14,7 +14,10 @@ REPAIR_PLAN_JSON_SCHEMA: dict = {
         "search": {"type": "string"},
         "replace": {"type": "string"},
         "full_content": {"type": "string"},
-        "inspected_files": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["root_cause", "target_file"],
+    # Ollama's local structured-output implementations are more reliable with
+    # one flat required list than with anyOf/oneOf. The unused edit mode is an
+    # empty string; LLMProposer still enforces that one mode is actionable.
+    "required": ["root_cause", "target_file", "search", "replace", "full_content"],
+    "additionalProperties": False,
 }

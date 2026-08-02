@@ -67,3 +67,34 @@ def test_parser_records_section_page_provenance():
         {"page": 2, "kind": "heading"},
         {"page": 2, "kind": "content"},
     ]
+
+
+def test_common_numbered_prd_headings_do_not_need_product_specific_allowlist():
+    parsed = parse_prd_text(
+        "\n".join(
+            [
+                "PRD: Orbit Desk",
+                "1. Overview",
+                "A collaborative workspace.",
+                "2. Goals",
+                "Support role-aware work.",
+                "3. Non-Goals (out of scope)",
+                "Real-time video.",
+                "4. Users & Roles",
+                "Admin and member.",
+                "5. Tech Stack",
+                "Framework chosen by the implementer.",
+                "6. Data Model",
+                "Workspace and Membership.",
+            ]
+        )
+    )
+
+    assert list(parsed.sections) == [
+        "1 Overview",
+        "2 Goals",
+        "3 Non-Goals (out of scope)",
+        "4 Users & Roles",
+        "5 Tech Stack",
+        "6 Data Model",
+    ]

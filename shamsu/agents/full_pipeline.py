@@ -7,6 +7,7 @@ Routes each PRD by its generation strategy (see registry/suitability.py):
 Templates are accelerators, never mandatory: a PRD that fits no template is
 still built, from the PRD.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -83,6 +84,7 @@ class FullDjangoPipeline:
         long_running: bool = False,
         generate: Callable[[str, str, dict], str] | None = None,
         strict_django_repair: bool = False,
+        user_request: str = "",
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.sandbox = Sandbox(self.workspace_root)
@@ -101,8 +103,11 @@ class FullDjangoPipeline:
         # (rollback, one-error-at-a-time) instead of ErrorFeedbackLoop. Default
         # off so the proven Django flow and its tests are unchanged.
         self.strict_django_repair = strict_django_repair
+        self.user_request = user_request.strip()
 
-    async def run(self, prd_path: Path | str, target_dir: Path | str | None = None) -> FullPipelineResult:
+    async def run(
+        self, prd_path: Path | str, target_dir: Path | str | None = None
+    ) -> FullPipelineResult:
         try:
             validated_prd = self._validate_prd(prd_path)
             validated_target = self.sandbox.validate(target_dir or ".")
@@ -145,7 +150,9 @@ class FullDjangoPipeline:
             )
             state = writer.write_project(project, validated_prd, target_dir=validated_target)
             diagnostics = writer.check_project(project, target_dir=validated_target)
-            written_files = [step.file.path for step in state.generation_order if step.status.value == "done"]
+            written_files = [
+                step.file.path for step in state.generation_order if step.status.value == "done"
+            ]
 
             if diagnostics:
                 return self._result(
@@ -165,7 +172,9 @@ class FullDjangoPipeline:
             setup_result = setup_runner.run(validated_target)
             if not setup_result.ok and self.long_running:
                 setup_result = await self._retry_setup_via_bugfix(
-                    setup_result, setup_runner, validated_target,
+                    setup_result,
+                    setup_runner,
+                    validated_target,
                 )
             if not setup_result.ok:
                 return self._result(
@@ -179,10 +188,13 @@ class FullDjangoPipeline:
                     error="Django setup failed.",
                 )
 
-            test_result = (self.test_runner or DjangoTestRunner(
-                self.workspace_root,
-                session_logger=self.session_logger,
-            )).run(validated_target)
+            test_result = (
+                self.test_runner
+                or DjangoTestRunner(
+                    self.workspace_root,
+                    session_logger=self.session_logger,
+                )
+            ).run(validated_target)
             if test_result.failed == 0:
                 return self._result(
                     validated_prd,
@@ -195,17 +207,29 @@ class FullDjangoPipeline:
                     success=True,
                 )
 
-            if self.strict_django_repair and self.generate is not None and self.feedback_loop is None:
+            if (
+                self.strict_django_repair
+                and self.generate is not None
+                and self.feedback_loop is None
+            ):
                 return await self._run_django_strict_repair(
-                    validated_prd, validated_target, project, written_files,
-                    diagnostics, setup_result, test_result,
+                    validated_prd,
+                    validated_target,
+                    project,
+                    written_files,
+                    diagnostics,
+                    setup_result,
+                    test_result,
                 )
 
-            feedback_result = await (self.feedback_loop or ErrorFeedbackLoop(
-                self.workspace_root,
-                search=self.search,
-                session_logger=self.session_logger,
-            )).run(validated_target)
+            feedback_result = await (
+                self.feedback_loop
+                or ErrorFeedbackLoop(
+                    self.workspace_root,
+                    search=self.search,
+                    session_logger=self.session_logger,
+                )
+            ).run(validated_target)
             return self._result(
                 validated_prd,
                 validated_target,
@@ -222,7 +246,9 @@ class FullDjangoPipeline:
             path = Path(prd_path)
             target = self.sandbox.validate(target_dir or ".")
             self._log("workflow.failed", {"error": str(exc)}, "Full Django pipeline failed")
-            return FullPipelineResult(prd_path=path, target_dir=target, success=False, error=str(exc))
+            return FullPipelineResult(
+                prd_path=path, target_dir=target, success=False, error=str(exc)
+            )
 
     def _validate_prd(self, prd_path: Path | str) -> Path:
         path = self.sandbox.validate(prd_path)
@@ -262,7 +288,11 @@ class FullDjangoPipeline:
         )
         self._log(
             "workflow.failed",
-            {"project": project.project_name, "strategy": "freeform", "reason": "templates_disabled"},
+            {
+                "project": project.project_name,
+                "strategy": "freeform",
+                "reason": "templates_disabled",
+            },
             "Template routing disabled and no generator wired",
         )
         return FullPipelineResult(
@@ -304,7 +334,9 @@ class FullDjangoPipeline:
             preview_url=outcome.preview_url,
             success=outcome.success,
             error=outcome.error,
-            prd_checklist=build_prd_checklist(getattr(project, "prd_contract", None), outcome.target_dir),
+            prd_checklist=build_prd_checklist(
+                getattr(project, "prd_contract", None), outcome.target_dir
+            ),
         )
         event_type = "workflow.finished" if result.success else "workflow.failed"
         self._log(
@@ -374,7 +406,12 @@ class FullDjangoPipeline:
         file, then verify + strict-repair. Runs in a worker thread so the sync
         `generate` can drive the model."""
         generator = FreeformGenerator(
-            self.workspace_root, self.generate, session_logger=self.session_logger
+            self.workspace_root,
+            self.generate,
+            session_logger=self.session_logger,
+            approval_func=self.approval_func,
+            prd_path=prd_path,
+            user_request=self.user_request or f"Build the complete project from {prd_path.name}",
         )
         outcome: FreeformRunResult = await asyncio.to_thread(generator.run, project, target_dir)
         result = FullPipelineResult(
@@ -385,7 +422,9 @@ class FullDjangoPipeline:
             diagnostics=[],
             success=outcome.success,
             error=outcome.error,
-            prd_checklist=build_prd_checklist(getattr(project, "prd_contract", None), outcome.target_dir),
+            prd_checklist=build_prd_checklist(
+                getattr(project, "prd_contract", None), outcome.target_dir
+            ),
         )
         event_type = "workflow.finished" if result.success else "workflow.failed"
         self._log(
@@ -420,7 +459,8 @@ class FullDjangoPipeline:
         reports Django setup failed rather than looping here.
         """
         self._log(
-            "workflow.retrying", {"target_dir": str(target_dir)},
+            "workflow.retrying",
+            {"target_dir": str(target_dir)},
             "Django setup failed; attempting one bugfix-and-retry pass",
         )
         fix = await BugFixWorkflow(
@@ -462,9 +502,12 @@ class FullDjangoPipeline:
             session_logger=self.session_logger,
         )
         failures = dod_result.required_failures
+        unverified = dod_result.required_unverified
         error = ""
         if failures:
             error = "Required DoD failed: " + ", ".join(failure.item_id for failure in failures)
+        elif unverified:
+            error = "Required DoD unverified: " + ", ".join(item.item_id for item in unverified)
         result = FullPipelineResult(
             prd_path=prd_path,
             target_dir=scaffold.target_dir,
@@ -473,7 +516,7 @@ class FullDjangoPipeline:
             diagnostics=[],
             dod_result=dod_result,
             preview_url=entry.manifest.preview_url,
-            success=not failures,
+            success=not failures and not unverified,
             error=error,
         )
         event_type = "workflow.finished" if result.success else "workflow.failed"
@@ -485,6 +528,7 @@ class FullDjangoPipeline:
                 "target_dir": str(scaffold.target_dir),
                 "written_files": scaffold.copied_files,
                 "dod_required_failures": [failure.item_id for failure in failures],
+                "dod_required_unverified": [item.item_id for item in unverified],
                 "success": result.success,
                 "error": error,
             },
@@ -544,4 +588,6 @@ class FullDjangoPipeline:
 
     def _log(self, event_type: str, payload: dict, summary: str) -> None:
         if self.session_logger:
-            self.session_logger.log(event_type, payload, summary, workflow_id="full-django-pipeline")
+            self.session_logger.log(
+                event_type, payload, summary, workflow_id="full-django-pipeline"
+            )

@@ -33,9 +33,9 @@ def test_select_evicts_oldest_and_snaps_to_user_boundary():
     state.append_user("u2 c d e")     # 4
     state.append_assistant("a2 y z")  # 3
 
-    # Budget 8 admits a2(3)+u2(4)=7 but not a1(2) on top; cut lands on u2, a
+    # Budget 9 minus sys(1) admits a2(3)+u2(4)=7 but not a1(2) on top; cut lands on u2, a
     # user boundary, so the tail starts cleanly at u2.
-    tail, start_abs = state.select_for_budget(8, _wc)
+    tail, start_abs = state.select_for_budget(9, _wc)
 
     assert start_abs == 3
     assert [m.role for m in tail] == ["user", "assistant"]

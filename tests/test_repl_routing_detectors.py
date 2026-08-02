@@ -33,8 +33,22 @@ from shamsu.cli.repl import (
     _looks_like_workspace_files_prompt,
     _looks_like_workspace_location_prompt,
     _looks_like_workspace_prd_request,
+    _prd_target_directory,
+    _resolve_build_prd,
 )
 from shamsu.types import RoutingDecision
+
+
+def test_prd_target_directory_accepts_quoted_folder_name():
+    project = type("Project", (), {"project_name": "fallback"})()
+
+    assert (
+        _prd_target_directory(
+            "Build it inside a new folder named `canvas-lite-universal-build-2026-08-01`.",
+            project,
+        )
+        == "canvas-lite-universal-build-2026-08-01"
+    )
 
 
 def test_direct_file_write_handoff_includes_skills_and_append_tool(
@@ -184,6 +198,35 @@ def test_explicit_backtick_command_is_not_replaced_by_inference(tmp_path: Path):
     assert _classify_route_label(prompt, tmp_path) == "command.run"
 
 
+def test_explicit_single_quoted_command_is_not_replaced_by_named_source_file(tmp_path: Path):
+    (tmp_path / "backend/core").mkdir(parents=True)
+    (tmp_path / "backend/core/models.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    prompt = (
+        "Read 'backend/core/models.py', update the failing test, then run "
+        "'python manage.py test' from the backend directory."
+    )
+
+    assert _command_for_existing_script_request(prompt, tmp_path) == "python manage.py test"
+    assert _classify_route_label(prompt, tmp_path) == "composite"
+
+
+def test_explicit_react_edit_keeps_read_edit_verify_contract_atomic(tmp_path: Path):
+    (tmp_path / "backend/core/tests").mkdir(parents=True)
+    (tmp_path / "backend/core/tests/test_canvas.py").write_text("OLD = True\n", encoding="utf-8")
+    prompt = (
+        "Fix one issue through the ReAct tool loop. Read 'backend/core/models.py' and the "
+        "canonical file 'backend/core/tests/test_canvas.py'. Update only the canonical file, "
+        "then run 'python manage.py test' and repair it until the command passes."
+    )
+
+    assert _classify_route_label(prompt, tmp_path) == "file.write"
+    handoff, plan = _direct_file_write_handoff(prompt, tmp_path)
+    assert plan.mode == "code_edit"
+    assert plan.target_files == ["backend/core/tests/test_canvas.py"]
+    assert "python manage.py test" in handoff
+
+
 def test_explicit_command_outside_the_runner_allowlist_stands_down(tmp_path: Path):
     """An explicit command that names no known runner is not executed by the
     deterministic path; it falls through to the fully gated agent loop."""
@@ -317,6 +360,12 @@ def test_direct_code_request(text, expected):
 def test_prd_path_extraction_and_dependent_detectors():
     # Path extraction underpins the PRD-plan / django-generation detectors.
     assert _extract_prd_path_from_prompt("plan from spec.md") == "spec.md"
+    assert (
+        _extract_prd_path_from_prompt("build from `requirements/Product Brief.pdf`")
+        == "requirements/Product Brief.pdf"
+    )
+    assert _extract_prd_path_from_prompt('summarize @"docs/Release Notes.txt"') == "docs/Release Notes.txt"
+    assert _extract_prd_path_from_prompt("read @docs/spec.md") == "docs/spec.md"
     assert _extract_prd_path_from_prompt("no path here") == ""
 
     # prd plan: phrase AND a PRD path required.
@@ -393,6 +442,32 @@ def test_prd_build_accepts_a_directly_named_spec(tmp_path: Path):
     assert _looks_like_prd_build_request("build the app from spec.md", workspace) is True
     # ...but only when that named doc actually exists.
     assert _looks_like_prd_build_request("build the app from missing.md", workspace) is False
+
+
+def test_prd_build_resolves_a_quoted_relative_spec_with_spaces(tmp_path: Path):
+    docs = tmp_path / "requirements"
+    docs.mkdir()
+    spec = docs / "Product Brief.pdf"
+    spec.write_bytes(b"%PDF-1.4 routing fixture")
+    prompt = "Build the complete application from `requirements/Product Brief.pdf`."
+
+    assert _resolve_build_prd(prompt, tmp_path) == spec
+    assert _looks_like_prd_build_request(prompt, tmp_path) is True
+
+
+def test_prd_build_accepts_a_mentioned_pdf_without_prd_wording(tmp_path: Path):
+    """`@canvas lite.pdf` names no PRD phrase, but an @-mentioned PDF in a
+    build prompt IS the requirements document - the 2026-08-01 dogfood needed
+    a rename to CANVAS_LITE_PRD.pdf to route at all."""
+    spec = tmp_path / "canvas lite.pdf"
+    spec.write_bytes(b"%PDF-1.4 routing fixture")
+
+    assert _resolve_build_prd(
+        'build the complete app from @"canvas lite.pdf"', tmp_path
+    ) == spec
+    assert _resolve_build_prd(
+        "build the complete app from @canvas lite.pdf", tmp_path
+    ) == spec
 
 
 @pytest.mark.parametrize(
@@ -509,3 +584,24 @@ def test_investigative_guard_leaves_non_code_intents_alone():
         "is there a bug in divide?", _mutating_decision("generate")
     )
     assert decision.intent == "generate"
+
+
+def test_plan_route_resolves_an_unquoted_spaced_mention(tmp_path: Path):
+    """Live 2026-08-02: `plan ... @canvas lite.pdf` reached the agent as "Read
+    lite.pdf", a file that does not exist, so the turn stopped to ask what that
+    document was. The plan prompt must name the real resolved path."""
+    from shamsu.cli.repl import _resolved_prd_reference
+
+    spec = tmp_path / "canvas lite.pdf"
+    spec.write_bytes(b"%PDF-1.4 fixture")
+
+    assert _resolved_prd_reference(
+        "plan a web app based on @canvas lite.pdf", tmp_path
+    ) == "canvas lite.pdf"
+
+
+def test_plan_route_falls_back_to_the_raw_token_when_nothing_resolves(tmp_path: Path):
+    from shamsu.cli.repl import _resolved_prd_reference
+
+    assert _resolved_prd_reference("plan the app from missing.md", tmp_path) == "missing.md"
+    assert _resolved_prd_reference("plan the app", tmp_path) == "the PRD"

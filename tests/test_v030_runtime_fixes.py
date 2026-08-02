@@ -189,7 +189,7 @@ def test_prose_promise_forces_tool_call(tmp_path):
     assert len(client.messages_seen) >= 2
 
 
-# --- E. greenfield PRD build creates html/css/js; never reads missing files -
+# --- E. greenfield PRD build delegates html/css/js authoring to ReAct --------
 
 
 def test_greenfield_prd_html_css_js(tmp_path, monkeypatch):
@@ -211,12 +211,47 @@ def test_greenfield_prd_html_css_js(tmp_path, monkeypatch):
     monkeypatch.setattr(repl, "parse_prd_file", _fake_parse)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *a, **k: None)
 
-    agent_calls: list[str] = []
+    agent_calls: list[tuple[str, dict]] = []
 
     async def _fake_agent_chat(user_input, workspace, console, **kwargs):
-        agent_calls.append(user_input)
+        agent_calls.append((user_input, kwargs))
+        project_root = kwargs["allowed_write_paths"][0]
+        root = tmp_path / project_root
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "index.html").write_text(
+            '<link rel="stylesheet" href="style.css"><script src="script.js"></script>',
+            encoding="utf-8",
+        )
+        (root / "style.css").write_text("body { margin: 0; }\n", encoding="utf-8")
+        (root / "script.js").write_text("export const notes = [];\n", encoding="utf-8")
+        return SimpleNamespace(
+            changed_files=[
+                f"{project_root}/index.html",
+                f"{project_root}/style.css",
+                f"{project_root}/script.js",
+            ],
+            stopped=False,
+            awaiting_user=False,
+            final="done",
+        )
+
+    async def _fake_verify(*_args, **_kwargs):
+        return "verified", {
+            "status": "verified",
+            "verified": True,
+            "unverifiable": False,
+            "exit_code": 0,
+            "command": "static-check",
+            "files": [],
+            "summary": "Verification passed.",
+        }
+
+    async def _fake_final(*_args, **_kwargs):
+        return True
 
     monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent_chat)
+    monkeypatch.setattr(repl, "_verify_prd_milestone", _fake_verify)
+    monkeypatch.setattr(repl, "_verify_completed_plan", _fake_final)
 
     asyncio.run(
         repl._handle_prd_build_request(
@@ -226,14 +261,15 @@ def test_greenfield_prd_html_css_js(tmp_path, monkeypatch):
 
     # The PDF PRD was read/extracted.
     assert prd_file in read_paths
-    # The three frontend files were created deterministically (not assumed).
+    project_root = agent_calls[0][1]["allowed_write_paths"][0]
+    root = tmp_path / project_root
+    # The simulated ReAct tool loop, not a deterministic scaffold, authored the files.
     for name in ("index.html", "style.css", "script.js"):
-        assert (tmp_path / name).exists(), f"{name} should have been created"
-    index = (tmp_path / "index.html").read_text(encoding="utf-8")
+        assert (root / name).exists(), f"{name} should have been created"
+    index = (root / "index.html").read_text(encoding="utf-8")
     assert "style.css" in index and "script.js" in index
-    # The agent was then asked to EXTEND the created files, not read missing ones.
-    assert agent_calls, "the agent should be invoked to flesh out the files"
-    assert "EXTEND" in agent_calls[0]
+    assert "Project root:" in agent_calls[0][0]
+    assert "## Active SHAMSU Skills" in agent_calls[0][0]
 
 
 # --- F. plan-prd does not fall back to a generic Django project -------------

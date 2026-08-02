@@ -97,7 +97,9 @@ def _parsed_prd() -> ParsedPRD:
 def test_prd_brief_is_compact_not_raw_text():
     parsed = _parsed_prd()
     brief = _prd_brief(parsed)
-    assert "PRD contract" in brief
+    # Rendered from the extracted contract, not by dumping the document.
+    assert "Product: Pong" in brief
+    assert "Kind: game" in brief
     assert len(brief) < len(parsed.raw_text) // 2  # much smaller than the raw PRD
 
 
@@ -116,19 +118,41 @@ def test_milestone_request_uses_brief_and_checklist_not_raw_text():
     assert parsed.raw_text not in req
 
 
-def test_compiled_prd_milestones_are_feature_flagged(monkeypatch):
+def test_compiled_prd_milestones_are_automatic_only_for_complex_projects(monkeypatch):
     parsed = parse_prd_text(
         "# Demo\n\n## Features\n- Search tasks\n\n## Acceptance\n- `npm test` exits 0.\n",
         markdown=True,
     )
 
     monkeypatch.delenv("SHAMSU_MILESTONE_EXECUTOR", raising=False)
-    disabled, disabled_source = _prd_milestones_for_execution(parsed)
-    assert disabled == []
-    assert disabled_source == "disabled"
+    simple, simple_source = _prd_milestones_for_execution(parsed)
+    assert simple == []
+    assert simple_source == "simple_project"
 
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     milestones, source = _prd_milestones_for_execution(parsed)
     assert source == "compiled_requirement_ledger"
     assert any(item.startswith("M-002") for item in milestones)
     assert any(item.startswith("M-004") for item in milestones)
+
+    monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "0")
+    disabled, disabled_source = _prd_milestones_for_execution(parsed)
+    assert disabled == []
+    assert disabled_source == "disabled"
+
+
+def test_complex_full_stack_prd_compiles_milestones_by_default(monkeypatch):
+    monkeypatch.delenv("SHAMSU_MILESTONE_EXECUTOR", raising=False)
+    parsed = parse_prd_text(
+        "# Portal\n\n## Overview\nA full-stack web application.\n\n"
+        "## Entities\n- **Workspace**: name (text), owner (FK to User)\n\n"
+        "## Authentication\n- Users log in.\n\n"
+        "## Features\n- Members manage workspaces.\n\n"
+        "## Acceptance\n- The production build passes.\n",
+        markdown=True,
+    )
+
+    milestones, source = _prd_milestones_for_execution(parsed)
+
+    assert source == "compiled_requirement_ledger"
+    assert len(milestones) >= 2

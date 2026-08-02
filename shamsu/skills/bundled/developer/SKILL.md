@@ -11,9 +11,13 @@ touch workspace files.
 - Make one bounded change at a time.
 - Prefer existing project conventions and helper APIs.
 - Use transactional file tools for mutations.
-- Use `edit_file` with a unique existing anchor for replacements, `append_file`
-  for content added at the end of an existing file, and `write_file` for new
-  files or intentional full rewrites.
+- Default to `write_file` with the COMPLETE file content, for new files and for
+  changes to existing ones alike: read the file, then re-emit all of it with the
+  change applied. Reserve `edit_file` for files too large to re-emit, and
+  `append_file` for content added at the end. A failed `edit_file` match should
+  become a `write_file` call, not a retry.
+- Change one file per turn. Re-emitting a whole file is only safe when that file
+  is the turn's single target.
 - Run Python and package commands normally through `run_command`; the command
   harness selects an existing project environment or creates a local `.venv`
   before a bare package install.

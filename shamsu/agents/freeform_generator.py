@@ -13,20 +13,37 @@ Trust boundaries:
   - Every write is transaction-backed and path-sandboxed; the strict RepairLoop
     handles failures with rollback.
 """
+
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Callable, Protocol
 
 from json_repair import repair_json
 
 from shamsu.action_ledger.context import get_current_run
+from shamsu.patch.rollback import rollback_transaction
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.prd.contract import PRDContract
+from shamsu.prd.execution import (
+    COMPLETED_STATUSES,
+    checkpoint_milestone,
+    initialize_prd_execution,
+    mark_milestone_running,
+    record_milestone_repair,
+    record_milestone_rollback,
+)
+from shamsu.prd.requirements import (
+    MilestoneRecord,
+    RequirementLedger,
+    compile_requirement_ledger,
+    is_complex_prd_contract,
+)
 from shamsu.repair.prompt import enforce_final_response
 from shamsu.repair.types import RepairResult
 from shamsu.safety.sandbox import Sandbox
@@ -38,7 +55,7 @@ from shamsu.skills.selector import (
 )
 from shamsu.skills.types import SkillSelection
 from shamsu.tools.executor import CommandRunner
-from shamsu.types import ProjectSpec
+from shamsu.types import ApprovalRequest, ProjectSpec
 from shamsu.verify.gate import (
     AcceptanceCheck,
     VerifyOutcome,
@@ -50,6 +67,8 @@ from shamsu.verify.gate import (
 _MAX_FILES = 30
 _BUILD_TIMEOUT_SECONDS = 600
 _GENERATION_TIMEOUT_SECONDS = 900
+_MAX_BUNDLE_FILES = 3
+_MAX_BUNDLE_ATTEMPTS = 2
 _CONVENTIONAL_EXTENSIONLESS = {
     "dockerfile",
     "makefile",
@@ -90,9 +109,7 @@ _EXTENSIONLESS_FILE_REWRITES = {
     "theme": ".css",
     "tsconfig": ".json",
 }
-_REGENERATE_SOURCE_EXTENSIONS = frozenset(
-    {".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css"}
-)
+_REGENERATE_SOURCE_EXTENSIONS = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".html", ".css"})
 _PYTHON_CLI_COMMANDS = ("seed", "add", "list", "summary", "export")
 _PYTHON_CLI_RESERVED_OPTIONS = {"db", "out", "help"}
 
@@ -116,6 +133,24 @@ FILE_CONTENT_SCHEMA: dict = {
     "type": "object",
     "properties": {"content": {"type": "string"}},
     "required": ["content"],
+}
+
+FILE_BUNDLE_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "files": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        }
+    },
+    "required": ["files"],
 }
 
 PLAN_SYSTEM = """You are SHAMSU planning a small project from a PRD, from scratch (no template).
@@ -148,6 +183,17 @@ Rules:
   quoted string.
 - For CLIs, implement the exact acceptance command syntax. If an option appears
   after a subcommand, accept it there; do not put it only on the root parser.
+"""
+
+BUNDLE_SYSTEM = """You are SHAMSU implementing ONE small milestone of a project.
+Output ONLY JSON: {"files": [{"path": string, "content": string}]}.
+Rules:
+- Return every requested path exactly once and no other paths.
+- Each content value is the complete file, not a patch or Markdown fence.
+- Keep imports, exports, routes, schemas, and commands consistent with the full file plan.
+- Implement only the supplied milestone requirements while preserving stated interfaces.
+- Finish every file. Never truncate JSON, source strings, functions, or expressions.
+- No prose outside the JSON.
 """
 
 REPAIR_FILE_SYSTEM = """You are SHAMSU repairing ONE generated source file after verification failed.
@@ -198,6 +244,22 @@ class FreeformRunResult:
     error: str = ""
 
 
+@dataclass(frozen=True)
+class BundleApplyResult:
+    ok: bool
+    paths: tuple[str, ...] = ()
+    transaction_id: str = ""
+    error: str = ""
+    rolled_back: bool = False
+
+
+@dataclass
+class MilestoneExecutionContext:
+    root: Path
+    state: dict[str, Any]
+    ledger: RequirementLedger
+
+
 class FreeformGenerator:
     def __init__(
         self,
@@ -210,6 +272,9 @@ class FreeformGenerator:
         max_files: int = _MAX_FILES,
         build_timeout: int = _BUILD_TIMEOUT_SECONDS,
         generation_timeout: int = _GENERATION_TIMEOUT_SECONDS,
+        approval_func: Callable[[ApprovalRequest], bool] | None = None,
+        prd_path: Path | str | None = None,
+        user_request: str = "",
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.generate = generate
@@ -219,10 +284,14 @@ class FreeformGenerator:
         self.max_files = max_files
         self.build_timeout = build_timeout
         self.generation_timeout = generation_timeout
+        self.approval_func = approval_func or (lambda _request: True)
+        self.prd_path = Path(prd_path) if prd_path else None
+        self.user_request = user_request.strip()
         self.sandbox = Sandbox(self.workspace_root)
         self.transactions = TransactionWorkspace(self.workspace_root)
         self._skill_selection: SkillSelection | None = None
         self._skill_context = ""
+        self._milestone_context: MilestoneExecutionContext | None = None
 
     def run(self, project: ProjectSpec, target_dir: Path | str) -> FreeformRunResult:
         contract: PRDContract | None = getattr(project, "prd_contract", None)
@@ -230,8 +299,12 @@ class FreeformGenerator:
         target.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.generation_timeout
         self._prepare_generation_skills(project, contract)
+        self._milestone_context = self._prepare_milestone_execution(contract)
 
-        plan = self._plan(contract)
+        plan = self._plan(
+            contract,
+            self._milestone_context.ledger if self._milestone_context is not None else None,
+        )
         if plan is None or not plan.files:
             return FreeformRunResult(
                 target_dir=target,
@@ -241,10 +314,32 @@ class FreeformGenerator:
             )
         self._log(
             "freeform.plan_created",
-            {"stack": plan.stack, "file_count": len(plan.files), "files": [file.path for file in plan.files]},
+            {
+                "stack": plan.stack,
+                "file_count": len(plan.files),
+                "files": [file.path for file in plan.files],
+            },
         )
 
-        written = self._generate_files(contract, plan, target, deadline)
+        if self._milestone_context is not None:
+            written, generation_error = self._generate_milestone_files(
+                contract,
+                plan,
+                target,
+                deadline,
+                self._milestone_context,
+            )
+            if generation_error:
+                return FreeformRunResult(
+                    target_dir=target,
+                    stack=plan.stack,
+                    written_files=written,
+                    success=False,
+                    final_message=generation_error,
+                    error=generation_error,
+                )
+        else:
+            written = self._generate_files(contract, plan, target, deadline)
         written = self._harden_generated_project(contract, plan, target, written)
         if not written:
             return FreeformRunResult(
@@ -272,7 +367,7 @@ class FreeformGenerator:
                 f"Generated {len(written)} file(s) from the PRD, but no build verifier is "
                 f"available for stack '{plan.stack or 'unknown'}', so this is UNVERIFIED."
             )
-            return FreeformRunResult(
+            result = FreeformRunResult(
                 target_dir=target,
                 stack=plan.stack,
                 written_files=written,
@@ -281,10 +376,12 @@ class FreeformGenerator:
                 final_message=msg,
                 error="no verifier for stack",
             )
+            self._checkpoint_final_verification(result)
+            return result
 
         repair_result = verification.repair_result
         success = verification.verified
-        if not success:
+        if not success and self._milestone_context is None:
             regenerated = (
                 self._regenerate_failed_source_file(
                     contract,
@@ -309,7 +406,7 @@ class FreeformGenerator:
                 success = verification.verified
         exit_code = verification.exit_code if verification.exit_code is not None else 1
         final_message = enforce_final_response(verification.summary, exit_code)
-        return FreeformRunResult(
+        result = FreeformRunResult(
             target_dir=target,
             stack=plan.stack,
             written_files=written,
@@ -321,6 +418,8 @@ class FreeformGenerator:
             final_message=final_message,
             error="" if success else f"Build/verify failed (exit code {exit_code}).",
         )
+        self._checkpoint_final_verification(result)
+        return result
 
     # -- helpers ---------------------------------------------------------------
 
@@ -344,7 +443,11 @@ class FreeformGenerator:
             written,
             generate=self.generate,
             command_runner=runner,
-            max_attempts=self.max_repair_attempts,
+            max_attempts=(
+                min(self.max_repair_attempts, _MAX_BUNDLE_ATTEMPTS)
+                if self._milestone_context is not None
+                else self.max_repair_attempts
+            ),
             stack=stack,
             stack_hint=(contract.stack_hint if contract is not None else ""),
             session_logger=self.session_logger,
@@ -409,11 +512,22 @@ class FreeformGenerator:
                 self._log("freeform.repair_regenerated_file", {"path": path})
         return changed
 
-    def _plan(self, contract: PRDContract | None) -> GenerationPlan | None:
+    def _plan(
+        self,
+        contract: PRDContract | None,
+        ledger: RequirementLedger | None = None,
+    ) -> GenerationPlan | None:
         brief = contract.render_brief() if contract is not None else "(no PRD contract)"
+        milestone_text = ""
+        if ledger is not None:
+            milestone_text = "\n\n## Compiled milestones\n" + "\n".join(
+                f"- {item.id}: {item.title} ({len(item.requirement_ids)} requirements)"
+                for item in ledger.milestones
+            )
         prompt = (
             f"{brief}\n\n"
             f"{self._generation_skill_prompt()}"
+            f"{milestone_text}\n\n"
             "## Task\nProduce the minimal file plan (JSON) to build and run this "
             "project from scratch."
         )
@@ -433,7 +547,9 @@ class FreeformGenerator:
                 files.append(PlannedFile(path=path, purpose=str(item.get("purpose") or "")))
         stack = str(data.get("stack") or "").strip()
         if not stack and contract is not None:
-            stack = ", ".join(contract.required_stack or ([contract.stack_hint] if contract.stack_hint else []))
+            stack = ", ".join(
+                contract.required_stack or ([contract.stack_hint] if contract.stack_hint else [])
+            )
         normalized = _normalize_planned_files(files)
         normalized = _ensure_required_test_plan(
             normalized,
@@ -479,6 +595,435 @@ class FreeformGenerator:
             self._log("freeform.file_written", {"path": planned.path})
         return written
 
+    def _prepare_milestone_execution(
+        self,
+        contract: PRDContract | None,
+    ) -> MilestoneExecutionContext | None:
+        if contract is None or self.prd_path is None or not _milestone_executor_enabled():
+            return None
+        ledger = compile_requirement_ledger(contract)
+        if not is_complex_prd_contract(contract, ledger):
+            return None
+        request = self.user_request or f"Build project from PRD {self.prd_path.name}"
+        root, state = initialize_prd_execution(
+            self.workspace_root,
+            request,
+            contract,
+            prd_path=str(self.prd_path),
+        )
+        self._log(
+            "freeform.milestone_execution_started",
+            {
+                "contract_hash": ledger.contract_hash,
+                "milestone_count": len(ledger.milestones),
+                "execution_root": str(root),
+            },
+        )
+        return MilestoneExecutionContext(root=root, state=state, ledger=ledger)
+
+    def _generate_milestone_files(
+        self,
+        contract: PRDContract | None,
+        plan: GenerationPlan,
+        target: Path,
+        deadline: float,
+        context: MilestoneExecutionContext,
+    ) -> tuple[list[str], str]:
+        assignments = _assign_files_to_milestones(
+            plan.files[: self.max_files],
+            context.ledger.milestones,
+        )
+        written: list[str] = []
+        requirements = {item.id: item for item in context.ledger.requirements}
+        statuses = {
+            str(item.get("id") or ""): str(item.get("status") or "pending")
+            for item in context.state.get("milestones", [])
+            if isinstance(item, dict)
+        }
+
+        for milestone in context.ledger.milestones:
+            files = assignments.get(milestone.id, [])
+            if not files:
+                self._log(
+                    "freeform.milestone_deferred",
+                    {"milestone_id": milestone.id, "reason": "no dedicated planned files"},
+                )
+                continue
+            existing = [item.path for item in files if (target / item.path).is_file()]
+            if statuses.get(milestone.id) in COMPLETED_STATUSES and len(existing) == len(files):
+                written.extend(existing)
+                self._log(
+                    "freeform.milestone_resumed",
+                    {"milestone_id": milestone.id, "files": existing},
+                )
+                continue
+
+            chunks = [
+                files[index : index + _MAX_BUNDLE_FILES]
+                for index in range(0, len(files), _MAX_BUNDLE_FILES)
+            ]
+            milestone_written: list[str] = []
+            context.state = mark_milestone_running(
+                context.root,
+                context.state,
+                milestone.id,
+            )
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                if time.monotonic() >= deadline:
+                    return written, f"Generation deadline reached during milestone {milestone.id}."
+                applied: BundleApplyResult | None = None
+                last_error = "bundle generation failed"
+                split_fallback_used = False
+                for attempt in range(1, _MAX_BUNDLE_ATTEMPTS + 1):
+                    contents, error = self._generate_file_bundle(
+                        plan,
+                        milestone,
+                        chunk,
+                        requirements,
+                        attempt=attempt,
+                        prior_error=last_error if attempt > 1 else "",
+                    )
+                    if contents is None:
+                        last_error = error
+                        context.state = record_milestone_repair(
+                            context.root,
+                            context.state,
+                            milestone.id,
+                            attempt=attempt,
+                            phase="bundle_generation",
+                            status="rejected",
+                            message=error,
+                        )
+                        if attempt == 1 and len(chunk) > 1:
+                            split_contents: dict[str, str] = {}
+                            split_errors: list[str] = []
+                            for item in chunk:
+                                item_contents, item_error = self._generate_file_bundle(
+                                    plan,
+                                    milestone,
+                                    [item],
+                                    requirements,
+                                    attempt=_MAX_BUNDLE_ATTEMPTS,
+                                    prior_error=(
+                                        f"{error}. Generate only {item.path} in this retry."
+                                    ),
+                                )
+                                if item_contents is None:
+                                    split_errors.append(f"{item.path}: {item_error}")
+                                else:
+                                    split_contents.update(item_contents)
+                            split_fallback_used = True
+                            if not split_errors:
+                                contents = split_contents
+                                self._log(
+                                    "freeform.bundle_split_recovered",
+                                    {
+                                        "milestone_id": milestone.id,
+                                        "chunk_index": chunk_index,
+                                        "files": [item.path for item in chunk],
+                                    },
+                                )
+                            else:
+                                last_error = "split bundle fallback failed (" + "; ".join(
+                                    split_errors
+                                ) + ")"
+                                context.state = record_milestone_repair(
+                                    context.root,
+                                    context.state,
+                                    milestone.id,
+                                    attempt=_MAX_BUNDLE_ATTEMPTS,
+                                    phase="bundle_generation",
+                                    status="rejected",
+                                    message=last_error,
+                                )
+                                break
+                        if contents is None:
+                            continue
+                    applied = self._apply_file_bundle(
+                        target,
+                        contents,
+                        milestone_id=milestone.id,
+                        chunk_index=chunk_index,
+                    )
+                    if not applied.ok:
+                        last_error = applied.error
+                        if applied.transaction_id:
+                            context.state = record_milestone_rollback(
+                                context.root,
+                                context.state,
+                                milestone.id,
+                                phase="finished",
+                                status="rolled_back" if applied.rolled_back else "rollback_failed",
+                                transaction_ids=[applied.transaction_id],
+                                restored_files=[item.path for item in chunk]
+                                if applied.rolled_back
+                                else [],
+                                failed_transactions=[]
+                                if applied.rolled_back
+                                else [{"transaction_id": applied.transaction_id}],
+                                policy=milestone.rollback_policy,
+                                message=applied.error,
+                            )
+                        if "approval denied" in applied.error.lower():
+                            break
+                        context.state = record_milestone_repair(
+                            context.root,
+                            context.state,
+                            milestone.id,
+                            attempt=attempt,
+                            phase="bundle_apply",
+                            status="failed",
+                            message=applied.error,
+                        )
+                        if split_fallback_used:
+                            break
+                        continue
+                    structural_error = _validate_written_bundle(target, applied.paths)
+                    if not structural_error:
+                        break
+                    ok, rollback_message = rollback_transaction(
+                        self.workspace_root,
+                        applied.transaction_id,
+                    )
+                    context.state = record_milestone_rollback(
+                        context.root,
+                        context.state,
+                        milestone.id,
+                        phase="finished",
+                        status="rolled_back" if ok else "rollback_failed",
+                        transaction_ids=[applied.transaction_id],
+                        restored_files=list(applied.paths) if ok else [],
+                        failed_transactions=[]
+                        if ok
+                        else [{"transaction_id": applied.transaction_id}],
+                        policy=milestone.rollback_policy,
+                        message=rollback_message,
+                    )
+                    last_error = structural_error
+                    applied = None
+                    context.state = record_milestone_repair(
+                        context.root,
+                        context.state,
+                        milestone.id,
+                        attempt=attempt,
+                        phase="structural_verification",
+                        status="failed",
+                        message=structural_error,
+                    )
+                    if split_fallback_used:
+                        break
+                if applied is None or not applied.ok:
+                    message = (
+                        f"Milestone {milestone.id} stopped after {_MAX_BUNDLE_ATTEMPTS} bounded "
+                        f"bundle attempt(s): {last_error}"
+                    )
+                    context.state = checkpoint_milestone(
+                        context.root,
+                        context.state,
+                        milestone.id,
+                        changed_files=milestone_written,
+                        evidence=[last_error],
+                        status="failed",
+                        message=message,
+                    )
+                    return list(dict.fromkeys([*written, *milestone_written])), message
+                milestone_written.extend(applied.paths)
+
+            written.extend(milestone_written)
+            context.state = checkpoint_milestone(
+                context.root,
+                context.state,
+                milestone.id,
+                changed_files=milestone_written,
+                evidence=["validated structured bundle", "atomic transaction applied"],
+                status="implemented",
+                message=f"Applied {len(milestone_written)} file(s) for {milestone.id}.",
+            )
+        return list(dict.fromkeys(written)), ""
+
+    def _generate_file_bundle(
+        self,
+        plan: GenerationPlan,
+        milestone: MilestoneRecord,
+        files: list[PlannedFile],
+        requirements: dict[str, Any],
+        *,
+        attempt: int,
+        prior_error: str,
+    ) -> tuple[dict[str, str] | None, str]:
+        requirement_lines = [
+            f"- {requirement_id}: {requirements[requirement_id].text}"
+            for requirement_id in milestone.requirement_ids
+            if requirement_id in requirements
+        ]
+        full_plan = "\n".join(f"- {item.path}: {item.purpose}" for item in plan.files)
+        requested = "\n".join(f"- {item.path}: {item.purpose}" for item in files)
+        retry = f"\n## Previous rejection\n{prior_error}\n" if prior_error else ""
+        prompt = (
+            f"## Stack\n{plan.stack or 'unspecified'}\n\n"
+            f"## Milestone\n{milestone.id}: {milestone.title}\n\n"
+            f"## Requirement capsule\n{chr(10).join(requirement_lines) or '- Preserve project interfaces'}\n\n"
+            f"## Full file plan\n{full_plan}\n\n"
+            f"## Files required in this bundle\n{requested}\n"
+            f"{retry}\n"
+            f"## Attempt\n{attempt} of {_MAX_BUNDLE_ATTEMPTS}\n\n"
+            "## Task\nReturn one JSON bundle containing every requested file exactly once."
+        )
+        try:
+            raw = self.generate(BUNDLE_SYSTEM, prompt, FILE_BUNDLE_SCHEMA)
+        except TimeoutError:
+            return None, "model timed out while generating the structured bundle"
+        except Exception as exc:
+            return None, f"model bundle generation failed: {type(exc).__name__}"
+        expected = [item.path for item in files]
+        return _validated_bundle(raw or "", expected)
+
+    def _apply_file_bundle(
+        self,
+        target: Path,
+        contents: dict[str, str],
+        *,
+        milestone_id: str,
+        chunk_index: int,
+    ) -> BundleApplyResult:
+        prepared, error = _prepare_bundle_paths(self.workspace_root, target, contents)
+        if error:
+            return BundleApplyResult(ok=False, error=error)
+        paths = tuple(path for path, _file_path, _content, _rel in prepared)
+        request = ApprovalRequest(
+            action_type="file_edit",
+            description=f"Apply {milestone_id} file bundle ({len(paths)} files).",
+            risk_level="medium",
+            preview="\n".join(paths),
+            working_dir=str(target),
+            reason="Milestone generation modifies files inside the selected workspace.",
+            target_paths=list(paths),
+        )
+        if not self.approval_func(request):
+            self._log(
+                "freeform.bundle_denied", {"milestone_id": milestone_id, "files": list(paths)}
+            )
+            return BundleApplyResult(ok=False, error="Bundle approval denied by user.")
+
+        operations = [
+            {
+                "op": "edit_file",
+                "path": rel,
+                "dest_path": "",
+                "reason": f"{milestone_id} structured bundle",
+            }
+            for _path, _file_path, _content, rel in prepared
+        ]
+        reason = f"Freeform: apply {milestone_id} bundle {chunk_index}"
+        transaction_id = self.transactions.begin(
+            reason=reason, operations=operations, destructive=False
+        )
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_mutation_started(transaction_id, reason)
+        try:
+            for _path, _file_path, _content, rel in prepared:
+                self.transactions.backup_file(transaction_id, rel)
+            for _path, file_path, content, _rel in prepared:
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content, encoding="utf-8")
+            for _path, _file_path, _content, rel in prepared:
+                self.transactions.record_after(transaction_id, rel)
+            manifest = self.transactions.finalize(transaction_id, "applied")
+        except Exception as exc:
+            self.transactions.finalize(transaction_id, "failed", error=str(exc))
+            rollback_ok, rollback_message = rollback_transaction(
+                self.workspace_root, transaction_id
+            )
+            final_manifest = self.transactions.load_manifest(transaction_id) or {}
+            if ledger:
+                ledger.log_mutation_finished(
+                    transaction_id,
+                    "rolled_back" if rollback_ok else "failed",
+                    touched_files=[rel for _path, _file_path, _content, rel in prepared],
+                    rollback_available=rollback_ok,
+                    operations=list(final_manifest.get("operations", [])),
+                    before_hashes=dict(final_manifest.get("before_hashes", {})),
+                    after_hashes=dict(final_manifest.get("after_hashes", {})),
+                    backups=dict(final_manifest.get("backups", {})),
+                )
+            self._log(
+                "freeform.bundle_apply_failed",
+                {
+                    "milestone_id": milestone_id,
+                    "transaction_id": transaction_id,
+                    "rollback_ok": rollback_ok,
+                    "error": str(exc),
+                },
+            )
+            return BundleApplyResult(
+                ok=False,
+                transaction_id=transaction_id,
+                error=f"Bundle apply failed: {exc}. {rollback_message}",
+                rolled_back=rollback_ok,
+            )
+        if ledger:
+            ledger.log_mutation_finished(
+                transaction_id,
+                "applied",
+                touched_files=[rel for _path, _file_path, _content, rel in prepared],
+                rollback_available=True,
+                operations=list(manifest.get("operations", [])),
+                before_hashes=dict(manifest.get("before_hashes", {})),
+                after_hashes=dict(manifest.get("after_hashes", {})),
+                backups=dict(manifest.get("backups", {})),
+            )
+        self._log(
+            "freeform.bundle_applied",
+            {
+                "milestone_id": milestone_id,
+                "transaction_id": transaction_id,
+                "files": list(paths),
+            },
+        )
+        return BundleApplyResult(ok=True, paths=paths, transaction_id=transaction_id)
+
+    def _checkpoint_final_verification(self, result: FreeformRunResult) -> None:
+        context = self._milestone_context
+        if context is None:
+            return
+        verification = {
+            "status": "passed" if result.verified else "failed",
+            "verified": result.verified,
+            "unverifiable": not bool(result.verify_command),
+            "exit_code": result.exit_code,
+            "command": result.verify_command,
+            "files": result.written_files,
+            "summary": result.final_message,
+        }
+        if result.verified:
+            for milestone in context.ledger.milestones:
+                context.state = checkpoint_milestone(
+                    context.root,
+                    context.state,
+                    milestone.id,
+                    changed_files=result.written_files,
+                    evidence=[result.verify_command],
+                    status="verified",
+                    message=result.final_message,
+                    verification=verification,
+                )
+            return
+        current = str(context.state.get("current_milestone_id") or "")
+        if not current and context.ledger.milestones:
+            current = context.ledger.milestones[-1].id
+        if current:
+            context.state = checkpoint_milestone(
+                context.root,
+                context.state,
+                current,
+                changed_files=[],
+                evidence=[result.final_message],
+                status="failed",
+                message=result.final_message,
+                verification=verification,
+            )
+
     def _write_project_file(
         self,
         target: Path,
@@ -515,7 +1060,9 @@ class FreeformGenerator:
         rel = file_path.relative_to(self.workspace_root).as_posix()
         transaction_id = self.transactions.begin(
             reason=reason,
-            operations=[{"op": "edit_file", "path": rel, "dest_path": "", "reason": operation_reason}],
+            operations=[
+                {"op": "edit_file", "path": rel, "dest_path": "", "reason": operation_reason}
+            ],
             destructive=False,
         )
         if ledger:
@@ -545,6 +1092,15 @@ class FreeformGenerator:
         target: Path,
         written: list[str],
     ) -> list[str]:
+        if not _deterministic_source_hardeners_enabled():
+            self._log(
+                "freeform.source_hardening_skipped",
+                {
+                    "reason": "source mutations are owned by the ReAct tool loop",
+                    "legacy_opt_in": "SHAMSU_ENABLE_DETERMINISTIC_SOURCE_HARDENERS=1",
+                },
+            )
+            return written
         python_cli = _python_cli_contract_files(contract, plan.stack, written)
         if python_cli:
             touched: list[str] = []
@@ -572,9 +1128,7 @@ class FreeformGenerator:
                 path,
                 content,
                 reason=f"Freeform: harden {path}",
-                operation_reason=(
-                    "react-vite skill deterministic foundation from PRD contract"
-                ),
+                operation_reason=("react-vite skill deterministic foundation from PRD contract"),
             ):
                 touched.append(path)
         if touched:
@@ -605,7 +1159,11 @@ class FreeformGenerator:
             scripts = {}
             package["scripts"] = scripts
         current_test = scripts.get("test")
-        if isinstance(current_test, str) and current_test.strip() and "no test specified" not in current_test:
+        if (
+            isinstance(current_test, str)
+            and current_test.strip()
+            and "no test specified" not in current_test
+        ):
             return written
         scripts["test"] = "node --test"
         content = json.dumps(package, indent=2) + "\n"
@@ -714,6 +1272,7 @@ class FreeformGenerator:
 
 # --- deterministic verifier selection ----------------------------------------
 
+
 def _default_verify(stack: str, contract: PRDContract | None, written: list[str]) -> str:
     """Pick a trustworthy build/syntax verifier from the stack + generated files.
     Never uses a model-proposed command. Returns "" when nothing can verify.
@@ -730,6 +1289,157 @@ def _safe_rel_path(path: str) -> str:
     if not cleaned or ".." in cleaned.split("/"):
         return ""
     return cleaned
+
+
+def _milestone_executor_enabled() -> bool:
+    raw = os.environ.get("SHAMSU_MILESTONE_EXECUTOR", "").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
+
+
+def _deterministic_source_hardeners_enabled() -> bool:
+    raw = os.environ.get("SHAMSU_ENABLE_DETERMINISTIC_SOURCE_HARDENERS", "").strip().lower()
+    return raw in {"1", "true", "yes", "on", "enabled"}
+
+
+def _validated_bundle(raw: str, expected_paths: list[str]) -> tuple[dict[str, str] | None, str]:
+    data = _loads(raw)
+    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
+        return None, "bundle response is not a JSON object with a files array"
+    expected = [_safe_rel_path(path) for path in expected_paths]
+    if any(not path for path in expected) or len(set(expected)) != len(expected):
+        return None, "harness supplied invalid or duplicate expected bundle paths"
+    contents: dict[str, str] = {}
+    for item in data["files"]:
+        if not isinstance(item, dict):
+            return None, "bundle files must be JSON objects"
+        path = _safe_rel_path(str(item.get("path") or ""))
+        content = item.get("content")
+        if not path or not isinstance(content, str) or not content.strip():
+            return None, "bundle contains an invalid path or empty content"
+        if path in contents:
+            return None, f"bundle contains duplicate path: {path}"
+        contents[path] = _sanitize_generated_content(content, path)
+    missing = [path for path in expected if path not in contents]
+    unexpected = [path for path in contents if path not in expected]
+    if missing or unexpected:
+        details: list[str] = []
+        if missing:
+            details.append(f"missing: {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected: {', '.join(unexpected)}")
+        return None, "bundle paths did not match the request (" + "; ".join(details) + ")"
+    return {path: contents[path] for path in expected}, ""
+
+
+def _prepare_bundle_paths(
+    workspace_root: Path,
+    target: Path,
+    contents: dict[str, str],
+) -> tuple[list[tuple[str, Path, str, str]], str]:
+    prepared: list[tuple[str, Path, str, str]] = []
+    for path, content in contents.items():
+        safe_path = _safe_rel_path(path)
+        if not safe_path:
+            return [], f"unsafe bundle path: {path}"
+        file_path = (target / safe_path).resolve()
+        try:
+            file_path.relative_to(target)
+            rel = file_path.relative_to(workspace_root).as_posix()
+        except ValueError:
+            return [], f"bundle path escapes the project target: {path}"
+        blocking_parent = _first_file_parent(file_path, target)
+        if blocking_parent is not None:
+            return [], f"parent path is already a file for bundle path: {path}"
+        if file_path.exists() and file_path.is_dir():
+            return [], f"bundle path is an existing directory: {path}"
+        prepared.append((safe_path, file_path, content, rel))
+    return prepared, ""
+
+
+def _validate_written_bundle(target: Path, paths: tuple[str, ...]) -> str:
+    for path in paths:
+        file_path = target / path
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return f"could not read generated file {path}: {exc}"
+        if not content.strip():
+            return f"generated file is empty: {path}"
+        suffix = file_path.suffix.lower()
+        if suffix == ".json":
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                return f"invalid JSON in {path}: {exc.msg}"
+        elif suffix == ".py":
+            try:
+                compile(content, path, "exec")
+            except SyntaxError as exc:
+                return f"invalid Python in {path}: {exc.msg} at line {exc.lineno}"
+    return ""
+
+
+def _assign_files_to_milestones(
+    files: list[PlannedFile],
+    milestones: list[MilestoneRecord],
+) -> dict[str, list[PlannedFile]]:
+    assignments = {milestone.id: [] for milestone in milestones}
+    by_base: dict[int, list[MilestoneRecord]] = {}
+    for milestone in milestones:
+        by_base.setdefault(_milestone_base(milestone.id), []).append(milestone)
+    cursors: dict[int, int] = {}
+    for file in files:
+        base = _planned_file_milestone_base(file)
+        candidates = by_base.get(base) or milestones[:1]
+        if not candidates:
+            continue
+        cursor = cursors.get(base, 0)
+        milestone = candidates[cursor % len(candidates)]
+        cursors[base] = cursor + 1
+        assignments[milestone.id].append(file)
+    return assignments
+
+
+def _milestone_base(milestone_id: str) -> int:
+    try:
+        number = int(milestone_id.removeprefix("M-"))
+    except ValueError:
+        return 2
+    return number if number < 100 else number // 100
+
+
+def _planned_file_milestone_base(file: PlannedFile) -> int:
+    path = file.path.lower().replace("\\", "/")
+    purpose = file.purpose.lower()
+    text = f"{path} {purpose}"
+    name = path.rsplit("/", 1)[-1]
+    if (
+        path.startswith("tests/")
+        or name.startswith("test_")
+        or ".test." in name
+        or ".spec." in name
+        or any(token in text for token in ("acceptance", "e2e", "readme", "release"))
+    ):
+        return 4
+    if any(token in text for token in ("seed", "status", "migration", "integration", "fixture")):
+        return 3
+    if any(
+        token in text
+        for token in (
+            "component",
+            "page",
+            "screen",
+            "view",
+            "route",
+            "workflow",
+            "style",
+            ".css",
+            "app.tsx",
+            "app.jsx",
+        )
+    ):
+        return 2
+    return 1
 
 
 def _dedupe_files(files: list[PlannedFile]) -> list[PlannedFile]:
@@ -785,7 +1495,9 @@ def _python_cli_contract_files(
     lowered = text.lower()
     commands = _python_cli_commands_from_text(text)
     has_python = "python" in " ".join([stack, lowered])
-    has_cli = any(token in lowered for token in ("cli", "command line", "command-line", "script named"))
+    has_cli = any(
+        token in lowered for token in ("cli", "command line", "command-line", "script named")
+    )
     has_json_db = "--db" in lowered and "json" in lowered
     if not (has_python and has_cli and has_json_db):
         return {}
@@ -807,7 +1519,7 @@ def _python_cli_contract_files(
     id_prefix, id_width = _python_cli_id_parts(text)
     label, plural = _python_cli_record_labels(text)
     csv_fields = _python_cli_csv_fields(text, fields)
-    return {
+    files = {
         script_path: _render_python_cli_script(
             default_db=default_db,
             fields=fields,
@@ -821,6 +1533,77 @@ def _python_cli_contract_files(
             csv_fields=csv_fields,
         )
     }
+    test_paths = [
+        path
+        for path in written
+        if path.endswith(".py")
+        and (path.startswith("tests/") or Path(path).name.startswith("test_"))
+    ]
+    if not test_paths:
+        test_paths = ["tests/test_generated_behavior.py"]
+    smoke_test = _render_python_cli_smoke_test(script_path)
+    files.update({path: smoke_test for path in test_paths})
+    if "requirements.txt" in written:
+        files["requirements.txt"] = "# Standard-library-only project.\n"
+    return files
+
+
+def _render_python_cli_smoke_test(script_path: str) -> str:
+    return f"""from __future__ import annotations
+
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+SCRIPT_RELATIVE = {script_path!r}
+
+
+def _script_path() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / SCRIPT_RELATIVE
+        if candidate.is_file():
+            return candidate
+    raise AssertionError(f"Could not locate {{SCRIPT_RELATIVE}} from generated test")
+
+
+def _project_root() -> Path:
+    return _script_path().parents[len(Path(SCRIPT_RELATIVE).parts) - 1]
+
+
+def _run(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_script_path()), *args],
+        cwd=_project_root(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_cli_seed_summary_list_and_export() -> None:
+    project_root = _project_root()
+    with tempfile.TemporaryDirectory(prefix=".shamsu-test-", dir=project_root) as directory:
+        temp_dir = Path(directory).relative_to(project_root)
+        database = temp_dir / "data.json"
+        seeded = _run("seed", "--db", str(database))
+        assert seeded.returncode == 0, seeded.stderr
+        assert (project_root / database).is_file()
+
+        summary = _run("summary", "--db", str(database))
+        assert summary.returncode == 0, summary.stderr
+        assert summary.stdout.strip()
+
+        listed = _run("list", "--db", str(database))
+        assert listed.returncode == 0, listed.stderr
+        assert listed.stdout.strip()
+
+        report = temp_dir / "report.csv"
+        exported = _run("export", "--db", str(database), "--out", str(report))
+        assert exported.returncode == 0, exported.stderr
+        assert (project_root / report).is_file()
+"""
 
 
 def _contract_text(contract: PRDContract) -> str:
@@ -930,7 +1713,11 @@ def _python_cli_seed_rows(
     amount_fields: list[str],
 ) -> list[dict[str, object]]:
     first_field = next(
-        (field for field in fields if field not in amount_fields and not _looks_like_note_field(field)),
+        (
+            field
+            for field in fields
+            if field not in amount_fields and not _looks_like_note_field(field)
+        ),
         fields[0],
     )
     note_field = next((field for field in fields if _looks_like_note_field(field)), "")
@@ -991,7 +1778,9 @@ def _python_cli_record_labels(text: str) -> tuple[str, str]:
 
 def _python_cli_csv_fields(text: str, fields: list[str]) -> list[str]:
     for match in re.finditer(r"`([^`\n]*,[^`\n]*)`", text):
-        values = [item.strip().replace("-", "_") for item in match.group(1).split(",") if item.strip()]
+        values = [
+            item.strip().replace("-", "_") for item in match.group(1).split(",") if item.strip()
+        ]
         lowered = {item.lower() for item in values}
         if "id" in lowered and all(field.lower() in lowered for field in fields):
             return values
@@ -1011,7 +1800,7 @@ def _render_python_cli_script(
     record_label_plural: str,
     csv_fields: list[str],
 ) -> str:
-    template = '''#!/usr/bin/env python3
+    template = """#!/usr/bin/env python3
 from __future__ import annotations
 
 import argparse
@@ -1177,7 +1966,7 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-'''
+"""
     replacements = {
         "__DEFAULT_DB__": json.dumps(default_db),
         "__FIELDS__": json.dumps(fields),
@@ -1265,6 +2054,7 @@ def _vite_react_contract_files(contract: PRDContract | None, fallback_name: str)
         "index.html": _render_index_html(app_name),
         "tsconfig.json": _render_tsconfig(),
         "vite.config.ts": _render_vite_config(),
+        "vitest.config.ts": _render_vitest_config(),
         "src/data.ts": _render_data_ts(
             app_name,
             _summary_for_contract(contract),
@@ -1289,7 +2079,9 @@ def _needs_incident_console_foundation(contract: PRDContract | None) -> bool:
         "incident" in text
         and "scripts/seed.mjs" in text
         and "scripts/status.mjs" in text
-        and ("react" in text or "vite" in text or getattr(contract, "project_kind", "") == "web_app")
+        and (
+            "react" in text or "vite" in text or getattr(contract, "project_kind", "") == "web_app"
+        )
     )
 
 
@@ -1362,6 +2154,7 @@ def _incident_console_contract_files(
         "index.html": _render_index_html(app_name),
         "tsconfig.json": _render_tsconfig(),
         "vite.config.ts": _render_vite_config(),
+        "vitest.config.ts": _render_vitest_config(),
         "src/data.ts": _render_incident_console_data_ts(app_name, contract, demo_data),
         "src/index.tsx": _render_index_tsx(),
         "src/App.tsx": _render_incident_console_app_tsx(),
@@ -2118,8 +2911,8 @@ def _summary_for_contract(contract: PRDContract | None) -> str:
     if contract is None:
         return "A local-first application generated from the PRD contract."
     return (
-        getattr(contract, "product_summary", "") or
-        "A local-first application generated from the PRD contract."
+        getattr(contract, "product_summary", "")
+        or "A local-first application generated from the PRD contract."
     )
 
 
@@ -2172,7 +2965,9 @@ def _entity_field_names(entity: dict[str, object]) -> list[str]:
     return fields or ["id", "name", "status", "created_at"]
 
 
-def _seed_data_for_entities(entities: list[dict[str, object]]) -> dict[str, list[dict[str, object]]]:
+def _seed_data_for_entities(
+    entities: list[dict[str, object]],
+) -> dict[str, list[dict[str, object]]]:
     seed: dict[str, list[dict[str, object]]] = {}
     for entity in entities:
         name = str(entity["name"])
@@ -2233,7 +3028,7 @@ def _cli_commands_for_entities(entities: list[dict[str, object]]) -> list[str]:
     for entity in entities[:10]:
         slug = str(entity.get("slug") or _kebab(str(entity.get("name") or "record")))
         commands.append(f"atlas {slug} list --json")
-        commands.append(f"atlas {slug} add --name \"Demo {entity.get('name')}\"")
+        commands.append(f'atlas {slug} add --name "Demo {entity.get("name")}"')
     return commands
 
 
@@ -2798,6 +3593,18 @@ describe('generated PRD application', () => {
 """
 
 
+def _render_vitest_config() -> str:
+    return """import { defineConfig } from 'vitest/config';
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    include: ['src/app.test.ts'],
+  },
+});
+"""
+
+
 def _ensure_required_test_plan(
     files: list[PlannedFile],
     *,
@@ -2814,11 +3621,13 @@ def _ensure_required_test_plan(
             "Focused pytest coverage for core PRD behavior and public interfaces",
         )
     elif (
-        any(token in stack_text for token in ("node", "javascript", "typescript"))
-        or any(file.path == "package.json" for file in files)
-    ) and any(
-        file.path == "package.json" for file in files
-    ) and not ("react" in stack_text and "vite" in stack_text):
+        (
+            any(token in stack_text for token in ("node", "javascript", "typescript"))
+            or any(file.path == "package.json" for file in files)
+        )
+        and any(file.path == "package.json" for file in files)
+        and not ("react" in stack_text and "vite" in stack_text)
+    ):
         test = PlannedFile(
             "tests/generated.test.mjs",
             "Focused node:test coverage for core PRD behavior and public interfaces",
@@ -2837,8 +3646,7 @@ def _is_nontrivial_generation(
     source_files = [
         file
         for file in files
-        if Path(file.path).suffix.lower()
-        in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+        if Path(file.path).suffix.lower() in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
     ]
     if len(source_files) >= 2:
         return True
@@ -2892,7 +3700,11 @@ def _normalize_planned_path(path: str, all_paths: list[str]) -> str:
         return cleaned
 
     prefix = f"{cleaned}/"
-    children = [candidate for candidate in all_paths if candidate != cleaned and candidate.startswith(prefix)]
+    children = [
+        candidate
+        for candidate in all_paths
+        if candidate != cleaned and candidate.startswith(prefix)
+    ]
     basename = cleaned.rsplit("/", 1)[-1].lower()
     if children:
         if any(child.startswith(prefix + "index.") for child in children):
@@ -3055,10 +3867,10 @@ def _extract_fenced_body(text: str) -> str:
                 fence_end = index
     if fence_start >= 0 and fence_end > fence_start:
         before = "\n".join(lines[:fence_start]).strip()
-        after = "\n".join(lines[fence_end + 1:]).strip()
+        after = "\n".join(lines[fence_end + 1 :]).strip()
         if not before or len(before) < 120:
             if not after or len(after) < 120:
-                return "\n".join(lines[fence_start + 1:fence_end]).strip()
+                return "\n".join(lines[fence_start + 1 : fence_end]).strip()
     return text
 
 
@@ -3072,7 +3884,7 @@ def _repair_wrapped_json(text: str) -> str:
     end = text.rfind("}")
     if start < 0 or end <= start:
         return text
-    candidate = text[start:end + 1]
+    candidate = text[start : end + 1]
     try:
         parsed = json.loads(candidate)
     except json.JSONDecodeError:

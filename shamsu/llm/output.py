@@ -49,6 +49,10 @@ _XML_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(?P<body>\{.*?\})\s*</tool_call>"
 # results in these tags, so the model reproduces them). Non-greedy body; the
 # closing tag is optional because echoes are often truncated mid-JSON.
 _TOOL_RESPONSE_RE = re.compile(r"<tool_response>\s*\{.*?(?:\}\s*</tool_response>|\}\s*$|$)", re.DOTALL)
+_COMMENTED_TOOL_FENCE_RE = re.compile(
+    r"```[^\r\n]*\r?\n\s*#\s*(?P<name>[A-Za-z_][\w-]*)\b(?P<body>.*?)```",
+    re.DOTALL,
+)
 
 # `<think>...</think>` reasoning trace (kept out of the visible answer).
 _THINK_RE = re.compile(r"<think>(?P<body>.*?)</think>", re.DOTALL | re.IGNORECASE)
@@ -108,7 +112,12 @@ def parse_model_turn(
     salvaged_calls: list[ToolCall] = []
     salvaged_spans: list[str] = []
     if allow_salvage:
-        for salvager in (_salvage_embedded_json, _salvage_search_replace, _salvage_xml_tool_call):
+        for salvager in (
+            _salvage_commented_tool_fences,
+            _salvage_embedded_json,
+            _salvage_search_replace,
+            _salvage_xml_tool_call,
+        ):
             calls, spans = salvager(raw_content, registered_set)
             if calls:
                 salvaged_calls = calls
@@ -142,7 +151,10 @@ def _native_tool_calls(message: Any) -> list[ToolCall]:
             ToolCall(
                 id=str(_get(call, "id", "") or name),
                 name=name,
-                arguments=_coerce_args(_get(function, "arguments", {})),
+                arguments=_normalize_tool_arguments(
+                    name,
+                    _coerce_args(_get(function, "arguments", {})),
+                ),
             )
         )
     return out
@@ -151,6 +163,42 @@ def _native_tool_calls(message: Any) -> list[ToolCall]:
 # ---------------------------------------------------------------------------
 # Salvage cascade
 # ---------------------------------------------------------------------------
+
+
+def _salvage_commented_tool_fences(
+    content: str,
+    registered: set[str] | None,
+) -> tuple[list[ToolCall], list[str]]:
+    """Recover explicit ``# write_file``/``# run_command`` fenced calls.
+
+    Qwen coder models commonly emit this dialect after being told to call a
+    tool. The comment must name a registered tool, so ordinary source fences
+    such as ``# models.py`` remain visible code and are never executed.
+    """
+    calls: list[ToolCall] = []
+    spans: list[str] = []
+    for match in _COMMENTED_TOOL_FENCE_RE.finditer(content):
+        name = match.group("name")
+        if registered is not None and name not in registered:
+            continue
+        body = match.group("body").strip()
+        arguments: dict[str, Any] | None = None
+        parsed = _load_json(body) if body.startswith("{") else None
+        if isinstance(parsed, dict):
+            arguments = parsed
+        elif name == "run_command" and body:
+            arguments = {"command": body}
+        if arguments is None:
+            continue
+        calls.append(
+            ToolCall(
+                id=f"salvaged_{name}_{len(calls) + 1}",
+                name=name,
+                arguments=_normalize_tool_arguments(name, arguments),
+            )
+        )
+        spans.append(match.group(0))
+    return calls, spans
 
 
 def _salvage_embedded_json(content: str, registered: set[str] | None) -> tuple[list[ToolCall], list[str]]:
@@ -239,7 +287,11 @@ def _tool_call_from_obj(obj: dict[str, Any], registered: set[str] | None) -> Too
         if extra:
             return None
         args = {}
-    return ToolCall(id=f"salvaged_{name}", name=name, arguments=args)
+    return ToolCall(
+        id=f"salvaged_{name}",
+        name=name,
+        arguments=_normalize_tool_arguments(name, args),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -339,13 +391,39 @@ def _join_thinking(*parts: str) -> str:
 def _iter_json_objects(text: str) -> list[str]:
     """Yield balanced ``{...}`` substrings from *text*, respecting JSON string
     quoting/escapes so braces inside strings don't break the scan. Only the
-    outermost object of each nesting is returned."""
+    outermost object of each nesting is returned.
+
+    An unbalanced ``{`` earlier in the text must not hide a real tool call
+    later in it. A single scan gives up the moment depth stops returning to
+    zero, so one truncated code fence swallowed everything after it: live
+    2026-08-01, a 7B repair reply held a cut-off ``TEMPLATES = [{...`` Python
+    fence followed by a valid ``{"name": "run_command", ...}`` call, and the
+    call was lost - the loop saw no tool calls, nagged, and the milestone
+    failed with the correct fix sitting in the reply. So when a scan ends
+    inside an unterminated object, restart just past that opening brace and
+    keep recovering.
+    """
+    objects: list[str] = []
+    search_from = 0
+    while search_from < len(text):
+        found, unmatched = _scan_json_objects(text, search_from)
+        objects.extend(found)
+        if unmatched < 0:
+            break
+        search_from = unmatched + 1
+    return objects
+
+
+def _scan_json_objects(text: str, start: int) -> tuple[list[str], int]:
+    """Scan from *start*; return (balanced outermost objects, index of the
+    first opening brace left unterminated, or -1 when everything closed)."""
     objects: list[str] = []
     depth = 0
-    start = -1
+    span_start = -1
     in_string = False
     escape = False
-    for i, ch in enumerate(text):
+    for i in range(start, len(text)):
+        ch = text[i]
         if in_string:
             if escape:
                 escape = False
@@ -359,15 +437,15 @@ def _iter_json_objects(text: str) -> list[str]:
             continue
         if ch == "{":
             if depth == 0:
-                start = i
+                span_start = i
             depth += 1
         elif ch == "}":
             if depth > 0:
                 depth -= 1
-                if depth == 0 and start >= 0:
-                    objects.append(text[start : i + 1])
-                    start = -1
-    return objects
+                if depth == 0 and span_start >= 0:
+                    objects.append(text[span_start : i + 1])
+                    span_start = -1
+    return objects, span_start if depth > 0 else -1
 
 
 def _load_json(span: str) -> Any:
@@ -401,6 +479,79 @@ def _coerce_args(value: Any) -> dict[str, Any]:
         parsed = _load_json(value)
         return parsed if isinstance(parsed, dict) else {}
     return {}
+
+
+def _normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Repair one extra layer of JSON escaping in model-authored file payloads.
+
+    Some local models return a decoded tool-call object but leave file content
+    with literal ``\\n`` separators. Writing that value verbatim produces a
+    one-line, invalid source file and traps the model in read/edit retries.
+    Only payloads with no real line breaks are repaired, and escape sequences
+    inside quoted source strings are preserved.
+    """
+    fields = {
+        "write_file": ("content",),
+        "append_file": ("content",),
+        "edit_file": ("old_string", "new_string"),
+    }.get(name, ())
+    if not fields:
+        return arguments
+    normalized = dict(arguments)
+    for field_name in fields:
+        value = normalized.get(field_name)
+        if isinstance(value, str) and "\n" not in value and "\\n" in value:
+            normalized[field_name] = _decode_escaped_layout(value)
+    return normalized
+
+
+def _decode_escaped_layout(value: str) -> str:
+    """Decode escaped layout outside quoted source literals.
+
+    This keeps code such as ``print("\\n")`` intact while turning
+    ``import os\\nprint(1)`` into two physical lines.
+    """
+    out: list[str] = []
+    quote = ""
+    escaped = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if char == "\\" and index + 1 < len(value) and value[index + 1] == "\\":
+                out.append("\\")
+                index += 2
+                escaped = False
+                continue
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            out.append(char)
+            index += 1
+            continue
+        if value.startswith("\\r\\n", index):
+            out.append("\n")
+            index += 4
+            continue
+        if value.startswith("\\n", index):
+            out.append("\n")
+            index += 2
+            continue
+        if value.startswith("\\t", index):
+            out.append("\t")
+            index += 2
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out)
 
 
 def _first_str(obj: dict[str, Any], keys: Iterable[str]) -> str:

@@ -3,6 +3,7 @@ Minimal REPL shell.
 
 The selected workspace is the sandbox boundary for project reads and indexes.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -11,6 +12,7 @@ import asyncio
 import atexit
 import difflib
 import inspect
+import itertools
 import json
 import os
 import re
@@ -45,7 +47,7 @@ from shamsu.diagnostics import setup as diagnostics_setup
 from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.diagnostics.setup import DiagnosticsWorkspace
 from shamsu.agents.bugfix_workflow import BugFixWorkflow
-from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult, _thinking_preview
+from shamsu.agents.chat_loop import edit_tools_for_target, AgentChatLoop, AgentLoopResult, _thinking_preview
 from shamsu.agents.code_edit_workflow import CodeEditWorkflow
 from shamsu.agents.doc_workflow import DocumentationWorkflow
 from shamsu.agents.error_feedback_loop import ErrorFeedbackLoop
@@ -89,9 +91,15 @@ from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
 from shamsu.memory.queue import flush_memory_queues, get_memory_queue
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
+from shamsu.prd import headings as prd_headings
 from shamsu.verify import contract
 from shamsu.verify.gate import default_verify_command, stack_of, verify_only
-from shamsu.prd.input import PRDParseError, is_prd_filename, parse_prd_file
+from shamsu.prd.input import (
+    PRDParseError,
+    extract_document_reference,
+    is_prd_filename,
+    parse_prd_file,
+)
 from shamsu.prd.execution import (
     attach_task_id,
     block_milestone,
@@ -108,11 +116,13 @@ from shamsu.prd.execution import (
     render_preflight_context,
     validate_model_preflight,
 )
-from shamsu.prd.project import build_project_spec, is_static_frontend_prd
-from shamsu.prd.requirements import compile_requirement_ledger, save_prd_execution_artifacts
+from shamsu.prd.project import build_project_spec
+from shamsu.prd.requirements import (
+    compile_requirement_ledger,
+    is_complex_prd_contract,
+    save_prd_execution_artifacts,
+)
 from shamsu.prd.state import create_generation_state, save_generation_state, state_path
-from shamsu.registry.schema import Category
-from shamsu.registry.suitability import templates_enabled
 from shamsu.plans.store import parse_plan_steps, read_plan
 from shamsu.routing.operations import (
     OperationPlan,
@@ -136,6 +146,9 @@ from shamsu.tasks.state import (
 from shamsu.taskmaster.service import TaskmasterService
 from shamsu.taskmaster.types import TaskmasterTask
 from shamsu.skills.cli import handle_skills_command
+from shamsu.skills.loader import discover_skills
+from shamsu.skills.selector import render_skill_context
+from shamsu.skills.types import SelectedSkill, SkillSelection
 from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_doctor
 from shamsu.runtime.models import (
     DEFAULT_TIER,
@@ -174,7 +187,12 @@ from shamsu.session.memory import is_affirmative, is_negative
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
-from shamsu.tools.dev_server import DevServerManager, extract_dev_command_from_sentence, infer_dev_command, is_dev_server_command
+from shamsu.tools.dev_server import (
+    DevServerManager,
+    extract_dev_command_from_sentence,
+    infer_dev_command,
+    is_dev_server_command,
+)
 from shamsu.tools.web import (
     WebFetchResult,
     WebSearchFetchResult,
@@ -224,14 +242,26 @@ def _make_approval_manager(
         menu_prompt_func=ask_approval_menu,
     )
 
+
 # Subcommands that claim the bare word "run" in the REPL dispatcher (see the
 # main loop below) - anything else starting with "run" (e.g. "run the tests")
 # is ordinary English and falls through to the normal agent request path.
 _RUN_SUBCOMMANDS = frozenset(
     {
-        "last", "show", "timeline", "decisions", "tools", "commands",
-        "context", "diff", "validate", "export", "clean",
-        "narrative", "prompt", "cot",
+        "last",
+        "show",
+        "timeline",
+        "decisions",
+        "tools",
+        "commands",
+        "context",
+        "diff",
+        "validate",
+        "export",
+        "clean",
+        "narrative",
+        "prompt",
+        "cot",
     }
 )
 
@@ -533,7 +563,7 @@ def _print_help(console: Console) -> None:
                     "  /tasks                    List Taskmaster tasks (status/priority/deps)",
                     "  /tasks next               Show the next unblocked Taskmaster task",
                     "  /tasks show <id>          Show one Taskmaster task's detail",
-                    "  /tasks continue [--all] [--verify \"<cmd>\"]  Run the next task through SHAMSU",
+                    '  /tasks continue [--all] [--verify "<cmd>"]  Run the next task through SHAMSU',
                     "  /tasks mark-done <id>     Explicitly accept a task without verification",
                     "  /tasks mark-blocked <id> <reason>",
                     "  /tasks mark-failed <id> <reason>",
@@ -706,7 +736,9 @@ def _handle_plan_prd(
         reason="M3 only stores resume metadata; it does not generate project files.",
         target_paths=[state_path(workspace).relative_to(workspace).as_posix()],
     )
-    approved = _make_approval_manager(workspace, session_logger, console, approval_func).ask(request)
+    approved = _make_approval_manager(workspace, session_logger, console, approval_func).ask(
+        request
+    )
     if not approved:
         console.print("[yellow]Project plan was not approved. No state was written.[/yellow]")
         return
@@ -844,7 +876,9 @@ def _pipeline_generate(session_logger: SessionLogger | None):
                     role="coder",
                     timeout_seconds=timeout_seconds,
                 )
-            raise TimeoutError(f"Freeform model call timed out after {timeout_seconds:.0f}s") from exc
+            raise TimeoutError(
+                f"Freeform model call timed out after {timeout_seconds:.0f}s"
+            ) from exc
 
     return _generate
 
@@ -904,11 +938,20 @@ def _print_full_pipeline_result(result: FullPipelineResult, console: Console) ->
     if result.setup_result:
         table.add_row("Setup", "ok" if result.setup_result.ok else "failed")
     if result.test_result:
-        table.add_row("Tests", f"{result.test_result.passed} passed, {result.test_result.failed} failed")
-    if result.dod_result:
-        dod_status = "ok" if result.dod_result.ok else (
-            "failed: " + ", ".join(item.item_id for item in result.dod_result.required_failures)
+        table.add_row(
+            "Tests", f"{result.test_result.passed} passed, {result.test_result.failed} failed"
         )
+    if result.dod_result:
+        if result.dod_result.required_failures:
+            dod_status = "failed: " + ", ".join(
+                item.item_id for item in result.dod_result.required_failures
+            )
+        elif result.dod_result.required_unverified:
+            dod_status = "unverified: " + ", ".join(
+                item.item_id for item in result.dod_result.required_unverified
+            )
+        else:
+            dod_status = "ok"
         table.add_row("Definition of Done", dod_status)
     table.add_row("Result", "success" if result.success else "failed")
     console.print(table)
@@ -938,9 +981,7 @@ def _print_project_plan(spec: ProjectSpec, console: Console) -> None:
     entities.add_column("Fields")
     entities.add_column("Relationships")
     for entity in spec.entities:
-        fields = ", ".join(
-            f"{field.name}:{field.django_type}" for field in entity.fields
-        )
+        fields = ", ".join(f"{field.name}:{field.django_type}" for field in entity.fields)
         entities.add_row(entity.name, fields, ", ".join(entity.relationships) or "-")
     console.print(entities)
 
@@ -990,14 +1031,14 @@ def _print_project_plan(spec: ProjectSpec, console: Console) -> None:
 def _project_plan_summary(spec: ProjectSpec) -> str:
     contract = getattr(spec, "prd_contract", None)
     lines = [
-            f"Project: {spec.project_name}",
-            f"App: {spec.app_name}",
-            f"Theme: {spec.theme}",
-            f"Status: {'ready' if spec.generation_ready else 'needs input'}",
-            f"Entities: {len(spec.entities)}",
-            f"Endpoints: {len(spec.endpoints)}",
-            f"Pages: {len(spec.pages)}",
-            f"Files planned: {len(spec.generation_order)}",
+        f"Project: {spec.project_name}",
+        f"App: {spec.app_name}",
+        f"Theme: {spec.theme}",
+        f"Status: {'ready' if spec.generation_ready else 'needs input'}",
+        f"Entities: {len(spec.entities)}",
+        f"Endpoints: {len(spec.endpoints)}",
+        f"Pages: {len(spec.pages)}",
+        f"Files planned: {len(spec.generation_order)}",
     ]
     if contract is not None:
         lines.append(f"Extraction confidence: {contract.extraction_confidence:.0%}")
@@ -1062,19 +1103,33 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
     if subcommand == "status":
         status = service.status()
         queue_status = get_memory_queue(workspace).status()
-        console.print(f"Codebase-Memory available: {status.health.available} ({status.health.message})")
+        console.print(
+            f"Codebase-Memory available: {status.health.available} ({status.health.message})"
+        )
         console.print(f"Mirror queue: {queue_status['pending']}/{queue_status['capacity']} pending")
-        console.print(f"Index: {'stale' if status.index.stale else 'fresh'} - {status.index.message}")
+        console.print(
+            f"Index: {'stale' if status.index.stale else 'fresh'} - {status.index.message}"
+        )
         console.print(f"Normal code-agent mode allowed: {status.normal_mode_allowed}")
-        console.print(f"Retrieval mode: {status.retrieval_mode}{' (degraded)' if status.degraded else ''}")
+        console.print(
+            f"Retrieval mode: {status.retrieval_mode}{' (degraded)' if status.degraded else ''}"
+        )
         return
     if subcommand == "setup":
         result = service.setup()
-        console.print("[green]Setup complete.[/green]" if result.get("ok") else f"[red]Setup failed: {result.get('error', result)}[/red]")
+        console.print(
+            "[green]Setup complete.[/green]"
+            if result.get("ok")
+            else f"[red]Setup failed: {result.get('error', result)}[/red]"
+        )
         return
     if subcommand == "repair":
         result = service.repair()
-        console.print("[green]Repair complete.[/green]" if result.get("ok") else f"[red]Repair failed: {result.get('message', result)}[/red]")
+        console.print(
+            "[green]Repair complete.[/green]"
+            if result.get("ok")
+            else f"[red]Repair failed: {result.get('message', result)}[/red]"
+        )
         return
     if subcommand == "build":
         console.print(service.build())
@@ -1106,7 +1161,6 @@ def _handle_abstract(user_input: str, workspace: Path, console: Console) -> None
     console.print(
         "[red]Usage: /abstract status|setup|repair|build|refresh|query|exports|imports|symbols|who-uses|impact[/red]"
     )
-
 
 
 def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> None:
@@ -1163,18 +1217,25 @@ def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> N
         return
     console.print("[red]Usage: /diagnostics status|setup|repair|last|parse|explain|sources[/red]")
 
+
 def _explain_diagnostic_packet(packet: dict[str, Any]) -> str:
     lines = ["Deterministic root cause selection:"]
     roots = packet.get("root_diagnostics", [])
     if not roots:
         lines.append("- No root diagnostics were recorded in the latest ErrorPacket.")
         return "\n".join(lines)
-    lines.append("- Native/SARIF/errorformat parsing runs before fallback parsers; no LLM parses raw logs first.")
+    lines.append(
+        "- Native/SARIF/errorformat parsing runs before fallback parsers; no LLM parses raw logs first."
+    )
     lines.append("- Syntax and import/export errors are ranked before cascading noise.")
     for item in roots[:5]:
         code = f" {item.get('code')}" if item.get("code") else ""
-        lines.append(f"- Root cause: {item.get('category')}{code} {item.get('message', '')}".strip())
+        lines.append(
+            f"- Root cause: {item.get('category')}{code} {item.get('message', '')}".strip()
+        )
     return "\n".join(lines)
+
+
 def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
     lines = [packet.get("summary", "No summary.")]
     roots = packet.get("root_diagnostics", [])
@@ -1190,7 +1251,9 @@ def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
     if snippets:
         lines.append("Recommended snippets:")
         for snippet in snippets[:8]:
-            lines.append(f"- {snippet.get('file')}:{snippet.get('line_start')}-{snippet.get('line_end')} {snippet.get('reason', '')}")
+            lines.append(
+                f"- {snippet.get('file')}:{snippet.get('line_start')}-{snippet.get('line_end')} {snippet.get('reason', '')}"
+            )
     facts = packet.get("related_code_facts", [])
     if facts:
         lines.append("Related code facts:")
@@ -1198,6 +1261,8 @@ def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
     if packet.get("raw_log_path"):
         lines.append(f"Raw log: {packet.get('raw_log_path')}")
     return "\n".join(lines)
+
+
 def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None:
     try:
         service = MemoryService(workspace)
@@ -1216,7 +1281,9 @@ def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None
                 "(degraded). Run /memory setup for the richer Graphiti backend.[/yellow]"
             )
     except Exception as exc:
-        console.print(f"[yellow]Graphiti memory: startup check failed ({exc}). Run /memory repair or /doctor.[/yellow]")
+        console.print(
+            f"[yellow]Graphiti memory: startup check failed ({exc}). Run /memory repair or /doctor.[/yellow]"
+        )
 
 
 def _memory_command_allowed(normalized_input: str) -> bool:
@@ -1254,7 +1321,9 @@ def _handle_memory(
         if result.get("ok"):
             console.print("[green]Graphiti setup complete.[/green]")
         else:
-            reason = result.get("error") or result.get("manual_steps") or result.get("message") or result
+            reason = (
+                result.get("error") or result.get("manual_steps") or result.get("message") or result
+            )
             console.print(f"[red]Graphiti setup failed: {reason}[/red]")
         return
     if subcommand == "repair":
@@ -1262,7 +1331,9 @@ def _handle_memory(
         if result.get("ok"):
             console.print("[green]Graphiti repair complete.[/green]")
         else:
-            reason = result.get("manual_steps") or result.get("message") or result.get("error") or result
+            reason = (
+                result.get("manual_steps") or result.get("message") or result.get("error") or result
+            )
             console.print(f"[red]Graphiti repair failed: {reason}[/red]")
         return
     if subcommand == "remember":
@@ -1279,12 +1350,20 @@ def _handle_memory(
             )
             outcome = bridge.get("long_term") or {}
             if outcome.get("ok"):
-                message = "Memory already existed." if outcome.get("deduped") else "Memory stored locally; Graphiti mirror queued."
+                message = (
+                    "Memory already existed."
+                    if outcome.get("deduped")
+                    else "Memory stored locally; Graphiti mirror queued."
+                )
                 console.print(f"[green]{message}[/green]")
             elif bridge.get("local"):
-                console.print("[green]Saved to session memory (long-term backend unavailable).[/green]")
+                console.print(
+                    "[green]Saved to session memory (long-term backend unavailable).[/green]"
+                )
             else:
-                console.print(f"[yellow]Memory not stored: {outcome.get('reason') or outcome.get('error') or 'skipped'}[/yellow]")
+                console.print(
+                    f"[yellow]Memory not stored: {outcome.get('reason') or outcome.get('error') or 'skipped'}[/yellow]"
+                )
             return
         result = get_memory_queue(workspace).enqueue(
             argument,
@@ -1292,9 +1371,15 @@ def _handle_memory(
             {"reason": "explicit_remember", "explicit": True, "confidence": 1.0},
         )
         if result.get("ok"):
-            console.print("[green]Memory stored.[/green]" if not result.get("deduped") else "[green]Memory already existed.[/green]")
+            console.print(
+                "[green]Memory stored.[/green]"
+                if not result.get("deduped")
+                else "[green]Memory already existed.[/green]"
+            )
         else:
-            console.print(f"[yellow]Memory not stored: {result.get('reason') or result.get('error') or result}[/yellow]")
+            console.print(
+                f"[yellow]Memory not stored: {result.get('reason') or result.get('error') or result}[/yellow]"
+            )
         return
     if subcommand in {"search", "recent"}:
         query = argument or "recent durable SHAMSU memory"
@@ -1310,7 +1395,10 @@ def _handle_memory(
         table.add_column("ID")
         table.add_column("Memory")
         for item in rows[:8]:
-            table.add_row(str(item.get("id") or item.get("uuid") or ""), str(item.get("text") or item.get("fact") or item)[:240])
+            table.add_row(
+                str(item.get("id") or item.get("uuid") or ""),
+                str(item.get("text") or item.get("fact") or item)[:240],
+            )
         console.print(table)
         return
     if subcommand == "forget":
@@ -1318,16 +1406,26 @@ def _handle_memory(
             console.print("[red]Usage: /memory forget <memory-id-or-query>[/red]")
             return
         result = service.forget(argument)
-        console.print("[green]Forget request completed.[/green]" if result.get("ok") else f"[yellow]Forget request not completed: {result.get('error') or result}[/yellow]")
+        console.print(
+            "[green]Forget request completed.[/green]"
+            if result.get("ok")
+            else f"[yellow]Forget request not completed: {result.get('error') or result}[/yellow]"
+        )
         return
     if subcommand == "summarize-session":
         if not argument:
             console.print("[red]Usage: /memory summarize-session <session-id>[/red]")
             return
         result = service.summarize_session(argument)
-        console.print("[green]Session summary stored.[/green]" if result.get("ok") else f"[yellow]Session summary not stored: {result.get('error') or result}[/yellow]")
+        console.print(
+            "[green]Session summary stored.[/green]"
+            if result.get("ok")
+            else f"[yellow]Session summary not stored: {result.get('error') or result}[/yellow]"
+        )
         return
-    console.print("[red]Usage: /memory status|setup|repair|remember|search|recent|forget|summarize-session[/red]")
+    console.print(
+        "[red]Usage: /memory status|setup|repair|remember|search|recent|forget|summarize-session[/red]"
+    )
 
 
 def _record_task_memory(
@@ -1360,8 +1458,18 @@ def _record_task_memory(
         "run_id": ledger.run_id if ledger is not None else "",
     }
     if outcome not in {"success", "success_unverified"} or not mutation_recorded:
-        result = {"ok": False, "skipped": True, "reason": f"outcome={outcome}, mutation={mutation_recorded}"}
-        _log_event(session_logger, "memory.write_skipped", result, "Automatic memory skipped", workflow_id="memory")
+        result = {
+            "ok": False,
+            "skipped": True,
+            "reason": f"outcome={outcome}, mutation={mutation_recorded}",
+        }
+        _log_event(
+            session_logger,
+            "memory.write_skipped",
+            result,
+            "Automatic memory skipped",
+            workflow_id="memory",
+        )
         return result
     if kind == "bug_lesson" and not verified:
         kind = "task_summary"
@@ -1404,6 +1512,8 @@ def _memory_request_text(text: str) -> str:
     ):
         clean = clean.split(marker, 1)[0].strip()
     return clean[:700]
+
+
 def _handle_permissions(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=1)
     command = parts[1].strip().lower() if len(parts) > 1 else "list"
@@ -1440,7 +1550,9 @@ def _print_task(task: MilestoneTask, console: Console) -> None:
     table.add_column("Status")
     table.add_column("Error")
     for step in task.steps:
-        table.add_row(str(step.id), step.phase, step.description, step.status.value, step.error or "")
+        table.add_row(
+            str(step.id), step.phase, step.description, step.status.value, step.error or ""
+        )
     console.print(table)
     if task.files_created:
         console.print(f"Files created: {', '.join(task.files_created)}")
@@ -1491,7 +1603,9 @@ def _make_trace_emitter(
     structured trace events (route/plan/blockers/clarification) without knowing
     about the console or the persisted trace mode."""
 
-    def _emit(event_type: str, message: str, payload: dict | None = None, level: str = "normal") -> None:
+    def _emit(
+        event_type: str, message: str, payload: dict | None = None, level: str = "normal"
+    ) -> None:
         emit_trace(console, session_logger, workspace, event_type, message, payload, level)
 
     return _emit
@@ -1526,17 +1640,19 @@ def _resolve_pending_question(
         console.print("[yellow]Cancelled. What would you like to do next?[/yellow]")
         return None
     if answer.kind == "negative":
-        console.print("[yellow]Understood - I won't proceed with that. Tell me how you'd like to continue.[/yellow]")
+        console.print(
+            "[yellow]Understood - I won't proceed with that. Tell me how you'd like to continue.[/yellow]"
+        )
         return None
     if not answer.resolved:
-        console.print("[yellow]I couldn't match that to the question. Let's continue normally.[/yellow]")
+        console.print(
+            "[yellow]I couldn't match that to the question. Let's continue normally.[/yellow]"
+        )
         return None
     created_from = str(pending.get("created_from_prompt", "")).strip()
     question = str(pending.get("question", "")).strip()
     if created_from:
-        return (
-            f"{created_from}\n\n(Answering the earlier question \"{question}\": {resolved_value})"
-        )
+        return f'{created_from}\n\n(Answering the earlier question "{question}": {resolved_value})'
     return resolved_value
 
 
@@ -1674,7 +1790,9 @@ def _format_audit_event(event: dict[str, Any]) -> str:
     message = str(event.get("message", "")).strip()
     extras = ""
     if etype == "tool.call":
-        extras = f" {event.get('tool', '')} {json.dumps(event.get('arguments', {}), default=str)[:200]}"
+        extras = (
+            f" {event.get('tool', '')} {json.dumps(event.get('arguments', {}), default=str)[:200]}"
+        )
     elif etype == "tool.result":
         extras = f" {event.get('tool', '')} ok={event.get('ok')}"
     elif etype == "file.change":
@@ -1729,7 +1847,8 @@ def _handle_audit_log(
             return
         needle = arg.lower()
         matches = [
-            event for event in _read_jsonl(events_path)
+            event
+            for event in _read_jsonl(events_path)
             if needle in json.dumps(event, default=str).lower()
         ]
         if not matches:
@@ -1761,12 +1880,15 @@ def _handle_audit_log(
         console.print(f"  context:  {root / 'context-packs'}")
         return
 
-    console.print("[red]Usage: audit-log tail [n] | show <session-id> | grep <query> | export [path] | open[/red]")
+    console.print(
+        "[red]Usage: audit-log tail [n] | show <session-id> | grep <query> | export [path] | open[/red]"
+    )
 
 
 # -- ActionLedger CLI (/runs, /run): local human-facing debug/audit trail. --
 # See agent context/prompts/audit_log.md. This inspects <workspace>/.shamsu/runs/
 # only - never Graphiti, never Codebase-Memory MCP, never fed back into a model.
+
 
 def _handle_runs(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=1)
@@ -1851,8 +1973,16 @@ def _handle_run(
         table.add_column("Event")
         table.add_column("Detail")
         for event in events:
-            detail = {k: v for k, v in event.items() if k not in {"event_id", "run_id", "type", "timestamp"}}
-            table.add_row(event.get("timestamp", ""), event.get("type", ""), json.dumps(detail, default=str)[:100])
+            detail = {
+                k: v
+                for k, v in event.items()
+                if k not in {"event_id", "run_id", "type", "timestamp"}
+            }
+            table.add_row(
+                event.get("timestamp", ""),
+                event.get("type", ""),
+                json.dumps(detail, default=str)[:100],
+            )
         console.print(table)
         return
 
@@ -1892,7 +2022,9 @@ def _handle_run(
         table.add_column("Phase")
         table.add_column("Outcome")
         for call in tool_calls:
-            outcome = "ok" if call.get("ok") else ("failed" if call.get("phase") == "finished" else "")
+            outcome = (
+                "ok" if call.get("ok") else ("failed" if call.get("phase") == "finished" else "")
+            )
             table.add_row(call.get("tool", ""), call.get("phase", ""), outcome)
         console.print(table)
         return
@@ -1929,7 +2061,9 @@ def _handle_run(
         if not previews:
             console.print("[dim]No context preview recorded for this run.[/dim]")
             return
-        console.print(Panel(json.dumps(previews, indent=2, default=str), title=f"Contexts: {run_id}"))
+        console.print(
+            Panel(json.dumps(previews, indent=2, default=str), title=f"Contexts: {run_id}")
+        )
         return
 
     if subcommand == "diff":
@@ -1997,7 +2131,9 @@ def _handle_run(
             console.print("[yellow]Clean cancelled; no runs were deleted.[/yellow]")
             return
         removed = action_ledger_store.clean_runs(workspace, retention_days)
-        console.print(f"[green]Removed {len(removed)} run(s) older than {retention_days} day(s).[/green]")
+        console.print(
+            f"[green]Removed {len(removed)} run(s) older than {retention_days} day(s).[/green]"
+        )
         return
 
     console.print(
@@ -2032,7 +2168,11 @@ def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> N
 
     if subcommand == "setup":
         result = diagnostics_setup.setup(workspace)
-        console.print("[green]Diagnostics setup complete.[/green]" if result.get("ok") else f"[yellow]Diagnostics setup finished with issues: {result}[/yellow]")
+        console.print(
+            "[green]Diagnostics setup complete.[/green]"
+            if result.get("ok")
+            else f"[yellow]Diagnostics setup finished with issues: {result}[/yellow]"
+        )
         return
     if subcommand == "repair":
         result = diagnostics_doctor.repair(workspace)
@@ -2045,36 +2185,58 @@ def _handle_diagnostics(user_input: str, workspace: Path, console: Console) -> N
     if subcommand in {"last", "parse", "explain", "sources"}:
         packet = ws.last_packet()
         if not packet:
-            console.print("[yellow]No ErrorPacket recorded yet. Run a command first (e.g. a build/test).[/yellow]")
+            console.print(
+                "[yellow]No ErrorPacket recorded yet. Run a command first (e.g. a build/test).[/yellow]"
+            )
             return
         if subcommand == "last":
             console.print(f"[bold]{packet.get('summary', '')}[/bold]")
             console.print(f"Command: {packet.get('command', '')} (exit {packet.get('exit_code')})")
             for record in packet.get("root_diagnostics", []):
-                location = f"{record.get('file', '')}:{record.get('line', '')}" if record.get("file") else ""
-                console.print(f"- [{record.get('category')}] {record.get('code', '')} {location} {record.get('message', '')}".strip())
+                location = (
+                    f"{record.get('file', '')}:{record.get('line', '')}"
+                    if record.get("file")
+                    else ""
+                )
+                console.print(
+                    f"- [{record.get('category')}] {record.get('code', '')} {location} {record.get('message', '')}".strip()
+                )
             if packet.get("target_files"):
                 console.print("Target files: " + ", ".join(packet["target_files"]))
             for snippet in packet.get("recommended_snippets", []):
-                console.print(f"Recommended snippet: {snippet['file']} lines {snippet['line_start']}-{snippet['line_end']} ({snippet['reason']})")
+                console.print(
+                    f"Recommended snippet: {snippet['file']} lines {snippet['line_start']}-{snippet['line_end']} ({snippet['reason']})"
+                )
             return
         if subcommand == "sources":
-            console.print("Parser chain: " + (", ".join(packet.get("parser_chain", [])) or "none (no diagnostics extracted)"))
+            console.print(
+                "Parser chain: "
+                + (", ".join(packet.get("parser_chain", [])) or "none (no diagnostics extracted)")
+            )
             return
         if subcommand == "explain":
             root = packet.get("root_diagnostics", [])
             if not root:
-                console.print("No root diagnostic was selected (command succeeded or nothing was extracted).")
+                console.print(
+                    "No root diagnostic was selected (command succeeded or nothing was extracted)."
+                )
                 return
             category = root[0].get("category", "")
-            reason = _ROOT_CAUSE_EXPLANATIONS.get(category, "no higher-priority category matched, so this was the first diagnostic after deduping/grouping.")
+            reason = _ROOT_CAUSE_EXPLANATIONS.get(
+                category,
+                "no higher-priority category matched, so this was the first diagnostic after deduping/grouping.",
+            )
             console.print(f"Root cause selection: {reason}")
-            console.print(f"Diagnostic: [{category}] {root[0].get('code', '')} {root[0].get('message', '')}")
+            console.print(
+                f"Diagnostic: [{category}] {root[0].get('code', '')} {root[0].get('message', '')}"
+            )
             return
         if subcommand == "parse":
             reparsed = _reparse_last_command(workspace, ws)
             if reparsed is None:
-                console.print("[yellow]No recent command output found in session logs to re-parse.[/yellow]")
+                console.print(
+                    "[yellow]No recent command output found in session logs to re-parse.[/yellow]"
+                )
                 return
             console.print(f"[green]Re-parsed.[/green] {reparsed.summary}")
             return
@@ -2159,7 +2321,9 @@ def _handle_undo(
     ok, message = engine.rollback_transaction(transaction_id)
     if ok:
         console.print(f"[green]{message}[/green]")
-        console.print("[dim]Undo again to step back further, or `/patch list` to see all changes.[/dim]")
+        console.print(
+            "[dim]Undo again to step back further, or `/patch list` to see all changes.[/dim]"
+        )
     else:
         console.print(f"[red]{message}[/red]")
     _log_assistant_message(session_logger, message, workflow_id="undo")
@@ -2189,7 +2353,9 @@ def _handle_patch(
         console.print(f"git apply available: {patch_git_apply.available(workspace)}")
         console.print(f"Trashed file(s): {trash_count}")
         if last:
-            console.print(f"Last transaction: {last['transaction_id']} ({last['status']}) - {last['reason']}")
+            console.print(
+                f"Last transaction: {last['transaction_id']} ({last['status']}) - {last['reason']}"
+            )
         else:
             console.print("[dim]No transactions recorded yet.[/dim]")
         return
@@ -2264,7 +2430,9 @@ def _handle_patch(
         console.print("Files: " + (", ".join(last.get("touched_files", [])) or "none"))
         verification = last.get("verification") or {}
         if verification.get("ran"):
-            console.print(f"Verification: `{verification.get('command')}` exit {verification.get('exit_code')}")
+            console.print(
+                f"Verification: `{verification.get('command')}` exit {verification.get('exit_code')}"
+            )
         return
 
     if subcommand == "diff":
@@ -2364,7 +2532,9 @@ def _patch_apply(argument: str, workspace: Path, console: Console, engine: "Patc
     try:
         payload = json.loads(target.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
-        console.print(f"[red]Change request must be JSON matching the change_plan/patch contract: {exc}[/red]")
+        console.print(
+            f"[red]Change request must be JSON matching the change_plan/patch contract: {exc}[/red]"
+        )
         return
     result = engine.execute_change_request(payload)
     if result.ok:
@@ -2378,7 +2548,13 @@ def _patch_apply(argument: str, workspace: Path, console: Console, engine: "Patc
             detail += f"\n\nVerification: `{result.verification.command}` exit {result.verification.exit_code}"
             if result.verification.stalled:
                 detail += "\n[yellow]This failure signature matches the previous run - repeated failure, not retrying blindly.[/yellow]"
-        console.print(Panel(detail, title=f"Patch Rejected ({result.transaction_id or 'no transaction'})", border_style="red"))
+        console.print(
+            Panel(
+                detail,
+                title=f"Patch Rejected ({result.transaction_id or 'no transaction'})",
+                border_style="red",
+            )
+        )
 
 
 def _handle_milestones(user_input: str, workspace: Path, console: Console) -> None:
@@ -2403,7 +2579,10 @@ def _handle_milestones(user_input: str, workspace: Path, console: Console) -> No
                 continue
             pending = sum(1 for step in task.steps if step.status == TaskStepStatus.PENDING)
             table.add_row(
-                task.task_id, task.phase, str(pending), str(len(task.blocked_steps)),
+                task.task_id,
+                task.phase,
+                str(pending),
+                str(len(task.blocked_steps)),
                 task.next_action or "-",
             )
         console.print(table)
@@ -2438,7 +2617,13 @@ def _print_tasks_table(service: "TaskmasterService", console: Console) -> None:
     table.add_column("Priority")
     table.add_column("Dependencies")
     for task in tasks:
-        table.add_row(task.id, task.title, task.status, task.priority or "-", ", ".join(task.dependencies) or "-")
+        table.add_row(
+            task.id,
+            task.title,
+            task.status,
+            task.priority or "-",
+            ", ".join(task.dependencies) or "-",
+        )
     console.print(table)
 
 
@@ -2463,7 +2648,9 @@ def _print_prd_task_summary(result: dict, console: Console) -> None:
         console.print(f"[red]PRD parse failed: {result.get('error') or 'unknown error'}[/red]")
         return
     if result.get("reused_cache"):
-        console.print("[dim]PRD unchanged - reusing the cached Taskmaster task graph (no reparse).[/dim]")
+        console.print(
+            "[dim]PRD unchanged - reusing the cached Taskmaster task graph (no reparse).[/dim]"
+        )
     _print_tasks_table_from_list(result.get("tasks", []), console)
 
 
@@ -2478,7 +2665,13 @@ def _print_tasks_table_from_list(tasks: list, console: Console) -> None:
     table.add_column("Priority")
     table.add_column("Dependencies")
     for task in tasks:
-        table.add_row(task.id, task.title, task.status, task.priority or "-", ", ".join(task.dependencies) or "-")
+        table.add_row(
+            task.id,
+            task.title,
+            task.status,
+            task.priority or "-",
+            ", ".join(task.dependencies) or "-",
+        )
     console.print(table)
 
 
@@ -2501,7 +2694,9 @@ def _handle_taskmaster(user_input: str, workspace: Path, console: Console) -> No
     if subcommand == "setup":
         result = service.setup()
         if result.get("ok"):
-            console.print("[green]Taskmaster setup complete (local Ollama provider configured).[/green]")
+            console.print(
+                "[green]Taskmaster setup complete (local Ollama provider configured).[/green]"
+            )
         else:
             reason = result.get("error") or result.get("manual_steps") or result
             console.print(f"[red]Taskmaster setup failed: {reason}[/red]")
@@ -2551,7 +2746,9 @@ def _handle_prd_command(user_input: str, workspace: Path, console: Console) -> N
         cached = service.last_prd_info()
         prd_path_str = argument or cached.get("prd_path", "")
         if not prd_path_str:
-            console.print("[red]No previously parsed PRD to reparse. Usage: /prd reparse [file][/red]")
+            console.print(
+                "[red]No previously parsed PRD to reparse. Usage: /prd reparse [file][/red]"
+            )
             return
         result = service.parse_prd(Path(prd_path_str), force=True)
         _log_prd_parse_result(Path(prd_path_str), result)
@@ -2580,7 +2777,12 @@ def _log_prd_parse_result(prd_path: Path, result: dict) -> None:
     ledger = get_current_run()
     if not ledger:
         return
-    ledger.log_event("prd.parsed", prd_path=str(prd_path), ok=bool(result.get("ok")), reused_cache=bool(result.get("reused_cache")))
+    ledger.log_event(
+        "prd.parsed",
+        prd_path=str(prd_path),
+        ok=bool(result.get("ok")),
+        reused_cache=bool(result.get("reused_cache")),
+    )
     if result.get("ok") and not result.get("reused_cache"):
         ledger.log_event("tasks.created", count=len(result.get("tasks", [])))
 
@@ -2592,7 +2794,7 @@ def _parse_task_execute_args(rest: str) -> tuple[str, str, bool]:
     match = re.search(r'--verify[= ]"([^"]*)"', rest)
     if match:
         verify_command = match.group(1)
-        rest = rest[: match.start()] + rest[match.end():]
+        rest = rest[: match.start()] + rest[match.end() :]
     batch = "--all" in rest
     rest = rest.replace("--all", "").strip()
     task_id = rest.split()[0] if rest.split() else ""
@@ -2601,8 +2803,11 @@ def _parse_task_execute_args(rest: str) -> tuple[str, str, bool]:
 
 def _print_task_execution_result(result: "TaskExecutionResult", console: Console) -> None:
     border = {
-        "done": "green", "blocked": "yellow", "applied_unverified": "yellow",
-        "failed": "red", "error": "red",
+        "done": "green",
+        "blocked": "yellow",
+        "applied_unverified": "yellow",
+        "failed": "red",
+        "error": "red",
     }.get(result.status, "white")
     body = result.message or result.error or f"Task {result.task_id}: {result.status}"
     if result.changed_files:
@@ -2645,10 +2850,16 @@ async def _handle_tasks_execute(
     approval_manager = _make_approval_manager(workspace, session_logger, console)
     action_ledger = get_current_run()
     patch_engine = PatchEngine(
-        workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger,
+        workspace,
+        session_logger=session_logger,
+        approval_manager=approval_manager,
+        action_ledger=action_ledger,
     )
     command_runner = CommandRunner(
-        workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger,
+        workspace,
+        session_logger=session_logger,
+        approval_manager=approval_manager,
+        action_ledger=action_ledger,
     )
     workflow = TaskExecutionWorkflow(
         workspace,
@@ -2656,7 +2867,9 @@ async def _handle_tasks_execute(
         service=service,
         memory_service=MemoryService(workspace),
         abstract_service=AbstractService(workspace),
-        code_edit_workflow=CodeEditWorkflow(workspace, search=search, llm=llm, patch_engine=patch_engine),
+        code_edit_workflow=CodeEditWorkflow(
+            workspace, search=search, llm=llm, patch_engine=patch_engine
+        ),
         command_runner=command_runner,
     )
 
@@ -2681,14 +2894,18 @@ async def _handle_tasks_execute(
             action_ledger.log_event("task.selected", task_id=current_id)
         result = await workflow.run(current_id, verify_command=verify_command)
         if action_ledger:
-            action_ledger.log_event("task.execution_finished", task_id=current_id, status=result.status)
+            action_ledger.log_event(
+                "task.execution_finished", task_id=current_id, status=result.status
+            )
         _print_task_execution_result(result, console)
         summaries.append(f"Task {current_id}: {result.status}")
 
         if command == "execute" or not batch:
             break
         if result.status != "done":
-            console.print("[yellow]Stopping batch execution: task did not complete successfully.[/yellow]")
+            console.print(
+                "[yellow]Stopping batch execution: task did not complete successfully.[/yellow]"
+            )
             break
 
     if summaries:
@@ -2756,8 +2973,11 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
         table.add_column("Executable")
         for row in result["tasks"]:
             table.add_row(
-                row["id"], row["title"], row["status"],
-                ", ".join(row["blocked_by"]) or "-", "yes" if row["executable"] else "no",
+                row["id"],
+                row["title"],
+                row["status"],
+                ", ".join(row["blocked_by"]) or "-",
+                "yes" if row["executable"] else "no",
             )
         console.print(table)
         return
@@ -2766,7 +2986,11 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
             console.print("[red]Usage: /tasks mark-done <id>[/red]")
             return
         result = service.mark_done(parts[2].strip(), note="Explicitly accepted by user.")
-        console.print("[green]Marked done.[/green]" if result.get("ok") else f"[red]{result.get('error')}[/red]")
+        console.print(
+            "[green]Marked done.[/green]"
+            if result.get("ok")
+            else f"[red]{result.get('error')}[/red]"
+        )
         return
     if command == "mark-blocked":
         rest = parts[2] if len(parts) > 2 else ""
@@ -2775,7 +2999,11 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
             console.print("[red]Usage: /tasks mark-blocked <id> <reason>[/red]")
             return
         result = service.mark_blocked(task_id.strip(), reason_text.strip())
-        console.print("[yellow]Marked blocked.[/yellow]" if result.get("ok") else f"[red]{result.get('error')}[/red]")
+        console.print(
+            "[yellow]Marked blocked.[/yellow]"
+            if result.get("ok")
+            else f"[red]{result.get('error')}[/red]"
+        )
         return
     if command == "mark-failed":
         rest = parts[2] if len(parts) > 2 else ""
@@ -2785,7 +3013,9 @@ def _handle_tasks(user_input: str, workspace: Path, console: Console) -> None:
             return
         result = service.mark_failed(task_id.strip(), reason_text.strip())
         if result.get("ok"):
-            console.print(f"[yellow]Marked failed (retry {result.get('retry_count')}; now {result.get('next_status')}).[/yellow]")
+            console.print(
+                f"[yellow]Marked failed (retry {result.get('retry_count')}; now {result.get('next_status')}).[/yellow]"
+            )
         else:
             console.print(f"[red]{result.get('error')}[/red]")
         return
@@ -2806,7 +3036,7 @@ def _handle_models(
         _print_runtime_status(console)
         return
     if command == "tier" or command.startswith("tier "):
-        tier_arg = command[len("tier"):].strip()
+        tier_arg = command[len("tier") :].strip()
         _handle_models_tier(tier_arg, console, workspace)
         return
     if command == "pull":
@@ -2832,7 +3062,9 @@ def _handle_models(
         console.print(
             "[cyan]Downloading missing local model(s):[/cyan] " + ", ".join(status.missing_models)
         )
-        results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
+        results = _pull_models_with_progress(
+            Path(status.ollama_path), status.missing_models, console
+        )
         _print_model_pull_results(results, console)
         _print_runtime_status(console)
         return
@@ -2848,9 +3080,12 @@ def _handle_models(
         if status.ollama_found and status.server_running and status.missing_models:
             # Explicit `/models repair` is consent - download directly.
             console.print(
-                "[cyan]Downloading missing local model(s):[/cyan] " + ", ".join(status.missing_models)
+                "[cyan]Downloading missing local model(s):[/cyan] "
+                + ", ".join(status.missing_models)
             )
-            results = _pull_models_with_progress(Path(status.ollama_path), status.missing_models, console)
+            results = _pull_models_with_progress(
+                Path(status.ollama_path), status.missing_models, console
+            )
             _print_model_pull_results(results, console)
             status = collect_status(Path(status.ollama_path))
         _print_runtime_status(console, status=status)
@@ -2893,7 +3128,9 @@ def _pull_missing_models_for_active_tier(console: Console) -> None:
     download directly, no second approval gate."""
     status = collect_status()
     if not status.ollama_found:
-        console.print("[yellow]Ollama was not found. Run `models repair` once Ollama is installed.[/yellow]")
+        console.print(
+            "[yellow]Ollama was not found. Run `models repair` once Ollama is installed.[/yellow]"
+        )
         return
     if not status.server_running:
         console.print("[yellow]Starting local Ollama...[/yellow]")
@@ -2974,13 +3211,19 @@ def _handle_web(
         fetch = web_tool.fetch(argument, reason="User explicitly requested a web page fetch.")
         _print_web_fetch(fetch, console)
         return
-    console.print("[red]Usage: web setup|status|start|stop|restart|search <query>|open <url>|summarize <url>[/red]")
+    console.print(
+        "[red]Usage: web setup|status|start|stop|restart|search <query>|open <url>|summarize <url>[/red]"
+    )
 
 
 def _print_web_service_status(status, console: Console) -> None:
     style = "green" if status.ok else "yellow"
-    state = getattr(status, "state", "") or ("running" if getattr(status, "running", False) else "not_running")
-    console.print(Panel(f"{status.message}\nStatus: {state}", title="Web Search Service", border_style=style))
+    state = getattr(status, "state", "") or (
+        "running" if getattr(status, "running", False) else "not_running"
+    )
+    console.print(
+        Panel(f"{status.message}\nStatus: {state}", title="Web Search Service", border_style=style)
+    )
 
 
 def _print_web_capability_status(status, console: Console) -> None:
@@ -2988,10 +3231,14 @@ def _print_web_capability_status(status, console: Console) -> None:
     table.add_column("Capability")
     table.add_column("State")
     table.add_column("Detail")
-    table.add_row("Web", "enabled" if status.enabled else "disabled", f"mode={status.provider_mode}")
+    table.add_row(
+        "Web", "enabled" if status.enabled else "disabled", f"mode={status.provider_mode}"
+    )
     table.add_row("SearXNG", status.searxng.state, status.searxng.message)
     table.add_row("Fallback search", status.fallback_state, "DuckDuckGo HTML provider")
-    table.add_row("Page fetch", status.fetch_state, "Public HTTP/HTTPS only; local/private targets blocked")
+    table.add_row(
+        "Page fetch", status.fetch_state, "Public HTTP/HTTPS only; local/private targets blocked"
+    )
     table.add_row("Cache", status.cache_state, status.cache_path)
     console.print(table)
 
@@ -3009,7 +3256,11 @@ def _handle_browse(
         detail = status.message
         if status.executable_path:
             detail = f"{detail}\nExecutable: {status.executable_path}"
-        console.print(Panel(f"State: {status.state}\n{detail}", title="Browser Capability", border_style=style))
+        console.print(
+            Panel(
+                f"State: {status.state}\n{detail}", title="Browser Capability", border_style=style
+            )
+        )
         return
     if command == "open":
         if len(parts) < 3:
@@ -3094,7 +3345,9 @@ class _LazyModelPullProgress:
             self._progress = None
 
     def as_model_pull_progress(self) -> ModelPullProgress:
-        return ModelPullProgress(on_start=self.on_start, on_chunk=self.on_chunk, on_finish=self.on_finish)
+        return ModelPullProgress(
+            on_start=self.on_start, on_chunk=self.on_chunk, on_finish=self.on_finish
+        )
 
 
 _BUDGET_MANAGER_CACHE: dict[Path, ContextBudgetManager] = {}
@@ -3128,7 +3381,9 @@ def _handle_context(
         rows: list[str] = [f"Active tier: {tier.value}", ""]
         for spec in tier_model_specs(tier):
             ctx = MODEL_CONTEXT_WINDOWS.get(spec.name, SAFE_FALLBACK_CTX_WINDOW)
-            rows.append(f"  {spec.name:<35}  ctx {ctx // 1024}k  roles: {', '.join(spec.roles[:4])}")
+            rows.append(
+                f"  {spec.name:<35}  ctx {ctx // 1024}k  roles: {', '.join(spec.roles[:4])}"
+            )
         rows.append("")
         calib = mgr._calibration
         if calib:
@@ -3227,6 +3482,7 @@ def _call_accepts_keyword(callable_obj: Any, keyword: str) -> bool:
         for name, param in signature.parameters.items()
     )
 
+
 def _make_llm_manager(
     session_logger: SessionLogger | None,
     console: Console,
@@ -3253,7 +3509,11 @@ def _make_llm_manager(
     # Surface a reasoning model's chain-of-thought on the specialist path (QA,
     # PRD summary, planner, direct-code). The agent chat loop already shows its
     # own; without this, everything routed OUTSIDE the loop reasoned invisibly.
-    if not lightweight and workspace is not None and _call_accepts_keyword(LLMManager, "on_thinking"):
+    if (
+        not lightweight
+        and workspace is not None
+        and _call_accepts_keyword(LLMManager, "on_thinking")
+    ):
         kwargs["on_thinking"] = _make_thinking_reporter(console, session_logger, workspace)
     return LLMManager(**kwargs)
 
@@ -3290,7 +3550,9 @@ def _pull_models_with_progress(
                 progress_callback=lambda _chunk: progress.advance(task_id),
             )
             results[model] = exit_code
-            progress.update(task_id, description=f"{'Installed' if exit_code == 0 else 'Failed'} {model}")
+            progress.update(
+                task_id, description=f"{'Installed' if exit_code == 0 else 'Failed'} {model}"
+            )
     return results
 
 
@@ -3299,7 +3561,9 @@ def _print_model_pull_results(results: dict[str, int], console: Console) -> None
         if exit_code == 0:
             console.print(f"[green]{model}: installed[/green]")
         else:
-            console.print(f"[red]{model}: failed with exit {exit_code}. Re-run `models pull` to resume.[/red]")
+            console.print(
+                f"[red]{model}: failed with exit {exit_code}. Re-run `models pull` to resume.[/red]"
+            )
 
 
 def _handle_django(
@@ -3402,7 +3666,9 @@ def _handle_sessions(
             table.add_column("Updated")
             table.add_column("Events")
             for item in manager.list_sessions():
-                table.add_row(item.session_id, item.title, item.status, item.updated_at, str(item.event_count))
+                table.add_row(
+                    item.session_id, item.title, item.status, item.updated_at, str(item.event_count)
+                )
             console.print(table)
             return current
         if command == "current":
@@ -3417,7 +3683,9 @@ def _handle_sessions(
             return resumed
         if command == "rename" and len(parts) >= 4:
             renamed = manager.rename_session(parts[2], parts[3])
-            console.print(f"[green]Renamed session {renamed.session_id} to \"{renamed.title}\"[/green]")
+            console.print(
+                f'[green]Renamed session {renamed.session_id} to "{renamed.title}"[/green]'
+            )
             if renamed.session_id == current.session_id:
                 return SessionLogger(manager, renamed)
             return current
@@ -3463,11 +3731,29 @@ def _handle_sessions(
 # excludes raw model turns and planner output (chat.message, planner.plan,
 # llm.request/response, user.prompt) so no hidden chain-of-thought leaks.
 _TRACE_ALLOW_PREFIXES = (
-    "router.", "route.", "workflow.", "agent.tool", "agent.run", "agent.stuck",
-    "command.", "patch.", "tool.", "web.", "browser.", "approval.",
-    "context.pack", "memory.write", "memory.long_term", "memory.local",
-    "memory.retrieved", "session.route", "session.pending_action",
-    "session.started", "session.resumed", "session.closed", "session.auto_titled",
+    "router.",
+    "route.",
+    "workflow.",
+    "agent.tool",
+    "agent.run",
+    "agent.stuck",
+    "command.",
+    "patch.",
+    "tool.",
+    "web.",
+    "browser.",
+    "approval.",
+    "context.pack",
+    "memory.write",
+    "memory.long_term",
+    "memory.local",
+    "memory.retrieved",
+    "session.route",
+    "session.pending_action",
+    "session.started",
+    "session.resumed",
+    "session.closed",
+    "session.auto_titled",
     "assistant.message",
 )
 
@@ -3510,7 +3796,9 @@ def _trace_line(event: dict[str, Any]) -> str:
 
 
 def _print_session_trace(logger: SessionLogger, console: Console) -> None:
-    events = [event for event in logger.tail(400) if _is_trace_event(str(event.get("event_type", "")))]
+    events = [
+        event for event in logger.tail(400) if _is_trace_event(str(event.get("event_type", "")))
+    ]
     if not events:
         console.print("[dim]No structured trace events for this session yet.[/dim]")
         return
@@ -3527,7 +3815,11 @@ def _print_session_summary(logger: SessionLogger, console: Console) -> None:
     if not summary.strip():
         # No summary persisted yet: generate a deterministic one on demand.
         summary = logger.update_summary_from_events()
-    console.print(Panel(summary.strip() or "No summary available.", title=f"Summary — {logger.metadata.title}"))
+    console.print(
+        Panel(
+            summary.strip() or "No summary available.", title=f"Summary — {logger.metadata.title}"
+        )
+    )
 
 
 def _print_session_memory(logger: SessionLogger, console: Console) -> None:
@@ -3648,6 +3940,7 @@ def _extract_requested_file_path(user_input: str) -> str | None:
 
 
 _BACKTICK_SPAN_RE = re.compile(r"`([^`\n]+)`")
+_QUOTED_COMMAND_SPAN_RE = re.compile(r"(?P<quote>['\"])(?P<content>[^'\"\n]+)(?P=quote)")
 _KNOWN_RUNNER_RE = re.compile(
     r"^(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)\b", re.IGNORECASE
 )
@@ -3662,6 +3955,10 @@ def _explicit_command_in_prompt(user_input: str) -> str:
     for match in _BACKTICK_SPAN_RE.finditer(str(user_input or "")):
         candidate = match.group(1).strip()
         if candidate and len(candidate.split()) > 1:
+            return candidate
+    for match in _QUOTED_COMMAND_SPAN_RE.finditer(str(user_input or "")):
+        candidate = match.group("content").strip()
+        if len(candidate.split()) > 1 and _KNOWN_RUNNER_RE.match(candidate):
             return candidate
     return ""
 
@@ -3807,7 +4104,9 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     ("workspace.prds", lambda text, ws: _looks_like_workspace_prd_request(text)),
     (
         "continue_game",
-        lambda text, ws: _looks_like_affirmative_continue(text) and _multiplayer_template_present(ws),
+        lambda text, ws: (
+            _looks_like_affirmative_continue(text) and _multiplayer_template_present(ws)
+        ),
     ),
     ("run_game", lambda text, ws: _looks_like_run_game_request(text)),
     ("dev_server.recovery", lambda text, ws: _looks_like_dev_server_failure(text)),
@@ -3869,7 +4168,25 @@ def _operation_plan(effective_input: str, workspace: Path) -> OperationPlan:
                 ),
             ),
         )
-    if _command_for_existing_script_request(effective_input, workspace):
+    if re.search(
+        r"\bthrough\s+(?:the\s+)?react\s+tool\s+loop\b", effective_input, re.I
+    ) and _looks_like_file_write_request(read_only.strip(effective_input)):
+        return OperationPlan(
+            prompt=effective_input.strip(),
+            candidates=("file.write",),
+            clauses=(effective_input.strip(),),
+            steps=(
+                OperationStep(
+                    id=1,
+                    kind="mutation",
+                    route="file.write",
+                    instruction=effective_input.strip(),
+                ),
+            ),
+        )
+    if _command_for_existing_script_request(
+        effective_input, workspace
+    ) and not _looks_like_file_write_request(read_only.strip(effective_input)):
         return OperationPlan(
             prompt=effective_input.strip(),
             candidates=("command.run",),
@@ -3990,7 +4307,9 @@ async def _handle_request(
         swallowed.record("repl.audit_prompt_route", exc)
     if agent_result.handled:
         console.print(Panel(agent_result.message, title=agent_result.title or "SHAMSU"))
-        _log_assistant_message(session_logger, agent_result.message, workflow_id=agent_result.action or "agent")
+        _log_assistant_message(
+            session_logger, agent_result.message, workflow_id=agent_result.action or "agent"
+        )
         return
     # Dispatch on the route already resolved above by `_classify_route_label`.
     # The detectors themselves live in `_ROUTE_RULES` - this chain used to run a
@@ -4050,7 +4369,9 @@ async def _handle_request(
         _log_assistant_message(session_logger, message, workflow_id="workspace.files")
         return
     if route_label == "prd.build":
-        await _handle_prd_build_request(effective_input, workspace, console, session_logger=session_logger)
+        await _handle_prd_build_request(
+            effective_input, workspace, console, session_logger=session_logger
+        )
         return
     if route_label == "docs.ingest":
         await _run_agent_chat(
@@ -4131,10 +4452,9 @@ async def _handle_request(
             workflow_id=direct_plan.mode,
         )
         required_tool_prefix = ""
-        if (
-            direct_plan.mode == "test_generation"
-            or direct_plan.document_context
-        ) and len(direct_plan.target_files) == 1:
+        if (direct_plan.mode == "test_generation" or direct_plan.document_context) and len(
+            direct_plan.target_files
+        ) == 1:
             try:
                 target_path = _resolve_workspace_file(direct_plan.target_files[0], workspace)
             except SecurityError:
@@ -4151,6 +4471,14 @@ async def _handle_request(
             use_long_term_memory=False,
             use_planner=False,
             required_tool_prefix=required_tool_prefix,
+            allowed_write_paths=tuple(direct_plan.target_files) or None,
+            force_long_running=bool(
+                re.search(
+                    r"\bthrough\s+(?:the\s+)?react\s+tool\s+loop\b",
+                    effective_input,
+                    re.IGNORECASE,
+                )
+            ),
         )
         # This route is dispatched as a mutation request. A model can answer
         # with a chat-shaped code fence instead of calling a file tool - no
@@ -4226,7 +4554,12 @@ async def _handle_request(
         _log_assistant_message(session_logger, message, workflow_id="prd.context_question")
         return
     if route_label == "browser":
-        await _run_browser_assist(effective_input, console, llm=_make_llm_manager(session_logger, console, workspace), browser_tool=browser_tool)
+        await _run_browser_assist(
+            effective_input,
+            console,
+            llm=_make_llm_manager(session_logger, console, workspace),
+            browser_tool=browser_tool,
+        )
         return
     if route_label == "web":
         await _run_web_assist(
@@ -4256,18 +4589,25 @@ async def _handle_request(
         # plan request can never mutate the workspace. The explicit
         # entity-oriented preview stays for `plan-prd`/`project plan` phrasing.
         if _looks_like_plan_intent(effective_input):
-            prd_ref = _extract_prd_path_from_prompt(effective_input) or "the PRD"
+            prd_ref = _resolved_prd_reference(effective_input, workspace)
+            # Keep the user's OWN words. This used to send a canned "Read X and
+            # produce a plan" and drop the request entirely, so every stated
+            # constraint - which features, in what order, what to build first -
+            # never reached the model. Live 2026-08-02: a detailed request for
+            # an ordered Django feature breakdown came back as a generic
+            # "convert the PDF with pdftotext" pipeline, with zero tool calls.
             plan_request = (
-                f"Read {prd_ref} and produce a concise, numbered, step-by-step "
-                "implementation plan: the files to create, the order to build them, "
-                "and how to verify the result. Do NOT write any code or files - "
-                "output only the plan as text."
+                f"{effective_input}\n\n"
+                f"First call read_file on {prd_ref} and use what it actually says. "
+                "Then produce a concise, numbered, step-by-step implementation plan "
+                "that satisfies the request above: the files to create, the order to "
+                "build them, and how to verify each step. Honor every feature, "
+                "constraint, and ordering the request states. Do NOT write any code "
+                "or files - output only the plan as text."
             )
-            await _run_agent_chat(
-                plan_request, workspace, console, session_logger=session_logger
-            )
+            await _run_agent_chat(plan_request, workspace, console, session_logger=session_logger)
             return
-        plan_command = f"plan-prd {_extract_prd_path_from_prompt(effective_input)}"
+        plan_command = f"plan-prd {_resolved_prd_reference(effective_input, workspace)}"
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
         return
     # ROUTE_FALLTHROUGH: no rule matched - the search/LLM-router tail.
@@ -4376,7 +4716,15 @@ async def _handle_request(
                     user_request=effective_input,
                 )
             else:
-                await _run_qa(effective_input, workspace, console, llm, extra_context=agent_context, session_logger=session_logger, thinking_status=thinking_status)
+                await _run_qa(
+                    effective_input,
+                    workspace,
+                    console,
+                    llm,
+                    extra_context=agent_context,
+                    session_logger=session_logger,
+                    thinking_status=thinking_status,
+                )
         elif decision.intent == "code_edit":
             # Hard safety guard: a read-only Git question ("what are the
             # unstaged changes?") must never enter the patch/coder workflow,
@@ -4386,7 +4734,12 @@ async def _handle_request(
                 _log_event(
                     session_logger,
                     "routing.git_override",
-                    {"route": "git_read", "reason": "code_edit_blocked", "read_only": True, "mutation": False},
+                    {
+                        "route": "git_read",
+                        "reason": "code_edit_blocked",
+                        "read_only": True,
+                        "mutation": False,
+                    },
                     "Blocked code-edit for read-only Git question",
                     workflow_id="git",
                 )
@@ -4398,7 +4751,11 @@ async def _handle_request(
                     workspace,
                     console,
                     session_logger,
-                    lambda line: console.print(f"[dim]{line}[/dim]") if _trace_mode(workspace) != "quiet" else None,
+                    lambda line: (
+                        console.print(f"[dim]{line}[/dim]")
+                        if _trace_mode(workspace) != "quiet"
+                        else None
+                    ),
                 )
             else:
                 await _run_code_edit(harness_input, workspace, search, console, llm, session_logger)
@@ -4414,7 +4771,9 @@ async def _handle_request(
                         "Tell me what to fix first: include a file path, traceback, failing command, "
                         "or the exact error message. Example: /fix tests/test_app.py fails with AssertionError ..."
                     )
-                    console.print(Panel(message, title="Bug Fix Needs Target", border_style="yellow"))
+                    console.print(
+                        Panel(message, title="Bug Fix Needs Target", border_style="yellow")
+                    )
                     _log_assistant_message(session_logger, message, workflow_id="bug_fix")
                     return
                 bugfix_input, reused_command = reused
@@ -4425,7 +4784,9 @@ async def _handle_request(
         elif decision.intent == "audit":
             await _run_audit(harness_input, search, console, llm)
         elif decision.intent == "test_gen":
-            await _run_test_generation(harness_input, workspace, search, console, llm, session_logger)
+            await _run_test_generation(
+                harness_input, workspace, search, console, llm, session_logger
+            )
         elif decision.intent == "doc_gen":
             await _run_docs(harness_input, workspace, search, console, llm, session_logger)
         else:
@@ -4478,8 +4839,13 @@ async def _route_prompt(user_input: str, llm: LLMManager) -> RoutingDecision:
         return forced
     try:
         decision = await llm.route(user_input, "Indexed workspace selected in SHAMSU CLI.")
-        if decision.intent in {"qa", "explain"} and decision.confidence < 0.6 and (
-            _looks_like_command_like_prompt(user_input) or _looks_like_trouble_report(user_input)
+        if (
+            decision.intent in {"qa", "explain"}
+            and decision.confidence < 0.6
+            and (
+                _looks_like_command_like_prompt(user_input)
+                or _looks_like_trouble_report(user_input)
+            )
         ):
             return _keyword_decision(user_input)
         return decision
@@ -4501,7 +4867,7 @@ def _forced_decision(user_input: str) -> RoutingDecision | None:
             return RoutingDecision(
                 intent=intent,
                 complexity="single",
-                steps=[{"id": 1, "specialist": intent, "task": user_input[len(prefix):]}],
+                steps=[{"id": 1, "specialist": intent, "task": user_input[len(prefix) :]}],
                 needs_tools=["search"],
                 confidence=1.0,
             )
@@ -4515,9 +4881,14 @@ def _keyword_decision(user_input: str) -> RoutingDecision:
         intent = "generate"
     elif _looks_like_prd_plan_request(user_input):
         intent = "generate"
-    elif _looks_like_trouble_report(user_input) or any(word in text for word in ("traceback", "exception", "error:", "failing", "fix ", "repair")):
+    elif _looks_like_trouble_report(user_input) or any(
+        word in text for word in ("traceback", "exception", "error:", "failing", "fix ", "repair")
+    ):
         intent = "bug_fix"
-    elif any(word in text for word in ("write tests", "generate tests", "test for", "pytest", "run tests", "test ")):
+    elif any(
+        word in text
+        for word in ("write tests", "generate tests", "test for", "pytest", "run tests", "test ")
+    ):
         intent = "test_gen"
     elif any(word in text for word in ("audit", "review", "security issue")):
         intent = "audit"
@@ -4540,19 +4911,31 @@ def _direct_file_write_handoff(
     agent_context: str = "",
 ) -> tuple[str, TaskPlan]:
     classified = _keyword_decision(user_input)
-    intent = classified.intent if classified.intent in {"code_edit", "test_gen", "doc_gen"} else "code_edit"
-    requested_target = _extract_requested_file_path(user_input)
+    deletion_requested = bool(re.search(r"\b(?:delete|remove)\b", user_input, re.IGNORECASE))
+    intent = (
+        classified.intent
+        if classified.intent in {"code_edit", "test_gen", "doc_gen"}
+        else "code_edit"
+    )
+    requested_target = _explicit_canonical_edit_target(user_input) or _extract_requested_file_path(
+        user_input
+    )
+    if deletion_requested:
+        intent = "code_edit"
+        requested_target = _project_root_qualified_target(
+            user_input, requested_target, workspace
+        )
     target = requested_target
     source_under_test = ""
     if requested_target:
         target_name = Path(requested_target).name.casefold()
         target_suffix = Path(requested_target).suffix.casefold()
-        if target_suffix in {".md", ".rst", ".txt"}:
+        if not deletion_requested and target_suffix in {".md", ".rst", ".txt"}:
             intent = "doc_gen"
         elif (
-            target_name.startswith("test_")
-            or ".test." in target_name
-            or ".spec." in target_name
+            not deletion_requested
+            and not (workspace / requested_target).is_file()
+            and (target_name.startswith("test_") or ".test." in target_name or ".spec." in target_name)
         ):
             intent = "test_gen"
     if intent == "test_gen" and requested_target:
@@ -4575,6 +4958,8 @@ def _direct_file_write_handoff(
             "edit_file",
             "append_file",
             "write_file",
+            "delete_file",
+            "file_info",
             "run_command",
         ],
         target_files=[target] if target else [],
@@ -4582,6 +4967,15 @@ def _direct_file_write_handoff(
     )
     plan = build_task_plan(decision, user_input, workspace=workspace)
     handoff = append_task_handoff(user_input, plan, agent_context)
+    if deletion_requested and target:
+        handoff += (
+            "\n\n## File Deletion Contract\n"
+            f"Deletion target: `{target}`\n"
+            "- Read or inspect the exact target first.\n"
+            "- Call `delete_file` on that exact target; do not represent deletion as an empty "
+            "write and do not rewrite a similarly named file.\n"
+            "- Confirm the target is absent with `file_info` before finishing.\n"
+        )
     semantic_contract = contract.derive(user_input, workspace=workspace)
     if semantic_contract.required_python_symbols:
         requirements = "\n".join(
@@ -4619,6 +5013,48 @@ def _direct_file_write_handoff(
                 + "\n```"
             )
     return handoff, plan
+
+
+def _project_root_qualified_target(
+    user_input: str,
+    target: str,
+    workspace: Path,
+) -> str:
+    """Qualify a basename described as being at an explicitly named project root."""
+    normalized = str(target or "").replace("\\", "/").strip("/ ")
+    if not normalized or "/" in normalized or "project root" not in user_input.lower():
+        return normalized
+    quoted = re.findall(r"[`\"']([^`\"']+)[`\"']", user_input)
+    project_dirs: list[str] = []
+    for item in quoted:
+        candidate = item.replace("\\", "/").strip("/ ")
+        if not candidate or Path(candidate).suffix:
+            continue
+        try:
+            resolved = _resolve_workspace_file(candidate, workspace)
+        except SecurityError:
+            continue
+        if resolved.is_dir():
+            project_dirs.append(candidate)
+    if len(project_dirs) != 1:
+        return normalized
+    return f"{project_dirs[0]}/{normalized}"
+
+
+def _explicit_canonical_edit_target(user_input: str) -> str:
+    """Resolve a path declared canonical when the user says to edit only it."""
+    if not re.search(
+        r"\b(?:update|edit|modify|change|repair|fix)\s+only\s+(?:the\s+)?canonical\b",
+        user_input,
+        re.IGNORECASE,
+    ):
+        return ""
+    match = re.search(
+        r"\bcanonical\b[^.!?\n]{0,80}['\"`](?P<path>[^'\"`\n]+\.[A-Za-z0-9]{1,12})['\"`]",
+        user_input,
+        re.IGNORECASE,
+    )
+    return match.group("path").replace("\\", "/") if match else ""
 
 
 def _test_output_path(source: str) -> str:
@@ -4847,10 +5283,9 @@ def _looks_like_mcp_request(user_input: str) -> bool:
 
 def _looks_like_django_generation_request(user_input: str) -> bool:
     text = user_input.lower()
-    return (
-        any(phrase in text for phrase in ("generate django", "generate project", "build django"))
-        and bool(_extract_prd_path_from_prompt(user_input))
-    )
+    return any(
+        phrase in text for phrase in ("generate django", "generate project", "build django")
+    ) and bool(_extract_prd_path_from_prompt(user_input))
 
 
 def _looks_like_web_needed_prompt(user_input: str) -> bool:
@@ -4868,19 +5303,51 @@ def _looks_like_web_needed_prompt(user_input: str) -> bool:
     if any(
         phrase in text
         for phrase in (
-            "web search", "search the web", "search online", "online search",
-            "search the internet", "internet search", "on the web", "from the web",
-            "check on the web", "google it", "google for",
+            "web search",
+            "search the web",
+            "search online",
+            "online search",
+            "search the internet",
+            "internet search",
+            "on the web",
+            "from the web",
+            "check on the web",
+            "google it",
+            "google for",
         )
     ):
         return True
-    if any(phrase in text for phrase in ("look up", "find docs", "documentation for", "official docs", "latest ", "current ")):
+    if any(
+        phrase in text
+        for phrase in (
+            "look up",
+            "find docs",
+            "documentation for",
+            "official docs",
+            "latest ",
+            "current ",
+        )
+    ):
         return True
-    if any(word in text for word in ("weather", "forecast", "temperature", "rain today", "news today", "stock price", "exchange rate")):
+    if any(
+        word in text
+        for word in (
+            "weather",
+            "forecast",
+            "temperature",
+            "rain today",
+            "news today",
+            "stock price",
+            "exchange rate",
+        )
+    ):
         return True
     if _has_fuzzy_web_keyword(text):
         return True
-    if any(word in text for word in ("package", "api docs", "release notes", "version", "breaking change")) and not _is_project_local_prompt(text):
+    if any(
+        word in text
+        for word in ("package", "api docs", "release notes", "version", "breaking change")
+    ) and not _is_project_local_prompt(text):
         return True
     return False
 
@@ -4988,38 +5455,90 @@ def _handle_package_install_request(
 # override so it always reaches the Git tools instead.
 
 _GIT_READ_ONLY_PHRASES = (
-    "git status", "git diff", "git branch", "git branches", "git remote",
-    "git log", "git show", "unstaged change", "staged change",
-    "uncommitted change", "unpushed commit", "current branch", "what changed",
-    "what has changed", "what are the changes", "what are the change",
-    "show changes", "show me the changes", "repo status", "repository status",
-    "status of the repo", "status of this repo", "what's changed",
-    "whats changed", "diff of the repo", "working tree",
+    "git status",
+    "git diff",
+    "git branch",
+    "git branches",
+    "git remote",
+    "git log",
+    "git show",
+    "unstaged change",
+    "staged change",
+    "uncommitted change",
+    "unpushed commit",
+    "current branch",
+    "what changed",
+    "what has changed",
+    "what are the changes",
+    "what are the change",
+    "show changes",
+    "show me the changes",
+    "repo status",
+    "repository status",
+    "status of the repo",
+    "status of this repo",
+    "what's changed",
+    "whats changed",
+    "diff of the repo",
+    "working tree",
     # Untracked files are a pure git/status concept: any mention must reach
     # git_status, never find_file (which used to search for a file literally
     # named "untracked").
-    "untracked", "untracked file", "untracked files", "untracked change",
+    "untracked",
+    "untracked file",
+    "untracked files",
+    "untracked change",
 )
 
 _GIT_MUTATION_PHRASES = (
-    "stage the file", "stage files", "stage the change", "stage changes",
-    "stage all", "stage everything", "git add", "commit", "git push",
-    "push this", "push to", "push it", "push the", "git pull", "pull from",
-    "pull the latest", "git fetch", "fetch from", "create branch",
-    "create a branch", "new branch", "switch branch", "stash", "git restore",
-    "restore the file", "amend",
+    "stage the file",
+    "stage files",
+    "stage the change",
+    "stage changes",
+    "stage all",
+    "stage everything",
+    "git add",
+    "commit",
+    "git push",
+    "push this",
+    "push to",
+    "push it",
+    "push the",
+    "git pull",
+    "pull from",
+    "pull the latest",
+    "git fetch",
+    "fetch from",
+    "create branch",
+    "create a branch",
+    "new branch",
+    "switch branch",
+    "stash",
+    "git restore",
+    "restore the file",
+    "amend",
     # "checkout" only counts when it clearly means the git verb. Bare "checkout"
     # is colloquial ("checkout the prd" = "look at the prd") and must NOT be
     # treated as a git request.
-    "git checkout", "checkout branch", "checkout the branch", "check out branch",
-    "checkout main", "checkout master", "switch to branch",
+    "git checkout",
+    "checkout branch",
+    "checkout the branch",
+    "check out branch",
+    "checkout main",
+    "checkout master",
+    "switch to branch",
 )
 
 # A generic Git anchor: a prompt that clearly talks about git/repo work is a
 # Git request even without one of the phrases above.
 _GIT_ANCHOR_PHRASES = (
-    "git ", "the repo", "this repo", "the repository", "in git",
-    "to github", "on github",
+    "git ",
+    "the repo",
+    "this repo",
+    "the repository",
+    "in git",
+    "to github",
+    "on github",
 )
 
 
@@ -5052,9 +5571,22 @@ def is_git_request(text: str) -> bool:
     return any(
         word in low
         for word in (
-            "status", "diff", "commit", "branch", "stage", "staged",
-            "unstaged", "untracked", "push", "pull", "fetch", "checkout",
-            "stash", "remote", "log", "changes",
+            "status",
+            "diff",
+            "commit",
+            "branch",
+            "stage",
+            "staged",
+            "unstaged",
+            "untracked",
+            "push",
+            "pull",
+            "fetch",
+            "checkout",
+            "stash",
+            "remote",
+            "log",
+            "changes",
         )
     )
 
@@ -5067,15 +5599,19 @@ def _is_read_only_git_question(text: str) -> bool:
     starts_read_only = any(
         low.startswith(prefix)
         for prefix in (
-            "what", "show", "list", "describe", "tell me", "explain",
-            "which", "where", "why", "how",
+            "what",
+            "show",
+            "list",
+            "describe",
+            "tell me",
+            "explain",
+            "which",
+            "where",
+            "why",
+            "how",
         )
     )
-    return (
-        starts_read_only
-        and is_read_only_git_request(text)
-        and not is_git_mutation_request(text)
-    )
+    return starts_read_only and is_read_only_git_request(text) and not is_git_mutation_request(text)
 
 
 def _git_inspection_guidance(user_input: str) -> str:
@@ -5095,10 +5631,10 @@ def _git_inspection_guidance(user_input: str) -> str:
             "- Before committing: call git_status, git_diff, then git_add_all "
             "(or git_add), then git_diff_staged, then git_commit."
         )
-    elif is_git_mutation_request(user_input) and any(
-        p in low for p in ("stage", "add")
-    ):
-        lines.append("- Before staging: call git_status (and git_diff), then git_add_all or git_add, then git_status again.")
+    elif is_git_mutation_request(user_input) and any(p in low for p in ("stage", "add")):
+        lines.append(
+            "- Before staging: call git_status (and git_diff), then git_add_all or git_add, then git_status again."
+        )
     if any(p in low for p in ("push",)):
         lines.append(
             "- Before pushing: call git_branch, git_remote, and "
@@ -5169,10 +5705,24 @@ def _run_git_read_only(
 
 
 _GIT_INIT_PHRASES = (
-    "git init", "initialize git", "initialise git", "init the repo", "init a repo",
-    "initialize the repo", "initialise the repo", "initialize a git", "initialise a git",
-    "initialize this repo", "create a git repo", "create a repo", "make this a git repo",
-    "make it a git repo", "make this a repo", "set up git", "setup git", "start a git repo",
+    "git init",
+    "initialize git",
+    "initialise git",
+    "init the repo",
+    "init a repo",
+    "initialize the repo",
+    "initialise the repo",
+    "initialize a git",
+    "initialise a git",
+    "initialize this repo",
+    "create a git repo",
+    "create a repo",
+    "make this a git repo",
+    "make it a git repo",
+    "make this a repo",
+    "set up git",
+    "setup git",
+    "start a git repo",
     "turn this into a git repo",
 )
 
@@ -5227,7 +5777,7 @@ def _run_git_init(
     body = "Initialized an empty git repository."
     if after.ok and isinstance(after.data, dict) and after.data.get("changed_files"):
         files = after.data["changed_files"]
-        body += f"\n{len(files)} untracked file(s). Say \"add and commit\" to make the first commit."
+        body += f'\n{len(files)} untracked file(s). Say "add and commit" to make the first commit.'
     console.print(Panel(body, title="Git Init"))
     _log_assistant_message(session_logger, body, workflow_id="git-init")
 
@@ -5282,7 +5832,9 @@ def _run_git_add_commit(
 
     trace("tool=git_status args={}")
     status = registry.execute("git_status", {})
-    if not status.ok or (isinstance(status.data, dict) and not status.data.get("is_git_repo", True)):
+    if not status.ok or (
+        isinstance(status.data, dict) and not status.data.get("is_git_repo", True)
+    ):
         # Not a repo yet - initialize it so "add and commit" actually works
         # instead of dead-ending. git init is safe and local.
         trace("tool=git_init args={}")
@@ -5297,7 +5849,11 @@ def _run_git_add_commit(
         status = registry.execute("git_status", {})
     if isinstance(status.data, dict) and not status.data.get("is_dirty", True):
         console.print(Panel("Nothing to commit - the working tree is clean.", title="Git"))
-        _log_assistant_message(session_logger, "Nothing to commit - the working tree is clean.", workflow_id="git-commit")
+        _log_assistant_message(
+            session_logger,
+            "Nothing to commit - the working tree is clean.",
+            workflow_id="git-commit",
+        )
         return
 
     message = _extract_commit_message(user_input)
@@ -5320,7 +5876,9 @@ def _run_git_add_commit(
         )
     if not approved:
         console.print("[yellow]Commit cancelled - nothing was staged or committed.[/yellow]")
-        _log_assistant_message(session_logger, "Commit cancelled by user.", workflow_id="git-commit")
+        _log_assistant_message(
+            session_logger, "Commit cancelled by user.", workflow_id="git-commit"
+        )
         return
 
     trace("tool=git_add_all args={}")
@@ -5333,7 +5891,9 @@ def _run_git_add_commit(
         lines.append(f"git add failed: {add_result.message}")
     if commit_result.ok:
         lines.append(f"Committed with message: {message}")
-        commit_out = commit_result.data.get("stdout", "") if isinstance(commit_result.data, dict) else ""
+        commit_out = (
+            commit_result.data.get("stdout", "") if isinstance(commit_result.data, dict) else ""
+        )
         if commit_out:
             lines.append(commit_out.strip())
     else:
@@ -5435,24 +5995,51 @@ _PRD_CONTEXT_QUESTION_PHRASES = (
 # prd and tell me what it is", "summarize the prd". These must read the actual
 # PRD text and summarize it - never route to git (checkout) or the tool loop.
 _PRD_SUMMARY_TRIGGERS = (
-    "what is the prd about", "what's the prd about", "whats the prd about",
-    "what is this prd about", "what is the project about", "what's the project about",
-    "whats the project about", "what is this project about", "what is this app about",
-    "what is this product about", "what is this about", "what's this about",
-    "tell me what is the project", "tell me what the project", "tell me about the prd",
-    "tell me about the project", "tell me about this project", "summarize the prd",
-    "summarise the prd", "what does the prd say", "what's in the prd", "what is in the prd",
-    "read the prd", "check the prd", "checkout the prd", "check out the prd",
-    "look at the prd", "review the prd", "explain the prd", "describe the project",
-    "describe the prd", "what is the app about",
+    "what is the prd about",
+    "what's the prd about",
+    "whats the prd about",
+    "what is this prd about",
+    "what is the project about",
+    "what's the project about",
+    "whats the project about",
+    "what is this project about",
+    "what is this app about",
+    "what is this product about",
+    "what is this about",
+    "what's this about",
+    "tell me what is the project",
+    "tell me what the project",
+    "tell me about the prd",
+    "tell me about the project",
+    "tell me about this project",
+    "summarize the prd",
+    "summarise the prd",
+    "what does the prd say",
+    "what's in the prd",
+    "what is in the prd",
+    "read the prd",
+    "check the prd",
+    "checkout the prd",
+    "check out the prd",
+    "look at the prd",
+    "review the prd",
+    "explain the prd",
+    "describe the project",
+    "describe the prd",
+    "what is the app about",
 )
 
 
 def _looks_like_prd_summary_request(user_input: str, workspace: Path) -> bool:
     text = user_input.lower()
     explicit_prd = _extract_prd_path_from_prompt(user_input)
-    explicit_summary = bool(explicit_prd) and is_prd_filename(Path(explicit_prd.lstrip("@")).name) and any(
-        verb in text for verb in ("summarize", "summarise", "explain", "describe", "review", "read")
+    explicit_summary = (
+        bool(explicit_prd)
+        and is_prd_filename(Path(explicit_prd.lstrip("@")).name)
+        and any(
+            verb in text
+            for verb in ("summarize", "summarise", "explain", "describe", "review", "read")
+        )
     )
     if not explicit_summary and not any(trigger in text for trigger in _PRD_SUMMARY_TRIGGERS):
         return False
@@ -5566,8 +6153,7 @@ def _has_fuzzy_web_keyword(text: str) -> bool:
     prompt into a tool-less chat path that hallucinates a fake search."""
     words = re.findall(r"[a-z]+", text)
     return any(
-        difflib.get_close_matches(word, _WEB_FUZZY_KEYWORDS, n=1, cutoff=0.8)
-        for word in words
+        difflib.get_close_matches(word, _WEB_FUZZY_KEYWORDS, n=1, cutoff=0.8) for word in words
     )
 
 
@@ -5592,11 +6178,7 @@ def _looks_like_browser_needed_prompt(user_input: str) -> bool:
 
 
 def _extract_prd_path_from_prompt(user_input: str) -> str:
-    quoted = re.search(r"['\"]([^'\"]+\.(?:md|markdown|txt|pdf))['\"]", user_input, re.I)
-    if quoted:
-        return quoted.group(1)
-    match = re.search(r"([^\s]+?\.(?:md|markdown|txt|pdf))", user_input, re.I)
-    return match.group(1) if match else ""
+    return extract_document_reference(user_input)
 
 
 def _extract_url_from_prompt(user_input: str) -> str:
@@ -5650,14 +6232,14 @@ _INTENT_ACTIVITY = {
 
 
 def _print_decision(decision: RoutingDecision, console: Console, verbose: bool = False) -> None:
-    activity = _INTENT_ACTIVITY.get(decision.intent, f"Working on this as a {decision.intent} task.")
+    activity = _INTENT_ACTIVITY.get(
+        decision.intent, f"Working on this as a {decision.intent} task."
+    )
     console.print(f"[cyan]{activity}[/cyan]")
     # Keep the raw routing signal available for debugging, but only when the
     # user has explicitly opted into verbose trace output.
     if verbose:
-        console.print(
-            f"[dim]intent={decision.intent} confidence={decision.confidence:.2f}[/dim]"
-        )
+        console.print(f"[dim]intent={decision.intent} confidence={decision.confidence:.2f}[/dim]")
 
 
 def _print_workspace_location(workspace: Path, console: Console) -> str:
@@ -5668,10 +6250,7 @@ def _print_workspace_location(workspace: Path, console: Console) -> str:
 
 def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -> str:
     entries = sorted(
-        [
-            path for path in workspace.iterdir()
-            if path.name != ".shamsu"
-        ],
+        [path for path in workspace.iterdir() if path.name != ".shamsu"],
         key=lambda path: (not path.is_dir(), path.name.lower()),
     )
     if not entries:
@@ -5680,8 +6259,7 @@ def _print_workspace_files(workspace: Path, console: Console, limit: int = 20) -
         return message
     shown = entries[:limit]
     body = "\n".join(
-        f"[dir]  {item.name}" if item.is_dir() else f"[file] {item.name}"
-        for item in shown
+        f"[dir]  {item.name}" if item.is_dir() else f"[file] {item.name}" for item in shown
     )
     if len(entries) > limit:
         body = f"{body}\n... {len(entries) - limit} more"
@@ -5749,7 +6327,9 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> str:
         console.print("[yellow]I found multiple PRD files in this workspace:[/yellow]")
         for path in candidates[:10]:
             console.print(f"- {path}")
-        console.print("Tell me which one to open, or run `/parse-prd <file>` or `/plan-prd <file>`.")
+        console.print(
+            "Tell me which one to open, or run `/parse-prd <file>` or `/plan-prd <file>`."
+        )
         return message
     relative_path = candidates[0]
     absolute_path = workspace / relative_path
@@ -5763,22 +6343,31 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> str:
         f"File: {relative_path}\n"
         f"Title: {parsed.title}\n"
         f"Sections: {section_names}\n\n"
-        f"Use `/plan-prd \"{relative_path}\"` if you want me to turn it into a project plan."
+        f'Use `/plan-prd "{relative_path}"` if you want me to turn it into a project plan.'
     )
     console.print(Panel(message, title="PRD Found"))
     return message
 
 
 _PRD_BUILD_VERBS = ("build", "finish", "implement", "generate", "make", "create", "develop")
-_PRD_BUILD_NOUNS = ("product", "app", "application", "game", "project", "website", "site", "it", "this", "prd")
+_PRD_BUILD_NOUNS = (
+    "product",
+    "app",
+    "application",
+    "game",
+    "project",
+    "website",
+    "site",
+    "it",
+    "this",
+    "prd",
+)
 # Matched on WORD boundaries, not as substrings. The plain `noun in text` this
 # replaced meant the "it" entry matched inside with/quit/write/site/edit - so
 # the noun half of the build test was satisfied by almost any English sentence,
 # leaving `_resolve_build_prd` as the only thing standing between an ordinary
 # prompt and a full product build.
-_PRD_BUILD_NOUN_RE = re.compile(
-    r"\b(?:" + "|".join(_PRD_BUILD_NOUNS) + r")s?\b", re.IGNORECASE
-)
+_PRD_BUILD_NOUN_RE = re.compile(r"\b(?:" + "|".join(_PRD_BUILD_NOUNS) + r")s?\b", re.IGNORECASE)
 
 # Terse imperative "just do it" style commands. These carry no task detail of
 # their own, so they must be routed to something that can actually act (the
@@ -5827,20 +6416,77 @@ def _looks_like_vague_action_request(user_input: str) -> bool:
 # Verbs that mean "modify the project" - their presence (outside obvious
 # question phrasing) marks a request as an action to perform, not a question.
 _ACTION_VERBS = {
-    "fix", "build", "make", "create", "add", "implement", "update", "change",
-    "edit", "modify", "write", "refactor", "rewrite", "improve", "apply",
-    "generate", "install", "setup", "configure", "continue", "finish",
-    "complete", "proceed", "resume", "redo", "regenerate", "review", "debug",
-    "resolve", "correct", "patch", "run", "start", "stop", "restart",
-    "execute", "launch", "open", "deploy", "compile", "rebuild",
+    "fix",
+    "build",
+    "make",
+    "create",
+    "add",
+    "implement",
+    "update",
+    "change",
+    "edit",
+    "modify",
+    "write",
+    "refactor",
+    "rewrite",
+    "improve",
+    "apply",
+    "generate",
+    "install",
+    "setup",
+    "configure",
+    "continue",
+    "finish",
+    "complete",
+    "proceed",
+    "resume",
+    "redo",
+    "regenerate",
+    "review",
+    "debug",
+    "resolve",
+    "correct",
+    "patch",
+    "run",
+    "start",
+    "stop",
+    "restart",
+    "execute",
+    "launch",
+    "open",
+    "deploy",
+    "compile",
+    "rebuild",
 }
 
 # Leading phrasing that marks a genuine question/explanation: keep it on QA.
 _QUESTION_PREFIXES = (
-    "what", "why", "how", "when", "where", "who", "which", "whose",
-    "explain", "tell me", "show me", "describe", "list ", "summarize",
-    "is ", "are ", "was ", "were ", "does ", "do you", "did you", "should i",
-    "can you explain", "could you explain", "whats", "hows",
+    "what",
+    "why",
+    "how",
+    "when",
+    "where",
+    "who",
+    "which",
+    "whose",
+    "explain",
+    "tell me",
+    "show me",
+    "describe",
+    "list ",
+    "summarize",
+    "is ",
+    "are ",
+    "was ",
+    "were ",
+    "does ",
+    "do you",
+    "did you",
+    "should i",
+    "can you explain",
+    "could you explain",
+    "whats",
+    "hows",
 )
 
 
@@ -5926,7 +6572,16 @@ def _looks_like_action_request(user_input: str) -> bool:
     if _ACTION_VERBS & words:
         return True
     # Generic "do the thing / work / rest / task" imperatives.
-    if "do" in words and words & {"thing", "things", "work", "stuff", "rest", "task", "tasks", "job"}:
+    if "do" in words and words & {
+        "thing",
+        "things",
+        "work",
+        "stuff",
+        "rest",
+        "task",
+        "tasks",
+        "job",
+    }:
         return True
     return False
 
@@ -5936,23 +6591,63 @@ def _looks_like_action_request(user_input: str) -> bool:
 # must reach the tool-having agent loop, which can read the files and repair,
 # not the tool-less QA brain that returns a troubleshooting checklist.
 _TROUBLE_SIGNALS = (
-    "not working", "cant see", "can't see", "cannot see", "doesnt work", "doesn't work",
-    "does not work", "not showing", "nothing happens", "nothing shows", "still broken",
-    "still not", "blank page", "blank screen", "white screen", "wont run", "won't run",
-    "crashes", "not rendering", "isnt working", "isn't working", "no game", "page is blank",
+    "not working",
+    "cant see",
+    "can't see",
+    "cannot see",
+    "doesnt work",
+    "doesn't work",
+    "does not work",
+    "not showing",
+    "nothing happens",
+    "nothing shows",
+    "still broken",
+    "still not",
+    "blank page",
+    "blank screen",
+    "white screen",
+    "wont run",
+    "won't run",
+    "crashes",
+    "not rendering",
+    "isnt working",
+    "isn't working",
+    "no game",
+    "page is blank",
 )
 _ERROR_LOG_SIGNALS = (
-    "error:", "cannot find", "is not exported", "has no exported member", "failed to compile",
-    "uncaught", "syntaxerror", "referenceerror", "typeerror", "module not found",
-    "cannot find module", "unexpected token", "traceback (most recent", "does not exist on type",
-    "does not provide an export named", "no exported member", "stack trace", " at ",
-    "ts2305", "ts2724", "ts2339", "ts2307", "ts(", "vite:", "[plugin:",
+    "error:",
+    "cannot find",
+    "is not exported",
+    "has no exported member",
+    "failed to compile",
+    "uncaught",
+    "syntaxerror",
+    "referenceerror",
+    "typeerror",
+    "module not found",
+    "cannot find module",
+    "unexpected token",
+    "traceback (most recent",
+    "does not exist on type",
+    "does not provide an export named",
+    "no exported member",
+    "stack trace",
+    " at ",
+    "ts2305",
+    "ts2724",
+    "ts2339",
+    "ts2307",
+    "ts(",
+    "vite:",
+    "[plugin:",
 )
 
 
 def _looks_like_trouble_report(user_input: str) -> bool:
     low = user_input.lower()
     return any(s in low for s in _TROUBLE_SIGNALS) or any(s in low for s in _ERROR_LOG_SIGNALS)
+
 
 def _bugfix_request_has_actionable_target(user_input: str) -> bool:
     """Bug-fix workflows need a concrete file, traceback, command, or error.
@@ -6003,7 +6698,9 @@ def _bugfix_report_from_last_failure(
     if not errors and not command:
         return None
     exit_code = failure.get("exit_code", "")
-    intent = _strip_forced_prefix(user_input, "fix").strip() or "Repair the reported build/test failure."
+    intent = (
+        _strip_forced_prefix(user_input, "fix").strip() or "Repair the reported build/test failure."
+    )
     report = (
         f"{intent}\n\n"
         f"Last failing command: {command or '(unknown)'}\n"
@@ -6012,14 +6709,36 @@ def _bugfix_report_from_last_failure(
     )
     return report, command or "(unknown)"
 
+
 _FILE_WRITE_VERBS = {
-    "create", "write", "save", "generate", "make", "add", "edit", "update",
-    "modify", "overwrite",
+    "create",
+    "write",
+    "save",
+    "generate",
+    "make",
+    "add",
+    "edit",
+    "update",
+    "modify",
+    "overwrite",
+    "fix",
+    "repair",
+    "change",
 }
 
 _FILE_HINT_WORDS = {
-    "file", "files", "script", "component", "module", "readme", "gitignore",
-    "config", "page", "class", "test", "tests",
+    "file",
+    "files",
+    "script",
+    "component",
+    "module",
+    "readme",
+    "gitignore",
+    "config",
+    "page",
+    "class",
+    "test",
+    "tests",
 }
 
 _FILELIKE_RE = re.compile(
@@ -6101,8 +6820,7 @@ def _looks_like_docs_ingest_request(user_input: str) -> bool:
         return False
     source_signal = bool(_FILELIKE_RE.search(user_input)) or "http://" in text or "https://" in text
     doc_signal = any(
-        word in text
-        for word in ("doc", "documentation", "reference", "manual", "guide", "library")
+        word in text for word in ("doc", "documentation", "reference", "manual", "guide", "library")
     )
     return source_signal and doc_signal
 
@@ -6153,20 +6871,61 @@ def _required_docs_tool(user_input: str) -> str:
 # planner + tool loop, which used to only produce a plan and then time out on a
 # trivial "print the first 100 primes" request.
 _DIRECT_CODE_NOUNS = (
-    "code", "function", "snippet", "script", "program", "programme", "regex",
-    "one-liner", "oneliner", "algorithm", "class", "method", "loop",
+    "code",
+    "function",
+    "snippet",
+    "script",
+    "program",
+    "programme",
+    "regex",
+    "one-liner",
+    "oneliner",
+    "algorithm",
+    "class",
+    "method",
+    "loop",
 )
 _DIRECT_CODE_PRODUCE_VERBS = (
-    "write", "give me", "show me", "generate", "create", "print", "implement",
-    "make", "provide", "produce", "code for", "how do i write", "how to write",
+    "write",
+    "give me",
+    "show me",
+    "generate",
+    "create",
+    "print",
+    "implement",
+    "make",
+    "provide",
+    "produce",
+    "code for",
+    "how do i write",
+    "how to write",
 )
 # Signals the ask is actually about the workspace/files, so it must NOT be a
 # direct answer (it needs the tool loop instead).
 _DIRECT_CODE_WORKSPACE_SIGNALS = (
-    "save", "to a file", "into a file", "in a file", "create a file", "write a file",
-    "in the workspace", "in my workspace", "in this project", "in the project",
-    "to the repo", "add to", "run it", "run this", "run the", "execute",
-    "test it", "edit ", " open ", "commit", "existing", "this file", "that file",
+    "save",
+    "to a file",
+    "into a file",
+    "in a file",
+    "create a file",
+    "write a file",
+    "in the workspace",
+    "in my workspace",
+    "in this project",
+    "in the project",
+    "to the repo",
+    "add to",
+    "run it",
+    "run this",
+    "run the",
+    "execute",
+    "test it",
+    "edit ",
+    " open ",
+    "commit",
+    "existing",
+    "this file",
+    "that file",
 )
 
 
@@ -6252,7 +7011,9 @@ async def _handle_file_read_request(
         candidates = result.data.get("candidates") if isinstance(result.data, dict) else None
         detail = f"read_file {filepath} failed: {result.message}"
         if candidates:
-            detail += "\n\nCandidates:\n" + "\n".join(f"- {candidate}" for candidate in candidates[:10])
+            detail += "\n\nCandidates:\n" + "\n".join(
+                f"- {candidate}" for candidate in candidates[:10]
+            )
         console.print(Panel(detail, title="File Read Failed", border_style="red"))
         _log_assistant_message(session_logger, detail, workflow_id="file.read")
         return
@@ -6342,11 +7103,19 @@ def _looks_like_run_game_request(user_input: str) -> bool:
 
 
 _DEV_SERVER_FAIL_PHRASES = (
-    "didnt run", "didn't run", "did not run",
-    "didnt start", "didn't start", "did not start",
-    "failed to start", "wont start", "won't start",
-    "not starting", "not running yet",
-    "dev server failed", "server failed",
+    "didnt run",
+    "didn't run",
+    "did not run",
+    "didnt start",
+    "didn't start",
+    "did not start",
+    "failed to start",
+    "wont start",
+    "won't start",
+    "not starting",
+    "not running yet",
+    "dev server failed",
+    "server failed",
 )
 
 
@@ -6472,8 +7241,17 @@ def _looks_like_affirmative_continue(user_input: str) -> bool:
     if not text:
         return False
     return text in {
-        "yes", "yes please", "yeah", "yep", "ok", "okay", "sure",
-        "continue", "go ahead", "do it", "proceed",
+        "yes",
+        "yes please",
+        "yeah",
+        "yep",
+        "ok",
+        "okay",
+        "sure",
+        "continue",
+        "go ahead",
+        "do it",
+        "proceed",
     }
 
 
@@ -6507,7 +7285,9 @@ async def _handle_run_game(
     if (workspace / "client").is_dir() and (workspace / "server").is_dir():
         # Monorepo: one `npm run dev` starts both the server and the client
         # (concurrently), in one terminal window teed to a log.
-        dev = _start_background_command("npm run dev", workspace, log_dir / "dev.log", visible_console=True)
+        dev = _start_background_command(
+            "npm run dev", workspace, log_dir / "dev.log", visible_console=True
+        )
         settle_log = log_dir / "dev.log"
         console.print(
             Panel(
@@ -6520,13 +7300,19 @@ async def _handle_run_game(
             )
         )
         _log_event(
-            session_logger, "project.preview.started",
+            session_logger,
+            "project.preview.started",
             {"url": url, "dev_pid": dev.pid, "logs": str(log_dir)},
-            f"Started game preview at {url}", workflow_id="game-preview",
+            f"Started game preview at {url}",
+            workflow_id="game-preview",
         )
     else:
-        relay = _start_background_command("npm run dev:relay", workspace, log_dir / "relay.log", visible_console=True)
-        vite = _start_background_command("npm run dev", workspace, log_dir / "vite.log", visible_console=True)
+        relay = _start_background_command(
+            "npm run dev:relay", workspace, log_dir / "relay.log", visible_console=True
+        )
+        vite = _start_background_command(
+            "npm run dev", workspace, log_dir / "vite.log", visible_console=True
+        )
         settle_log = log_dir / "vite.log"
         console.print(
             Panel(
@@ -6540,9 +7326,11 @@ async def _handle_run_game(
             )
         )
         _log_event(
-            session_logger, "project.preview.started",
+            session_logger,
+            "project.preview.started",
             {"url": url, "vite_pid": vite.pid, "relay_pid": relay.pid, "logs": str(log_dir)},
-            f"Started game preview at {url}", workflow_id="game-preview",
+            f"Started game preview at {url}",
+            workflow_id="game-preview",
         )
 
     # Read the dev-server log back and, if it failed to boot cleanly, fix errors.
@@ -6645,11 +7433,24 @@ def _start_background_command(
 
 
 _DEV_ERROR_SIGNALS = (
-    "failed to resolve import", "internal server error", "pre-transform error",
-    "could not resolve", "transform failed", "[plugin:", "has no exported member",
-    "is not exported", "cannot find module", "cannot find name", "unexpected token",
-    "syntaxerror", "referenceerror", "error ts", "tsc: error", "npm err!",
-    "module not found", "failed to compile",
+    "failed to resolve import",
+    "internal server error",
+    "pre-transform error",
+    "could not resolve",
+    "transform failed",
+    "[plugin:",
+    "has no exported member",
+    "is not exported",
+    "cannot find module",
+    "cannot find name",
+    "unexpected token",
+    "syntaxerror",
+    "referenceerror",
+    "error ts",
+    "tsc: error",
+    "npm err!",
+    "module not found",
+    "failed to compile",
 )
 _DEV_READY_SIGNALS = ("ready in", "localhost:5173", "vite v", "local:   http")
 
@@ -6724,7 +7525,10 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     # .gitignore). A plan intent is never a build.
     if _looks_like_plan_intent(user_input):
         return False
-    if _looks_like_vague_action_request(user_input) and _resolve_build_prd(user_input, workspace) is not None:
+    if (
+        _looks_like_vague_action_request(user_input)
+        and _resolve_build_prd(user_input, workspace) is not None
+    ):
         return True
     explicit_path = _extract_prd_path_from_prompt(user_input)
     if (
@@ -6762,6 +7566,25 @@ def _has_fuzzy_word(words: list[str], targets: tuple[str, ...], cutoff: float = 
     return False
 
 
+def _resolved_prd_reference(user_input: str, workspace: Path) -> str:
+    """A workspace-relative PRD path to name in a plan prompt.
+
+    The bare-document pattern truncates an unquoted mention whose filename
+    contains spaces (`@canvas lite.pdf` -> `lite.pdf`), so the plan route told
+    the agent to read a file that does not exist and it stopped to ask what
+    that document was (observed live 2026-08-02). The mention-aware resolver
+    reassembles the real name; fall back to the raw token only when nothing
+    resolves.
+    """
+    resolved = _resolve_build_prd(user_input, workspace)
+    if resolved is not None:
+        try:
+            return resolved.resolve().relative_to(Path(workspace).resolve()).as_posix()
+        except (OSError, ValueError):
+            return resolved.as_posix()
+    return _extract_prd_path_from_prompt(user_input) or "the PRD"
+
+
 def _resolve_build_prd(user_input: str, workspace: Path) -> Path | None:
     """Resolve which PRD a build request refers to (relative to workspace).
 
@@ -6783,11 +7606,38 @@ def _resolve_build_prd(user_input: str, workspace: Path) -> Path | None:
         # prompt resolve to an unrelated PRD, so a one-line file request routed
         # to prd.build and built somebody else's product instead. If the user
         # named a doc, that doc is the subject; not finding it is an answer.
-        return None
+        #
+        # Exception: an unquoted @-mention whose filename contains spaces is
+        # truncated by the bare-document pattern (`@canvas lite.pdf` yields
+        # `lite.pdf`, which of course does not exist). An `@` means the user is
+        # pointing AT an existing workspace file, never asking to create one,
+        # so let the mention resolver - which reassembles the spaced name - have
+        # its turn instead of failing on the truncated token.
+        if "@" not in user_input:
+            return None
 
     for mention in MentionResolver(workspace).resolve_all(user_input):
-        if mention.resolved and mention.path is not None and is_prd_filename(mention.path.name):
+        # Identification, not readability: a mention that pinned down a real
+        # file still names the PRD even when reading its CONTENT failed (an
+        # unreadable/corrupt PDF must route here and report the parse error,
+        # not fall back to generic file.write on a truncated name).
+        if mention.path is None or not (workspace / mention.path).is_file():
+            continue
+        if (
+            is_prd_filename(mention.path.name)
+            # A .pdf the user explicitly @-mentions in a build request IS the
+            # requirements document, whatever it is named - PDFs are inputs
+            # SHAMSU reads, never code it writes. The name heuristic alone
+            # rejected `canvas lite.pdf` and derailed the 2026-08-01 dogfood
+            # into generic file.write.
+            or mention.path.suffix.lower() == ".pdf"
+        ):
             return workspace / mention.path
+
+    if explicit:
+        # A named-but-unresolvable document stays the subject of the request:
+        # never silently substitute the workspace's single PRD for it.
+        return None
 
     candidates = _find_workspace_prd_files(workspace)
     if len(candidates) == 1:
@@ -6798,22 +7648,23 @@ def _resolve_build_prd(user_input: str, workspace: Path) -> Path | None:
 def _extract_prd_milestones(parsed) -> list[str]:
     lines = parsed.raw_text.splitlines() if parsed.raw_text else []
     milestones = [
-        line.strip()
-        for line in lines
-        if re.match(r"^\s*(milestone|phase|step)\s*\d", line, re.I)
+        line.strip() for line in lines if re.match(r"^\s*(milestone|phase|step)\s*\d", line, re.I)
     ]
     return milestones
 
 
 def _milestone_executor_enabled() -> bool:
     raw = os.environ.get("SHAMSU_MILESTONE_EXECUTOR", "").strip().lower()
-    return raw in {"1", "true", "yes", "on", "enabled"}
+    return raw not in {"0", "false", "no", "off", "disabled"}
 
 
-def _compiled_prd_milestones(parsed) -> list[str]:
+def _compiled_prd_milestones(parsed, *, require_complex: bool = False) -> list[str]:
     try:
-        ledger = compile_requirement_ledger(extract_contract(parsed))
+        contract_obj = extract_contract(parsed)
+        ledger = compile_requirement_ledger(contract_obj)
     except Exception:
+        return []
+    if require_complex and not is_complex_prd_contract(contract_obj, ledger):
         return []
     milestones: list[str] = []
     for milestone in ledger.milestones:
@@ -6831,8 +7682,9 @@ def _prd_milestones_for_execution(parsed) -> tuple[list[str], str]:
         return explicit, "explicit_prd"
     if not _milestone_executor_enabled():
         return [], "disabled"
-    compiled = _compiled_prd_milestones(parsed)
-    return compiled, "compiled_requirement_ledger" if compiled else "none"
+    configured = os.environ.get("SHAMSU_MILESTONE_EXECUTOR", "").strip()
+    compiled = _compiled_prd_milestones(parsed, require_complex=not configured)
+    return compiled, "compiled_requirement_ledger" if compiled else "simple_project"
 
 
 def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None:
@@ -6865,7 +7717,7 @@ PRD_BUILD_FRAMING = (
     "Before rewriting any file that already exists, read it first with read_file and EXTEND it - never "
     "regenerate a file from scratch in a way that drops features implemented in earlier milestones. "
     "Keep the app wired together: if the project has a script.js, index.html must load it with "
-    "<script src=\"script.js\"></script> and must NOT keep its own inline game logic or a leftover "
+    '<script src="script.js"></script> and must NOT keep its own inline game logic or a leftover '
     "placeholder demo (e.g. a rotating-cube snippet). All logic lives in script.js. "
     "Use write_file for file changes and run_command to verify when possible. "
     "A milestone is done only when its acceptance criteria are implemented and the files are wired together "
@@ -7007,8 +7859,7 @@ def _extract_error_snippets(
         start = max(line_no - context_lines, 1)
         end = min(line_no + context_lines, len(lines))
         numbered = "\n".join(
-            f"{n:>5}{'>' if n == line_no else ' '} {lines[n - 1]}"
-            for n in range(start, end + 1)
+            f"{n:>5}{'>' if n == line_no else ' '} {lines[n - 1]}" for n in range(start, end + 1)
         )
         snippets.append(f"--- {path_text} around line {line_no} ---\n{numbered}")
         if len(snippets) >= max_snippets:
@@ -7055,23 +7906,35 @@ async def _verify_and_repair_frontend(
         console.print("[yellow]Skipping compile check - dependencies are not installed.[/yellow]")
         return False
     for attempt in range(1, max_attempts + 1):
-        console.print(f"[dim]Checking the game compiles (tsc, attempt {attempt}/{max_attempts})...[/dim]")
+        console.print(
+            f"[dim]Checking the game compiles (tsc, attempt {attempt}/{max_attempts})...[/dim]"
+        )
         ok, output = _run_frontend_typecheck(workspace)
         if ok:
             console.print(
                 "[green]OK: The game compiles cleanly - frontend and game logic are wired together.[/green]"
             )
             _log_event(
-                session_logger, "project.typecheck.ok", {"attempt": attempt},
-                "Frontend typecheck passed", workflow_id="prd-build",
+                session_logger,
+                "project.typecheck.ok",
+                {"attempt": attempt},
+                "Frontend typecheck passed",
+                workflow_id="prd-build",
             )
             return True
         console.print(
-            Panel(output[-3000:] or "tsc reported errors.", title=f"Compile errors (attempt {attempt})", border_style="yellow")
+            Panel(
+                output[-3000:] or "tsc reported errors.",
+                title=f"Compile errors (attempt {attempt})",
+                border_style="yellow",
+            )
         )
         _log_event(
-            session_logger, "project.typecheck.failed", {"attempt": attempt},
-            "Frontend typecheck failed", workflow_id="prd-build",
+            session_logger,
+            "project.typecheck.failed",
+            {"attempt": attempt},
+            "Frontend typecheck failed",
+            workflow_id="prd-build",
         )
         if attempt == max_attempts:
             console.print(
@@ -7094,10 +7957,31 @@ async def _verify_and_repair_frontend(
 # File extensions that mean "this workspace already has an app" - so a greenfield
 # PRD build should EXTEND, not scaffold from scratch.
 _APP_SOURCE_EXTENSIONS = {
-    ".html", ".css", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
-    ".py", ".vue", ".svelte", ".go", ".rs", ".rb", ".php", ".java",
+    ".html",
+    ".css",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".py",
+    ".vue",
+    ".svelte",
+    ".go",
+    ".rs",
+    ".rb",
+    ".php",
+    ".java",
 }
-_SCAFFOLD_IGNORED_FILES = {".gitignore", "readme.md", "readme", "license", "license.md", "license.txt"}
+_SCAFFOLD_IGNORED_FILES = {
+    ".gitignore",
+    "readme.md",
+    "readme",
+    "license",
+    "license.md",
+    "license.txt",
+}
 
 
 def _looks_like_frontend_build_request(user_input: str) -> bool:
@@ -7130,7 +8014,7 @@ def _starter_index_html(title: str) -> str:
         '  <link rel="stylesheet" href="style.css" />\n'
         "</head>\n"
         "<body>\n"
-        f"  <main id=\"app\">\n    <h1>{safe}</h1>\n  </main>\n"
+        f'  <main id="app">\n    <h1>{safe}</h1>\n  </main>\n'
         '  <script src="script.js"></script>\n'
         "</body>\n"
         "</html>\n"
@@ -7151,7 +8035,7 @@ def _starter_script_js(title: str) -> str:
     return (
         f"// {safe} - entry point\n"
         '"use strict";\n\n'
-        "document.addEventListener(\"DOMContentLoaded\", () => {\n"
+        'document.addEventListener("DOMContentLoaded", () => {\n'
         "  // App logic goes here.\n"
         "});\n"
     )
@@ -7169,7 +8053,9 @@ def _scaffold_frontend_from_prd(
     registry = AgentToolRegistry(
         workspace,
         session_logger=session_logger,
-        approval_manager=_make_approval_manager(workspace, session_logger, console, lambda _request: True),
+        approval_manager=_make_approval_manager(
+            workspace, session_logger, console, lambda _request: True
+        ),
         action_ledger=get_current_run(),
     )
     title = getattr(parsed, "title", "") or "App"
@@ -7211,6 +8097,164 @@ def _build_frontend_fill_request(parsed, relative_path: Path) -> str:
     )
 
 
+def _prd_grounding_issue(parsed) -> str:
+    confidence = float(getattr(parsed, "extraction_confidence", 1.0) or 0.0)
+    if confidence >= 0.5:
+        return ""
+    warnings = list(getattr(parsed, "extraction_warnings", []) or [])
+    details = f" Extraction warnings: {'; '.join(warnings)}" if warnings else ""
+    return (
+        f"I could not ground this build reliably (extraction confidence {confidence:.0%})."
+        f"{details} Please provide a clearer document or a text version before I modify the project."
+    )
+
+
+# A document with at least this many sections is structured enough that
+# extracting nothing from it means the headings were not understood, rather
+# than that the document is a short prose brief (which builds from raw text).
+_PRD_STRUCTURED_SECTION_COUNT = 8
+
+
+async def _infer_prd_entities(parsed, console, session_logger) -> list:
+    """Recover entities the PRD names but never defines.
+
+    Runs only when deterministic extraction found none and the document does
+    list entity names, so a well-formed PRD costs nothing. Failure is never
+    fatal: it returns [] and the build proceeds exactly as before.
+    """
+    from shamsu.prd import entity_fields
+
+    try:
+        if extract_contract(parsed).entities:
+            return []
+        names = entity_fields.bare_entity_names(parsed)
+    except Exception:
+        return []
+    if not names:
+        return []
+
+    limit = entity_fields.max_inferred_entities()
+    console.print(
+        f"[dim]The PRD names {len(names)} entities without defining their fields. "
+        f"Asking the reasoning model to design the first {min(limit, len(names))}...[/dim]"
+    )
+    try:
+        entities = await entity_fields.infer_entity_fields(parsed, names)
+    except Exception as exc:
+        _log_event(
+            session_logger,
+            "prd.entity_inference_failed",
+            {"error": str(exc)},
+            "Entity field inference failed",
+            workflow_id="prd-build",
+        )
+        return []
+    if entities:
+        console.print(
+            f"[dim]Designed {len(entities)} models: "
+            f"{', '.join(entity.name for entity in entities[:8])}"
+            f"{'...' if len(entities) > 8 else ''}[/dim]"
+        )
+        _log_event(
+            session_logger,
+            "prd.entities_inferred",
+            {
+                "named": len(names),
+                "designed": len(entities),
+                "models": [entity.name for entity in entities],
+            },
+            f"Inferred fields for {len(entities)} entities",
+            workflow_id="prd-build",
+        )
+    return entities
+
+
+def _prd_extraction_is_thin(parsed) -> bool:
+    """True when heading matching found nothing substantial to build from."""
+    try:
+        contract_obj = extract_contract(parsed)
+    except Exception:
+        return True
+    return not contract_obj.entities and not contract_obj.features
+
+
+def _prd_has_nothing_to_build(parsed) -> bool:
+    """True for a clearly structured document that still yielded no work.
+
+    A short prose PRD with no sections is not this case - the generator works
+    from its raw text. This is the document that lays out dozens of sections
+    and still produces no entity and no feature, which compiles to a plan of
+    pure verification steps that writes no code.
+    """
+    if len(getattr(parsed, "sections", {}) or {}) < _PRD_STRUCTURED_SECTION_COUNT:
+        return False
+    return _prd_extraction_is_thin(parsed)
+
+
+async def _resolve_prd_headings(parsed, console, session_logger):
+    """Fold this PRD's own section names onto the ones extraction understands.
+
+    Requirements are found by heading name, so a PRD that words its headings
+    differently is read as empty and compiles to a plan with nothing in it.
+    The deterministic pass inside ``extract_contract`` handles rewordings; when
+    it still finds no entities and no features, the reasoning model is asked to
+    place the remaining sections. Failure here is never fatal - it leaves the
+    document exactly as parsed.
+    """
+    resolution = prd_headings.resolve_headings(parsed.sections)
+    resolved = prd_headings.apply_heading_aliases(parsed, resolution.aliases)
+    if not _prd_extraction_is_thin(resolved) or not resolution.unresolved:
+        return resolved
+
+    console.print(
+        f"[dim]Section names in this document do not match the ones I read by "
+        f"default ({len(resolution.unresolved)} unrecognised). Asking the "
+        f"reasoning model to place them...[/dim]"
+    )
+    try:
+        model_aliases = await prd_headings.resolve_headings_with_model(
+            parsed, resolution.unresolved
+        )
+    except Exception as exc:  # never block a build on the optional pass
+        _log_event(
+            session_logger,
+            "prd.heading_resolution_failed",
+            {"error": str(exc)},
+            "Model heading resolution failed",
+            workflow_id="prd-build",
+        )
+        return resolved
+
+    if not model_aliases:
+        return resolved
+
+    combined = dict(resolution.aliases)
+    combined.update(model_aliases)
+    resolved = prd_headings.apply_heading_aliases(parsed, combined)
+    contract_obj = extract_contract(resolved)
+    console.print(
+        f"[dim]Placed {len(model_aliases)} section(s): "
+        f"{len(contract_obj.features)} features, "
+        f"{len(contract_obj.entities)} entities, "
+        f"{len(contract_obj.roles)} roles.[/dim]"
+    )
+    _log_event(
+        session_logger,
+        "prd.headings_resolved",
+        {
+            "deterministic": len(resolution.aliases),
+            "model": len(model_aliases),
+            "unresolved": len(resolution.unresolved),
+            "features": len(contract_obj.features),
+            "entities": len(contract_obj.entities),
+            "aliases": model_aliases,
+        },
+        f"Resolved {len(model_aliases)} PRD headings with the reasoning model",
+        workflow_id="prd-build",
+    )
+    return resolved
+
+
 async def _handle_prd_build_request(
     user_input: str,
     workspace: Path,
@@ -7221,17 +8265,19 @@ async def _handle_prd_build_request(
     if prd_path is None:
         candidates = _find_workspace_prd_files(workspace)
         if len(candidates) > 1:
-            console.print("[yellow]I found multiple PRD files - which one should I build from?[/yellow]")
+            console.print(
+                "[yellow]I found multiple PRD files - which one should I build from?[/yellow]"
+            )
             for path in candidates[:10]:
                 console.print(f"- {path.as_posix()}")
-            console.print("Name one, e.g. `build the product from \"<file>\"`.")
+            console.print('Name one, e.g. `build the product from "<file>"`.')
         else:
             console.print(
                 "[yellow]I couldn't find a PRD to build from.[/yellow] "
                 "I look for a `.md`, `.txt`, or `.pdf` whose name contains `prd` or "
                 "`Product Requirements`.\n"
                 "If your spec is already here under another name, point me straight at it, "
-                "e.g. `build the app from \"spec.md\"` - I'll build from any file you name."
+                'e.g. `build the app from "spec.md"` - I\'ll build from any file you name.'
             )
         return
 
@@ -7239,6 +8285,53 @@ async def _handle_prd_build_request(
         parsed = parse_prd_file(prd_path)
     except PRDParseError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
+        return
+
+    parsed = await _resolve_prd_headings(parsed, console, session_logger)
+
+    grounding_issue = _prd_grounding_issue(parsed)
+    if grounding_issue:
+        console.print(
+            Panel(grounding_issue, title="Specification Extraction Failed", border_style="red")
+        )
+        _log_event(
+            session_logger,
+            "prd.grounding_failed",
+            {
+                "confidence": parsed.extraction_confidence,
+                "warnings": list(parsed.extraction_warnings),
+            },
+            grounding_issue,
+            workflow_id="prd-build",
+        )
+        return
+
+    if _prd_has_nothing_to_build(parsed):
+        # An acceptance-only contract still compiles to a milestone plan, so
+        # this used to run to "completion" having written no source file at
+        # all. Say so instead of spending a build proving it.
+        section_names = ", ".join(list(parsed.sections)[:8]) or "none"
+        message = (
+            "I read this document but could not find anything to build.\n\n"
+            "No data entities and no features were extracted, which means the "
+            "plan would contain only verification steps and would produce no "
+            "code.\n\n"
+            f"Sections I found: {section_names}\n\n"
+            "This usually means the document describes the product in prose "
+            "without sections I can map to features or data. Naming a section "
+            "for the data records the system stores, and one per capability, "
+            "is normally enough."
+        )
+        console.print(
+            Panel(message, title="Nothing To Build From This PRD", border_style="red")
+        )
+        _log_event(
+            session_logger,
+            "prd.extraction_empty",
+            {"sections": len(parsed.sections)},
+            "PRD produced no entities and no features",
+            workflow_id="prd-build",
+        )
         return
 
     try:
@@ -7257,28 +8350,13 @@ async def _handle_prd_build_request(
     if not output_scope and not _explicitly_read_only(user_input) and not dry_run.active():
         _ensure_git_repo(workspace, console, session_logger)
 
-    # Greenfield static frontend: the user asked to build with HTML/CSS/JS (or
-    # the PRD explicitly says static frontend) and the workspace has no app
-    # files yet. Create the three files deterministically FIRST so the agent
-    # extends real files instead of trying to read a missing index.html.
-    if (
-        _looks_like_frontend_build_request(user_input) or is_static_frontend_prd(parsed)
-    ) and not _workspace_has_app_files(workspace):
-        _scaffold_frontend_from_prd(parsed, workspace, console, session_logger=session_logger)
-        console.print(
-            "[green]Starter files created. Implementing the PRD on top of them now.[/green]"
-        )
-        await _run_agent_chat(
-            _build_frontend_fill_request(parsed, relative_path),
-            workspace,
-            console,
-            session_logger=session_logger,
-            force_long_running=True,
-            auto_approve=True,
-        )
-        return
-
-    project = build_project_spec(parsed)
+    # A document that lists its data model as bare nouns parses to zero
+    # entities, and zero entities leaves the planner with no model layer to
+    # generate - a 45-entity specification degraded to a single index.html.
+    inferred_entities = await _infer_prd_entities(parsed, console, session_logger)
+    project = build_project_spec(
+        parsed, request_text=user_input, extra_entities=inferred_entities
+    )
     _log_prd_contract_summary(project)
     if not project.generation_ready:
         console.print(
@@ -7292,86 +8370,13 @@ async def _handle_prd_build_request(
             workflow_id="prd-build",
         )
         return
-    strategy = getattr(getattr(project, "suitability", None), "strategy", None)
-    if getattr(strategy, "value", strategy) == "freeform":
-        await _run_freeform_prd_build(
-            user_input,
-            prd_path,
-            project,
-            workspace,
-            console,
-            session_logger=session_logger,
-            prd_text=parsed.raw_text or "",
-            acceptance=acceptance,
-        )
-        return
-    if getattr(strategy, "value", strategy) == "django":
-        await _run_django_prd_build(
-            user_input,
-            prd_path,
-            project,
-            workspace,
-            console,
-            session_logger=session_logger,
-        )
-        return
-    # Templates disabled by default: a game PRD is built from scratch via the
-    # agent below (the generic build path), never by copying the 3D multiplayer
-    # boilerplate. Set SHAMSU_ENABLE_TEMPLATES=1 to restore the template build.
-    if templates_enabled() and project.category == Category.MULTIPLAYER_GAME.value:
-        if not _multiplayer_template_present(workspace):
-            console.print(
-                Panel(
-                    "Detected category: multiplayer-game\n"
-                    "Using the v2.3 multiplayer template before model edits.\n"
-                    "SHAMSU will create the project folder structure and copy the boilerplate "
-                    "into this workspace, then run the template Definition of Done checks.",
-                    title="Template Build",
-                )
-            )
-            search, _uses_real_index = _build_search_agent(workspace, session_logger)
-            result = await FullDjangoPipeline(
-                workspace,
-                search=search,
-                session_logger=session_logger,
-                approval_func=lambda _request: True,
-                long_running=is_long_running_enabled(workspace),
-                generate=_pipeline_generate(session_logger),
-            ).run(prd_path, target_dir=".")
-            _print_full_pipeline_result(result, console)
-            if not result.success:
-                return
-            console.print(
-                "[dim]Note: the Definition of Done above verified the scaffold template only, "
-                "NOT the PRD requirements. PRD implementation begins now.[/dim]"
-            )
-            console.print(
-                "[green]Template scaffold ready. Now implementing game requirements from the PRD.[/green]"
-            )
-        else:
-            # Setup is already done in this workspace (the template files exist),
-            # so don't re-run or re-announce the scaffold step every turn - just
-            # continue filling the game from the PRD and the current code.
-            console.print(
-                "[dim]Continuing the game build - setup already done; reading the current files and the PRD.[/dim]"
-            )
-        await _run_agent_chat(
-            _build_multiplayer_game_request(parsed, relative_path),
-            workspace,
-            console,
-            session_logger=session_logger,
-            force_long_running=True,
-            auto_approve=True,
-        )
-        # Gate on a real compile: the model just edited the game logic, so make
-        # sure it still typechecks (no dropped exports, no broken imports)
-        # before declaring victory. On failure, feed the exact errors back to
-        # the agent to fix; this is what stops "kept adding features while the
-        # frontend was crashing".
-        await _verify_and_repair_frontend(
-            workspace, relative_path, console, session_logger=session_logger
-        )
-        return
+    # Every PRD build now enters the same milestone-scoped ReAct executor below.
+    # Framework writers, bulk JSON bundles, templates, and deterministic UI
+    # hardeners may still be exercised directly by compatibility tests, but they
+    # no longer author code for an interactive user build. This keeps one
+    # inspect -> act -> verify -> repair loop in charge of every source mutation.
+    project_root = _prd_target_directory(user_input, project)
+    output_scope = (project_root,)
 
     _print_prd_build_plan(parsed, relative_path, console)
     _log_event(
@@ -7402,6 +8407,14 @@ async def _handle_prd_build_request(
             user_input,
             contract_obj,
             prd_path=relative_path.as_posix(),
+            execution_key=project_root,
+        )
+        prd_execution_state = _reopen_invalid_prd_checkpoint(
+            prd_execution_root_path,
+            prd_execution_state,
+            project_root,
+            workspace,
+            console,
         )
         milestones = milestone_lines_from_state(prd_execution_state)
         start_milestone_index = first_incomplete_milestone_index(prd_execution_state)
@@ -7423,21 +8436,31 @@ async def _handle_prd_build_request(
             await _verify_completed_plan(changed, workspace, console, session_logger)
             return
     if not milestones:
+        fallback_preflight = _prd_fallback_preflight(project, project_root)
         result = await _run_agent_chat(
             _build_prd_build_request(
                 parsed,
                 relative_path,
                 output_scope=output_scope,
                 acceptance=acceptance,
-            ),
+            )
+            + f"\n\nProject root: {project_root}\n"
+            + "Create and modify application files only below that directory."
+            + "\n\n"
+            + _prd_milestone_skill_context(workspace, fallback_preflight),
             workspace,
             console,
             session_logger=session_logger,
             force_long_running=True,
             auto_approve=True,
             allowed_write_paths=output_scope or None,
+            allowed_read_paths=output_scope or None,
+            allowed_tools=tuple(fallback_preflight.get("allowed_tools") or ()),
             use_long_term_memory=False,
             use_planner=False,
+            user_request=_prd_agent_safety_request(project_root),
+            hydrate_history=False,
+            verify_changes=False,
         )
         changed_files = list(getattr(result, "changed_files", ()) or ())
         if not changed_files:
@@ -7468,8 +8491,7 @@ async def _handle_prd_build_request(
                     "Do not ask for confirmation.\n"
                     f"Modify ONLY: {', '.join(output_scope)}.\n\n"
                     f"Authoritative PRD:\n{parsed.raw_text}\n\n"
-                    "Current validation failures:\n"
-                    + "\n\n".join(failures)
+                    "Current validation failures:\n" + "\n\n".join(failures)
                 )
                 await _run_agent_chat(
                     repair_prompt,
@@ -7479,8 +8501,13 @@ async def _handle_prd_build_request(
                     force_long_running=True,
                     auto_approve=True,
                     allowed_write_paths=output_scope,
+                    allowed_read_paths=output_scope,
+                    allowed_tools=tuple(fallback_preflight.get("allowed_tools") or ()),
                     use_long_term_memory=False,
                     use_planner=False,
+                    user_request=_prd_agent_safety_request(project_root),
+                    hydrate_history=False,
+                    verify_changes=False,
                 )
                 passed, failures = _run_prd_validation(
                     parsed.raw_text,
@@ -7519,6 +8546,10 @@ async def _handle_prd_build_request(
         )
     prd_brief = _prd_brief(parsed)
     changed_files: list[str] = list(prd_execution_state.get("changed_files") or [])
+    # milestone_id -> why it failed. A failure blocks only the milestones that
+    # declare it as a dependency, never the whole build.
+    failed_milestones: dict[str, str] = {}
+    skipped_milestones: dict[str, str] = {}
     for index in range(start_milestone_index, len(milestones)):
         milestone = milestones[index]
         step = task.steps[index]
@@ -7526,6 +8557,23 @@ async def _handle_prd_build_request(
         preflight: dict[str, Any] = {}
         if prd_execution_root_path is not None:
             preflight = load_milestone_preflight(prd_execution_root_path, milestone_id)
+        # Checked BEFORE mark_milestone_running: a milestone that is blocked was
+        # never attempted, so it must stay `pending` and must not move the
+        # execution state to `running`.
+        blocking = _prd_blocking_dependencies(preflight, failed_milestones, skipped_milestones)
+        if blocking:
+            reason = f"Skipped: depends on {', '.join(blocking)}, which did not complete."
+            skipped_milestones[milestone_id] = reason
+            console.print(f"[yellow]Milestone {milestone_id}: {reason}[/yellow]")
+            ledger = get_current_run()
+            if ledger:
+                ledger.log_event(
+                    "prd_milestone_skipped_blocked",
+                    milestone_id=milestone_id,
+                    blocked_by=blocking,
+                )
+            continue
+        if prd_execution_root_path is not None:
             prd_execution_state = mark_milestone_running(
                 prd_execution_root_path,
                 prd_execution_state,
@@ -7540,30 +8588,87 @@ async def _handle_prd_build_request(
                 console,
                 session_logger,
             )
+            preflight = _scope_prd_preflight(preflight, project_root)
         milestone_transaction_baseline = _prd_transaction_snapshot(workspace)
+        milestone_tool_baseline = _prd_tool_snapshot(workspace)
         milestone_changed_baseline = list(changed_files)
+        resumed_milestone_changed = next(
+            (
+                list(item.get("changed_files") or [])
+                for item in prd_execution_state.get("milestones") or []
+                if isinstance(item, dict) and str(item.get("id") or "") == milestone_id
+            ),
+            [],
+        )
         task = mark_step_running(task, step.id)
         save_task(task, workspace)
         console.print(f"[dim]  -> Milestone {index + 1}/{len(milestones)}: {milestone}[/dim]")
         try:
-            result = await _run_agent_chat(
-                _build_prd_milestone_request(
-                    parsed.title,
-                    relative_path,
-                    prd_brief,
-                    milestones,
-                    index + 1,
-                    len(milestones),
-                    preflight=preflight,
-                ),
-                workspace,
-                console,
+            file_pass_changed = await _run_prd_expected_file_passes(
+                title=parsed.title,
+                relative_path=relative_path,
+                prd_brief=prd_brief,
+                milestone=milestone,
+                preflight=preflight,
+                project_root=project_root,
+                workspace=workspace,
+                console=console,
                 session_logger=session_logger,
-                force_long_running=True,
-                auto_approve=True,
-                use_long_term_memory=False,
-                use_planner=False,
             )
+            if not file_pass_changed and _prd_milestone_requires_mutation(preflight):
+                # The architecture pass only targets declared files that are
+                # missing or invalid. Behavioural requirements name no file, so
+                # without this the whole milestone became ONE turn - which is
+                # why every non-scaffolding milestone failed.
+                file_pass_changed = await _run_prd_behavioural_file_passes(
+                    title=parsed.title,
+                    relative_path=relative_path,
+                    prd_brief=prd_brief,
+                    milestone=milestone,
+                    preflight=preflight,
+                    project_root=project_root,
+                    workspace=workspace,
+                    console=console,
+                    session_logger=session_logger,
+                )
+            if file_pass_changed or resumed_milestone_changed:
+                accumulated = list(
+                    dict.fromkeys([*resumed_milestone_changed, *file_pass_changed])
+                )
+                result = AgentLoopResult(
+                    final=(
+                        "Existing milestone mutations are ready; proceed to deterministic "
+                        "milestone verification before further model edits."
+                    ),
+                    changed_files=tuple(accumulated),
+                )
+            else:
+                result = await _run_agent_chat(
+                    _build_prd_milestone_request(
+                        parsed.title,
+                        relative_path,
+                        prd_brief,
+                        milestones,
+                        index + 1,
+                        len(milestones),
+                        preflight=preflight,
+                        project_root=project_root,
+                        skill_context=_prd_milestone_skill_context(workspace, preflight),
+                    ),
+                    workspace,
+                    console,
+                    session_logger=session_logger,
+                    force_long_running=True,
+                    auto_approve=True,
+                    allowed_write_paths=output_scope,
+                    allowed_read_paths=output_scope,
+                    allowed_tools=tuple(preflight.get("allowed_tools") or ()),
+                    use_long_term_memory=False,
+                    use_planner=False,
+                    user_request=_prd_agent_safety_request(project_root),
+                    hydrate_history=False,
+                    verify_changes=False,
+                )
         except Exception as exc:
             task = mark_step_failed(task, step.id, str(exc))
             if prd_execution_root_path is not None:
@@ -7587,7 +8692,13 @@ async def _handle_prd_build_request(
                 )
             save_task(task, workspace)
             raise
-        milestone_changed = list(getattr(result, "changed_files", ()) or ())
+        milestone_changed = list(resumed_milestone_changed)
+        for path in file_pass_changed:
+            if path not in milestone_changed:
+                milestone_changed.append(path)
+        for path in getattr(result, "changed_files", ()) or ():
+            if path not in milestone_changed:
+                milestone_changed.append(path)
         for path in milestone_changed:
             if path not in changed_files:
                 changed_files.append(path)
@@ -7609,79 +8720,69 @@ async def _handle_prd_build_request(
                 )
             )
             return
-        if prd_execution_root_path is not None and getattr(result, "stopped", False):
-            reason = getattr(result, "final", "") or "Agent stopped before completing the milestone."
-            prd_execution_state, rollback_result = _rollback_failed_prd_milestone(
-                prd_execution_root_path,
-                prd_execution_state,
-                milestone_id,
-                preflight,
-                _prd_transactions_since(workspace, milestone_transaction_baseline),
-                workspace,
-                console,
-                preserved_changed_files=milestone_changed_baseline,
+        agent_stop_reason = ""
+        if (
+            prd_execution_root_path is not None
+            and getattr(result, "stopped", False)
+            and not milestone_changed
+        ):
+            agent_stop_reason = (
+                getattr(result, "final", "") or "Agent stopped before completing the milestone."
             )
-            checkpoint_changed = _prd_checkpoint_changed_after_rollback(
-                milestone_changed,
-                rollback_result,
-            )
-            prd_execution_state = checkpoint_milestone(
-                prd_execution_root_path,
-                prd_execution_state,
-                milestone_id,
-                changed_files=checkpoint_changed,
-                evidence=[
-                    *[f"changed:{path}" for path in checkpoint_changed],
-                    *_prd_rollback_evidence(rollback_result),
-                ],
-                status="failed",
-                message=reason,
-            )
-            task = mark_step_failed(task, step.id, reason)
-            save_task(task, workspace)
-            console.print(
-                Panel(
-                    f"PRD milestone {milestone_id} failed: {reason[:500]}",
-                    title="PRD Build Paused",
-                    border_style="red",
-                )
-            )
-            return
         step_done_message = "Agent completed this milestone build pass."
         if prd_execution_root_path is not None:
-            checkpoint_status, verification = await _verify_prd_milestone(
-                milestone_id,
-                preflight,
-                milestone_changed,
-                workspace,
-                console,
-                session_logger,
+            unresolved_commands = _prd_unrecovered_command_failures(
+                workspace, milestone_tool_baseline
             )
+            if agent_stop_reason:
+                checkpoint_status = "failed"
+                verification = _milestone_verification_payload(
+                    "failed",
+                    files=milestone_changed,
+                    summary=agent_stop_reason,
+                )
+            elif unresolved_commands:
+                checkpoint_status = "failed"
+                verification = _prd_command_failure_verification(unresolved_commands)
+            else:
+                checkpoint_status, verification = await _verify_prd_milestone(
+                    milestone_id,
+                    preflight,
+                    milestone_changed,
+                    workspace,
+                    console,
+                    session_logger,
+                )
             if checkpoint_status == "failed" and _prd_milestone_repair_enabled():
-                checkpoint_status, verification, milestone_changed, prd_execution_state = (
-                    await _repair_failed_prd_milestone(
-                        prd_execution_root_path,
-                        prd_execution_state,
-                        milestone_id,
-                        preflight,
-                        verification,
-                        milestone_changed,
-                        workspace,
-                        console,
-                        session_logger,
-                        parsed.title,
-                        relative_path,
-                        prd_brief,
-                        milestones,
-                        index + 1,
-                        len(milestones),
-                    )
+                (
+                    checkpoint_status,
+                    verification,
+                    milestone_changed,
+                    prd_execution_state,
+                ) = await _repair_failed_prd_milestone(
+                    prd_execution_root_path,
+                    prd_execution_state,
+                    milestone_id,
+                    preflight,
+                    verification,
+                    milestone_changed,
+                    workspace,
+                    console,
+                    session_logger,
+                    parsed.title,
+                    relative_path,
+                    prd_brief,
+                    milestones,
+                    index + 1,
+                    len(milestones),
                 )
                 for path in milestone_changed:
                     if path not in changed_files:
                         changed_files.append(path)
             if checkpoint_status == "blocked":
-                reason = str(verification.get("summary") or "Milestone repair requested user input.")
+                reason = str(
+                    verification.get("summary") or "Milestone repair requested user input."
+                )
                 prd_execution_state = block_milestone(
                     prd_execution_root_path,
                     prd_execution_state,
@@ -7730,7 +8831,9 @@ async def _handle_prd_build_request(
                 changed_files=milestone_changed,
                 evidence=evidence,
                 status=checkpoint_status,
-                message=str(verification.get("summary") or "Agent completed this milestone build pass."),
+                message=str(
+                    verification.get("summary") or "Agent completed this milestone build pass."
+                ),
                 verification=verification,
             )
             ledger = get_current_run()
@@ -7744,13 +8847,34 @@ async def _handle_prd_build_request(
                     execution_dir=prd_execution_root_path.relative_to(workspace).as_posix(),
                 )
             if checkpoint_status == "failed":
+                failure_message = (
+                    f"PRD milestone {milestone_id} remains FAILED after its repair budget: "
+                    + str(verification.get("summary") or "Milestone verification failed.")
+                )
+                _log_assistant_message(
+                    session_logger,
+                    failure_message,
+                    workflow_id="prd-build",
+                )
                 task = mark_step_failed(
                     task,
                     step.id,
                     str(verification.get("summary") or "Milestone verification failed."),
                 )
                 save_task(task, workspace)
-                return
+                # One failed milestone used to `return` out of the WHOLE build,
+                # so a single failure ended all 23 - at even 90% per-milestone
+                # success that is 0.9^23 ~ 9%, which is why no run ever
+                # finished. Keep the failure local: independent milestones
+                # still run, only dependents are skipped.
+                failed_milestones[milestone_id] = str(
+                    verification.get("summary") or "Milestone verification failed."
+                )
+                console.print(
+                    f"[yellow]Milestone {milestone_id} failed; continuing with "
+                    f"milestones that do not depend on it.[/yellow]"
+                )
+                continue
             step_done_message = (
                 "Milestone verified."
                 if checkpoint_status == "verified"
@@ -7760,9 +8884,29 @@ async def _handle_prd_build_request(
         if index < len(milestones) - 1:
             if not advance_phase(task, f"milestone-{index + 2}"):
                 save_task(task, workspace)
-                console.print(Panel(task.next_action, title="PRD Build Paused", border_style="yellow"))
+                console.print(
+                    Panel(task.next_action, title="PRD Build Paused", border_style="yellow")
+                )
                 return
         save_task(task, workspace)
+    if failed_milestones or skipped_milestones:
+        # Honest partial outcome: say which milestones landed and which did not,
+        # instead of the old behaviour of aborting on the first failure. The
+        # final integration verifier is NOT run - the build is knowingly
+        # incomplete, so a whole-project verdict would be misleading.
+        report = _prd_build_completion_report(milestones, failed_milestones, skipped_milestones)
+        console.print(Panel(report, title="PRD Build: Partial", border_style="yellow"))
+        _log_assistant_message(session_logger, report, workflow_id="prd-build")
+        ledger = get_current_run()
+        if ledger:
+            ledger.log_event(
+                "prd_build_partial",
+                completed=len(milestones) - len(failed_milestones) - len(skipped_milestones),
+                total=len(milestones),
+                failed=sorted(failed_milestones),
+                skipped=sorted(skipped_milestones),
+            )
+        return
     console.print(f"[green]PRD milestone build flow complete. Task: {task.task_id}[/green]")
     # Integration check across everything the milestones built (mirrors /proceed).
     verified = await _verify_completed_plan(changed_files, workspace, console, session_logger)
@@ -7849,13 +8993,18 @@ def _log_prd_contract_summary(project: Any) -> None:
 def _prd_target_directory(user_input: str, project: Any) -> str:
     match = re.search(
         r"\b(?:new\s+)?(?:folder|directory)\s+(?:named|called)\s+"
-        r"(?P<path>[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)",
+        r"[\x60\"']?(?P<path>[A-Za-z0-9_.-]+(?:[/\\][A-Za-z0-9_.-]+)*)[\x60\"']?",
         user_input,
         re.IGNORECASE,
     )
     if match:
         return match.group("path").rstrip(".")
     return str(getattr(project, "project_name", "generated-app") or "generated-app")
+
+
+def _prd_agent_safety_request(project_root: str) -> str:
+    """Keep top-level intent routing out of orchestrated coding child turns."""
+    return f"Implement the current coding milestone inside project root {project_root}."
 
 
 def _planned_django_paths(project: Any, target_dir: str) -> list[str]:
@@ -7929,6 +9078,7 @@ async def _run_freeform_prd_build(
         approval_func=lambda _request: True,
         long_running=True,
         generate=_pipeline_generate(session_logger),
+        user_request=user_input,
     ).run(prd_path, target_dir=target_dir)
 
     written = list(result.written_files or [])
@@ -8025,8 +9175,7 @@ async def _validate_freeform_prd_result(
             "Make a complete correction and run verification. Do not ask for confirmation.\n"
             f"Modify ONLY: {', '.join(repair_targets)}.\n\n"
             f"Authoritative PRD:\n{prd_text}\n\n"
-            "Current validation failures:\n"
-            + "\n\n".join(failures)
+            "Current validation failures:\n" + "\n\n".join(failures)
         )
         await _run_agent_chat(
             repair_prompt,
@@ -8038,6 +9187,8 @@ async def _validate_freeform_prd_result(
             allowed_write_paths=repair_targets,
             use_long_term_memory=False,
             use_planner=False,
+            hydrate_history=False,
+            verify_changes=False,
         )
         passed, failures = _run_prd_validation(
             prd_text,
@@ -8384,7 +9535,9 @@ async def _run_django_prd_build(
 
 def _requests_demo_login(user_input: str, project: Any) -> bool:
     lowered = user_input.casefold()
-    requested = any(term in lowered for term in ("seed", "demo data", "demo login", "login credentials"))
+    requested = any(
+        term in lowered for term in ("seed", "demo data", "demo login", "login credentials")
+    )
     pages = list(getattr(project, "pages", []) or [])
     has_login = any(
         getattr(page, "page_type", "") == "auth" or "login" in getattr(page, "name", "").casefold()
@@ -8410,11 +9563,7 @@ def _seed_django_demo_login(target: Path, command_runner: CommandRunner) -> tupl
 
 
 def _append_demo_login_docs(target: Path, username: str, password: str) -> None:
-    section = (
-        "\n\n## Demo Login\n\n"
-        f"- Email: `{username}`\n"
-        f"- Password: `{password}`\n"
-    )
+    section = f"\n\n## Demo Login\n\n- Email: `{username}`\n- Password: `{password}`\n"
     for name in ("README.md", "SHAMSU_SUMMARY.md"):
         path = target / name
         if not path.is_file():
@@ -8583,8 +9732,7 @@ def _run_prd_acceptance_commands(
             hint = _acceptance_failure_hint(command, detail)
             failure_details.append(
                 f"Failed command: {command}\nExpected stdout: {expected or '(exit 0)'}\n"
-                f"Actual result:\n{detail}"
-                + (f"\nRepair hint: {hint}" if hint else "")
+                f"Actual result:\n{detail}" + (f"\nRepair hint: {hint}" if hint else "")
             )
     summary = (
         "PRD acceptance passed.\n" if all_passed else "PRD acceptance failed.\n"
@@ -8676,9 +9824,7 @@ def _run_prd_conformance_checks(
     lines: list[str] = []
     all_passed = True
     python_files = [path for path in output_scope if Path(path).suffix.lower() == ".py"]
-    required_functions = set(
-        re.findall(r"`([A-Za-z_]\w*)\([^`\n]*\)`", prd_text or "")
-    )
+    required_functions = set(re.findall(r"`([A-Za-z_]\w*)\([^`\n]*\)`", prd_text or ""))
     if python_files and required_functions:
         found: set[str] = set()
         parse_errors: list[str] = []
@@ -8698,7 +9844,9 @@ def _run_prd_conformance_checks(
         detail = (
             "all named functions present"
             if passed
-            else "; ".join(parse_errors + ([f"missing functions: {', '.join(missing)}"] if missing else []))
+            else "; ".join(
+                parse_errors + ([f"missing functions: {', '.join(missing)}"] if missing else [])
+            )
         )
         command = "prd:function-contract"
         lines.append(f"{'PASS' if passed else 'FAIL'}  named Python functions\n{detail}")
@@ -8788,9 +9936,9 @@ def _run_prd_conformance_checks(
                     f"PRD {label} check failed. Command: {command}\nActual result:\n{detail}"
                 )
 
-    summary = (
-        "PRD conformance passed.\n" if all_passed else "PRD conformance failed.\n"
-    ) + ("\n\n".join(lines) if lines else "No supplemental checks were inferred.")
+    summary = ("PRD conformance passed.\n" if all_passed else "PRD conformance failed.\n") + (
+        "\n\n".join(lines) if lines else "No supplemental checks were inferred."
+    )
     console.print(
         Panel(
             summary,
@@ -8804,17 +9952,1120 @@ def _run_prd_conformance_checks(
 
 
 def _prd_brief(parsed: Any) -> str:
-    """Compact, structured PRD summary for per-milestone prompts, so the raw PRD
-    text is not re-dumped into every milestone (G10). The agent still has the PRD
-    file path and can read the full text when it needs exact detail. Falls back
-    to the section outline (still far smaller than raw_text) if extraction fails."""
+    """Render only cross-cutting context; preflight carries exact milestone requirements."""
     try:
-        brief = extract_contract(parsed).render_brief()
-        if brief.strip():
-            return brief
+        contract_obj = extract_contract(parsed)
+        lines = [
+            f"Product: {contract_obj.title}",
+            f"Kind: {contract_obj.project_kind or 'application'}",
+        ]
+        if contract_obj.product_summary:
+            lines.append(f"Summary: {contract_obj.product_summary}")
+        if contract_obj.required_stack:
+            lines.append("Required stack: " + ", ".join(contract_obj.required_stack))
+        if contract_obj.architecture:
+            lines.append("Architecture: " + ", ".join(contract_obj.architecture))
+        if contract_obj.roles:
+            lines.append("Roles: " + ", ".join(contract_obj.roles[:8]))
+        if contract_obj.authorization_rules:
+            lines.append("Global authorization rules:")
+            lines.extend(f"- {item}" for item in contract_obj.authorization_rules[:8])
+        if contract_obj.assumptions:
+            lines.append("Confirmed assumptions:")
+            lines.extend(f"- {item}" for item in contract_obj.assumptions[:5])
+        return "\n".join(lines)
     except Exception:
         pass
     return _render_sections(parsed)
+
+
+# Which file in a conventional web project carries each kind of requirement.
+# Requirement kinds that change no source (acceptance, out_of_scope) are absent
+# on purpose - they are judged by the verifier, not implemented.
+_REQUIREMENT_FILE_ROLES: dict[str, str] = {
+    "entity": "models",
+    "persistence": "models",
+    "role": "models",
+    "feature": "views",
+    "mechanic": "views",
+    "workflow": "views",
+    "screen": "views",
+    "auth": "views",
+    "authorization": "views",
+    "security": "views",
+    "api": "urls",
+}
+
+# Dependency order: models before the views that query them, views before the
+# routes that name them.
+_FILE_ROLE_ORDER = ("models", "views", "urls")
+
+# A milestone is split into at most this many focused turns. Beyond it the
+# milestone is too broad to be worth decomposing turn-by-turn.
+_MAX_BEHAVIOURAL_TARGETS = 4
+
+
+def _prd_app_package(project_root: str, workspace: Path) -> str:
+    """The Django app package inside *project_root*, or "" when there isn't one."""
+    root = (workspace / project_root) if project_root else workspace
+    try:
+        children = sorted(item for item in root.iterdir() if item.is_dir())
+    except OSError:
+        return ""
+    for child in children:
+        if child.name.startswith((".", "__")):
+            continue
+        if (child / "models.py").exists() or (child / "apps.py").exists():
+            return child.name
+    return ""
+
+
+def _prd_behavioural_file_groups(
+    preflight: dict[str, Any], project_root: str, workspace: Path
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Group a milestone's behavioural requirements by the file that carries each.
+
+    Non-scaffolding milestones had no decomposition at all: every requirement
+    went into ONE turn, and a 7B asked to implement four requirements across
+    three files in a single response truncates. Declared architecture files are
+    already handled one at a time by ``_run_prd_expected_file_passes``; this is
+    the same treatment for work that names no file of its own.
+
+    Returns [(relative_path, requirements)] in dependency order, or [] when the
+    project has no recognisable app layout (in which case the caller keeps the
+    existing single-turn behaviour).
+    """
+    package = _prd_app_package(project_root, workspace)
+    if not package:
+        return []
+    prefix = f"{project_root}/" if project_root else ""
+    role_paths = {
+        "models": f"{prefix}{package}/models.py",
+        "views": f"{prefix}{package}/views.py",
+        "urls": f"{prefix}{package}/urls.py",
+    }
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in preflight.get("requirements") or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("scope") or "in") != "in":
+            continue
+        role = _REQUIREMENT_FILE_ROLES.get(str(item.get("kind") or "").lower())
+        if not role:
+            continue
+        grouped.setdefault(role, []).append(item)
+
+    ordered: list[tuple[str, list[dict[str, Any]]]] = []
+    for role in _FILE_ROLE_ORDER:
+        if grouped.get(role):
+            ordered.append((role_paths[role], grouped[role]))
+    return ordered[:_MAX_BEHAVIOURAL_TARGETS]
+
+
+async def _run_prd_behavioural_file_passes(
+    *,
+    title: str,
+    relative_path: str,
+    prd_brief: str,
+    milestone: str,
+    preflight: dict[str, Any],
+    project_root: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> list[str]:
+    """Implement a milestone's behavioural requirements one file per turn."""
+    groups = _prd_behavioural_file_groups(preflight, project_root, workspace)
+    if not groups:
+        return []
+
+    skill_context = _prd_milestone_skill_context(workspace, preflight)
+    allowed = set(preflight.get("allowed_tools") or [])
+    tools = tuple(
+        name
+        for name in (
+            "read_file",
+            "file_info",
+            "write_file",
+            "edit_file",
+            "append_file",
+            "run_command",
+        )
+        if name in allowed
+    )
+    changed: list[str] = []
+
+    for target, requirements in groups:
+        exists = (workspace / target).is_file()
+        requirement_lines = "\n".join(
+            f"- {item.get('id', '')} [{item.get('kind', '')}]: {item.get('text', '')}"
+            for item in requirements
+        )
+        console.print(f"[dim]     · {target} ({len(requirements)} requirement(s))[/dim]")
+        # Withhold the patch tools on a file small enough to re-emit whole.
+        turn_tools = edit_tools_for_target(target, workspace, tools)
+        mutation_instruction = (
+            "Read it first, then use edit_file or append_file to add what is missing. "
+            "Preserve everything already there"
+            if exists
+            else "Call write_file with the COMPLETE file content"
+        )
+        result = await _run_agent_chat(
+            f"""Implement one file for {title}.
+
+Authoritative PRD: {relative_path}
+Current milestone: {milestone}
+Only mutation target: {target}
+Project root: {project_root}
+
+Relevant product context:
+{prd_brief}
+
+Implement ONLY these requirements, and only the part of them that belongs in {target}:
+{requirement_lines}
+
+{mutation_instruction} for exactly `{target}`. Other files in this milestone are
+handled by their own separate turns - do not create or modify them, do not list
+them, and do not ask which file comes next. Do not answer with a code fence or a
+description instead of a tool call.
+
+{skill_context}""",
+            workspace,
+            console,
+            session_logger=session_logger,
+            allowed_write_paths=[target],
+            allowed_tools=turn_tools,
+            required_tool_prefix="write_file" if "edit_file" not in turn_tools else "",
+            long_running=True,
+        )
+        for path in getattr(result, "changed_files", ()) or ():
+            if path not in changed:
+                changed.append(str(path))
+
+    return changed
+
+
+async def _run_prd_expected_file_passes(
+    *,
+    title: str,
+    relative_path: str,
+    prd_brief: str,
+    milestone: str,
+    preflight: dict[str, Any],
+    project_root: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> list[str]:
+    """Materialize required architecture files through small, focused ReAct turns.
+
+    A local 7B model is much more reliable when each turn has one mutation
+    target. Valid files are retained, then the normal milestone pass integrates
+    and verifies them as a unit.
+    """
+    if not _prd_milestone_is_mandatory(preflight):
+        return []
+    expected = _preflight_expected_files(preflight)
+    if not expected:
+        return []
+    missing = _missing_expected_files(expected, workspace)
+    invalid = [
+        value.split(" (", 1)[0]
+        for value in _invalid_expected_architecture_files(preflight, workspace)
+    ]
+    targets = list(dict.fromkeys([*missing, *invalid]))
+    if not targets:
+        return []
+
+    requirements = "\n".join(
+        f"- {item.get('id', '')} [{item.get('kind', '')}]: {item.get('text', '')}"
+        for item in preflight.get("requirements") or []
+        if isinstance(item, dict)
+    )
+    existing_file_tools = tuple(
+        name
+        for name in (
+            "read_file",
+            "file_info",
+            "find_file",
+            "write_file",
+            "edit_file",
+            "append_file",
+            "run_command",
+        )
+        if name in set(preflight.get("allowed_tools") or [])
+    )
+    skill_context = _prd_milestone_skill_context(workspace, preflight)
+    attempts = _env_int_at_least("SHAMSU_PRD_FILE_PASS_ATTEMPTS", 2, 1)
+    changed: list[str] = []
+
+    for target in targets:
+        rejection_feedback = ""
+        # Framework scaffolding is generated by substitution, never by the
+        # model. Six consecutive live 7B runs wrote a settings.py that used
+        # BASE_DIR without defining it, failing M-001 every time and blocking
+        # all 23 milestones; templates/django/constants.py already said these
+        # files belong out of the LLM path.
+        if _write_prd_boilerplate(target, preflight, workspace, console, session_logger):
+            if target not in changed:
+                changed.append(target)
+            continue
+        for attempt in range(1, attempts + 1):
+            target_is_missing = bool(_missing_expected_files([target], workspace))
+            current_invalid = _invalid_expected_architecture_files(preflight, workspace)
+            target_invalid = [
+                value for value in current_invalid if value.split(" (", 1)[0] == target
+            ]
+            if not target_is_missing and not target_invalid:
+                break
+            console.print(
+                f"[dim]     file pass {attempt}/{attempts}: {target}[/dim]"
+            )
+            action_instruction = (
+                "The harness has confirmed that the target is missing. Your FIRST response must "
+                "call write_file for the exact target; do not read, search, or list files first."
+                if target_is_missing
+                else (
+                    "The target exists but failed deterministic validation. Read it, then repair "
+                    "the exact problem: " + "; ".join(target_invalid)
+                )
+            )
+            repair_guidance = _prd_file_repair_guidance(
+                target, preflight, workspace=workspace
+            )
+            append_missing_entities = _prd_requires_entity_declaration_append(target_invalid)
+            deterministic_edit = "Deterministic edit recipe:" in repair_guidance
+            if append_missing_entities:
+                action_instruction += (
+                    " The named entity classes are entirely absent. Do not edit any existing "
+                    "class or field. The harness already inspected the current file, so do not read "
+                    "or run commands. Your FIRST response MUST call append_file for the exact target "
+                    "with complete Django model declarations for every missing entity and every "
+                    "listed field."
+                )
+            rewrite_required = target_is_missing or any(
+                token in " ".join(target_invalid).lower()
+                for token in (
+                    "empty",
+                    "invalid python",
+                    "incomplete",
+                    "no executable declarations",
+                    "no persisted model declarations",
+                )
+            )
+            active_tools = (
+                ("write_file",)
+                if target_is_missing
+                else tuple(
+                    name
+                    for name in existing_file_tools
+                    if name == "append_file"
+                )
+                if append_missing_entities
+                else tuple(
+                    name
+                    for name in existing_file_tools
+                    if rewrite_required or name != "write_file"
+                )
+            )
+            mutation_instruction = (
+                "Call write_file with the COMPLETE production-ready content"
+                if rewrite_required
+                else "Call append_file with complete declarations for the missing entities"
+                if append_missing_entities
+                else (
+                    "Preserve all unrelated content. Use edit_file for exact replacements or "
+                    "append_file for a missing trailing declaration; do not rewrite the whole file"
+                )
+            )
+            before_errors = _prd_target_validation_errors(target, current_invalid)
+            transaction_baseline = _prd_transaction_snapshot(workspace)
+            result = await _run_agent_chat(
+                f"""Implement exactly one required file for {title}.
+
+Authoritative PRD: {relative_path}
+Current milestone: {milestone}
+Only mutation target: {target}
+Project root: {project_root}
+
+Relevant product context:
+{prd_brief}
+
+Binding requirements for this milestone:
+{requirements or '- Complete the named milestone contract.'}
+
+{action_instruction}
+{rejection_feedback}
+{repair_guidance}
+Use the ReAct tool loop. {mutation_instruction} for exactly `{target}`. Do not
+merely show a code fence, describe the code, list
+other files, or ask which file comes next. For an __init__.py package marker,
+empty content is valid but the write_file call must still be made. After a
+successful mutation, run only a focused syntax check when one is applicable.
+Do not modify any other file.
+
+{skill_context}""",
+                workspace,
+                console,
+                session_logger=session_logger,
+                force_long_running=True,
+                auto_approve=True,
+                allowed_write_paths=(target,),
+                allowed_read_paths=(project_root,),
+                allowed_tools=active_tools,
+                use_long_term_memory=False,
+                use_planner=False,
+                user_request=_prd_agent_safety_request(project_root),
+                required_tool_prefix=(
+                    "append_file"
+                    if append_missing_entities
+                    else "edit_file"
+                    if deterministic_edit
+                    else ""
+                ),
+                hydrate_history=False,
+                verify_changes=False,
+            )
+            after_invalid = _invalid_expected_architecture_files(preflight, workspace)
+            after_errors = _prd_target_validation_errors(target, after_invalid)
+            introduced_errors = sorted(after_errors - before_errors)
+            no_validation_progress = bool(before_errors) and after_errors >= before_errors
+            if _prd_entity_validation_progress(before_errors, after_errors):
+                # A small model often gets a whole missing declaration mostly right in
+                # one append, leaving one malformed field or import. Keep that bounded
+                # progress for the next focused pass; final architecture validation still
+                # prevents the milestone from verifying until every issue is gone.
+                introduced_errors = [
+                    error
+                    for error in introduced_errors
+                    if _prd_fatal_file_regression(error)
+                ]
+                no_validation_progress = False
+            if introduced_errors or no_validation_progress:
+                if target_is_missing and not any(
+                    _prd_fatal_file_regression(error) for error in introduced_errors
+                ):
+                    # The file did not exist before this attempt, so a rollback
+                    # deletes the ONLY copy and leaves the target missing -
+                    # strictly worse than an incomplete file, because the
+                    # milestone then fails on "missing expected architecture
+                    # files" instead of the real defect and burns the repair
+                    # budget on the wrong problem (observed live 2026-08-01:
+                    # models.py was rolled back to nothing twice). Keep a
+                    # syntactically valid creation and let the next focused
+                    # pass append what is missing; final architecture
+                    # validation still blocks the milestone until it is whole.
+                    ledger = get_current_run()
+                    if ledger:
+                        ledger.log_event(
+                            "prd_file_pass_incomplete_creation_kept",
+                            target=target,
+                            introduced_errors=introduced_errors,
+                        )
+                    rejection_feedback = _prd_file_pass_rejection_feedback(
+                        introduced_errors, sorted(before_errors)
+                    )
+                    for path in getattr(result, "changed_files", ()) or ():
+                        if path not in changed:
+                            changed.append(path)
+                    continue
+                transaction_ids = _prd_transactions_since(workspace, transaction_baseline)
+                rollback_messages: list[str] = []
+                for transaction_id in reversed(transaction_ids):
+                    ok, message = rollback_transaction(workspace, transaction_id)
+                    rollback_messages.append(message)
+                    ledger = get_current_run()
+                    if ledger:
+                        ledger.log_rollback(transaction_id, ok, message)
+                ledger = get_current_run()
+                if ledger:
+                    ledger.log_event(
+                        "prd_file_pass_regression_rolled_back",
+                        target=target,
+                        introduced_errors=introduced_errors,
+                        no_validation_progress=no_validation_progress,
+                        transaction_ids=transaction_ids,
+                        messages=rollback_messages,
+                    )
+                # Tell the NEXT attempt what was wrong. Without this the retry
+                # prompt was byte-identical after a rollback, and the 7B model
+                # deterministically re-emitted the same placeholder scaffold
+                # every time (observed live 2026-08-01).
+                rejection_feedback = _prd_file_pass_rejection_feedback(
+                    introduced_errors, sorted(before_errors)
+                )
+                continue
+            for path in getattr(result, "changed_files", ()) or ():
+                if path not in changed:
+                    changed.append(path)
+    return changed
+
+
+def _write_prd_boilerplate(
+    target: str,
+    preflight: dict[str, Any],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> bool:
+    """Generate a Django scaffolding file deterministically. True when written.
+
+    Returns False for anything carrying product logic (models.py, views.py),
+    which stays with the model - that is what it is good at, and it produced
+    correct entity models in the same runs where it broke settings.py.
+    """
+    from shamsu.prd.boilerplate import render_boilerplate
+
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    relative = _workspace_relative_paths([target], workspace)
+    if not relative:
+        return False
+    content = render_boilerplate(
+        relative[0],
+        expected,
+        custom_user_model=any(
+            str(entity).lower() == "user"
+            for entity, _fields in _prd_required_entity_fields(preflight)
+        ),
+    )
+    if content is None:
+        return False
+    ledger = get_current_run()
+    registry = AgentToolRegistry(
+        workspace,
+        session_logger=session_logger,
+        approval_manager=_make_approval_manager(
+            workspace, session_logger, console, lambda _request: True
+        ),
+        action_ledger=ledger,
+    )
+    call_id = ledger.log_tool_call("write_file", {"filepath": relative[0]}) if ledger else ""
+    result = registry.execute("write_file", {"filepath": relative[0], "content": content})
+    if ledger:
+        ledger.log_tool_result(call_id, "write_file", bool(result.ok), result.message, result.data)
+        ledger.log_event(
+            "prd_boilerplate_generated",
+            target=relative[0],
+            ok=bool(result.ok),
+            message=str(result.message)[:200],
+        )
+    if result.ok:
+        console.print(f"[dim]     boilerplate (deterministic): {relative[0]}[/dim]")
+    return bool(result.ok)
+
+
+def _prd_file_pass_rejection_feedback(
+    introduced_errors: list[str], unresolved_errors: list[str]
+) -> str:
+    """One paragraph telling the retry exactly why the last write was undone."""
+    reasons = introduced_errors or unresolved_errors
+    detail = "; ".join(reasons[:6]) if reasons else "it did not satisfy the contract"
+    return (
+        "PREVIOUS ATTEMPT REJECTED AND ROLLED BACK. The last write failed validation: "
+        f"{detail}. Do NOT write a placeholder, stub, or scaffold comment such as "
+        '"# Define your models here." - write the COMPLETE implementation with every '
+        "required entity, field, and import this time."
+    )
+
+
+def _prd_target_validation_errors(target: str, invalid: list[str]) -> set[str]:
+    errors: set[str] = set()
+    for value in invalid:
+        path, separator, detail = value.partition(" (")
+        if path != target or not separator:
+            continue
+        for item in detail.rsplit(")", 1)[0].split(";"):
+            item = item.strip()
+            if not item:
+                continue
+            marker = "missing required entities or fields:"
+            if item.lower().startswith(marker):
+                values = item.split(":", 1)[1]
+                errors.update(
+                    f"missing entity contract:{value.strip()}"
+                    for value in values.split(",")
+                    if value.strip()
+                )
+                continue
+            errors.add(item)
+    return errors
+
+
+_ENTITY_CONTRACT_PREFIX = "missing entity contract:"
+
+
+def _prd_missing_entity_atoms(errors: set[str]) -> set[str]:
+    """Expand grouped entity contracts into one item per missing field.
+
+    The validator renders every field a single entity is missing as ONE
+    slash-joined value ("User.name/role"). Counting or subtracting those
+    strings makes fixing one of two fields look like a brand-new error, since
+    "User.name/role" and "User.name" simply differ. Observed live 2026-08-02:
+    a repair that correctly added `role` was rolled back as a regression.
+    """
+    atoms: set[str] = set()
+    for error in errors:
+        if not error.startswith(_ENTITY_CONTRACT_PREFIX):
+            continue
+        value = error[len(_ENTITY_CONTRACT_PREFIX) :].strip()
+        entity, _dot, fields = value.partition(".")
+        entity = entity.strip()
+        if not entity:
+            continue
+        if not fields.strip():
+            atoms.add(entity)
+            continue
+        atoms.update(
+            f"{entity}.{field.strip()}" for field in fields.split("/") if field.strip()
+        )
+    return atoms
+
+
+def _prd_entity_validation_progress(before: set[str], after: set[str]) -> bool:
+    """Return true when a bounded pass reduced unresolved entity contracts."""
+    before_atoms = _prd_missing_entity_atoms(before)
+    after_atoms = _prd_missing_entity_atoms(after)
+    return bool(before_atoms) and len(after_atoms) < len(before_atoms)
+
+
+def _prd_repair_regressions(
+    invalid_before: set[str], invalid_after: set[str]
+) -> list[str]:
+    """Architecture entries a repair genuinely made worse.
+
+    Compares parsed per-file contents rather than raw strings, so partially
+    satisfying an entity contract counts as progress and is kept.
+    """
+    before_list = sorted(invalid_before)
+    after_list = sorted(invalid_after)
+    targets = {
+        value.split(" (", 1)[0] for value in set(invalid_before) | set(invalid_after)
+    }
+    regressions: list[str] = []
+    for target in sorted(targets):
+        before = _prd_target_validation_errors(target, before_list)
+        after = _prd_target_validation_errors(target, after_list)
+        new_other = {
+            item
+            for item in after - before
+            if not item.startswith(_ENTITY_CONTRACT_PREFIX)
+        }
+        new_atoms = _prd_missing_entity_atoms(after) - _prd_missing_entity_atoms(before)
+        if not new_other and not new_atoms:
+            continue
+        detail = sorted(new_other | {f"missing {atom}" for atom in new_atoms})
+        regressions.append(f"{target} ({'; '.join(detail)})")
+    return regressions
+
+
+def _prd_fatal_file_regression(error: str) -> bool:
+    lowered = error.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "invalid python",
+            "empty",
+            "no executable declarations",
+            "no persisted model declarations",
+        )
+    )
+
+
+def _prd_requires_entity_declaration_append(target_invalid: list[str]) -> bool:
+    """Whether validation says whole entity classes, rather than fields, are absent."""
+    details = " ".join(target_invalid)
+    marker = "missing required entities or fields:"
+    if marker not in details:
+        return False
+    missing = details.split(marker, 1)[1].rsplit(")", 1)[0]
+    values = [value.strip() for value in missing.split(",") if value.strip()]
+    return bool(values) and all("." not in value for value in values)
+
+
+_RELATION_FIELDS = {"ForeignKey", "OneToOneField", "ManyToManyField"}
+
+
+def _django_dangling_relation_errors(module: ast.Module, defined: set[str]) -> list[str]:
+    """Relation fields whose quoted target model does not exist in this file.
+
+    A 7B routinely switches from a direct reference to a STRING one mid-file and
+    invents a role-shaped name: live 2026-08-02 it wrote
+    `ForeignKey('Teacher')` and `ForeignKey('Student')` while defining neither,
+    having already given `User` a `role` field. Django only reports that at
+    `manage.py check` time (fields.E300/E307), by which point the milestone has
+    failed. Catch it at write time instead.
+
+    Only bare quoted names are checked: `'self'`, `'app.Model'`, and settings
+    references like AUTH_USER_MODEL are all legitimate and left alone.
+    """
+    errors: list[str] = []
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        target = node.func
+        name = (
+            target.attr if isinstance(target, ast.Attribute)
+            else target.id if isinstance(target, ast.Name)
+            else ""
+        )
+        if name not in _RELATION_FIELDS or not node.args:
+            continue
+        first = node.args[0]
+        if not isinstance(first, ast.Constant) or not isinstance(first.value, str):
+            continue
+        reference = first.value.strip()
+        if not reference or reference.lower() == "self" or "." in reference:
+            continue
+        if reference in defined:
+            continue
+        errors.append(
+            f"{name} references undefined model '{reference}' "
+            f"(defined here: {', '.join(sorted(defined)) or 'none'})"
+        )
+    return sorted(dict.fromkeys(errors))
+
+
+def _django_model_structure_errors(content: str) -> list[str]:
+    """Find valid-Python model declarations that Django cannot use correctly."""
+    try:
+        module = ast.parse(content)
+    except SyntaxError:
+        return []
+    classes = {
+        node.name: node for node in module.body if isinstance(node, ast.ClassDef)
+    }
+    errors: list[str] = []
+    for node in module.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        for alias in node.names:
+            declared = classes.get(alias.asname or alias.name)
+            if declared is not None and node.lineno > declared.lineno:
+                errors.append(f"local model class shadowed by later import: {declared.name}")
+    settings_used = any(
+        isinstance(node, ast.Name) and node.id == "settings" and isinstance(node.ctx, ast.Load)
+        for node in ast.walk(module)
+    )
+    settings_imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "django.conf"
+        and any((alias.asname or alias.name) == "settings" for alias in node.names)
+        for node in module.body
+    )
+    if settings_used and not settings_imported:
+        errors.append("Django settings is referenced but not imported")
+    errors.extend(_django_dangling_relation_errors(module, set(classes)))
+    for class_node in classes.values():
+        for statement in class_node.body:
+            if not isinstance(statement, ast.AnnAssign) or statement.value is not None:
+                continue
+            annotation = statement.annotation
+            if not isinstance(annotation, ast.Call):
+                continue
+            function = annotation.func
+            if not (
+                isinstance(function, ast.Attribute)
+                and isinstance(function.value, ast.Name)
+                and function.value.id == "models"
+            ):
+                continue
+            if isinstance(statement.target, ast.Name):
+                errors.append(
+                    "Django field uses annotation instead of assignment: "
+                    f"{class_node.name}.{statement.target.id}"
+                )
+    return list(dict.fromkeys(errors))
+
+
+def _django_model_structure_edit_recipes(
+    target: str,
+    content: str,
+) -> list[dict[str, Any]]:
+    """Build exact, source-derived edits for common small-model Django mistakes."""
+    try:
+        module = ast.parse(content)
+    except SyntaxError:
+        return []
+    lines = content.splitlines(keepends=True)
+    classes = {
+        node.name: node for node in module.body if isinstance(node, ast.ClassDef)
+    }
+    recipes: list[dict[str, Any]] = []
+
+    for node in module.body:
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        shadowed = [
+            alias
+            for alias in node.names
+            if (alias.asname or alias.name) in classes
+            and node.lineno > classes[alias.asname or alias.name].lineno
+        ]
+        if not shadowed:
+            continue
+        start = node.lineno - 1
+        end = int(getattr(node, "end_lineno", node.lineno))
+        old_string = "".join(lines[start:end])
+        kept = [alias for alias in node.names if alias not in shadowed]
+        if kept:
+            rendered = ", ".join(
+                alias.name + (f" as {alias.asname}" if alias.asname else "")
+                for alias in kept
+            )
+            ending = "\n" if old_string.endswith("\n") else ""
+            new_string = f"from {node.module} import {rendered}{ending}"
+        else:
+            new_string = ""
+        recipes.append(
+            {
+                "name": "edit_file",
+                "arguments": {
+                    "filepath": target,
+                    "old_string": old_string,
+                    "new_string": new_string,
+                },
+            }
+        )
+
+    settings_used = any(
+        isinstance(node, ast.Name) and node.id == "settings" and isinstance(node.ctx, ast.Load)
+        for node in ast.walk(module)
+    )
+    settings_imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "django.conf"
+        and any((alias.asname or alias.name) == "settings" for alias in node.names)
+        for node in module.body
+    )
+    if settings_used and not settings_imported:
+        first_import = next(
+            (node for node in module.body if isinstance(node, (ast.Import, ast.ImportFrom))),
+            None,
+        )
+        if first_import is not None:
+            end = int(getattr(first_import, "end_lineno", first_import.lineno))
+            old_string = "".join(lines[:end])
+            prefix = "".join(lines[: first_import.lineno - 1])
+            import_text = "".join(lines[first_import.lineno - 1 : end])
+            recipes.append(
+                {
+                    "name": "edit_file",
+                    "arguments": {
+                        "filepath": target,
+                        "old_string": old_string,
+                        "new_string": prefix + "from django.conf import settings\n" + import_text,
+                    },
+                }
+            )
+
+    for class_node in classes.values():
+        for statement in class_node.body:
+            if not (
+                isinstance(statement, ast.AnnAssign)
+                and statement.value is None
+                and isinstance(statement.target, ast.Name)
+                and isinstance(statement.annotation, ast.Call)
+                and isinstance(statement.annotation.func, ast.Attribute)
+                and isinstance(statement.annotation.func.value, ast.Name)
+                and statement.annotation.func.value.id == "models"
+            ):
+                continue
+            start = statement.lineno - 1
+            end = int(getattr(statement, "end_lineno", statement.lineno))
+            context_start = class_node.lineno - 1
+            annotation = ast.get_source_segment(content, statement.annotation)
+            if not annotation:
+                continue
+            indent = " " * int(getattr(statement, "col_offset", 0))
+            ending = "\n" if "".join(lines[start:end]).endswith("\n") else ""
+            replacement = f"{indent}{statement.target.id} = {annotation}{ending}"
+            recipes.append(
+                {
+                    "name": "edit_file",
+                    "arguments": {
+                        "filepath": target,
+                        "old_string": "".join(lines[context_start:end]),
+                        "new_string": "".join(lines[context_start:start]) + replacement,
+                    },
+                }
+            )
+    return recipes
+
+
+def _prd_file_repair_guidance(
+    target: str,
+    preflight: dict[str, Any],
+    *,
+    workspace: Path | None = None,
+) -> str:
+    """Derive exact cross-file repair facts the model should not have to guess."""
+    posix = target.lower().replace("\\", "/")
+    expected = _preflight_expected_files(preflight)
+    app_init_paths = {
+        (Path(path).parent / "__init__.py").as_posix()
+        for path in expected
+        if path.lower().replace("\\", "/").endswith("/apps.py")
+    }
+    if Path(target).as_posix() in app_init_paths and workspace is not None:
+        try:
+            content = (workspace / target).read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        import_match = re.search(
+            r"(?m)^\s*(?:from\s+\.models\s+import|from\s+\.\s+import\s+models|import\s+.*\bmodels\b)[^\r\n]*(?:\r?\n)?",
+            content,
+        )
+        if import_match:
+            recipe = {
+                "name": "edit_file",
+                "arguments": {
+                    "filepath": target,
+                    "old_string": import_match.group(0),
+                    "new_string": "",
+                },
+            }
+            return (
+                "Django app package markers must not import models during app registry loading. "
+                "An empty __init__.py is valid.\nDeterministic edit recipe: your next response "
+                "must call this tool without changing its arguments:\n" + json.dumps(recipe)
+            )
+    if posix.endswith("/urls.py") and workspace is not None:
+        try:
+            content = (workspace / target).read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        django_root = (workspace / target).parent.parent
+        recipes: list[dict[str, Any]] = []
+        missing_modules: list[str] = []
+        for match in re.finditer(
+            r"(?m)^.*include\(\s*['\"](?P<module>[^'\"]+)['\"]\s*\).*?(?:\r?\n|$)",
+            content,
+        ):
+            included = match.group("module")
+            module_base = django_root.joinpath(*included.split("."))
+            if module_base.with_suffix(".py").is_file() or (module_base / "__init__.py").is_file():
+                continue
+            missing_modules.append(included)
+            recipes.append(
+                {
+                    "name": "edit_file",
+                    "arguments": {
+                        "filepath": target,
+                        "old_string": match.group(0),
+                        "new_string": "",
+                    },
+                }
+            )
+        if recipes:
+            return (
+                "The URL configuration includes module(s) that do not exist: "
+                + ", ".join(missing_modules)
+                + ". Remove those route entries until the owning milestone creates the modules."
+                + "\nDeterministic edit recipe: your next response must call every tool below "
+                "in order without changing its arguments:\n"
+                + "\n".join(json.dumps(item) for item in recipes)
+            )
+    if posix.endswith("/models.py") and workspace is not None:
+        try:
+            content = (workspace / target).read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        missing = _missing_django_entity_requirements(content, preflight)
+        structure_errors = _django_model_structure_errors(content)
+        recipes = _django_model_structure_edit_recipes(target, content)
+        facts: list[str] = []
+        if missing:
+            facts.append(
+                "Entity contract facts: add or repair only these absent declarations: "
+                + ", ".join(missing)
+                + ". Fields inherited from Django AbstractUser already exist and must not be "
+                "redeclared. Preserve every existing model and relationship."
+            )
+        if structure_errors:
+            facts.append("Django model structure errors: " + "; ".join(structure_errors) + ".")
+        if recipes:
+            facts.append(
+                "Deterministic edit recipe: your next responses must call every tool below "
+                "in order without changing its arguments:\n"
+                + "\n".join(json.dumps(item) for item in recipes)
+            )
+        if facts:
+            return "\n".join(facts)
+    if posix.endswith("/settings.py"):
+        url_modules = sorted(
+            {
+                ".".join(Path(path).with_suffix("").parts[-2:])
+                for path in _preflight_expected_files(preflight)
+                if path.lower().replace("\\", "/").endswith("/urls.py")
+            }
+        )
+        app_modules = sorted(
+            {
+                Path(path).parent.name
+                for path in _preflight_expected_files(preflight)
+                if path.lower().replace("\\", "/").endswith("/apps.py")
+            }
+        )
+        facts: list[str] = []
+        custom_user_models = (
+            _django_custom_user_models(preflight, workspace) if workspace is not None else []
+        )
+        if url_modules:
+            facts.append(f"ROOT_URLCONF must be `{url_modules[0]}`")
+        if app_modules:
+            facts.append("INSTALLED_APPS must include " + ", ".join(app_modules))
+        if custom_user_models:
+            facts.append(f"AUTH_USER_MODEL must be `{custom_user_models[0]}`")
+        has_wsgi_file = any(
+            path.lower().replace("\\", "/").endswith("/wsgi.py")
+            for path in _preflight_expected_files(preflight)
+        )
+        facts.append(
+            "WSGI_APPLICATION must reference the expected wsgi.py module"
+            if has_wsgi_file
+            else (
+                "no wsgi.py exists in this architecture, so remove the WSGI_APPLICATION "
+                "assignment entirely"
+            )
+        )
+        facts.append(
+            "the complete file must retain SECRET_KEY, DEBUG, ALLOWED_HOSTS, INSTALLED_APPS, "
+            "MIDDLEWARE, ROOT_URLCONF, TEMPLATES, DATABASES, locale/time-zone settings, and "
+            "STATIC_URL"
+        )
+        recipes: list[dict[str, Any]] = []
+        if workspace is not None:
+            try:
+                content = (workspace / target).read_text(encoding="utf-8")
+            except OSError:
+                content = ""
+            root_match = re.search(
+                r"(?m)^ROOT_URLCONF\s*=\s*(?P<quote>['\"])(?P<module>[^'\"]+)(?P=quote)[^\r\n]*",
+                content,
+            )
+            if (
+                root_match
+                and url_modules
+                and root_match.group("module") != url_modules[0]
+            ):
+                old_string = root_match.group(0)
+                recipes.append(
+                    {
+                        "name": "edit_file",
+                        "arguments": {
+                            "filepath": target,
+                            "old_string": old_string,
+                            "new_string": f"ROOT_URLCONF = '{url_modules[0]}'",
+                        },
+                    }
+                )
+            if not has_wsgi_file:
+                wsgi_match = re.search(
+                    r"(?m)^WSGI_APPLICATION[^\r\n]*(?:\r?\n)?", content
+                )
+                if wsgi_match:
+                    recipes.append(
+                        {
+                            "name": "edit_file",
+                            "arguments": {
+                                "filepath": target,
+                                "old_string": wsgi_match.group(0),
+                                "new_string": "",
+                            },
+                        }
+                    )
+            if custom_user_models:
+                auth_match = re.search(
+                    r"(?m)^AUTH_USER_MODEL\s*=\s*(?P<quote>['\"])(?P<model>[^'\"]+)(?P=quote)[^\r\n]*",
+                    content,
+                )
+                expected_user = custom_user_models[0]
+                if auth_match and auth_match.group("model") != expected_user:
+                    recipes.append(
+                        {
+                            "name": "edit_file",
+                            "arguments": {
+                                "filepath": target,
+                                "old_string": auth_match.group(0),
+                                "new_string": f"AUTH_USER_MODEL = '{expected_user}'",
+                            },
+                        }
+                    )
+                elif not auth_match:
+                    recipes.append(
+                        {
+                            "name": "append_file",
+                            "arguments": {
+                                "filepath": target,
+                                "content": f"\nAUTH_USER_MODEL = '{expected_user}'\n",
+                            },
+                        }
+                    )
+        recipe = ""
+        if recipes:
+            recipe = (
+                "\nDeterministic edit recipe: your next response must call every tool below "
+                "in order without changing its arguments:\n"
+                + "\n".join(json.dumps(item) for item in recipes)
+            )
+        return (
+            "Cross-file facts from the architecture contract: "
+            + "; ".join(facts)
+            + "."
+            + recipe
+        )
+    if not posix.endswith("/manage.py"):
+        return ""
+    settings_modules = sorted(
+        {
+            ".".join(Path(path).with_suffix("").parts[-2:])
+            for path in _preflight_expected_files(preflight)
+            if path.lower().replace("\\", "/").endswith("/settings.py")
+        }
+    )
+    if not settings_modules:
+        return ""
+    module = settings_modules[0]
+    guidance = (
+        f"Cross-file fact from the architecture contract: settings.py is in the `{module}` "
+        f"module. The manage.py DJANGO_SETTINGS_MODULE value must be exactly `{module}`; "
+        "any other module name is invalid."
+    )
+    if workspace is not None:
+        try:
+            content = (workspace / target).read_text(encoding="utf-8")
+        except OSError:
+            content = ""
+        match = re.search(
+            r"(?m)^(?P<prefix>\s*os\.environ\.setdefault\(\s*['\"]DJANGO_SETTINGS_MODULE['\"]\s*,\s*)"
+            r"(?P<quote>['\"])(?P<module>[^'\"]+)(?P=quote)(?P<suffix>\s*\).*)$",
+            content,
+        )
+        if match and match.group("module") != module:
+            old_string = match.group(0)
+            new_string = (
+                match.group("prefix")
+                + match.group("quote")
+                + module
+                + match.group("quote")
+                + match.group("suffix")
+            )
+            guidance += (
+                "\nDeterministic edit recipe: your next response must call this exact tool "
+                "without changing its arguments: "
+                + json.dumps(
+                    {
+                        "name": "edit_file",
+                        "arguments": {
+                            "filepath": target,
+                            "old_string": old_string,
+                            "new_string": new_string,
+                        },
+                    }
+                )
+            )
+    return guidance
 
 
 def _build_prd_milestone_request(
@@ -8825,14 +11076,19 @@ def _build_prd_milestone_request(
     milestone_index: int,
     milestone_count: int,
     preflight: dict[str, Any] | None = None,
+    project_root: str = "",
+    skill_context: str = "",
 ) -> str:
-    checklist = render_progress_checklist(milestones, milestone_index - 1, header="Milestones")
+    checklist = _render_prd_milestone_window(milestones, milestone_index - 1)
     preflight_context = render_preflight_context(preflight or {})
     preflight_block = f"\n\n{preflight_context}" if preflight_context else ""
+    skills_block = f"\n\n{skill_context}" if skill_context else ""
+    root_line = f"Project root: {project_root}\n" if project_root else ""
     return (
         f"{PRD_BUILD_FRAMING}\n\n"
         f"Project: {title}\n"
-        f"PRD file: {relative_path.as_posix()} (read it if you need exact detail)\n"
+        f"{root_line}"
+        f"PRD source reference: {relative_path.as_posix()} (already extracted by the harness)\n"
         f"Current milestone {milestone_index}/{milestone_count}: {milestones[milestone_index - 1]}\n\n"
         "FIRST list and read the files already in the workspace so you build ON TOP of the previous "
         "milestones instead of replacing their work. THEN implement only the current milestone by "
@@ -8842,7 +11098,159 @@ def _build_prd_milestone_request(
         f"{prd_brief}\n\n"
         f"{checklist}"
         f"{preflight_block}"
+        f"{skills_block}"
     )
+
+
+def _render_prd_milestone_window(milestones: list[str], current_index: int) -> str:
+    """Keep nearby checkpoint context without resending the whole milestone graph."""
+    start = max(0, current_index - 2)
+    stop = min(len(milestones), current_index + 2)
+    nearby = milestones[start:stop]
+    completed = max(0, current_index - start)
+    return render_progress_checklist(nearby, completed, header="Nearby milestones")
+
+
+def _scope_prd_preflight(preflight: dict[str, Any], project_root: str) -> dict[str, Any]:
+    """Anchor milestone file contracts below the requested project directory."""
+    scoped = dict(preflight)
+    scoped["allowed_tools"] = list(
+        dict.fromkeys(
+            [
+                str(name)
+                for name in preflight.get("allowed_tools") or []
+                if str(name) != "ask_user"
+            ]
+            + ["append_file", "file_info", "find_file"]
+        )
+    )
+    if (
+        len(preflight.get("expected_files") or []) > 1
+        and str(preflight.get("rollback_policy") or "").strip().lower()
+        == "rollback changed files on failed verifier"
+    ):
+        scoped["rollback_policy"] = (
+            "keep valid partial changes; no rollback for an incomplete milestone"
+        )
+    root = Path(project_root).as_posix().strip("/")
+    if not root or root == ".":
+        return scoped
+    expected: list[str] = []
+    for value in preflight.get("expected_files") or []:
+        path = Path(str(value)).as_posix().lstrip("/")
+        if not path:
+            continue
+        expected.append(path if path == root or path.startswith(root + "/") else f"{root}/{path}")
+    scoped["expected_files"] = list(dict.fromkeys(expected))
+    scoped["project_root"] = root
+    return scoped
+
+
+def _reopen_invalid_prd_checkpoint(
+    root: Path,
+    state: dict[str, Any],
+    project_root: str,
+    workspace: Path,
+    console: Console,
+) -> dict[str, Any]:
+    """Reopen the first completed checkpoint whose durable artifacts are invalid."""
+    updated = state
+    for milestone in state.get("milestones") or []:
+        if not isinstance(milestone, dict):
+            continue
+        status = str(milestone.get("status") or "pending")
+        if status not in {"implemented", "verified"}:
+            break
+        milestone_id = str(milestone.get("id") or "")
+        preflight = _scope_prd_preflight(
+            load_milestone_preflight(root, milestone_id), project_root
+        )
+        expected = _preflight_expected_files(preflight)
+        problems = [
+            *_missing_expected_files(expected, workspace),
+            *_invalid_expected_architecture_files(preflight, workspace),
+            *_prd_requirement_evidence_errors(preflight, workspace),
+        ]
+        if not problems:
+            continue
+        reason = "Checkpoint revalidation failed: " + ", ".join(problems[:12])
+        updated = checkpoint_milestone(
+            root,
+            updated,
+            milestone_id,
+            status="pending",
+            evidence=["checkpoint_revalidation_failed"],
+            message=reason,
+        )
+        console.print(
+            Panel(
+                f"Reopening {milestone_id}: {reason}",
+                title="PRD Checkpoint Revalidation",
+                border_style="yellow",
+            )
+        )
+        break
+    return updated
+
+
+def _prd_fallback_preflight(project: Any, project_root: str) -> dict[str, Any]:
+    contract_obj = getattr(project, "prd_contract", None)
+    stack = " ".join(
+        [
+            str(getattr(contract_obj, "stack_hint", "") or ""),
+            *[str(item) for item in getattr(contract_obj, "required_stack", ()) or ()],
+        ]
+    ).lower()
+    skills = ["developer", "prd-planner"]
+    if any(token in stack for token in ("react", "vite", "node", "typescript")):
+        skills.append("react-vite")
+    if getattr(contract_obj, "project_kind", "") in {"web_app", "game"}:
+        skills.append("ui-designer")
+    if any(token in stack for token in ("sqlite", "database", "postgres")):
+        skills.append("sqlite-persistence")
+    skills.append("testing")
+    return {
+        "milestone_id": "M-FALLBACK",
+        "title": "Complete PRD implementation",
+        "project_root": project_root,
+        "active_skills": list(dict.fromkeys(skills)),
+        "requirements": [],
+    }
+
+
+def _prd_milestone_skill_context(workspace: Path, preflight: dict[str, Any]) -> str:
+    """Render the exact compiled milestone skills, without global selection loss."""
+    names = list(dict.fromkeys(str(item) for item in preflight.get("active_skills") or []))
+    if not names:
+        return ""
+    catalog = discover_skills(workspace)
+    selected: list[SelectedSkill] = []
+    missing: list[str] = []
+    for name in names:
+        skill = catalog.skills.get(name)
+        if skill is None:
+            missing.append(name)
+            continue
+        selected.append(
+            SelectedSkill(skill=skill, score=100.0, reasons=("compiled milestone contract",))
+        )
+    ledger = get_current_run()
+    if ledger:
+        ledger.log_event(
+            "prd_milestone_skills_injected",
+            milestone_id=str(preflight.get("milestone_id") or ""),
+            selected=[item.skill.name for item in selected],
+            missing=missing,
+        )
+    if missing:
+        preflight["missing_skills"] = missing
+    selection = SkillSelection(
+        mode="on",
+        selected=tuple(selected),
+        issues=catalog.issues,
+        budget_tokens=_env_int_at_least("SHAMSU_PRD_SKILL_BUDGET_TOKENS", 3600, 900),
+    )
+    return render_skill_context(selection)
 
 
 def _create_prd_build_task(user_request: str, title: str, milestones: list[str]) -> MilestoneTask:
@@ -8943,7 +11351,9 @@ async def _prepare_prd_milestone_preflight(
         errors = [f"{type(exc).__name__}: {exc}"]
         preflight, _ = validate_model_preflight(deterministic_preflight, None)
 
-    state = record_milestone_preflight(root, state, milestone_id, preflight, validation_errors=errors)
+    state = record_milestone_preflight(
+        root, state, milestone_id, preflight, validation_errors=errors
+    )
     source = str(preflight.get("preflight_source") or "deterministic")
     if ledger:
         ledger.log_event(
@@ -9019,9 +11429,17 @@ def _workspace_file_inventory_for_preflight(workspace: Path, limit: int = 80) ->
 # --- Plan mode: plan -> review -> proceed -------------------------------------
 
 _FOLLOW_PLAN_PHRASES = (
-    "follow the plan", "proceed with the plan", "execute the plan", "run the plan",
-    "do the plan", "go with the plan", "start the plan", "implement the plan",
-    "build the plan", "let's proceed", "lets proceed",
+    "follow the plan",
+    "proceed with the plan",
+    "execute the plan",
+    "run the plan",
+    "do the plan",
+    "go with the plan",
+    "start the plan",
+    "implement the plan",
+    "build the plan",
+    "let's proceed",
+    "lets proceed",
 )
 
 
@@ -9330,7 +11748,7 @@ async def _execute_plan(
         # on the unanswered assumption, with a subsequent step free to overwrite
         # the question nobody had seen yet. Pause here and resume on the answer.
         if getattr(result, "awaiting_user", False):
-            save_task(task_obj, workspace)   # leave the step RUNNING, not done
+            save_task(task_obj, workspace)  # leave the step RUNNING, not done
             _pause_plan_for_question(
                 task, route, plan_markdown, steps, index, changed_files, workspace, session_logger
             )
@@ -9416,7 +11834,9 @@ async def _verify_completed_plan(
             console.print("[dim]The full verifier errored - left UNVERIFIED.[/dim]")
             return None
         if heavy.verified:
-            console.print(Panel(heavy.summary, title="Plan verified (full build)", border_style="green"))
+            console.print(
+                Panel(heavy.summary, title="Plan verified (full build)", border_style="green")
+            )
             return True
         else:
             console.print(
@@ -9443,6 +11863,233 @@ async def _verify_completed_plan(
         return False
 
 
+def _prd_verification_summary(outcome: Any) -> str:
+    """Attach the primary failing output to the compact milestone verdict."""
+    summary = str(getattr(outcome, "summary", "") or "Verification failed.")
+    failed_result = next(
+        (
+            result
+            for result in getattr(outcome, "steps", ()) or ()
+            if not bool(getattr(result, "passed", False))
+        ),
+        None,
+    )
+    if failed_result is None:
+        return summary
+    step = getattr(failed_result, "step", None)
+    stage = str(getattr(step, "stage", "") or "")
+    stdout = str(getattr(failed_result, "stdout", "") or "").strip()
+    stderr = str(getattr(failed_result, "stderr", "") or "").strip()
+    ordered = (("stdout", stdout), ("stderr", stderr)) if stage == "migration" else (
+        ("stderr", stderr),
+        ("stdout", stdout),
+    )
+    diagnostic = "\n".join(
+        f"{label}:\n{value}" for label, value in ordered if value
+    ).strip()
+    if not diagnostic:
+        return summary
+    if len(diagnostic) > 1800:
+        diagnostic = diagnostic[-1800:]
+    return f"{summary}\nPrimary error:\n{diagnostic}"
+
+
+def _prd_verification_cwd(outcome: Any, workspace: Path) -> str:
+    """Return the verifier cwd as a workspace-relative repair fact."""
+    failed_step = getattr(outcome, "failed_step", None)
+    steps = tuple(getattr(outcome, "steps", ()) or ())
+    step = failed_step or (getattr(steps[0], "step", None) if steps else None)
+    cwd = getattr(step, "cwd", None)
+    if cwd is None:
+        return "."
+    try:
+        relative = Path(cwd).resolve().relative_to(workspace.resolve())
+    except (OSError, ValueError):
+        return str(cwd)
+    return relative.as_posix() or "."
+
+
+def _prd_requirement_evidence_errors(
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    """Check durable behavior evidence that compile/framework checks cannot prove."""
+    requirements = [
+        item
+        for item in preflight.get("requirements") or []
+        if isinstance(item, dict)
+        and str(item.get("scope") or "in") == "in"
+        and str(item.get("priority") or "must") == "must"
+    ]
+    kinds = {str(item.get("kind") or "").lower() for item in requirements}
+    if not kinds & {"auth", "authorization", "role"}:
+        return []
+    roots = _workspace_relative_paths(
+        [str(preflight.get("project_root") or ".")], workspace
+    )
+    root = workspace / (roots[0] if roots else ".")
+    if not root.is_dir():
+        return ["requirement evidence root does not exist"]
+    source_parts: list[str] = []
+    test_parts: list[str] = []
+    url_parts: list[str] = []
+    url_sources: dict[str, str] = {}
+    placeholder_files: list[str] = []
+    for path in root.rglob("*.py"):
+        if any(part in {".venv", "node_modules", "migrations", "__pycache__"} for part in path.parts):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        lowered = content.lower()
+        if re.search(r"\b(?:add|implement)\s+[^\r\n#]{0,60}\blogic\s+here\b", lowered):
+            try:
+                placeholder_files.append(path.relative_to(workspace).as_posix())
+            except ValueError:
+                placeholder_files.append(path.name)
+        if path.name.startswith("test") or "tests" in {part.lower() for part in path.parts}:
+            test_parts.append(lowered)
+        else:
+            source_parts.append(lowered)
+        if path.name == "urls.py":
+            url_parts.append(lowered)
+            try:
+                url_sources[path.relative_to(workspace).as_posix()] = lowered
+            except ValueError:
+                url_sources[path.as_posix()] = lowered
+    source = "\n".join(source_parts)
+    tests = "\n".join(test_parts)
+    urls = "\n".join(url_parts)
+    expected_urls = [
+        path
+        for path in _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+        if path.replace("\\", "/").endswith("/config/urls.py")
+    ]
+    root_urls = "\n".join(url_sources.get(path, "") for path in expected_urls)
+    included_urls = root_urls
+    for module in re.findall(r"include\(\s*['\"](?P<module>[^'\"]+)['\"]", root_urls):
+        suffix = module.replace(".", "/") + ".py"
+        included_urls += "\n" + "\n".join(
+            content for path, content in url_sources.items() if path.endswith(suffix)
+        )
+    reachable_urls = included_urls or urls
+    errors: list[str] = []
+    if placeholder_files and kinds & {"auth", "authorization"}:
+        errors.append(
+            "placeholder behavior remains in " + ", ".join(sorted(set(placeholder_files))[:6])
+        )
+    texts = [str(item.get("text") or "").lower() for item in requirements]
+    required_roles = {
+        role
+        for item, text in zip(requirements, texts, strict=True)
+        if str(item.get("kind") or "").lower() == "role"
+        for role in ("admin", "teacher", "student")
+        if role in text
+    }
+    wants_login = any(
+        str(item.get("kind") or "").lower() == "auth" and "login" in text
+        for item, text in zip(requirements, texts, strict=True)
+    )
+    wants_logout = any(
+        str(item.get("kind") or "").lower() == "auth" and "logout" in text
+        for item, text in zip(requirements, texts, strict=True)
+    )
+    wants_session = any(
+        str(item.get("kind") or "").lower() == "auth" and "session" in text
+        for item, text in zip(requirements, texts, strict=True)
+    )
+    missing_roles = sorted(
+        role for role in required_roles if not re.search(rf"['\"]{role}['\"]", source)
+    )
+    if missing_roles:
+        errors.append(
+            "roles have no executable source declarations: " + ", ".join(missing_roles)
+        )
+    if wants_login:
+        login_import = re.search(
+            r"from\s+django\.contrib\.auth\s+import[^\r\n]*\blogin\b", source
+        )
+        if not login_import or "authenticate(" not in source or not re.search(
+            r"(?<!def )\blogin\s*\(", source
+        ):
+            errors.append("login does not call Django authenticate() and login()")
+        if "login" not in reachable_urls:
+            errors.append("login endpoint is not wired into Django URL patterns")
+    if wants_logout:
+        logout_import = re.search(
+            r"from\s+django\.contrib\.auth\s+import[^\r\n]*\blogout\b", source
+        )
+        if not logout_import or not re.search(r"(?<!def )\blogout\s*\(", source):
+            errors.append("logout does not call Django logout()")
+        if "logout" not in reachable_urls:
+            errors.append("logout endpoint is not wired into Django URL patterns")
+    if wants_session and "session" not in tests:
+        errors.append("session persistence has no focused test evidence")
+    if (wants_login or wants_logout) and not (
+        "test" in tests and "login" in tests and "logout" in tests
+    ):
+        errors.append("login/logout behavior has no focused Django tests")
+
+    authorization_texts = [
+        text
+        for item, text in zip(requirements, texts, strict=True)
+        if str(item.get("kind") or "").lower() == "authorization"
+    ]
+    if authorization_texts:
+        if "request.user" not in source:
+            errors.append("authorization rules do not inspect the authenticated user")
+        required_terms = {
+            term
+            for text in authorization_texts
+            for term in ("teacher", "student", "course", "submission", "grade")
+            if term in text
+        }
+        missing_terms = sorted(term for term in required_terms if term not in source)
+        if missing_terms:
+            errors.append(
+                "authorization implementation omits required domain terms: "
+                + ", ".join(missing_terms)
+            )
+        if not tests or not re.search(r"\b(?:403|forbidden|permissiondenied)\b", tests):
+            errors.append("authorization rules have no forbidden-access tests")
+    return list(dict.fromkeys(errors))
+
+
+def _prd_behavior_test_count(outcome: Any) -> int | None:
+    counts: list[int] = []
+    for result in getattr(outcome, "steps", ()) or ():
+        stage = str(getattr(getattr(result, "step", None), "stage", "") or "")
+        if stage != "test":
+            continue
+        output = "\n".join(
+            [
+                str(getattr(result, "stdout", "") or ""),
+                str(getattr(result, "stderr", "") or ""),
+            ]
+        )
+        counts.extend(
+            int(match.group("count"))
+            for match in re.finditer(
+                r"(?:Found|Ran)\s+(?P<count>\d+)\s+test(?:\(s\)|s)?",
+                output,
+                re.IGNORECASE,
+            )
+        )
+    return max(counts) if counts else None
+
+
+def _prd_requires_behavior_tests(preflight: dict[str, Any]) -> bool:
+    return any(
+        isinstance(item, dict)
+        and str(item.get("scope") or "in") == "in"
+        and str(item.get("priority") or "must") == "must"
+        and str(item.get("kind") or "").lower()
+        in {"auth", "authorization", "feature", "screen", "workflow", "mechanic"}
+        for item in preflight.get("requirements") or []
+    )
+
+
 async def _verify_prd_milestone(
     milestone_id: str,
     preflight: dict[str, Any],
@@ -9452,9 +12099,48 @@ async def _verify_prd_milestone(
     session_logger: SessionLogger | None,
 ) -> tuple[str, dict[str, Any]]:
     """Return the milestone checkpoint status plus compact verifier evidence."""
+    if preflight.get("missing_skills"):
+        summary = "Required milestone skills are unavailable: " + ", ".join(
+            str(item) for item in preflight["missing_skills"]
+        )
+        verification = _milestone_verification_payload("failed", files=[], summary=summary)
+        _log_prd_milestone_verification(milestone_id, verification)
+        return "failed", verification
+    if not changed_files and _prd_milestone_requires_mutation(preflight):
+        summary = "The mandatory milestone completed without a confirmed source mutation."
+        verification = _milestone_verification_payload("failed", files=[], summary=summary)
+        _log_prd_milestone_verification(milestone_id, verification)
+        console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
+        return "failed", verification
+    expected_files = _preflight_expected_files(preflight)
+    missing_expected = _missing_expected_files(expected_files, workspace)
+    if missing_expected and _prd_milestone_is_mandatory(preflight):
+        summary = "Mandatory milestone is missing expected architecture files: " + ", ".join(
+            missing_expected[:12]
+        )
+        verification = _milestone_verification_payload(
+            "failed",
+            files=[path for path in expected_files if path not in missing_expected],
+            summary=summary,
+        )
+        _log_prd_milestone_verification(milestone_id, verification)
+        console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
+        return "failed", verification
+    invalid_expected = _invalid_expected_architecture_files(preflight, workspace)
+    if invalid_expected and _prd_milestone_is_mandatory(preflight):
+        summary = "Mandatory milestone contains hollow or invalid architecture files: " + ", ".join(
+            invalid_expected[:12]
+        )
+        verification = _milestone_verification_payload(
+            "failed",
+            files=expected_files,
+            summary=summary,
+        )
+        _log_prd_milestone_verification(milestone_id, verification)
+        console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
+        return "failed", verification
     verifier_files = _milestone_verifier_files(preflight, changed_files, workspace)
     if not verifier_files:
-        expected_files = _preflight_expected_files(preflight)
         missing = _missing_expected_files(expected_files, workspace)
         if expected_files and len(missing) == len(expected_files):
             summary = (
@@ -9467,7 +12153,9 @@ async def _verify_prd_milestone(
                 summary=summary,
             )
             _log_prd_milestone_verification(milestone_id, verification)
-            console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
+            console.print(
+                Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red")
+            )
             return "failed", verification
         summary = "No deterministic verifier is available for this milestone (UNVERIFIED)."
         verification = _milestone_verification_payload(
@@ -9477,11 +12165,28 @@ async def _verify_prd_milestone(
             unverifiable=True,
         )
         _log_prd_milestone_verification(milestone_id, verification)
-        console.print(f"[dim]{summary}[/dim]")
+        # Same reasoning as the unverifiable branch below: a missing verifier
+        # is a gap in the gate, not a defect in the work, and failing here
+        # blocked every dependent milestone.
+        if _prd_milestone_is_mandatory(preflight):
+            console.print(
+                Panel(
+                    f"{summary}\nContinuing; this milestone is recorded as implemented "
+                    f"but UNVERIFIED.",
+                    title=f"Milestone {milestone_id} unverified",
+                    border_style="yellow",
+                )
+            )
+        else:
+            console.print(f"[dim]{summary}[/dim]")
         return "implemented", verification
 
     stack = _milestone_stack(verifier_files, preflight)
     stack_hint = _milestone_stack_hint(preflight)
+    # The milestone's own declared verifier (e.g. `python manage.py check`)
+    # runs as a required acceptance step - it used to be a stack hint only,
+    # leaving the declared check unexecuted ("no deterministic verifier").
+    acceptance_commands = _prd_milestone_acceptance_commands(preflight, workspace)
     try:
         outcome = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -9492,6 +12197,7 @@ async def _verify_prd_milestone(
                 stack_hint=stack_hint,
                 lightweight=True,
                 session_logger=session_logger,
+                acceptance_commands=acceptance_commands,
             ),
         )
     except Exception as exc:
@@ -9508,18 +12214,60 @@ async def _verify_prd_milestone(
     verification = _milestone_verification_payload(
         outcome.status(),
         files=verifier_files,
-        summary=outcome.summary,
+        summary=_prd_verification_summary(outcome),
         verified=outcome.verified,
         unverifiable=outcome.unverifiable,
         exit_code=outcome.exit_code,
         command=outcome.command,
+        cwd=_prd_verification_cwd(outcome, workspace),
     )
+    semantic_errors = _prd_requirement_evidence_errors(preflight, workspace)
+    test_count = _prd_behavior_test_count(outcome)
+    if outcome.verified and _prd_requires_behavior_tests(preflight) and test_count == 0:
+        semantic_errors.append(
+            "behavior milestone verifier discovered 0 tests; add focused requirement tests"
+        )
+    if outcome.verified and semantic_errors:
+        verification = {
+            **verification,
+            "status": "failed",
+            "verified": False,
+            "summary": "Requirement evidence validation failed: " + "; ".join(semantic_errors),
+        }
+        _log_prd_milestone_verification(milestone_id, verification)
+        console.print(
+            Panel(
+                verification["summary"],
+                title=f"Milestone {milestone_id} FAILED",
+                border_style="red",
+            )
+        )
+        return "failed", verification
     _log_prd_milestone_verification(milestone_id, verification)
     if outcome.verified:
-        console.print(Panel(outcome.summary, title=f"Milestone {milestone_id} verified", border_style="green"))
+        console.print(
+            Panel(outcome.summary, title=f"Milestone {milestone_id} verified", border_style="green")
+        )
         return "verified", verification
     if outcome.unverifiable:
-        console.print(f"[dim]{outcome.summary}[/dim]")
+        # "No verifier exists for this kind of change" is a gap in the gate,
+        # not a defect in the work. Failing the milestone for it also blocked
+        # every dependent, so one uncheckable behavioural milestone ended the
+        # build: M-002 unverifiable took 15 further milestones down with it.
+        # Report it honestly as unverified - never as verified - and let the
+        # build continue. Checkpoint revalidation and the final whole-project
+        # verification still apply.
+        if _prd_milestone_is_mandatory(preflight):
+            console.print(
+                Panel(
+                    f"{outcome.summary}\nContinuing; this milestone is recorded as "
+                    f"implemented but UNVERIFIED.",
+                    title=f"Milestone {milestone_id} unverified",
+                    border_style="yellow",
+                )
+            )
+        else:
+            console.print(f"[dim]{outcome.summary}[/dim]")
         return "implemented", verification
     console.print(
         Panel(
@@ -9586,6 +12334,65 @@ async def _repair_failed_prd_milestone(
                 attempts=budget,
                 verification_status=latest_verification.get("status"),
             )
+        repair_tool_baseline = _prd_tool_snapshot(workspace)
+        repair_transaction_baseline = _prd_transaction_snapshot(workspace)
+        invalid_before = set(_invalid_expected_architecture_files(preflight, workspace))
+        migration_source_files = _prd_migration_source_repair_files(
+            latest_verification, preflight, workspace
+        )
+        migration_source_guidance = _prd_migration_source_edit_guidance(
+            latest_verification, preflight, workspace
+        )
+        semantic_source_files = _prd_semantic_source_repair_files(
+            latest_verification, preflight, workspace
+        )
+        semantic_source_guidance = _prd_semantic_source_edit_guidance(
+            latest_verification, preflight, workspace
+        )
+        # A plain runtime exception (the most common Django failure) matched
+        # neither branch above, so repair ran with no root cause, no scoped
+        # file, and no forced tool - and the model just talked.
+        runtime_source_files = _prd_runtime_exception_repair_files(
+            latest_verification, workspace
+        )
+        runtime_source_guidance = _prd_runtime_exception_edit_guidance(
+            latest_verification, workspace
+        )
+        # Django's own check errors (fields.EXXX) carry no file or line, so the
+        # traceback parser skips them and the repair used to get nothing.
+        check_source_files = _prd_django_check_repair_files(
+            latest_verification, preflight, workspace
+        )
+        check_source_guidance = _prd_django_check_edit_guidance(
+            latest_verification, preflight, workspace
+        )
+        focused_source_files = (
+            migration_source_files
+            or semantic_source_files
+            or check_source_files
+            or runtime_source_files
+        )
+        focused_source_guidance = (
+            migration_source_guidance
+            or semantic_source_guidance
+            or check_source_guidance
+            or runtime_source_guidance
+        )
+        semantic_behavior_failure = str(latest_verification.get("summary") or "").startswith(
+            "Requirement evidence validation failed:"
+        )
+        semantic_repair_context = (
+            _prd_semantic_repair_source_context(preflight, workspace)
+            if semantic_behavior_failure and not focused_source_files
+            else ""
+        )
+        repair_tools = tuple(preflight.get("allowed_tools") or ())
+        if focused_source_files:
+            repair_tools = tuple(
+                name
+                for name in repair_tools
+                if name in {"read_file", "file_info", "edit_file"}
+            )
         try:
             result = await _run_agent_chat(
                 _build_prd_milestone_repair_request(
@@ -9600,18 +12407,39 @@ async def _repair_failed_prd_milestone(
                     all_changed,
                     attempt,
                     budget,
-                ),
+                )
+                + ("\n\n" + focused_source_guidance if focused_source_guidance else "")
+                + ("\n\n" + semantic_repair_context if semantic_repair_context else "")
+                + "\n\n"
+                + _prd_milestone_skill_context(workspace, preflight),
                 workspace,
                 console,
                 session_logger=session_logger,
                 force_long_running=True,
                 auto_approve=True,
-                allowed_write_paths=_prd_milestone_repair_write_scope(
-                    preflight, all_changed, workspace
-                )
-                or None,
+                allowed_write_paths=(
+                    tuple(focused_source_files)
+                    or _prd_milestone_repair_write_scope(preflight, all_changed, workspace)
+                    or None
+                ),
+                allowed_read_paths=(str(preflight.get("project_root")),)
+                if str(preflight.get("project_root") or "")
+                else None,
+                allowed_tools=repair_tools,
                 use_long_term_memory=False,
                 use_planner=False,
+                user_request=_prd_agent_safety_request(
+                    str(preflight.get("project_root") or ".")
+                ),
+                required_tool_prefix=(
+                    "edit_file"
+                    if focused_source_files
+                    else "write_file"
+                    if semantic_behavior_failure
+                    else ""
+                ),
+                hydrate_history=False,
+                verify_changes=False,
             )
         except Exception as exc:
             latest_status = "failed"
@@ -9643,6 +12471,49 @@ async def _repair_failed_prd_milestone(
                 )
             break
         repair_changed = list(getattr(result, "changed_files", ()) or ())
+        invalid_after = set(_invalid_expected_architecture_files(preflight, workspace))
+        wrong_entrypoints = _unexpected_prd_entrypoint_changes(preflight, repair_changed, workspace)
+        # Compare parsed contents, not raw strings: a repair that satisfied one
+        # of two missing fields used to read as a new error and get rolled back,
+        # discarding real progress (observed live 2026-08-02, run 8).
+        introduced_invalid = sorted(
+            set(_prd_repair_regressions(invalid_before, invalid_after)) | set(wrong_entrypoints)
+        )
+        if introduced_invalid:
+            transaction_ids = _prd_transactions_since(
+                workspace, repair_transaction_baseline
+            )
+            for transaction_id in reversed(transaction_ids):
+                ok, message = rollback_transaction(workspace, transaction_id)
+                if ledger:
+                    ledger.log_rollback(transaction_id, ok, message)
+            latest_status = "failed"
+            rejected = (
+                "Repair introduced architecture regressions and was rolled back: "
+                + ", ".join(introduced_invalid)
+            )
+            latest_verification = {
+                **latest_verification,
+                "status": "failed",
+                "verified": False,
+                "summary": str(latest_verification.get("summary") or "Verification failed.")
+                + "\nRejected repair attempt: "
+                + rejected,
+            }
+            state = record_milestone_repair(
+                root,
+                state,
+                milestone_id,
+                attempt=attempt,
+                phase="finished",
+                status=latest_status,
+                changed_files=[],
+                verification=latest_verification,
+                message=latest_verification["summary"],
+            )
+            if attempt < budget:
+                continue
+            break
         all_changed = list(dict.fromkeys([*all_changed, *repair_changed]))
         if getattr(result, "awaiting_user", False):
             latest_status = "blocked"
@@ -9672,12 +12543,18 @@ async def _repair_failed_prd_milestone(
                     verification_status=latest_verification.get("status"),
                 )
             break
-        if getattr(result, "stopped", False):
+        if getattr(result, "stopped", False) and not repair_changed:
             latest_status = "failed"
-            latest_verification = _milestone_verification_payload(
-                "failed",
-                files=all_changed,
-                summary=getattr(result, "final", "") or "Milestone repair stopped before completion.",
+            unresolved_commands = _prd_unrecovered_command_failures(
+                workspace, repair_tool_baseline
+            )
+            if unresolved_commands:
+                latest_verification = _prd_command_failure_verification(unresolved_commands)
+            stall_message = (
+                str(latest_verification.get("summary") or "")
+                if unresolved_commands
+                else getattr(result, "final", "")
+                or "Milestone repair stopped before completion."
             )
             state = record_milestone_repair(
                 root,
@@ -9688,7 +12565,7 @@ async def _repair_failed_prd_milestone(
                 status=latest_status,
                 changed_files=repair_changed,
                 verification=latest_verification,
-                message=latest_verification["summary"],
+                message=stall_message,
             )
             if ledger:
                 ledger.log_event(
@@ -9699,16 +12576,25 @@ async def _repair_failed_prd_milestone(
                     changed_files=repair_changed,
                     verification_status=latest_verification.get("status"),
                 )
+            if attempt < budget:
+                continue
             break
 
-        latest_status, latest_verification = await _verify_prd_milestone(
-            milestone_id,
-            preflight,
-            all_changed,
-            workspace,
-            console,
-            session_logger,
+        unresolved_commands = _prd_unrecovered_command_failures(
+            workspace, repair_tool_baseline
         )
+        if unresolved_commands:
+            latest_status = "failed"
+            latest_verification = _prd_command_failure_verification(unresolved_commands)
+        else:
+            latest_status, latest_verification = await _verify_prd_milestone(
+                milestone_id,
+                preflight,
+                all_changed,
+                workspace,
+                console,
+                session_logger,
+            )
         state = record_milestone_repair(
             root,
             state,
@@ -9740,6 +12626,9 @@ def _prd_milestone_repair_write_scope(
     changed_files: list[str],
     workspace: Path,
 ) -> tuple[str, ...]:
+    project_root = str(preflight.get("project_root") or "")
+    if project_root:
+        return (project_root,)
     expected = _preflight_expected_files(preflight)
     scope = _workspace_relative_paths([*expected, *changed_files], workspace)
     return tuple(scope)
@@ -9758,13 +12647,17 @@ def _build_prd_milestone_repair_request(
     attempt: int,
     budget: int,
 ) -> str:
+    recovery_guidance = _prd_verifier_recovery_guidance(verification, preflight)
     verifier_lines = [
         f"- status: {verification.get('status') or 'failed'}",
         f"- command: {verification.get('command') or 'not available'}",
+        f"- working_directory: {verification.get('cwd') or '.'}",
         f"- exit_code: {verification.get('exit_code')}",
         f"- files: {', '.join(verification.get('files') or []) or 'none'}",
         f"- summary: {verification.get('summary') or 'Verification failed.'}",
     ]
+    if recovery_guidance:
+        verifier_lines.append(f"- required_recovery: {recovery_guidance}")
     changed = ", ".join(changed_files) if changed_files else "none recorded yet"
     return (
         f"Repair PRD milestone {milestone_index}/{milestone_count}: {milestones[milestone_index - 1]}\n"
@@ -9772,12 +12665,10 @@ def _build_prd_milestone_repair_request(
         "The milestone verifier failed. Fix the current milestone only, preserve every completed "
         "milestone, and do not ask the user unless a real blocker prevents progress.\n\n"
         f"## Project\n{title}\n\n"
-        f"## PRD source\n{relative_path.as_posix()}\n\n"
+        f"## PRD source reference\n{relative_path.as_posix()} (already extracted by the harness)\n\n"
         f"## PRD brief\n{prd_brief}\n\n"
         f"{render_preflight_context(preflight)}\n\n"
-        "## Failed verifier\n"
-        + "\n".join(verifier_lines)
-        + "\n\n"
+        "## Failed verifier\n" + "\n".join(verifier_lines) + "\n\n"
         f"Changed files so far: {changed}\n\n"
         "Read the implicated files before editing. Make the smallest complete fix that satisfies "
         "the milestone requirements, then run the verifier or the closest focused check before "
@@ -9785,11 +12676,650 @@ def _build_prd_milestone_repair_request(
     )
 
 
+def _prd_verifier_recovery_guidance(
+    verification: dict[str, Any],
+    preflight: dict[str, Any] | None = None,
+) -> str:
+    """Translate deterministic verifier failures into exact safe recovery actions."""
+    command = str(verification.get("command") or "")
+    cwd = str(verification.get("cwd") or ".")
+    summary = str(verification.get("summary") or "")
+    if summary.startswith("Requirement evidence validation failed:"):
+        kinds = {
+            str(item.get("kind") or "").lower()
+            for item in (preflight or {}).get("requirements") or []
+            if isinstance(item, dict)
+        }
+        expected = _preflight_expected_files(preflight or {})
+        models = [path for path in expected if path.replace("\\", "/").endswith("/models.py")]
+        urls = [path for path in expected if path.replace("\\", "/").endswith("/urls.py")]
+        targets: list[str] = []
+        if "role" in kinds:
+            targets.extend(models[:1])
+        if kinds & {"auth", "authorization"}:
+            app_root = Path(models[0]).parent.as_posix() if models else "backend/core"
+            targets.extend(
+                [
+                    f"{app_root}/views.py",
+                    f"{app_root}/urls.py",
+                    f"{app_root}/tests/__init__.py",
+                    f"{app_root}/tests/test_auth.py",
+                    *urls[:1],
+                ]
+            )
+        return (
+            "This is a semantic requirement failure, not a migration failure. Do not rerun "
+            "makemigrations until source behavior changes. Read and edit the smallest relevant "
+            "targets, then add focused tests: "
+            + ", ".join(dict.fromkeys(targets))
+            + ". Fix every listed evidence error before running Django tests."
+        )
+    if "manage.py makemigrations --check --dry-run" in command:
+        guidance = (
+            f"From `{cwd}`, call run_command with `python manage.py makemigrations` to generate "
+            "the missing migration files. Do not edit settings to suppress migration warnings; "
+            "then rerun `python manage.py makemigrations --check --dry-run`."
+        )
+        required = {
+            entity.lower(): set(fields)
+            for entity, fields in _prd_required_entity_fields(preflight or {})
+        }
+        additions = re.findall(
+            r"Add field\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s+to\s+(?P<entity>[A-Za-z_][A-Za-z0-9_]*)",
+            summary,
+            re.IGNORECASE,
+        )
+        unexpected = [
+            f"{entity}.{field}"
+            for field, entity in additions
+            if entity.lower() in required and field not in required[entity.lower()]
+        ]
+        expected_new = [
+            f"{entity}.{field}"
+            for field, entity in additions
+            if entity.lower() in required and field in required[entity.lower()]
+        ]
+        if unexpected:
+            guidance += (
+                " Remove these out-of-contract model fields instead of migrating them: "
+                + ", ".join(unexpected)
+                + "."
+            )
+        if expected_new:
+            guidance += (
+                " Required new fields must use a migration-safe deterministic default or an "
+                "appropriate nullable/blank declaration so makemigrations never asks for input: "
+                + ", ".join(expected_new)
+                + "."
+            )
+        return guidance
+    return ""
+
+
+def _prd_migration_source_repair_files(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    """Focus migration repair on models when Django proposes out-of-contract fields."""
+    if "manage.py makemigrations --check --dry-run" not in str(
+        verification.get("command") or ""
+    ):
+        return []
+    if not _prd_migration_source_edit_recipes(verification, preflight, workspace):
+        return []
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    return [path for path in expected if path.lower().replace("\\", "/").endswith("/models.py")]
+
+
+def _prd_semantic_source_repair_files(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    if not _prd_semantic_source_edit_recipes(verification, preflight, workspace):
+        return []
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    return [path for path in expected if path.lower().replace("\\", "/").endswith("/models.py")]
+
+
+def _prd_runtime_exception_diagnostic(
+    verification: dict[str, Any],
+    workspace: Path,
+) -> tuple[str, int, str, str] | None:
+    """Recover ``(relative_path, line, exception_type, message)`` from a failed
+    verifier's traceback text.
+
+    The verifier summary is often front-truncated, so the ``Traceback (most
+    recent call last):`` header the standard parser anchors on may be gone.
+    That anchor exists to stop arbitrary log lines being read as exceptions;
+    here the text is already known to be a FAILED command's output, so the
+    last workspace frame plus the final exception line are trustworthy.
+    """
+    from shamsu.diagnostics.parsers.python_fallback import (
+        FINAL_EXCEPTION_RE,
+        FRAME_RE,
+        VENDOR_MARKERS,
+    )
+
+    summary = str(verification.get("summary") or "")
+    if not summary.strip():
+        return None
+    frame: tuple[str, int] | None = None
+    exception: tuple[str, str] | None = None
+    for raw_line in summary.splitlines():
+        frame_match = FRAME_RE.match(raw_line)
+        if frame_match:
+            path = frame_match.group("file")
+            normalized = path.replace("\\", "/")
+            if any(marker.replace("\\", "/") in normalized for marker in VENDOR_MARKERS):
+                continue
+            relatives = _workspace_relative_paths([path], workspace)
+            if relatives and (workspace / relatives[0]).is_file():
+                frame = (relatives[0], int(frame_match.group("line")))
+            continue
+        exception_match = FINAL_EXCEPTION_RE.match(raw_line.strip())
+        if exception_match:
+            exception = (
+                exception_match.group("etype"),
+                exception_match.group("message").strip(),
+            )
+    if frame is None or exception is None:
+        return None
+    return frame[0], frame[1], exception[0], exception[1]
+
+
+_DJANGO_CHECK_ERROR_RE = re.compile(
+    r"^\s*(?P<app>[A-Za-z_]\w*)\.(?P<model>[A-Za-z_]\w*)(?:\.(?P<field>[A-Za-z_]\w*))?:\s*"
+    r"\((?P<code>[a-z_]+\.[EW]\d{3})\)\s*(?P<message>.+?)\s*$"
+)
+
+
+def _prd_django_check_diagnostic(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> tuple[str, list[str]] | None:
+    """Recover ``(models_path, errors)`` from a Django ``manage.py check`` failure.
+
+    Django reports these as ``core.Grade.graded_by: (fields.E300) ...`` - no
+    file, no line, so the traceback parser skips them entirely and the repair
+    turn got no root cause and no forced edit. That is exactly how run 11 died
+    with a fully machine-readable error in hand ("no structured diagnostics
+    were extracted").
+    """
+    summary = str(verification.get("summary") or "")
+    if not summary.strip():
+        return None
+    found: dict[str, list[str]] = {}
+    for line in summary.splitlines():
+        match = _DJANGO_CHECK_ERROR_RE.match(line)
+        if not match:
+            continue
+        # Errors only - a (fields.W042) warning does not fail the check.
+        if ".E" not in match.group("code"):
+            continue
+        app = match.group("app")
+        detail = (
+            f"{match.group('model')}"
+            + (f".{match.group('field')}" if match.group("field") else "")
+            + f" ({match.group('code')}): {match.group('message')}"
+        )
+        found.setdefault(app, []).append(detail)
+    if not found:
+        return None
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    for app, errors in found.items():
+        for path in expected:
+            parts = Path(path).parts
+            if len(parts) >= 2 and parts[-1] == "models.py" and parts[-2] == app:
+                if (workspace / path).is_file():
+                    return path, sorted(dict.fromkeys(errors))
+    return None
+
+
+def _prd_django_check_repair_files(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    diagnostic = _prd_django_check_diagnostic(verification, preflight, workspace)
+    return [diagnostic[0]] if diagnostic else []
+
+
+def _prd_django_check_edit_guidance(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> str:
+    """Turn Django's own check errors into an exact, editable instruction."""
+    diagnostic = _prd_django_check_diagnostic(verification, preflight, workspace)
+    if diagnostic is None:
+        return ""
+    path, errors = diagnostic
+    lines = [
+        "## Harness-parsed Django check errors",
+        f"- file: {path}",
+        *(f"- {error}" for error in errors),
+        "",
+        "These are model definition errors in the file above, not missing files. Do NOT "
+        "rewrite the file and do NOT reprint it - a full reprint gets truncated. Your "
+        "FIRST response must call edit_file on that exact path with the smallest unique "
+        "old_string that anchors each broken field.",
+    ]
+    if any("E300" in error or "E307" in error for error in errors):
+        lines.append(
+            "A relation points at a model that does not exist. Point it at a model that "
+            "IS defined in this file - if the missing name is a role (Student, Teacher, "
+            "Instructor), the correct target is the User model, which carries a role field."
+        )
+    return "\n".join(lines)
+
+
+def _prd_runtime_exception_repair_files(
+    verification: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    """Scope repair to the one source file a runtime exception points at."""
+    diagnostic = _prd_runtime_exception_diagnostic(verification, workspace)
+    return [diagnostic[0]] if diagnostic else []
+
+
+def _prd_runtime_exception_edit_guidance(
+    verification: dict[str, Any],
+    workspace: Path,
+) -> str:
+    """Hand the model the exact defect and force a minimal edit.
+
+    Live 2026-08-01: given only a raw traceback, a 7B model answered a
+    one-line NameError by reprinting all 60 lines of settings.py - which the
+    response limit truncated, losing code and producing no usable mutation. The
+    parsed root cause plus an explicit "edit, do not reprint" instruction is
+    what turns that into a single applicable edit.
+    """
+    diagnostic = _prd_runtime_exception_diagnostic(verification, workspace)
+    if diagnostic is None:
+        return ""
+    path, line, code, message = diagnostic
+    lines = [
+        "## Harness-parsed root cause",
+        f"- file: {path}",
+        f"- line: {line}",
+        f"- error: {code}: {message}",
+        "",
+        "This is a single runtime defect in an existing file, not a missing file. Do NOT "
+        "rewrite the file and do NOT reprint it in a code fence - a full reprint gets "
+        "truncated and loses code. Your FIRST response must call edit_file on the exact "
+        "path above, with the smallest unique old_string that anchors the defect and a "
+        "new_string that fixes it. Leave every other line unchanged.",
+    ]
+    undefined = re.search(r"name '([^']+)' is not defined", message)
+    if code == "NameError" and undefined:
+        symbol = undefined.group(1)
+        lines.append(
+            f"`{symbol}` is used but never defined. Define it ABOVE its first use: anchor "
+            f"old_string on the existing line that uses `{symbol}` (or the import block at "
+            f"the top) and put the definition plus that same line in new_string."
+        )
+    return "\n".join(lines)
+
+
+def _prd_semantic_repair_source_context(
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> str:
+    """Give a small model exact behavior-file evidence before forcing its first write."""
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    model_paths = [path for path in expected if path.replace("\\", "/").endswith("/models.py")]
+    root_paths = _workspace_relative_paths(
+        [str(preflight.get("project_root") or ".")], workspace
+    )
+    root = workspace / (root_paths[0] if root_paths else ".")
+    candidates: list[str] = []
+    for models_path in model_paths[:1]:
+        app_root = Path(models_path).parent.as_posix()
+        candidates.extend(
+            [
+                models_path,
+                    f"{app_root}/views.py",
+                    f"{app_root}/urls.py",
+                    f"{app_root}/tests/__init__.py",
+                    f"{app_root}/tests/test_auth.py",
+            ]
+        )
+    candidates.extend(
+        path for path in expected if path.replace("\\", "/").endswith("/config/urls.py")
+    )
+    if root.is_dir():
+        for path in root.rglob("test*.py"):
+            if any(part in {".venv", "node_modules", "__pycache__"} for part in path.parts):
+                continue
+            try:
+                candidates.append(path.relative_to(workspace).as_posix())
+            except ValueError:
+                continue
+    sections = [
+        "## Harness-provided semantic repair files",
+        "Do not list or search the project. The current source evidence is below. Your FIRST "
+        "response must call write_file for one implicated behavior file with its complete "
+        "corrected content; do not run a command first. Then wire routes, add focused tests, "
+        "and run `python manage.py test` only after all required writes succeed.",
+    ]
+    for relative in list(dict.fromkeys(candidates))[:8]:
+        target = workspace / relative
+        if not target.is_file():
+            sections.append(f"\n### {relative}\n<MISSING - create this file if required>")
+            continue
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            sections.append(f"\n### {relative}\n<UNREADABLE>")
+            continue
+        if len(content) > 5000:
+            content = content[:5000] + "\n... [truncated by harness]"
+        sections.append(f"\n### {relative}\n```\n{content.rstrip()}\n```")
+    return "\n".join(sections)
+
+
+def _prd_semantic_source_edit_guidance(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> str:
+    recipes = _prd_semantic_source_edit_recipes(verification, preflight, workspace)
+    if not recipes:
+        return ""
+    return (
+        "Deterministic semantic-source repair: your next responses must call these edit_file "
+        "tools in order without changing their arguments. Do not run framework commands until "
+        "every edit succeeds:\n" + "\n".join(json.dumps(recipe) for recipe in recipes)
+    )
+
+
+def _prd_semantic_source_edit_recipes(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[dict[str, Any]]:
+    summary = str(verification.get("summary") or "")
+    marker = "roles have no executable source declarations:"
+    if marker not in summary:
+        return []
+    required_roles = [
+        role.strip().lower()
+        for role in summary.split(marker, 1)[1].split(";", 1)[0].split(",")
+        if role.strip()
+    ]
+    if not required_roles:
+        return []
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    model_paths = [
+        path for path in expected if path.lower().replace("\\", "/").endswith("/models.py")
+    ]
+    recipes: list[dict[str, Any]] = []
+    for path in model_paths:
+        target = workspace / path
+        try:
+            content = target.read_text(encoding="utf-8")
+            module = ast.parse(content)
+        except (OSError, SyntaxError):
+            continue
+        lines = content.splitlines(keepends=True)
+        user_class = next(
+            (
+                node
+                for node in module.body
+                if isinstance(node, ast.ClassDef) and node.name.lower() == "user"
+            ),
+            None,
+        )
+        if user_class is None:
+            continue
+        assignment = next(
+            (
+                node
+                for node in user_class.body
+                if isinstance(node, ast.Assign)
+                and any(isinstance(item, ast.Name) and item.id == "role" for item in node.targets)
+                and isinstance(node.value, ast.Call)
+            ),
+            None,
+        )
+        if assignment is None:
+            continue
+        start = assignment.lineno - 1
+        end = int(getattr(assignment, "end_lineno", assignment.lineno))
+        field_string = "".join(lines[start:end])
+        stripped = field_string.rstrip("\r\n")
+        ending = field_string[len(stripped) :]
+        choices_keyword = next(
+            (keyword for keyword in assignment.value.keywords if keyword.arg == "choices"),
+            None,
+        )
+        existing_roles: list[str] = []
+        if choices_keyword is not None:
+            if not isinstance(choices_keyword.value, (ast.List, ast.Tuple)):
+                continue
+            for item in choices_keyword.value.elts:
+                if not isinstance(item, (ast.List, ast.Tuple)) or not item.elts:
+                    continue
+                value = item.elts[0]
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    existing_roles.append(value.value.lower())
+        all_roles = list(dict.fromkeys([*existing_roles, *required_roles]))
+        choices = "[" + ", ".join(
+            f"('{role}', '{role.title()}')" for role in all_roles
+        ) + "]"
+        if choices_keyword is None:
+            replacement = re.sub(r"\)\s*$", f", choices={choices})", stripped) + ending
+        else:
+            old_choices = ast.get_source_segment(content, choices_keyword.value)
+            if not old_choices:
+                continue
+            replacement = stripped.replace(old_choices, choices, 1) + ending
+        context_start = user_class.lineno - 1
+        recipes.append(
+            {
+                "name": "edit_file",
+                "arguments": {
+                    "filepath": path,
+                    "old_string": "".join(lines[context_start:end]),
+                    "new_string": "".join(lines[context_start:start]) + replacement,
+                },
+            }
+        )
+    return recipes
+
+
+def _prd_migration_source_edit_guidance(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> str:
+    recipes = _prd_migration_source_edit_recipes(verification, preflight, workspace)
+    if not recipes:
+        return ""
+    return (
+        "Deterministic migration-source repair: your next responses must call these edit_file "
+        "tools in order without changing their arguments. Do not run makemigrations until every "
+        "edit succeeds:\n" + "\n".join(json.dumps(recipe) for recipe in recipes)
+    )
+
+
+def _prd_migration_source_edit_recipes(
+    verification: dict[str, Any],
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[dict[str, Any]]:
+    required = {
+        entity.lower(): set(fields)
+        for entity, fields in _prd_required_entity_fields(preflight)
+    }
+    additions = re.findall(
+        r"Add field\s+(?P<field>[A-Za-z_][A-Za-z0-9_]*)\s+to\s+(?P<entity>[A-Za-z_][A-Za-z0-9_]*)",
+        str(verification.get("summary") or ""),
+        re.IGNORECASE,
+    )
+    if not additions:
+        return []
+    expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    model_paths = [
+        path for path in expected if path.lower().replace("\\", "/").endswith("/models.py")
+    ]
+    recipes: list[dict[str, Any]] = []
+    for path in model_paths:
+        target = workspace / path
+        try:
+            content = target.read_text(encoding="utf-8")
+            module = ast.parse(content)
+        except (OSError, SyntaxError):
+            continue
+        lines = content.splitlines(keepends=True)
+        classes = {
+            node.name.lower(): node for node in module.body if isinstance(node, ast.ClassDef)
+        }
+        for field, entity in additions:
+            class_node = classes.get(entity.lower())
+            if class_node is None:
+                continue
+            assignment = next(
+                (
+                    node
+                    for node in class_node.body
+                    if isinstance(node, ast.Assign)
+                    and any(isinstance(item, ast.Name) and item.id == field for item in node.targets)
+                ),
+                None,
+            )
+            if assignment is None or not getattr(assignment, "lineno", None):
+                continue
+            start = int(assignment.lineno) - 1
+            end = int(getattr(assignment, "end_lineno", assignment.lineno))
+            field_string = "".join(lines[start:end])
+            if field not in required.get(entity.lower(), set()):
+                replacement = ""
+            else:
+                value = assignment.value
+                if not isinstance(value, ast.Call):
+                    continue
+                keywords = {item.arg for item in value.keywords if item.arg}
+                if keywords & {"default", "null"}:
+                    continue
+                call_name = value.func.attr if isinstance(value.func, ast.Attribute) else ""
+                default = "''" if call_name in {"CharField", "TextField", "EmailField"} else None
+                if default is None:
+                    continue
+                stripped = field_string.rstrip("\r\n")
+                ending = field_string[len(stripped) :]
+                replacement = re.sub(
+                    r"\)\s*$", f", default={default})", stripped
+                ) + ending
+            context_start = int(class_node.lineno) - 1
+            old_string = "".join(lines[context_start:end])
+            new_string = "".join(lines[context_start:start]) + replacement
+            recipes.append(
+                {
+                    "name": "edit_file",
+                    "arguments": {
+                        "filepath": path,
+                        "old_string": old_string,
+                        "new_string": new_string,
+                    },
+                }
+            )
+    return recipes
+
+
 def _prd_transaction_snapshot(workspace: Path) -> set[str]:
     try:
         return set(TransactionWorkspace(workspace).list_transaction_ids())
     except Exception:
         return set()
+
+
+def _prd_tool_snapshot(workspace: Path) -> int:
+    ledger = get_current_run()
+    if ledger is None:
+        return 0
+    return len(action_ledger_store.load_tool_calls(workspace, ledger.run_id))
+
+
+def _prd_unrecovered_command_failures(
+    workspace: Path,
+    before_tools: int,
+) -> list[dict[str, Any]]:
+    """Return commands whose latest milestone-local result still failed."""
+    ledger = get_current_run()
+    if ledger is None:
+        return []
+    records = action_ledger_store.load_tool_calls(workspace, ledger.run_id)[before_tools:]
+    return _prd_unrecovered_command_failures_from_records(records)
+
+
+def _prd_unrecovered_command_failures_from_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return latest command failures that were not made stale by a later edit."""
+    arguments = {
+        str(record.get("tool_call_id") or ""): record.get("arguments") or {}
+        for record in records
+        if record.get("phase") == "called"
+    }
+    latest: dict[str, tuple[int, dict[str, Any]]] = {}
+    order: list[str] = []
+    latest_mutation_index = -1
+    for index, record in enumerate(records):
+        if (
+            record.get("phase") == "finished"
+            and bool(record.get("ok"))
+            and record.get("tool") in {"edit_file", "write_file", "append_file", "apply_patch"}
+        ):
+            latest_mutation_index = index
+        if record.get("tool") != "run_command" or record.get("phase") != "finished":
+            continue
+        call_args = arguments.get(str(record.get("tool_call_id") or ""), {})
+        command = str(call_args.get("command") or "").strip()
+        if not command:
+            continue
+        if command not in latest:
+            order.append(command)
+        latest[command] = (index, record)
+    return [
+        record
+        for command in order
+        for index, record in [latest[command]]
+        if not bool(record.get("ok")) and index > latest_mutation_index
+    ]
+
+
+def _prd_command_failure_verification(
+    failures: list[dict[str, Any]],
+) -> dict[str, Any]:
+    primary = failures[0]
+    data = primary.get("data") if isinstance(primary.get("data"), dict) else {}
+    command = str(data.get("resolved_command") or "run_command")
+    outputs = [
+        ("stdout", str(data.get("stdout") or "").strip()),
+        ("stderr", str(data.get("stderr") or "").strip()),
+        ("diagnostics", str(data.get("diagnostics") or "").strip()),
+    ]
+    diagnostic = "\n".join(
+        f"{label}:\n{value}" for label, value in outputs if value
+    ).strip()[:2400]
+    if not diagnostic:
+        diagnostic = str(primary.get("message") or "").strip()[:2400]
+    summary = f"Milestone command failed and was not recovered: {command}."
+    if diagnostic:
+        summary += f"\n{diagnostic}"
+    if len(failures) > 1:
+        summary += f"\n{len(failures) - 1} additional command failure(s) remain."
+    return _milestone_verification_payload(
+        "failed",
+        files=[],
+        summary=summary,
+        exit_code=int(data.get("exit_code", 1) or 1),
+        command=command,
+    )
 
 
 def _prd_transactions_since(workspace: Path, before: set[str]) -> list[str]:
@@ -9861,20 +13391,14 @@ def _rollback_failed_prd_milestone(
     failed_transactions: list[dict[str, Any]] = []
     for transaction_id in reversed(transaction_ids):
         manifest = store.load_manifest(transaction_id) or {}
-        touched = [
-            str(path)
-            for path in list(manifest.get("touched_files") or [])
-            if str(path)
-        ]
+        touched = [str(path) for path in list(manifest.get("touched_files") or []) if str(path)]
         ok, message = rollback_transaction(workspace, transaction_id)
         if ledger:
             ledger.log_rollback(transaction_id, ok, message)
         if ok:
             restored_files.extend(touched)
         else:
-            failed_transactions.append(
-                {"transaction_id": transaction_id, "message": message}
-            )
+            failed_transactions.append({"transaction_id": transaction_id, "message": message})
 
     status = "rolled_back" if not failed_transactions else "rollback_failed"
     message = (
@@ -9944,11 +13468,127 @@ def _milestone_verifier_files(
     changed_files: list[str],
     workspace: Path,
 ) -> list[str]:
-    changed = _workspace_relative_paths(changed_files, workspace)
-    if changed:
-        return changed
     expected = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
-    return [path for path in expected if (workspace / path).is_file()]
+    existing = [path for path in expected if (workspace / path).is_file()]
+    changed = [
+        path
+        for path in _workspace_relative_paths(changed_files, workspace)
+        if (workspace / path).is_file()
+    ]
+    if existing or changed:
+        # Expected architecture goes first so a one-file resumed repair cannot
+        # redefine a nested project's verification root.
+        return list(dict.fromkeys([*existing, *changed]))
+    return _project_verifier_entry_files(preflight, workspace)
+
+
+def _unexpected_prd_entrypoint_changes(
+    preflight: dict[str, Any],
+    changed_files: list[str],
+    workspace: Path,
+) -> list[str]:
+    """Reject repair-created duplicate framework entry points at the wrong depth."""
+    expected = set(_workspace_relative_paths(_preflight_expected_files(preflight), workspace))
+    expected_manage = {path for path in expected if Path(path).name == "manage.py"}
+    if not expected_manage:
+        return []
+    changed = _workspace_relative_paths(changed_files, workspace)
+    return [
+        f"{path} (unexpected duplicate Django entry point; expected {sorted(expected_manage)[0]})"
+        for path in changed
+        if Path(path).name == "manage.py" and path not in expected_manage
+    ]
+
+
+def _project_verifier_entry_files(preflight: dict[str, Any], workspace: Path) -> list[str]:
+    root_text = str(preflight.get("project_root") or ".")
+    roots = _workspace_relative_paths([root_text], workspace)
+    root = workspace / (roots[0] if roots else ".")
+    if not root.is_dir():
+        return []
+    names = {
+        "package.json",
+        "pyproject.toml",
+        "requirements.txt",
+        "manage.py",
+        "Cargo.toml",
+        "go.mod",
+    }
+    found: list[str] = []
+    for path in root.rglob("*"):
+        if len(found) >= 32:
+            break
+        if not path.is_file() or path.name not in names:
+            continue
+        try:
+            relative = path.relative_to(workspace).as_posix()
+        except ValueError:
+            continue
+        if any(part in {"node_modules", ".venv", ".git"} for part in path.parts):
+            continue
+        found.append(relative)
+    return list(dict.fromkeys(found))
+
+
+def _prd_blocking_dependencies(
+    preflight: dict[str, Any],
+    failed: dict[str, str],
+    skipped: dict[str, str],
+) -> list[str]:
+    """Declared dependencies of this milestone that failed or were skipped.
+
+    Empty means the milestone can run: a failure elsewhere in the build must
+    not stop work that does not depend on it.
+    """
+    if not isinstance(preflight, dict):
+        return []
+    unavailable = {*failed, *skipped}
+    return [
+        str(dependency)
+        for dependency in preflight.get("dependencies") or []
+        if str(dependency) in unavailable
+    ]
+
+
+def _prd_build_completion_report(
+    milestones: list[str],
+    failed: dict[str, str],
+    skipped: dict[str, str],
+) -> str:
+    """Per-milestone outcome for the end of a build that had failures."""
+    lines = [
+        f"PRD build finished: {len(milestones) - len(failed) - len(skipped)}"
+        f"/{len(milestones)} milestone(s) completed."
+    ]
+    if failed:
+        lines.append("")
+        lines.append("Failed:")
+        lines.extend(f"- {name}: {reason}" for name, reason in failed.items())
+    if skipped:
+        lines.append("")
+        lines.append("Skipped (blocked by a failed dependency):")
+        lines.extend(f"- {name}: {reason}" for name, reason in skipped.items())
+    return "\n".join(lines)
+
+
+def _prd_milestone_is_mandatory(preflight: dict[str, Any]) -> bool:
+    return any(
+        str(item.get("scope") or "in") == "in"
+        and str(item.get("priority") or "must") == "must"
+        for item in preflight.get("requirements") or []
+        if isinstance(item, dict)
+    )
+
+
+def _prd_milestone_requires_mutation(preflight: dict[str, Any]) -> bool:
+    non_mutating_kinds = {"acceptance", "test", "out_of_scope"}
+    return any(
+        str(item.get("scope") or "in") == "in"
+        and str(item.get("priority") or "must") == "must"
+        and str(item.get("kind") or "") not in non_mutating_kinds
+        for item in preflight.get("requirements") or []
+        if isinstance(item, dict)
+    )
 
 
 def _preflight_expected_files(preflight: dict[str, Any]) -> list[str]:
@@ -9966,6 +13606,264 @@ def _missing_expected_files(expected_files: list[str], workspace: Path) -> list[
     ]
 
 
+def _invalid_expected_architecture_files(
+    preflight: dict[str, Any],
+    workspace: Path,
+) -> list[str]:
+    """Reject files that exist only to make framework commands exit zero."""
+    invalid: list[str] = []
+    entity_milestone = any(
+        isinstance(item, dict) and str(item.get("kind") or "") == "entity"
+        for item in preflight.get("requirements") or []
+    )
+    expected_paths = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    settings_modules = {
+        ".".join(Path(path).with_suffix("").parts[-2:])
+        for path in expected_paths
+        if path.lower().replace("\\", "/").endswith("/settings.py")
+    }
+    url_modules = {
+        ".".join(Path(path).with_suffix("").parts[-2:])
+        for path in expected_paths
+        if path.lower().replace("\\", "/").endswith("/urls.py")
+    }
+    app_modules = {
+        Path(path).parent.name
+        for path in expected_paths
+        if path.lower().replace("\\", "/").endswith("/apps.py")
+    }
+    custom_user_models = _django_custom_user_models(preflight, workspace)
+    app_init_paths = {
+        (Path(path).parent / "__init__.py").as_posix()
+        for path in expected_paths
+        if path.lower().replace("\\", "/").endswith("/apps.py")
+    }
+    for relative in expected_paths:
+        target = workspace / relative
+        if not target.is_file():
+            continue
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            invalid.append(f"{relative} (unreadable)")
+            continue
+        stripped = content.strip()
+        if target.name == "__init__.py":
+            if relative in app_init_paths and re.search(
+                r"(?m)^\s*(?:from\s+\.models\s+import|from\s+\.\s+import\s+models|import\s+.*\bmodels\b)",
+                content,
+            ):
+                invalid.append(f"{relative} (imports Django models during app loading)")
+            continue
+        if not stripped:
+            invalid.append(f"{relative} (empty)")
+            continue
+        posix = relative.lower().replace("\\", "/")
+        if target.suffix.lower() == ".py":
+            try:
+                module = ast.parse(content)
+            except SyntaxError:
+                invalid.append(f"{relative} (invalid Python)")
+                continue
+            if not module.body:
+                invalid.append(f"{relative} (no executable declarations)")
+                continue
+        if posix.endswith("/manage.py"):
+            if "execute_from_command_line" not in content:
+                invalid.append(f"{relative} (not a Django entry point)")
+            elif settings_modules:
+                module_match = re.search(
+                    r"DJANGO_SETTINGS_MODULE['\"]\s*,\s*['\"](?P<module>[^'\"]+)['\"]",
+                    content,
+                )
+                if not module_match or module_match.group("module") not in settings_modules:
+                    invalid.append(f"{relative} (wrong Django settings module)")
+        elif posix.endswith("/settings.py"):
+            settings_errors: list[str] = []
+            if not all(
+                token in content for token in ("INSTALLED_APPS", "DATABASES", "SECRET_KEY")
+            ):
+                settings_errors.append("incomplete Django settings")
+            if url_modules:
+                root_match = re.search(
+                    r"ROOT_URLCONF\s*=\s*['\"](?P<module>[^'\"]+)['\"]",
+                    content,
+                )
+                if not root_match or root_match.group("module") not in url_modules:
+                    settings_errors.append("wrong ROOT_URLCONF module")
+            if app_modules and not all(
+                re.search(rf"['\"]{re.escape(module)}(?:\.apps\.[A-Za-z0-9_]+)?['\"]", content)
+                for module in app_modules
+            ):
+                settings_errors.append("required Django app is not installed")
+            if custom_user_models:
+                auth_match = re.search(
+                    r"AUTH_USER_MODEL\s*=\s*['\"](?P<model>[^'\"]+)['\"]",
+                    content,
+                )
+                if not auth_match or auth_match.group("model") not in custom_user_models:
+                    settings_errors.append("custom Django user model is not configured")
+            wsgi_match = re.search(
+                r"WSGI_APPLICATION\s*=\s*['\"](?P<module>[A-Za-z0-9_.]+)['\"]",
+                content,
+            )
+            if wsgi_match:
+                module = wsgi_match.group("module").removesuffix(".application")
+                project_root = target.parent.parent
+                module_path = project_root.joinpath(*module.split(".")).with_suffix(".py")
+                if not module_path.is_file():
+                    settings_errors.append("WSGI module does not exist")
+            if settings_errors:
+                invalid.append(f"{relative} ({'; '.join(settings_errors)})")
+        elif posix.endswith("/urls.py"):
+            url_errors: list[str] = []
+            if "urlpatterns" not in content:
+                url_errors.append("no URL patterns")
+            django_root = target.parent.parent
+            for included in re.findall(r"include\(\s*['\"](?P<module>[^'\"]+)['\"]", content):
+                module_base = django_root.joinpath(*included.split("."))
+                if not (
+                    module_base.with_suffix(".py").is_file()
+                    or (module_base / "__init__.py").is_file()
+                ):
+                    url_errors.append(f"included URL module {included} does not exist")
+            if url_errors:
+                invalid.append(f"{relative} ({'; '.join(url_errors)})")
+        elif posix.endswith("/apps.py") and "AppConfig" not in content:
+            invalid.append(f"{relative} (no Django app config)")
+        elif entity_milestone and posix.endswith("/models.py") and not (
+            "class " in content and ("models.Model" in content or "AbstractUser" in content)
+        ):
+            invalid.append(f"{relative} (no persisted model declarations)")
+        elif entity_milestone and posix.endswith("/models.py"):
+            model_errors = _django_model_structure_errors(content)
+            missing_entities = _missing_django_entity_requirements(content, preflight)
+            if missing_entities:
+                model_errors.append(
+                    "missing required entities or fields: " + ", ".join(missing_entities)
+                )
+            if model_errors:
+                invalid.append(f"{relative} ({'; '.join(model_errors)})")
+        elif target.name == "package.json":
+            try:
+                package = json.loads(content)
+            except json.JSONDecodeError:
+                invalid.append(f"{relative} (invalid package JSON)")
+            else:
+                if not isinstance(package, dict) or not isinstance(package.get("scripts"), dict):
+                    invalid.append(f"{relative} (missing package scripts)")
+    return invalid
+
+
+def _django_custom_user_models(preflight: dict[str, Any], workspace: Path) -> list[str]:
+    """Discover custom Django user models declared by expected app model files."""
+    models: list[str] = []
+    expected_paths = _workspace_relative_paths(_preflight_expected_files(preflight), workspace)
+    for relative in expected_paths:
+        if not relative.lower().replace("\\", "/").endswith("/models.py"):
+            continue
+        target = workspace / relative
+        if not target.is_file():
+            continue
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        app_name = target.parent.name
+        for class_name in re.findall(
+            r"(?m)^class\s+(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*\([^\n]*(?:AbstractUser|AbstractBaseUser)[^\n]*\)\s*:",
+            content,
+        ):
+            models.append(f"{app_name}.{class_name}")
+    return list(dict.fromkeys(models))
+
+
+def _missing_django_entity_requirements(
+    content: str,
+    preflight: dict[str, Any],
+) -> list[str]:
+    """Return PRD entity classes/fields absent from a Django models module."""
+    required = _prd_required_entity_fields(preflight)
+    if not required:
+        return []
+    return _missing_django_entity_requirements_from_required(content, required)
+
+
+def _prd_required_entity_fields(preflight: dict[str, Any]) -> list[tuple[str, list[str]]]:
+    """Parse normalized ``Entity: fields ...`` requirement records."""
+    required: list[tuple[str, list[str]]] = []
+    for item in preflight.get("requirements") or []:
+        if not isinstance(item, dict) or str(item.get("kind") or "") != "entity":
+            continue
+        text = str(item.get("text") or "").strip()
+        match = re.match(
+            r"^(?P<entity>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*fields?\s+(?P<fields>.+)$",
+            text,
+            re.IGNORECASE,
+        )
+        if not match:
+            continue
+        fields = [
+            value.strip().split()[0]
+            for value in re.split(r"[,;]", match.group("fields"))
+            if value.strip()
+        ]
+        required.append((match.group("entity"), fields))
+    return required
+
+
+def _missing_django_entity_requirements_from_required(
+    content: str,
+    required: list[tuple[str, list[str]]],
+) -> list[str]:
+    try:
+        module = ast.parse(content)
+    except SyntaxError:
+        return [entity for entity, _fields in required]
+    declarations: dict[str, set[str]] = {}
+    for node in module.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        fields: set[str] = set()
+        for statement in node.body:
+            if isinstance(statement, ast.Assign):
+                fields.update(
+                    target.id for target in statement.targets if isinstance(target, ast.Name)
+                )
+            elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+                if isinstance(statement.target, ast.Name):
+                    fields.add(statement.target.id)
+        base_names = {
+            base.id if isinstance(base, ast.Name) else base.attr
+            for base in node.bases
+            if isinstance(base, (ast.Name, ast.Attribute))
+        }
+        if "AbstractUser" in base_names:
+            fields.update(
+                {
+                    "username",
+                    "first_name",
+                    "last_name",
+                    "email",
+                    "password",
+                    "is_staff",
+                    "is_active",
+                    "date_joined",
+                }
+            )
+        declarations[node.name.lower()] = fields
+    missing: list[str] = []
+    for entity, fields in required:
+        declared = declarations.get(entity.lower())
+        if declared is None:
+            missing.append(entity)
+            continue
+        absent = [field for field in fields if field not in declared]
+        if absent:
+            missing.append(f"{entity}." + "/".join(absent))
+    return missing
+
+
 def _workspace_relative_paths(paths: list[str], workspace: Path) -> list[str]:
     workspace = workspace.resolve()
     normalized: list[str] = []
@@ -9975,7 +13873,11 @@ def _workspace_relative_paths(paths: list[str], workspace: Path) -> list[str]:
             continue
         candidate = Path(text)
         try:
-            absolute = candidate.resolve() if candidate.is_absolute() else (workspace / candidate).resolve()
+            absolute = (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (workspace / candidate).resolve()
+            )
             relative = absolute.relative_to(workspace)
         except (OSError, ValueError):
             continue
@@ -10012,6 +13914,54 @@ def _milestone_stack_hint(preflight: dict[str, Any]) -> str:
     return " ".join(parts).lower()
 
 
+# Runners a milestone-declared verifier may start. Everything else stays a
+# descriptive hint, never an executed command - preflight text is
+# model-authored and has contained things like "rm -rf".
+_PRD_VERIFIER_RUNNER_RE = re.compile(
+    r"^(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet|java|mvn|gradle)\s+\S",
+    re.IGNORECASE,
+)
+_PRD_VERIFIER_FILE_TOKEN_RE = re.compile(r"^[\w][\w./\\-]*\.[A-Za-z0-9]{1,12}$")
+
+
+def _prd_milestone_acceptance_commands(
+    preflight: dict[str, Any], workspace: Path
+) -> list[str]:
+    """Promote the milestone's declared verifier into a real verification step.
+
+    The 2026-08-01 dogfood: milestones declared `python manage.py check`, but
+    the verifier string was only ever a stack HINT, so verification reported
+    "no deterministic verifier" while the declared one sat unused. Only a
+    single-line, allowlisted runner command qualifies, and any file it invokes
+    must already exist under the project root - early milestones run before
+    the framework entry point is generated, and failing them on a command that
+    cannot run yet would be a false verdict."""
+    raw = str(preflight.get("verifier") or "").strip().strip("`").strip()
+    if not raw or "\n" in raw or not _PRD_VERIFIER_RUNNER_RE.match(raw):
+        return []
+    if any(char in raw for char in (";", "&", "|", ">", "<", "$")):
+        return []
+    file_tokens = [
+        token for token in raw.split()[1:] if _PRD_VERIFIER_FILE_TOKEN_RE.match(token)
+    ]
+    if file_tokens:
+        roots = _workspace_relative_paths(
+            [str(preflight.get("project_root") or ".")], workspace
+        )
+        root = workspace / (roots[0] if roots else ".")
+        if not root.is_dir():
+            root = workspace
+        for token in file_tokens:
+            name = Path(token.replace("\\", "/")).name
+            found = any(
+                not any(part in {"node_modules", ".venv", ".git"} for part in path.parts)
+                for path in itertools.islice(root.rglob(name), 200)
+            )
+            if not found:
+                return []
+    return [raw]
+
+
 def _milestone_verification_payload(
     status: str,
     *,
@@ -10021,6 +13971,7 @@ def _milestone_verification_payload(
     unverifiable: bool = False,
     exit_code: int | None = None,
     command: str = "",
+    cwd: str = ".",
 ) -> dict[str, Any]:
     return {
         "status": status,
@@ -10028,6 +13979,7 @@ def _milestone_verification_payload(
         "unverifiable": unverifiable,
         "exit_code": exit_code,
         "command": command,
+        "cwd": cwd,
         "files": list(dict.fromkeys(files)),
         "summary": summary,
     }
@@ -10041,13 +13993,38 @@ def _log_prd_milestone_verification(
     if not ledger:
         return
     status = str(verification.get("status") or "unknown")
+    command = str(verification.get("command") or "")
+    files = list(verification.get("files") or [])
+    summary = str(verification.get("summary") or "")[:500]
+    verifier_id = f"prd_milestone:{milestone_id}"
     ledger.log_event(
         f"prd_milestone_verification_{status}",
         milestone_id=milestone_id,
-        command=verification.get("command") or "",
-        files=list(verification.get("files") or []),
+        command=command,
+        files=files,
         exit_code=verification.get("exit_code"),
-        summary=str(verification.get("summary") or "")[:500],
+        summary=summary,
+    )
+    if status not in {"verified", "failed"}:
+        return
+    ledger.log_verification_started(
+        command,
+        verifier_id=verifier_id,
+        source="prd_milestone",
+        required=True,
+        files=files,
+        milestone_id=milestone_id,
+    )
+    ledger.log_verification_result(
+        status == "verified",
+        summary,
+        command=command,
+        verifier_id=verifier_id,
+        source="prd_milestone",
+        required=True,
+        files=files,
+        exit_code=verification.get("exit_code"),
+        milestone_id=milestone_id,
     )
 
 
@@ -10075,9 +14052,7 @@ def _plan_single_request(task: str, plan_markdown: str) -> str:
     )
 
 
-def _plan_step_request(
-    task: str, steps: list[str], index: int, count: int
-) -> str:
+def _plan_step_request(task: str, steps: list[str], index: int, count: int) -> str:
     """Build a step's request from a compact progress checklist instead of
     re-dumping the whole plan markdown every step (G10). ``index`` is 1-based."""
     checklist = render_progress_checklist(steps, index - 1, header="Plan steps")
@@ -10196,7 +14171,11 @@ async def _run_qa(
         except Exception:
             streamed = False
         if streamed:
-            if _should_show_context_preview() and preview.prompt and _preview_contains_context(preview.prompt):
+            if (
+                _should_show_context_preview()
+                and preview.prompt
+                and _preview_contains_context(preview.prompt)
+            ):
                 console.print(Panel(preview.prompt, title="Context Preview"))
             return
     result = await Coordinator(llm=llm, qa_workflow=qa_workflow).handle(request)
@@ -10206,7 +14185,11 @@ async def _run_qa(
         _log_assistant_message(session_logger, result.answer, workflow_id="qa")
     elif result.fallback_reason:
         console.print(f"[yellow]{result.fallback_reason}[/yellow]")
-    if _should_show_context_preview() and result.preview and _preview_contains_context(result.preview):
+    if (
+        _should_show_context_preview()
+        and result.preview
+        and _preview_contains_context(result.preview)
+    ):
         console.print(Panel(result.preview, title="Context Preview"))
 
 
@@ -10349,6 +14332,7 @@ async def _run_composite_request(
     statuses: list[dict[str, object]] = []
     last_result: Any = None
     blocked = False
+    failed_step_id: int | None = None
     for step in plan.steps:
         if blocked:
             # An earlier step is waiting on the user; later steps depend on the
@@ -10357,10 +14341,24 @@ async def _run_composite_request(
             statuses.append(record)
             _record_composite_step(step, record, ledger, session_logger)
             continue
+        if failed_step_id is not None:
+            # A dependency FAILED. Running the dependents blind against the
+            # broken state produced cascading nonsense in the 2026-08-01
+            # dogfood; they are honestly not-run instead.
+            record = {
+                **step.to_dict(),
+                "status": "not_run",
+                "evidence": [f"blocked:dependency_failed:step_{failed_step_id}"],
+            }
+            statuses.append(record)
+            _record_composite_step(step, record, ledger, session_logger)
+            continue
 
         before_tools, before_events = _ledger_counts(workspace, ledger)
         step_output = ""
-        install_command = _package_install_command(step.instruction) if step.kind == "mutation" else ""
+        install_command = (
+            _package_install_command(step.instruction) if step.kind == "mutation" else ""
+        )
         deterministic_verify = (
             _composite_verification_command(plan, step)
             if step.kind == "verify" and _python_package_spec(plan.prompt)
@@ -10421,9 +14419,7 @@ async def _run_composite_request(
             step_output, _verify_ok = _execute_deterministic_composite_verification(
                 plan, step, workspace, console, session_logger, ledger
             )
-            step_tools, step_events = _ledger_delta(
-                workspace, ledger, before_tools, before_events
-            )
+            step_tools, step_events = _ledger_delta(workspace, ledger, before_tools, before_events)
         if step.kind == "verify" and not step_output:
             step_output = _composite_command_output(workspace, ledger, before_tools)
         if step.kind == "verify" and "run_command" in set(step_tools):
@@ -10444,6 +14440,8 @@ async def _run_composite_request(
         _record_composite_step(step, record, ledger, session_logger)
         if status == "needs_input" or bool(getattr(result, "awaiting_user", False)):
             blocked = True
+        elif status == "failed":
+            failed_step_id = step.id
 
     completed = [item for item in statuses if item["status"] == "success"]
     incomplete = [item for item in statuses if item["status"] != "success"]
@@ -10456,7 +14454,11 @@ async def _run_composite_request(
     else:
         composite_status = "failed"
     if ledger:
-        event_type = "composite_completed" if composite_status == "success" else f"composite_{composite_status}"
+        event_type = (
+            "composite_completed"
+            if composite_status == "success"
+            else f"composite_{composite_status}"
+        )
         ledger.log_event(event_type, steps=statuses)
     if composite_status != "needs_input":
         lines = []
@@ -10536,9 +14538,7 @@ def _execute_composite_git_inspection(
         console.print(Panel(Text(body), title="Git Follow-up"))
 
 
-def _composite_verification_command(
-    plan: OperationPlan, step: OperationStep
-) -> str:
+def _composite_verification_command(plan: OperationPlan, step: OperationStep) -> str:
     explicit = re.search(r"`([^`]+)`", step.instruction)
     if explicit and re.match(
         r"^(?:python3?|py|pytest|npm|npx|node|pnpm|yarn|cargo|go|dotnet)\b",
@@ -10561,10 +14561,7 @@ def _composite_verification_command(
     if package_spec and re.search(r"\bimport(?:s|ed|ing)?\b", instruction):
         module = re.split(r"[\[<>=!~]", package_spec, maxsplit=1)[0].replace("-", "_")
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", module):
-            script = (
-                f"import {module}, sys; "
-                f"print(sys.executable); print({module}.__file__)"
-            )
+            script = f"import {module}, sys; print(sys.executable); print({module}.__file__)"
             quoted_script = subprocess.list2cmdline([script])
             return f"python -c {quoted_script}"
     return ""
@@ -10727,6 +14724,8 @@ def _composite_step_outcome(
     awaiting_user = bool(getattr(result, "awaiting_user", False))
     evidence: list[str] = []
     matched = False
+    if "verification_failed" in event_types:
+        return "failed", ["event:verification_failed"]
     if step.kind == "mutation":
         file_mutation = bool(
             set(tool_leaves)
@@ -10736,11 +14735,8 @@ def _composite_step_outcome(
         matched = file_mutation or (package_install and "run_command" in tools)
         evidence = [f"changed:{path}" for path in changed_files]
     elif step.kind == "verify":
-        if "verification_failed" in event_types:
-            return "failed", ["event:verification_failed"]
-        matched = (
-            "verification_passed" in event_types
-            or any(_mcp_tool_provides_read_evidence(name) for name in successful_tools)
+        matched = "verification_passed" in event_types or any(
+            _mcp_tool_provides_read_evidence(name) for name in successful_tools
         )
         evidence = ["event:verification_passed"] if "verification_passed" in event_types else []
     elif step.kind == "git_inspect":
@@ -10808,6 +14804,7 @@ def _configure_agent_request_safety(
     workspace: Path | None = None,
     force_read_only: bool = False,
     allowed_write_paths: tuple[str, ...] | None = None,
+    allowed_read_paths: tuple[str, ...] | None = None,
 ) -> bool:
     """Apply permissions from the clean current request, never model context."""
     tools.set_user_request(safety_input)
@@ -10820,6 +14817,8 @@ def _configure_agent_request_safety(
             tools.set_allowed_write_paths(allowed)
     if allowed_write_paths:
         tools.set_allowed_write_paths(allowed_write_paths)
+    if allowed_read_paths:
+        tools.set_allowed_read_paths(allowed_read_paths)
     return request_is_read_only
 
 
@@ -10831,11 +14830,15 @@ async def _run_agent_chat(
     force_long_running: bool = False,
     auto_approve: bool = False,
     allowed_write_paths: tuple[str, ...] | None = None,
+    allowed_read_paths: tuple[str, ...] | None = None,
+    allowed_tools: tuple[str, ...] | None = None,
     use_long_term_memory: bool = True,
     use_planner: bool = True,
     user_request: str | None = None,
     force_read_only: bool = False,
     required_tool_prefix: str = "",
+    hydrate_history: bool = True,
+    verify_changes: bool = True,
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -10861,7 +14864,10 @@ async def _run_agent_chat(
         workspace=workspace,
         force_read_only=force_read_only,
         allowed_write_paths=allowed_write_paths,
+        allowed_read_paths=allowed_read_paths,
     )
+    if allowed_tools is not None:
+        tools.set_allowed_tools(allowed_tools)
     if required_tool_prefix:
         tools.require_tool_prefix(required_tool_prefix)
         user_input = (
@@ -10978,6 +14984,14 @@ async def _run_agent_chat(
         chat_kwargs["use_long_term_memory"] = use_long_term_memory
     if _call_accepts_keyword(AgentChatLoop, "use_planner"):
         chat_kwargs["use_planner"] = use_planner
+    if _call_accepts_keyword(AgentChatLoop, "hydrate_history"):
+        chat_kwargs["hydrate_history"] = hydrate_history
+    if _call_accepts_keyword(AgentChatLoop, "verify_changes"):
+        chat_kwargs["verify_changes"] = verify_changes
+    if _call_accepts_keyword(AgentChatLoop, "original_user_request"):
+        # A pending ask_user must resume from the clean user request, not an
+        # internal wrapper (composite step / PRD repair contract).
+        chat_kwargs["original_user_request"] = safety_input
     if _call_accepts_keyword(AgentChatLoop, "audit"):
         session_id = session_logger.session_id if session_logger is not None else None
         audit = SessionAuditLog(workspace, session_id)
@@ -11006,9 +15020,8 @@ async def _run_agent_chat(
     body = result.final.strip() or "No response returned."
     mcp_tools_used = _successful_mcp_tools(action_ledger, workspace)
     if mcp_tools_used and not all(name in body for name in mcp_tools_used):
-        body = (
-            f"{body}\n\nExternal MCP tool used: "
-            + ", ".join(f"`{name}`" for name in mcp_tools_used)
+        body = f"{body}\n\nExternal MCP tool used: " + ", ".join(
+            f"`{name}`" for name in mcp_tools_used
         )
         result = replace(result, final=body)
     if getattr(result, "awaiting_user", False):
@@ -11072,7 +15085,9 @@ def _agent_display_summary(body: str, activities: list[str]) -> str:
         lines.append("What changed:")
         lines.extend(f"- {item}" for item in actions[:6])
         lines.append("")
-    lines.append("Full generated code is in the edited files. Detailed raw output is kept in the session log.")
+    lines.append(
+        "Full generated code is in the edited files. Detailed raw output is kept in the session log."
+    )
     return "\n".join(lines).strip()
 
 
@@ -11127,22 +15142,22 @@ async def _run_web_assist(
             reason="SHAMSU thinks this request needs current or external information from the web.",
         )
         if ledger:
-            ok = bool(combined.approved and not combined.error and (combined.hits or combined.pages))
+            ok = bool(
+                combined.approved and not combined.error and (combined.hits or combined.pages)
+            )
             ledger.log_tool_result(
                 call_id,
                 "web_search",
                 ok,
-                combined.error or f"Found {len(combined.hits)} result(s) and fetched {len(combined.pages)} page(s).",
+                combined.error
+                or f"Found {len(combined.hits)} result(s) and fetched {len(combined.pages)} page(s).",
                 {
                     "query": combined.query,
                     "provider": combined.provider,
                     "fallback_used": combined.fallback_used,
                     "hit_count": len(combined.hits),
                     "page_count": len(combined.pages),
-                    "sources": [
-                        {"title": hit.title, "url": hit.url}
-                        for hit in combined.hits[:10]
-                    ],
+                    "sources": [{"title": hit.title, "url": hit.url} for hit in combined.hits[:10]],
                 },
             )
         if not combined.approved:
@@ -11184,7 +15199,9 @@ async def _run_web_assist(
             console.print(Panel(message, title="Web Search — No Results", border_style="yellow"))
             _log_assistant_message(session_logger, message, workflow_id="web")
             return
-        await _print_web_answer(user_input, combined, combined.pages, console, llm, session_logger=session_logger)
+        await _print_web_answer(
+            user_input, combined, combined.pages, console, llm, session_logger=session_logger
+        )
         return
 
     result = web_tool.search(
@@ -11241,7 +15258,9 @@ async def _run_web_assist(
                     )
                 if fetch.approved and not fetch.error and _is_useful_web_fetch(fetch):
                     fetches.append(fetch)
-    await _print_web_answer(user_input, result, fetches, console, llm, session_logger=session_logger)
+    await _print_web_answer(
+        user_input, result, fetches, console, llm, session_logger=session_logger
+    )
 
 
 def _web_search_query(user_input: str) -> str:
@@ -11304,7 +15323,9 @@ async def _run_browser_assist(
     console.print(
         Panel(
             f"{response.raw.strip()}\n\nURL: {opened.url}\nTitle: {opened.title}",
-            title=f"Browser Inspection ({response.model_used})" if response.model_used else "Browser Inspection",
+            title=f"Browser Inspection ({response.model_used})"
+            if response.model_used
+            else "Browser Inspection",
         )
     )
 
@@ -11346,8 +15367,7 @@ async def _print_web_answer(
         body = response.raw.strip()
     elif fetches:
         context = "\n\n".join(
-            f"Source: {item.url}\nTitle: {item.title}\n{item.text[:2500]}"
-            for item in fetches
+            f"Source: {item.url}\nTitle: {item.title}\n{item.text[:2500]}" for item in fetches
         )
         pack = ContextPack(
             task_id="web-qa",
@@ -11380,7 +15400,10 @@ async def _print_web_answer(
             ),
         )
         response = await llm.run_specialist("qa", pack)
-        body = response.raw.strip() or "I found sources, but could not synthesize an answer from the snippets."
+        body = (
+            response.raw.strip()
+            or "I found sources, but could not synthesize an answer from the snippets."
+        )
     body = re.split(
         r"\n\s*(?:#{1,4}\s*)?(?:sources?\s+used|sources?\s+searched(?:/fetched)?|sources?)\s*:?[ \t]*\n",
         body,
@@ -11463,8 +15486,7 @@ def _is_useful_web_fetch(fetch: WebFetchResult) -> bool:
         return False
     lowered = text.lower()
     navigation_markers = sum(
-        marker in lowered
-        for marker in ("cookie", "subscribe", "sign in", "menu", "advertisement")
+        marker in lowered for marker in ("cookie", "subscribe", "sign in", "menu", "advertisement")
     )
     return navigation_markers < 4
 
@@ -11530,14 +15552,39 @@ _GREETING_TOKENS = frozenset(
 
 _SOCIAL_SMALL_TALK = frozenset(
     {
-        "how are you", "how are you doing", "how are you doing today",
-        "how are you today", "how r you", "how r u", "how are u", "how you doing",
-        "how ya doing", "how is it going", "hows it going", "hows it going today",
-        "how are things", "hows things", "how is everything", "hows everything",
-        "hows life", "how is your day", "hows your day", "hows your day going",
-        "whats up", "what is up", "whats good", "whats new", "how do you do",
-        "how have you been", "you good", "are you ok", "are you okay",
-        "good morning", "good afternoon", "good evening", "good day",
+        "how are you",
+        "how are you doing",
+        "how are you doing today",
+        "how are you today",
+        "how r you",
+        "how r u",
+        "how are u",
+        "how you doing",
+        "how ya doing",
+        "how is it going",
+        "hows it going",
+        "hows it going today",
+        "how are things",
+        "hows things",
+        "how is everything",
+        "hows everything",
+        "hows life",
+        "how is your day",
+        "hows your day",
+        "hows your day going",
+        "whats up",
+        "what is up",
+        "whats good",
+        "whats new",
+        "how do you do",
+        "how have you been",
+        "you good",
+        "are you ok",
+        "are you okay",
+        "good morning",
+        "good afternoon",
+        "good evening",
+        "good day",
         "there",  # trailing token for "hey there"
     }
 )
@@ -11694,8 +15741,12 @@ async def _run_code_edit(
         _log_assistant_message(session_logger, body, workflow_id="code_edit")
         return
     if getattr(result, "used_full_rewrite", False):
-        console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
-    message = _print_patch_result("Code Edit", result.applied, result.changed_files, result.error, console)
+        console.print(
+            "[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]"
+        )
+    message = _print_patch_result(
+        "Code Edit", result.applied, result.changed_files, result.error, console
+    )
     _log_assistant_message(session_logger, message, workflow_id="code_edit")
 
 
@@ -11726,7 +15777,9 @@ async def _run_bug_fix(
             f"[dim]The reported path(s) didn't exist; I edited the real workspace file(s):\n{lines}[/dim]"
         )
     if getattr(result, "used_full_rewrite", False):
-        console.print("[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]")
+        console.print(
+            "[dim]The diff didn't parse cleanly, so I rewrote the file(s) in full instead.[/dim]"
+        )
     message = _print_patch_result(
         "Bug Fix",
         result.applied,
@@ -11779,10 +15832,16 @@ async def _run_test_generation(
         approval_manager = _make_approval_manager(workspace, session_logger, console)
         action_ledger = get_current_run()
         kwargs["patch_engine"] = PatchEngine(
-            workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger
+            workspace,
+            session_logger=session_logger,
+            approval_manager=approval_manager,
+            action_ledger=action_ledger,
         )
         kwargs["command_runner"] = CommandRunner(
-            workspace, session_logger=session_logger, approval_manager=approval_manager, action_ledger=action_ledger
+            workspace,
+            session_logger=session_logger,
+            approval_manager=approval_manager,
+            action_ledger=action_ledger,
         )
     result = await TestGenerationWorkflow(workspace, search=search, llm=llm, **kwargs).run(
         _strip_forced_prefix(user_input, "test-gen")
@@ -11864,9 +15923,17 @@ async def _handle_django_fix_tests(
     ).run(project_dir)
     _print_django_test_result(result.final_result, console)
     if result.success:
-        console.print(f"[green]Django tests passed after {len(result.iterations)} fix attempt(s).[/green]")
+        console.print(
+            f"[green]Django tests passed after {len(result.iterations)} fix attempt(s).[/green]"
+        )
         return
-    console.print(Panel(result.error or "Django tests still failing.", title="Fix Loop Stopped", border_style="red"))
+    console.print(
+        Panel(
+            result.error or "Django tests still failing.",
+            title="Fix Loop Stopped",
+            border_style="red",
+        )
+    )
 
 
 def _print_patch_result(
@@ -11901,7 +15968,7 @@ def _strip_forced_prefix(user_input: str, command: str) -> str:
     normalized = _normalize_command_input(user_input)
     prefix = f"{command} "
     if normalized.lower().startswith(prefix):
-        return normalized[len(prefix):].strip()
+        return normalized[len(prefix) :].strip()
     return user_input
 
 
@@ -12035,7 +16102,9 @@ def _make_input_key_bindings() -> KeyBindings:
     return kb
 
 
-def _make_prompt_session(workspace: Path, bottom_toolbar: Callable[[], str] | None = None) -> PromptSession | None:
+def _make_prompt_session(
+    workspace: Path, bottom_toolbar: Callable[[], str] | None = None
+) -> PromptSession | None:
     style = Style.from_dict(
         {
             "prompt": "ansigreen bold",
@@ -12226,7 +16295,9 @@ def main(argv: list[str] | None = None) -> None:
                 continuation_message = _continuation_clarification(user_input, previous_user_prompt)
                 if continuation_message is not None:
                     console.print(f"[yellow]{continuation_message}[/yellow]")
-                    _log_assistant_message(session_logger, continuation_message, workflow_id="clarification")
+                    _log_assistant_message(
+                        session_logger, continuation_message, workflow_id="clarification"
+                    )
                     continue
         elif session_logger.get_pending_question().get("question"):
             # Topic change via slash command: drop the stale pending question,
@@ -12253,7 +16324,13 @@ def main(argv: list[str] | None = None) -> None:
             # only a hard rejection (e.g. a non-local URI) still stops here.
             memory_gate = MemoryService(workspace).ensure_ready_degraded()
             if not memory_gate.allowed:
-                console.print(Panel(memory_gate.reason or REQUIRED_MEMORY_MESSAGE, title="Graphiti Memory Required", border_style="red"))
+                console.print(
+                    Panel(
+                        memory_gate.reason or REQUIRED_MEMORY_MESSAGE,
+                        title="Graphiti Memory Required",
+                        border_style="red",
+                    )
+                )
                 continue
         if lowered_input in {"exit", "quit"}:
             print("Goodbye.")
@@ -12326,7 +16403,9 @@ def main(argv: list[str] | None = None) -> None:
             _run_plan_with_ledger(normalized_input, user_input, workspace, console, session_logger)
             continue
         if lowered_input.startswith("generate-django "):
-            _handle_generate_django(normalized_input, workspace, console, session_logger=session_logger)
+            _handle_generate_django(
+                normalized_input, workspace, console, session_logger=session_logger
+            )
             continue
         if lowered_input.startswith("generate-prd "):
             asyncio.run(_handle_generate_prd(normalized_input, workspace, console, session_logger))
@@ -12335,20 +16414,29 @@ def main(argv: list[str] | None = None) -> None:
             _handle_models(normalized_input, console, workspace)
             continue
         if lowered_input.startswith("web "):
-            _handle_web(normalized_input, console, web_tool, _make_llm_manager(session_logger, console, workspace))
+            _handle_web(
+                normalized_input,
+                console,
+                web_tool,
+                _make_llm_manager(session_logger, console, workspace),
+            )
             continue
         if lowered_input.startswith("browse "):
             _handle_browse(normalized_input, console, browser_tool)
             continue
         if lowered_input.startswith("django"):
             if lowered_input.startswith("django fix-tests"):
-                asyncio.run(_handle_django_fix_tests(normalized_input, workspace, console, session_logger))
+                asyncio.run(
+                    _handle_django_fix_tests(normalized_input, workspace, console, session_logger)
+                )
             else:
                 _handle_django(normalized_input, workspace, console, session_logger=session_logger)
             continue
         if lowered_input.startswith("sessions"):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-                session_logger = _handle_sessions(normalized_input, session_manager, session_logger, console)
+                session_logger = _handle_sessions(
+                    normalized_input, session_manager, session_logger, console
+                )
                 web_tool.session_logger = session_logger
                 browser_tool.session_logger = session_logger
             continue
@@ -12403,7 +16491,12 @@ def main(argv: list[str] | None = None) -> None:
                 try:
                     asyncio.run(
                         _handle_tasks_execute(
-                            normalized_input, workspace, console, search, llm, session_logger=session_logger,
+                            normalized_input,
+                            workspace,
+                            console,
+                            search,
+                            llm,
+                            session_logger=session_logger,
                         )
                     )
                 except Exception as exc:

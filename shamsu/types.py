@@ -135,6 +135,11 @@ class EntitySpec:
     name: str
     fields: list[EntityFieldSpec]
     relationships: list[str] = field(default_factory=list)   # "belongs_to:User"
+    # True when the PRD named this entity but never defined its fields, so the
+    # fields were designed rather than read. Such fields guide generation but
+    # must not be enforced: failing a mandatory milestone because a generated
+    # model omitted an invented `User.phone` blocked all 18 milestones once.
+    inferred: bool = False
 
 
 @dataclass

@@ -64,11 +64,38 @@ def parse_python_traceback(text: str) -> list[DiagnosticRecord]:
     ]
 
 
+_TRACEBACK_HEADER = "Traceback (most recent call last)"
+_CHAIN_MARKERS = (
+    "During handling of the above exception, another exception occurred",
+    "The above exception was the direct cause of the following exception",
+)
+
+
 def _looks_like_traceback_context(lines: list[str], index: int) -> bool:
     """Only treat an `Error: message` line as the *final* exception if it
-    follows a Traceback block, not an arbitrary log line mentioning "Error"."""
-    window = lines[max(0, index - 15):index]
-    return any("Traceback (most recent call last)" in line for line in window)
+    follows a Traceback block, not an arbitrary log line mentioning "Error".
+
+    Walks back through the traceback body instead of a fixed-size window: a
+    Django `manage.py check` settings failure puts 25+ frame lines between the
+    header and the final NameError, and a window that stops short leaves the
+    whole run with zero diagnostics (observed live 2026-08-01)."""
+    for line in reversed(lines[:index]):
+        if _TRACEBACK_HEADER in line:
+            return True
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Frame headers, indented source/caret lines, chained-exception
+        # markers, and intermediate exception lines are all traceback body;
+        # anything else means we left the block without finding its header.
+        if line[:1].isspace():
+            continue
+        if FRAME_RE.match(line) or SYNTAX_FRAME_RE.match(line):
+            continue
+        if FINAL_EXCEPTION_RE.match(stripped) or any(marker in line for marker in _CHAIN_MARKERS):
+            continue
+        return False
+    return False
 
 
 def _parse_syntax_error_block(lines: list[str]) -> list[DiagnosticRecord]:

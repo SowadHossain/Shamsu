@@ -123,6 +123,31 @@ def test_mention_resolver_reads_quoted_path_with_spaces(tmp_path):
     assert "# Progress" in contexts[0].content
 
 
+def test_mention_resolver_extends_unquoted_mention_with_spaces(tmp_path):
+    """`@canvas lite.pdf` typed without quotes stops at the space; absorbing
+    the next word must find the real file. Observed live 2026-08-01: the PRD
+    `canvas lite.pdf` resolved as `canvas` / `lite.pdf` and derailed the build
+    into generic file.write."""
+    (tmp_path / "canvas lite.md").write_text("# Canvas Lite PRD\n", encoding="utf-8")
+    (tmp_path / "canvas.py").write_text("x = 1\n", encoding="utf-8")
+
+    contexts = MentionResolver(tmp_path).resolve_all("build the app from @canvas lite.md")
+
+    assert contexts[0].resolved
+    assert contexts[0].path.as_posix() == "canvas lite.md"
+    assert "# Canvas Lite PRD" in contexts[0].content
+
+
+def test_mention_resolver_does_not_extend_a_mention_that_already_resolves(tmp_path):
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "app second.py").write_text("y = 2\n", encoding="utf-8")
+
+    contexts = MentionResolver(tmp_path).resolve_all("read @app.py second time please")
+
+    assert contexts[0].resolved
+    assert contexts[0].path.as_posix() == "app.py"
+
+
 def test_mention_resolver_ignores_python_decorators(tmp_path):
     """Live repro (2026-07-23): replayed model-generated code containing
     `@app.route("/tasks/<id>")` got parsed as an `@app.route` file mention and
@@ -213,3 +238,34 @@ def test_read_only_turn_does_not_auto_build_code_memory_index(tmp_path):
 
     assert result.handled is False
     assert abstract.auto_build == [False]
+
+
+def test_read_file_extracts_pdf_text(tmp_path):
+    """Live 2026-08-02: told to "Read canvas lite.pdf", the agent got "Not a
+    supported text file" and stopped to ask the user what the document was -
+    while SHAMSU was already extracting that same PDF for @-mentions."""
+    from pathlib import Path
+
+    source = Path("F:/Work/PROJECTS/shamsu/test-shamsu/canvas lite.pdf")
+    if not source.is_file():
+        import pytest
+
+        pytest.skip("canvas lite.pdf fixture not present")
+    target = tmp_path / "canvas lite.pdf"
+    target.write_bytes(source.read_bytes())
+
+    text = WorkspaceTool(tmp_path).read_file("canvas lite.pdf")
+
+    assert text.strip()
+    assert "Canvas" in text
+
+
+def test_read_file_still_rejects_a_binary_it_cannot_parse(tmp_path):
+    (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02")
+
+    try:
+        WorkspaceTool(tmp_path).read_file("blob.bin")
+    except ValueError as exc:
+        assert "Not a supported text file" in str(exc)
+    else:
+        raise AssertionError("expected a ValueError for an unsupported binary")

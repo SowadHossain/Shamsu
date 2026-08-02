@@ -30,15 +30,90 @@ _REFERENCE_RE = re.compile(
 )
 _ORIGINAL_MARKER = "Original request: "
 _PLAN_MARKER = "\n\nOrdered operation plan:"
+# The per-step composite contract (`_composite_step_prompt`) wraps the original
+# request with this line instead of the whole-plan marker above. Both must
+# unwrap: a pending ask_user stored during a composite STEP resumes through
+# here, and an unrecognized wrapper re-routes the internal step contract as a
+# fresh prompt - whose "Do not modify any files" line then strips the user's
+# real mutation intent (observed live 2026-08-01).
+_STEP_PLAN_MARKER = "\n\nYou are executing that request one step at a time."
 _ANSWER_MARKER = "\n\n(Answering the earlier question"
 _FILE_TOKEN_RE = re.compile(
     r"(?:[A-Za-z0-9_.-]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}",
     re.IGNORECASE,
 )
+# Real file suffixes. The pattern above accepts ANY short trailing segment, so
+# a dotted Python module path counted as a filename: "Import AbstractUser from
+# django.contrib.auth.models" contributed `django.contrib.auth.models` AND
+# `django.db` as targets, making a ONE-file request look like three and
+# shredding it into composite steps (observed live 2026-08-02).
+_FILE_SUFFIXES = frozenset(
+    """py pyi ipynb js jsx ts tsx mjs cjs json jsonc yaml yml toml ini cfg conf env
+    md markdown rst txt csv tsv sql db sqlite sqlite3 html htm css scss sass less
+    png jpg jpeg gif svg ico webp pdf docx doc xlsx lock sh bash ps1 bat cmd
+    dockerfile gitignore go rs java kt rb php c h cpp hpp cs xml""".split()
+)
+
+
+def _looks_like_real_file(token: str) -> bool:
+    normalized = token.replace("\\", "/")
+    if "/" in normalized:
+        return True
+    return normalized.rsplit(".", 1)[-1].lower() in _FILE_SUFFIXES
+
+
+_IMPORT_CONTEXT_RE = re.compile(r"\b(?:from|import)\s+$", re.IGNORECASE)
+# "Write the complete file now with write_file" - an instruction to perform the
+# write just specified, not a new target. Must not match a second real edit.
+_TRAILING_WRITE_IMPERATIVE_RE = re.compile(
+    r"^\s*(?:write|create|save|output|generate)\b[^.]{0,80}?\b(?:file|it|now|write_file)\b",
+    re.IGNORECASE,
+)
+
+
+def file_targets(text: str) -> set[str]:
+    """Distinct file paths named in *text*, excluding dotted module paths.
+
+    Two filters, because a suffix allowlist alone is not enough: `django.db`
+    ends in a genuine file suffix. What actually distinguishes a module is the
+    import context it appears in.
+    """
+    body = text or ""
+    targets: set[str] = set()
+    for match in _FILE_TOKEN_RE.finditer(body):
+        token = match.group(0)
+        if not _looks_like_real_file(token):
+            continue
+        if _IMPORT_CONTEXT_RE.search(body[: match.start()]):
+            continue
+        targets.add(token.replace("\\", "/").casefold())
+    return targets
+
+
 _CREATE_NAMED_FILE_RE = re.compile(
     rf"^\s*(?:create|write|generate|make)\b(?:(?![.!?\n]).)*{_FILE_TOKEN_RE.pattern}",
     re.IGNORECASE,
 )
+_QUOTED_FILE_RE = re.compile(
+    r"[\x60\"'](?P<path>(?:[A-Za-z0-9_.-]+[/\\])*"
+    r"[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})[\x60\"']"
+)
+_EDIT_LEAD_RE = re.compile(
+    r"^\s*(?:fix|repair|edit|update|modify|change|add|remove)\b",
+    re.IGNORECASE,
+)
+_QUOTED_SPAN_RE = re.compile(r"[`\"'][^`\"']*[`\"']")
+_CONTINUATION_LEAD_RE = re.compile(
+    r"^\s*(?:continue|continuing|resume|resuming|finish|finishing|complete|completing|"
+    r"keep\s+going|pick\s+up)\b",
+    re.IGNORECASE,
+)
+_NEGATED_ACTION_RE = re.compile(
+    r"\b(?:do\s+not|don'?t|never|avoid)\s+"
+    r"(?:create|write|build|implement|fix|repair|edit|update|modify|change|add|remove|delete|rename|move)\b",
+    re.IGNORECASE,
+)
+_DELETE_ONLY_RE = re.compile(r"\b(?:delete|remove)\s+only\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -158,6 +233,45 @@ def parse_operation_plan(
                 instruction=prompt.strip().rstrip(".?!"),
             )
         ]
+    elif _is_single_file_deletion_workflow(prompt, steps):
+        steps = [
+            OperationStep(
+                id=1,
+                kind="mutation",
+                route="file.write",
+                instruction=prompt.strip().rstrip(".?!"),
+            )
+        ]
+    elif _is_single_quoted_file_edit_workflow(prompt, steps):
+        # A cohesive one-file repair often includes dependent read, mutation,
+        # and verification sentences. Splitting those sentences strips the
+        # target from later fragments and sends them through QA, where a small
+        # model describes the edit instead of calling a mutation tool.
+        steps = [
+            OperationStep(
+                id=1,
+                kind="mutation",
+                route="file.write",
+                instruction=prompt.strip().rstrip(".?!"),
+            )
+        ]
+    elif _is_targeted_continuation(prompt, steps):
+        # "Continue the milestone: fix BASE_DIR in settings.py, then verify"
+        # is one resumed task, not an ordered plan. Splitting it strips the
+        # implementation path from later fragments and executes them under a
+        # composite contract that never resumes cleanly (observed live
+        # 2026-08-01: a targeted continuation was shredded into steps). A
+        # continuation carries mutation intent, so the tool-less QA route can
+        # never satisfy it - fall back to the tool-equipped agent instead.
+        classified = classify(prompt, workspace)
+        steps = [
+            OperationStep(
+                id=1,
+                kind="mutation",
+                route="agent-chat" if classified == "qa" else classified,
+                instruction=prompt.strip().rstrip(".?!"),
+            )
+        ]
     return OperationPlan(
         prompt=prompt.strip(),
         candidates=tuple(_dedupe(candidates)),
@@ -169,18 +283,61 @@ def parse_operation_plan(
 def _is_single_named_file_creation(prompt: str, steps: list[OperationStep]) -> bool:
     if len(steps) < 2 or not _CREATE_NAMED_FILE_RE.search(prompt):
         return False
-    if any(step.kind != "mutation" or step.route != "file.write" for step in steps):
+    if any(step.kind != "mutation" for step in steps):
         return False
-    targets = {match.group(0).replace("\\", "/").casefold() for match in _FILE_TOKEN_RE.finditer(prompt)}
-    return len(targets) == 1
+    return len(file_targets(prompt)) == 1
+
+
+def _is_single_quoted_file_edit_workflow(prompt: str, steps: list[OperationStep]) -> bool:
+    if len(steps) < 2 or not _EDIT_LEAD_RE.search(prompt):
+        return False
+    targets = {
+        match.group("path").replace("\\", "/").casefold()
+        for match in _QUOTED_FILE_RE.finditer(prompt)
+    }
+    if len(targets) != 1:
+        return False
+    return {step.kind for step in steps}.issubset({"mutation", "read", "verify", "summarize"})
+
+
+def _is_targeted_continuation(prompt: str, steps: list[OperationStep]) -> bool:
+    """A continuation of interrupted work stays one grounded agent turn.
+
+    Requires an explicit continuation lead, at least one mutation step, no
+    git/web/launch steps, and at most two named files (the target plus perhaps
+    a verifier entry point) so a genuinely multi-artifact request still gets
+    per-step evidence."""
+    if len(steps) < 2 or not _CONTINUATION_LEAD_RE.match(prompt):
+        return False
+    kinds = {step.kind for step in steps}
+    if "mutation" not in kinds:
+        return False
+    if not kinds.issubset({"mutation", "read", "verify", "summarize", "answer"}):
+        return False
+    return len(file_targets(prompt)) <= 2
+
+
+def _is_single_file_deletion_workflow(prompt: str, steps: list[OperationStep]) -> bool:
+    """Keep a scoped delete/preserve/verify request in one grounded agent turn."""
+    if len(steps) < 2 or len(_DELETE_ONLY_RE.findall(prompt)) != 1:
+        return False
+    if not re.search(r"\b(?:keep|preserve|retain|canonical)\b", prompt, re.IGNORECASE):
+        return False
+    return {step.kind for step in steps}.issubset({"mutation", "read", "verify", "summarize"})
 
 
 def recover_original_prompt(prompt: str) -> str:
     """Unwrap a paused composite execution contract before rerouting it."""
-    if _ORIGINAL_MARKER not in prompt or _PLAN_MARKER not in prompt:
+    if _ORIGINAL_MARKER not in prompt:
+        return prompt
+    plan_marker = next(
+        (marker for marker in (_PLAN_MARKER, _STEP_PLAN_MARKER) if marker in prompt),
+        None,
+    )
+    if plan_marker is None:
         return prompt
     original_tail = prompt.split(_ORIGINAL_MARKER, 1)[1]
-    original = original_tail.split(_PLAN_MARKER, 1)[0].strip()
+    original = original_tail.split(plan_marker, 1)[0].strip()
     answer = ""
     if _ANSWER_MARKER in prompt:
         answer = _ANSWER_MARKER + prompt.split(_ANSWER_MARKER, 1)[1]
@@ -214,7 +371,7 @@ def _is_standalone_instruction(clause: str) -> bool:
         return False
     if text.endswith("?") or _QUESTION_LEAD_RE.match(text):
         return True
-    return bool(_STANDALONE_VERB_RE.search(text))
+    return bool(_STANDALONE_VERB_RE.search(_QUOTED_SPAN_RE.sub(" ", text)))
 
 
 def _merge_context_fragments(parts: list[str]) -> list[str]:
@@ -247,16 +404,62 @@ def _merge_context_fragments(parts: list[str]) -> list[str]:
     return out
 
 
+def _merge_specification_clauses(parts: list[str]) -> list[str]:
+    """Rejoin an instruction with the clause that specifies it.
+
+    "Build the Django foundation in canvas_lms_lite. Create: manage.py,
+    config/settings.py, core/models.py." is ONE task: the second clause is the
+    file list for the first, not an independent step. Splitting them left step
+    1 with no concrete target at all (it failed) and stranded the entire file
+    list in step 2, which then never ran - observed live 2026-08-02 on a
+    deliberately detailed, well-specified build request.
+
+    Only a mutation clause carrying NO file target absorbs the following
+    clause, and only when that next clause names files; a genuine multi-file
+    request whose first clause already names its own target is untouched.
+    """
+    if len(parts) < 2:
+        return parts
+    out: list[str] = []
+    index = 0
+    while index < len(parts):
+        current = parts[index]
+        following = parts[index + 1] if index + 1 < len(parts) else ""
+        if (
+            following
+            and _operation_kind(current) == "mutation"
+            and _operation_kind(following) == "mutation"
+            and (
+                # instruction -> its file list ("Build the foundation. Create: a.py, b.py")
+                (not file_targets(current) and file_targets(following))
+                # spec -> a trailing "now write it" imperative. Deliberately
+                # narrow: "edit greet in greeting.py, and update the __main__
+                # block" is TWO real mutations and must stay split.
+                or (
+                    file_targets(current)
+                    and not file_targets(following)
+                    and _TRAILING_WRITE_IMPERATIVE_RE.match(following)
+                )
+            )
+        ):
+            out.append(f"{current}. {following}")
+            index += 2
+            continue
+        out.append(current)
+        index += 1
+    return out
+
+
 def _split_clauses(prompt: str) -> list[str]:
     parts = [part.strip(" ,") for part in _CLAUSE_SPLIT_RE.split(prompt.strip())]
     parts = [part for part in parts if part]
-    return _merge_context_fragments(parts)
+    return _merge_specification_clauses(_merge_context_fragments(parts))
 
 
 def _operation_kind(clause: str) -> str:
     text = " ".join(clause.lower().split())
     explicitly_read_only = read_only.applies(text)
-    action_text = read_only.strip(text)
+    action_text = _NEGATED_ACTION_RE.sub(" ", read_only.strip(text))
     if not text:
         return ""
     if any(

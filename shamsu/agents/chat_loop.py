@@ -9,7 +9,9 @@ import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any
 
 import ollama
@@ -33,6 +35,7 @@ from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
 from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
 from shamsu.memory.service import MemoryService
+from shamsu.routing.operations import file_targets
 from shamsu.runtime.models import (
     model_for_role,
     model_is_reasoning,
@@ -54,6 +57,12 @@ LONG_RUNNING_MAX_TOOL_ROUNDS = 50
 # bound the worst-case wall-clock cost on a developer machine.
 # Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
 _MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
+_REPAIR_MODEL_TIMEOUT_SECONDS: int = int(
+    _os.environ.get("SHAMSU_REPAIR_MODEL_TIMEOUT_SECONDS", "120")
+)
+_REPAIR_MODEL_MAX_OUTPUT_TOKENS: int = int(
+    _os.environ.get("SHAMSU_REPAIR_MODEL_MAX_OUTPUT_TOKENS", "2048")
+)
 
 # How often to emit a "still waiting for the model" heartbeat during a long model
 # call, so a slow local model reads as working rather than a frozen prompt.
@@ -83,7 +92,7 @@ _CHAT_EXECUTOR_ROLE = _os.environ.get("SHAMSU_CHAT_ROLE", "coder").strip() or "c
 # The per-turn planner is on by default, but can be disabled (SHAMSU_CHAT_PLANNER=0)
 # on very small machines where the extra planner-model round-trip + model swap
 # adds too much latency.
-# One bounded strict-repair pass when an autonomous run's verify FAILS (E1).
+# Bounded strict-repair iterations when an autonomous run's verify FAILS (E1).
 # The repair machinery existed (freeform/full_pipeline) but the chat loop only
 # ever reported failure. SHAMSU_AUTO_REPAIR=0 restores report-only.
 _AUTO_REPAIR_ENABLED = _os.environ.get("SHAMSU_AUTO_REPAIR", "1").strip().lower() not in {
@@ -140,11 +149,15 @@ File tools:
   before editing. Never call grep_files with an empty query.
 - Use find_file when you are unsure of a path (search by name). Use grep_files when you know a
   symbol or text but not the file. Use file_info to check a path before editing it.
-- Use edit_file for small, targeted changes: pass the exact old_string and new_string. It must
-  match exactly once (or set replace_all=true).
+- PREFER write_file with the COMPLETE file content. This is the default for creating a file AND
+  for changing one. Read the file first when it exists, then re-emit all of it with your change
+  applied. Whole-file writes are far more reliable than patches; a mismatched old_string wastes
+  the whole turn.
+- Use edit_file ONLY when the file is too large to re-emit, or the change is a single unique
+  line. Pass the exact old_string and new_string, matching exactly once (or set replace_all=true).
+  If an edit_file call fails to match, do not retry it - switch to write_file with the full content.
 - Use append_file when adding content at the end of an existing file. Do not fake append by
   passing an empty old_string to edit_file.
-- Use write_file only to create a new file or fully rewrite one, passing the COMPLETE content.
 - If the user asks you to create, write, save, generate, add, edit, or update a file,
   your next action must be an edit_file/append_file/write_file tool call or a clarification question.
 - A file change only counts if the edit_file/append_file/write_file tool result says ok. If a tool result
@@ -172,6 +185,10 @@ File tools:
   before asking - but never "research your way past" a judgment call that is the user's.
 - For multiple file candidates, call ask_user with the candidates as options so the user can choose.
 - Ask for a commit message, branch/remote, or a specific target when those are required and ambiguous.
+- A path the request already names is NOT ambiguous. Never ask "what is the full path to X",
+  "where should X go", or "may I create X" when the request said to create X: write X exactly as
+  named, relative to the workspace, creating parent directories as needed. An empty workspace is
+  the normal starting state, not a reason to ask.
 - Example: task says "add auth" and nothing specifies sessions vs JWT -> ask_user with those
   two options. Example: two config files could be the target -> ask_user listing both.
 
@@ -213,10 +230,30 @@ _READ_STALL_PHRASES = (
 _MAX_READ_RECOVERIES = 3
 # How many times we correct a prose-only "I will read X next" reply that did not
 # actually call a tool, before giving up (a backstop against a chatty model).
-_MAX_PROSE_CORRECTIONS = 2
+# Env-tunable because 2 is tight for a 7B: it stalls on prose more often than a
+# larger model, and each correction is one cheap round, while giving up ends the
+# whole milestone. Note this is an ATTEMPT budget, not a clock - the
+# `tool_call_missing_after_promise` category it sets makes runs read as
+# "timed_out" when nothing actually timed out.
+def _os_env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(_os.environ.get(name, "").strip() or default))
+    except ValueError:
+        return default
+
+
+_MAX_PROSE_CORRECTIONS = _os_env_int("SHAMSU_MAX_PROSE_CORRECTIONS", 2, 1)
+# How often a "which file / may I create it" non-question is answered for the
+# model before its next one is forwarded to the user as a real question.
+_MAX_STALL_ANSWERS = _os_env_int("SHAMSU_MAX_STALL_ANSWERS", 2, 1)
 # How many empty model replies (no content, no tool call) to nudge past before
 # giving up with a clear message instead of a blank "No response returned".
 _MAX_EMPTY_RESPONSES = 2
+# One retry is not enough: a 7B reliably spends its first response asking which
+# path to use, which consumed the only recovery and ended the turn unwritten
+# (observed repeatedly 2026-08-02). The correction now names the target, so the
+# second attempt is the one that usually lands.
+_MAX_MISSING_MUTATION_RECOVERIES = _os_env_int("SHAMSU_MAX_MUTATION_RECOVERIES", 2, 1)
 
 _EMPTY_RESPONSE_CORRECTION = (
     "You returned an empty response. Do not return nothing. Either call a tool to make "
@@ -301,6 +338,9 @@ class AgentChatLoop:
         read_only: bool = False,
         use_long_term_memory: bool = True,
         use_planner: bool = True,
+        hydrate_history: bool = True,
+        verify_changes: bool = True,
+        original_user_request: str = "",
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
@@ -335,6 +375,7 @@ class AgentChatLoop:
                 include_tool_protocol=not self._supports_native_tools,
             ),
             session_logger=session_logger,
+            hydrate=hydrate_history,
         )
         self.long_running = long_running
         self.max_tool_rounds = LONG_RUNNING_MAX_TOOL_ROUNDS if long_running else max_tool_rounds
@@ -344,6 +385,12 @@ class AgentChatLoop:
         self.read_only = read_only
         self.use_long_term_memory = use_long_term_memory
         self.use_planner = use_planner
+        self.verify_changes = verify_changes
+        # The clean CURRENT user request, when the caller wraps it in an
+        # internal contract (composite step, PRD repair). A pending ask_user
+        # must resume from this - resuming from the internal wrapper re-routes
+        # contract text as if the user typed it (observed live 2026-08-01).
+        self.original_user_request = str(original_user_request or "")
         if read_only:
             self.tools.set_read_only(True)
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
@@ -561,15 +608,23 @@ class AgentChatLoop:
             self._pending_upfront_question = None
             return self._handle_ask_user(question, original_input, 0)
         repeated_calls: Counter[tuple[str, str]] = Counter()
+        successful_call_signatures: set[tuple[str, str]] = set()
+        successful_read_paths: set[str] = set()
         unconfirmed_failed_writes: dict[str, str] = {}
         mutation_recovery_attempts = 0
+        missing_mutation_recovery_attempts = 0
+        strict_repair_recovery_attempted = False
         # Files this run actually wrote (confirmed ok), for the end-of-run verify gate.
         written_files: list[str] = []
+        # Times a "which file / may I" non-question was answered on the model's
+        # behalf; bounded so a model that only ever asks still hands back.
+        stall_answers = 0
         # The most recent read_file failure that has not yet been recovered from,
         # plus a cap on prose-only "I'll read X next" stalls after such a failure.
         last_failed_read: dict[str, Any] | None = None
         read_recovery_attempts = 0
         prose_corrections = 0
+        truncation_recoveries = 0
         empty_responses = 0
         # Whether any tool has actually executed yet - used to tell a genuine LLM
         # timeout apart from an executor stall when a model call times out.
@@ -636,6 +691,28 @@ class AgentChatLoop:
             turn = parse_model_turn(response, self._registered_tool_names)
             content = turn.text
             tool_calls = [tool_call_to_message_dict(call) for call in turn.tool_calls]
+            if not tool_calls:
+                promised_read = _promised_read_tool_call(content)
+                if promised_read is not None:
+                    tool_calls = [promised_read]
+                    self._emit_trace(
+                        "tool.salvaged",
+                        "Converted an explicit prose-only file-read promise into a read_file call.",
+                        {"round": round_index, "tools": ["read_file"]},
+                    )
+                elif "write_file" in self._registered_tool_names and not self.read_only:
+                    promised_write = _promised_write_tool_call(
+                        content,
+                        self.workspace_root,
+                        self.original_user_request or original_input,
+                    )
+                    if promised_write is not None:
+                        tool_calls = [promised_write]
+                        self._emit_trace(
+                            "tool.salvaged",
+                            "Converted a prose-only mutation promise with a code fence into a write_file call.",
+                            {"round": round_index, "tools": ["write_file"]},
+                        )
             # Surface the visible (tool-syntax-stripped) message in `/trace raw`;
             # keep any reasoning trace out of the answer on a verbose channel.
             if content.strip():
@@ -658,6 +735,21 @@ class AgentChatLoop:
                     {"round": round_index, "tools": [_tool_call_name(call) for call in tool_calls]},
                 )
             self.state.append_assistant(content, tool_calls=tool_calls)
+            repair_targets = self.tools.allowed_write_paths()
+            should_handoff_to_strict_repair = (
+                self.long_running
+                and not strict_repair_recovery_attempted
+                and not successful_mutation
+                and len(successful_read_paths) >= 1
+                and bool(repair_targets)
+                and _request_is_verification_repair(original_input)
+                and not tool_calls
+            )
+            if should_handoff_to_strict_repair:
+                strict_repair_recovery_attempted = True
+                handoff = await self._run_scoped_repair_handoff(repair_targets, round_index)
+                if handoff is not None:
+                    return handoff
             if not tool_calls and not content.strip():
                 # An empty model reply (no content, no tool call) is the "No
                 # response returned" the user saw. Retry with a nudge rather than
@@ -749,6 +841,28 @@ class AgentChatLoop:
                         round_index=round_index,
                         options=[{"label": candidate, "description": ""} for candidate in candidates],
                     )
+                # A failed write/edit is stronger evidence than generic prose
+                # that merely promises another action. Handle it first so the
+                # model receives the exact failed path and a concrete recovery
+                # contract instead of exhausting generic prose corrections.
+                if unconfirmed_failed_writes:
+                    if mutation_recovery_attempts < 2:
+                        mutation_recovery_attempts += 1
+                        details = "; ".join(
+                            f"{path}: {message}"
+                            for path, message in unconfirmed_failed_writes.items()
+                        )
+                        self.state.append_user(
+                            "A required file mutation is still unconfirmed: "
+                            f"{details}. Your NEXT response must call read_file plus a corrected "
+                            "edit_file, append_file, or write_file with the complete corrected file. Do not "
+                            "reply with a success summary until a mutation tool returns ok."
+                        )
+                        continue
+                    final = _failed_write_final(unconfirmed_failed_writes)
+                    self.state.append_assistant(final)
+                    self._audit_final(final)
+                    return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
                 if _looks_like_deferred_action(content):
                     # The model said it would take a tool action ("I will read X
                     # next") but did not call a tool. Do not end the turn on an
@@ -781,25 +895,46 @@ class AgentChatLoop:
                         stopped=True,
                         timeout_category=TIMEOUT_TOOL_MISSING_AFTER_PROMISE,
                     )
-                if unconfirmed_failed_writes:
-                    if mutation_recovery_attempts < 2:
-                        mutation_recovery_attempts += 1
-                        details = "; ".join(
-                            f"{path}: {message}"
-                            for path, message in unconfirmed_failed_writes.items()
+                if _request_requires_workspace_change(original_input) and not successful_mutation:
+                    max_missing_mutation_recoveries = (
+                        3 if self.long_running else _MAX_MISSING_MUTATION_RECOVERIES
+                    )
+                    if missing_mutation_recovery_attempts < max_missing_mutation_recoveries:
+                        missing_mutation_recovery_attempts += 1
+                        # Naming the target here matters: the model's prose is
+                        # often a question about *which path* to write ("could
+                        # you provide the full path to manage.py?"), and a
+                        # correction that says "use the exact workspace target"
+                        # without stating it leaves the question standing, so
+                        # the next turn asks again and the run ends unwritten.
+                        targets = sorted(
+                            file_targets(self.original_user_request or original_input)
                         )
+                        target_hint = ""
+                        if targets:
+                            target_hint = (
+                                " The request already states the path: "
+                                + ", ".join(targets)
+                                + ". Paths are relative to the workspace root, so write "
+                                "exactly that - do not ask which path to use."
+                            )
                         self.state.append_user(
-                            "A required file mutation is still unconfirmed: "
-                            f"{details}. Your NEXT response must call read_file plus a corrected "
-                            "edit_file, append_file, or write_file with the complete corrected file. Do not "
-                            "reply with a success summary until a mutation tool returns ok."
+                            "No workspace mutation has succeeded yet. Your diagnosis or proposed "
+                            "code is not an edit. In your NEXT response, call edit_file, "
+                            "append_file, or write_file on the exact workspace target using the "
+                            "file evidence already returned by tools. Do not provide prose, a "
+                            "code fence, or a success summary before a mutation tool returns ok."
+                            + target_hint
+                        )
+                        self._emit_trace(
+                            "workflow.blocked",
+                            "Mutation was required but the model returned prose; requiring a tool call.",
+                            {
+                                "attempt": missing_mutation_recovery_attempts,
+                                "category": "required_mutation_tool_missing",
+                            },
                         )
                         continue
-                    final = _failed_write_final(unconfirmed_failed_writes)
-                    self.state.append_assistant(final)
-                    self._audit_final(final)
-                    return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
-                if _request_requires_workspace_change(original_input) and not successful_mutation:
                     final = _missing_mutation_final(content)
                     self.state.append_assistant(final)
                     self._emit_trace(
@@ -825,8 +960,61 @@ class AgentChatLoop:
                 name = _tool_call_name(call)
                 arguments = _tool_call_arguments(call)
                 signature = (name, json.dumps(arguments, sort_keys=True, default=str))
+                requested_read = str(arguments.get("filepath") or "").replace("\\", "/").lower()
+                if (
+                    name == "read_file"
+                    and requested_read in successful_read_paths
+                    and (
+                        len(successful_read_paths) >= 2
+                        or (
+                            _request_is_verification_repair(original_input)
+                            and bool(self.tools.allowed_write_paths())
+                        )
+                    )
+                    and _request_requires_workspace_change(original_input)
+                    and not successful_mutation
+                ):
+                    self.state.append_user(
+                        "The relevant files have already been read successfully, including "
+                        f"{requested_read}. Do not read them again. Your NEXT response must call "
+                        "edit_file, append_file, or write_file on the allowed mutation target using "
+                        "the source evidence already in context."
+                    )
+                    self._emit_trace(
+                        "workflow.recovering",
+                        f"Skipped redundant read_file for {requested_read}; requiring mutation.",
+                        {"category": "read_saturation", "filepath": requested_read},
+                    )
+                    if not strict_repair_recovery_attempted:
+                        strict_repair_recovery_attempted = True
+                        handoff = await self._run_scoped_repair_handoff(
+                            self.tools.allowed_write_paths(), round_index
+                        )
+                        if handoff is not None:
+                            return handoff
+                    continue
                 repeated_calls[signature] += 1
                 if repeated_calls[signature] >= _MAX_REPEATED_CALLS:
+                    if signature in successful_call_signatures:
+                        failed_targets = sorted(unconfirmed_failed_writes)
+                        target_hint = (
+                            f" The failed mutation target is {failed_targets[-1]}."
+                            if failed_targets
+                            else ""
+                        )
+                        self.state.append_user(
+                            _repetition_correction(name) + target_hint
+                        )
+                        self._emit_trace(
+                            "workflow.recovering",
+                            f"Skipped a repeated successful {name} call and required a different action.",
+                            {
+                                "category": "successful_tool_repetition",
+                                "tool": name,
+                                "target": failed_targets[-1] if failed_targets else "",
+                            },
+                        )
+                        break
                     # Repeating the same call means the loop is missing a
                     # decision, not effort - ask for it instead of giving up.
                     return self._ask_for_help_on_stall(
@@ -847,6 +1035,18 @@ class AgentChatLoop:
                     self.audit.log_tool_call(name, arguments)
                 ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
                 result = self.tools.execute(name, arguments)
+                if result.ok:
+                    successful_call_signatures.add(signature)
+                    if name == "read_file":
+                        result_data = result.data if isinstance(result.data, dict) else {}
+                        read_path = str(
+                            result_data.get("resolved_filepath")
+                            or result_data.get("filepath")
+                            or arguments.get("filepath")
+                            or ""
+                        ).replace("\\", "/").lower()
+                        if read_path:
+                            successful_read_paths.add(read_path)
                 raw_tool_json = result.to_json()
                 budgeted_tool_json, tool_budget = _budget_tool_result_json_with_meta(
                     raw_tool_json,
@@ -860,7 +1060,12 @@ class AgentChatLoop:
                     and not bool(result_data.get("read_only", False))
                     and bool(result_data.get("touched_files"))
                 )
-                if (name in _MUTATION_TOOL_NAMES and result.ok) or mcp_mutation:
+                command_mutation = (
+                    name == "run_command"
+                    and result.ok
+                    and bool(result_data.get("touched_files"))
+                )
+                if (name in _MUTATION_TOOL_NAMES and result.ok) or mcp_mutation or command_mutation:
                     successful_mutation = True
                 elif result.ok:
                     nonwrite_tool_succeeded = True
@@ -937,10 +1142,33 @@ class AgentChatLoop:
                     )
                     if written and written not in written_files:
                         written_files.append(written)
+                    truncation = _truncated_write_correction(self.workspace_root, written)
+                    if truncation:
+                        # The write SUCCEEDED but the content stops mid-construct:
+                        # a 7B routinely runs out of room part-way through a long
+                        # file (live 2026-08-02: a 35-byte settings.py stub, and a
+                        # manage.py with an unterminated string literal). Treat it
+                        # as unfinished rather than done, and ask for the rest
+                        # instead of letting the turn end on a broken file.
+                        truncation_recoveries += 1
+                        if truncation_recoveries <= _MAX_TRUNCATION_RECOVERIES:
+                            self.state.append_user(truncation)
+                            self._emit_trace(
+                                "workflow.blocked",
+                                f"{written} was written truncated; asking for the remainder.",
+                                {"attempt": truncation_recoveries, "category": "truncated_write"},
+                            )
+                            continue
                 if mcp_mutation:
                     for written in result_data.get("touched_files", []):
                         written = str(written)
                         if written and written not in written_files:
+                            written_files.append(written)
+                if command_mutation:
+                    deleted = {str(path) for path in result_data.get("deleted_files", [])}
+                    for written in result_data.get("touched_files", []):
+                        written = str(written)
+                        if written and written not in deleted and written not in written_files:
                             written_files.append(written)
                 if name == "search_index" and result.ok and isinstance(result.data, dict):
                     # Make the context feed visible (G9): the query + top hits with
@@ -1010,11 +1238,41 @@ class AgentChatLoop:
                         _discovery_failure_correction(name, result.message, hint_name)
                     )
                 if name == "ask_user" and result.ok and isinstance(result.data, dict) and result.data.get("ask_user"):
+                    pending = result.data.get("pending_question", {})
+                    question = str((pending or {}).get("question", ""))
+                    stalls_named_write = (
+                        stall_answers < _MAX_STALL_ANSWERS
+                        and _question_stalls_a_named_write(
+                            question,
+                            self.original_user_request or original_input,
+                            bool(written_files),
+                            (pending or {}).get("options") or (),
+                        )
+                    )
+                    if stalls_named_write:
+                        stall_answers += 1
+                    if stalls_named_write or _asks_permission_already_granted(
+                        question, original_input
+                    ):
+                        # Asking "the file does not exist, should I create it?"
+                        # for a request that SAYS "create the file" spends the
+                        # turn re-requesting consent the user already gave
+                        # (observed live 2026-08-02: a one-file build ended in
+                        # 2.8s having written nothing). Answer it and continue.
+                        self.state.append_user(
+                            "Yes - that is exactly what was requested. Do not ask for "
+                            "permission to do what the request already states. Perform "
+                            "the write now with write_file and the complete file content."
+                        )
+                        self._emit_trace(
+                            "clarification.skipped",
+                            "Declined a permission question the request already answered.",
+                            {"round": round_index},
+                        )
+                        continue
                     # ask_user ends the turn: store the pending question and hand
                     # control back to the user (resolved on their next reply).
-                    return self._handle_ask_user(
-                        result.data.get("pending_question", {}), original_input, round_index
-                    )
+                    return self._handle_ask_user(pending, original_input, round_index)
                 if name == "read_file" and not result.ok:
                     # A wrong/ambiguous path is the #1 reason SHAMSU used to say
                     # "I'll read X next" and then stall. Turn the failure into a
@@ -1029,10 +1287,39 @@ class AgentChatLoop:
                         f"read_file {arguments.get('filepath', '')} failed: {result.message}",
                         {"filepath": str(arguments.get("filepath", ""))},
                     )
+                if name in {"find_file", "grep_files"} and result.ok:
+                    # Searching for a file the request says to CREATE returns
+                    # "no files matched", which the model reads as "I do not
+                    # know the path" and answers with "could you provide the
+                    # full path to X?" - then repeats that sentence for the
+                    # rest of the session (observed live 2026-08-02: ten
+                    # identical assistant turns, zero files). Absence is the
+                    # expected result here, so say so.
+                    missing = self._creation_target_not_found(
+                        arguments, result, original_input
+                    )
+                    if missing:
+                        self.state.append_user(
+                            f"{missing} does not exist yet - that is expected, the "
+                            "request is to create it. Do not search for it again and do "
+                            "not ask where it should go. Call write_file with filepath "
+                            f"'{missing}' and the complete file content now."
+                        )
+                        self._emit_trace(
+                            "workflow.blocked",
+                            f"Discovery found no {missing}; it is the file to create.",
+                            {"category": "search_for_creation_target"},
+                        )
                 if name in {"write_file", "append_file"}:
                     filepath = str(arguments.get("filepath", "the file"))
                     if result.ok:
                         unconfirmed_failed_writes.pop(filepath, None)
+                        # A small model often follows the failed tool's candidate
+                        # path on its next turn. Reconcile the stale failure for
+                        # the same basename once that corrected write succeeds.
+                        for failed_path in list(unconfirmed_failed_writes):
+                            if _basename(failed_path) == _basename(filepath):
+                                unconfirmed_failed_writes.pop(failed_path, None)
                     else:
                         unconfirmed_failed_writes[filepath] = result.message
                 if name == "edit_file" and not result.ok:
@@ -1049,6 +1336,7 @@ class AgentChatLoop:
                             result.data,
                             old_string=str(arguments.get("old_string", "")),
                             new_string=str(arguments.get("new_string", "")),
+                            append_available="append_file" in self._registered_tool_names,
                         )
                     )
                 elif name == "edit_file" and result.ok:
@@ -1132,7 +1420,9 @@ class AgentChatLoop:
             )
         except Exception:
             return user_input
-        if plan.needs_input:
+        if plan.needs_input and not _question_is_answerable_by_reading(
+            plan.question, self.workspace_root, user_input
+        ):
             self._pending_upfront_question = {
                 "question": plan.question,
                 "options": list(plan.options),
@@ -1170,7 +1460,7 @@ class AgentChatLoop:
         short confirmation, and an unverifiable change is left untouched. Safe
         lightweight checks run interactively; automatic repair is autonomous-only.
         A verifier error never breaks the turn."""
-        if not _VERIFY_GATE_ENABLED or not written_files:
+        if not self.verify_changes or not _VERIFY_GATE_ENABLED or not written_files:
             return content
         try:
             outcome = await asyncio.get_event_loop().run_in_executor(
@@ -1245,7 +1535,8 @@ class AgentChatLoop:
                 )
                 return (
                     f"{content}\n\n[verified after repair] The first check failed "
-                    f"({outcome.summary}), so I ran one repair pass; it now passes: {repaired.summary}"
+                    f"({outcome.summary}), so I ran bounded repair iterations; "
+                    f"it now passes: {repaired.summary}"
                 ).strip()
             return (
                 f"{content}\n\n⚠ I could not confirm these changes: {outcome.summary} "
@@ -1259,7 +1550,7 @@ class AgentChatLoop:
         return f"{content}\n\n[verified] {outcome.summary}".strip()
 
     async def _attempt_repair(self, written_files: list[str]):
-        """Run one strict repair pass over the files this run wrote.
+        """Run bounded strict repair iterations over scoped editable files.
 
         Returns the repair's VerifyOutcome, or None when repair is disabled,
         unavailable (no schema-capable LLM), or errored - the caller then keeps
@@ -1277,11 +1568,22 @@ class AgentChatLoop:
             # no event loop, the same shape as repl._pipeline_generate.
             from shamsu.llm.manager import LLMManager
 
-            return asyncio.run(
-                LLMManager(session_logger=session_logger).generate_structured(
-                    "coder", system, user, schema
+            async def _bounded_generate() -> str:
+                return await asyncio.wait_for(
+                    LLMManager(
+                        session_logger=session_logger,
+                        action_ledger=self.action_ledger,
+                    ).generate_structured(
+                        "coder",
+                        system,
+                        user,
+                        schema,
+                        num_predict=_REPAIR_MODEL_MAX_OUTPUT_TOKENS,
+                    ),
+                    timeout=_REPAIR_MODEL_TIMEOUT_SECONDS,
                 )
-            )
+
+            return asyncio.run(_bounded_generate())
 
         try:
             from shamsu.verify.gate import verify_and_repair
@@ -1293,9 +1595,10 @@ class AgentChatLoop:
                     list(written_files),
                     generate=_generate_sync,
                     command_runner=self.tools.command_runner,
-                    max_attempts=1,
+                    max_attempts=3,
                     lightweight=True,
                     session_logger=session_logger,
+                    action_ledger=self.action_ledger,
                 ),
             )
         except Exception as exc:
@@ -1310,6 +1613,43 @@ class AgentChatLoop:
                 except Exception:
                     pass
             return None
+
+    async def _run_scoped_repair_handoff(
+        self, repair_targets: list[str], round_index: int
+    ) -> AgentLoopResult | None:
+        """Hand grounded repair targets from broad chat to strict verification."""
+        self._emit_trace(
+            "workflow.recovering",
+            "Evidence gathered without a mutation; handing scoped targets to the "
+            "verifier-driven repair loop.",
+            {"category": "strict_repair_handoff", "targets": repair_targets},
+        )
+        repaired = await self._attempt_repair(repair_targets)
+        if repaired is None:
+            return None
+        if repaired.verified:
+            final = (
+                "[verified after repair] The chat loop gathered the relevant evidence but did "
+                "not apply an edit, so the scoped strict repair loop took over. "
+                f"{repaired.summary}"
+            )
+            self._audit_final(final)
+            return AgentLoopResult(
+                final=final,
+                tool_rounds=round_index,
+                changed_files=tuple(repair_targets),
+            )
+        final = (
+            "The verifier-driven repair loop could not confirm a repair within its bounded "
+            f"attempts. {repaired.summary} Treat the target files as UNCONFIRMED."
+        )
+        self._audit_final(final)
+        return AgentLoopResult(
+            final=final,
+            tool_rounds=round_index,
+            stopped=True,
+            changed_files=tuple(repair_targets),
+        )
 
     def _timeout_category(self, round_index: int, ran_any_tool: bool) -> str:
         """Classify a model-call timeout so the CLI/logs stop blaming the GPU
@@ -1421,7 +1761,7 @@ class AgentChatLoop:
     ) -> AgentLoopResult:
         pending = dict(pending or {})
         pending.setdefault("awaiting", "user_input")
-        pending["created_from_prompt"] = original_input
+        pending["created_from_prompt"] = self.original_user_request or original_input
         if self.session_logger:
             self.session_logger.set_pending_question(pending)
         if self.action_ledger:
@@ -1440,6 +1780,35 @@ class AgentChatLoop:
         )
         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True, awaiting_user=True)
 
+    def _creation_target_not_found(
+        self, arguments: dict[str, Any], result: Any, original_input: str
+    ) -> str:
+        """The request's target file, when a search just proved it absent.
+
+        Returns "" unless the request asked to create a file, the search was
+        for that file, and it turned up nothing.
+        """
+        request = self.original_user_request or original_input
+        if not _CREATE_INTENT_RE.search(request or ""):
+            return ""
+        targets = file_targets(request)
+        if not targets:
+            return ""
+        data = getattr(result, "data", None) or {}
+        if isinstance(data, dict):
+            if data.get("count") or data.get("candidates") or data.get("matches"):
+                return ""
+        query = str(arguments.get("query") or arguments.get("filepath") or "").strip()
+        if not query:
+            return ""
+        needle = query.replace("\\", "/").lower()
+        for target in sorted(targets):
+            normalized = target.replace("\\", "/").lower()
+            if needle in normalized or normalized.endswith(needle):
+                if not (self.workspace_root / target).exists():
+                    return target
+        return ""
+
     def _read_failure_correction(
         self, filepath: str, message: str, user_request: str = ""
     ) -> str:
@@ -1454,10 +1823,22 @@ class AgentChatLoop:
                 candidates = []
         # Drop an exact self-match so we don't suggest the very path that failed.
         candidates = [candidate for candidate in candidates if candidate != filepath]
-        if not candidates and _request_explicitly_creates_path(user_request, filepath):
+        sole_target = str(
+            getattr(self.tools, "sole_allowed_write_path", lambda: "")() or ""
+        ).replace("\\", "/")
+        requested_path = filepath.replace("\\", "/").lstrip("./")
+        exact_scoped_target = bool(
+            sole_target
+            and (
+                sole_target == requested_path
+                or sole_target.endswith("/" + requested_path)
+            )
+        )
+        if exact_scoped_target or _request_explicitly_creates_path(user_request, filepath):
             return (
                 f"read_file {filepath} confirmed that the requested new file does not exist. "
-                f"The user explicitly asked to create {filepath}; call write_file now with its complete "
+                f"The orchestrated step explicitly targets {sole_target or filepath}; call write_file "
+                "now with its complete "
                 "implementation. Do not ask whether to create it and do not modify another file."
             )
         if len(candidates) == 1:
@@ -1471,6 +1852,13 @@ class AgentChatLoop:
                 f"read_file {filepath} failed ({message}) and several files match: {listed}. "
                 "Call ask_user with these as options so the user can choose, or read_file the correct "
                 "one. Do NOT guess between them."
+            )
+        if bool(getattr(self.tools, "has_scoped_reads", lambda: False)()):
+            return (
+                f"read_file {filepath} failed ({message}) and no matching file exists inside the "
+                "active project. Do not inspect or ask about files from other projects. If this "
+                "milestone needs the file, call write_file with its complete implementation under "
+                "the active project root; otherwise continue with another in-scope project file."
             )
         # No candidate matched. Sending a small model hunting ("use find_file")
         # is one more hop it fumbles - and the light tier was observed ECHOING
@@ -1582,6 +1970,23 @@ def _request_requires_workspace_change(prompt: str) -> bool:
     return bool(_WORKSPACE_CHANGE_RE.search(text))
 
 
+def _request_is_verification_repair(prompt: str) -> bool:
+    """Identify scoped fix/debug requests suitable for deterministic repair.
+
+    Feature creation still belongs to the normal ReAct loop. This handoff is
+    reserved for requests that explicitly combine repair language with failing
+    tests, errors, or a verification command.
+    """
+    lowered = " ".join((prompt or "").lower().split())
+    repair_signal = re.search(r"\b(fix|repair|debug|resolve|correct|failing)\b", lowered)
+    verification_signal = re.search(
+        r"\b(test|tests|pytest|vitest|error|failure|traceback|verify|verification|"
+        r"compile|build)\b|manage\.py\s+test|npm\s+(?:run\s+)?test",
+        lowered,
+    )
+    return bool(repair_signal and verification_signal)
+
+
 def _missing_mutation_final(model_response: str) -> str:
     detail = " ".join((model_response or "").strip().split())
     suffix = f" The model's response was: {detail[:300]}" if detail else ""
@@ -1608,12 +2013,330 @@ def _mutation_evidence_final(written_files: list[str]) -> str:
     )
 
 
+_CONTENT_QUESTION_RE = re.compile(
+    r"\b(what|purpose|about|contain|contains|describe|explain|summar\w*|say|says|detail\w*)\b",
+    re.IGNORECASE,
+)
+_USER_CHOICE_RE = re.compile(
+    r"\b(or|instead|prefer|choose|pick|which one|rather|option [ab12])\b",
+    re.IGNORECASE,
+)
+
+
+_CREATE_INTENT_RE = re.compile(
+    # Edit verbs count too: "replace the line X with Y in config/urls.py" has
+    # named its target just as firmly as "create X", and the same stall came
+    # back as "should the routes go before or after?" when the prompt showed
+    # the order (observed live 2026-08-02).
+    r"\b(creat\w*|writ\w*|add|adds|adding|make|makes|making|generat\w*|"
+    r"scaffold\w*|implement\w*|build\w*|replac\w*|rewrit\w*|updat\w*|"
+    r"modif\w*|fix\w*|edit\w*|insert\w*|remov\w*|delet\w*)\b",
+    re.IGNORECASE,
+)
+
+
+_TARGET_QUESTION_RE = re.compile(
+    r"\b(full path|path|paths|director\w*|folder|location|where|"
+    r"creat\w*|exist\w*|overwrit\w*|file ?name|which file|this file)\b",
+    re.IGNORECASE,
+)
+
+
+def _question_stalls_a_named_write(
+    question: str,
+    user_request: str,
+    wrote_anything: bool,
+    options: Sequence[Any] = (),
+) -> bool:
+    """True when ask_user cannot yet be a real question.
+
+    Matching question *phrasings* is a losing game - the same non-question
+    arrived live on 2026-08-02 as "should I create it?", "do you want to
+    create the manage.py file in this directory?" and "could you please
+    provide the full path to manage.py", each ending the turn having written
+    nothing. Gate on the situation instead: a request that names the file to
+    create has already answered both "which file" and "may I", so until
+    something has been written there is nothing to ask about. A genuine
+    either/or choice still reaches the user.
+
+    Only create/write requests qualify. "read the file src/App.tsx" is
+    genuinely ambiguous when two such files exist, and a question offering
+    concrete alternatives is a real choice whatever the request said.
+    """
+    if wrote_anything:
+        return False
+    if len(options or ()) >= 2:
+        return False
+    if _USER_CHOICE_RE.search(question or ""):
+        return False
+    if not _CREATE_INTENT_RE.search(user_request or ""):
+        return False
+    # The question must be about the *target* - which path, may I create it,
+    # does it exist. A question about a VALUE ("which port?" for "fix the
+    # server port in app.py") is a real one however firmly the file is named,
+    # and suppressing it answers the user's decision for them.
+    if not _TARGET_QUESTION_RE.search(question or ""):
+        return False
+    return bool(file_targets(user_request or ""))
+
+
+def _question_is_answerable_by_reading(
+    question: str, workspace_root: Path, user_input: str = ""
+) -> bool:
+    """True when the planner's question is answerable from a document present.
+
+    Asking "What is the main purpose of canvas lite.pdf?" - or "What is the
+    primary purpose of the app?" when the request pointed at a spec - spends
+    the whole turn on something one read-only call answers. Observed live
+    2026-08-02: two plan attempts ended with ZERO tool calls because this gate
+    fired before any reading happened.
+
+    The document may be named in the QUESTION or only in the REQUEST, so both
+    are checked. Asking the user to CHOOSE between alternatives is still their
+    decision and is left alone, and the loop can always call ask_user later if
+    the document turns out not to answer it.
+    """
+    text = str(question or "").strip()
+    if not text or not _CONTENT_QUESTION_RE.search(text) or _USER_CHOICE_RE.search(text):
+        return False
+    try:
+        from shamsu.tools.workspace import WorkspaceTool
+
+        tool = WorkspaceTool(workspace_root)
+        return bool(tool.names_in_text(text) or tool.names_in_text(user_input))
+    except Exception:
+        return False
+
+
 def _looks_like_deferred_action(content: str) -> bool:
     """True when a tool-less reply merely *promises* a tool action."""
     text = " ".join(content.strip().lower().split())
     if not text:
         return False
     return any(re.search(pattern, text) for pattern in _DEFERRED_ACTION_PATTERNS)
+
+
+def _promised_read_tool_call(content: str) -> dict[str, Any] | None:
+    """Turn an explicit, safe read promise into the tool call a small model omitted."""
+    matches = list(re.finditer(
+        r"\b(?:read(?:ing)?|open(?:ing)?|inspect(?:ing)?)\s+(?:the\s+)?"
+        r"[`\"'](?P<path>[^`\"'\r\n]+\.[A-Za-z0-9_]{1,12})[`\"']",
+        content or "",
+        re.IGNORECASE,
+    ))
+    if not matches:
+        return None
+    # Small models often summarize the prior read before promising the next
+    # one. The final explicit read phrase is the action they intend now.
+    match = matches[-1]
+    filepath = match.group("path").strip()
+    return {
+        "id": f"salvaged_read_{sha256(filepath.encode('utf-8')).hexdigest()[:10]}",
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "arguments": {"filepath": filepath},
+        },
+    }
+
+
+_MUTATION_PROMISE_RE = re.compile(
+    # The optional `_file` matters: models narrate the call itself ("write_file
+    # with filepath 'library/urls.py'"), and `\bwrite\b` cannot match inside
+    # `write_file`, so the promise went unrecognised and nothing was salvaged.
+    r"\b(?:writ(?:e|ing)|creat(?:e|ing)|sav(?:e|ing)|updat(?:e|ing)|edit(?:ing)?|"
+    r"implement(?:ing)?|overwrit(?:e|ing)|add(?:ing)?)(?:_file)?\b"
+    r"[^.\r\n]{0,80}?"
+    r"[`\"']?[\w][\w./\\-]*\.[A-Za-z0-9_]{1,12}[`\"']?",
+    re.IGNORECASE,
+)
+_PROSE_FILE_TOKEN_RE = re.compile(r"[\w][\w./\\-]*\.[A-Za-z0-9_]{1,12}\b")
+_SINGLE_FENCE_RE = re.compile(r"```[^\r\n]*\r?\n(?P<body>.*?)```", re.DOTALL)
+
+
+# Files at or below this size are always rewritten whole rather than patched.
+# Measured 2026-08-02: every `edit_file` attempt failed on an `old_string`
+# mismatch (five on one line of urls.py), while every whole-file `write_file`
+# landed first try. Aider's benchmarks show the same - edit format alone swung
+# GPT-4 Turbo 26% -> 59%, and weak models exceed 50% patch failure.
+_WHOLE_FILE_MAX_BYTES = _os_env_int("SHAMSU_WHOLE_FILE_MAX_BYTES", 8000, 200)
+
+
+def edit_tools_for_target(
+    target: str, workspace_root: Path, available: Sequence[str]
+) -> tuple[str, ...]:
+    """The mutation tools to offer for a single-file turn.
+
+    Small or missing files get `write_file` only: withholding the patch tools
+    is what actually changes behaviour. Telling the model to prefer whole-file
+    writes did not - it reached for `append_file` anyway and appended a route
+    outside `urlpatterns`.
+    """
+    mutators = {"write_file", "edit_file", "append_file"}
+    try:
+        size = (Path(workspace_root) / target).stat().st_size
+    except OSError:
+        size = 0
+    whole_file_only = size <= _WHOLE_FILE_MAX_BYTES
+    return tuple(
+        name
+        for name in available
+        if name not in mutators or (name == "write_file" or not whole_file_only)
+    )
+
+
+def _is_unparseable_python(path: Path, source: str) -> bool:
+    """True for a .py file that does not currently compile."""
+    if path.suffix.lower() != ".py":
+        return False
+    try:
+        compile(source, str(path), "exec")
+    except SyntaxError:
+        return True
+    except (ValueError, TypeError):
+        return False
+    return False
+
+
+def _promised_write_tool_call(
+    content: str, workspace_root: Path, user_request: str = ""
+) -> dict[str, Any] | None:
+    """Turn a prose-only mutation promise plus its code fence into the
+    write_file call a small model omitted.
+
+    The 2026-08-01 dogfood showed 7B coders repeatedly *promising* an
+    edit_file call, showing the finished file in a fence, and emitting no tool
+    call - reads had a salvager for this, mutations did not. Conservative on
+    purpose: exactly one fence, exactly one promised path, and for an existing
+    file the fence must read as a full replacement (at least as long as the
+    current content and containing its first meaningful line) so a snippet can
+    never clobber a file."""
+    text = content or ""
+    fences = list(_SINGLE_FENCE_RE.finditer(text))
+    if len(fences) != 1:
+        return None
+    body = fences[0].group("body")
+    if not body.strip():
+        return None
+    prose = text[: fences[0].start()]
+    # Exactly one distinct file token in the whole promise: a reply naming a
+    # second file (another target, or a source doc) is ambiguous - skip it
+    # rather than guess which file the fence belongs to.
+    paths = {
+        match.group(0).strip().replace("\\", "/")
+        for match in _PROSE_FILE_TOKEN_RE.finditer(prose)
+    }
+    if _MUTATION_PROMISE_RE.search(prose) and len(paths) == 1:
+        filepath = next(iter(paths))
+    else:
+        # No usable promise. A model that answers "create library/.../login.html"
+        # with the finished document and *no prose at all* leaves prose empty,
+        # so there is nothing to match - yet the target is not in doubt, the
+        # request named exactly one file (observed live 2026-08-02, the reply
+        # opened directly with ```html and the whole turn was discarded).
+        request_targets = file_targets(user_request or "")
+        if len(request_targets) != 1:
+            return None
+        filepath = next(iter(request_targets)).replace("\\", "/")
+    try:
+        target = (Path(workspace_root) / filepath).resolve()
+        target.relative_to(Path(workspace_root).resolve())
+    except (OSError, ValueError):
+        return None
+    if target.is_file():
+        try:
+            existing = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        # These two guards stop a snippet clobbering a good file: the rewrite
+        # must be at least as long and must keep the current first line. A
+        # file that does not parse has nothing worth protecting, and a repair
+        # necessarily breaks both rules - it removes the bad line (so the first
+        # line changes) and is therefore shorter. Refusing there blocked the
+        # only fix that mattered: a stray "import path from django.urls"
+        # survived five rewrite attempts live on 2026-08-02.
+        # A template converted to `{% extends %}` legitimately drops the
+        # document it used to own - doctype, <html>, <head> and all - so it is
+        # both shorter and missing the old first line. The guard refused that
+        # rewrite three times running.
+        converting_to_extends = body.lstrip().startswith(
+            ("{% extends", "{%extends")
+        ) and not existing.lstrip().startswith(("{% extends", "{%extends"))
+        if not converting_to_extends and not _is_unparseable_python(target, existing):
+            existing_lines = [line for line in existing.splitlines() if line.strip()]
+            body_line_count = len([line for line in body.splitlines() if line.strip()])
+            if existing_lines and (
+                body_line_count < len(existing_lines)
+                or existing_lines[0].strip() not in body
+            ):
+                return None
+    if not body.endswith("\n"):
+        body += "\n"
+    return {
+        "id": f"salvaged_write_{sha256(filepath.encode('utf-8')).hexdigest()[:10]}",
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "arguments": {"filepath": filepath, "content": body},
+        },
+    }
+
+
+_MAX_TRUNCATION_RECOVERIES = 3
+# Python syntax errors that mean "the file stops mid-construct", as opposed to
+# an ordinary typo. These are what a cut-off generation produces.
+_TRUNCATION_ERROR_MARKERS = (
+    "unterminated string literal",
+    "unterminated triple-quoted string literal",
+    "was never closed",
+    "unexpected eof",
+    "expected an indented block",
+    "incomplete input",
+)
+
+
+def _truncated_write_correction(workspace_root: Path, relative_path: str) -> str:
+    """Ask for the remainder when a just-written file stops mid-construct.
+
+    A successful write is not a finished file: a 7B commonly runs out of output
+    room part-way through, leaving an unterminated string or an unclosed
+    bracket. Live 2026-08-02 this produced a 35-byte `settings.py` and a
+    `manage.py` with `SyntaxError: unterminated string literal`, each of which
+    ended the turn looking like success. Only Python is checked, and only for
+    errors that specifically mean "cut off".
+    """
+    path = str(relative_path or "").strip()
+    if not path or not path.lower().endswith(".py"):
+        return ""
+    try:
+        target = (Path(workspace_root) / path).resolve()
+        target.relative_to(Path(workspace_root).resolve())
+        source = target.read_text(encoding="utf-8")
+    except (OSError, ValueError, UnicodeError):
+        return ""
+    if not source.strip():
+        return ""
+    try:
+        compile(source, path, "exec")
+    except SyntaxError as exc:
+        message = str(getattr(exc, "msg", "") or exc).lower()
+        if not any(marker in message for marker in _TRUNCATION_ERROR_MARKERS):
+            return ""
+    except ValueError:
+        return ""
+    else:
+        return ""
+    tail = "\n".join(source.splitlines()[-12:])
+    return (
+        f"{path} was written but STOPS PART-WAY THROUGH - it does not parse: the "
+        "content is cut off mid-construct, so the file is unusable as written. Do "
+        "not re-send the whole file (that is what truncated). Call append_file on "
+        f"{path} with ONLY the missing remainder, continuing exactly from where "
+        "this current tail ends, and close every open string, bracket and block:\n"
+        "--- current end of file ---\n"
+        f"{tail}\n"
+        "--- end ---"
+    )
 
 
 def _repetition_correction(tool_name: str) -> str:
@@ -1659,6 +2382,7 @@ def _edit_failure_correction(
     *,
     old_string: str = "",
     new_string: str = "",
+    append_available: bool = True,
 ) -> str:
     """Steer the model past the two common edit_file failures.
 
@@ -1670,10 +2394,26 @@ def _edit_failure_correction(
     """
     lowered = message.lower()
     if not old_string and new_string:
+        # Naming only the ambiguity ("read the file, then decide") left a 7B
+        # model repeating the identical empty-anchor call until the run hit its
+        # deadlock timeout - observed live 2026-08-01 adding AUTH_USER_MODEL to
+        # settings.py. Still refuse to ASSUME which was meant; enumerate both
+        # branches concretely so either one is a single next call.
+        add_option = (
+            "to ADD it as new content, call append_file with the same filepath and this content"
+            if append_available
+            else (
+                "to ADD it as new content, call read_file and then edit_file with old_string "
+                "anchored on the exact line it should follow and new_string containing that "
+                "line plus your addition"
+            )
+        )
         how = (
-            "An empty old_string is not a valid replacement anchor. Since you are adding content "
-            "to the end of an existing file, call append_file with filepath and content=new_string. "
-            "Do not retry edit_file with an empty old_string."
+            "An empty old_string is not a valid replacement anchor and does not reveal whether "
+            f"you intended to add or replace content. Decide explicitly: {add_option}; to "
+            "REPLACE existing content, call read_file and use an exact old_string copied from "
+            "it. Do not retry the empty anchor. If a targeted change remains difficult, call "
+            "write_file with the complete corrected file."
         )
     elif old_string == new_string and old_string:
         how = (
@@ -1697,10 +2437,19 @@ def _edit_failure_correction(
             + exact_blocks
         )
     elif "not found" in lowered or "no match" in lowered or "does not appear" in lowered:
+        current_excerpt = str((data or {}).get("current_excerpt") or "").strip()
+        exact_source = (
+            " The tool already returned this exact current source excerpt; use text from it "
+            "as the next old_string:\n--- current source ---\n"
+            + current_excerpt
+            + "\n--- end current source ---"
+            if current_excerpt
+            else ""
+        )
         how = (
-            "That old_string was not found verbatim. Call read_file on the file first and "
-            "copy the EXACT current text (whitespace included) into old_string, or use "
-            "write_file with the entire corrected file."
+            "That old_string was not found verbatim. Copy EXACT current text (whitespace "
+            "included) into old_string, or use write_file with the entire corrected file."
+            + exact_source
         )
     else:
         how = (
@@ -1750,6 +2499,67 @@ def _read_failure_correction(
         'Do NOT say "I will read..." or "let me read..." without emitting a read_file tool call in '
         "the SAME response, and do NOT claim you read or know the contents of that file."
     )
+
+
+_PERMISSION_QUESTION_RE = re.compile(
+    # "me" is optional: models phrase the same non-question both as "do you
+    # want me to create X" and "do you want to create X" (observed live
+    # 2026-08-02, the latter form slipped through and wrote nothing).
+    r"\b(should i|shall i|shall we|do you want (?:me )?to|would you like (?:me )?to|"
+    r"may i|can i|ok to|is it ok|proceed\?)\b",
+    re.IGNORECASE,
+)
+# "Where should settings.py be created?" / "Which directory ...?" - a location
+# question whose answer is the path already written in the request.
+_LOCATION_QUESTION_RE = re.compile(
+    r"\b(where|which director|which folder|what path|which path|what director)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def _asks_permission_already_granted(question: str, user_request: str) -> bool:
+    """True when ask_user re-requests information the request already gave.
+
+    A model answering "Create the file core/models.py" with "that file does not
+    exist, should I create it?" - or "where should it be created?" - has asked
+    nothing: the request is the answer, and each such turn ends having written
+    nothing (observed live 2026-08-02, twice). A real choice between
+    alternatives ("sessions or JWT?") is untouched.
+    """
+    text = str(question or "").strip()
+    if not text:
+        return False
+    if _USER_CHOICE_RE.search(text):
+        # "Should I use sessions or JWT?" is permission-shaped but is a real
+        # decision between alternatives - that still belongs to the user.
+        return False
+    asks_permission = bool(_PERMISSION_QUESTION_RE.search(text))
+    asks_location = bool(_LOCATION_QUESTION_RE.search(text))
+    if not asks_permission and not asks_location:
+        return False
+    for match in _PROSE_FILE_TOKEN_RE.finditer(text):
+        token = match.group(0)
+        if not _request_explicitly_creates_path(user_request, token):
+            continue
+        if asks_permission:
+            return True
+        # A location question is answered only when the request states a path
+        # with a directory, not just a bare filename.
+        if _request_states_directory_for(user_request, token):
+            return True
+    return False
+
+
+def _request_states_directory_for(user_request: str, token: str) -> bool:
+    """Whether the request names *token* with an explicit directory component."""
+    basename = _basename(token.replace("\\", "/")).lower()
+    if not basename:
+        return False
+    pattern = re.escape(basename)
+    for match in re.finditer(rf"[\w./\\-]*{pattern}", user_request, re.IGNORECASE):
+        if "/" in match.group(0).replace("\\", "/").strip("/"):
+            return True
+    return False
 
 
 def _request_explicitly_creates_path(user_request: str, filepath: str) -> bool:
@@ -1904,8 +2714,9 @@ def _tool_call_id(call: dict[str, Any], fallback: str) -> str:
 
 
 _ADDITIONAL_FILE_WRITE_RE = re.compile(
-    r"\b(?:create|write|save|add|update|edit)\s+(?:a\s+|the\s+)?"
-    r"(?:file\s+)?[`'\"]?[\w./\\-]+\.[A-Za-z0-9_]{1,12}",
+    r"\b(?:create|write|save|add|update|edit)\b"
+    r"[^\r\n`]{0,120}(?:to|in|at|as)?\s*[`'\"]?"
+    r"[\w./\\-]+\.[A-Za-z0-9_]{1,12}",
     re.IGNORECASE,
 )
 

@@ -8,6 +8,8 @@ injected so the control flow is unit-testable without Ollama or a real build.
 """
 from __future__ import annotations
 
+import ast
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -37,6 +39,10 @@ if TYPE_CHECKING:
 
 _INSPECT_WINDOW = 40
 _IMPORT_KINDS = {ErrorKind.IMPORT_ERROR, ErrorKind.MODULE_NOT_FOUND}
+_TEST_FILE_RE = re.compile(r"(?:^|/)(?:tests?/|test_[^/]+\.py$)|\.(?:test|spec)\.[cm]?[jt]sx?$", re.I)
+_JS_IMPORT_RE = re.compile(
+    r"(?:from\s+|import\s*\(\s*|require\s*\(\s*)['\"](?P<module>\.{1,2}/[^'\"]+)['\"]"
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,7 @@ class RepairLoop:
         session_logger: SessionLogger | None = None,
         digest: DiagnosticDigest | None = None,
         action_ledger: "ActionLedger | None" = None,
+        editable_files: list[str] | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.verifier = verifier
@@ -120,6 +127,11 @@ class RepairLoop:
         self.comparator = ErrorComparator()
         self.blocker = RepeatedActionBlocker()
         self.transactions = TransactionWorkspace(self.workspace_root)
+        self.editable_files = (
+            {path for item in editable_files if (path := self._relative_path(item))}
+            if editable_files is not None
+            else None
+        )
 
     def run(self) -> RepairResult:
         attempts: list[RepairAttemptRecord] = []
@@ -148,13 +160,75 @@ class RepairLoop:
                 stopped_reason = "model produced no actionable repair plan"
                 break
 
-            # Enforce: never edit a file the model was not shown.
+            normalized_target = self._relative_path(plan.target_file)
+            if not normalized_target:
+                stopped_reason = f"model proposed a path outside the workspace: {plan.target_file}"
+                break
+            if normalized_target != plan.target_file:
+                plan = RepairPlan(
+                    root_cause=plan.root_cause,
+                    target_file=normalized_target,
+                    search=plan.search,
+                    replace=plan.replace,
+                    full_content=plan.full_content,
+                    inspected_files=plan.inspected_files,
+                )
+
+            # Enforce: never edit read-only evidence or an uninspected file.
             inspected_files = {snippet.file for snippet in context.inspected}
             if plan.target_file not in inspected_files:
                 stopped_reason = (
                     f"model tried to edit an uninspected file: {plan.target_file}"
                 )
                 break
+            if plan.target_file not in set(context.editable_files):
+                stopped_reason = f"model tried to edit a read-only evidence file: {plan.target_file}"
+                break
+
+            relevance_error = _plan_relevance_error(primary, plan)
+            if relevance_error:
+                deterministic_plan = _deterministic_unique_fixture_plan(
+                    self.workspace_root, primary, plan.target_file
+                )
+                if deterministic_plan is not None:
+                    plan = deterministic_plan
+                    self._log(
+                        "repair.deterministic_plan",
+                        {
+                            "target_file": plan.target_file,
+                            "reason": plan.root_cause,
+                            "rejected_model_plan": relevance_error,
+                        },
+                    )
+                    if self.action_ledger:
+                        self.action_ledger.log_event(
+                            "deterministic_repair_plan_created",
+                            target_file=plan.target_file,
+                            reason=plan.root_cause,
+                            rejected_model_plan=relevance_error,
+                        )
+                else:
+                    before_signature = primary.signature()
+                    history.append(
+                        PreviousAttempt(
+                            files_changed=[],
+                            before_signature=before_signature,
+                            after_signature=before_signature,
+                            outcome=RepairOutcome.UNCHANGED,
+                            note=relevance_error,
+                        )
+                    )
+                    self._record(
+                        attempts,
+                        index,
+                        [],
+                        before_signature,
+                        before_signature,
+                        RepairOutcome.UNCHANGED,
+                        kept=False,
+                        note=relevance_error,
+                    )
+                    continue
 
             signature = action_signature([plan.target_file], plan.payload())
             if self.blocker.is_blocked(signature):
@@ -214,7 +288,7 @@ class RepairLoop:
                 before_signature=before_signature,
                 after_signature=after_signature,
                 outcome=outcome,
-                note="rolled back",
+                note=_failed_plan_note(plan),
             ))
 
         # Exhausted or stopped: report from verifier ground truth only.
@@ -272,10 +346,14 @@ class RepairLoop:
             fix = suggest_import_fix(self.workspace_root, primary.file, primary.module)
             if fix:
                 suggestion = fix.describe()
+        inspected = self._inspect(primary)
+        inspected_files = {snippet.file for snippet in inspected}
+        editable = self.editable_files if self.editable_files is not None else inspected_files
         return DebugContext(
             primary_error=primary,
             verify_command=self.verifier.command,
-            inspected=self._inspect(primary),
+            inspected=inspected,
+            editable_files=sorted(editable & inspected_files),
             previous_attempts=list(history),
             import_suggestion=suggestion,
         )
@@ -301,12 +379,14 @@ class RepairLoop:
             resolved = resolve_module_path(self.workspace_root, primary.file, primary.module)
             if resolved:
                 targets.append((resolved, 1))
+        targets.extend(self._related_test_dependencies(primary.file))
         return targets
 
     def _read_window(self, file_path: str, line: int) -> InspectedSnippet | None:
-        target = (self.workspace_root / file_path).resolve()
+        raw_target = Path(file_path)
+        target = raw_target.resolve() if raw_target.is_absolute() else (self.workspace_root / raw_target).resolve()
         try:
-            target.relative_to(self.workspace_root)
+            relative = target.relative_to(self.workspace_root).as_posix()
             lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
         except (OSError, ValueError):
             return None
@@ -314,8 +394,99 @@ class RepairLoop:
         end = min(line + _INSPECT_WINDOW, len(lines))
         content = "\n".join(lines[start - 1:end])
         return InspectedSnippet(
-            file=Path(file_path).as_posix(), line_start=start, line_end=end, content=content
+            file=relative, line_start=start, line_end=end, content=content
         )
+
+    def _relative_path(self, file_path: str) -> str:
+        """Return one normalized workspace-relative path, or empty if unsafe."""
+        try:
+            raw = Path(str(file_path).replace("\\", "/"))
+            target = raw.resolve() if raw.is_absolute() else (self.workspace_root / raw).resolve()
+            return target.relative_to(self.workspace_root).as_posix()
+        except (OSError, ValueError):
+            return ""
+
+    def _related_test_dependencies(self, file_path: str) -> list[tuple[str, int]]:
+        """Inspect bounded local dependencies when a failure points into a test.
+
+        Tests frequently fail because their fixture no longer matches a model,
+        schema, component, or API. Supplying the imported implementation as
+        read-only evidence lets a small model repair the test without granting
+        permission to rewrite production code.
+        """
+        relative = self._relative_path(file_path)
+        if not relative or not _TEST_FILE_RE.search(relative):
+            return []
+        source_path = self.workspace_root / relative
+        try:
+            source = source_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+        if source_path.suffix == ".py":
+            return self._python_test_dependencies(source_path, source)
+        if source_path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            return self._js_test_dependencies(source_path, source)
+        return []
+
+    def _python_test_dependencies(self, source_path: Path, source: str) -> list[tuple[str, int]]:
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        targets: list[tuple[str, int]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level <= 0:
+                continue
+            base = source_path.parent
+            for _ in range(node.level - 1):
+                base = base.parent
+            module_parts = (node.module or "").split(".") if node.module else []
+            candidate = base.joinpath(*module_parts)
+            resolved = self._resolve_python_module(candidate)
+            if not resolved:
+                continue
+            line = self._python_symbol_line(resolved, [alias.name for alias in node.names])
+            targets.append((str(resolved), line))
+            if len(targets) >= 3:
+                break
+        return targets
+
+    @staticmethod
+    def _resolve_python_module(candidate: Path) -> Path | None:
+        file_candidate = candidate.with_suffix(".py")
+        if file_candidate.is_file():
+            return file_candidate
+        package_candidate = candidate / "__init__.py"
+        return package_candidate if package_candidate.is_file() else None
+
+    @staticmethod
+    def _python_symbol_line(file_path: Path, symbols: list[str]) -> int:
+        try:
+            tree = ast.parse(file_path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            return 1
+        wanted = set(symbols)
+        lines = [
+            node.lineno
+            for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name in wanted
+        ]
+        return min(lines, default=1)
+
+    def _js_test_dependencies(self, source_path: Path, source: str) -> list[tuple[str, int]]:
+        targets: list[tuple[str, int]] = []
+        extensions = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+        for match in _JS_IMPORT_RE.finditer(source):
+            candidate = (source_path.parent / match.group("module")).resolve()
+            choices = [candidate] if candidate.suffix else [candidate.with_suffix(ext) for ext in extensions]
+            choices.extend(candidate / f"index{ext}" for ext in extensions)
+            resolved = next((choice for choice in choices if choice.is_file()), None)
+            if resolved and self._relative_path(str(resolved)):
+                targets.append((str(resolved), 1))
+            if len(targets) >= 3:
+                break
+        return targets
 
     def _record(
         self,
@@ -376,3 +547,117 @@ def _packet_signature(packet: ErrorPacket) -> str:
     if primary is not None:
         return primary.signature()
     return f"exit={packet.exit_code}"
+
+
+def _failed_plan_note(plan: RepairPlan, limit: int = 600) -> str:
+    """Give the next repair iteration the concrete strategy that was rejected."""
+    if plan.search:
+        detail = f"rolled back search {plan.search!r} -> {plan.replace!r}"
+    else:
+        detail = f"rolled back full_content rewrite for {plan.target_file}"
+    if len(detail) <= limit:
+        return detail
+    return detail[:limit].rstrip() + "...<truncated>"
+
+
+def _plan_relevance_error(primary: RepairError, plan: RepairPlan) -> str:
+    """Reject patches that plainly change an unrelated field for a named constraint."""
+    match = re.search(
+        r"constraint failed:\s*[\w.]+\.(?P<field>[A-Za-z_]\w*)",
+        primary.message,
+        re.IGNORECASE,
+    )
+    if not match:
+        return ""
+    field = match.group("field")
+    fixture_field = field.removesuffix("_id")
+    replacement = plan.full_content or plan.replace
+    if re.search(rf"\b{re.escape(fixture_field)}\b", replacement):
+        return ""
+    # Reusing/removing a duplicate constructor can resolve a uniqueness error
+    # without spelling the constrained field in the replacement.
+    if ".objects.create" in plan.search and ".objects.create" not in replacement:
+        return ""
+    return (
+        f"rejected before apply: verifier names constraint field `{field}`, but the patch "
+        f"does not modify fixture field `{fixture_field}`. Changing an unrelated field "
+        "cannot resolve this diagnostic; use a different strategy."
+    )
+
+
+def _deterministic_unique_fixture_plan(
+    workspace_root: Path, primary: RepairError, target_file: str
+) -> RepairPlan | None:
+    """Add a named UNIQUE text field to the matching constructor in a Python test."""
+    match = re.search(
+        r"unique constraint failed:\s*(?P<table>[\w.]+)\.(?P<field>[A-Za-z_]\w*)",
+        primary.message,
+        re.IGNORECASE,
+    )
+    normalized_target = target_file.replace("\\", "/")
+    if not match or not _TEST_FILE_RE.search(normalized_target) or not normalized_target.endswith(".py"):
+        return None
+    field = match.group("field")
+    if field not in {"username", "email", "slug", "code", "name"}:
+        return None
+    entity = match.group("table").split(".")[-1].split("_")[-1]
+    target = (workspace_root / normalized_target).resolve()
+    try:
+        target.relative_to(workspace_root)
+        source = target.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
+    except (OSError, ValueError, SyntaxError):
+        return None
+
+    candidates: list[ast.Call] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not _call_creates_entity(node, entity):
+            continue
+        end_line = getattr(node, "end_lineno", node.lineno)
+        if primary.line and not (node.lineno <= primary.line <= end_line):
+            continue
+        if any(keyword.arg == field for keyword in node.keywords):
+            continue
+        candidates.append(node)
+    if not candidates:
+        return None
+    call = min(
+        candidates,
+        key=lambda node: (
+            getattr(node, "end_lineno", node.lineno) - node.lineno,
+            getattr(node, "end_col_offset", 0) - node.col_offset,
+        ),
+    )
+    search = ast.get_source_segment(source, call)
+    if not search:
+        return None
+    try:
+        replacement_call = ast.parse(search, mode="eval").body
+    except SyntaxError:
+        return None
+    if not isinstance(replacement_call, ast.Call):
+        return None
+    value = f"test_{field}_{primary.line or call.lineno}"
+    if field == "email":
+        value = f"test_{primary.line or call.lineno}@example.com"
+    replacement_call.keywords.append(ast.keyword(arg=field, value=ast.Constant(value=value)))
+    return RepairPlan(
+        root_cause=(
+            f"Harness fallback: add unique `{field}` fixture value to the failing "
+            f"{entity} constructor named by the verifier."
+        ),
+        target_file=normalized_target,
+        search=search,
+        replace=ast.unparse(replacement_call),
+    )
+
+
+def _call_creates_entity(node: ast.Call, entity: str) -> bool:
+    function = node.func
+    if not isinstance(function, ast.Attribute) or function.attr != "create":
+        return False
+    manager = function.value
+    if not isinstance(manager, ast.Attribute) or manager.attr != "objects":
+        return False
+    owner = manager.value
+    return isinstance(owner, ast.Name) and owner.id.lower() == entity.lower()

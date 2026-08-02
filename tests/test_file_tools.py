@@ -64,6 +64,23 @@ def test_read_file_resolves_single_strong_candidate(tmp_path: Path):
     assert "export const App" in result.data["content"]
 
 
+def test_write_reuses_path_resolved_by_prior_scoped_read(tmp_path: Path):
+    existing = _write(tmp_path, "demo/backend/core/tests/test_canvas.py", "OLD = True\n")
+    registry = _registry(tmp_path)
+    registry.set_allowed_read_paths(("demo",))
+    registry.set_allowed_write_paths(("demo",))
+
+    read = registry.read_file("test_canvas.py")
+    written = registry.write_file("test_canvas.py", "OLD = False\n", overwrite=True)
+
+    assert read.ok is True
+    assert read.data["resolved_filepath"] == "demo/backend/core/tests/test_canvas.py"
+    assert written.ok is True
+    assert written.data["resolved_filepath"] == "demo/backend/core/tests/test_canvas.py"
+    assert existing.read_text(encoding="utf-8") == "OLD = False\n"
+    assert not (tmp_path / "demo/test_canvas.py").exists()
+
+
 def test_read_file_does_not_auto_pick_with_multiple_candidates(tmp_path: Path):
     _write(tmp_path, "client/src/App.tsx", "client\n")
     _write(tmp_path, "web/src/App.tsx", "web\n")
@@ -211,6 +228,7 @@ def test_edit_file_fails_when_old_string_absent(tmp_path: Path):
 
     assert result.ok is False
     assert result.data["matches"] == 0
+    assert result.data["current_excerpt"] == "print('hello')\n"
     assert (tmp_path / "greet.py").read_text(encoding="utf-8") == "print('hello')\n"
 
 
@@ -230,6 +248,26 @@ def test_edit_file_tolerates_trailing_whitespace_drift(tmp_path: Path):
     assert result.ok is True
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == (
         "def greet(name):\n    msg = 'hello'\n    return msg\n"
+    )
+
+
+def test_edit_file_indents_multiline_replacement_at_inline_anchor(tmp_path: Path):
+    _write(
+        tmp_path,
+        "models.py",
+        "class User:\n    role = field()\n    created_at = field()\n",
+    )
+    registry = _registry(tmp_path)
+
+    result = registry.edit_file(
+        "models.py",
+        "role = field()",
+        "name = field()\nrole = field()",
+    )
+
+    assert result.ok is True
+    assert (tmp_path / "models.py").read_text(encoding="utf-8") == (
+        "class User:\n    name = field()\n    role = field()\n    created_at = field()\n"
     )
 
 
@@ -483,6 +521,33 @@ async def test_loop_does_not_stop_on_prose_only_read_promise(tmp_path: Path):
     assert client.calls == 4
 
 
+@pytest.mark.asyncio
+async def test_loop_salvages_explicit_quoted_read_promise(tmp_path: Path):
+    _write(tmp_path, "seed_data.py", "SEED = True\n")
+    registry = _registry(tmp_path)
+    client = _ScriptedClient(
+        [
+            _text_response("Understood. Let's proceed with reading `seed_data.py` next."),
+            _text_response("The seed data is present."),
+        ]
+    )
+    loop = AgentChatLoop(tmp_path, client=client, tools=registry, llm=_NoPlanLLM())
+
+    result = await loop.run("inspect the seed data")
+
+    assert result.final == "The seed data is present."
+    assert client.calls == 2
+    assert any(message.role == "tool" for message in loop.state.all_messages)
+    assistant_with_call = next(
+        message
+        for message in loop.state.all_messages
+        if message.role == "assistant" and message.tool_calls
+    )
+    assert assistant_with_call.tool_calls[0]["function"]["arguments"] == {
+        "filepath": "seed_data.py"
+    }
+
+
 def test_no_candidate_read_failure_names_the_files_that_do_exist(tmp_path: Path):
     """Light-tier failure observed live: the model read the DESTINATION of a
     rename first, got the old "go use find_file" coaching, and echoed the
@@ -610,7 +675,15 @@ async def test_empty_anchor_edit_recovers_with_append_file(tmp_path: Path):
     assert result.changed_files == ("calculator.py",)
     assert "def subtract" in (tmp_path / "calculator.py").read_text(encoding="utf-8")
     user_contents = [message.content for message in loop.state.all_messages if message.role == "user"]
-    assert any("call append_file" in content for content in user_contents)
+    # The correction still refuses to ASSUME which was meant, but now spells out
+    # both branches: a 7B model given only the ambiguity repeated the identical
+    # empty-anchor call until the run timed out (live 2026-08-01).
+    assert any(
+        "does not reveal whether you intended to add or replace" in content
+        for content in user_contents
+    )
+    assert any("to ADD it as new content, call append_file" in content for content in user_contents)
+    assert any("to REPLACE existing content, call read_file" in content for content in user_contents)
     records = [
         json.loads(line)
         for line in audit.session_path.read_text(encoding="utf-8").splitlines()
