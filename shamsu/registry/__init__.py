@@ -1,4 +1,11 @@
 """Disk-backed project category registry for SHAMSU v2.3."""
+from shamsu.registry.blueprints import (
+    BlueprintResolution,
+    StackBlueprint,
+    all_blueprints,
+    blueprint_by_id,
+    resolve_blueprints,
+)
 from shamsu.registry.detector import CategoryDecision, detect_category
 from shamsu.registry.loader import load_registry_entry
 from shamsu.registry.scaffold import ScaffoldResult, scaffold_template
@@ -15,8 +22,13 @@ __all__ = [
     "RegistryEntry",
     "ScaffoldResult",
     "StackPolicy",
+    "BlueprintResolution",
+    "StackBlueprint",
+    "all_blueprints",
+    "blueprint_by_id",
     "detect_category",
     "load_registry_entry",
+    "resolve_blueprints",
     "scaffold_template",
     "stack_policy_for",
 ]

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.prd.contract import PRDContract
+from shamsu.registry.blueprints import resolve_blueprints
 
 MAX_REQUIREMENTS_PER_MILESTONE = 4
 
@@ -193,6 +194,7 @@ def is_complex_prd_contract(
 
 def compile_prd_execution_artifacts(contract: PRDContract) -> PRDExecutionArtifacts:
     requirement_ledger = compile_requirement_ledger(contract)
+    blueprint_resolution = resolve_blueprints(contract)
     architecture = {
         "schema_version": 1,
         "title": contract.title,
@@ -202,6 +204,7 @@ def compile_prd_execution_artifacts(contract: PRDContract) -> PRDExecutionArtifa
         "required_stack": list(contract.required_stack),
         "architecture": list(contract.architecture),
         "components": _architecture_components(contract),
+        "blueprints": blueprint_resolution.to_dict(),
         "source_authoring": "react_tool_loop",
         "assumptions": list(contract.assumptions),
         "warnings": list(contract.extraction_warnings),
