@@ -70,7 +70,14 @@ class EmptySearch:
 
 
 def _spec(text: str = ""):
-    prd = text or "# Todo App\n\n## Entities\n- Task: title (text), done (boolean), user (FK to User)\n"
+    prd = text or (
+        "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
+        "## Entities\n"
+        "- Task: title (text), done (boolean), user (FK to User)\n"
+    )
     return build_project_spec(parse_prd_text(prd, fallback_title="PRD", markdown=True))
 
 

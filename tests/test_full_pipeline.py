@@ -127,6 +127,9 @@ def _prd(root: Path) -> Path:
     path = root / "todo.md"
     path.write_text(
         "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
         "## Entities\n"
         "- Task: title (text), done (boolean), user (FK to User)\n",
         encoding="utf-8",

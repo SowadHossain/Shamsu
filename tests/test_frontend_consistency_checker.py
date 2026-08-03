@@ -155,6 +155,9 @@ def _todo_spec():
     return build_project_spec(
         parse_prd_text(
             "# Todo App\n\n"
+            "## Tech Stack\n"
+            "- Django\n"
+            "- SQLite\n\n"
             "## Entities\n"
             "- Task: title (text), done (boolean), user (FK to User)\n",
             fallback_title="PRD",

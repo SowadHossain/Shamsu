@@ -904,6 +904,7 @@ class AgentChatLoop:
         original_input = user_input
         if self.audit:
             self.audit.log_prompt(original_input)
+        self._refresh_system_prompt()
         if self.use_long_term_memory:
             user_input = self._append_long_term_memory(user_input)
         # Structural facts about the files this turn names, from the code graph.

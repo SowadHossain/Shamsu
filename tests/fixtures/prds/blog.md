@@ -1,5 +1,10 @@
 # Blog Platform
 
+## Tech Stack
+
+- Django
+- SQLite
+
 ## Entities
 
 - Post: title (string), body (markdown), tags (many to many Tag), author (auth user)

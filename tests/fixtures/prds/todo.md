@@ -1,5 +1,10 @@
 # Todo App
 
+## Tech Stack
+
+- Django
+- SQLite
+
 ## Entities
 
 - Task: title (text), done (boolean), user (FK to User)

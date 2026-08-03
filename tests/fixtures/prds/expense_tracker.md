@@ -1,5 +1,10 @@
 # Expense Tracker
 
+## Tech Stack
+
+- Django
+- SQLite
+
 ## Data Models
 
 - Budget: name (string), amount (decimal max_digits=12 decimal_places=2), user (auth user)
