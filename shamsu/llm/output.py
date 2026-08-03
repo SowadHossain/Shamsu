@@ -62,6 +62,31 @@ _DANGLING_THINK_RE = re.compile(r"<think>(?P<body>.*)\Z", re.DOTALL | re.IGNOREC
 
 
 @dataclass(frozen=True)
+class ParseFailure:
+    """Why a tool-call-shaped span in the content did NOT become a call.
+
+    Exists so a loop can tell an unparseable *attempt* from no attempt at all.
+    Before this, both produced the same "the model returned prose" correction —
+    a misdiagnosis with teeth: on 2026-08-03 a complete, correct 736-char
+    ``write_file`` call for ``templates/my_orders.html`` was discarded because
+    the model escaped the opening ``"`` of ``href=\\"{% url ... %}">`` and not
+    the closing one. The loop told it to stop returning prose, so at
+    temperature 0.1 it re-emitted the identical call three times and the run
+    ended with nothing written.
+
+    ``error`` carries the verbatim ``json.loads`` message; a model handed the
+    real parse error can fix it, a model told it wrote prose cannot.
+    """
+
+    kind: str
+    tool: str = ""
+    path: str = ""
+    error: str = ""
+    span_preview: str = ""
+    repaired: bool = False
+
+
+@dataclass(frozen=True)
 class ModelTurn:
     """A normalized model turn: the visible answer, the reasoning trace kept out
     of it, and the tool calls parsed from either the native field or salvaged
@@ -71,6 +96,9 @@ class ModelTurn:
     thinking: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     salvaged: bool = False
+    # Defaults to () so whole-instance equality assertions on an empty turn keep
+    # passing (tests/test_model_output_boundary.py compares ModelTurn objects).
+    parse_failures: tuple[ParseFailure, ...] = ()
 
     @property
     def has_tool_calls(self) -> bool:
@@ -481,7 +509,9 @@ def _coerce_args(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def _normalize_tool_arguments(
+    name: str, arguments: dict[str, Any], *, raw: bool = False
+) -> dict[str, Any]:
     """Repair one extra layer of JSON escaping in model-authored file payloads.
 
     Some local models return a decoded tool-call object but leave file content
@@ -489,7 +519,15 @@ def _normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str,
     one-line, invalid source file and traps the model in read/edit retries.
     Only payloads with no real line breaks are repaired, and escape sequences
     inside quoted source strings are preserved.
+
+    ``raw=True`` skips the repair entirely, for payloads that never went through
+    JSON at all (the raw fenced envelope). Their bodies are already physical
+    bytes, and a one-line JS/JSON file whose string contains a literal ``\\n``
+    satisfies this function's trigger condition exactly — "no real newline, has
+    a ``\\n``" — so running it would corrupt the very files it exists to fix.
     """
+    if raw:
+        return arguments
     fields = {
         "write_file": ("content",),
         "append_file": ("content",),
