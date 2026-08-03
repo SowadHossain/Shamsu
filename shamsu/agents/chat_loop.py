@@ -34,6 +34,7 @@ from shamsu.context.manager import ContextBudgetManager
 from shamsu.safety import read_only
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
+from shamsu.agents.project_instructions import load_project_instructions
 from shamsu.llm.output import ParseFailure, parse_model_turn, tool_call_to_message_dict
 from shamsu.memory.service import MemoryService
 from shamsu.routing.operations import file_targets
@@ -265,6 +266,11 @@ _MAX_EMPTY_RESPONSES = 2
 # (observed repeatedly 2026-08-02). The correction now names the target, so the
 # second attempt is the one that usually lands.
 _MAX_MISSING_MUTATION_RECOVERIES = _os_env_int("SHAMSU_MAX_MUTATION_RECOVERIES", 2, 1)
+
+# Post-eviction re-grounding. Scaled for a 7B's window: Codex re-reads 5 files on a
+# 50k budget, which would be most of this model's context.
+_REGROUND_MAX_FILES = _os_env_int("SHAMSU_REGROUND_MAX_FILES", 3, 0)
+_REGROUND_MAX_CHARS_PER_FILE = _os_env_int("SHAMSU_REGROUND_MAX_CHARS", 2400, 200)
 
 _EMPTY_RESPONSE_CORRECTION = (
     "You returned an empty response. Do not return nothing. Either call a tool to make "
@@ -498,14 +504,18 @@ class AgentChatLoop:
         self.progress = progress
         self.budget_manager = budget_manager
         self.audit = audit
+        # The prompt WITHOUT project instructions. Those are appended fresh each
+        # turn by _refresh_system_prompt so an edit to SHAMSU.md mid-session takes
+        # effect, and so they can never be paraphrased away by the rolling summary.
+        self._base_system_prompt = _system_prompt(
+            self.workspace_root,
+            include_tool_protocol=not self._supports_native_tools,
+            # A read-only turn must not be taught to write, and skipping it
+            # returns ~250 tokens to a 7B's window.
+            include_raw_write_protocol=not read_only,
+        )
         self.state = state or ChatState(
-            _system_prompt(
-                self.workspace_root,
-                include_tool_protocol=not self._supports_native_tools,
-                # A read-only turn must not be taught to write, and skipping it
-                # returns ~250 tokens to a 7B's window.
-                include_raw_write_protocol=not read_only,
-            ),
+            self._base_system_prompt + load_project_instructions(self.workspace_root),
             session_logger=session_logger,
             hydrate=hydrate_history,
         )
@@ -527,23 +537,99 @@ class AgentChatLoop:
             self.tools.set_read_only(True)
         self.markdown_fallback = MarkdownWriteFallback(self.tools)
 
-    async def _messages_within_budget(self, num_ctx: int) -> list[dict[str, Any]]:
+    def _refresh_system_prompt(self) -> None:
+        """Re-read the workspace's standing instructions before each model call.
+
+        Per turn, not per session, on purpose: a rolling summary is a lossy
+        paraphrase that degrades every time it is folded, whereas re-reading the
+        file keeps the rules byte-exact for the whole run no matter how much
+        history gets evicted.
+        """
+        self.state.set_system_prompt(
+            self._base_system_prompt + load_project_instructions(self.workspace_root)
+        )
+
+    def _regrounding_block(self, mutated_paths: Sequence[str]) -> str:
+        """Current on-disk contents of the files this run most recently changed.
+
+        Injected only after eviction. Once the tool results that carried a write
+        are trimmed away, the model's only remaining knowledge of its own work is
+        the rolling summary - a paraphrase - so it starts re-deriving file state
+        and re-editing from memory. Codex re-reads recently edited files after
+        every compaction for exactly this reason; the counts here are scaled for a
+        7B window rather than a 200k one.
+
+        Reads from disk, not from the transcript, so the model sees what the file
+        ACTUALLY contains after every write, revert, and external edit.
+        """
+        if not mutated_paths:
+            return ""
+        sections: list[str] = []
+        for relative in list(mutated_paths)[-_REGROUND_MAX_FILES:]:
+            try:
+                target = (self.workspace_root / relative).resolve()
+                target.relative_to(self.workspace_root)
+                if not target.is_file():
+                    continue
+                body = target.read_text(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                continue
+            if len(body) > _REGROUND_MAX_CHARS_PER_FILE:
+                body = (
+                    body[:_REGROUND_MAX_CHARS_PER_FILE].rstrip()
+                    + f"\n[...truncated at {_REGROUND_MAX_CHARS_PER_FILE} chars]"
+                )
+            sections.append(f"--- {relative} ---\n{body.rstrip()}")
+        if not sections:
+            return ""
+        return (
+            "Current on-disk contents of the files you have changed this run. "
+            "Earlier turns were trimmed from this conversation, so trust THIS over "
+            "anything you remember writing:\n\n" + "\n\n".join(sections)
+        )
+
+    async def _messages_within_budget(
+        self, num_ctx: int, mutated_paths: Sequence[str] = ()
+    ) -> list[dict[str, Any]]:
         """Budget-aware replacement for the flat 30-message cap: keep the system
         prompt plus the largest recent suffix of the conversation that fits the
         model's window, folding older evicted turns into a compact rolling
-        summary instead of silently dropping them."""
+        summary instead of silently dropping them.
+
+        When eviction happens, the summary is followed by the current on-disk
+        contents of recently changed files, so the model is grounded in real bytes
+        rather than in a paraphrase of its own earlier writes.
+        """
         reserve = RESERVE_OUTPUT_TOKENS + SAFETY_MARGIN_TOKENS
         usable = max(1, num_ctx - reserve)
         history_budget = max(1, usable - _CHAT_SUMMARY_BUDGET_TOKENS)
+        evicted_anything = False
         tail, start_abs = self.state.select_for_budget(history_budget, count_tokens)
         if start_abs > 1:
+            evicted_anything = True
             pending = self.state.newly_evicted(start_abs)
             if pending:
                 summary = await self._summarize_evicted(
                     self.state.rolling_summary, pending, _CHAT_SUMMARY_BUDGET_TOKENS
                 )
                 self.state.update_rolling_summary(summary, start_abs)
-        return self.state.build_ollama_messages(tail, include_summary=start_abs > 1)
+        messages = self.state.build_ollama_messages(tail, include_summary=start_abs > 1)
+        if evicted_anything:
+            grounding = self._regrounding_block(mutated_paths)
+            if grounding:
+                # After the summary, before the tail: it is reference material for
+                # the recent turns, not part of the conversation.
+                messages.insert(
+                    len(messages) - len(tail), {"role": "system", "content": grounding}
+                )
+                self._emit_trace(
+                    "context.regrounded",
+                    f"Re-read {min(len(mutated_paths), _REGROUND_MAX_FILES)} changed "
+                    "file(s) from disk after context eviction.",
+                    {"files": list(mutated_paths)[-_REGROUND_MAX_FILES:]},
+                    level="verbose",
+                )
+        return messages
 
     async def _summarize_evicted(
         self, prior_summary: str, evicted: list[Any], budget_tokens: int
@@ -786,7 +872,8 @@ class AgentChatLoop:
         pending_options: dict[str, Any] | None = None
         for round_index in range(self.max_tool_rounds):
             num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
-            messages = await self._messages_within_budget(num_ctx)
+            self._refresh_system_prompt()
+            messages = await self._messages_within_budget(num_ctx, written_files)
             # Show context-window usage before each model call.
             if self.budget_manager:
                 _msg_text = "\n".join(str(m.get("content", "")) for m in messages)

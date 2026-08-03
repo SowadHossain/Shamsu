@@ -92,6 +92,19 @@ class ChatState:
                 message.tool_calls = []
                 return
 
+    def set_system_prompt(self, content: str) -> None:
+        """Replace the system prompt in place, keeping history intact.
+
+        Used to re-inject per-workspace standing instructions every turn. It
+        updates ``_messages[0]``, which is never evicted by the budget trimmer and
+        is what ``select_for_budget`` charges against the budget, so refreshed
+        instructions are always both present and accounted for.
+        """
+        if content == self.system_prompt:
+            return
+        self.system_prompt = content
+        self._messages[0].content = content
+
     def append_tool(self, tool_call_id: str, name: str, content: str) -> None:
         self._append(ChatMessage("tool", content, tool_call_id=tool_call_id, name=name), persist=True)
 

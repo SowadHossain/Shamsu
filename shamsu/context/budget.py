@@ -32,7 +32,31 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 }
 
 SAFE_FALLBACK_CTX_WINDOW = 8_192   # conservative fallback for unknown models
-RESERVE_OUTPUT_TOKENS = 2_048      # headroom reserved for model response
+
+
+def _reserve_output_tokens() -> int:
+    """Headroom reserved for the model's response.
+
+    Raised from 2048 because a mutation turn now emits a WHOLE FILE: the raw write
+    envelope asks for complete file content, and 2048 tokens is roughly 200 lines,
+    which real modules and templates routinely exceed. When the reserve is too
+    small the prompt is allowed to grow until the response has nowhere to go, and
+    the model's tool call is cut off mid-payload - the `json_truncated` failure in
+    llm/output.py.
+
+    Note this is the right lever, not `num_predict`: an explicit output cap cannot
+    make room, it can only stop generation sooner, so capping would CAUSE the
+    truncation it is meant to prevent. Reserving space prevents it.
+    """
+    import os
+
+    raw = os.environ.get("SHAMSU_RESERVE_OUTPUT_TOKENS", "").strip()
+    if raw.isdigit() and int(raw) >= 512:
+        return int(raw)
+    return 4_096
+
+
+RESERVE_OUTPUT_TOKENS = _reserve_output_tokens()
 SAFETY_MARGIN_TOKENS = 512         # extra buffer against off-by-one token counts
 
 
