@@ -12203,6 +12203,21 @@ async def _verify_prd_milestone(
         console.print(Panel(summary, title=f"Milestone {milestone_id} FAILED", border_style="red"))
         return "failed", verification
 
+    if (
+        not outcome.verified
+        and not outcome.unverifiable
+        and not str(outcome.command or "").strip()
+        and outcome.exit_code is None
+    ):
+        outcome = replace(
+            outcome,
+            unverifiable=True,
+            summary=(
+                outcome.summary
+                or "No deterministic verifier is available for this milestone (UNVERIFIED)."
+            ),
+        )
+
     verification = _milestone_verification_payload(
         outcome.status(),
         files=verifier_files,

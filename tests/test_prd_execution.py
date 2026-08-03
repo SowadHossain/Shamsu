@@ -485,6 +485,41 @@ def test_prd_milestone_verifier_does_not_run_field_name_evidence_gate(
     assert verification["verified"] is True
 
 
+def test_prd_milestone_verifier_records_empty_outcome_as_unverifiable(
+    tmp_path: Path,
+    monkeypatch,
+):
+    (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    monkeypatch.setattr(
+        repl,
+        "verify_only",
+        lambda *args, **kwargs: VerifyOutcome(
+            verified=False,
+            unverifiable=False,
+            exit_code=None,
+            command="",
+            summary="",
+        ),
+    )
+
+    status, verification = asyncio.run(
+        repl._verify_prd_milestone(
+            "M-001",
+            {"active_skills": ["developer"], "expected_files": ["app.py"], "verifier": "python"},
+            ["app.py"],
+            tmp_path,
+            _console(),
+            None,
+        )
+    )
+
+    assert status == "implemented"
+    assert verification["status"] == "unverifiable"
+    assert verification["unverifiable"] is True
+    assert verification["command"] == ""
+    assert verification["exit_code"] is None
+
+
 def test_prd_milestone_verifier_stops_on_python_failure(tmp_path: Path):
     (tmp_path / "app.py").write_text("def nope(:\n", encoding="utf-8")
 
