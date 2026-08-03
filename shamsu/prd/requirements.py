@@ -119,7 +119,7 @@ def compile_requirement_ledger(contract: PRDContract) -> RequirementLedger:
     )
     deduped = _dedupe_records(records)
     executable_records = [record for record in deduped if record.scope == "in"]
-    milestones, milestone_assignment = _expanded_milestones(executable_records)
+    milestones, milestone_assignment = _expanded_milestones(executable_records, contract)
     by_id = {milestone.id: milestone for milestone in milestones}
     assigned_records = [
         RequirementRecord(
@@ -397,14 +397,17 @@ def _dedupe_records(records: list[RequirementRecord]) -> list[RequirementRecord]
     return result
 
 
-def _assign_milestones(records: list[RequirementRecord]) -> list[MilestoneRecord]:
+def _assign_milestones(
+    records: list[RequirementRecord],
+    contract: PRDContract,
+) -> list[MilestoneRecord]:
     needed = {_milestone_for(record) for record in records}
     order = [
         MilestoneRecord(
             "M-001",
             "Foundation and data model",
             [],
-            active_skills=["developer", "prd-planner", "sqlite-persistence"],
+            active_skills=_active_skills_for_milestone("M-001", contract),
             verifier="schema/data checks",
         ),
         MilestoneRecord(
@@ -412,7 +415,7 @@ def _assign_milestones(records: list[RequirementRecord]) -> list[MilestoneRecord
             "Product workflows and UI",
             [],
             dependencies=["M-001"],
-            active_skills=["developer", "react-vite", "ui-designer"],
+            active_skills=_active_skills_for_milestone("M-002", contract),
             verifier="focused app tests/build",
         ),
         MilestoneRecord(
@@ -420,7 +423,7 @@ def _assign_milestones(records: list[RequirementRecord]) -> list[MilestoneRecord
             "Persistence, scripts, and integrations",
             [],
             dependencies=["M-001"],
-            active_skills=["developer", "sqlite-persistence", "mcp-tools"],
+            active_skills=_active_skills_for_milestone("M-003", contract),
             verifier="seed/status checks",
         ),
         MilestoneRecord(
@@ -428,7 +431,7 @@ def _assign_milestones(records: list[RequirementRecord]) -> list[MilestoneRecord
             "Acceptance and release verification",
             [],
             dependencies=["M-001", "M-002", "M-003"],
-            active_skills=["developer", "testing"],
+            active_skills=_active_skills_for_milestone("M-004", contract),
             verifier="acceptance commands",
         ),
     ]
@@ -437,8 +440,9 @@ def _assign_milestones(records: list[RequirementRecord]) -> list[MilestoneRecord
 
 def _expanded_milestones(
     records: list[RequirementRecord],
+    contract: PRDContract,
 ) -> tuple[list[MilestoneRecord], dict[str, str]]:
-    base_milestones = _assign_milestones(records)
+    base_milestones = _assign_milestones(records, contract)
     records_by_base = {
         milestone.id: [record for record in records if _milestone_for(record) == milestone.id]
         for milestone in base_milestones
@@ -502,6 +506,70 @@ def _milestone_for(record: RequirementRecord) -> str:
     if record.kind in {"persistence"} or _mentions_script_or_seed(record.text):
         return "M-003"
     return "M-004"
+
+
+def _stack_tokens(contract: PRDContract) -> set[str]:
+    text = " ".join([contract.stack_hint, *contract.required_stack]).lower()
+    aliases = {
+        "postgresql": "postgres",
+        "node.js": "node",
+        "express.js": "express",
+    }
+    tokens = {
+        aliases.get(token, token)
+        for token in re.findall(r"[a-z][a-z0-9.+-]*", text)
+    }
+    if "postgresql" in text:
+        tokens.add("postgres")
+    if "node.js" in text:
+        tokens.add("node")
+    if "express.js" in text:
+        tokens.add("express")
+    return tokens
+
+
+def _active_skills_for_milestone(milestone_id: str, contract: PRDContract) -> list[str]:
+    """Milestone skill allowlist derived from the contract, never from category defaults."""
+    tokens = _stack_tokens(contract)
+    skills = ["developer"]
+    if milestone_id == "M-001":
+        skills.append("prd-planner")
+    if milestone_id == "M-002" and _has_ui_work(contract, tokens):
+        skills.append("ui-designer")
+    if {"react", "vite", "typescript", "tsx", "jsx"} & tokens:
+        if milestone_id in {"M-002", "M-004"}:
+            skills.append("react-vite")
+    if "sqlite" in tokens:
+        if milestone_id in {"M-001", "M-003", "M-004"}:
+            skills.append("sqlite-persistence")
+    elif {"postgres", "mysql", "mariadb", "mssql", "database"} & tokens:
+        if milestone_id in {"M-001", "M-003", "M-004"}:
+            skills.append("sql-databases")
+    if milestone_id == "M-003" and _needs_tool_or_integration_skill(contract):
+        skills.append("mcp-tools")
+    if milestone_id == "M-004":
+        skills.append("testing")
+    return list(dict.fromkeys(skills))
+
+
+def _has_ui_work(contract: PRDContract, tokens: set[str]) -> bool:
+    return bool(
+        contract.project_kind in {"web_app", "frontend", "game"}
+        or contract.screens
+        or {"react", "vite", "vue", "svelte", "frontend", "django"} & tokens
+    )
+
+
+def _needs_tool_or_integration_skill(contract: PRDContract) -> bool:
+    text = " ".join(
+        [
+            *contract.features,
+            *contract.persistence_requirements,
+            *contract.required_tests,
+            *contract.acceptance_criteria,
+        ]
+    ).lower()
+    return bool(re.search(r"\b(mcp|external|integration|api client|webhook|seed|script)\b", text))
 
 
 def _verification_for(record: RequirementRecord) -> str:
@@ -606,18 +674,40 @@ def _architecture_components(contract: PRDContract) -> list[dict[str, Any]]:
     return components
 
 
+def _component_roots(contract: PRDContract) -> dict[str, str]:
+    return {
+        str(component.get("id", "")): str(component.get("root", ".") or ".")
+        for component in _architecture_components(contract)
+    }
+
+
+def _under_root(root: str, relative: str) -> str:
+    normalized_root = root.strip().strip("/\\").replace("\\", "/")
+    normalized_path = relative.strip().strip("/\\").replace("\\", "/")
+    if not normalized_path:
+        return normalized_root or "."
+    if not normalized_root or normalized_root == ".":
+        return normalized_path
+    if normalized_path == normalized_root or normalized_path.startswith(f"{normalized_root}/"):
+        return normalized_path
+    return f"{normalized_root}/{normalized_path}"
+
+
 def _architecture_expected_files_for_milestone(
     milestone_id: str,
     contract: PRDContract,
 ) -> list[str]:
     """Give small models a framework file map without authoring source code."""
     stack = " ".join([contract.stack_hint, *contract.required_stack]).lower()
+    roots = _component_roots(contract)
+    backend_root = roots.get("backend")
+    frontend_root = roots.get("frontend")
     number = int(milestone_id.removeprefix("M-") or 0)
     foundation = number == 1 or 100 <= number < 200
     product = number == 2 or 200 <= number < 300
     release = number in {3, 4} or 300 <= number < 500
     paths: list[str] = []
-    if _is_node_backend_stack(contract) and (foundation or release):
+    if backend_root and _is_node_backend_stack(contract) and (foundation or release):
         # Without this branch a Node PRD declared no foundation files at all.
         # Two things then went wrong at once: the file-at-a-time pass had no
         # missing architecture file to target, so the whole milestone collapsed
@@ -625,42 +715,59 @@ def _architecture_expected_files_for_milestone(
         # directory that had no package.json, which is the `npm error code
         # ENOENT` that ended the run.
         paths.extend(
-            [
-                "backend/package.json",
-                "backend/server.js",
-                "backend/src/db.js",
-                "backend/src/schema.sql",
-                "backend/src/app.js",
-                "backend/src/routes/index.js",
-            ]
+            _under_root(backend_root, path)
+            for path in (
+                "package.json",
+                "server.js",
+                "src/db.js",
+                "src/schema.sql",
+                "src/app.js",
+                "src/routes/index.js",
+            )
         )
-    if "django" in stack and (foundation or release):
+    if backend_root and "django" in stack and (foundation or release):
         paths.extend(
-            [
-                "backend/manage.py",
-                "backend/requirements.txt",
-                "backend/config/__init__.py",
-                "backend/config/settings.py",
-                "backend/config/urls.py",
-                "backend/core/__init__.py",
-                "backend/core/apps.py",
-                "backend/core/models.py",
-                "backend/core/migrations/__init__.py",
-            ]
+            _under_root(backend_root, path)
+            for path in (
+                "manage.py",
+                "requirements.txt",
+                "config/__init__.py",
+                "config/settings.py",
+                "config/urls.py",
+                "core/__init__.py",
+                "core/apps.py",
+                "core/models.py",
+                "core/migrations/__init__.py",
+            )
         )
-    if any(token in stack for token in ("react", "vite")) and (product or release):
+    if backend_root and "django" in stack and (product or release):
+        paths.extend(
+            _under_root(backend_root, path)
+            for path in (
+                "core/forms.py",
+                "core/views.py",
+                "core/urls.py",
+                "core/templates/base.html",
+                "core/templates/dashboard.html",
+                "core/templates/resource_list.html",
+                "core/templates/resource_detail.html",
+                "core/templates/resource_form.html",
+            )
+        )
+    if frontend_root and any(token in stack for token in ("react", "vite")) and (product or release):
         typed = "typescript" in stack or "tsx" in stack
         extension = "tsx" if typed else "jsx"
         paths.extend(
-            [
-                "frontend/package.json",
-                "frontend/index.html",
-                f"frontend/src/main.{extension}",
-                f"frontend/src/App.{extension}",
-                "frontend/src/styles.css",
-            ]
+            _under_root(frontend_root, path)
+            for path in (
+                "package.json",
+                "index.html",
+                f"src/main.{extension}",
+                f"src/App.{extension}",
+                "src/styles.css",
+            )
         )
-    return paths
+    return list(dict.fromkeys(paths))
 
 
 def _milestone_expected_files(

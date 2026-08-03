@@ -209,3 +209,75 @@ def test_prd_execution_artifacts_are_stable_for_same_contract():
 
     assert first.requirement_ledger.to_dict() == second.requirement_ledger.to_dict()
     assert first.acceptance_matrix == second.acceptance_matrix
+
+
+def test_milestone_skills_do_not_invent_react_or_sqlite_for_unspecified_stack():
+    contract = extract_contract(
+        parse_prd_text(
+            "# Studio Ops\n\n"
+            "## Overview\nA full-stack web application for managing orders.\n\n"
+            "## Data Model\nOrder\n- id, status\n\n"
+            "## Features\n- Staff update an order status from a browser screen.\n\n"
+            "## Persistence Requirements\n- Orders are stored durably.\n\n"
+            "## Acceptance Criteria\n- Staff can see the updated status after reload.\n",
+            markdown=True,
+        )
+    )
+
+    ledger = compile_requirement_ledger(contract)
+    all_skills = {
+        skill
+        for milestone in ledger.milestones
+        for skill in milestone.active_skills
+    }
+
+    assert "react-vite" not in all_skills
+    assert "sqlite-persistence" not in all_skills
+
+
+def test_postgres_milestones_use_sql_databases_not_sqlite_persistence():
+    contract = extract_contract(
+        parse_prd_text(
+            "# Market API\n\n"
+            "## Tech Stack\n- Node with Express\n- React with Vite\n- PostgreSQL 16\n\n"
+            "## Data Model\nListing\n- id, title, price\n\n"
+            "## Features\n- Buyers browse listings.\n\n"
+            "## Persistence Requirements\n- All data lives in PostgreSQL.\n"
+            "- Seed demo listings with a script.\n\n"
+            "## Acceptance Criteria\n- `npm test` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    ledger = compile_requirement_ledger(contract)
+    all_skills = {
+        skill
+        for milestone in ledger.milestones
+        for skill in milestone.active_skills
+    }
+
+    assert "sql-databases" in all_skills
+    assert "sqlite-persistence" not in all_skills
+    assert "react-vite" in all_skills
+
+
+def test_django_product_milestone_declares_server_rendered_ui_files():
+    contract = extract_contract(
+        parse_prd_text(
+            "# Course Desk\n\n"
+            "## Tech Stack\n- Django\n- SQLite\n\n"
+            "## Data Model\nCourse\n- id, title\n\n"
+            "## Features\n- Teachers create courses from the browser.\n"
+            "- Students view assigned courses.\n\n"
+            "## Acceptance Criteria\n- A teacher can create a course.\n",
+            markdown=True,
+        )
+    )
+
+    ledger = compile_requirement_ledger(contract)
+    product = next(milestone for milestone in ledger.milestones if milestone.id == "M-002")
+
+    assert "backend/core/views.py" in product.expected_files
+    assert "backend/core/urls.py" in product.expected_files
+    assert "backend/core/templates/dashboard.html" in product.expected_files
+    assert "react-vite" not in product.active_skills
