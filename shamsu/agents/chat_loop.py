@@ -160,6 +160,9 @@ File tools:
   for changing one. Read the file first when it exists, then re-emit all of it with your change
   applied. Whole-file writes are far more reliable than patches; a mismatched old_string wastes
   the whole turn.
+- Send file content as a RAW block, never as a JSON string. Never escape quotes, backslashes, or
+  newlines in code you are writing - the block is copied to disk exactly as you type it. See
+  "File writes" at the end of this prompt for the exact form.
 - Use edit_file ONLY when the file is too large to re-emit, or the change is a single unique
   line. Pass the exact old_string and new_string, matching exactly once (or set replace_all=true).
   If an edit_file call fails to match, do not retry it - switch to write_file with the full content.
@@ -380,6 +383,9 @@ class AgentChatLoop:
             _system_prompt(
                 self.workspace_root,
                 include_tool_protocol=not self._supports_native_tools,
+                # A read-only turn must not be taught to write, and skipping it
+                # returns ~250 tokens to a 7B's window.
+                include_raw_write_protocol=not read_only,
             ),
             session_logger=session_logger,
             hydrate=hydrate_history,
@@ -2705,6 +2711,57 @@ Examples:
 Use the exact argument names each tool documents. Emit the JSON only when you
 want to run a tool; otherwise answer normally in prose. Never wrap the JSON in
 extra commentary on the same turn.
+
+EXCEPTION - file content is never JSON. Do NOT put source code in a JSON string.
+Use the raw block form below, because escaping code inside JSON is what breaks
+these calls. This is the write_file example the three above deliberately do not
+give you: there is no reliable way to hand-escape a file, so do not try.
+"""
+
+# Injected for EVERY model, native-tool-capable or not. This is deliberate: the
+# tier models all carry supports_native_tools=True and therefore never see
+# _TOOL_PROTOCOL_PROMPT, yet they still route write calls through TEXT often
+# enough that this is exactly where mutations were being lost. On 2026-08-03 a
+# complete 736-char write_file call for templates/my_orders.html was discarded
+# over one unescaped quote and reported as prose. output.py can now repair that
+# after the fact; this stops it happening at all by removing the escaping step.
+_RAW_WRITE_PROTOCOL_PROMPT = """
+## File writes: send code as a RAW block, never as escaped JSON
+
+Never put file content inside a JSON string. Escaping quotes and backslashes in
+source code is the single biggest cause of a lost turn here: one wrong escape
+discards the entire call and nothing is written.
+
+To write a file, emit a fenced block whose FIRST line names the tool and the
+path, then the content exactly as it must appear on disk:
+
+```html
+# write_file: templates/my_orders.html
+{% extends "base.html" %}
+<a href="{% url 'my_orders' %}">Orders</a>
+```
+
+Rules for that block:
+- The header line is `# <tool>: <path>`, where <tool> is write_file, append_file,
+  or edit_file. The path is relative to the workspace root.
+- Everything between the header line and the closing fence is written VERBATIM.
+  Do not escape quotes or backslashes. Do not write \\n for a newline - press
+  enter. Do not indent the content to line up with the fence.
+- write_file needs the COMPLETE file. append_file adds only new lines at the end
+  of an existing file.
+- For edit_file the body is one or more search/replace pairs:
+
+```python
+# edit_file: core/urls.py
+<<<<<<< SEARCH
+urlpatterns = []
+=======
+urlpatterns = [path("orders/", views.my_orders, name="my_orders")]
+>>>>>>> REPLACE
+```
+- If the content itself contains a ``` line, open and close the block with FOUR
+  backticks instead of three. Markdown files always need four.
+- One block per file. Emit the blocks plus a one-line summary, nothing else.
 """
 
 
@@ -2734,10 +2791,16 @@ def _search_summary(query: str, results: Any) -> str:
     return f'"{query}" -> {listed}'
 
 
-def _system_prompt(workspace: Path, include_tool_protocol: bool = False) -> str:
+def _system_prompt(
+    workspace: Path,
+    include_tool_protocol: bool = False,
+    include_raw_write_protocol: bool = True,
+) -> str:
     prompt = f"{AGENT_SYSTEM_PROMPT}\nWorkspace: {workspace}\n"
     if include_tool_protocol:
         prompt += _TOOL_PROTOCOL_PROMPT
+    if include_raw_write_protocol:
+        prompt += _RAW_WRITE_PROTOCOL_PROMPT
     return prompt
 
 
