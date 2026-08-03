@@ -9,6 +9,7 @@ from pathlib import Path
 from rich.console import Console
 
 import shamsu.memory.service as memory_service
+from shamsu.action_ledger.ledger import start_run
 from shamsu.memory.queue import get_memory_queue
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.orchestrator import AgentOrchestrator
@@ -318,6 +319,39 @@ def test_session_summary_writes_reads_and_updates_metadata(tmp_path: Path):
     assert logger.read_summary() == text
     assert logger.summary_path.exists()
     assert logger.metadata.summary_updated_at != ""
+
+
+def test_session_summary_includes_linked_prd_milestone_state(tmp_path: Path):
+    logger = SessionManager(tmp_path).create_session("OpenBazaar")
+    ledger = start_run(tmp_path, "build OpenBazaar from PRD", session_logger=logger)
+    ledger.log_event(
+        "prd_milestone_graph_compiled",
+        source="compiled",
+        milestones=3,
+        execution_dir=".shamsu/prd-executions/demo",
+    )
+    ledger.log_event(
+        "prd_model_preflight_finished",
+        milestone_id="M-001",
+        source="model",
+        accepted=True,
+        expected_files=["docker-compose.yml", "backend/server.js", "frontend/package.json"],
+    )
+    ledger.log_event(
+        "prd_milestone_checkpointed",
+        milestone_id="M-001",
+        status="verified",
+        verification_status="verified",
+        changed_files=["docker-compose.yml", "backend/server.js"],
+    )
+
+    text = logger.update_summary_from_events()
+
+    assert "## PRD build state" in text
+    assert "compiled 3 milestone(s)" in text
+    assert "M-001: planner preflight accepted from model" in text
+    assert "M-001: checkpoint verified, verifier verified" in text
+    assert "backend/server.js" in text
 
 
 # --------------------------------------------------------------------------
