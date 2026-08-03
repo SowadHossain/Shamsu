@@ -146,6 +146,28 @@ def _assess_game(contract: PRDContract) -> TemplateSuitability:
 def _assess_django(contract: PRDContract, archetype: Archetype) -> TemplateSuitability:
     label = "REST API" if archetype == Archetype.REST_API else "CRUD web app"
     requested_stack = {item.lower() for item in contract.required_stack}
+    # Prohibitions are checked FIRST and win outright. The Django writer ships
+    # Django, Python and (by default) SQLite, so a PRD forbidding any of them can
+    # never be served by it - no scoring, no fit, no fallback. This is the escape
+    # that did not exist: a negative constraint had no representation, so
+    # "NEVER Django" reached this function as a stack MENTION and the writer was
+    # selected anyway.
+    forbidden = {item.lower() for item in contract.prohibitions}
+    blocked_by_prohibition = forbidden & {"django", "python", "sqlite"}
+    if blocked_by_prohibition:
+        named = ", ".join(sorted(blocked_by_prohibition))
+        return TemplateSuitability(
+            strategy=GenerationStrategy.FREEFORM,
+            candidate="",
+            reason=(
+                f"The PRD forbids {named}, which the deterministic Django writer "
+                "requires; build from the PRD instead."
+            ),
+            matches=[f"{label} structure"],
+            conflicts=[f"Django writer would introduce forbidden technology: {named}."],
+            must_change=["derive architecture, schema, UI, and tests from the PRD"],
+            fit_score=0.0,
+        )
     non_django_stack = requested_stack & {"go", "node", "rust"}
     if non_django_stack and not (requested_stack & {"django", "python"}):
         return TemplateSuitability(

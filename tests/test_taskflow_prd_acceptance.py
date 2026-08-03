@@ -49,7 +49,12 @@ def test_taskflow_routes_to_real_full_stack_generation_plan():
     assert {entity.name for entity in spec.entities} >= {"User", "Category", "Task"}
     assert len(spec.generation_order) > 20
     assert [item.path for item in spec.generation_order[:2]] != ["index.html", "README.md"]
-    assert any("Django" in item for item in spec.assumptions)
+    # The assumption records that the framework is UNSPECIFIED, and deliberately
+    # does not name one. It used to read "Django is selected as SHAMSU's supported
+    # local full-stack default", which is how a stack nobody asked for entered the
+    # plan; choosing one is the blueprint layer's job and is recorded there.
+    assert any("does not specify an application framework" in item for item in spec.assumptions)
+    assert not any("Django is selected" in item for item in spec.assumptions)
     assert spec.definition_of_done
 
 
@@ -208,5 +213,13 @@ def test_compact_plain_text_contract_selects_a_compatible_project_adapter():
     assert contract.authorization_rules == ["Members can only access assigned workspaces."]
     assert contract.required_tests == ["Automated tests cover permissions."]
     assert spec.generation_ready is True
+    # Freeform, and never the Django writer. This used to be reached a different
+    # way: requires_full_stack forced the archetype to WEB_CRUD, so the Django
+    # writer WAS considered and then rejected over the React frontend - which is
+    # why the old assertion looked for a React/SPA conflict. With that override
+    # gone the PRD classifies on its own signals (roles, permissions, workspaces)
+    # as SAAS_FULLSTACK, so no template is a candidate at all and the Django writer
+    # is never in the running. Same outcome, arrived at without forcing a category.
     assert spec.suitability.strategy.value == "freeform"
-    assert "React" in spec.suitability.conflicts[0] or "SPA" in spec.suitability.conflicts[0]
+    assert spec.suitability.strategy.value != "django"
+    assert "no template fits" in spec.suitability.reason.lower()

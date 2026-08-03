@@ -321,7 +321,11 @@ def extract_contract(
     endpoints = _extract_api_endpoints(parsed)
 
     architecture: list[str] = []
-    for phrase in ("full-stack", "full stack", "backend api", "sqlite", "responsive user interface"):
+    # Architecture describes SHAPE, so no technology names here. "sqlite" used to be
+    # in this list, which meant merely mentioning SQLite - including to forbid it -
+    # made `architecture` non-empty, and a non-empty architecture was a precondition
+    # for the Django-default assumption path.
+    for phrase in ("full-stack", "full stack", "backend api", "responsive user interface"):
         if phrase in lowered:
             architecture.append(phrase)
     # A forbidden technology must never land in a field named `required_stack`.

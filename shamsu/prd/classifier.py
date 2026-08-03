@@ -86,12 +86,27 @@ def classify_archetype(parsed: ParsedPRD) -> ArchetypeDecision:
         ),
     }
     section_names = {name.lower() for name in parsed.sections}
-    if "entities" in section_names or "data models" in section_names:
+    # Substring matching, because exact names miss the obvious variants: this
+    # required the literal "data models" and so scored nothing for a PRD whose
+    # section is "Data Model" (singular) or "Database Schema". A declared data
+    # model is the STRUCTURAL signal for an entity-backed product, and it has to
+    # carry the weight now that the framework keyword bonus is gone.
+    if any(
+        token in name
+        for name in section_names
+        for token in ("entit", "data model", "schema")
+    ):
         scores[Archetype.WEB_CRUD] += 3
-    if "endpoints" in section_names or "api" in section_names:
+    if any(
+        token in name for name in section_names for token in ("endpoint", "api")
+    ):
         scores[Archetype.REST_API] += 2
-    if "django" in text:
-        scores[Archetype.WEB_CRUD] += 2
+    # Deliberately no per-framework keyword bonus. A bare mention of "django"
+    # used to add +2 to WEB_CRUD - with no equivalent for any other framework -
+    # so naming Django anywhere, including inside a prohibition, biased the
+    # archetype toward the one path that routes to the Django writer. Archetype is
+    # about the SHAPE of the product; the stack is decided separately from the
+    # contract's stack_hint and prohibitions.
 
     winner = max(scores, key=scores.get)
     winning_score = scores[winner]

@@ -1,4 +1,10 @@
-"""Forced category tech stacks for small-local-model reliability."""
+"""Fixed stacks for the copy-paste SCAFFOLD categories.
+
+Previously "forced category tech stacks": every web category was answered with a
+hardcoded Django + DRF + SQLite policy regardless of what the PRD asked for. A web
+app's stack now comes from the contract (stack_hint plus prohibitions); only the
+game scaffolds have a genuinely fixed stack, because the template ships it.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -100,18 +106,17 @@ STACK_POLICIES: dict[Category, StackPolicy] = {
 }
 
 
-def stack_policy_for(category: Category | str) -> StackPolicy:
+def stack_policy_for(category: Category | str) -> StackPolicy | None:
+    """The fixed stack for a *scaffold* category, or None when there isn't one.
+
+    WEB_CRUD and REST_API used to be answered here with a hardcoded
+    "Django + DRF + SQLite" policy, which is exactly the stack-forcing this slice
+    removes: a web app's stack comes from the PRD's own stack_hint and
+    prohibitions, not from its category. Those categories now return None, and the
+    caller resolves an actual stack from the contract.
+
+    The remaining entries describe the copy-paste game scaffolds, where the stack
+    genuinely IS fixed because the template ships it.
+    """
     resolved = Category(category)
-    if resolved in {Category.WEB_CRUD, Category.REST_API}:
-        return StackPolicy(
-            category=resolved,
-            frontend="Django templates + DaisyUI + HTMX",
-            styling="DaisyUI/Tailwind via CDN",
-            backend="Django + Django REST Framework",
-            database="SQLite default, Django ORM",
-            build="Python manage.py",
-            required_packages=["django", "djangorestframework", "crispy-forms", "django-htmx"],
-            model_job=["models", "serializers", "forms", "views", "templates", "tests"],
-            template_owns=["settings", "urls", "auth shell", "base templates"],
-        )
-    return STACK_POLICIES[resolved]
+    return STACK_POLICIES.get(resolved)

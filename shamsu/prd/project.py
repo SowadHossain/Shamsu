@@ -156,21 +156,27 @@ def build_project_spec(
     theme = _select_theme(parsed.raw_text)
     archetype = classify_archetype(parsed)
     category_decision = detect_category(parsed.raw_text)
-    if contract.requires_full_stack:
-        category = Category.WEB_CRUD
-        selected_archetype = Archetype.WEB_CRUD
-    else:
-        category = _resolve_category(category_decision.category, archetype.archetype)
-        selected_archetype = CATEGORY_TO_ARCHETYPE.get(category, archetype.archetype)
+    # "Full stack" is a SHAPE, not a stack. This used to force WEB_CRUD, bypassing
+    # detection entirely and routing straight to GenerationStrategy.DJANGO - so any
+    # PRD with auth plus persistence became a Django project regardless of what it
+    # asked for. The detected category is now respected; the blueprint layer
+    # decides implementation.
+    category = _resolve_category(category_decision.category, archetype.archetype)
+    selected_archetype = CATEGORY_TO_ARCHETYPE.get(category, archetype.archetype)
 
     domain_entities = [entity for entity in entities if entity.name.lower() not in {"user", "session"}]
     needs_input = (contract.requires_full_stack and not domain_entities) or bool(extraction_error)
     assumptions = list(contract.assumptions)
     if contract.requires_full_stack and not contract.stack_hint:
+        # Records that the framework is UNSPECIFIED. It deliberately does not name
+        # one: this line used to read "Django is selected as SHAMSU's supported
+        # local full-stack default", which is how a stack nobody asked for entered
+        # the plan. Choosing one is the blueprint layer's job, and its choice is
+        # recorded as an assumption there - never as a requirement.
         assumptions = [item for item in assumptions if "framework" not in item.lower()]
         assumptions.append(
-            "Django is selected as SHAMSU's supported local full-stack default; "
-            "the PRD does not specify an application framework."
+            "The PRD does not specify an application framework; SHAMSU will "
+            "suggest one and record the suggestion as an assumption."
         )
 
     generation_order = (
