@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import time
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass, field
@@ -26,6 +27,12 @@ from shamsu.session.manager import SessionManager
 from shamsu.tools.browser import BrowserTool
 from shamsu.tools.web import WebTool
 from shamsu.types import ApprovalRequest
+
+
+def _env_int(name: str, default: int) -> int:
+    """A non-negative integer override, or *default*. 0 disables the bound."""
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() else default
 
 
 ApprovalMode = Literal["allow", "deny"]
@@ -226,7 +233,20 @@ async def run_prompt(
         width=120,
     )
     manager = SessionManager(root)
-    logger = manager.resume_session(session) if session else manager.create_session("Headless Run")
+    if session:
+        logger = manager.resume_session(session)
+    else:
+        # Continue the workspace's latest session rather than always starting a new
+        # one. A per-prompt session cannot persist an answer, so a question asked in
+        # one prompt was gone by the next and a fresh instruction got recorded as
+        # the answer to the old question. Bounded by age and length - see
+        # SessionManager.continue_or_create - so continuity does not become a
+        # transcript long enough to make the model echo stale text.
+        logger = manager.continue_or_create(
+            "Headless Run",
+            max_age_seconds=_env_int("SHAMSU_SESSION_CONTINUE_SECONDS", 1800),
+            max_messages=_env_int("SHAMSU_SESSION_CONTINUE_MAX_MESSAGES", 40),
+        )
     previous_user_prompt = logger.metadata.last_user_prompt
     user_event = logger.log(
         "user.prompt",

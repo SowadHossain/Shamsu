@@ -94,6 +94,53 @@ class SessionManager:
         latest.log("session.resumed", {"query": "latest-active"}, "Session resumed")
         return latest
 
+    def continue_or_create(
+        self,
+        title: str | None = None,
+        *,
+        max_age_seconds: int = 1800,
+        max_messages: int = 40,
+    ) -> "SessionLogger":
+        """Continue the latest active session when that is still safe, else start one.
+
+        Why continue at all: a headless run used to create a NEW session per
+        prompt (the OpenBazaar build produced 124 of them), so nothing could
+        persist between prompts. A question asked in prompt N was gone by N+1, and
+        a fresh instruction arriving mid-question got recorded as the *answer* to
+        the old one. That is structural, not a bug in the question code.
+
+        Why bounded: live testing on 2026-08-02 found that session history degrades
+        after roughly six turns - the model starts echoing stale text instead of
+        acting. Continuation is therefore capped by both age and message count, so
+        a run gets continuity across the prompts where it matters without
+        inheriting a transcript long enough to poison it.
+        """
+        latest = self.latest_active()
+        if latest is not None and self._safe_to_continue(
+            latest.metadata, max_age_seconds, max_messages
+        ):
+            latest.log("session.resumed", {"query": "continue-latest"}, "Session resumed")
+            return latest
+        return self.create_session(title)
+
+    @staticmethod
+    def _safe_to_continue(
+        metadata: SessionMetadata, max_age_seconds: int, max_messages: int
+    ) -> bool:
+        if max_messages and metadata.message_count >= max_messages:
+            return False
+        if not max_age_seconds:
+            return True
+        try:
+            updated = datetime.fromisoformat(metadata.updated_at.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            # An unparseable timestamp is not evidence of freshness.
+            return False
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - updated).total_seconds()
+        return age <= max_age_seconds
+
     def resume_session(self, query: str) -> "SessionLogger":
         metadata = self.resolve(query)
         metadata.status = "active"
