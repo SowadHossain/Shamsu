@@ -304,6 +304,68 @@ def test_dockerized_postgres_full_stack_files_are_foundation_targets():
     assert "sql-databases" in foundation.active_skills
 
 
+def test_selected_node_backend_blueprint_declares_backend_source_files_with_react_present():
+    contract = extract_contract(
+        parse_prd_text(
+            "# OpenBazaar\n\n"
+            "## Tech Stack\n"
+            "- Node.js with Express backend\n"
+            "- React and Vite frontend\n"
+            "- PostgreSQL 16\n\n"
+            "## Data Model\n"
+            "Listing\n"
+            "- id, title, price\n\n"
+            "## Features\n"
+            "- Buyers browse listings.\n\n"
+            "## Acceptance\n"
+            "- `docker compose config -q` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    artifacts = compile_prd_execution_artifacts(contract)
+    foundation = next(
+        milestone for milestone in artifacts.requirement_ledger.milestones
+        if milestone.id == "M-001"
+    )
+
+    assert "backend/server.js" in foundation.expected_files
+    assert "backend/src/app.js" in foundation.expected_files
+    assert "backend/src/db.js" in foundation.expected_files
+    assert "backend/src/schema.sql" in foundation.expected_files
+
+
+def test_node_react_postgres_stack_infers_node_backend_for_data_prd():
+    contract = extract_contract(
+        parse_prd_text(
+            "# OpenBazaar\n\n"
+            "## Tech Stack\n"
+            "- Node.js\n"
+            "- React and Vite\n"
+            "- PostgreSQL 16\n\n"
+            "## Data Model\n"
+            "Listing\n"
+            "- id, title, price\n\n"
+            "## Features\n"
+            "- Buyers browse listings.\n\n"
+            "## Acceptance\n"
+            "- `docker compose config -q` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    artifacts = compile_prd_execution_artifacts(contract)
+    foundation = next(
+        milestone for milestone in artifacts.requirement_ledger.milestones
+        if milestone.id == "M-001"
+    )
+
+    assert "backend/server.js" in foundation.expected_files
+    assert "backend/src/app.js" in foundation.expected_files
+    assert "backend/src/schema.sql" in foundation.expected_files
+    assert "frontend/package.json" in foundation.expected_files
+
+
 def test_django_product_milestone_declares_server_rendered_ui_files():
     contract = extract_contract(
         parse_prd_text(

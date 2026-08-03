@@ -11269,8 +11269,8 @@ def _milestone_id_from_line(line: str) -> str:
 
 
 def _prd_model_preflight_enabled() -> bool:
-    raw = os.environ.get("SHAMSU_PRD_MODEL_PREFLIGHT", "").strip().lower()
-    return raw in {"1", "true", "yes", "on", "enabled"}
+    raw = os.environ.get("SHAMSU_PRD_MODEL_PREFLIGHT", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", "disabled"}
 
 
 def _prd_milestone_repair_enabled() -> bool:
@@ -11305,6 +11305,7 @@ Return ONLY JSON matching the schema.
 Do not invent requirements, tools, or shell commands.
 You may narrow active_skills and allowed_tools to the provided allowlists.
 You may add safe relative expected files when they are clearly needed for this milestone.
+Return implementation_steps as 3 to 6 ordered, file-aware actions for this milestone.
 Keep notes short and operational."""
 
 
@@ -11398,6 +11399,7 @@ def _build_prd_model_preflight_prompt(preflight: dict[str, Any], workspace: Path
             "Use only tools from allowed_tools_allowlist.",
             "Expected files must be safe relative file paths.",
             "Verifier is a short strategy label, not a shell command.",
+            "implementation_steps must be concrete, ordered, and bounded to this milestone.",
         ],
     }
     return json.dumps(payload, indent=2, ensure_ascii=True)

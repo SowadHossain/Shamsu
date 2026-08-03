@@ -321,12 +321,15 @@ def test_prd_execution_blocker_is_durable(tmp_path: Path):
 def test_render_preflight_context_is_compact_and_grounded(tmp_path: Path):
     root, _state = initialize_prd_execution(tmp_path, "build from PRD", _contract())
     preflight = load_milestone_preflight(root, "M-002")
+    preflight["implementation_steps"] = ["Create src/SearchPanel.tsx.", "Run the focused check."]
 
     rendered = render_preflight_context(preflight)
 
     assert "## Milestone Preflight" in rendered
     assert "Requirement IDs: FEAT-001" in rendered
     assert "Search tasks" in rendered
+    assert "Implementation plan:" in rendered
+    assert "1. Create src/SearchPanel.tsx." in rendered
     assert len(rendered) < 2000
 
 
@@ -337,6 +340,7 @@ def test_model_preflight_schema_declares_bounded_fields():
     assert "milestone_id" in schema["required"]
     assert "expected_files" in schema["properties"]
     assert "allowed_tools" in schema["properties"]
+    assert "implementation_steps" in schema["properties"]
 
 
 def test_validate_model_preflight_accepts_allowlisted_focus(tmp_path: Path):
@@ -353,6 +357,7 @@ def test_validate_model_preflight_accepts_allowlisted_focus(tmp_path: Path):
             "allowed_tools": ["read_file", "write_file", "edit_file"],
             "verifier": "focused app tests/build",
             "context_focus": ["Search task workflow", "preserve existing App wiring"],
+            "implementation_steps": ["Create the search panel.", "Run the focused check."],
             "risk_flags": ["do not replace previous milestone files"],
             "notes": "Keep the milestone small.",
         },
@@ -365,6 +370,7 @@ def test_validate_model_preflight_accepts_allowlisted_focus(tmp_path: Path):
     assert "src/SearchPanel.tsx" in preflight["expected_files"]
     assert preflight["allowed_tools"] == ["read_file", "write_file", "edit_file"]
     assert preflight["context_focus"][0] == "Search task workflow"
+    assert preflight["implementation_steps"] == ["Create the search panel.", "Run the focused check."]
 
 
 def test_validate_model_preflight_rejects_ledger_or_tool_drift(tmp_path: Path):
@@ -395,6 +401,7 @@ def test_record_milestone_preflight_is_durable(tmp_path: Path):
     preflight = load_milestone_preflight(root, "M-002")
     preflight["preflight_source"] = "model"
     preflight["context_focus"] = ["Search task workflow"]
+    preflight["implementation_steps"] = ["Create the search panel.", "Run the focused check."]
 
     state = record_milestone_preflight(root, state, "M-002", preflight)
     reloaded = json.loads((root / "state.json").read_text(encoding="utf-8"))
@@ -404,6 +411,7 @@ def test_record_milestone_preflight_is_durable(tmp_path: Path):
     assert reloaded["preflight_decisions"][0]["source"] == "model"
     assert (root / "preflight" / "M-002.effective.json").is_file()
     assert decision["context_focus"] == ["Search task workflow"]
+    assert decision["implementation_steps"] == ["Create the search panel.", "Run the focused check."]
 
 
 def test_prd_milestone_verifier_marks_python_file_verified(tmp_path: Path):
@@ -1792,6 +1800,10 @@ def test_prepare_prd_milestone_preflight_accepts_valid_model_output(
                     "allowed_tools": ["read_file", "write_file"],
                     "verifier": "focused app tests/build",
                     "context_focus": ["Search task workflow"],
+                    "implementation_steps": [
+                        "Create the search panel target file.",
+                        "Run the focused app check.",
+                    ],
                     "risk_flags": [],
                     "blocker_question": "",
                     "notes": "Use existing app state.",
@@ -1816,12 +1828,74 @@ def test_prepare_prd_milestone_preflight_accepts_valid_model_output(
     assert seen["role"] == "planner"
     assert preflight["preflight_source"] == "model"
     assert preflight["context_focus"] == ["Search task workflow"]
+    assert preflight["implementation_steps"] == [
+        "Create the search panel target file.",
+        "Run the focused app check.",
+    ]
     assert "src/SearchPanel.tsx" in preflight["expected_files"]
     assert state["preflight_decisions"][0]["accepted"] is True
+    assert state["preflight_decisions"][0]["implementation_steps"][1] == (
+        "Run the focused app check."
+    )
     assert (root / "preflight" / "M-002.effective.json").is_file()
 
 
-def test_prepare_prd_milestone_preflight_is_disabled_by_default(
+def test_prepare_prd_milestone_preflight_runs_by_default(
+    monkeypatch,
+    tmp_path: Path,
+):
+    root, state = initialize_prd_execution(tmp_path, "build from PRD", _contract())
+    deterministic = load_milestone_preflight(root, "M-002")
+
+    class FakeLLM:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def generate_structured(self, role, system, prompt, schema, **kwargs):
+            return json.dumps(
+                {
+                    "milestone_id": "M-002",
+                    "requirement_ids": ["FEAT-001"],
+                    "active_skills": ["developer"],
+                    "expected_files": ["src/SearchPanel.tsx"],
+                    "allowed_tools": ["read_file", "write_file"],
+                    "verifier": "focused app tests/build",
+                    "context_focus": ["Search task workflow"],
+                    "implementation_steps": [
+                        "Create the search panel target file.",
+                        "Wire the task search requirements into that file.",
+                        "Run the focused app check.",
+                    ],
+                    "risk_flags": [],
+                    "blocker_question": "",
+                    "notes": "Use existing app state.",
+                }
+            )
+
+    monkeypatch.delenv("SHAMSU_PRD_MODEL_PREFLIGHT", raising=False)
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    preflight, next_state = asyncio.run(
+        repl._prepare_prd_milestone_preflight(
+            root,
+            state,
+            "M-002",
+            deterministic,
+            tmp_path,
+            _console(),
+            None,
+        )
+    )
+
+    assert preflight["preflight_source"] == "model"
+    assert preflight["context_focus"] == ["Search task workflow"]
+    assert preflight["implementation_steps"][1] == (
+        "Wire the task search requirements into that file."
+    )
+    assert next_state["preflight_decisions"][0]["accepted"] is True
+
+
+def test_prepare_prd_milestone_preflight_can_be_disabled_by_env(
     monkeypatch,
     tmp_path: Path,
 ):
@@ -1830,9 +1904,9 @@ def test_prepare_prd_milestone_preflight_is_disabled_by_default(
 
     class BoomLLM:  # pragma: no cover - must not be instantiated
         def __init__(self, **_kwargs):
-            raise AssertionError("model preflight should be opt-in")
+            raise AssertionError("model preflight should obey the explicit off switch")
 
-    monkeypatch.delenv("SHAMSU_PRD_MODEL_PREFLIGHT", raising=False)
+    monkeypatch.setenv("SHAMSU_PRD_MODEL_PREFLIGHT", "0")
     monkeypatch.setattr(repl, "LLMManager", BoomLLM)
 
     preflight, next_state = asyncio.run(

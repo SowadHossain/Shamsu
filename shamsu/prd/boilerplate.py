@@ -158,7 +158,8 @@ NODE_PACKAGE_JSON = """{
   "dependencies": {
     "better-sqlite3": "^9.0.0",
     "cors": "^2.8.5",
-    "express": "^4.18.0"
+    "express": "^4.18.0",
+    "pg": "^8.11.0"
   }
 }
 """
@@ -166,6 +167,11 @@ NODE_PACKAGE_JSON = """{
 NODE_ENV_EXAMPLE = """NODE_ENV=development
 PORT=8000
 DATABASE_URL=sqlite:./db.sqlite3
+"""
+
+NODE_POSTGRES_ENV_EXAMPLE = """NODE_ENV=development
+PORT=8000
+DATABASE_URL=postgres://openbazaar:openbazaar@postgres:5432/openbazaar
 """
 
 NODE_DOCKERFILE = """FROM node:22-alpine
@@ -285,6 +291,7 @@ DOCKER_COMPOSE_TEMPLATE = """services:
       POSTGRES_PASSWORD: openbazaar
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      DATABASE_URL: postgres://openbazaar:openbazaar@postgres:5432/openbazaar
     ports:
       - "8000:8000"
     depends_on:
@@ -454,6 +461,7 @@ def _docker_compose_content(expected_files: Sequence[str]) -> str:
       POSTGRES_PASSWORD: openbazaar
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      DATABASE_URL: postgres://openbazaar:openbazaar@postgres:5432/openbazaar
     ports:
       - "8000:8000"
     depends_on:
@@ -514,7 +522,11 @@ def render_boilerplate(
         if _endswith_component_path(normalized, "backend/package.json"):
             return NODE_PACKAGE_JSON
         if _endswith_component_path(normalized, "backend/.env.example"):
-            return NODE_ENV_EXAMPLE
+            return (
+                NODE_POSTGRES_ENV_EXAMPLE
+                if uses_postgres_runtime(expected_files)
+                else NODE_ENV_EXAMPLE
+            )
         if _endswith_component_path(normalized, "backend/Dockerfile"):
             return NODE_DOCKERFILE
     if not is_django_project(expected_files):

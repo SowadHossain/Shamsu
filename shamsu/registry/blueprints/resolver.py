@@ -95,6 +95,7 @@ def resolve_blueprints(contract: PRDContract) -> BlueprintResolution:
         if set(blueprint.provides) & prohibited
     }
     tokens = _contract_tokens(contract)
+    tokens = _without_frontend_tooling_node(tokens, contract)
     selected: dict[str, StackBlueprint] = {}
     unsupported: list[str] = []
     conflicts: list[str] = []
@@ -161,6 +162,34 @@ def _contract_tokens(contract: PRDContract) -> set[str]:
     return {
         normalized for normalized in (_normalize_token(token) for token in parts) if normalized
     }
+
+
+def _without_frontend_tooling_node(tokens: set[str], contract: PRDContract) -> set[str]:
+    """Do not turn React/Vite's Node tooling into a backend service."""
+    frontend_tokens = {"react", "vite", "vue", "svelte", "typescript", "tsx", "jsx"}
+    backend_tokens = {"express", "fastify", "koa", "nest", "hapi"}
+    if "node" not in tokens or not (tokens & frontend_tokens) or tokens & backend_tokens:
+        return tokens
+    if _contract_needs_backend_service(contract, tokens):
+        return tokens
+    return {token for token in tokens if token != "node"}
+
+
+def _contract_needs_backend_service(contract: PRDContract, tokens: set[str]) -> bool:
+    database_tokens = {"postgres", "mysql", "mariadb", "mongodb"}
+    if tokens & database_tokens:
+        return True
+    if (
+        contract.requires_full_stack
+        or contract.entities
+        or contract.api_endpoints
+        or contract.authentication_rules
+        or contract.authorization_rules
+        or contract.persistence_requirements
+    ):
+        return True
+    text = " ".join([contract.product_summary, *contract.architecture, *contract.features]).lower()
+    return any(token in text for token in ("backend", "api", "server", "database"))
 
 
 def _normalize_token(value: str) -> str:

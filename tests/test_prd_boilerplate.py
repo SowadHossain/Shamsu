@@ -212,6 +212,25 @@ def test_node_express_runtime_files_are_generated_deterministically():
     assert 'CMD ["npm", "start"]' in render_boilerplate("backend/Dockerfile", expected)
 
 
+def test_node_express_runtime_uses_postgres_when_compose_is_expected():
+    expected = [
+        "docker-compose.yml",
+        ".env.example",
+        "backend/package.json",
+        "backend/server.js",
+        "backend/.env.example",
+        "backend/Dockerfile",
+    ]
+
+    package = render_boilerplate("backend/package.json", expected)
+    env = render_boilerplate("backend/.env.example", expected)
+    compose = render_boilerplate("docker-compose.yml", expected)
+
+    assert package is not None and '"pg"' in package
+    assert env is not None and "postgres://openbazaar" in env
+    assert compose is not None and "DATABASE_URL: postgres://openbazaar" in compose
+
+
 def test_react_index_html_matches_jsx_entrypoint_when_that_is_expected():
     expected = [
         "frontend/package.json",

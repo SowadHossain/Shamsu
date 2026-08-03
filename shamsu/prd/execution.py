@@ -55,6 +55,7 @@ MODEL_PREFLIGHT_SCHEMA: dict[str, Any] = {
         "allowed_tools": {"type": "array", "items": {"type": "string"}},
         "verifier": {"type": "string"},
         "context_focus": {"type": "array", "items": {"type": "string"}},
+        "implementation_steps": {"type": "array", "items": {"type": "string"}},
         "risk_flags": {"type": "array", "items": {"type": "string"}},
         "blocker_question": {"type": "string"},
         "notes": {"type": "string"},
@@ -200,6 +201,9 @@ def validate_model_preflight(
             "verifier": _safe_model_text(candidate.get("verifier"), 160)
             or str(deterministic.get("verifier") or ""),
             "context_focus": _safe_text_list(candidate.get("context_focus"), limit=12, max_chars=160),
+            "implementation_steps": _safe_text_list(
+                candidate.get("implementation_steps"), limit=8, max_chars=180
+            ),
             "risk_flags": _safe_text_list(candidate.get("risk_flags"), limit=8, max_chars=160),
             "blocker_question": _safe_model_text(candidate.get("blocker_question"), 240),
             "notes": _safe_model_text(candidate.get("notes"), 400),
@@ -229,6 +233,7 @@ def record_milestone_preflight(
         "allowed_tools": _unique_strings(preflight.get("allowed_tools") or []),
         "verifier": str(preflight.get("verifier") or ""),
         "context_focus": _unique_strings(preflight.get("context_focus") or []),
+        "implementation_steps": _unique_strings(preflight.get("implementation_steps") or []),
         "risk_flags": _unique_strings(preflight.get("risk_flags") or []),
         "blocker_question": str(preflight.get("blocker_question") or "")[:240],
         "notes": str(preflight.get("notes") or "")[:400],
@@ -530,6 +535,10 @@ def render_preflight_context(preflight: dict[str, Any]) -> str:
     if context_focus:
         lines.extend(["", "Context focus:"])
         lines.extend(f"- {item}" for item in context_focus)
+    implementation_steps = list(preflight.get("implementation_steps") or [])[:8]
+    if implementation_steps:
+        lines.extend(["", "Implementation plan:"])
+        lines.extend(f"{index}. {item}" for index, item in enumerate(implementation_steps, start=1))
     risk_flags = list(preflight.get("risk_flags") or [])[:6]
     if risk_flags:
         lines.extend(["", "Risk flags:"])

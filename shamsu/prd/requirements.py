@@ -640,32 +640,40 @@ def _is_node_backend_stack(contract: PRDContract) -> bool:
 def _architecture_components(contract: PRDContract) -> list[dict[str, Any]]:
     """Describe component ownership without generating framework source files."""
     stack = " ".join([contract.stack_hint, *contract.required_stack]).lower()
+    selected = resolve_blueprints(contract).selected
     components: list[dict[str, Any]] = []
-    if any(token in stack for token in ("react", "vite", "vue", "svelte", "frontend")):
+    frontend_blueprint = selected.get("frontend")
+    backend_blueprint = selected.get("backend")
+    database_blueprint = selected.get("database")
+    if frontend_blueprint or any(token in stack for token in ("react", "vite", "vue", "svelte", "frontend")):
         components.append(
             {
                 "id": "frontend",
-                "root": "frontend",
+                "root": frontend_blueprint.root if frontend_blueprint else "frontend",
                 "required": True,
                 "responsibility": "browser UI and API client",
             }
         )
-    if _is_node_backend_stack(contract) or any(
+    if backend_blueprint or _is_node_backend_stack(contract) or any(
         token in stack for token in ("django", "fastapi", "flask", "backend")
     ):
         components.append(
             {
                 "id": "backend",
-                "root": "backend",
+                "root": backend_blueprint.root if backend_blueprint else "backend",
                 "required": True,
                 "responsibility": "API, authentication, and domain logic",
             }
         )
-    if any(token in stack for token in ("sqlite", "postgres", "mysql", "database")):
+    if database_blueprint or any(token in stack for token in ("sqlite", "postgres", "mysql", "database")):
         components.append(
             {
                 "id": "database",
-                "root": "backend" if any(item["id"] == "backend" for item in components) else ".",
+                "root": (
+                    database_blueprint.root
+                    if database_blueprint
+                    else "backend" if any(item["id"] == "backend" for item in components) else "."
+                ),
                 "required": True,
                 "responsibility": "persistent application state owned by the backend",
             }
@@ -710,6 +718,9 @@ def _architecture_expected_files_for_milestone(
     roots = _component_roots(contract)
     backend_root = roots.get("backend")
     frontend_root = roots.get("frontend")
+    selected = resolve_blueprints(contract).selected
+    backend_blueprint = selected.get("backend")
+    frontend_blueprint = selected.get("frontend")
     number = int(milestone_id.removeprefix("M-") or 0)
     foundation = number == 1 or 100 <= number < 200
     product = number == 2 or 200 <= number < 300
@@ -717,7 +728,12 @@ def _architecture_expected_files_for_milestone(
     paths: list[str] = []
     if foundation or release:
         paths.extend(runtime_file_paths_for_contract(contract))
-    if backend_root and _is_node_backend_stack(contract) and (foundation or release):
+    if (
+        backend_root
+        and backend_blueprint is not None
+        and backend_blueprint.id == "node-express"
+        and (foundation or release)
+    ):
         # Without this branch a Node PRD declared no foundation files at all.
         # Two things then went wrong at once: the file-at-a-time pass had no
         # missing architecture file to target, so the whole milestone collapsed
@@ -735,7 +751,12 @@ def _architecture_expected_files_for_milestone(
                 "src/routes/index.js",
             )
         )
-    if backend_root and "django" in stack and (foundation or release):
+    if (
+        backend_root
+        and backend_blueprint is not None
+        and backend_blueprint.id == "django"
+        and (foundation or release)
+    ):
         paths.extend(
             _under_root(backend_root, path)
             for path in (
@@ -750,7 +771,12 @@ def _architecture_expected_files_for_milestone(
                 "core/migrations/__init__.py",
             )
         )
-    if backend_root and "django" in stack and (product or release):
+    if (
+        backend_root
+        and backend_blueprint is not None
+        and backend_blueprint.id == "django"
+        and (product or release)
+    ):
         paths.extend(
             _under_root(backend_root, path)
             for path in (
@@ -764,7 +790,12 @@ def _architecture_expected_files_for_milestone(
                 "core/templates/resource_form.html",
             )
         )
-    if frontend_root and any(token in stack for token in ("react", "vite")) and (product or release):
+    if (
+        frontend_root
+        and frontend_blueprint is not None
+        and frontend_blueprint.id == "react-vite"
+        and (product or release)
+    ):
         typed = "typescript" in stack or "tsx" in stack
         extension = "tsx" if typed else "jsx"
         paths.extend(

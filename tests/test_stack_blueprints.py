@@ -44,6 +44,35 @@ def test_named_but_unsupported_stack_yields_no_blueprint_instead_of_a_default():
     assert any("rails" in error for error in resolution.errors)
 
 
+def test_react_vite_node_tooling_does_not_select_a_backend_blueprint():
+    contract = PRDContract(
+        title="Frontend",
+        stack_hint="node",
+        required_stack=["react", "vite"],
+    )
+
+    resolution = resolve_blueprints(contract)
+
+    assert "backend" not in resolution.selected
+    assert resolution.selected["frontend"].id == "react-vite"
+
+
+def test_node_react_postgres_prd_selects_a_backend_service():
+    contract = PRDContract(
+        title="OpenBazaar",
+        stack_hint="node",
+        required_stack=["react", "vite", "postgres"],
+        entities=[{"name": "Listing"}],
+        persistence_requirements=["Listings are stored in PostgreSQL."],
+    )
+
+    resolution = resolve_blueprints(contract)
+
+    assert resolution.selected["backend"].id == "node-express"
+    assert resolution.selected["frontend"].id == "react-vite"
+    assert resolution.selected["database"].id == "postgres"
+
+
 def test_selected_blueprint_paths_match_the_compiled_expected_file_path():
     contract = PRDContract(title="Course Desk", stack_hint="django", required_stack=["django"])
     django = resolve_blueprints(contract).selected["backend"]

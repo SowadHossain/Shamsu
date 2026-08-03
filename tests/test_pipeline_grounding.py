@@ -396,7 +396,13 @@ def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
     target = tmp_path / "atlasops-freeform"
     assert (target / "backend" / "package.json").is_file()
     assert (target / "backend" / "Dockerfile").is_file()
-    assert all(call[1]["allowed_write_paths"] == ("atlasops-freeform",) for call in calls)
+    assert all(
+        all(
+            path == "atlasops-freeform" or str(path).startswith("atlasops-freeform/")
+            for path in call[1]["allowed_write_paths"]
+        )
+        for call in calls
+    )
     assert all(
         call[1]["user_request"]
         == "Implement the current coding milestone inside project root atlasops-freeform."
