@@ -468,11 +468,17 @@ error.
 
 ### Model Tiers
 
-| Tier | Thinking/text model | Coding model | Intended host | Measured limitation |
-|---|---|---|---|---|
-| `light` | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` | 8 GB RAM / CPU-first | Faster, but the current 12-case eval is 9/12; clarification and rename/destructive-ambiguity cases remain weak. |
-| `default` | `deepseek-r1:7b` | `qwen2.5-coder:7b-instruct` | 8 GB+ with one model active at a time | Current 12-case eval is 11/12 with two stochastic cases; model swaps can dominate task time. |
-| `heavy` | `mistral-nemo:12b` | `qwen2.5-coder:14b` | 16 GB+ | Higher memory and download cost; not yet represented by a published three-sample benchmark. |
+One model per tier serves every role. The coding anchor is still declared and is
+used only when `SHAMSU_MULTI_MODEL_MODE=1` restores the two-anchor layout.
+
+| Tier | Model (all roles) | Coding anchor (multi-model mode only) | Intended host |
+|---|---|---|---|
+| `light` | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` | 8 GB RAM / CPU-first |
+| `default` | `qwen3:8b` | `qwen2.5-coder:7b-instruct` | 8 GB+ |
+| `heavy` | `mistral-nemo:12b` | `qwen2.5-coder:14b` | 16 GB+ |
+
+Eval figures published before the single-model default was adopted were measured
+on the two-anchor layout and do not describe the current default.
 
 Choose with `/models tier light|default|heavy` or `SHAMSU_MODEL_TIER`. See
 `BENCHMARK.md`, `BENCHMARK-light.md`, and `RELEASE_VALIDATION.md` for measured
@@ -698,10 +704,16 @@ Local AI runtime:
 - Required model checks use Ollama's local CLI and local HTTP API.
 - Setup-time downloads require installer approval or `-Yes`/`--yes`.
 - Runtime inference does not call cloud AI endpoints.
-- The default v2.2 model map uses two 8GB-friendly anchors: `deepseek-r1:7b`
-  for routing/chat/planning/review/docs and `qwen2.5-coder:7b-instruct`
-  for code, tests, and bug-fix work. Set `SHAMSU_SINGLE_MODEL_MODE=1` to
-  route every role through `deepseek-r1:7b` for zero-swap measurement.
+- **One model serves every role by default.** On the `default` tier that is
+  `qwen3:8b`, which does native tool-calling and keeps a separate thinking
+  channel, so planning and coding need no model swap. Two anchors could not be
+  co-resident on an 8GB machine, so Ollama evicted and cold-loaded on every
+  planner-to-coder handoff — a swap on every turn.
+- Roles whose work is mechanical (routing, classification, PRD extraction) are
+  sent `think=false` per call, so sharing a reasoning model costs them no
+  chain-of-thought latency.
+- `SHAMSU_MODEL=<name>` pins any local model for every role.
+  `SHAMSU_MULTI_MODEL_MODE=1` restores the historical two-anchor layout.
 
 Internal command execution:
 

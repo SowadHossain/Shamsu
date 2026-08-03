@@ -89,3 +89,14 @@ def _model_tier_reset(monkeypatch):
     monkeypatch.setattr(models_module, "_ACTIVE_TIER", models_module.DEFAULT_TIER)
 
 
+@pytest.fixture(autouse=True)
+def _model_presence_cache_reset(monkeypatch):
+    """`_ensure_model` remembers confirmed-present models for the process so it
+    stops re-shelling `ollama list` before every call. That cache is global, so a
+    test whose fake reports a model installed would otherwise suppress the pull
+    path in every later test."""
+    import shamsu.llm.manager as manager_module
+
+    monkeypatch.setattr(manager_module, "_MODELS_CONFIRMED_PRESENT", set())
+
+

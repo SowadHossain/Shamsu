@@ -1411,17 +1411,22 @@ collapsed into a **two-anchor** contract to minimize model swapping: every
 chat) shares one anchor, and every "coding" role (coder, frontend, backend,
 tests, bugfix) shares the other. Three hardware tiers provide the anchors:
 
-| Tier | Thinking anchor | Coding anchor |
+**Superseded: one model now serves every role.** The role split below applies only
+when `SHAMSU_MULTI_MODEL_MODE=1` restores the two-anchor layout. By default a tier
+resolves every role to its single model, and roles that must not pay for
+chain-of-thought are handled per call by `role_should_think()`.
+
+| Tier | Model (all roles) | Coding anchor (multi-model mode only) |
 |---|---|---|
 | `light` — 8 GB, CPU-only | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` |
-| `default` — 8 GB cookbook | `deepseek-r1:7b` | `qwen2.5-coder:7b-instruct` |
+| `default` — 8 GB cookbook | `qwen3:8b` | `qwen2.5-coder:7b-instruct` |
 | `heavy` — 16 GB+ | `mistral-nemo:12b` | `qwen2.5-coder:14b` |
 
 Notes:
 
-- `qwen3:8b` and `gemma3:4b` are **former** anchors — still recognized and
-  allowed for existing installs, never auto-pulled. Older docs naming either as
-  "the default" are stale.
+- `deepseek-r1:7b` and `gemma3:4b` are **non-anchor** allowed models — recognized
+  for existing installs, never auto-pulled.
+- `SHAMSU_MODEL=<name>` pins any local model for every role.
 - Each `ModelSpec` carries capability flags (`supports_native_tools`,
   `is_reasoning`). SHAMSU does not assume native tool-calling: models without it
   get a prompt-level tool protocol, with `llm/output.py::parse_model_turn` as the

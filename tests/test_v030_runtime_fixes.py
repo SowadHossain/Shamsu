@@ -419,13 +419,16 @@ def test_prd_summary_reads_and_summarizes(tmp_path):
     assert "notes app" in console.file.getvalue().lower()
 
 
-def test_agent_loop_runs_on_coder_model(tmp_path):
+def test_agent_loop_runs_on_the_configured_executor_model(tmp_path):
     from shamsu.runtime.models import model_for_role
 
     loop = _loop(tmp_path, ScriptedClient([_message(content="hi")]))
-    # The tool loop must not run on the slow thinking model.
+    # The original assertion also required coder != qa, which is unsatisfiable
+    # under the single-model default. What it was really protecting is that the
+    # tool loop runs on the model resolved for its executor role rather than an
+    # unrelated one; the "don't use the slow thinking model" half is now handled
+    # per call by role_should_think() instead of by picking a second model.
     assert loop.model_name == model_for_role("coder")
-    assert loop.model_name != model_for_role("qa")
 
 
 def test_bugfix_diff_tolerates_fences_and_prose():

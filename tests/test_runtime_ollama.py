@@ -36,14 +36,19 @@ def test_llm_manager_rejects_remote_urls():
         LLMManager("https://api.example.com")
 
 
-def test_model_defaults_are_shared_by_runtime_and_llm_manager():
+def test_only_one_model_is_required_by_default():
+    """The point of the single-model default: one model to pull and keep resident."""
+    assert required_model_names() == ["qwen3:8b"]
+
+
+def test_multi_model_mode_requires_both_anchors(monkeypatch):
+    monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
     required = required_model_names()
 
     assert required == ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
-    assert SPECIALIST_MODELS["router"] in required
+    # SPECIALIST_MODELS is the back-compat static snapshot of the two-anchor
+    # default-tier layout, so it is only meaningful in this mode.
     assert SPECIALIST_MODELS["coder"] in required
-    assert SPECIALIST_MODELS["bugfix"] in required
-    assert SPECIALIST_MODELS["reviewer"] in required
     assert SPECIALIST_MODELS["bugfix"] == SPECIALIST_MODELS["coder"]
     assert SPECIALIST_MODELS["reviewer"] == SPECIALIST_MODELS["router"]
 

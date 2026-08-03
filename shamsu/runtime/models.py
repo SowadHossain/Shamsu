@@ -237,23 +237,70 @@ def _coding_model_for_tier(tier: ModelTier) -> str:
     return TIER_MODEL_SPECS[tier][1].name
 
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def configured_model() -> str:
+    """An explicit ``SHAMSU_MODEL`` pin used for every role, or ``""``.
+
+    Highest precedence, and the documented escape hatch: one line of env restores
+    any previous model if the single-model default regresses code quality.
+    """
+    return os.environ.get("SHAMSU_MODEL", "").strip()
+
+
+def multi_model_mode_enabled() -> bool:
+    """Whether to use the historical two-anchor-per-tier layout.
+
+    Off by default. Multi-model cost more than it bought on the 8GB target: the
+    two anchors cannot be co-resident, so Ollama evicted and cold-loaded on every
+    planner -> coder handoff, i.e. a model swap on every turn of a chat run.
+    """
+    raw = os.environ.get("SHAMSU_MULTI_MODEL_MODE", "").strip().lower()
+    if raw in _TRUE_VALUES:
+        return True
+    # Back-compat: SHAMSU_SINGLE_MODEL_MODE=0 was the way to ask for two models.
+    return os.environ.get("SHAMSU_SINGLE_MODEL_MODE", "").strip().lower() in _FALSE_VALUES
+
+
 def single_model_mode_enabled() -> bool:
-    value = os.environ.get("SHAMSU_SINGLE_MODEL_MODE", "")
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    """One model serves every role. Now the DEFAULT rather than opt-in."""
+    return not multi_model_mode_enabled()
 
 
 def model_for_role(role: str) -> str:
+    pinned = configured_model()
+    if pinned:
+        return pinned
     tier = active_tier()
     if single_model_mode_enabled():
+        # The tier's thinking anchor, which is qwen3:8b on the default tier: it
+        # does native tool-calling AND has a separate thinking channel, so one
+        # model can serve planning and coding without a swap. Roles that must not
+        # pay for chain-of-thought are handled per CALL by role_should_think(),
+        # not by routing them to a second model.
         return _thinking_model_for_tier(tier)
     if role == "router":
-        # The router runs a schema-constrained JSON classification every turn.
-        # Run it on the tier's fast INSTRUCT (coding) anchor instead of the
-        # reasoning anchor (deepseek-r1 / mistral-nemo), whose per-turn
-        # chain-of-thought is pure latency for pure classification. The coding
-        # anchor is already required/pulled, so this costs no extra model.
+        # Multi-model only. The router runs a schema-constrained JSON
+        # classification every turn; the reasoning anchor's per-turn
+        # chain-of-thought is pure latency for pure classification.
         return _coding_model_for_tier(tier)
     return _role_models_for_tier(tier).get(role, _thinking_model_for_tier(tier))
+
+
+# Roles whose work is mechanical classification or extraction, where a
+# chain-of-thought pass is pure latency. With one model serving every role, the
+# old defence (route the router to a non-reasoning model) no longer exists, so the
+# same intent is enforced per CALL instead.
+_NO_THINK_ROLES = frozenset({"router", "classifier", "prd_headings", "prd_entities"})
+
+
+def role_should_think(role: str, model_name: str) -> bool:
+    """Whether to ask *model_name* to ``think`` when serving *role*."""
+    if role in _NO_THINK_ROLES:
+        return False
+    return model_is_reasoning(model_name)
 
 
 def model_spec(model_name: str) -> ModelSpec | None:
@@ -316,6 +363,9 @@ def allowed_model_names() -> list[str]:
 
 def required_model_names(tier: ModelTier | None = None) -> list[str]:
     resolved_tier = tier or active_tier()
+    pinned = configured_model()
+    if pinned:
+        return [pinned]
     if single_model_mode_enabled():
         return [_thinking_model_for_tier(resolved_tier)]
     return [spec.name for spec in TIER_MODEL_SPECS[resolved_tier] if spec.required]

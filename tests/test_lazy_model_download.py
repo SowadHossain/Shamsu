@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from shamsu.llm.manager import _MODEL_PULL_LOCKS, LLMManager, ModelPullProgress
+from shamsu.runtime.models import model_for_role
 from shamsu.types import ContextPack
 
 
@@ -125,7 +126,10 @@ async def test_run_specialist_ensures_model_before_generating(monkeypatch, tmp_p
     pack = ContextPack(task_id="t1", step_id=1, specialist="coder", user_request="do it")
     await manager.run_specialist("coder", pack)
 
-    assert calls == ["qwen2.5-coder:7b-instruct"]
+    # Asserted against the resolver rather than a literal name: what matters is
+    # that the role's model is ensured before generating, not which model a given
+    # tier or single-model default happens to pick.
+    assert calls == [model_for_role("coder")]
 
 
 @pytest.mark.asyncio
@@ -144,9 +148,7 @@ async def test_route_ensures_router_model_before_routing(monkeypatch, tmp_path):
     manager = RoutingStub()
     await manager.route("hello", "a project")
 
-    # The router role resolves to the default tier's instruct (coding) anchor -
-    # it skips the reasoning anchor's per-turn chain-of-thought (G13).
-    assert calls == ["qwen2.5-coder:7b-instruct"]
+    assert calls == [model_for_role("router")]
 
 
 @pytest.mark.asyncio

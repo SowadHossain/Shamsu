@@ -12,16 +12,44 @@ from shamsu.runtime.models import (
 )
 
 
-def test_default_tier_uses_qwen3_for_thinking_and_qwen_coder_for_code():
+def test_default_tier_serves_every_role_from_one_model():
+    """One model is now the default, not opt-in.
+
+    Two anchors cost more than they bought on the 8GB target: they cannot be
+    co-resident, so Ollama evicted and cold-loaded on every planner -> coder
+    handoff - a model swap on every turn. qwen3:8b does native tool calls AND has
+    a separate thinking channel, so one model covers planning and coding.
+    """
     assert active_tier() is DEFAULT_TIER
-    # Thinking/qa/planner roles run on Qwen3 8B (replaced deepseek-r1:7b, which
-    # could not do native tool calls, so every planner/router call depended on
-    # the output salvager); coding stays qwen2.5-coder. The router runs on the
-    # fast instruct (coding) anchor to skip the reasoning model's per-turn
-    # chain-of-thought (G13).
+    for role in ("qa", "coder", "router", "planner", "bugfix"):
+        assert model_for_role(role) == "qwen3:8b", role
+    assert required_model_names() == ["qwen3:8b"]
+
+
+def test_multi_model_mode_restores_the_two_anchor_layout(monkeypatch):
+    """The escape hatch, kept working so the default is reversible."""
+    monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
+
     assert model_for_role("qa") == "qwen3:8b"
     assert model_for_role("coder") == "qwen2.5-coder:7b-instruct"
+    # In this mode the router still dodges the reasoning anchor by model choice.
     assert model_for_role("router") == "qwen2.5-coder:7b-instruct"
+
+
+def test_shamsu_model_pins_any_model_for_every_role(monkeypatch):
+    """One line of env reverts the model choice if it regresses code quality."""
+    monkeypatch.setenv("SHAMSU_MODEL", "qwen2.5-coder:7b-instruct")
+
+    for role in ("qa", "coder", "router", "planner"):
+        assert model_for_role(role) == "qwen2.5-coder:7b-instruct", role
+    assert required_model_names() == ["qwen2.5-coder:7b-instruct"]
+
+
+def test_a_pin_outranks_multi_model_mode(monkeypatch):
+    monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
+    monkeypatch.setenv("SHAMSU_MODEL", "qwen3:8b")
+
+    assert model_for_role("coder") == "qwen3:8b"
 
 
 def test_default_thinking_anchor_does_native_tools_and_reasoning():
@@ -34,8 +62,16 @@ def test_default_thinking_anchor_does_native_tools_and_reasoning():
 def test_light_tier_uses_small_cpu_friendly_models(tmp_path):
     set_model_tier(tmp_path, ModelTier.LIGHT)
 
-    # Router runs on the small instruct (coding) anchor, not the thinking anchor.
-    assert model_for_role("router") == "qwen2.5-coder:3b-instruct"
+    # One small model for everything - the tier still scales the model down.
+    assert model_for_role("router") == "qwen2.5:3b-instruct"
+    assert model_for_role("coder") == "qwen2.5:3b-instruct"
+    assert required_model_names() == ["qwen2.5:3b-instruct"]
+
+
+def test_light_tier_multi_model_mode_still_pulls_both_anchors(tmp_path, monkeypatch):
+    set_model_tier(tmp_path, ModelTier.LIGHT)
+    monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
+
     assert model_for_role("coder") == "qwen2.5-coder:3b-instruct"
     assert required_model_names() == ["qwen2.5:3b-instruct", "qwen2.5-coder:3b-instruct"]
 
@@ -49,7 +85,9 @@ def test_heavy_tier_caps_thinking_model_at_12b_and_allows_14b_coder(tmp_path):
 
     assert thinking.max_vram_gb <= 12.0
     assert coder.name == "qwen2.5-coder:14b"
-    assert model_for_role("bugfix") == "qwen2.5-coder:14b"
+    # The tier's coder anchor is still declared; under the single-model default the
+    # shared model is the thinking anchor, so that is what a coding role resolves to.
+    assert model_for_role("bugfix") == thinking.name
 
 
 def test_set_model_tier_persists_and_takes_effect_immediately(tmp_path):
@@ -103,18 +141,37 @@ def test_single_model_mode_uses_active_tiers_thinking_model(tmp_path, monkeypatc
     assert required_model_names() == ["qwen2.5:3b-instruct"]
 
 
-def test_router_avoids_the_reasoning_anchor_on_every_tier(tmp_path):
-    # G13: the router must not run on the reasoning/thinking anchor (which would
-    # add per-turn chain-of-thought latency); it uses the instruct coding anchor,
-    # which is already required so no extra model is pulled.
-    from shamsu.runtime.models import model_is_reasoning
+def test_the_router_never_pays_for_chain_of_thought_on_any_tier(tmp_path):
+    """G13's intent, enforced per CALL now that one model serves every role.
+
+    The router runs a schema-constrained JSON classification every turn, and
+    chain-of-thought on that is pure latency. That used to be guaranteed by sending
+    the router to a non-reasoning MODEL - impossible once a single reasoning model
+    serves everything - so the guarantee moved to role_should_think(), which is the
+    gate llm/manager actually consults before sending `think`.
+    """
+    from shamsu.runtime.models import role_should_think
 
     for tier in (ModelTier.LIGHT, ModelTier.DEFAULT, ModelTier.HEAVY):
         set_model_tier(tmp_path, tier)
         router = model_for_role("router")
-        assert router == model_for_role("coder")
-        assert model_is_reasoning(router) is False
-        assert router in required_model_names()
+        assert role_should_think("router", router) is False, tier
+        assert router in required_model_names(), tier
+
+
+def test_mechanical_roles_do_not_think_but_real_work_does():
+    from shamsu.runtime.models import role_should_think
+
+    for role in ("router", "classifier", "prd_headings", "prd_entities"):
+        assert role_should_think(role, "qwen3:8b") is False, role
+    for role in ("planner", "coder", "reviewer", "qa"):
+        assert role_should_think(role, "qwen3:8b") is True, role
+
+
+def test_a_non_reasoning_model_never_thinks_whatever_the_role():
+    from shamsu.runtime.models import role_should_think
+
+    assert role_should_think("planner", "qwen2.5-coder:7b-instruct") is False
 
 
 # ---------------------------------------------------------------------------

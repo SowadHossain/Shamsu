@@ -40,8 +40,8 @@ from shamsu.memory.service import MemoryService
 from shamsu.routing.operations import file_targets
 from shamsu.runtime.models import (
     model_for_role,
-    model_is_reasoning,
     model_supports_native_tools,
+    role_should_think,
 )
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
@@ -498,7 +498,10 @@ class AgentChatLoop:
         # model a native tools schema (vs. an in-prompt protocol + salvager) and
         # whether to ask it to `think` so reasoning stays out of the answer.
         self._supports_native_tools = model_supports_native_tools(self.model_name)
-        self._is_reasoning = model_is_reasoning(self.model_name)
+        # Per-role, not per-model: the executor role is real work, so it keeps its
+        # thinking channel, but the gate is now the same one the mechanical roles
+        # (router/classifier) go through in llm/manager.
+        self._is_reasoning = role_should_think(_CHAT_EXECUTOR_ROLE, self.model_name)
         self.llm = llm or LLMManager(session_logger=session_logger, action_ledger=action_ledger)
         self.context_builder = context_builder or ContextBuilder()
         self.client = client or ollama.AsyncClient(host=base_url)

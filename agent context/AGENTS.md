@@ -90,25 +90,35 @@ The central engineering principle:
 
 ## 4. Models
 
-Three tiers, one role contract (`shamsu/runtime/models.py`). Thinking roles
-(router/qa/planner/classifier/review/docs/summarizer/chat) get one anchor;
-coding roles (coder/frontend/backend/tests/bugfix) get the other.
+**One model serves every role** (`shamsu/runtime/models.py`). Three tiers scale
+which model that is. Each tier still declares a coding anchor, used only when
+multi-model mode is explicitly restored.
 
-| Tier | Thinking anchor | Coding anchor |
+| Tier | Model (all roles) | Coding anchor (multi-model mode only) |
 |---|---|---|
 | `light` (8GB, CPU-only) | `qwen2.5:3b-instruct` | `qwen2.5-coder:3b-instruct` |
-| `default` (8GB cookbook) | `deepseek-r1:7b` | `qwen2.5-coder:7b-instruct` |
+| `default` (8GB cookbook) | `qwen3:8b` | `qwen2.5-coder:7b-instruct` |
 | `heavy` (16GB+) | `mistral-nemo:12b` | `qwen2.5-coder:14b` |
 
-- `qwen3:8b` and `gemma3:4b` are **former** anchors — still allowed and known,
-  never auto-pulled. Older docs naming either as "the default" are stale.
-- `ModelSpec` carries capability flags: `supports_native_tools` and
-  `is_reasoning`. Do not assume a model does native tool-calling — the default
-  thinking anchor (`deepseek-r1:7b`) does not, and gets a prompt-level tool
-  protocol with `llm/output.py` as the primary parser.
+- Why one model: the two anchors cannot be co-resident on the 8GB target, so
+  Ollama evicted and cold-loaded on every planner-to-coder handoff — a model swap
+  on every turn of a chat run. `qwen3:8b` does native tool-calling *and* keeps a
+  separate thinking channel, so it covers both jobs.
+- **`think` is gated per CALL, not per model** (`role_should_think`). Mechanical
+  roles — `router`, `classifier`, `prd_headings`, `prd_entities` — never think, so
+  sharing a reasoning model costs them no chain-of-thought latency. This replaces
+  the old defence of routing the router to a non-reasoning model, which a single
+  model makes impossible.
+- `deepseek-r1:7b` and `gemma3:4b` are **non-anchor** allowed models — known,
+  never auto-pulled. Docs naming either as "the default" are stale.
+- `ModelSpec` carries `supports_native_tools` and `is_reasoning`. Every tier
+  anchor is `supports_native_tools=True`, which is why `_TOOL_PROTOCOL_PROMPT` is
+  never shown to them and the raw-write protocol is injected unconditionally
+  instead (`agents/chat_loop.py`).
 - Active tier is process-global (`initialize_model_tier` / `set_model_tier`),
   persisted at `.shamsu/model_tier.json`, overridable with `SHAMSU_MODEL_TIER`.
-- `SHAMSU_SINGLE_MODEL_MODE=1` routes every role to the thinking anchor.
+- `SHAMSU_MODEL=<name>` pins any local model for every role.
+  `SHAMSU_MULTI_MODEL_MODE=1` restores the two-anchor layout.
 
 ---
 

@@ -36,7 +36,12 @@ from shamsu.action_ledger.redaction import redact_text
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import ILLMManager
 from shamsu.memory.service import MemoryService
-from shamsu.runtime.models import SPECIALIST_MODELS, model_for_role, model_is_reasoning
+from shamsu.runtime.models import (
+    SPECIALIST_MODELS,
+    model_for_role,
+    model_is_reasoning,
+    role_should_think,
+)
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
 from pathlib import Path
@@ -107,6 +112,11 @@ SPECIALIST_TEMPS = {
 # Guards concurrent lazy pulls of the same model across LLMManager instances
 # (e.g. two workflows both needing "coder" right after a fresh install).
 _MODEL_PULL_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Models confirmed installed in THIS process. Presence cannot become false while
+# we run, so re-shelling `ollama list` before every call bought nothing; see
+# _ensure_model.
+_MODELS_CONFIRMED_PRESENT: set[str] = set()
 
 
 def _pull_lock_for(model_name: str) -> asyncio.Lock:
@@ -216,10 +226,21 @@ class LLMManager(ILLMManager):
         if ollama_path is None:
             return  # let _generate's HTTP call surface the real error
 
+        # Confirmed-present models are remembered for the process: this ran an
+        # `ollama list` subprocess before EVERY route/run_specialist call, which on
+        # a single-model setup is pure per-call overhead for an answer that cannot
+        # change once true. A model can only appear, not vanish, mid-process; a
+        # deleted model surfaces as an HTTP error from the generate call itself.
+        if model_name in _MODELS_CONFIRMED_PRESENT:
+            return
+
         lock = _pull_lock_for(model_name)
         async with lock:
+            if model_name in _MODELS_CONFIRMED_PRESENT:
+                return
             installed = await asyncio.to_thread(list_installed_models, ollama_path)
             if model_name in installed:
+                _MODELS_CONFIRMED_PRESENT.add(model_name)
                 return
             if self.session_logger:
                 self.session_logger.log(
@@ -238,6 +259,8 @@ class LLMManager(ILLMManager):
             available = await asyncio.to_thread(
                 ensure_model_available, ollama_path, model_name, _on_chunk
             )
+            if available:
+                _MODELS_CONFIRMED_PRESENT.add(model_name)
             if self.model_pull_progress and self.model_pull_progress.on_finish:
                 self.model_pull_progress.on_finish(model_name, available)
             if self.session_logger:
@@ -288,7 +311,11 @@ class LLMManager(ILLMManager):
         return "".join(chunks), "".join(thinking_chunks), prompt_eval_count
 
     async def _stream_completion(
-        self, model: str, payload: dict, on_token: Callable[[str], None] | None = None
+        self,
+        model: str,
+        payload: dict,
+        on_token: Callable[[str], None] | None = None,
+        role: str = "",
     ) -> tuple[str, str, int]:
         """Stream a completion, asking reasoning models to separate their CoT.
 
@@ -303,7 +330,13 @@ class LLMManager(ILLMManager):
         that reject the flag get one retry without it, remembered per-model so it
         costs at most one 400 per model per process.
         """
-        want_think = model_is_reasoning(model) and model not in _THINK_UNSUPPORTED
+        # Gated per CALL, not per model. With one model serving every role, the old
+        # defence (send the router to a non-reasoning model) is gone, so a
+        # mechanical role - routing, classification, extraction - must not pay for a
+        # chain-of-thought pass just because the shared model is capable of one.
+        want_think = (
+            role_should_think(role, model) if role else model_is_reasoning(model)
+        ) and model not in _THINK_UNSUPPORTED
         if not want_think:
             return await self._stream_once(model, payload, on_token)
         try:
@@ -340,7 +373,9 @@ class LLMManager(ILLMManager):
             payload["options"]["num_predict"] = int(num_predict)
         if json_schema is not None:
             payload["format"] = json_schema   # Ollama-native structured output
-        text, thinking, prompt_eval_count = await self._stream_completion(model, payload)
+        text, thinking, prompt_eval_count = await self._stream_completion(
+            model, payload, role=_role
+        )
         # Capture the reasoning trace (surfaced/logged, kept out of the text).
         self._log_thinking(model, thinking, _ledger_call_id, _role)
         # Calibrate future token estimates with Ollama's ground-truth count.
@@ -799,7 +834,9 @@ class LLMManager(ILLMManager):
         }
         # Reasoning stays out of the visible answer tokens: `on_token` only ever
         # sees "response" chunks, never "thinking" ones.
-        text, thinking, prompt_eval_count = await self._stream_completion(model, payload, on_token)
+        text, thinking, prompt_eval_count = await self._stream_completion(
+            model, payload, on_token, role=_role
+        )
         self._log_thinking(model, thinking, _ledger_call_id, _role)
         # Same calibration as the non-streaming path (see _generate) - the
         # final streamed chunk carries the same ground-truth prompt_eval_count.
