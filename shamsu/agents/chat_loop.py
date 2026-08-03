@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import os as _os
 import re
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
@@ -33,7 +34,7 @@ from shamsu.context.manager import ContextBudgetManager
 from shamsu.safety import read_only
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
-from shamsu.llm.output import parse_model_turn, tool_call_to_message_dict
+from shamsu.llm.output import ParseFailure, parse_model_turn, tool_call_to_message_dict
 from shamsu.memory.service import MemoryService
 from shamsu.routing.operations import file_targets
 from shamsu.runtime.models import (
@@ -270,6 +271,124 @@ _EMPTY_RESPONSE_CORRECTION = (
     "progress, or write the answer/code directly, or state plainly what input you need."
 )
 
+# Tools whose failed parse means a MUTATION was attempted and lost, as opposed to
+# a turn that never tried to change anything.
+_MUTATION_TOOL_NAMES = frozenset({"write_file", "append_file", "edit_file"})
+# Failure kinds that are a mutation attempt even when `tool` was not recoverable.
+_MUTATION_FAILURE_KINDS = frozenset(
+    {
+        "raw_envelope_bad_path",
+        "raw_envelope_empty_body",
+        "raw_envelope_fence_collision",
+        "edit_envelope_without_search_replace",
+        "fence_body_not_json",
+        "json_decode",
+        "json_truncated",
+    }
+)
+
+
+class _RetryEscalation:
+    """Break the determinism trap.
+
+    At temperature 0.1 an unchanged prompt reproduces byte-identical output, so a
+    retry that only re-nags is a guaranteed wasted round: 2026-08-03 burned all
+    three mutation rounds on the same broken call, byte for byte, then spent the
+    remaining circuit-breaker budget getting nowhere. Every identical response
+    escalates the STRATEGY instead of repeating it.
+    """
+
+    def __init__(self) -> None:
+        self.last_hash = ""
+        self.level = 0
+
+    def observe(self, raw: str) -> int:
+        digest = hashlib.sha256((raw or "").encode("utf-8", "replace")).hexdigest()
+        if digest == self.last_hash:
+            self.level += 1
+        else:
+            self.level = 0
+        self.last_hash = digest
+        return self.level
+
+    def sampling_override(self, round_index: int) -> dict[str, Any] | None:
+        """Sampling that will actually produce a DIFFERENT response.
+
+        Only fires once a repeat is proven, so ordinary runs stay deterministic
+        and evals stay reproducible.
+        """
+        if self.level < 1:
+            return None
+        return {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "seed": 7919 * (round_index + 1),
+        }
+
+
+def _first_mutation_parse_failure(
+    failures: Iterable[ParseFailure],
+) -> ParseFailure | None:
+    """The first failure that represents a LOST mutation, not a repaired one.
+
+    ``repaired`` failures are informational - the call went through - so they
+    must never trigger a correction.
+    """
+    for failure in failures:
+        if failure.repaired:
+            continue
+        if failure.tool in _MUTATION_TOOL_NAMES or failure.kind in _MUTATION_FAILURE_KINDS:
+            return failure
+    return None
+
+
+def _unparseable_tool_call_correction(failure: ParseFailure, target: str) -> str:
+    """The correction for a turn that DID emit a mutation call SHAMSU could not read.
+
+    Deliberately distinct from the missing-mutation nag. Telling a model that
+    emitted a complete, correct write_file call to "stop returning prose" is a
+    lie it cannot act on, and at temperature 0.1 it answers by re-emitting the
+    identical broken call (2026-08-03: three rounds, byte-identical, zero files).
+    """
+    tool = failure.tool or "write_file"
+    path = failure.path or target or "<path>"
+    reason = (
+        "Your call ended mid-payload - it was cut off before the JSON closed."
+        if failure.kind == "json_truncated"
+        else (
+            "File content inside a JSON string has to escape every \" and every "
+            "\\, and yours escaped some but not all of them. There is no reliable "
+            "way to do that by hand, so do not retry the JSON form."
+        )
+    )
+    detail = f"\n\nThe exact parser error was: {failure.error}" if failure.error else ""
+    return (
+        f"Your last response DID contain a {tool} call, but SHAMSU could not parse it, "
+        "so nothing was written. This is an encoding failure, not a planning failure - "
+        f"your plan was fine.{detail}\n\n{reason}\n\n"
+        "Send the file as a raw block instead. No JSON, no escaping:\n\n"
+        f"```\n# {tool}: {path}\n<the complete file content, exactly as it must appear on disk>\n```\n\n"
+        "Everything between the header line and the closing fence is written verbatim. "
+        "Reply with that block and nothing else."
+    )
+
+
+def _unparseable_mutation_final(failure: ParseFailure, artifact_path: str = "") -> str:
+    """The user-facing result. Says what actually broke, not "returned prose"."""
+    tool = failure.tool or "mutation"
+    path = failure.path or "the requested file"
+    reason = (
+        f" ({failure.error})" if failure.error else ""
+    )
+    evidence = (
+        f" The full raw response was saved to {artifact_path}." if artifact_path else ""
+    )
+    return (
+        f"I could not complete the change. The model produced a {tool} call for {path} "
+        f"that SHAMSU could not parse{reason}, so no file was written. This is a "
+        f"tool-call encoding failure, not a missing plan.{evidence}"
+    )
+
 # Phrases that signal the assistant *promised* a tool action but did not call
 # one. Used only when there are no tool calls in the reply.
 _DEFERRED_ACTION_PATTERNS = (
@@ -473,9 +592,15 @@ class AgentChatLoop:
         messages: list[dict[str, Any]],
         num_ctx: int,
         round_index: int = 0,
+        *,
+        options_override: dict[str, Any] | None = None,
     ) -> Any:
         """Call the model, emitting a periodic 'still waiting' heartbeat so a slow
-        local model reads as working, not frozen. The timeout is unchanged."""
+        local model reads as working, not frozen. The timeout is unchanged.
+
+        ``options_override`` raises sampling for a retry that would otherwise be
+        byte-identical (see :class:`_RetryEscalation`).
+        """
 
         async def _beat() -> None:
             elapsed = 0
@@ -489,7 +614,11 @@ class AgentChatLoop:
             "model": self.model_name,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": num_ctx},
+            "options": {
+                "temperature": 0.1,
+                "num_ctx": num_ctx,
+                **(options_override or {}),
+            },
         }
         # Only hand a native tools schema to models that actually do native
         # tool-calling; for the rest the in-prompt protocol + output salvager
@@ -652,6 +781,9 @@ class AgentChatLoop:
         # fenced block in the reply is the RESULT, not a file to write - see the
         # markdown-fallback guard below.
         nonwrite_tool_succeeded = False
+        # Raised sampling for the NEXT call once a byte-identical repeat is proven.
+        escalation = _RetryEscalation()
+        pending_options: dict[str, Any] | None = None
         for round_index in range(self.max_tool_rounds):
             num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
             messages = await self._messages_within_budget(num_ctx)
@@ -670,7 +802,10 @@ class AgentChatLoop:
                     level="verbose",
                 )
             try:
-                response = await self._chat_with_heartbeat(messages, num_ctx, round_index)
+                response = await self._chat_with_heartbeat(
+                    messages, num_ctx, round_index, options_override=pending_options
+                )
+                pending_options = None
             except asyncio.TimeoutError:
                 category = self._timeout_category(round_index, ran_any_tool)
                 final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
@@ -706,6 +841,11 @@ class AgentChatLoop:
             # leaked tool syntax from the visible answer. This is what stops raw
             # `{"name":"ask_user",...}` / diff markers from reaching the user.
             turn = parse_model_turn(response, self._registered_tool_names)
+            # The PRE-strip text. _strip_tool_artifacts has already removed the
+            # very spans needed to diagnose a failed parse, so turn.text is
+            # useless as evidence here.
+            raw_response = str(_get(_message_from_response(response), "content", "") or "")
+            repeat_level = escalation.observe(raw_response)
             content = turn.text
             tool_calls = [tool_call_to_message_dict(call) for call in turn.tool_calls]
             if not tool_calls:
@@ -935,6 +1075,47 @@ class AgentChatLoop:
                                 + ". Paths are relative to the workspace root, so write "
                                 "exactly that - do not ask which path to use."
                             )
+                        # An unparseable ATTEMPT and no attempt at all need
+                        # opposite corrections. Conflating them is what kept the
+                        # 2026-08-03 run telling a model that had emitted a
+                        # correct write_file call to stop writing prose.
+                        mutation_failure = _first_mutation_parse_failure(turn.parse_failures)
+                        if mutation_failure is not None:
+                            # A proven byte-identical repeat cannot be argued out
+                            # of at temperature 0.1, so change BOTH the sampling
+                            # and the prefix: raise temperature for the next call
+                            # and take the broken payload out of the prompt so the
+                            # model stops copying it. The on-disk transcript keeps
+                            # the original.
+                            #
+                            # Both fire at the first proven repeat rather than
+                            # laddering: _MAX_MISSING_MUTATION_RECOVERIES is 2, so
+                            # there are only three rounds here and a longer ladder
+                            # would never reach its later steps.
+                            pending_options = escalation.sampling_override(round_index)
+                            if repeat_level >= 1:
+                                self.state.replace_last_assistant(
+                                    "(unparseable tool call omitted by the harness)"
+                                )
+                            self.state.append_user(
+                                _unparseable_tool_call_correction(
+                                    mutation_failure,
+                                    targets[0] if targets else "",
+                                )
+                            )
+                            self._emit_trace(
+                                "workflow.blocked",
+                                "A mutation call was emitted but could not be parsed; "
+                                "asking for a raw block.",
+                                {
+                                    "attempt": missing_mutation_recovery_attempts,
+                                    "category": "unparseable_tool_call",
+                                    "kind": mutation_failure.kind,
+                                    "parse_error": mutation_failure.error,
+                                    "repeat_level": repeat_level,
+                                },
+                            )
+                            continue
                         self.state.append_user(
                             "No workspace mutation has succeeded yet. Your diagnosis or proposed "
                             "code is not an edit. In your NEXT response, call edit_file, "
@@ -952,7 +1133,31 @@ class AgentChatLoop:
                             },
                         )
                         continue
-                    final = _missing_mutation_final(content)
+                    mutation_failure = _first_mutation_parse_failure(turn.parse_failures)
+                    # Always keep the raw response for a failed mutation round.
+                    # Without it every failure of this class looks like "returned
+                    # prose", which is exactly how this went undiagnosed.
+                    artifact_path = ""
+                    if self.action_ledger:
+                        artifact_path = self.action_ledger.record_unparsed_response(
+                            "agent-executor",
+                            self.model_name,
+                            raw_response,
+                            reason=(
+                                "mutation_round_unparseable"
+                                if mutation_failure is not None
+                                else "mutation_round_no_attempt"
+                            ),
+                            round_index=round_index,
+                            parse_error=(
+                                mutation_failure.error if mutation_failure is not None else ""
+                            ),
+                        )
+                    final = (
+                        _unparseable_mutation_final(mutation_failure, artifact_path)
+                        if mutation_failure is not None
+                        else _missing_mutation_final(content, artifact_path)
+                    )
                     self.state.append_assistant(final)
                     self._emit_trace(
                         "workflow.failed",
@@ -960,10 +1165,23 @@ class AgentChatLoop:
                         {"category": "required_mutation_missing"},
                     )
                     if self.action_ledger:
+                        # Both events: the existing one keeps repl.py, the
+                        # reliability report, and test_action_ledger_integration
+                        # working; the new one lets telemetry stop filing an
+                        # encoding failure as a planning failure.
                         self.action_ledger.log_event(
                             "mutation_required_but_missing",
                             model_response=content,
                         )
+                        if mutation_failure is not None:
+                            self.action_ledger.log_event(
+                                "mutation_tool_call_unparseable",
+                                model_response=content,
+                                kind=mutation_failure.kind,
+                                parse_error=mutation_failure.error,
+                                tool=mutation_failure.tool,
+                                path=mutation_failure.path,
+                            )
                     self._audit_final(final)
                     return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
                 if successful_mutation and _model_claims_mutation_failed(content):
@@ -2047,12 +2265,15 @@ def _request_is_verification_repair(prompt: str) -> bool:
     return bool(repair_signal and verification_signal)
 
 
-def _missing_mutation_final(model_response: str) -> str:
+def _missing_mutation_final(model_response: str, artifact_path: str = "") -> str:
     detail = " ".join((model_response or "").strip().split())
     suffix = f" The model's response was: {detail[:300]}" if detail else ""
+    # The 300-char clip stays - a terminal message should not dump 5 kB - but it
+    # stops being a LOSS now that the full text is on disk and named here.
+    evidence = f" The full raw response was saved to {artifact_path}." if artifact_path else ""
     return (
         "I did not complete the requested workspace change because no file mutation "
-        f"succeeded. No file was changed.{suffix}"
+        f"succeeded. No file was changed.{suffix}{evidence}"
     )
 
 

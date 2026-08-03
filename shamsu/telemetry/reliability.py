@@ -47,6 +47,7 @@ _VERIFICATION_RESULTS = {
 _FAILURE_EVENTS = {
     "patch_apply_failed",
     "mutation_required_but_missing",
+    "mutation_tool_call_unparseable",
     "contract_failed",
     "agent_stopped",
     "composite_failed",
@@ -456,6 +457,13 @@ def _classify_failure_category(
     elif _has_unrecovered_tool_result_failure(tools) or "agent_stopped" in event_types:
         result.failure_category = "tool_call"
         result.failure_category_reason = "tool failure or stopped tool loop"
+    elif "mutation_tool_call_unparseable" in event_types:
+        # Must precede mutation_required_but_missing: both events are logged for
+        # this failure, and it is an ENCODING failure, not a planning one. Filing
+        # it as "planning" is what hid 128 runs' worth of lost write_file calls
+        # behind a category nobody would look in for a parser bug.
+        result.failure_category = "tool_call"
+        result.failure_category_reason = "the model emitted a mutation call that could not be parsed"
     elif "mutation_required_but_missing" in event_types:
         result.failure_category = "planning"
         result.failure_category_reason = "mutation was required but no mutation landed"

@@ -968,6 +968,50 @@ class ActionLedger:
         )
         return relative
 
+    def record_unparsed_response(
+        self,
+        role: str,
+        model: str,
+        raw_response: str,
+        *,
+        reason: str,
+        round_index: int = 0,
+        parse_error: str = "",
+    ) -> str:
+        """Persist a model response the harness could not turn into a tool call.
+
+        Written at EVERY log level, unlike ``responses/<call_id>.txt``. ``essential``
+        is the default, so the one response most needed for diagnosis - the
+        mutation round that produced no file - was precisely the one never kept.
+        That is why the 2026-08-03 failure was misread as "the model returned
+        prose" for 128 runs: the evidence proving otherwise was being discarded.
+
+        Lands under ``.evidence/diagnostics`` beside exception tracebacks, which
+        are also always retained, and goes through ``_write_text`` so it is
+        redacted like everything else.
+        """
+        if not self.enabled:
+            return ""
+        idx = self._diagnostics_seq
+        self._diagnostics_seq += 1
+        safe_reason = "".join(
+            char for char in reason.lower() if char.isalnum() or char in {"-", "_"}
+        )
+        path = self.diagnostics_dir / f"unparsed_response_{idx:03d}_{safe_reason or 'unknown'}.txt"
+        self._write_text(path, raw_response or "The model returned an empty response.")
+        relative = str(path.relative_to(self.run_dir).as_posix())
+        self.log_event(
+            "unparsed_model_response",
+            role=role,
+            model=model,
+            reason=reason,
+            parse_error=parse_error,
+            response_chars=len(raw_response or ""),
+            round=round_index,
+            path=relative,
+        )
+        return relative
+
     # -- files / patches / mutations --------------------------------------------
 
     def log_file_read(self, path: str) -> None:

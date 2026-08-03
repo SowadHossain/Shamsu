@@ -410,7 +410,20 @@ def _valid_source_for_path(path: str, code: str) -> bool:
     return bool(code.strip())
 
 
+# A raw-envelope header (`# write_file: path`) that output.py REJECTED and so
+# left in the content. Matched before the generic comment form because that one's
+# path class excludes ":", so it would fail here and the header line would be
+# written into the file as line 1.
+_TOOL_HEADER_RE = re.compile(
+    r"^\s*(?:\#+|//+|--|<!--|/\*)?\s*(?:write_file|append_file|edit_file)\s*[:=]\s*"
+    r"(?P<path>[^\s\r\n]+)"
+)
+
+
 def _path_from_comment(line: str) -> str:
+    header = _TOOL_HEADER_RE.match(line)
+    if header:
+        return header.group("path").strip().replace("\\", "/")
     match = re.match(r"\s*(?://|#|/\*)\s*(?P<path>[\w./\\ -]+\.[A-Za-z0-9_]+)", line)
     return match.group("path").strip().replace("\\", "/") if match else ""
 

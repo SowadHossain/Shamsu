@@ -496,7 +496,9 @@ class AgentToolRegistry:
                 "Create a new file or fully rewrite an existing one. Always pass the COMPLETE new "
                 "file content (it overwrites). For a small change to an existing file, prefer "
                 "edit_file or append_file. If a matching file already exists at a different path "
-                "this refuses and returns candidates rather than creating a duplicate.",
+                "this refuses and returns candidates rather than creating a duplicate. Pass content "
+                "as plain text; SHAMSU also accepts a raw '# write_file: <path>' fenced block, so "
+                "you never have to escape code.",
                 {
                     "filepath": {"type": "string", "description": "Relative file path."},
                     "content": {"type": "string", "description": "Complete file content."},

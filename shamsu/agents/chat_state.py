@@ -23,6 +23,9 @@ _HARNESS_STATUS_PREFIXES = (
     "local ai failed safely",
     "the model call timed out",
     "shamsu is ready",
+    # Placeholder left by replace_last_assistant. Replaying it would teach the
+    # model that emitting an unparseable call is a normal way to end a turn.
+    "(unparseable tool call omitted",
 )
 
 # How many times the same assistant answer may be replayed before the rest are
@@ -73,6 +76,21 @@ class ChatState:
 
     def append_assistant(self, content: str, tool_calls: list[dict[str, Any]] | None = None) -> None:
         self._append(ChatMessage("assistant", content, tool_calls=tool_calls or []), persist=True)
+
+    def replace_last_assistant(self, content: str) -> None:
+        """Swap the most recent assistant turn for *content*, in memory only.
+
+        Used to evict an unparseable tool call from the PROMPT. An identical
+        prefix is what makes a deterministic retry byte-identical, and leaving a
+        broken payload in context invites the model to copy it verbatim. The
+        on-disk transcript keeps the original as evidence, so this deliberately
+        does not persist.
+        """
+        for message in reversed(self._messages):
+            if message.role == "assistant":
+                message.content = content
+                message.tool_calls = []
+                return
 
     def append_tool(self, tool_call_id: str, name: str, content: str) -> None:
         self._append(ChatMessage("tool", content, tool_call_id=tool_call_id, name=name), persist=True)
