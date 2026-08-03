@@ -1,2 +1,7 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
+
+# Model-output fixtures are byte-exact captures of what a model actually emitted.
+# Line-ending translation would silently rewrite the very bytes under test - the
+# escaping and whitespace ARE the bug being reproduced - so keep git out of them.
+tests/fixtures/*.txt -text

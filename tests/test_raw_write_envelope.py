@@ -161,6 +161,203 @@ def test_python_apostrophe_escapes_survive_alongside_a_stray_quote():
     assert "\\'" in content
 
 
+# ---------------------------------------------------------------------------
+# The raw envelope: the primary channel, where escaping never happens
+# ---------------------------------------------------------------------------
+
+FENCE = "`" * 3
+FENCE4 = "`" * 4
+
+
+def test_a_raw_write_envelope_writes_its_body_verbatim():
+    body = '{% extends "base.html" %}\n<a href="{% url \'orders\' %}">Orders</a>'
+    raw = f"Creating it now.\n\n{FENCE}html\n# write_file: templates/x.html\n{body}\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert len(turn.tool_calls) == 1
+    call = turn.tool_calls[0]
+    assert call.name == "write_file"
+    assert call.arguments["filepath"] == "templates/x.html"
+    # Byte-identical to what sat between the fences, plus a trailing newline.
+    assert call.arguments["content"] == body + "\n"
+    # The header must not leak into the file, and nothing may be escaped.
+    assert "write_file" not in call.arguments["content"]
+    assert "\\\"" not in call.arguments["content"]
+
+
+def test_the_envelope_is_stripped_from_the_visible_answer():
+    raw = f"Done.\n\n{FENCE}python\n# write_file: a.py\nprint(1)\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert "write_file" not in turn.text
+    assert "print(1)" not in turn.text
+    assert turn.text.strip() == "Done."
+
+
+def test_a_literal_backslash_n_in_the_body_survives_verbatim():
+    """Raw bodies must never go through the escaped-layout repair."""
+    body = 'const s = "a\\nb";'
+    raw = f"{FENCE}js\n# write_file: src/a.js\n{body}\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls[0].arguments["content"] == body + "\n"
+
+
+def test_a_four_backtick_envelope_carries_a_body_containing_fences():
+    body = f"# Title\n\n{FENCE}python\nprint(1)\n{FENCE}\n\nDone."
+    raw = f"{FENCE4}markdown\n# write_file: docs/guide.md\n{body}\n{FENCE4}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert len(turn.tool_calls) == 1
+    content = turn.tool_calls[0].arguments["content"]
+    assert content == body + "\n"
+    assert content.count(FENCE) == 2
+
+
+def test_a_three_backtick_envelope_for_a_markdown_target_is_refused():
+    """It would close at the file's own first fence and write a truncated file."""
+    raw = f"{FENCE}markdown\n# write_file: docs/guide.md\n# Title\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls == []
+    kinds = [f.kind for f in turn.parse_failures]
+    assert "raw_envelope_fence_collision" in kinds
+
+
+def test_a_raw_append_envelope_becomes_append_file():
+    raw = f"{FENCE}python\n# append_file: core/urls.py\nurlpatterns += []\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert [c.name for c in turn.tool_calls] == ["append_file"]
+    assert turn.tool_calls[0].arguments["filepath"] == "core/urls.py"
+
+
+def test_a_raw_edit_envelope_takes_its_path_from_the_header():
+    """The header path must beat the prose-guessed one.
+
+    A path line before the block is exactly what _path_before would latch onto,
+    and it is wrong here. The envelope exists so the target is declared, never
+    inferred.
+    """
+    raw = (
+        "config/urls.py needs updating, here is the edit:\n\n"
+        f"{FENCE}python\n"
+        "# edit_file: core/urls.py\n"
+        "<<<<<<< SEARCH\n"
+        "urlpatterns = []\n"
+        "=======\n"
+        'urlpatterns = [path("orders/", views.my_orders)]\n'
+        ">>>>>>> REPLACE\n"
+        f"{FENCE}\n"
+    )
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert [c.name for c in turn.tool_calls] == ["edit_file"]
+    args = turn.tool_calls[0].arguments
+    assert args["filepath"] == "core/urls.py"
+    assert args["old_string"] == "urlpatterns = []"
+    assert 'path("orders/", views.my_orders)' in args["new_string"]
+
+
+def test_an_edit_envelope_without_search_replace_is_refused():
+    """Never fall back to writing a fragment as the whole file."""
+    raw = f"{FENCE}python\n# edit_file: core/urls.py\nurlpatterns = []\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls == []
+    kinds = [f.kind for f in turn.parse_failures]
+    assert "edit_envelope_without_search_replace" in kinds
+
+
+def test_an_implausible_header_path_is_not_executed():
+    """A YAML body containing `write_file: true` must not become a write."""
+    raw = f"{FENCE}yaml\n# write_file: true\nsome: value\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls == []
+
+
+def test_an_absolute_or_traversing_header_path_is_refused():
+    for bad in ("/etc/passwd", "../../secrets.env"):
+        raw = f"{FENCE}text\n# write_file: {bad}\nx\n{FENCE}\n"
+        turn = parse_model_turn(_resp(raw), REGISTERED)
+        assert turn.tool_calls == [], bad
+        assert "raw_envelope_bad_path" in [f.kind for f in turn.parse_failures], bad
+
+
+def test_an_empty_envelope_body_is_refused():
+    raw = f"{FENCE}python\n# write_file: a.py\n\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls == []
+    assert "raw_envelope_empty_body" in [f.kind for f in turn.parse_failures]
+
+
+def test_a_raw_envelope_inside_a_think_block_is_not_executed():
+    """Reasoning is not a decision. Writing from a think trace is worse than
+    losing the call: the model is still weighing options in there."""
+    raw = (
+        "<think>\n"
+        f"Maybe I should do:\n{FENCE}python\n# write_file: a.py\nprint('draft')\n{FENCE}\n"
+        "</think>\n"
+        "Let me check the file first."
+    )
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls == []
+
+
+def test_a_real_json_file_body_stays_raw():
+    """package.json has a `name` field; that must not read as a tool envelope."""
+    body = '{\n  "name": "my-app",\n  "version": "1.0.0"\n}'
+    raw = f"{FENCE}json\n# write_file: package.json\n{body}\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert len(turn.tool_calls) == 1
+    assert turn.tool_calls[0].arguments["content"] == body + "\n"
+
+
+def test_a_leaked_json_envelope_inside_a_raw_body_is_unwrapped():
+    body = '{"name": "write_file", "arguments": {"content": "print(1)\\n"}}'
+    raw = f"{FENCE}\n# write_file: src/a.py\n{body}\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert len(turn.tool_calls) == 1
+    args = turn.tool_calls[0].arguments
+    # Header path survives, which _unwrap_serialized_tool_call downstream cannot do.
+    assert args["filepath"] == "src/a.py"
+    assert args["content"] == "print(1)\n"
+
+
+def test_the_commented_json_fence_dialect_still_works():
+    """Tier-2 guard: the older `# write_file` + JSON body form has no `:`, so the
+    raw envelope must not intercept it."""
+    raw = f'{FENCE}\n# write_file\n{{"filepath": "a.py", "content": "print(1)\\n"}}\n{FENCE}\n'
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert len(turn.tool_calls) == 1
+    assert turn.tool_calls[0].arguments["filepath"] == "a.py"
+
+
+def test_the_envelope_is_inert_where_write_file_is_not_registered():
+    """tool_calling_loop shares this parser with a narrow action-tool registry.
+
+    A loop that cannot execute write_file must not have the envelope silently
+    manufacture one for it.
+    """
+    raw = f"{FENCE}python\n# write_file: a.py\nprint(1)\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), {"run_command", "git_status"})
+
+    assert turn.tool_calls == []
+
+
+def test_an_ordinary_source_comment_fence_is_never_executed():
+    raw = f"{FENCE}python\n# models.py\nclass User: pass\n{FENCE}\n"
+    turn = parse_model_turn(_resp(raw), REGISTERED)
+
+    assert turn.tool_calls == []
+
+
 def test_a_prose_example_without_a_content_key_can_never_write():
     """The salvager maps any {name, arguments} shape, by long-standing design.
 

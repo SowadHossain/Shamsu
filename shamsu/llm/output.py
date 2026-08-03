@@ -54,6 +54,41 @@ _COMMENTED_TOOL_FENCE_RE = re.compile(
     re.DOTALL,
 )
 
+# A RAW-payload tool envelope: a fenced block whose FIRST line names a mutation
+# tool AND its target path, with everything up to the closing fence written to
+# disk verbatim. Nothing inside is JSON, so a 7B never has to escape source code
+# — the single largest cause of a lost mutation turn (see _repair_unescaped_quotes
+# for the 2026-08-03 incident this exists to make impossible rather than
+# recoverable).
+#
+# Every piece is load-bearing:
+#  * `(?P=fence)` requires the closing fence to be the SAME length as the opening
+#    one, so a file whose own body contains ``` can be written by opening with
+#    four backticks.
+#  * The header must be the FIRST line inside the fence (`[ \t]*`, never `\s*`,
+#    which would cross newlines under DOTALL) so the payload's byte range is
+#    unambiguous.
+#  * The tool name is a closed literal alternation, so an ordinary source comment
+#    fence such as `# models.py` can never match.
+#  * The `[:=]` separator is REQUIRED. That is what keeps the older
+#    `# write_file` + JSON-body dialect falling through to the commented-fence
+#    salvager untouched.
+_RAW_TOOL_FENCE_RE = re.compile(
+    r"^[ \t]*(?P<fence>`{3,}|~{3,})[^\r\n]*\r?\n"
+    r"[ \t]*(?:\#+|//+|--|<!--|/\*|\*)?[ \t]*"
+    r"(?P<name>write_file|append_file|edit_file)"
+    r"[ \t]*[:=][ \t]*"
+    r"(?P<path>[^\s\r\n]+?)"
+    r"[ \t]*(?:-->|\*/)?[ \t]*\r?\n"
+    r"(?P<body>.*?)"
+    r"^[ \t]*(?P=fence)[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+# Markdown-family targets cannot be carried safely by a 3-backtick envelope: the
+# non-greedy body stops at the file's OWN first fence line and would write a
+# truncated file with no way to detect it after the fact. Require 4+ instead.
+_FENCE_UNSAFE_SUFFIXES = (".md", ".mdx", ".markdown")
+
 # --- Quote repair (mutation tool calls only) -------------------------------
 # A `"` inside a JSON string can only be the terminator when the next
 # non-whitespace character is one of these; anything else means the model forgot
@@ -160,13 +195,31 @@ def parse_model_turn(
     salvaged_spans: list[str] = []
     failures: list[ParseFailure] = []
     if allow_salvage:
+        # ASYMMETRY, DELIBERATE — do not "tidy" this into one source string.
+        # The raw envelope writes its body to disk verbatim, so a block sitting
+        # inside a <think> trace would turn the model's musings into a file. It
+        # therefore sees think-stripped content. The other salvagers keep seeing
+        # raw_content: they parse structured payloads rather than copying bytes,
+        # and models that wrap everything in a dangling <think> would otherwise
+        # lose real calls.
+        raw_fence_source = _strip_think_spans(raw_content)
         for salvager in (
+            # Raw first: it is the only form that names the tool AND the path AND
+            # delimits the payload, and its body must not be re-interpreted. If
+            # _salvage_embedded_json ran first it would brace-scan a .json/.js
+            # payload and invent a second call from the file's own contents.
+            _salvage_raw_tool_fences,
             _salvage_commented_tool_fences,
             _salvage_embedded_json,
             _salvage_search_replace,
             _salvage_xml_tool_call,
         ):
-            calls, spans = salvager(raw_content, registered_set, failures)
+            source = (
+                raw_fence_source
+                if salvager is _salvage_raw_tool_fences
+                else raw_content
+            )
+            calls, spans = salvager(source, registered_set, failures)
             if calls:
                 salvaged_calls = calls
                 salvaged_spans = spans
@@ -219,6 +272,130 @@ def _native_tool_calls(message: Any) -> list[ToolCall]:
 # ---------------------------------------------------------------------------
 # Salvage cascade
 # ---------------------------------------------------------------------------
+
+
+def _strip_think_spans(content: str) -> str:
+    """Remove ``<think>`` reasoning, including an unterminated trailing one."""
+    return _DANGLING_THINK_RE.sub("", _THINK_RE.sub("", content))
+
+
+def _is_tool_call_envelope(obj: dict[str, Any], registered: set[str] | None) -> bool:
+    """True when a ``{...}`` body is a leaked tool-call envelope, not file content.
+
+    Deliberately keyed on the name being a REGISTERED TOOL, not merely present:
+    ``package.json`` has a ``"name"`` field, and treating that as an envelope
+    would unwrap a real file into nonsense.
+    """
+    name = _first_str(obj, _NAME_KEYS)
+    return bool(name) and (registered is None or name in registered)
+
+
+def _salvage_raw_tool_fences(
+    content: str,
+    registered: set[str] | None,
+    failures: list[ParseFailure],
+) -> tuple[list[ToolCall], list[str]]:
+    """Recover ``# write_file: <path>`` fenced blocks whose body is raw bytes.
+
+    This is the primary mutation channel. The body is copied to disk exactly as
+    the model typed it, so there is no escaping step that can fail.
+    """
+    calls: list[ToolCall] = []
+    spans: list[str] = []
+    for match in _RAW_TOOL_FENCE_RE.finditer(content):
+        name = match.group("name")
+        if registered is not None and name not in registered:
+            continue
+        path = match.group("path")
+        fence = match.group("fence")
+        if not _looks_like_path(path) or path.startswith(("/", "\\")):
+            failures.append(
+                ParseFailure(kind="raw_envelope_bad_path", tool=name, path=path)
+            )
+            continue
+        if ".." in re.split(r"[/\\]", path):
+            failures.append(
+                ParseFailure(kind="raw_envelope_bad_path", tool=name, path=path)
+            )
+            continue
+        if len(fence) == 3 and path.lower().endswith(_FENCE_UNSAFE_SUFFIXES):
+            failures.append(
+                ParseFailure(
+                    kind="raw_envelope_fence_collision",
+                    tool=name,
+                    path=path,
+                    error=(
+                        "a markdown target needs a 4-backtick envelope; a "
+                        "3-backtick one closes at the file's own first fence"
+                    ),
+                )
+            )
+            continue
+        # Trailing newlines are normalized, but NOT trailing indentation: the
+        # byte range here is exact, so whitespace on the final line is content.
+        body = match.group("body").rstrip("\r\n")
+        if not body.strip():
+            failures.append(
+                ParseFailure(kind="raw_envelope_empty_body", tool=name, path=path)
+            )
+            continue
+        body += "\n"
+
+        arguments: dict[str, Any] | None = None
+        # A model that wraps the JSON envelope inside the raw fence still gets its
+        # call. Complements agent_tools._unwrap_serialized_tool_call, which can
+        # only recover `content`; the header path survives here too.
+        if body.lstrip().startswith("{"):
+            parsed, _error, _repaired = _load_tool_call_json(body, registered)
+            if isinstance(parsed, dict) and _is_tool_call_envelope(parsed, registered):
+                inner = _first_dict(parsed, _ARG_KEYS)
+                if inner:
+                    arguments = {"filepath": path, **inner}
+
+        if arguments is None:
+            if name == "edit_file":
+                # One grammar for the model to learn: the edit body is the
+                # SEARCH/REPLACE dialect it already emits, with the path taken
+                # from the header instead of guessed from surrounding prose.
+                pairs = list(_SEARCH_REPLACE_RE.finditer(body))
+                if not pairs:
+                    failures.append(
+                        ParseFailure(
+                            kind="edit_envelope_without_search_replace",
+                            tool=name,
+                            path=path,
+                            error=(
+                                "edit_file needs <<<<<<< SEARCH / ======= / "
+                                ">>>>>>> REPLACE pairs in the block body"
+                            ),
+                        )
+                    )
+                    continue
+                for pair in pairs:
+                    calls.append(
+                        ToolCall(
+                            id=f"raw_edit_file_{len(calls) + 1}",
+                            name=name,
+                            arguments={
+                                "filepath": path,
+                                "old_string": pair.group("old"),
+                                "new_string": pair.group("new"),
+                            },
+                        )
+                    )
+                spans.append(match.group(0))
+                continue
+            arguments = {"filepath": path, "content": body}
+
+        calls.append(
+            ToolCall(
+                id=f"raw_{name}_{len(calls) + 1}",
+                name=name,
+                arguments=_normalize_tool_arguments(name, arguments, raw=True),
+            )
+        )
+        spans.append(match.group(0))
+    return calls, spans
 
 
 def _salvage_commented_tool_fences(
