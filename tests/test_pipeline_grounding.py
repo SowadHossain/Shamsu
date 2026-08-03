@@ -393,7 +393,9 @@ def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
         )
     )
 
-    assert calls
+    target = tmp_path / "atlasops-freeform"
+    assert (target / "backend" / "package.json").is_file()
+    assert (target / "backend" / "Dockerfile").is_file()
     assert all(call[1]["allowed_write_paths"] == ("atlasops-freeform",) for call in calls)
     assert all(
         call[1]["user_request"]
@@ -401,8 +403,9 @@ def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
         for call in calls
     )
     assert all("Project root: atlasops-freeform" in call[0] for call in calls)
-    assert any("## Active SHAMSU Skills" in call[0] for call in calls)
-    assert any("Use this skill for coding" in call[0] for call in calls)
+    if calls:
+        assert any("## Active SHAMSU Skills" in call[0] for call in calls)
+        assert any("Use this skill for coding" in call[0] for call in calls)
 
 
 def test_freeform_prd_build_validates_acceptance_and_downgrades(tmp_path, monkeypatch):

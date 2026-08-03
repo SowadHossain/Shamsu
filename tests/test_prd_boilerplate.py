@@ -11,7 +11,10 @@ import ast
 from shamsu.prd.boilerplate import (
     django_layout,
     is_django_project,
+    is_node_express_project,
+    is_react_vite_project,
     render_boilerplate,
+    uses_postgres_runtime,
 )
 
 EXPECTED = [
@@ -109,7 +112,6 @@ def test_product_logic_is_left_to_the_model():
     and must keep them."""
     assert render_boilerplate("backend/core/models.py", EXPECTED) is None
     assert render_boilerplate("backend/core/views.py", EXPECTED) is None
-    assert render_boilerplate("backend/requirements.txt", EXPECTED) is None
 
 
 def test_non_django_projects_are_untouched():
@@ -117,3 +119,140 @@ def test_non_django_projects_are_untouched():
 
     assert is_django_project(node) is False
     assert render_boilerplate("src/App.tsx", node) is None
+
+
+def test_django_runtime_files_are_generated_deterministically():
+    requirements = render_boilerplate("backend/requirements.txt", EXPECTED)
+
+    assert requirements is not None
+    assert "Django" in requirements
+    assert "psycopg" in requirements
+    assert render_boilerplate("backend/Dockerfile", [*EXPECTED, "backend/Dockerfile"]) is not None
+    assert render_boilerplate("backend/.env.example", [*EXPECTED, "backend/.env.example"]) is not None
+
+
+def test_postgres_runtime_switches_django_settings_off_sqlite():
+    expected = [
+        *EXPECTED,
+        "docker-compose.yml",
+        ".env.example",
+        "backend/Dockerfile",
+        "backend/.env.example",
+    ]
+
+    settings = render_boilerplate("backend/config/settings.py", expected)
+    compose = render_boilerplate("docker-compose.yml", expected)
+
+    assert uses_postgres_runtime(expected)
+    assert settings is not None
+    assert "django.db.backends.postgresql" in settings
+    assert "db.sqlite3" not in settings
+    assert compose is not None
+    assert "postgres:" in compose
+    assert "backend:" in compose
+    assert "frontend:" not in compose
+    assert "condition: service_healthy" in compose
+    ast.parse(settings)
+
+
+def test_full_stack_compose_includes_frontend_when_frontend_runtime_is_expected():
+    expected = [
+        *EXPECTED,
+        "docker-compose.yml",
+        ".env.example",
+        "backend/Dockerfile",
+        "backend/.env.example",
+        "frontend/Dockerfile",
+        "frontend/package.json",
+    ]
+
+    compose = render_boilerplate("docker-compose.yml", expected)
+
+    assert compose is not None
+    assert "postgres:" in compose
+    assert "backend:" in compose
+    assert "frontend:" in compose
+    assert "context: ./frontend" in compose
+
+
+def test_react_vite_runtime_files_are_generated_deterministically():
+    expected = [
+        "frontend/package.json",
+        "frontend/index.html",
+        "frontend/vite.config.ts",
+        "frontend/.env.example",
+        "frontend/Dockerfile",
+        "frontend/src/main.tsx",
+        "frontend/src/App.tsx",
+    ]
+
+    assert is_react_vite_project(expected)
+    assert '"dev": "vite --host 0.0.0.0"' in render_boilerplate(
+        "frontend/package.json", expected
+    )
+    assert 'src/main.tsx' in render_boilerplate("frontend/index.html", expected)
+    assert "http://backend:8000" in render_boilerplate("frontend/vite.config.ts", expected)
+    assert "VITE_API_BASE_URL=/api" in render_boilerplate("frontend/.env.example", expected)
+    assert "node:22-alpine" in render_boilerplate("frontend/Dockerfile", expected)
+
+
+def test_node_express_runtime_files_are_generated_deterministically():
+    expected = [
+        "backend/package.json",
+        "backend/server.js",
+        "backend/.env.example",
+        "backend/Dockerfile",
+    ]
+
+    assert is_node_express_project(expected)
+    assert '"start": "node server.js"' in render_boilerplate("backend/package.json", expected)
+    assert "DATABASE_URL=sqlite:./db.sqlite3" in render_boilerplate(
+        "backend/.env.example", expected
+    )
+    assert 'CMD ["npm", "start"]' in render_boilerplate("backend/Dockerfile", expected)
+
+
+def test_react_index_html_matches_jsx_entrypoint_when_that_is_expected():
+    expected = [
+        "frontend/package.json",
+        "frontend/index.html",
+        "frontend/vite.config.ts",
+        "frontend/src/main.jsx",
+        "frontend/src/App.jsx",
+    ]
+
+    html = render_boilerplate("frontend/index.html", expected)
+
+    assert html is not None
+    assert 'src/main.jsx' in html
+    assert 'src/main.tsx' not in html
+
+
+def test_runtime_boilerplate_handles_expected_files_under_project_root():
+    expected = [
+        "openbazaar/docker-compose.yml",
+        "openbazaar/.env.example",
+        "openbazaar/backend/manage.py",
+        "openbazaar/backend/requirements.txt",
+        "openbazaar/backend/config/settings.py",
+        "openbazaar/backend/Dockerfile",
+        "openbazaar/backend/.env.example",
+        "openbazaar/frontend/package.json",
+        "openbazaar/frontend/index.html",
+        "openbazaar/frontend/vite.config.ts",
+        "openbazaar/frontend/Dockerfile",
+        "openbazaar/frontend/src/main.jsx",
+    ]
+
+    assert uses_postgres_runtime(expected)
+    assert is_react_vite_project(expected)
+    assert render_boilerplate("openbazaar/docker-compose.yml", expected) is not None
+    assert render_boilerplate("openbazaar/backend/Dockerfile", expected) is not None
+    assert render_boilerplate("openbazaar/backend/package.json", [
+        "openbazaar/backend/package.json",
+        "openbazaar/backend/server.js",
+    ]) is not None
+    html = render_boilerplate("openbazaar/frontend/index.html", expected)
+
+    assert html is not None
+    assert "src/main.jsx" in html

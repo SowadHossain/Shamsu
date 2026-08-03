@@ -17,7 +17,7 @@ BLUEPRINT = StackBlueprint(
         "forms": "core/forms.py",
         "tests": "core/tests",
     },
-    config_files=("requirements.txt", ".env.example"),
+    config_files=("requirements.txt", ".env.example", "Dockerfile"),
     verify=("python manage.py check", "python manage.py migrate --check"),
     description="Django backend and app package layout.",
 )

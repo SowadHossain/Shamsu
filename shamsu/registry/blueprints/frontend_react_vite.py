@@ -16,7 +16,7 @@ BLUEPRINT = StackBlueprint(
         "styles": "src/styles.css",
         "tests": "src",
     },
-    config_files=("package.json", "index.html", "vite.config.ts"),
+    config_files=("package.json", "index.html", "vite.config.ts", ".env.example", "Dockerfile"),
     verify=("npm install", "npm run build", "npm test"),
     description="React single-page frontend built with Vite.",
 )

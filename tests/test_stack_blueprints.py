@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from shamsu.prd.contract import PRDContract
 from shamsu.prd.requirements import _architecture_expected_files_for_milestone
-from shamsu.registry.blueprints import blueprint_by_id, resolve_blueprints
+from shamsu.registry.blueprints import (
+    blueprint_by_id,
+    resolve_blueprints,
+    runtime_file_paths_for_contract,
+    runtime_plan_for_contract,
+)
 
 
 def test_a_prohibited_blueprint_is_unavailable_even_when_it_is_the_suggestion():
@@ -71,3 +76,36 @@ def test_selecting_postgres_produces_compose_and_env_without_sqlite():
     assert "docker-compose.yml" in postgres.config_paths()
     assert ".env.example" in postgres.config_paths()
     assert "sqlite" not in rendered
+
+
+def test_full_stack_runtime_plan_ties_backend_frontend_and_postgres_together():
+    contract = PRDContract(
+        title="OpenBazaar",
+        stack_hint="django",
+        required_stack=["django", "react", "vite", "postgres"],
+    )
+
+    plan = runtime_plan_for_contract(contract)
+    paths = runtime_file_paths_for_contract(contract)
+
+    assert [service["name"] for service in plan["services"]] == [
+        "postgres",
+        "backend",
+        "frontend",
+    ]
+    assert plan["compose"] == {
+        "path": "docker-compose.yml",
+        "services": ["postgres", "backend", "frontend"],
+        "database": "postgres",
+    }
+    assert {
+        "docker-compose.yml",
+        ".env.example",
+        "backend/Dockerfile",
+        "backend/.env.example",
+        "backend/requirements.txt",
+        "frontend/Dockerfile",
+        "frontend/.env.example",
+        "frontend/package.json",
+        "frontend/vite.config.ts",
+    }.issubset(set(paths))

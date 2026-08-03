@@ -261,6 +261,49 @@ def test_postgres_milestones_use_sql_databases_not_sqlite_persistence():
     assert "react-vite" in all_skills
 
 
+def test_dockerized_postgres_full_stack_files_are_foundation_targets():
+    contract = extract_contract(
+        parse_prd_text(
+            "# OpenBazaar\n\n"
+            "## Tech Stack\n"
+            "- Django backend\n"
+            "- React and Vite frontend\n"
+            "- PostgreSQL 16\n"
+            "- Docker Compose\n\n"
+            "## Data Model\n"
+            "Item\n"
+            "- id, title\n\n"
+            "## Features\n"
+            "- Buyers browse marketplace listings.\n\n"
+            "## Acceptance\n"
+            "- `docker compose config -q` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    artifacts = compile_prd_execution_artifacts(contract)
+    foundation = next(
+        milestone for milestone in artifacts.requirement_ledger.milestones
+        if milestone.id == "M-001"
+    )
+    runtime = artifacts.architecture["runtime"]
+
+    assert runtime["compose"]["services"] == ["postgres", "backend", "frontend"]
+    assert {
+        "docker-compose.yml",
+        ".env.example",
+        "backend/Dockerfile",
+        "backend/.env.example",
+        "backend/requirements.txt",
+        "frontend/Dockerfile",
+        "frontend/.env.example",
+        "frontend/package.json",
+        "frontend/vite.config.ts",
+    }.issubset(set(foundation.expected_files))
+    assert "sqlite-persistence" not in foundation.active_skills
+    assert "sql-databases" in foundation.active_skills
+
+
 def test_django_product_milestone_declares_server_rendered_ui_files():
     contract = extract_contract(
         parse_prd_text(

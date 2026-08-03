@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.prd.contract import PRDContract
-from shamsu.registry.blueprints import resolve_blueprints
+from shamsu.registry.blueprints import (
+    resolve_blueprints,
+    runtime_file_paths_for_contract,
+    runtime_plan_for_contract,
+)
 
 MAX_REQUIREMENTS_PER_MILESTONE = 4
 
@@ -205,6 +209,7 @@ def compile_prd_execution_artifacts(contract: PRDContract) -> PRDExecutionArtifa
         "architecture": list(contract.architecture),
         "components": _architecture_components(contract),
         "blueprints": blueprint_resolution.to_dict(),
+        "runtime": runtime_plan_for_contract(contract),
         "source_authoring": "react_tool_loop",
         "assumptions": list(contract.assumptions),
         "warnings": list(contract.extraction_warnings),
@@ -710,6 +715,8 @@ def _architecture_expected_files_for_milestone(
     product = number == 2 or 200 <= number < 300
     release = number in {3, 4} or 300 <= number < 500
     paths: list[str] = []
+    if foundation or release:
+        paths.extend(runtime_file_paths_for_contract(contract))
     if backend_root and _is_node_backend_stack(contract) and (foundation or release):
         # Without this branch a Node PRD declared no foundation files at all.
         # Two things then went wrong at once: the file-at-a-time pass had no
