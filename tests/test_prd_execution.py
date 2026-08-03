@@ -27,6 +27,7 @@ from shamsu.prd.execution import (
 )
 from shamsu.prd.parser import parse_prd_text
 from shamsu.patch.transactions import TransactionWorkspace
+from shamsu.verify.gate import VerifyOutcome
 
 
 def _contract():
@@ -423,6 +424,65 @@ def test_prd_milestone_verifier_marks_python_file_verified(tmp_path: Path):
     assert verification["status"] == "verified"
     assert verification["command"]
     assert verification["files"] == ["app.py"]
+
+
+def test_prd_milestone_verifier_does_not_run_field_name_evidence_gate(
+    tmp_path: Path,
+    monkeypatch,
+):
+    (tmp_path / "backend/core").mkdir(parents=True)
+    (tmp_path / "backend/core/models.py").write_text(
+        "from django.db import models\n"
+        "from django.contrib.auth.models import AbstractUser\n\n"
+        "class User(AbstractUser):\n"
+        "    role = models.CharField(max_length=20)\n",
+        encoding="utf-8",
+    )
+    preflight = {
+        "active_skills": ["django"],
+        "expected_files": ["backend/core/models.py"],
+        "verifier": "python manage.py check",
+        "requirements": [
+            {
+                "id": "ENT-001",
+                "kind": "entity",
+                "scope": "in",
+                "priority": "must",
+                "text": "User: fields email, password_hash, role",
+            }
+        ],
+    }
+
+    monkeypatch.setattr(
+        repl,
+        "verify_only",
+        lambda *args, **kwargs: VerifyOutcome(
+            verified=True,
+            exit_code=0,
+            command="python manage.py check",
+            summary="Django checks passed",
+        ),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("field-name evidence gate should not run after verification")
+
+    monkeypatch.setattr(repl, "_prd_requirement_evidence_errors", fail_if_called)
+
+    status, verification = asyncio.run(
+        repl._verify_prd_milestone(
+            "M-001",
+            preflight,
+            ["backend/core/models.py"],
+            tmp_path,
+            _console(),
+            None,
+        )
+    )
+
+    assert status == "verified"
+    assert verification["status"] == "verified"
+    assert verification["verified"] is True
 
 
 def test_prd_milestone_verifier_stops_on_python_failure(tmp_path: Path):
@@ -1116,14 +1176,14 @@ def test_expected_architecture_requires_custom_django_user_setting(tmp_path: Pat
     assert "AUTH_USER_MODEL = 'core.User'" in guidance
 
 
-def test_expected_architecture_requires_prd_django_entities_and_fields(tmp_path: Path):
+def test_expected_architecture_does_not_require_exact_prd_django_entity_fields(tmp_path: Path):
     models = tmp_path / "demo/backend/core/models.py"
     models.parent.mkdir(parents=True)
     models.write_text(
         "from django.db import models\n"
         "class Submission(models.Model):\n"
-        "    assignment = models.ForeignKey('Assignment', on_delete=models.CASCADE)\n"
-        "    student = models.ForeignKey('User', on_delete=models.CASCADE)\n",
+        "    assignment = models.CharField(max_length=100)\n"
+        "    student = models.CharField(max_length=100)\n",
         encoding="utf-8",
     )
     preflight = {
@@ -1148,9 +1208,7 @@ def test_expected_architecture_requires_prd_django_entities_and_fields(tmp_path:
 
     invalid = repl._invalid_expected_architecture_files(preflight, tmp_path)
 
-    assert len(invalid) == 1
-    assert "Submission.content/submitted_at" in invalid[0]
-    assert "Grade" in invalid[0]
+    assert invalid == []
 
 
 def test_django_entity_requirement_check_passes_complete_models():

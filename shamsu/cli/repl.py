@@ -10464,8 +10464,8 @@ def _prd_file_pass_rejection_feedback(
     return (
         "PREVIOUS ATTEMPT REJECTED AND ROLLED BACK. The last write failed validation: "
         f"{detail}. Do NOT write a placeholder, stub, or scaffold comment such as "
-        '"# Define your models here." - write the COMPLETE implementation with every '
-        "required entity, field, and import this time."
+        '"# Define your models here." - write the COMPLETE working implementation '
+        "with the required imports and behavior this time."
     )
 
 
@@ -10871,17 +10871,9 @@ def _prd_file_repair_guidance(
             content = (workspace / target).read_text(encoding="utf-8")
         except OSError:
             content = ""
-        missing = _missing_django_entity_requirements(content, preflight)
         structure_errors = _django_model_structure_errors(content)
         recipes = _django_model_structure_edit_recipes(target, content)
         facts: list[str] = []
-        if missing:
-            facts.append(
-                "Entity contract facts: add or repair only these absent declarations: "
-                + ", ".join(missing)
-                + ". Fields inherited from Django AbstractUser already exist and must not be "
-                "redeclared. Preserve every existing model and relationship."
-            )
         if structure_errors:
             facts.append("Django model structure errors: " + "; ".join(structure_errors) + ".")
         if recipes:
@@ -12221,18 +12213,21 @@ async def _verify_prd_milestone(
         command=outcome.command,
         cwd=_prd_verification_cwd(outcome, workspace),
     )
-    semantic_errors = _prd_requirement_evidence_errors(preflight, workspace)
     test_count = _prd_behavior_test_count(outcome)
-    if outcome.verified and _prd_requires_behavior_tests(preflight) and test_count == 0:
-        semantic_errors.append(
-            "behavior milestone verifier discovered 0 tests; add focused requirement tests"
-        )
-    if outcome.verified and semantic_errors:
+    missing_behavior_tests = (
+        outcome.verified
+        and _prd_requires_behavior_tests(preflight)
+        and test_count == 0
+    )
+    if missing_behavior_tests:
         verification = {
             **verification,
             "status": "failed",
             "verified": False,
-            "summary": "Requirement evidence validation failed: " + "; ".join(semantic_errors),
+            "summary": (
+                "Requirement evidence validation failed: behavior milestone verifier "
+                "discovered 0 tests; add focused requirement tests"
+            ),
         }
         _log_prd_milestone_verification(milestone_id, verification)
         console.print(
@@ -13737,11 +13732,6 @@ def _invalid_expected_architecture_files(
             invalid.append(f"{relative} (no persisted model declarations)")
         elif entity_milestone and posix.endswith("/models.py"):
             model_errors = _django_model_structure_errors(content)
-            missing_entities = _missing_django_entity_requirements(content, preflight)
-            if missing_entities:
-                model_errors.append(
-                    "missing required entities or fields: " + ", ".join(missing_entities)
-                )
             if model_errors:
                 invalid.append(f"{relative} ({'; '.join(model_errors)})")
         elif target.name == "package.json":
