@@ -91,6 +91,8 @@ def initialize_prd_execution(
         state = _merge_state(existing, ledger, user_request, prd_path)
     else:
         state = _new_state(ledger, user_request, prd_path)
+    if not _has_acceptance_criteria(ledger):
+        state = _block_missing_acceptance_criteria(state)
     state["execution_key"] = execution_key
     _write_json(path, state)
     return root, state
@@ -609,6 +611,39 @@ def _new_state(
         "changed_files": [],
         "milestones": [_milestone_state(milestone) for milestone in ledger.milestones],
     }
+
+
+def _has_acceptance_criteria(ledger: RequirementLedger) -> bool:
+    return any(
+        record.kind == "acceptance" and record.scope == "in"
+        for record in ledger.requirements
+    )
+
+
+def _block_missing_acceptance_criteria(state: dict[str, Any]) -> dict[str, Any]:
+    summary = (
+        "PRD execution is blocked because the acceptance matrix contains no "
+        "criteria. Add explicit acceptance criteria before milestone verification."
+    )
+    updated = dict(state)
+    updated["status"] = "blocked"
+    updated["current_milestone_id"] = ""
+    blockers = list(updated.get("blockers") or [])
+    blocker = {
+        "kind": "missing_acceptance_criteria",
+        "summary": summary,
+        "at": _now(),
+    }
+    if not any(item.get("kind") == blocker["kind"] for item in blockers if isinstance(item, dict)):
+        blockers.append(blocker)
+    updated["blockers"] = blockers
+    updated["milestones"] = [
+        {**milestone, "status": "blocked", "last_message": summary}
+        if isinstance(milestone, dict)
+        else milestone
+        for milestone in updated.get("milestones", [])
+    ]
+    return updated
 
 
 def _merge_state(

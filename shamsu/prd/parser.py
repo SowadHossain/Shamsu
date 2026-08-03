@@ -29,6 +29,11 @@ PRD_TITLE_RE = re.compile(
 )
 LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+MARKDOWN_TABLE_DELIMITER_RE = re.compile(
+    r"^\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$"
+)
+STRUCTURAL_LINE_CHARS = set("|+-=:._ \t")
+BOX_DRAWING_CHARS = set("─━│┃┌┐└┘├┤┬┴┼╭╮╰╯═║╔╗╚╝╠╣╦╩╬")
 
 TOP_LEVEL_NUMBERED_HEADINGS = {
     "overview",
@@ -186,7 +191,7 @@ def parse_prd_text(
             continue
 
         cleaned = _clean_line(line)
-        if cleaned:
+        if cleaned and not _is_structural_noise_line(cleaned):
             sections.setdefault(current_section, []).append(cleaned)
             _add_source_ref(source_refs, current_section, page, "content")
 
@@ -233,6 +238,21 @@ def _looks_like_plain_heading(line: str) -> bool:
     }
     lowered = line.rstrip(":").lower()
     return lowered in known
+
+
+def _is_structural_noise_line(line: str) -> bool:
+    """Rows that describe document layout, not requirements."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if MARKDOWN_TABLE_DELIMITER_RE.match(stripped):
+        return True
+    non_space = [char for char in stripped if not char.isspace()]
+    if len(non_space) >= 3 and all(char in STRUCTURAL_LINE_CHARS for char in non_space):
+        return True
+    if any(char in BOX_DRAWING_CHARS for char in stripped):
+        return True
+    return False
 
 
 def _match_numbered_heading(

@@ -824,6 +824,7 @@ def test_complex_freeform_uses_atomic_milestone_bundles_and_checkpoints(tmp_path
     contract.authentication_rules = ["Users log in"]
     contract.persistence_requirements = ["Store records in a database"]
     contract.required_tests = ["Core workflows pass"]
+    contract.acceptance_criteria = ["Core workflows pass end to end"]
     calls: list[str] = []
     approvals: list[list[str]] = []
 

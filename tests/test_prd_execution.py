@@ -80,6 +80,25 @@ def test_initialize_prd_execution_writes_state_preflights_and_artifacts(tmp_path
     assert "developer" in preflight["active_skills"]
 
 
+def test_prd_execution_without_acceptance_criteria_hard_stops(tmp_path: Path):
+    contract = extract_contract(
+        parse_prd_text(
+            "# Demo\n\n"
+            "## Features\n"
+            "- Search tasks\n",
+            markdown=True,
+        )
+    )
+
+    root, state = initialize_prd_execution(tmp_path, "build from PRD", contract)
+    matrix = json.loads((root / "acceptance-matrix.json").read_text(encoding="utf-8"))
+
+    assert matrix["criteria"] == []
+    assert state["status"] == "blocked"
+    assert state["current_milestone_id"] == ""
+    assert state["blockers"][0]["kind"] == "missing_acceptance_criteria"
+
+
 def test_prd_execution_isolated_by_target_project_root(tmp_path: Path):
     first_root, first_state = initialize_prd_execution(
         tmp_path,
@@ -328,7 +347,7 @@ def test_validate_model_preflight_accepts_allowlisted_focus(tmp_path: Path):
         {
             "milestone_id": "M-002",
             "requirement_ids": ["FEAT-001"],
-            "active_skills": ["developer", "react-vite"],
+            "active_skills": ["developer"],
             "expected_files": ["src/SearchPanel.tsx"],
             "allowed_tools": ["read_file", "write_file", "edit_file"],
             "verifier": "focused app tests/build",
@@ -341,7 +360,7 @@ def test_validate_model_preflight_accepts_allowlisted_focus(tmp_path: Path):
     assert errors == []
     assert preflight["preflight_source"] == "model"
     assert preflight["requirement_ids"] == ["FEAT-001"]
-    assert preflight["active_skills"] == ["developer", "react-vite"]
+    assert preflight["active_skills"] == ["developer"]
     assert "src/SearchPanel.tsx" in preflight["expected_files"]
     assert preflight["allowed_tools"] == ["read_file", "write_file", "edit_file"]
     assert preflight["context_focus"][0] == "Search task workflow"
@@ -1675,7 +1694,7 @@ def test_prepare_prd_milestone_preflight_accepts_valid_model_output(
                 {
                     "milestone_id": "M-002",
                     "requirement_ids": ["FEAT-001"],
-                    "active_skills": ["developer", "react-vite"],
+                    "active_skills": ["developer"],
                     "expected_files": ["src/SearchPanel.tsx"],
                     "allowed_tools": ["read_file", "write_file"],
                     "verifier": "focused app tests/build",

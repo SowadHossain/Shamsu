@@ -8,6 +8,7 @@ from typing import Any
 
 from shamsu.prd import headings as _headings
 from shamsu.prd.extractor import extract_entities
+from shamsu.prd.parser import _is_structural_noise_line
 from shamsu.types import ParsedPRD
 
 _GAME_TYPES: list[tuple[str, tuple[str, ...]]] = [
@@ -574,7 +575,11 @@ def _clean_items(items: list[str]) -> list[str]:
     cleaned: list[str] = []
     for item in items:
         value = item.strip().lstrip("-*+\u2022 ").strip()
-        if value and value.lower() not in {"test:", "fields:", "constraints:", "indexes:"}:
+        if (
+            value
+            and value.lower() not in {"test:", "fields:", "constraints:", "indexes:"}
+            and not _is_structural_noise_line(value)
+        ):
             cleaned.append(value)
     return cleaned
 
