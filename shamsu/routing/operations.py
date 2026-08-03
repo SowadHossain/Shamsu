@@ -55,7 +55,13 @@ _FILE_SUFFIXES = frozenset(
 )
 
 
-def _looks_like_real_file(token: str) -> bool:
+def looks_like_real_file(token: str) -> bool:
+    """Whether a dotted token is a path rather than a module/attribute name.
+
+    Public because the run contract needs the same judgement: two extractors
+    disagreeing about what counts as a file meant a prompt could promise
+    `config.settings` and then fail for not writing it.
+    """
     normalized = token.replace("\\", "/")
     if "/" in normalized:
         return True
@@ -82,7 +88,7 @@ def file_targets(text: str) -> set[str]:
     targets: set[str] = set()
     for match in _FILE_TOKEN_RE.finditer(body):
         token = match.group(0)
-        if not _looks_like_real_file(token):
+        if not looks_like_real_file(token):
             continue
         if _IMPORT_CONTEXT_RE.search(body[: match.start()]):
             continue
@@ -456,6 +462,20 @@ def _split_clauses(prompt: str) -> list[str]:
     return _merge_specification_clauses(_merge_context_fragments(parts))
 
 
+_MARKUP_RE = re.compile(r"<[^>]+>|\{%.*?%\}|\{\{.*?\}\}", re.DOTALL)
+
+
+def _without_file_tokens(text: str) -> str:
+    """*text* with file paths and dictated markup removed.
+
+    Intent classification must read the instruction, not its payload: a prompt
+    that dictates HTML should be judged on "rewrite this template", not on the
+    words inside the tags it is quoting.
+    """
+    stripped = _MARKUP_RE.sub(" ", text)
+    return _FILE_TOKEN_RE.sub(" ", stripped)
+
+
 def _operation_kind(clause: str) -> str:
     text = " ".join(clause.lower().split())
     explicitly_read_only = read_only.applies(text)
@@ -480,12 +500,23 @@ def _operation_kind(clause: str) -> str:
         return "summarize"
     if re.search(r"\bcompare\b", text):
         return "compare"
-    if re.search(r"\b(search|browse|look up|check)\b", text) and re.search(
-        r"\b(web|online|latest|current|docs?|documentation|release)\b", text
+    # Web intent must come from the instruction, not from a filename or from
+    # markup being dictated. "Rewrite templates/browse.html ... Current bid:"
+    # supplied both halves of this test - `browse` from the path and `current`
+    # from template text - and a prompt whose entire job was to write a file
+    # was dispatched to web search, changing nothing.
+    intent_text = _without_file_tokens(text)
+    if re.search(r"\b(search|browse|look up|check)\b", intent_text) and re.search(
+        r"\b(web|online|latest|current|docs?|documentation|release)\b", intent_text
     ):
         return "web"
     if not explicitly_read_only and re.search(
-        r"\b(create|write|build|implement|install|fix|repair|edit|update|modify|change|add|remove|delete|rename|move)\b",
+        # `rewrite`/`replace`/`overwrite`/`append` were missing, so "Rewrite
+        # core/views.py so it contains ..." was not recognised as a mutation at
+        # all and fell through to the answer route - the model described the
+        # file instead of writing it.
+        r"\b(create|write|rewrite|overwrite|replace|append|build|implement|install"
+        r"|fix|repair|edit|update|modify|change|add|remove|delete|rename|move)\b",
         action_text,
     ):
         return "mutation"
@@ -506,6 +537,13 @@ def _operation_kind(clause: str) -> str:
 
 
 def _route_for_kind(kind: str, classified: str) -> str:
+    # A turn whose instruction is to write a file is never a web search,
+    # whatever the model's classifier decided. Without this the fall-through at
+    # the end returned the classifier's answer verbatim, and a prompt dictating
+    # HTML ("rewrite templates/browse.html ...") was dispatched to web search:
+    # it changed nothing, reported failure, and left the file broken.
+    if kind == "mutation" and classified == "web":
+        return "file.write"
     if kind in {"verify", "launch"} and classified in {
         "run_game",
         "dev_server",

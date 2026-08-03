@@ -102,6 +102,13 @@ _AUTO_REPAIR_ENABLED = _os.environ.get("SHAMSU_AUTO_REPAIR", "1").strip().lower(
     "no",
 }
 
+# Repair iterations allowed per failed verify. `RepairLoop` stops as soon as no
+# actionable error remains, so a first-attempt fix still costs exactly one pass
+# and this ceiling is only ever paid on the sad path. It must stay small: the
+# point is to rescue a one-line syntax error at the end of a long autonomous
+# run, not to let a model grind at a problem it cannot solve.
+_AUTO_REPAIR_MAX_ATTEMPTS = 3
+
 # Whether the planner may stop a run to ask the user a decision before work
 # starts (J6). On by default: a wrong build costs far more than one question.
 # SHAMSU_ASK_UPFRONT=0 restores straight-to-work behavior.
@@ -593,6 +600,10 @@ class AgentChatLoop:
             self.audit.log_prompt(original_input)
         if self.use_long_term_memory:
             user_input = self._append_long_term_memory(user_input)
+        # Structural facts about the files this turn names, from the code graph.
+        # Independent of Graphiti (cross-session recall): the two answer
+        # different questions and one being unavailable must not mute the other.
+        user_input = self._append_codebase_memory(user_input)
         self._produced_plan = False
         self._pending_upfront_question: dict[str, Any] | None = None
         if self.use_planner and (self.long_running or _CHAT_PLANNER_ENABLED):
@@ -1377,6 +1388,48 @@ class AgentChatLoop:
             changed_files=tuple(written_files),
         )
 
+    def _append_codebase_memory(self, user_input: str) -> str:
+        """Attach Codebase-Memory MCP facts about the files this turn names.
+
+        `CodeEditWorkflow` and `BugfixWorkflow` have always done this, but the
+        route table has no `edit` entry and `file.write` sits above everything
+        that would reach them - so "edit core/views.py to ..." is dispatched
+        here, and the code graph, however healthy, was never consulted. The
+        symptom is the expensive one: the model re-derives what a module
+        exports and imports by guessing, and invents names that do not exist.
+
+        Only files that ALREADY exist are looked up; a request to create a new
+        file has nothing to say. Best-effort throughout - an unavailable or
+        unindexed workspace returns "" and the turn proceeds unchanged.
+        """
+        try:
+            from shamsu.abstract.context import build_codebase_memory_brief
+            from shamsu.agents.rewrite_fallback import mentioned_workspace_files
+
+            # Capped tightly: the brief renders at most three paths, and by the
+            # time a composite turn reaches here the text can carry plan and
+            # workspace context naming files the user never asked about. Tokens
+            # come back in order of appearance, so the file the request actually
+            # names leads and incidental mentions cannot crowd it out.
+            targets = mentioned_workspace_files(self.workspace_root, user_input, limit=3)
+            if not targets:
+                # Nothing named that exists - skip the lookup rather than pay a
+                # healthcheck round-trip on every conversational turn.
+                return user_input
+            brief = build_codebase_memory_brief(self.workspace_root, targets)
+        except Exception:
+            return user_input
+        if not brief:
+            return user_input
+        if self.session_logger:
+            self.session_logger.log(
+                "codebase_memory.retrieved",
+                {"specialist": "agent-chat", "targets": targets[:3]},
+                "Retrieved Codebase-Memory facts for named files",
+                workflow_id="agent-chat",
+            )
+        return f"{user_input}\n\n{brief}"
+
     def _append_long_term_memory(self, user_input: str) -> str:
         try:
             memory_context = MemoryService(self.workspace_root).render_relevant(
@@ -1520,7 +1573,8 @@ class AgentChatLoop:
         if outcome.unverifiable:
             return content
         if outcome.failed:
-            # One bounded repair before giving up (gap E1). The machinery to fix
+            # One bounded repair pass before giving up (gap E1), itself capped
+            # at _AUTO_REPAIR_MAX_ATTEMPTS iterations. The machinery to fix
             # a one-line syntax error after a 30-minute run existed all along
             # (RepairLoop, used by freeform/full_pipeline) and simply was never
             # invited here - the loop verified, reported failure, and left the
@@ -1595,7 +1649,7 @@ class AgentChatLoop:
                     list(written_files),
                     generate=_generate_sync,
                     command_runner=self.tools.command_runner,
-                    max_attempts=3,
+                    max_attempts=_AUTO_REPAIR_MAX_ATTEMPTS,
                     lightweight=True,
                     session_logger=session_logger,
                     action_ledger=self.action_ledger,

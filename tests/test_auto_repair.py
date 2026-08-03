@@ -83,8 +83,12 @@ async def test_failed_verify_triggers_one_repair_and_reports_success(tmp_path: P
     client = _WriteThenAnswerClient("app.py", "def broken(:\n    pass\n")
     result = await _loop(tmp_path, client).run("write app.py")
 
-    assert len(calls) == 1
-    assert calls[0]["max_attempts"] == 1          # bounded, not a retry storm
+    assert len(calls) == 1                        # one repair pass, not a loop of them
+    # Bounded, not a retry storm. Asserted against the constant rather than a
+    # literal so raising the ceiling is a deliberate edit to a documented value;
+    # the upper bound is what actually matters here.
+    assert calls[0]["max_attempts"] == chat_loop_module._AUTO_REPAIR_MAX_ATTEMPTS
+    assert 1 <= chat_loop_module._AUTO_REPAIR_MAX_ATTEMPTS <= 3
     assert calls[0]["lightweight"] is True        # never pip/npm mid-chat
     assert "[verified after repair]" in result.final
     assert "UNCONFIRMED" not in result.final

@@ -187,6 +187,31 @@ HEADING_ROLE_SCHEMA = {
 # "Detailed Notes On Feature Flag Rollout Sequencing".
 _MIN_COVERAGE = 0.34
 
+# Words that pad a heading without narrowing what it is about. They are
+# excluded from the coverage denominator, because otherwise a heading is
+# punished for being verbose: "Comprehensive Feature Specifications" scored
+# 1/3 = 0.33 against `features` and missed the floor by a hundredth, so a PRD
+# whose entire feature list sat under it contributed zero features. Dropping
+# the padding scores it 1/1. The floor still rejects genuinely different
+# subjects - "Detailed Notes On Feature Flag Rollout Sequencing" keeps four
+# content words and stays at 0.25.
+_QUALIFIER_WORDS = frozenset(
+    {
+        "comprehensive",
+        "complete",
+        "detailed",
+        "full",
+        "general",
+        "high",
+        "key",
+        "level",
+        "main",
+        "specification",
+        "summary",
+        "table",
+    }
+)
+
 # Terms too generic to claim a heading on one shared word. "Financial Controls"
 # is not game controls; "Backdated Transactions" is not a database transaction
 # requirement. These still match exactly, just never fuzzily.
@@ -281,8 +306,9 @@ def resolve_headings(headings: Iterable[str]) -> HeadingResolution:
         if term not in _EXACT_ONLY_TERMS
     }
     resolution = HeadingResolution()
+    ordered = list(headings)
 
-    for heading in headings:
+    for heading in ordered:
         normalized = normalize_heading(heading)
         if not normalized:
             continue
@@ -295,11 +321,12 @@ def resolve_headings(headings: Iterable[str]) -> HeadingResolution:
             resolution.unresolved.append(heading)
             continue
 
+        significant = (tokens - _QUALIFIER_WORDS) or tokens
         candidates: list[tuple[int, float, str]] = []
         for term, term_tokens in index.items():
             if not term_tokens or not term_tokens <= tokens:
                 continue
-            coverage = len(term_tokens) / len(tokens)
+            coverage = len(term_tokens - _QUALIFIER_WORDS) / len(significant)
             if coverage < _MIN_COVERAGE:
                 continue
             candidates.append((len(term_tokens), coverage, term))
@@ -318,7 +345,71 @@ def resolve_headings(headings: Iterable[str]) -> HeadingResolution:
             continue
         resolution.aliases[heading] = best[2]
 
+    _inherit_from_parent_headings(ordered, resolution)
     return resolution
+
+
+_SECTION_NUMBER_RE = re.compile(r"^(?P<number>\d+(?:\.\d+)+)[.)]?\s")
+
+
+def _inherit_from_parent_headings(
+    ordered: list[str], resolution: HeadingResolution
+) -> None:
+    """Let a numbered subsection take its parent section's role.
+
+    A PRD names its top-level section for the reader and its subsections for
+    the subject: "3. Comprehensive Feature Specifications" holds no lines of
+    its own, and every feature lives under "3.1 Item Listing Engine",
+    "3.2 Auction Engine", "3.3 Fulfillment Lifecycle" - none of which look
+    like anything the extractor knows. Resolving the parent and stranding its
+    children finds the section but none of its content.
+
+    Only exact numeric parentage counts ("3.1" under "3."), so this cannot
+    reach across sections, and a subsection that resolved on its own keeps its
+    own answer.
+    """
+    roles: dict[str, str] = {}
+    for heading in ordered:
+        number = _heading_number(heading)
+        if not number:
+            continue
+        if heading in resolution.aliases:
+            roles[number] = resolution.aliases[heading]
+        elif heading in resolution.already_canonical:
+            # Hand down the canonical term, not the heading's own wording:
+            # "5.2 Database Schema (PostgreSQL DDL)" matches `database schema`
+            # by prefix, and its children must inherit that name to be found.
+            canonical = _canonical_prefix(normalize_heading(heading))
+            if canonical:
+                roles[number] = canonical
+
+    if not roles:
+        return
+
+    still_unresolved: list[str] = []
+    for heading in resolution.unresolved:
+        match = _SECTION_NUMBER_RE.match(heading.strip())
+        parent = roles.get(match.group("number").rsplit(".", 1)[0]) if match else None
+        if parent:
+            resolution.aliases[heading] = parent
+        else:
+            still_unresolved.append(heading)
+    resolution.unresolved = still_unresolved
+
+
+def _heading_number(heading: str) -> str:
+    match = _HEADING_NUMBER_RE.match(heading.strip())
+    return match.group(0).strip().rstrip(".") if match else ""
+
+
+def _canonical_prefix(normalized: str) -> str:
+    """The longest canonical term this already-matching heading starts with."""
+    matches = [
+        term
+        for term in CANONICAL_TERMS
+        if normalized == term or normalized.startswith(f"{term} ")
+    ]
+    return max(matches, key=len) if matches else ""
 
 
 def apply_heading_aliases(

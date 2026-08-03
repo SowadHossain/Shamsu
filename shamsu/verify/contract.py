@@ -230,6 +230,24 @@ _PROTECTED_PATH_PREFIX_RE = re.compile(
 )
 
 
+def _names_a_file(text: str, token_start: int, candidate: str) -> bool:
+    """Whether a dotted token is a real path rather than a module or attribute.
+
+    `_FILE_TOKEN_RE` accepts anything shaped `name.ext`, which is also the shape
+    of `config.settings`, `django.contrib.admin` and `sys.argv`. A prompt that
+    merely NAMES a settings module ("set DJANGO_SETTINGS_MODULE to
+    config.settings ... write manage.py") therefore promised two files it never
+    meant, and every such run failed its own contract while doing exactly what
+    was asked. The routing layer already solved this for its own extractor;
+    this reuses that judgement so the two cannot drift apart.
+    """
+    from shamsu.routing.operations import _IMPORT_CONTEXT_RE, looks_like_real_file
+
+    if not looks_like_real_file(candidate):
+        return False
+    return not _IMPORT_CONTEXT_RE.search(text[:token_start])
+
+
 def _is_source_reference(text: str, token_start: int, candidate: str) -> bool:
     if _SOURCE_FILENAME_RE.search(candidate):
         return True
@@ -271,6 +289,7 @@ def requested_paths(prompt: str, workspace: Path | None = None) -> tuple[str, ..
     spans: list[tuple[int, str]] = [
         (match.start(), _requested_path(match.group(0), workspace))
         for match in _FILE_TOKEN_RE.finditer(text)
+        if _names_a_file(text, match.start(), match.group(0))
     ]
     spans.extend((match.start(), match.group(0)) for match in _DOTFILE_RE.finditer(text))
     spans.extend(

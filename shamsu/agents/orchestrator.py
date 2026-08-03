@@ -98,7 +98,7 @@ class AgentOrchestrator:
             if not prds:
                 message = (
                     "I couldn't find a PRD file in this workspace. "
-                    "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or "
+                    "Add a `.md`, `.txt`, `.pdf`, or `.docx` PRD (e.g. named `*prd*` or "
                     "`Product Requirements*`), then ask again."
                 )
             else:

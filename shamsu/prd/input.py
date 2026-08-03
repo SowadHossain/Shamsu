@@ -1,4 +1,4 @@
-"""Unified PRD input parsing for Markdown, TXT, and PDF files."""
+"""Unified PRD input parsing for Markdown, TXT, PDF, and DOCX files."""
 from __future__ import annotations
 
 import hashlib
@@ -26,7 +26,12 @@ class PRDParseError(Exception):
     """Raised when a PRD file cannot be converted into text sections."""
 
 
-SUPPORTED_PRD_EXTENSIONS = {".md", ".markdown", ".txt", ".pdf"}
+SUPPORTED_PRD_EXTENSIONS = {".md", ".markdown", ".txt", ".pdf", ".docx"}
+
+# PRD formats that are not plain text and must be extracted before they can be
+# read. `read_file` and @-mention resolution key off this, so a user can point
+# any tool at the document they actually have.
+BINARY_PRD_EXTENSIONS = {".pdf", ".docx"}
 
 _DOCUMENT_SUFFIX_PATTERN = "|".join(
     re.escape(extension.lstrip("."))
@@ -98,6 +103,28 @@ class PRDInputParser:
             parsed = parse_prd_text(raw_text, fallback_title=path.stem)
             parsed.source_path = str(path.resolve())
             parsed.source_kind = "text"
+            return parsed
+        if suffix == ".docx":
+            from shamsu.prd.docx import DocxParseError, extract_docx_document
+            from shamsu.prd.parser import parse_prd_text
+
+            try:
+                document = extract_docx_document(path)
+            except DocxParseError as exc:
+                raise PRDParseError(str(exc)) from exc
+            # The extractor rebuilds Markdown headings, so parse in Markdown
+            # mode: the plain/numbered-heading heuristics are for PDF text
+            # dumps and would re-interpret body prose as sections here.
+            parsed = parse_prd_text(document.text, fallback_title=path.stem, markdown=True)
+            parsed.source_path = str(path.resolve())
+            parsed.source_kind = "docx"
+            parsed.tables = document.tables
+            parsed.extraction_warnings = document.warnings
+            if document.warnings:
+                parsed.extraction_confidence = 0.7
+            parsed.title = (
+                document.title or _product_name(parsed) or _document_title(document.text) or parsed.title
+            )
             return parsed
         if suffix == ".pdf":
             from shamsu.prd.parser import parse_prd_text

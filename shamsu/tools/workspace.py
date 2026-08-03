@@ -37,11 +37,13 @@ MENTION_RE = re.compile(
 )
 MAX_FILE_CHARS = 6000
 # Documents SHAMSU can extract text from rather than read as plain text.
-DOCUMENT_EXTENSIONS = {".pdf"}
+# Sourced from the PRD parser so a newly supported document format is readable
+# by every tool at once, not just by the PRD pipeline.
+DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 
 
 def extract_document_text(path: Path) -> str:
-    """Plain text of a document SHAMSU knows how to parse (currently PDF)."""
+    """Plain text of a document SHAMSU knows how to parse (PDF, DOCX)."""
     # Lazy: pdf extraction (via pdfplumber) is heavy and rarely needed.
     from shamsu.prd.input import parse_prd_file
 
@@ -263,7 +265,7 @@ class MentionResolver:
             listing = WorkspaceTool(path).list_files(limit=20).render()
             return MentionContext(mention=mention, workspace_root=self.workspace_root, path=rel, kind="folder", content=listing)
         try:
-            if path.suffix.lower() == ".pdf":
+            if path.suffix.lower() in DOCUMENT_EXTENSIONS:
                 content = self._read_pdf(path)
             else:
                 content = self.tool.read_file(str(rel))

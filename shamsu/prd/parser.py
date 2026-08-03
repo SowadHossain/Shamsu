@@ -28,6 +28,7 @@ PRD_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
 
 TOP_LEVEL_NUMBERED_HEADINGS = {
     "overview",
@@ -121,11 +122,22 @@ def parse_prd_text(
     current_section = "Overview"
     source_refs: dict[str, list[dict[str, int | str]]] = {}
     last_top_level_number = 0
+    in_code_fence = False
 
     for index, raw_line in enumerate(raw_text.splitlines()):
         line = raw_line.strip()
         page = line_pages[index] if line_pages and index < len(line_pages) else 0
         if not line:
+            continue
+
+        # A fenced block is code, not a requirement. Left in, a pasted SQL
+        # schema or ASCII architecture diagram becomes a multi-thousand
+        # character "feature" and the compiled plan tries to build it. The text
+        # stays in `raw_text`, which is where schema extraction reads from.
+        if markdown and FENCE_RE.match(line):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence:
             continue
 
         prefixed_title = PRD_TITLE_RE.match(line)

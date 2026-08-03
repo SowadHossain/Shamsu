@@ -47,7 +47,12 @@ from shamsu.tools.path_resolve import (
     _strong_path_candidates,
     _walk_workspace_files,
 )
-from shamsu.tools.workspace import TEXT_EXTENSIONS, WorkspaceTool
+from shamsu.tools.workspace import (
+    DOCUMENT_EXTENSIONS,
+    TEXT_EXTENSIONS,
+    WorkspaceTool,
+    extract_document_text,
+)
 from shamsu.types import ApprovalRequest
 
 # Extensions the read tools will return as text (a superset of WorkspaceTool's
@@ -562,7 +567,7 @@ class AgentToolRegistry:
                 {
                     "source": {
                         "type": "string",
-                        "description": "Workspace-relative .md/.txt/.pdf path or absolute http(s) URL.",
+                        "description": "Workspace-relative .md/.txt/.pdf/.docx path or absolute http(s) URL.",
                     },
                     "name": {
                         "type": "string",
@@ -1454,7 +1459,12 @@ class AgentToolRegistry:
                 },
             )
 
-        if PurePosixPath(normalized).suffix.lower() == ".pdf":
+        # Documents SHAMSU extracts rather than reads as text. Keyed off the
+        # shared set, not a literal: when `.docx` became a supported PRD format
+        # this check still said `.pdf`, so the model was told the PRD it had
+        # been pointed at was "not a supported text file" - the same failure
+        # that derailed the 2026-08-01 dogfood for PDFs.
+        if PurePosixPath(normalized).suffix.lower() in DOCUMENT_EXTENSIONS:
             return self._read_pdf(normalized)
 
         try:
@@ -1879,6 +1889,14 @@ class AgentToolRegistry:
             reason="The agent requested a targeted file edit.",
             target_paths=[normalized],
         )
+        broken = _breaks_working_python(target, new_content)
+        if broken:
+            return ToolResult(
+                False,
+                f"Refusing to edit {normalized}: {broken}, but the file on disk currently does. "
+                "The replacement text is truncated or malformed - the working file has been kept.",
+                {"filepath": normalized, "syntax_regression": True},
+            )
         if not self.approval_manager.ask(request):
             return ToolResult(False, "File edit denied by user.", {"filepath": normalized})
 
@@ -1990,6 +2008,15 @@ class AgentToolRegistry:
         separator = "\n" if old_content and not old_content.endswith(("\n", "\r")) and not content.startswith(("\n", "\r")) else ""
         appended_content = f"{separator}{content}"
         new_content = f"{old_content}{appended_content}"
+        broken = _breaks_working_python(target, new_content)
+        if broken:
+            return ToolResult(
+                False,
+                f"Refusing to append to {normalized}: {broken}, but the file on disk currently "
+                "does. The appended text is truncated or malformed - the working file has been "
+                "kept.",
+                {"filepath": normalized, "syntax_regression": True},
+            )
         request = ApprovalRequest(
             action_type="file_edit",
             description=f"Append to file: {normalized}",
@@ -2179,11 +2206,19 @@ class AgentToolRegistry:
                     raise ReferenceIngestError(
                         f"Documentation ingestion supports {supported} files."
                     )
-                text = (
-                    ""
-                    if source_path.suffix.lower() == ".pdf"
-                    else source_path.read_text(encoding="utf-8")
-                )
+                suffix = source_path.suffix.lower()
+                if suffix == ".pdf":
+                    # Deferred: the PDF path prepares a page-indexed document
+                    # below rather than a flat string.
+                    text = ""
+                elif suffix in DOCUMENT_EXTENSIONS:
+                    # Other extractable documents (.docx) have no page model,
+                    # so they ingest as text and take the ordinary size-based
+                    # document/reference decision. `read_text` on one would
+                    # raise UnicodeDecodeError - it is a zip archive.
+                    text = extract_document_text(source_path)
+                else:
+                    text = source_path.read_text(encoding="utf-8")
             except (SecurityError, ReferenceIngestError, OSError, UnicodeDecodeError) as exc:
                 return ToolResult(
                     False,
@@ -2877,6 +2912,28 @@ class AgentToolRegistry:
                 "file content. Empty writes are allowed only for __init__.py package markers.",
                 {"filepath": normalized, "content_missing": True},
             )
+        unwrapped = _unwrap_serialized_tool_call(str(content), "write_file")
+        if unwrapped is not None:
+            content = unwrapped
+        broken = _breaks_working_python(self.workspace_root / normalized, str(content))
+        if broken:
+            return ToolResult(
+                False,
+                f"Refusing to overwrite {normalized}: {broken}, but the file on disk currently "
+                "does. This is a truncated or malformed generation - the working file has been "
+                "kept. Send the COMPLETE file content.",
+                {"filepath": normalized, "syntax_regression": True},
+            )
+        gutted = _gutting_overwrite(self.workspace_root / normalized, str(content))
+        if gutted:
+            return ToolResult(
+                False,
+                f"Refusing to overwrite {normalized}: {gutted} This looks like a truncated "
+                "generation rather than the file you meant to write. Read the file, then send "
+                "its COMPLETE new content - or use edit_file/append_file to change one part of "
+                "it.",
+                {"filepath": normalized, "gutting_overwrite": True},
+            )
         try:
             target = self.sandbox.validate(normalized)
         except SecurityError as exc:
@@ -3295,6 +3352,125 @@ def _truncate_text(text: str, limit: int) -> str:
 # file" dead-end into an actionable set of candidates so the read tools can
 # recover instead of stalling the agent loop.
 # ---------------------------------------------------------------------------
+
+
+# Top-level declarations across the languages SHAMSU writes. Used only to ask
+# "did this file define things before, and does it still?"
+_DEFINITION_RE = re.compile(
+    # `export function foo()` and `export default class Bar` are the ordinary
+    # shape in JS/TS; without the optional export/default prefix a whole module
+    # of them counted as zero declarations and the gutting guard stood down.
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?"
+    r"(?:def|class|function|interface|type|struct|impl|fn)\s+\w"
+    r"|^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:\(|function|async|\{)"
+    r"|^\s*\{%\s*block\b",
+    re.MULTILINE,
+)
+
+# Below this the shrink is not "an edit", it is a loss.
+_GUTTING_SIZE_RATIO = 0.25
+
+
+def _unwrap_serialized_tool_call(content: str, tool: str) -> str | None:
+    """The real file content when *content* is a tool call the model serialized.
+
+    Small models sometimes emit the call itself where the argument should go:
+    `{"name": "write_file", "arguments": {"content": "...", "filepath": "..."}}`
+    written verbatim into the file. Observed 2026-08-03 - a whole template was
+    replaced by its own JSON envelope, and the page failed much later at render
+    time with a baffling escaped-quote error.
+
+    Returns the inner content when the envelope names *this* tool and carries a
+    `content` argument, because then the model has already said exactly what it
+    wanted written and refusing would throw that away. Returns None when the
+    text is ordinary file content (including a legitimate .json file).
+    """
+    stripped = content.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return None
+    try:
+        payload = json.loads(stripped)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("name") != tool:
+        return None
+    arguments = payload.get("arguments")
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(arguments, dict):
+        return None
+    inner = arguments.get("content")
+    return inner if isinstance(inner, str) and inner.strip() else None
+
+
+def _breaks_working_python(target: Path, content: str) -> str:
+    """Why this write would replace parsing Python with unparseable Python.
+
+    The gutting guard needs the file to lose every declaration, so a generation
+    that stops mid-string slips past it: `return render(request, "item` keeps
+    all seven `def`s and does not parse. Observed twice on the same file. The
+    verify gate's syntax stage catches it a step later, but by then the working
+    file is already gone and the run is reporting "partial" - refusing the write
+    keeps the good file on disk.
+
+    Only files that parsed BEFORE are protected: repairing an already-broken
+    file must stay possible.
+    """
+    if target.suffix.lower() != ".py":
+        return ""
+    try:
+        if not target.is_file():
+            return ""
+        existing = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    try:
+        compile(existing, str(target), "exec")
+    except (SyntaxError, ValueError):
+        return ""  # already broken - let the model fix it
+    try:
+        compile(content, str(target), "exec")
+    except SyntaxError as exc:
+        return f"the replacement does not parse ({exc.msg} at line {exc.lineno})"
+    except ValueError as exc:
+        return f"the replacement does not parse ({exc})"
+    return ""
+
+
+def _gutting_overwrite(target: Path, content: str) -> str:
+    """Why this overwrite would destroy the file, or "" when it is a real edit.
+
+    A model that loses its place mid-generation can emit a fragment - live on
+    2026-08-03 a working `core/views.py` holding four view functions was
+    replaced by the three bytes `}`. It is not empty, so the empty-write guard
+    passed it, and nothing else looked at what was already there.
+
+    Deliberately conservative: BOTH a drastic shrink AND the loss of every
+    declaration are required, so legitimately reducing a file to one small
+    function is still allowed.
+    """
+    try:
+        if not target.is_file():
+            return ""
+        existing = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+    existing_definitions = len(_DEFINITION_RE.findall(existing))
+    if existing_definitions == 0 or len(existing) < 200:
+        return ""
+    if _DEFINITION_RE.search(content):
+        return ""
+    if len(content) >= len(existing) * _GUTTING_SIZE_RATIO:
+        return ""
+    return (
+        f"the existing file is {len(existing)} bytes and defines "
+        f"{existing_definitions} top-level name(s); the replacement is "
+        f"{len(content)} bytes and defines none."
+    )
 
 
 def _is_readable_text(target: Path) -> bool:

@@ -47,6 +47,14 @@ DEFAULT_EXCLUDED_FILES = frozenset(
         ".cbmignore",
         ".codebase-memory.json",
         ".DS_Store",
+        # Verifier artifacts SHAMSU writes into the project it is checking.
+        # They are its own scaffolding, not the user's code: indexing them put
+        # `.shamsu_probe.py exports: src, m, declared, failures` into a
+        # Codebase-Memory brief about the user's views, and made the agent's
+        # own probe a candidate for editing.
+        ".shamsu_probe.py",
+        ".shamsu_probe.mjs",
+        ".shamsu_template_probe.py",
     }
 )
 
@@ -56,6 +64,8 @@ DEFAULT_EXCLUDED_PATTERNS = frozenset(
         "*.bmp",
         "*.db",
         "*.egg-info",
+        "*.doc",
+        "*.docx",
         "*.gif",
         "*.ico",
         "*.jpeg",

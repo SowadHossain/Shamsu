@@ -205,7 +205,7 @@ from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
-from shamsu.tools.workspace import MentionResolver, WorkspaceTool
+from shamsu.tools.workspace import DOCUMENT_EXTENSIONS, MentionResolver, WorkspaceTool
 from shamsu.ui.progress import ProgressReporter
 from shamsu.ui.trace import emit_trace, read_trace_mode, write_trace_mode
 from shamsu.agents.clarification import classify_reply, format_question, resolve_answer
@@ -6313,7 +6313,7 @@ def _handle_workspace_prd_request(workspace: Path, console: Console) -> str:
     if not candidates:
         message = (
             "I couldn't find a PRD file in this workspace yet. "
-            "Add a `.md`, `.txt`, or `.pdf` PRD (e.g. named `*prd*` or `Product Requirements*`), "
+            "Add a `.md`, `.txt`, `.pdf`, or `.docx` PRD (e.g. named `*prd*` or `Product Requirements*`), "
             "then ask again or run `/parse-prd <file>`."
         )
         console.print(f"[yellow]{message}[/yellow]")
@@ -7625,12 +7625,12 @@ def _resolve_build_prd(user_input: str, workspace: Path) -> Path | None:
             continue
         if (
             is_prd_filename(mention.path.name)
-            # A .pdf the user explicitly @-mentions in a build request IS the
-            # requirements document, whatever it is named - PDFs are inputs
-            # SHAMSU reads, never code it writes. The name heuristic alone
-            # rejected `canvas lite.pdf` and derailed the 2026-08-01 dogfood
-            # into generic file.write.
-            or mention.path.suffix.lower() == ".pdf"
+            # A document the user explicitly @-mentions in a build request IS
+            # the requirements document, whatever it is named - PDFs and Word
+            # files are inputs SHAMSU reads, never code it writes. The name
+            # heuristic alone rejected `canvas lite.pdf` and derailed the
+            # 2026-08-01 dogfood into generic file.write.
+            or mention.path.suffix.lower() in DOCUMENT_EXTENSIONS
         ):
             return workspace / mention.path
 
@@ -8274,7 +8274,7 @@ async def _handle_prd_build_request(
         else:
             console.print(
                 "[yellow]I couldn't find a PRD to build from.[/yellow] "
-                "I look for a `.md`, `.txt`, or `.pdf` whose name contains `prd` or "
+                "I look for a `.md`, `.txt`, `.pdf`, or `.docx` whose name contains `prd` or "
                 "`Product Requirements`.\n"
                 "If your spec is already here under another name, point me straight at it, "
                 'e.g. `build the app from "spec.md"` - I\'ll build from any file you name.'

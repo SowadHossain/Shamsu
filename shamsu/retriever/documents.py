@@ -17,7 +17,7 @@ from shamsu.context.manager import ContextBudgetManager
 from shamsu.prd.document import NUMBERED_HEADING_RE, normalize_pdf_pages
 from shamsu.retriever.semantic import EMBED_MODEL, _cosine, _ollama_embed
 
-DOCUMENT_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".pdf"})
+DOCUMENT_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".pdf", ".docx"})
 DOCUMENTS_RELATIVE_DIR = Path(".shamsu") / "documents"
 DOCUMENT_VECTORS_RELATIVE_DIR = DOCUMENTS_RELATIVE_DIR / "vectors"
 MAX_CHUNK_TOKENS = 360

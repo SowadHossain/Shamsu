@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from shamsu.prd.sql_schema import entities_from_sql
 from shamsu.types import EntityFieldSpec, EntitySpec, ParsedPRD
 
 ENTITY_LINE_RE = re.compile(r"^(?:[-*+]\s*)?(?:\*\*)?([A-Za-z][\w ]+)(?:\*\*)?\s*:\s*(.+)$")
@@ -82,6 +83,14 @@ def extract_entities(parsed: ParsedPRD) -> list[EntitySpec]:
     by_name = {entity.name.lower(): entity for entity in entities}
     for entity in table_entities:
         by_name[entity.name.lower()] = entity
+
+    # A PRD that ships DDL has stated its data model more precisely than any
+    # prose section could, but the column syntax parses as nothing, so such a
+    # PRD used to yield zero entities. Prose definitions still win: the DDL is
+    # usually an appendix, and overriding a section the author wrote by hand
+    # would be the wrong way round.
+    for entity in entities_from_sql(parsed.raw_text):
+        by_name.setdefault(entity.name.lower(), entity)
     return list(by_name.values())
 
 

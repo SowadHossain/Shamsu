@@ -19,7 +19,7 @@ from shamsu.diagnostics.digest import DiagnosticDigest
 from shamsu.repair.loop import RepairLoop, VerifyRun
 from shamsu.repair.proposer_llm import GenerateJSON, LLMProposer
 from shamsu.repair.types import RepairResult
-from shamsu.verify import semantic
+from shamsu.verify import infra, semantic
 from shamsu.session.manager import SessionLogger
 from shamsu.verify.wiring import WIRING_COMMAND, has_wiring_surface, verify_wiring
 
@@ -166,6 +166,13 @@ def default_verify_command(
 
     is_node = has_package_json or "node" in stack_l or "node" in hint or "vite" in stack_l
     if is_node:
+        # `npm install` in a directory with no package.json exits with
+        # `npm error code ENOENT`, which reads as a broken build rather than as
+        # "the manifest has not been written yet". A Node milestone that had
+        # not reached its package.json failed on this every time, so the
+        # manifest has to exist before npm is worth running at all.
+        if not has_package_json:
+            return ""
         return "" if lightweight else "npm install && npm run build"
 
     if py_files or "python" in stack_l or "django" in stack_l or hint in {"python", "django"}:
@@ -203,7 +210,7 @@ def build_verification_plan(
     if is_node:
         node_root = _project_root(workspace_path, changed, ("package.json",))
         project_roots.append(node_root)
-        steps.extend(_node_steps(node_root, lightweight=lightweight))
+        steps.extend(_node_steps(node_root, lightweight=lightweight, changed=changed))
     if is_python:
         python_root = _project_root(
             workspace_path,
@@ -230,6 +237,7 @@ def build_verification_plan(
         steps.extend(_go_steps(go_root, lightweight=lightweight))
     unique_roots = list(dict.fromkeys(project_roots))
     project_root = unique_roots[0] if len(unique_roots) == 1 else workspace_path
+    steps.extend(_infra_steps(workspace_path, changed))
     if has_wiring_surface(project_root):
         steps.insert(
             0,
@@ -388,7 +396,12 @@ def _repair_editable_files(
     return editable
 
 
-def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationStep]:
+def _node_steps(
+    project_root: Path,
+    *,
+    lightweight: bool,
+    changed: Sequence[str] = (),
+) -> list[VerificationStep]:
     package_path = project_root / "package.json"
     if not package_path.is_file():
         return []
@@ -488,6 +501,25 @@ def _node_steps(project_root: Path, *, lightweight: bool) -> list[VerificationSt
             )
         )
 
+    # A Node project that declares no build/test script would otherwise be
+    # unverifiable, and "it parsed" is precisely the evidence that let dead
+    # Django code report success. Boot the app and make its own router prove
+    # the routes exist.
+    if semantic.should_probe_node(list(changed), project_root):
+        try:
+            semantic.write_node_probe(project_root)
+        except OSError:
+            pass
+        else:
+            checks.append(
+                VerificationStep(
+                    "semantic",
+                    semantic.node_probe_command(),
+                    project_root,
+                    reason="declared routes must resolve and serve",
+                )
+            )
+
     # Setup alone proves dependency resolution, not application correctness.
     if not any(step.required and step.stage != "setup" for step in checks):
         return []
@@ -547,22 +579,41 @@ def _python_steps(
             )
         )
 
-    if (project_root / "manage.py").is_file():
-        checks.extend(
-            [
-                VerificationStep(
-                    "framework",
-                    f"{python_bin} manage.py check",
-                    project_root,
-                    reason="Django system checks",
-                ),
+    # `manage.py check` cannot say anything until the settings module and the
+    # local apps it lists exist. On an incremental build - manage.py, then
+    # settings, then the app - it otherwise failed on files that were perfectly
+    # correct, and every foundation step reported UNCONFIRMED.
+    if (project_root / "manage.py").is_file() and _django_is_checkable(project_root):
+        checks.append(
+            VerificationStep(
+                "framework",
+                f"{python_bin} manage.py check",
+                project_root,
+                reason="Django system checks",
+            )
+        )
+        # A turn that just edited models.py cannot pass `makemigrations --check`
+        # - by construction the models moved and the migration has not been
+        # written yet, so the step could only ever fail. Generating the
+        # migration is what a developer does next anyway, and it is a derived
+        # artifact, not a decision. The --check below then genuinely asserts
+        # that generation produced a complete migration.
+        if _changed_django_models(changed):
+            checks.append(
                 VerificationStep(
                     "migration",
-                    f"{python_bin} manage.py makemigrations --check --dry-run",
+                    f"{python_bin} manage.py makemigrations",
                     project_root,
-                    reason="Django model changes must have migrations",
-                ),
-            ]
+                    reason="models changed, so their migration must be generated",
+                )
+            )
+        checks.append(
+            VerificationStep(
+                "migration",
+                f"{python_bin} manage.py makemigrations --check --dry-run",
+                project_root,
+                reason="Django model changes must have migrations",
+            )
         )
         if not lightweight:
             checks.append(
@@ -587,6 +638,22 @@ def _python_steps(
         # a route appended outside `urlpatterns` parses, and `check` is happy.
         # This stage boots the project and asserts the routes it declares
         # actually resolve and serve.
+        # A template is code too, and nothing ever compiled one. `{% extends %}`
+        # after a doctype is a TemplateSyntaxError that no text-file check sees.
+        if semantic.should_probe_templates(list(changed), project_root):
+            try:
+                semantic.write_template_probe(project_root)
+            except OSError:
+                pass
+            else:
+                checks.append(
+                    VerificationStep(
+                        "template",
+                        semantic.django_template_probe_command(python_bin),
+                        project_root,
+                        reason="templates must compile",
+                    )
+                )
         if semantic.should_probe(list(changed), project_root):
             try:
                 semantic.write_probe(project_root)
@@ -770,6 +837,27 @@ def _outcome_from_results(
             None,
         )
         exit_code = failed_result.exit_code if failed_result else 1
+        incomplete = _incomplete_project_reason(failed_result)
+        if incomplete:
+            # The project is half-built, not broken. A framework that refuses to
+            # start because a module named in its own configuration has not been
+            # written yet is telling us the build is unfinished - which is true
+            # after every single step of an incremental build, and is not
+            # evidence that the file just written is wrong. Reporting it as a
+            # failure made every foundation step read UNCONFIRMED and trained
+            # the reader to ignore the verdict entirely.
+            return VerifyOutcome(
+                verified=False,
+                unverifiable=True,
+                exit_code=exit_code,
+                command=command,
+                summary=(
+                    f"Cannot verify yet - the project is incomplete: {incomplete} "
+                    f"(`{failed_step.command}`). This is not a defect in the change."
+                ),
+                repair_result=repair_result,
+                steps=results,
+            )
         message = summary or (
             f"Verification FAILED at required {failed_step.stage} stage: "
             f"`{failed_step.command}` (exit {exit_code})."
@@ -805,11 +893,218 @@ def _outcome_from_results(
     )
 
 
+# Framework start-up complaints that mean "not written yet", not "wrong".
+# Third-party modules are deliberately NOT covered: a missing dependency is a
+# real failure the user has to act on.
+_INCOMPLETE_PROJECT_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"ModuleNotFoundError: No module named ['\"](?P<name>[\w.]+)['\"]"),
+        "module {name} does not exist yet",
+    ),
+    (
+        re.compile(
+            r"ImproperlyConfigured: (?P<name>AUTH_USER_MODEL refers to model "
+            r"'[^']+' that has not been installed)"
+        ),
+        "{name}",
+    ),
+    (
+        re.compile(r"(?P<name>ImportError: Module ['\"][\w.]+['\"] does not define)"),
+        "{name}",
+    ),
+    # `from . import views` before views.py exists - the shape every partially
+    # wired Django package produces.
+    (
+        re.compile(
+            r"ImportError: cannot import name ['\"](?P<name>\w+)['\"] from ['\"][\w.]+['\"]"
+        ),
+        "module {name} does not exist yet",
+    ),
+)
+
+# A dotted name whose first segment is a directory in the project is local.
+_THIRD_PARTY_ROOTS = {"django", "rest_framework", "celery", "corsheaders"}
+
+
+def _infra_steps(workspace: Path, changed: Sequence[str]) -> list[VerificationStep]:
+    """Validate container and reverse-proxy config that this change touched.
+
+    Both checks are daemon-free, so they run on a machine where Docker Desktop
+    is installed but not started. A missing tool skips its check rather than
+    failing it: an absent verifier is a gap in the harness, not a defect in the
+    work.
+    """
+    steps: list[VerificationStep] = []
+
+    compose = infra.compose_files(workspace, changed)
+    if compose:
+        try:
+            infra.write_compose_lint(workspace)
+        except OSError:
+            compose = []
+    for path in compose:
+        if infra.docker_available():
+            steps.append(
+                VerificationStep(
+                    "infra",
+                    infra.compose_command(path, workspace),
+                    workspace,
+                    reason="compose file must parse and validate",
+                )
+            )
+        # The parser accepts a depends_on/service_healthy pointing at a service
+        # with no healthcheck, which then fails at `up`. Structure needs its own
+        # check, and unlike the parser it needs no Docker at all.
+        steps.append(
+            VerificationStep(
+                "infra",
+                infra.compose_lint_command(path, workspace, _default_python_bin()),
+                workspace,
+                reason="compose structure must be internally consistent",
+            )
+        )
+
+    for path in infra.nginx_files(workspace, changed):
+        if not infra.nginx_available():
+            break
+        steps.append(
+            VerificationStep(
+                "infra",
+                infra.nginx_command(path, workspace),
+                workspace,
+                required=False,
+                reason="nginx configuration must pass nginx -t",
+            )
+        )
+    return steps
+
+
+def _changed_django_models(changed: Sequence[str]) -> bool:
+    return any(
+        str(path).replace("\\", "/").endswith("models.py")
+        or "/migrations/" in str(path).replace("\\", "/")
+        for path in changed
+    )
+
+
+def _incomplete_project_reason(result: VerificationStepResult | None) -> str:
+    """Why this failure means "unfinished", or "" when it is a real defect."""
+    if result is None:
+        return ""
+    output = f"{result.stdout}\n{result.stderr}"
+    for pattern, template in _INCOMPLETE_PROJECT_PATTERNS:
+        match = pattern.search(output)
+        if not match:
+            continue
+        name = match.group("name")
+        root = name.split(".", 1)[0]
+        if root in _THIRD_PARTY_ROOTS:
+            # `import django` failing is a broken environment, not a half-built
+            # project, and must stay a failure.
+            continue
+        return template.format(name=name)
+    return ""
+
+
 def _unverifiable_outcome() -> VerifyOutcome:
     return VerifyOutcome(
         verified=False,
         unverifiable=True,
         summary="No deterministic verifier is available for these changes (UNVERIFIED).",
+    )
+
+
+_SETTINGS_MODULE_RE = re.compile(
+    r"DJANGO_SETTINGS_MODULE[\"']\s*,\s*[\"'](?P<module>[^\"']+)"
+)
+
+
+_INSTALLED_APPS_RE = re.compile(r"INSTALLED_APPS\s*=\s*\[(?P<body>.*?)\]", re.DOTALL)
+_QUOTED_APP_RE = re.compile(r"[\"']([\w.]+)[\"']")
+_AUTH_USER_MODEL_RE = re.compile(r"AUTH_USER_MODEL\s*=\s*[\"'](?P<target>[\w.]+)[\"']")
+
+
+def _django_settings_path(project_root: Path) -> Path | None:
+    """The settings file `manage.py` points at, if it exists.
+
+    Read from manage.py rather than assumed, so `config/settings.py`,
+    `myproject/settings.py` and a `settings/` package all answer correctly.
+    Returns None when manage.py declares nothing readable - Django itself is
+    then the better judge, which is the behaviour this had before.
+    """
+    try:
+        source = (project_root / "manage.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _SETTINGS_MODULE_RE.search(source)
+    if not match:
+        return None
+    base = project_root.joinpath(*match.group("module").split("."))
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _django_is_checkable(project_root: Path) -> bool:
+    """Whether `manage.py check` can say anything yet about this project.
+
+    An incremental build writes manage.py, then settings, then the app - and
+    `check` fails on each of those steps for a file that is perfectly correct
+    (`ModuleNotFoundError: No module named 'core'` simply means the app has not
+    been written yet). Reporting that as a failed verification made every
+    foundation step read UNCONFIRMED and taught the user to ignore the verdict,
+    which is worse than not checking at all. A half-built project is not a
+    broken one.
+    """
+    try:
+        source = (project_root / "manage.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if not _SETTINGS_MODULE_RE.search(source):
+        return True
+
+    settings_path = _django_settings_path(project_root)
+    if settings_path is None:
+        return False
+    try:
+        settings_source = settings_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+    apps_match = _INSTALLED_APPS_RE.search(settings_source)
+    if apps_match:
+        for entry in _QUOTED_APP_RE.findall(apps_match.group("body")):
+            # Only local apps: a third-party one is a dependency problem, which
+            # is a real failure and must still be reported.
+            if "." in entry:
+                continue
+            if not (project_root / entry / "__init__.py").is_file():
+                return False
+
+    # `AUTH_USER_MODEL = "core.User"` is written with settings, but the model it
+    # names arrives with models.py several steps later. Until then Django
+    # refuses to start at all: "AUTH_USER_MODEL refers to model 'core.User'
+    # that has not been installed".
+    user_model = _AUTH_USER_MODEL_RE.search(settings_source)
+    if user_model and "." in user_model.group("target"):
+        app_label, _, model_name = user_model.group("target").partition(".")
+        models_file = project_root / app_label / "models.py"
+        try:
+            models_source = models_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        if not re.search(rf"^\s*class\s+{re.escape(model_name)}\b", models_source, re.MULTILINE):
+            return False
+    return True
+
+
+def _django_settings_exist(project_root: Path) -> bool:
+    """Backward-compatible name for the settings-only half of the check."""
+    return _django_settings_path(project_root) is not None or not _SETTINGS_MODULE_RE.search(
+        (project_root / "manage.py").read_text(encoding="utf-8", errors="replace")
+        if (project_root / "manage.py").is_file()
+        else ""
     )
 
 

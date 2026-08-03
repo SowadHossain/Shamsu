@@ -10,6 +10,7 @@ from shamsu.cli.repl import (
     _prd_milestones_for_execution,
     _plan_step_request,
     _prd_brief,
+    _render_prd_milestone_window,
 )
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.parser import parse_prd_text
@@ -108,7 +109,9 @@ def test_milestone_request_uses_brief_and_checklist_not_raw_text():
     brief = _prd_brief(parsed)
     milestones = ["Render board", "Add ball physics", "Add scoring"]
     req = _build_prd_milestone_request(parsed.title, Path("prd.md"), brief, milestones, 2, 3)
-    assert "## Milestones" in req
+    # A window around the current milestone, not the whole graph - hence
+    # "Nearby", which is what the prompt must tell the model it is looking at.
+    assert "## Nearby milestones" in req
     for m in milestones:
         assert m in req
     assert "[x] Render board" in req
@@ -116,6 +119,27 @@ def test_milestone_request_uses_brief_and_checklist_not_raw_text():
     assert "prd.md" in req  # the agent is told where to read full detail
     # The verbose raw PRD text must NOT be dumped into the per-milestone prompt.
     assert parsed.raw_text not in req
+
+
+def test_milestone_window_carries_neighbours_not_the_whole_graph():
+    """A 20-milestone PRD must not resend all 20 every turn. Untested until now,
+    which is how the checklist header drifted without anything noticing."""
+    milestones = [f"M{index}" for index in range(20)]
+
+    window = _render_prd_milestone_window(milestones, 10)
+
+    assert "## Nearby milestones" in window
+    assert "[>] M10   <- implement THIS one now" in window
+    assert "[x] M8" in window and "[x] M9" in window     # the two just finished
+    assert "[ ] M11" in window                            # the one coming up
+    assert "M0" not in window and "M19" not in window     # the rest stays out
+
+
+def test_milestone_window_handles_the_first_milestone():
+    window = _render_prd_milestone_window(["A", "B", "C"], 0)
+
+    assert "[>] A   <- implement THIS one now" in window
+    assert "[x]" not in window
 
 
 def test_compiled_prd_milestones_are_automatic_only_for_complex_projects(monkeypatch):

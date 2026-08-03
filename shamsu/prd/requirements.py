@@ -535,6 +535,32 @@ def _expected_files_for(record: RequirementRecord, contract: PRDContract) -> lis
     return sorted(dict.fromkeys(path.replace("\\", "/") for path in matches))
 
 
+# Server-side JavaScript signals. `node` alone is ambiguous - a Vite/React PRD
+# also mentions Node - so a bare "node" only counts as a backend when nothing
+# says the project is a browser-only frontend.
+_NODE_BACKEND_TOKENS = ("express", "fastify", "koa", "nest", "hapi")
+_NODE_FRONTEND_ONLY_TOKENS = ("react", "vue", "svelte", "vite", "phaser")
+
+# Backends that settle the question on their own. `stack_hint` is the primary
+# stack - it already folds in the user's own instruction - so when it names one
+# of these, a passing mention of Node in the document does not add a second
+# server. "Build this as a Django project" against a PRD whose architecture
+# diagram says "Node.js / Go microservices" must not scaffold both.
+_PRIMARY_NON_NODE_BACKENDS = ("django", "python", "flask", "fastapi", "go", "rust")
+
+
+def _is_node_backend_stack(contract: PRDContract) -> bool:
+    hint = (contract.stack_hint or "").lower()
+    if any(token in hint for token in _PRIMARY_NON_NODE_BACKENDS):
+        return False
+    stack = " ".join([contract.stack_hint, *contract.required_stack]).lower()
+    if any(token in stack for token in _NODE_BACKEND_TOKENS):
+        return True
+    if "node" not in stack:
+        return False
+    return not any(token in stack for token in _NODE_FRONTEND_ONLY_TOKENS)
+
+
 def _architecture_components(contract: PRDContract) -> list[dict[str, Any]]:
     """Describe component ownership without generating framework source files."""
     stack = " ".join([contract.stack_hint, *contract.required_stack]).lower()
@@ -548,7 +574,9 @@ def _architecture_components(contract: PRDContract) -> list[dict[str, Any]]:
                 "responsibility": "browser UI and API client",
             }
         )
-    if any(token in stack for token in ("django", "fastapi", "flask", "express", "backend")):
+    if _is_node_backend_stack(contract) or any(
+        token in stack for token in ("django", "fastapi", "flask", "backend")
+    ):
         components.append(
             {
                 "id": "backend",
@@ -589,6 +617,23 @@ def _architecture_expected_files_for_milestone(
     product = number == 2 or 200 <= number < 300
     release = number in {3, 4} or 300 <= number < 500
     paths: list[str] = []
+    if _is_node_backend_stack(contract) and (foundation or release):
+        # Without this branch a Node PRD declared no foundation files at all.
+        # Two things then went wrong at once: the file-at-a-time pass had no
+        # missing architecture file to target, so the whole milestone collapsed
+        # back into one oversized turn; and verification ran `npm install` in a
+        # directory that had no package.json, which is the `npm error code
+        # ENOENT` that ended the run.
+        paths.extend(
+            [
+                "backend/package.json",
+                "backend/server.js",
+                "backend/src/db.js",
+                "backend/src/schema.sql",
+                "backend/src/app.js",
+                "backend/src/routes/index.js",
+            ]
+        )
     if "django" in stack and (foundation or release):
         paths.extend(
             [
