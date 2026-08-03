@@ -1840,6 +1840,67 @@ def test_prepare_prd_milestone_preflight_accepts_valid_model_output(
     assert (root / "preflight" / "M-002.effective.json").is_file()
 
 
+def test_prepare_prd_development_plan_uses_planner_model(monkeypatch, tmp_path: Path):
+    parsed = parse_prd_text(
+        "# OpenBazaar\n\n"
+        "## Tech Stack\n- Node.js\n- React\n- PostgreSQL\n\n"
+        "## Data Model\nListing\n- id, title, price\n",
+        markdown=True,
+    )
+    project = SimpleNamespace(prd_contract=extract_contract(parsed))
+    project.user_request = "Plan OpenBazaar with Docker, Node, React, and Postgres."
+    seen: dict[str, object] = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            seen["kwargs"] = kwargs
+
+        async def generate_structured(self, role, system, prompt, schema, **kwargs):
+            seen["role"] = role
+            seen["system"] = system
+            seen["prompt"] = prompt
+            seen["schema"] = schema
+            seen["options"] = kwargs
+            return json.dumps(
+                {
+                    "plan_summary": "Build Docker, backend, database, then frontend.",
+                    "stack": ["Node.js", "React", "PostgreSQL", "Docker Compose"],
+                    "milestones": [
+                        {
+                            "id": "M-001",
+                            "title": "Foundation",
+                            "goal": "Create runnable Docker, backend, frontend, and database wiring.",
+                            "files": ["docker-compose.yml", "backend/server.js"],
+                            "verification": "docker compose config -q",
+                        }
+                    ],
+                    "risks": ["Keep PRD schema and generated schema aligned."],
+                    "first_actions": ["Create deterministic runtime files."],
+                }
+            )
+
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    plan = asyncio.run(
+        repl._prepare_prd_development_plan(
+            parsed,
+            Path("OpenBazaar_Marketplace_PRD.docx"),
+            project,
+            ["M-001: Foundation [DATA-001]"],
+            tmp_path,
+            _console(),
+            None,
+        )
+    )
+
+    assert seen["role"] == "planner"
+    assert "compiled_milestones" in seen["prompt"]
+    assert "Plan OpenBazaar with Docker, Node, React, and Postgres." in seen["prompt"]
+    assert plan["source"] == "model"
+    assert plan["plan_summary"] == "Build Docker, backend, database, then frontend."
+    assert plan["milestones"][0]["files"] == ["docker-compose.yml", "backend/server.js"]
+
+
 def test_prepare_prd_milestone_preflight_runs_by_default(
     monkeypatch,
     tmp_path: Path,

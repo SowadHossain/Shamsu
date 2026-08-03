@@ -4581,31 +4581,13 @@ async def _handle_request(
         _handle_generate_django(generate_command, workspace, console, session_logger=session_logger)
         return
     if route_label == "plan_prd":
-        # The deterministic `plan-prd` planner extracts Django-style entities and
-        # endpoints, so it produces an empty plan for a plain functional PRD
-        # (dogfood: a temperature-converter PRD yielded nothing). A natural
-        # "make a step by step plan" is better served by the agent loop, which
-        # reads the PRD and writes a real ordered plan - in READ-ONLY mode so a
-        # plan request can never mutate the workspace. The explicit
-        # entity-oriented preview stays for `plan-prd`/`project plan` phrasing.
         if _looks_like_plan_intent(effective_input):
-            prd_ref = _resolved_prd_reference(effective_input, workspace)
-            # Keep the user's OWN words. This used to send a canned "Read X and
-            # produce a plan" and drop the request entirely, so every stated
-            # constraint - which features, in what order, what to build first -
-            # never reached the model. Live 2026-08-02: a detailed request for
-            # an ordered Django feature breakdown came back as a generic
-            # "convert the PDF with pdftotext" pipeline, with zero tool calls.
-            plan_request = (
-                f"{effective_input}\n\n"
-                f"First call read_file on {prd_ref} and use what it actually says. "
-                "Then produce a concise, numbered, step-by-step implementation plan "
-                "that satisfies the request above: the files to create, the order to "
-                "build them, and how to verify each step. Honor every feature, "
-                "constraint, and ordering the request states. Do NOT write any code "
-                "or files - output only the plan as text."
+            await _handle_prd_development_plan_request(
+                effective_input,
+                workspace,
+                console,
+                session_logger=session_logger,
             )
-            await _run_agent_chat(plan_request, workspace, console, session_logger=session_logger)
             return
         plan_command = f"plan-prd {_resolved_prd_reference(effective_input, workspace)}"
         _handle_plan_prd(plan_command, workspace, console, session_logger=session_logger)
@@ -5149,7 +5131,8 @@ def _enforce_investigative_question_decision(
 # "implement". Distinct from `proceed`/`run the plan`, which execute one.
 _PLAN_INTENT_RE = re.compile(
     r"\b(?:make|write|draft|create|give\s+me|outline|sketch|propose)\s+"
-    r"(?:a\s+|an\s+|the\s+)?(?:step[\s-]?by[\s-]?step\s+)?(?:implementation\s+)?plan\b"
+    r"(?:a\s+|an\s+|the\s+)?(?:step[\s-]?by[\s-]?step\s+)?"
+    r"(?:(?:implementation|development|devolopment)\s+)?plan\b"
     r"|\bplan\s+(?:out\s+)?(?:the\s+|a\s+|how\s+)"
     r"|\boutline\s+(?:the\s+)?(?:steps|approach|plan)\b"
     r"|^\s*plan\b(?!\s*(?:mode|is|was))",
@@ -6032,6 +6015,8 @@ _PRD_SUMMARY_TRIGGERS = (
 
 def _looks_like_prd_summary_request(user_input: str, workspace: Path) -> bool:
     text = user_input.lower()
+    if _looks_like_prd_plan_request(user_input):
+        return False
     explicit_prd = _extract_prd_path_from_prompt(user_input)
     explicit_summary = (
         bool(explicit_prd)
@@ -7687,7 +7672,240 @@ def _prd_milestones_for_execution(parsed) -> tuple[list[str], str]:
     return compiled, "compiled_requirement_ledger" if compiled else "simple_project"
 
 
-def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None:
+PRD_DEVELOPMENT_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "plan_summary": {"type": "string"},
+        "stack": {"type": "array", "items": {"type": "string"}},
+        "milestones": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                    "verification": {"type": "string"},
+                },
+                "required": ["id", "title", "goal"],
+            },
+        },
+        "risks": {"type": "array", "items": {"type": "string"}},
+        "first_actions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["plan_summary", "milestones"],
+}
+
+PRD_DEVELOPMENT_PLAN_SYSTEM = """You are SHAMSU's PRD development planner.
+Use reasoning to turn the PRD contract into a practical build plan.
+Return ONLY JSON matching the schema.
+Respect the compiled requirement IDs and milestone boundaries.
+Do not claim files already exist unless the prompt says they do.
+Keep the plan concrete, ordered, and buildable by a local coding agent."""
+
+
+async def _prepare_prd_development_plan(
+    parsed,
+    relative_path: Path,
+    project: Any,
+    milestones: list[str],
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> dict[str, Any]:
+    contract = getattr(project, "prd_contract", None)
+    contract_brief = contract.render_brief() if contract is not None else ""
+    payload = {
+        "user_request": str(getattr(project, "user_request", "") or ""),
+        "prd_file": relative_path.as_posix(),
+        "title": parsed.title,
+        "sections": list(parsed.sections.keys()),
+        "contract": contract_brief,
+        "compiled_milestones": milestones,
+        "workspace_files": _workspace_file_inventory_for_preflight(workspace, limit=40),
+        "rules": [
+            "Use the compiled milestones as the executable backbone.",
+            "Add practical implementation detail, file ownership, and verification per milestone.",
+            "Prefer Docker Compose, backend, frontend, and database wiring when the contract requires them.",
+            "Return plan text only as JSON fields; do not write files.",
+        ],
+    }
+    ledger = get_current_run()
+    if ledger:
+        ledger.log_event("prd_development_plan_started", path=relative_path.as_posix())
+    try:
+        raw = await asyncio.wait_for(
+            LLMManager(session_logger=session_logger, action_ledger=ledger).generate_structured(
+                "planner",
+                PRD_DEVELOPMENT_PLAN_SYSTEM,
+                json.dumps(payload, indent=2, ensure_ascii=True),
+                PRD_DEVELOPMENT_PLAN_SCHEMA,
+                temperature=0.0,
+                num_predict=_env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 1400, 512),
+            ),
+            timeout=float(os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "75")),
+        )
+        candidate = _loads_freeform_json(raw or "")
+        plan = _validate_prd_development_plan(candidate)
+    except Exception as exc:
+        plan = {
+            "source": "deterministic_fallback",
+            "error": f"{type(exc).__name__}: {exc}",
+            "plan_summary": "Using the compiled requirement milestones as the development plan.",
+            "stack": [],
+            "milestones": _compiled_milestones_as_plan_items(milestones),
+            "risks": [],
+            "first_actions": [],
+        }
+    if ledger:
+        ledger.log_event(
+            "prd_development_plan_finished",
+            source=plan.get("source"),
+            milestones=len(plan.get("milestones") or []),
+            error=plan.get("error", ""),
+        )
+    if plan.get("source") == "model":
+        console.print("[dim]LLM development plan accepted from planner role.[/dim]")
+    else:
+        console.print("[dim]LLM development plan unavailable; using compiled fallback.[/dim]")
+    return plan
+
+
+def _validate_prd_development_plan(candidate: Any) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        raise ValueError("planner did not return a JSON object")
+    raw_milestones = candidate.get("milestones")
+    if not isinstance(raw_milestones, list) or not raw_milestones:
+        raise ValueError("planner returned no milestones")
+    milestones: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_milestones[:12], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = _safe_plan_text(item.get("title"), 140)
+        goal = _safe_plan_text(item.get("goal"), 260)
+        if not title or not goal:
+            continue
+        milestones.append(
+            {
+                "id": _safe_plan_text(item.get("id"), 40) or f"M-{index:03d}",
+                "title": title,
+                "goal": goal,
+                "files": _safe_plan_list(item.get("files"), 6, 120),
+                "verification": _safe_plan_text(item.get("verification"), 180),
+            }
+        )
+    if not milestones:
+        raise ValueError("planner milestones were incomplete")
+    return {
+        "source": "model",
+        "plan_summary": _safe_plan_text(candidate.get("plan_summary"), 500),
+        "stack": _safe_plan_list(candidate.get("stack"), 10, 80),
+        "milestones": milestones,
+        "risks": _safe_plan_list(candidate.get("risks"), 8, 160),
+        "first_actions": _safe_plan_list(candidate.get("first_actions"), 8, 160),
+    }
+
+
+def _safe_plan_text(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _safe_plan_list(value: Any, limit: int, max_chars: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned = [_safe_plan_text(item, max_chars) for item in value[:limit] if item]
+    return [item for item in dict.fromkeys(cleaned) if item]
+
+
+def _compiled_milestones_as_plan_items(milestones: list[str]) -> list[dict[str, str]]:
+    result: list[dict[str, str]] = []
+    for index, milestone in enumerate(milestones[:12], start=1):
+        milestone_id = _milestone_id_from_line(milestone)
+        title = milestone.split(":", 1)[1].strip() if ":" in milestone else milestone
+        result.append(
+            {
+                "id": milestone_id,
+                "title": title,
+                "goal": "Implement and verify this compiled PRD milestone.",
+            }
+        )
+    return result
+
+
+def _print_prd_development_plan(
+    parsed,
+    relative_path: Path,
+    milestones: list[str],
+    development_plan: dict[str, Any],
+    console: Console,
+    *,
+    build_after: bool,
+) -> None:
+    section_names = list(parsed.sections.keys())
+    lines = [
+        f"File: {relative_path.as_posix()}",
+        f"Title: {parsed.title}",
+        f"Plan source: {development_plan.get('source') or 'deterministic'}",
+        "",
+        "Sections: " + (", ".join(section_names) if section_names else "none"),
+    ]
+    summary = str(development_plan.get("plan_summary") or "").strip()
+    if summary:
+        lines.extend(["", "Planner summary:", summary])
+    stack = list(development_plan.get("stack") or [])
+    if stack:
+        lines.extend(["", "Planned stack: " + ", ".join(stack[:10])])
+    plan_items = list(development_plan.get("milestones") or [])
+    if plan_items:
+        lines.append("")
+        lines.append("LLM development milestones:")
+        for item in plan_items[:12]:
+            files = list(item.get("files") or []) if isinstance(item, dict) else []
+            verification = str(item.get("verification") or "") if isinstance(item, dict) else ""
+            lines.append(
+                f"  - {item.get('id', '')}: {item.get('title', '')} - {item.get('goal', '')}"
+            )
+            if files:
+                lines.append(f"    files: {', '.join(files[:6])}")
+            if verification:
+                lines.append(f"    verify: {verification}")
+    if milestones:
+        lines.append("")
+        lines.append("Compiled execution ledger:")
+        lines.extend(f"  - {item}" for item in milestones[:12])
+        if len(milestones) > 12:
+            lines.append(f"  ... {len(milestones) - 12} more")
+    risks = list(development_plan.get("risks") or [])
+    if risks:
+        lines.extend(["", "Risks:"])
+        lines.extend(f"  - {item}" for item in risks[:6])
+    lines.append("")
+    if build_after:
+        lines.append("I'll build this now, autonomously (long-running mode), writing files in")
+        lines.append("your workspace until it's implemented. Type `exit` to stop.")
+    else:
+        lines.append("Plan only. No project files were created or modified.")
+    console.print(Panel("\n".join(lines), title="PRD Development Plan"))
+
+
+def _print_prd_build_plan(
+    parsed,
+    relative_path: Path,
+    console: Console,
+    development_plan: dict[str, Any] | None = None,
+) -> None:
+    if development_plan is not None:
+        milestones, _ = _prd_milestones_for_execution(parsed)
+        _print_prd_development_plan(
+            parsed,
+            relative_path,
+            milestones,
+            development_plan,
+            console,
+            build_after=True,
+        )
+        return
     section_names = list(parsed.sections.keys())
     milestones, milestone_source = _prd_milestones_for_execution(parsed)
     lines = [
@@ -7710,6 +7928,70 @@ def _print_prd_build_plan(parsed, relative_path: Path, console: Console) -> None
     lines.append("I'll build this now, autonomously (long-running mode), writing files in")
     lines.append("your workspace until it's implemented. Type `exit` to stop.")
     console.print(Panel("\n".join(lines), title="PRD Build Plan"))
+
+
+async def _handle_prd_development_plan_request(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    prd_path = _resolve_build_prd(user_input, workspace)
+    if prd_path is None:
+        console.print("[yellow]I could not find the PRD file to plan from.[/yellow]")
+        return
+    try:
+        parsed = parse_prd_file(prd_path)
+    except PRDParseError as exc:
+        prd_ref = _resolved_prd_reference(user_input, workspace)
+        plan_request = (
+            f"{user_input}\n\n"
+            f"I could not parse {prd_ref} directly ({exc}). "
+            "Use the user's request above as the planning brief. Produce a concise, "
+            "numbered, step-by-step implementation plan: files to create, build order, "
+            "and verification for each step. Do NOT write any code or files."
+        )
+        await _run_agent_chat(
+            plan_request,
+            workspace,
+            console,
+            session_logger=session_logger,
+            read_only=True,
+        )
+        return
+    try:
+        relative_path = prd_path.relative_to(workspace)
+    except ValueError:
+        relative_path = prd_path
+
+    inferred_entities = await _infer_prd_entities(parsed, console, session_logger)
+    project = build_project_spec(
+        parsed, request_text=user_input, extra_entities=inferred_entities
+    )
+    setattr(project, "user_request", user_input)
+    milestones, _milestone_source = _prd_milestones_for_execution(parsed)
+    plan = await _prepare_prd_development_plan(
+        parsed,
+        relative_path,
+        project,
+        milestones,
+        workspace,
+        console,
+        session_logger,
+    )
+    _print_prd_development_plan(
+        parsed,
+        relative_path,
+        milestones,
+        plan,
+        console,
+        build_after=False,
+    )
+    _log_assistant_message(
+        session_logger,
+        "Prepared a PRD development plan without modifying project files.",
+        workflow_id="plan-prd",
+    )
 
 
 PRD_BUILD_FRAMING = (
@@ -8357,6 +8639,7 @@ async def _handle_prd_build_request(
     project = build_project_spec(
         parsed, request_text=user_input, extra_entities=inferred_entities
     )
+    setattr(project, "user_request", user_input)
     _log_prd_contract_summary(project)
     if not project.generation_ready:
         console.print(
@@ -8378,11 +8661,26 @@ async def _handle_prd_build_request(
     project_root = _prd_target_directory(user_input, project)
     output_scope = (project_root,)
 
-    _print_prd_build_plan(parsed, relative_path, console)
+    milestones, milestone_source = _prd_milestones_for_execution(parsed)
+    development_plan = await _prepare_prd_development_plan(
+        parsed,
+        relative_path,
+        project,
+        milestones,
+        workspace,
+        console,
+        session_logger,
+    )
+    _print_prd_build_plan(parsed, relative_path, console, development_plan=development_plan)
     _log_event(
         session_logger,
         "prd.build.planned",
-        {"path": str(prd_path), "title": parsed.title, "sections": list(parsed.sections)},
+        {
+            "path": str(prd_path),
+            "title": parsed.title,
+            "sections": list(parsed.sections),
+            "plan_source": development_plan.get("source"),
+        },
         f"Planned PRD build for {prd_path.name}",
         workflow_id="prd-build",
     )
@@ -8396,7 +8694,6 @@ async def _handle_prd_build_request(
         "[green]Building now - I'll read the PRD and write files in your workspace. "
         "Type `exit` to stop.[/green]"
     )
-    milestones, milestone_source = _prd_milestones_for_execution(parsed)
     prd_execution_root_path: Path | None = None
     prd_execution_state: dict[str, Any] = {}
     start_milestone_index = 0
