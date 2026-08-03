@@ -272,6 +272,18 @@ _MAX_MISSING_MUTATION_RECOVERIES = _os_env_int("SHAMSU_MAX_MUTATION_RECOVERIES",
 _REGROUND_MAX_FILES = _os_env_int("SHAMSU_REGROUND_MAX_FILES", 3, 0)
 _REGROUND_MAX_CHARS_PER_FILE = _os_env_int("SHAMSU_REGROUND_MAX_CHARS", 2400, 200)
 
+# Above this share of assistant PROSE in an evicted span, the structured digest
+# would drop real reasoning and the LLM summary tier runs instead.
+_STRUCTURED_COMPACT_PROSE_RATIO = 0.25
+
+
+def _load_arguments_or_empty(raw: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
 _EMPTY_RESPONSE_CORRECTION = (
     "You returned an empty response. Do not return nothing. Either call a tool to make "
     "progress, or write the answer/code directly, or state plainly what input you need."
@@ -609,9 +621,20 @@ class AgentChatLoop:
             evicted_anything = True
             pending = self.state.newly_evicted(start_abs)
             if pending:
-                summary = await self._summarize_evicted(
-                    self.state.rolling_summary, pending, _CHAT_SUMMARY_BUDGET_TOKENS
-                )
+                # Two-tier: try the deterministic digest before spending a model
+                # round-trip, and only summarize when real reasoning would be lost.
+                summary = self._structured_compact(self.state.rolling_summary, pending)
+                if summary:
+                    self._emit_trace(
+                        "context.compacted",
+                        "Compacted evicted turns from structured state, without a model call.",
+                        {"messages": len(pending)},
+                        level="verbose",
+                    )
+                else:
+                    summary = await self._summarize_evicted(
+                        self.state.rolling_summary, pending, _CHAT_SUMMARY_BUDGET_TOKENS
+                    )
                 self.state.update_rolling_summary(summary, start_abs)
         messages = self.state.build_ollama_messages(tail, include_summary=start_abs > 1)
         if evicted_anything:
@@ -630,6 +653,65 @@ class AgentChatLoop:
                     level="verbose",
                 )
         return messages
+
+    def _structured_compact(self, prior_summary: str, evicted: list[Any]) -> str:
+        """Tier 1 compaction: a deterministic digest of what the evicted turns DID.
+
+        Most evicted content in a build run is mechanical tool traffic - reads,
+        writes, commands and their results - and summarizing that with a model is
+        both a wasted round-trip on a local 7B and lossy: each fold paraphrases the
+        previous paraphrase, so paths and command names drift. Structured facts do
+        not drift.
+
+        Returns ``""`` when the evicted span carries enough genuine prose that a
+        digest would lose reasoning, and the LLM tier should run instead.
+        """
+        wrote: list[str] = []
+        read: list[str] = []
+        ran: list[str] = []
+        asked: list[str] = []
+        prose_chars = 0
+        total_chars = 0
+        for message in evicted:
+            content = str(getattr(message, "content", "") or "")
+            role = str(getattr(message, "role", ""))
+            total_chars += len(content)
+            if role == "user":
+                if not content.startswith("("):
+                    asked.append(" ".join(content.split())[:200])
+                continue
+            for call in getattr(message, "tool_calls", None) or []:
+                function = (call or {}).get("function") or {}
+                name = str(function.get("name") or "")
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    arguments = _load_arguments_or_empty(arguments)
+                arguments = arguments if isinstance(arguments, dict) else {}
+                target = str(arguments.get("filepath") or arguments.get("command") or "")
+                if name in _MUTATION_TOOL_NAMES and target:
+                    wrote.append(target)
+                elif name == "read_file" and target:
+                    read.append(target)
+                elif name == "run_command" and target:
+                    ran.append(target[:120])
+            if role == "assistant" and not getattr(message, "tool_calls", None):
+                prose_chars += len(content)
+        if total_chars and prose_chars / total_chars > _STRUCTURED_COMPACT_PROSE_RATIO:
+            return ""
+        lines: list[str] = []
+        if prior_summary.strip():
+            lines.append(prior_summary.strip())
+        if asked:
+            lines.append(f"- asked: {'; '.join(dict.fromkeys(asked))}")
+        if wrote:
+            lines.append(f"- wrote: {', '.join(dict.fromkeys(wrote))}")
+        if read:
+            lines.append(f"- read: {', '.join(dict.fromkeys(read))}")
+        if ran:
+            lines.append(f"- ran: {'; '.join(dict.fromkeys(ran))}")
+        if not lines:
+            return ""
+        return "\n".join(lines)
 
     async def _summarize_evicted(
         self, prior_summary: str, evicted: list[Any], budget_tokens: int
