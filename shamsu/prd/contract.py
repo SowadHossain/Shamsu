@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -51,6 +52,35 @@ _STACK_PATTERNS: list[tuple[str, str]] = [
     ("go", r"\b(?:golang|go module)\b"),
     ("rust", r"\b(?:rust|cargo)\b"),
 ]
+# --- Prohibitions ----------------------------------------------------------
+# Technologies a PRD or request can forbid. Deliberately wider than
+# _STACK_PATTERNS: a PRD may forbid something SHAMSU would never have detected as
+# a stack (sqlalchemy, jquery), and "not that" is still load-bearing.
+_PROHIBITABLE_TECHNOLOGIES: tuple[str, ...] = (
+    "django", "flask", "fastapi", "python", "node", "express", "react", "vue",
+    "svelte", "vite", "typescript", "javascript", "next.js", "phaser", "jquery",
+    "sqlite", "postgresql", "postgres", "mysql", "mariadb", "mongodb",
+    "sqlalchemy", "go", "golang", "rust", "php", "laravel", "rails",
+)
+# Spelling variants collapse so a prohibition matches however it was written.
+_TECHNOLOGY_ALIASES = {"postgresql": "postgres", "golang": "go"}
+# A clause carrying one of these forbids the technologies named in it. Checked
+# per clause, not per document: "use PostgreSQL, never SQLite" must forbid only
+# SQLite, and a document-wide scan would forbid both.
+_PROHIBITION_MARKERS: tuple[str, ...] = (
+    "never", "do not use", "don't use", "dont use", "do not", "don't", "dont",
+    "must not", "cannot use", "can't use", "avoid", "without", "no longer",
+    "reject", "forbidden", "not allowed", "not permitted", "instead of",
+    "rather than", "migrate away from",
+)
+# Deliberately NOT a marker: "replace". "replace SQLite with PostgreSQL" names the
+# REPLACEMENT after the marker, so it would forbid the intended stack.
+# Splits on sentence and parenthetical boundaries. A `.` only ends a clause when
+# whitespace or end-of-text follows it, so dotted technology names survive: a bare
+# `[.]` split turns "do not use Node.js or Express" into "do not use node" plus a
+# marker-less "js or express", silently losing the Express prohibition.
+_CLAUSE_SPLIT_RE = re.compile(r"[;\n]|\.(?=\s|$)|(?<=\))\s|\s(?=\()")
+
 _HEADING_NUMBER_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+")
 _ENDPOINT_RE = re.compile(r"\b(GET|POST|PUT|PATCH|DELETE)\s+(/api/[^\s,]+)", re.IGNORECASE)
 
@@ -89,6 +119,14 @@ class PRDContract:
     nonfunctional_requirements: list[str] = field(default_factory=list)
     required_tests: list[str] = field(default_factory=list)
     out_of_scope: list[str] = field(default_factory=list)
+    # Technologies the PRD or request explicitly FORBIDS. Before this existed, a
+    # negative constraint was unrepresentable: every contract field was a positive
+    # accumulator, so "PostgreSQL 16, NEVER SQLite, NEVER Django" was not merely
+    # ignored - the words were read as stack MENTIONS, so django landed in
+    # required_stack and stack_hint, and render_brief then re-asserted the
+    # forbidden stack to the model as a requirement on every turn. A prohibition
+    # has nowhere to go, so it could not survive parsing.
+    prohibitions: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
     source_refs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     extraction_confidence: float = 1.0
@@ -132,6 +170,15 @@ class PRDContract:
             flavor = "multiplayer" if self.is_multiplayer else "single/local"
             dimensions = "3D" if self.is_3d else "2D"
             lines.append(f"game: {self.game_type} ({dimensions}, {flavor})")
+        # Prohibitions come FIRST, and unmissably. This brief is re-asserted to the
+        # model every turn, and it used to re-state the forbidden stack as
+        # "required stack: django" - actively teaching the model to do the one thing
+        # the PRD ruled out.
+        if self.prohibitions:
+            lines.append(
+                "FORBIDDEN - do not use, and reject any plan that does: "
+                + ", ".join(self.prohibitions)
+            )
         if self.required_stack:
             lines.append(f"required stack: {', '.join(self.required_stack)}")
         elif self.stack_hint:
@@ -180,7 +227,10 @@ def extract_contract(
     stack_text = f"{lowered}\n{(request_text or '').lower()}" if request_text else lowered
     game_type = _detect_game_type(lowered)
     project_kind = _detect_kind(lowered, game_type)
-    stack_hint = _detect_stack(stack_text)
+    # Prohibitions are resolved BEFORE any stack detection, so a forbidden name
+    # can never become the detected stack.
+    prohibitions = detect_prohibitions(stack_text)
+    stack_hint = _detect_stack(stack_text, prohibitions)
     summary_lines = _section_lines(parsed, "product summary", exact=True)
     if not summary_lines:
         summary_lines = _section_lines(parsed, "overview", exact=True)
@@ -274,10 +324,14 @@ def extract_contract(
     for phrase in ("full-stack", "full stack", "backend api", "sqlite", "responsive user interface"):
         if phrase in lowered:
             architecture.append(phrase)
+    # A forbidden technology must never land in a field named `required_stack`.
+    _blocked = {_normalize_technology(name) for name in prohibitions}
     required_stack = [
-        name for name, pattern in _STACK_PATTERNS if re.search(pattern, stack_text)
+        name
+        for name, pattern in _STACK_PATTERNS
+        if re.search(pattern, stack_text) and _normalize_technology(name) not in _blocked
     ]
-    if re.search(r"\bsqlite\b", stack_text):
+    if re.search(r"\bsqlite\b", stack_text) and "sqlite" not in _blocked:
         required_stack.append("sqlite")
     assumptions: list[str] = []
     if project_kind == "web_app" and architecture and not stack_hint:
@@ -318,6 +372,7 @@ def extract_contract(
         nonfunctional_requirements=_dedupe(_clean_items(nonfunctional))[:60],
         required_tests=_dedupe(_clean_items(tests))[:100],
         out_of_scope=_dedupe(_clean_items(out_of_scope))[:40],
+        prohibitions=prohibitions,
         assumptions=assumptions,
         source_refs={key: list(value) for key, value in parsed.source_refs.items()},
         extraction_confidence=parsed.extraction_confidence,
@@ -445,8 +500,58 @@ def _detect_kind(lowered: str, game_type: str) -> str:
     return "unknown"
 
 
-def _detect_stack(lowered: str) -> str:
+def _normalize_technology(name: str) -> str:
+    return _TECHNOLOGY_ALIASES.get(name, name)
+
+
+def detect_prohibitions(text: str) -> list[str]:
+    """Technologies *text* explicitly forbids.
+
+    Clause-scoped on purpose. A document-wide scan cannot tell
+    "use PostgreSQL, never SQLite" (forbid SQLite) from "never use PostgreSQL,
+    use SQLite" (forbid PostgreSQL) - it would forbid both and leave nothing to
+    build with.
+
+    Recall is favoured over precision here: a missed prohibition silently builds
+    the wrong stack, while a false positive removes one candidate from a list that
+    still has to be resolved and reported.
+    """
+    lowered = (text or "").lower()
+    found: list[str] = []
+    for clause in _CLAUSE_SPLIT_RE.split(lowered):
+        marker_at = min(
+            (clause.find(marker) for marker in _PROHIBITION_MARKERS if marker in clause),
+            default=-1,
+        )
+        if marker_at < 0:
+            continue
+        for technology in _PROHIBITABLE_TECHNOLOGIES:
+            # `\b` alone would miss "django/python" and "Node.js"; the escape keeps
+            # dotted names like next.js literal.
+            match = re.search(rf"(?<![\w.]){re.escape(technology)}(?![\w])", clause)
+            # Position matters, and getting this wrong is worse than missing a
+            # prohibition: "Use PostgreSQL, never SQLite" is one clause (a comma is
+            # not a boundary), so a clause-wide scan forbids PostgreSQL too - and
+            # strips the very stack that was asked for. Only what follows the
+            # negation is forbidden.
+            if match is not None and match.start() > marker_at:
+                normalized = _normalize_technology(technology)
+                if normalized not in found:
+                    found.append(normalized)
+    return sorted(found)
+
+
+def _detect_stack(lowered: str, prohibited: Iterable[str] = ()) -> str:
+    """First matching stack name that is not forbidden.
+
+    Skipping forbidden names is what stops the inversion: `("django", ...)` is
+    entry 0 in _STACK_PATTERNS, so a PRD saying "NEVER Django" used to match it
+    first and set stack_hint = "django".
+    """
+    blocked = {_normalize_technology(name) for name in prohibited}
     for name, pattern in _STACK_PATTERNS:
+        if _normalize_technology(name) in blocked:
+            continue
         if re.search(pattern, lowered):
             return name
     return ""
