@@ -54,6 +54,25 @@ _COMMENTED_TOOL_FENCE_RE = re.compile(
     re.DOTALL,
 )
 
+# --- Quote repair (mutation tool calls only) -------------------------------
+# A `"` inside a JSON string can only be the terminator when the next
+# non-whitespace character is one of these; anything else means the model forgot
+# to escape a literal quote in the payload.
+_AFTER_STRING_RE = re.compile(r"[ \t\r\n]*[,}\]:]")
+# Only tools whose arguments carry source code get the repair. read_file /
+# run_command arguments are bare strings that always parse, so a rewrite there
+# could only ever corrupt a value that was already fine.
+_QUOTE_REPAIR_TOOLS = frozenset({"write_file", "append_file", "edit_file"})
+# Fields whose length decides which candidate reading of an ambiguous payload to
+# keep: always prefer the LONGEST, so a wrong terminator cannot silently write a
+# truncated file.
+_QUOTE_REPAIR_PAYLOAD_KEYS = ("content", "new_string", "old_string")
+_TOOL_CALL_SHAPE_RE = re.compile(
+    r'"(?:name|action|tool|tool_name|function)"\s*:\s*"(?P<tool>[A-Za-z_][\w-]*)"'
+)
+_MAX_QUOTE_REPAIR_ATTEMPTS = 16
+_MAX_QUOTE_REPAIR_CHARS = 400_000
+
 # `<think>...</think>` reasoning trace (kept out of the visible answer).
 _THINK_RE = re.compile(r"<think>(?P<body>.*?)</think>", re.DOTALL | re.IGNORECASE)
 # An unmatched, dangling `<think>` with no closing tag: everything after it is
@@ -139,6 +158,7 @@ def parse_model_turn(
     # form that yields at least one valid (registered) call.
     salvaged_calls: list[ToolCall] = []
     salvaged_spans: list[str] = []
+    failures: list[ParseFailure] = []
     if allow_salvage:
         for salvager in (
             _salvage_commented_tool_fences,
@@ -146,11 +166,18 @@ def parse_model_turn(
             _salvage_search_replace,
             _salvage_xml_tool_call,
         ):
-            calls, spans = salvager(raw_content, registered_set)
+            calls, spans = salvager(raw_content, registered_set, failures)
             if calls:
                 salvaged_calls = calls
                 salvaged_spans = spans
                 break
+        if not salvaged_calls and not failures:
+            # Nothing parsed and nothing explained it: check for a call that was
+            # cut off before its braces closed, so the loop can say so instead
+            # of calling a real attempt "prose".
+            truncated = _truncated_mutation_failure(raw_content, registered_set)
+            if truncated is not None:
+                failures.append(truncated)
 
     text, inline_thinking = _split_thinking(raw_content)
     text = _strip_tool_artifacts(text, salvaged_spans)
@@ -159,6 +186,7 @@ def parse_model_turn(
         thinking=_join_thinking(native_thinking, inline_thinking),
         tool_calls=salvaged_calls,
         salvaged=bool(salvaged_calls),
+        parse_failures=tuple(failures),
     )
 
 
@@ -196,6 +224,7 @@ def _native_tool_calls(message: Any) -> list[ToolCall]:
 def _salvage_commented_tool_fences(
     content: str,
     registered: set[str] | None,
+    failures: list[ParseFailure],
 ) -> tuple[list[ToolCall], list[str]]:
     """Recover explicit ``# write_file``/``# run_command`` fenced calls.
 
@@ -211,13 +240,36 @@ def _salvage_commented_tool_fences(
             continue
         body = match.group("body").strip()
         arguments: dict[str, Any] | None = None
-        parsed = _load_json(body) if body.startswith("{") else None
-        if isinstance(parsed, dict):
-            arguments = parsed
+        repaired = False
+        error = ""
+        if body.startswith("{"):
+            parsed, error, repaired = _load_tool_call_json(body, registered)
+            if isinstance(parsed, dict):
+                arguments = parsed
         elif name == "run_command" and body:
             arguments = {"command": body}
         if arguments is None:
+            if name in _QUOTE_REPAIR_TOOLS and error:
+                failures.append(
+                    ParseFailure(
+                        kind="fence_body_not_json",
+                        tool=name,
+                        path=_probable_filepath(body),
+                        error=error,
+                        span_preview=body[:240],
+                    )
+                )
             continue
+        if repaired:
+            failures.append(
+                ParseFailure(
+                    kind="quote_repaired",
+                    tool=name,
+                    path=str(arguments.get("filepath") or ""),
+                    error=error,
+                    repaired=True,
+                )
+            )
         calls.append(
             ToolCall(
                 id=f"salvaged_{name}_{len(calls) + 1}",
@@ -229,24 +281,55 @@ def _salvage_commented_tool_fences(
     return calls, spans
 
 
-def _salvage_embedded_json(content: str, registered: set[str] | None) -> tuple[list[ToolCall], list[str]]:
+def _salvage_embedded_json(
+    content: str,
+    registered: set[str] | None,
+    failures: list[ParseFailure],
+) -> tuple[list[ToolCall], list[str]]:
     """Brace-scan *content* for JSON objects that describe a tool call — even
     inside prose or ``` fences — and map them to registered tools. This is the
     direct fix for the ``{"name": "ask_user", ...}`` leak."""
     calls: list[ToolCall] = []
     spans: list[str] = []
     for span in _iter_json_objects(content):
-        obj = _load_json(span)
+        obj, error, repaired = _load_tool_call_json(span, registered)
         if not isinstance(obj, dict):
+            # A span that named a mutation tool and still would not parse is the
+            # failure the loop must report honestly instead of calling it prose.
+            tool = _names_quote_repair_tool(span, registered)
+            if tool and error:
+                failures.append(
+                    ParseFailure(
+                        kind="json_decode",
+                        tool=tool,
+                        path=_probable_filepath(span),
+                        error=error,
+                        span_preview=span[:240],
+                    )
+                )
             continue
         call = _tool_call_from_obj(obj, registered)
         if call is not None:
             calls.append(call)
             spans.append(span)
+            if repaired:
+                failures.append(
+                    ParseFailure(
+                        kind="quote_repaired",
+                        tool=call.name,
+                        path=str(call.arguments.get("filepath") or ""),
+                        error=error,
+                        repaired=True,
+                    )
+                )
     return calls, spans
 
 
-def _salvage_search_replace(content: str, registered: set[str] | None) -> tuple[list[ToolCall], list[str]]:
+def _salvage_search_replace(
+    content: str,
+    registered: set[str] | None,
+    failures: list[ParseFailure],
+) -> tuple[list[ToolCall], list[str]]:
     """Turn ``<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE`` blocks into
     ``edit_file`` calls, recovering the target path from the text just before
     each block."""
@@ -275,19 +358,45 @@ def _salvage_search_replace(content: str, registered: set[str] | None) -> tuple[
     return calls, spans
 
 
-def _salvage_xml_tool_call(content: str, registered: set[str] | None) -> tuple[list[ToolCall], list[str]]:
+def _salvage_xml_tool_call(
+    content: str,
+    registered: set[str] | None,
+    failures: list[ParseFailure],
+) -> tuple[list[ToolCall], list[str]]:
     """Parse ``<tool_call>{...}</tool_call>`` wrappers (some chat templates emit
     tool calls this way)."""
     calls: list[ToolCall] = []
     spans: list[str] = []
     for match in _XML_TOOL_CALL_RE.finditer(content):
-        obj = _load_json(match.group("body"))
+        body = match.group("body")
+        obj, error, repaired = _load_tool_call_json(body, registered)
         if not isinstance(obj, dict):
+            tool = _names_quote_repair_tool(body, registered)
+            if tool and error:
+                failures.append(
+                    ParseFailure(
+                        kind="json_decode",
+                        tool=tool,
+                        path=_probable_filepath(body),
+                        error=error,
+                        span_preview=body[:240],
+                    )
+                )
             continue
         call = _tool_call_from_obj(obj, registered)
         if call is not None:
             calls.append(call)
             spans.append(match.group(0))
+            if repaired:
+                failures.append(
+                    ParseFailure(
+                        kind="quote_repaired",
+                        tool=call.name,
+                        path=str(call.arguments.get("filepath") or ""),
+                        error=error,
+                        repaired=True,
+                    )
+                )
     return calls, spans
 
 
@@ -498,6 +607,211 @@ def _load_json(span: str) -> Any:
         return repair_json(span, return_objects=True)
     except Exception:
         return None
+
+
+def _greedy_string_repair(
+    span: str, force_escape: frozenset[int] = frozenset()
+) -> tuple[str, list[int]]:
+    """Escape every in-string ``"`` that cannot be a terminator.
+
+    Rule: while inside a JSON string, a ``"`` whose next non-whitespace
+    character is not one of ``, } ] :`` cannot close the string, so it must be a
+    literal quote the model forgot to escape — emit ``\\"`` and stay in the
+    string. Indices in *force_escape* are treated as literal even when they do
+    look like terminators, which is how the caller explores the readings where
+    the greedy choice was wrong.
+
+    Returns the rewritten text plus the indices this pass ACCEPTED as
+    terminators, so the caller knows which choices are open to revision.
+    """
+    out: list[str] = []
+    accepted: list[int] = []
+    in_string = False
+    index = 0
+    length = len(span)
+    while index < length:
+        char = span[index]
+        if not in_string:
+            out.append(char)
+            if char == '"':
+                in_string = True
+            index += 1
+            continue
+        # Inside a string: a backslash escape is copied whole so `\"` is never
+        # mistaken for a terminator and `\\` never swallows the next quote.
+        if char == "\\" and index + 1 < length:
+            out.append(span[index : index + 2])
+            index += 2
+            continue
+        if char == '"':
+            if index not in force_escape and _AFTER_STRING_RE.match(span, index + 1):
+                out.append(char)
+                accepted.append(index)
+                in_string = False
+            else:
+                out.append('\\"')
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+    return "".join(out), accepted
+
+
+def _payload_length(obj: Any) -> int:
+    """Total length of the code-carrying values in a parsed tool call.
+
+    Used to choose between competing readings of an ambiguous payload.
+    """
+    if not isinstance(obj, dict):
+        return 0
+    total = 0
+    for candidate in (obj, *(value for value in obj.values() if isinstance(value, dict))):
+        for key in _QUOTE_REPAIR_PAYLOAD_KEYS:
+            value = candidate.get(key)
+            if isinstance(value, str):
+                total += len(value)
+    return total
+
+
+def _repair_unescaped_quotes(span: str) -> dict[str, Any] | None:
+    """Recover a tool call whose code payload under-escaped its double quotes.
+
+    This is the 2026-08-03 failure: one missing backslash in a 736-char
+    ``write_file`` call discarded the whole mutation, and at temperature 0.1 the
+    retry reproduced it byte for byte.
+
+    Every candidate reading is validated by ``json.loads``, so this can only
+    ever return structurally valid JSON — never a half-parsed dict. When more
+    than one reading parses, the one with the LONGEST payload wins: a wrong
+    terminator shortens the content, and silently writing a truncated file is
+    far worse than failing loudly.
+    """
+    if len(span) > _MAX_QUOTE_REPAIR_CHARS:
+        return None
+    candidates: list[dict[str, Any]] = []
+    repaired, accepted = _greedy_string_repair(span)
+    first = _try_json_object(repaired)
+    if first is not None:
+        candidates.append(first)
+    # A parse failure means one of the accepted terminators was really a literal
+    # quote. Re-run forcing each in turn; escaping an earlier one EXTENDS the
+    # payload, which is the direction we want to explore.
+    for forced in accepted[:_MAX_QUOTE_REPAIR_ATTEMPTS]:
+        retry, _ = _greedy_string_repair(span, frozenset({forced}))
+        parsed = _try_json_object(retry)
+        if parsed is not None:
+            candidates.append(parsed)
+    if not candidates:
+        return None
+    return max(candidates, key=_payload_length)
+
+
+def _try_json_object(span: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(span)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _names_quote_repair_tool(span: str, registered: set[str] | None) -> str:
+    """The mutation tool this span claims to call, or ``""``.
+
+    Gates the quote repair: it must not run on arbitrary JSON, only on a span
+    that already identifies itself as a code-carrying tool call.
+    """
+    match = _TOOL_CALL_SHAPE_RE.search(span)
+    if match is None:
+        return ""
+    tool = match.group("tool")
+    if tool not in _QUOTE_REPAIR_TOOLS:
+        return ""
+    if registered is not None and tool not in registered:
+        return ""
+    return tool
+
+
+def _truncated_mutation_failure(
+    content: str, registered: set[str] | None
+) -> ParseFailure | None:
+    """Report a mutation call that was cut off mid-payload.
+
+    A truncated call never balances its braces, so ``_iter_json_objects`` skips
+    it entirely and no salvager ever sees it — meaning the loop would fall
+    through to "the model returned prose" for output that was in fact a correct
+    call the model ran out of room to finish. That is a distinct diagnosis with a
+    distinct fix (raise the output budget), so it gets its own failure kind
+    rather than being folded into the escaping case.
+    """
+    balanced = list(_iter_json_objects(content))
+    for match in _TOOL_CALL_SHAPE_RE.finditer(content):
+        tool = match.group("tool")
+        if tool not in _QUOTE_REPAIR_TOOLS:
+            continue
+        if registered is not None and tool not in registered:
+            continue
+        # Inside a balanced object? Then it was parsed (or reported) already.
+        if any(span in content and match.start() >= content.find(span)
+               and match.end() <= content.find(span) + len(span)
+               for span in balanced):
+            continue
+        return ParseFailure(
+            kind="json_truncated",
+            tool=tool,
+            path=_probable_filepath(content),
+            error="tool call ended mid-payload: the JSON never closed",
+            span_preview=content[match.start() : match.start() + 240],
+        )
+    return None
+
+
+def _probable_filepath(span: str) -> str:
+    """Best-effort target path out of a span that failed to parse.
+
+    The correction shown to the model is far more actionable when it names the
+    file ("send a raw block for templates/my_orders.html") than when it says
+    "<path>". Deliberately tolerant: this is only ever used for prompt text, so
+    a wrong guess costs nothing and is preferable to no guess.
+    """
+    for key in ("filepath", "file_path", "path"):
+        match = re.search(rf'"{key}"\s*:\s*"(?P<value>[^"\\]{{1,200}})"', span)
+        if match:
+            return match.group("value")
+    return ""
+
+
+def _load_tool_call_json(
+    span: str, registered: set[str] | None
+) -> tuple[Any, str, bool]:
+    """``_load_json`` plus a mutation-aware quote-repair tier.
+
+    Returns ``(parsed, strict_error, repaired)``. *strict_error* is the verbatim
+    ``json.loads`` message, which the loop shows the model — a model handed the
+    real error can fix it.
+
+    Order is load-bearing: for a span naming a mutation tool the targeted repair
+    runs BEFORE generic ``json_repair``, because ``json_repair`` "succeeds" on an
+    under-escaped code payload by TRUNCATING the string at the stray quote. That
+    yields a plausible-looking dict that would write half a file, with no error
+    to report. The targeted repair keeps the whole payload or fails loudly.
+    """
+    try:
+        return json.loads(span), "", False
+    except (ValueError, TypeError) as exc:
+        error = str(exc)
+    # Same Python-apostrophe preservation as _load_json, applied before the
+    # quote repair so a payload with both `\'` and a stray `"` needs one pass.
+    apostrophe_safe = re.sub(r"(?<!\\)\\'", r"\\\\'", span)
+    if apostrophe_safe != span:
+        try:
+            return json.loads(apostrophe_safe), "", False
+        except (ValueError, TypeError):
+            pass
+    if _names_quote_repair_tool(span, registered):
+        recovered = _repair_unescaped_quotes(apostrophe_safe)
+        if recovered is not None:
+            return recovered, error, True
+    return _load_json(span), error, False
 
 
 def _coerce_args(value: Any) -> dict[str, Any]:
