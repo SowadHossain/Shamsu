@@ -185,6 +185,134 @@ EXPOSE 8000
 CMD ["npm", "start"]
 """
 
+NODE_SERVER_JS = """const { app } = require("./src/app");
+const { initializeDatabase } = require("./src/db");
+
+const port = Number.parseInt(process.env.PORT || "8000", 10);
+
+initializeDatabase()
+  .then(() => {
+    app.listen(port, "0.0.0.0", () => {
+      console.log(`Backend listening on port ${port}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Backend failed to start", error);
+    process.exit(1);
+  });
+"""
+
+NODE_APP_JS = """const express = require("express");
+const cors = require("cors");
+const routes = require("./routes");
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+app.get("/health", (_request, response) => {
+  response.json({ ok: true, service: "backend" });
+});
+
+app.use("/api", routes);
+
+app.use((error, _request, response, _next) => {
+  console.error(error);
+  response.status(500).json({ error: "Internal server error" });
+});
+
+module.exports = { app };
+"""
+
+NODE_DB_JS = """const fs = require("fs");
+const path = require("path");
+
+const databaseUrl = process.env.DATABASE_URL || "sqlite:./db.sqlite3";
+let postgresPool;
+let sqliteDatabase;
+
+function usesPostgres() {
+  return databaseUrl.startsWith("postgres://") || databaseUrl.startsWith("postgresql://");
+}
+
+function schemaPath() {
+  return path.join(__dirname, "schema.sql");
+}
+
+function sqliteSchema(sql) {
+  return sql
+    .replace(/SERIAL PRIMARY KEY/g, "INTEGER PRIMARY KEY AUTOINCREMENT")
+    .replace(/TIMESTAMPTZ NOT NULL DEFAULT NOW\\(\\)/g, "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP");
+}
+
+async function initializeDatabase() {
+  const schema = fs.readFileSync(schemaPath(), "utf-8");
+  if (usesPostgres()) {
+    const { Pool } = require("pg");
+    postgresPool = postgresPool || new Pool({ connectionString: databaseUrl });
+    await postgresPool.query(schema);
+    return;
+  }
+
+  const Database = require("better-sqlite3");
+  const filename = databaseUrl.replace(/^sqlite:/, "") || "./db.sqlite3";
+  sqliteDatabase = sqliteDatabase || new Database(path.resolve(process.cwd(), filename));
+  sqliteDatabase.exec(sqliteSchema(schema));
+}
+
+async function query(sql, params = []) {
+  if (usesPostgres()) {
+    if (!postgresPool) {
+      await initializeDatabase();
+    }
+    return postgresPool.query(sql, params);
+  }
+  if (!sqliteDatabase) {
+    await initializeDatabase();
+  }
+  const statement = sqliteDatabase.prepare(sql.replace(/\\$\\d+/g, "?"));
+  if (/^\\s*select\\b/i.test(sql)) {
+    return { rows: statement.all(params) };
+  }
+  const info = statement.run(params);
+  return { rows: [], rowCount: info.changes };
+}
+
+module.exports = { initializeDatabase, query };
+"""
+
+NODE_ROUTES_INDEX_JS = """const express = require("express");
+const { query } = require("../db");
+
+const router = express.Router();
+
+router.get("/health", (_request, response) => {
+  response.json({ ok: true, service: "api" });
+});
+
+router.get("/listings", async (_request, response, next) => {
+  try {
+    const result = await query(
+      "SELECT id, title, price, created_at FROM listings ORDER BY created_at DESC LIMIT 50"
+    );
+    response.json({ listings: result.rows });
+  } catch (error) {
+    next(error);
+  }
+});
+
+module.exports = router;
+"""
+
+NODE_SCHEMA_SQL = """CREATE TABLE IF NOT EXISTS listings (
+  id SERIAL PRIMARY KEY,
+  title TEXT NOT NULL,
+  price NUMERIC(10, 2) NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
 REACT_PACKAGE_JSON = """{
   "scripts": {
     "dev": "vite --host 0.0.0.0",
@@ -529,6 +657,16 @@ def render_boilerplate(
             )
         if _endswith_component_path(normalized, "backend/Dockerfile"):
             return NODE_DOCKERFILE
+        if _endswith_component_path(normalized, "backend/server.js"):
+            return NODE_SERVER_JS
+        if _endswith_component_path(normalized, "backend/src/app.js"):
+            return NODE_APP_JS
+        if _endswith_component_path(normalized, "backend/src/db.js"):
+            return NODE_DB_JS
+        if _endswith_component_path(normalized, "backend/src/routes/index.js"):
+            return NODE_ROUTES_INDEX_JS
+        if _endswith_component_path(normalized, "backend/src/schema.sql"):
+            return NODE_SCHEMA_SQL
     if not is_django_project(expected_files):
         return None
     project_package, app_package = django_layout(expected_files)

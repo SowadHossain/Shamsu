@@ -200,12 +200,25 @@ def test_node_express_runtime_files_are_generated_deterministically():
     expected = [
         "backend/package.json",
         "backend/server.js",
+        "backend/src/app.js",
+        "backend/src/db.js",
+        "backend/src/routes/index.js",
+        "backend/src/schema.sql",
         "backend/.env.example",
         "backend/Dockerfile",
     ]
 
     assert is_node_express_project(expected)
     assert '"start": "node server.js"' in render_boilerplate("backend/package.json", expected)
+    assert 'require("./src/app")' in render_boilerplate("backend/server.js", expected)
+    assert 'app.use("/api", routes)' in render_boilerplate("backend/src/app.js", expected)
+    assert 'require("pg")' in render_boilerplate("backend/src/db.js", expected)
+    assert 'router.get("/listings"' in render_boilerplate(
+        "backend/src/routes/index.js", expected
+    )
+    assert "CREATE TABLE IF NOT EXISTS listings" in render_boilerplate(
+        "backend/src/schema.sql", expected
+    )
     assert "DATABASE_URL=sqlite:./db.sqlite3" in render_boilerplate(
         "backend/.env.example", expected
     )
