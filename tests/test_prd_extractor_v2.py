@@ -109,6 +109,9 @@ def test_classifier_falls_back_to_generic_web_for_vague_prd():
 def test_template_registry_wraps_django_for_web_crud():
     parsed = parse_prd_text(
         "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
         "## Entities\n"
         "- Task: title (text), done (boolean)\n"
     )

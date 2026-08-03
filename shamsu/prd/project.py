@@ -10,6 +10,7 @@ from shamsu.registry import load_registry_entry
 from shamsu.registry.categories import CATEGORY_TO_ARCHETYPE
 from shamsu.registry.detector import detect_category
 from shamsu.registry.schema import Category
+from shamsu.registry.blueprints import resolve_blueprints
 from shamsu.registry.suitability import assess
 from shamsu.types import Archetype, DjangoFileSpec, EndpointSpec, PageSpec, ParsedPRD, ProjectSpec
 
@@ -178,10 +179,20 @@ def build_project_spec(
             "The PRD does not specify an application framework; SHAMSU will "
             "suggest one and record the suggestion as an assumption."
         )
+    blueprint_resolution = resolve_blueprints(contract)
+    assumptions.extend(blueprint_resolution.assumptions)
+    uses_django_blueprint = (
+        blueprint_resolution.selected.get("backend") is not None
+        and blueprint_resolution.selected["backend"].id == "django"
+    )
 
     generation_order = (
         _fixed_generation_order(project_name, app_name, pages)
-        if not needs_input and selected_archetype in {Archetype.WEB_CRUD, Archetype.REST_API}
+        if (
+            not needs_input
+            and uses_django_blueprint
+            and selected_archetype in {Archetype.WEB_CRUD, Archetype.REST_API}
+        )
         else _generic_generation_order()
     )
     if needs_input:

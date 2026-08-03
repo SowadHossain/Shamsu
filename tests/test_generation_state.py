@@ -17,7 +17,12 @@ from shamsu.types import TaskStepStatus
 
 def _project_spec():
     parsed = parse_prd_text(
-        "# Todo App\n\n## Entities\n- Task: title (text), done (boolean)\n"
+        "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
+        "## Entities\n"
+        "- Task: title (text), done (boolean)\n"
     )
     return build_project_spec(parsed)
 

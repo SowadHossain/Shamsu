@@ -780,7 +780,7 @@ def _handle_generate_django(
         f"Parsed PRD {file_path.name}",
         workflow_id="generate-django",
     )
-    spec = build_project_spec(parsed)
+    spec = build_project_spec(parsed, request_text="Use the Django backend blueprint.")
     _log_event(
         session_logger,
         "project.planned",

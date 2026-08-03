@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from shamsu.prd.contract import PRDContract
+from shamsu.registry.blueprints import resolve_blueprints
 from shamsu.registry.schema import Category
 from shamsu.types import Archetype
 
@@ -146,6 +147,8 @@ def _assess_game(contract: PRDContract) -> TemplateSuitability:
 def _assess_django(contract: PRDContract, archetype: Archetype) -> TemplateSuitability:
     label = "REST API" if archetype == Archetype.REST_API else "CRUD web app"
     requested_stack = {item.lower() for item in contract.required_stack}
+    blueprint_resolution = resolve_blueprints(contract)
+    selected_backend = blueprint_resolution.selected.get("backend")
     # Prohibitions are checked FIRST and win outright. The Django writer ships
     # Django, Python and (by default) SQLite, so a PRD forbidding any of them can
     # never be served by it - no scoring, no fit, no fallback. This is the escape
@@ -166,6 +169,23 @@ def _assess_django(contract: PRDContract, archetype: Archetype) -> TemplateSuita
             matches=[f"{label} structure"],
             conflicts=[f"Django writer would introduce forbidden technology: {named}."],
             must_change=["derive architecture, schema, UI, and tests from the PRD"],
+            fit_score=0.0,
+        )
+    if selected_backend is None or selected_backend.id != "django":
+        conflicts = [
+            "Django backend blueprint was not selected from the PRD stack, so the Django generator is unavailable.",
+        ]
+        conflicts.extend(blueprint_resolution.errors)
+        return TemplateSuitability(
+            strategy=GenerationStrategy.FREEFORM,
+            candidate="",
+            reason=(
+                f"{label} structure is present, but the PRD does not explicitly "
+                "select the Django backend blueprint; build from the PRD instead."
+            ),
+            matches=[f"{label} structure"],
+            conflicts=conflicts,
+            must_change=["derive backend, frontend, database, and tests from the PRD"],
             fit_score=0.0,
         )
     non_django_stack = requested_stack & {"go", "node", "rust"}

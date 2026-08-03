@@ -19,6 +19,9 @@ def _spec(text: str):
 def _todo_spec():
     return _spec(
         "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
         "## Entities\n"
         "- Task: title (text), done (boolean), user (FK to User)\n"
     )

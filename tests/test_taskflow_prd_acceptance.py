@@ -47,13 +47,14 @@ def test_taskflow_routes_to_real_full_stack_generation_plan():
     assert spec.generation_ready is True
     assert spec.needs_input is False
     assert {entity.name for entity in spec.entities} >= {"User", "Category", "Task"}
-    assert len(spec.generation_order) > 20
-    assert [item.path for item in spec.generation_order[:2]] != ["index.html", "README.md"]
+    assert [item.path for item in spec.generation_order] == ["index.html", "README.md"]
+    assert spec.suitability.strategy.value == "freeform"
     # The assumption records that the framework is UNSPECIFIED, and deliberately
     # does not name one. It used to read "Django is selected as SHAMSU's supported
     # local full-stack default", which is how a stack nobody asked for entered the
     # plan; choosing one is the blueprint layer's job and is recorded there.
     assert any("does not specify an application framework" in item for item in spec.assumptions)
+    assert any("suggested blueprint" in item for item in spec.assumptions)
     assert not any("Django is selected" in item for item in spec.assumptions)
     assert spec.definition_of_done
 

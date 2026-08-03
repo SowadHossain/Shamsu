@@ -132,6 +132,33 @@ def test_suitability_routes_cms_to_freeform():
     assert spec.suitability.candidate == ""
 
 
+def test_suitability_routes_explicit_django_to_django_writer():
+    spec = build_project_spec(
+        parse_prd_text(
+            "# Notes\n\n"
+            "## Tech Stack\n- Django\n- SQLite\n\n"
+            "## Entities\n- Note: title (text), body (long text)\n",
+            markdown=True,
+        )
+    )
+
+    assert spec.suitability.strategy is GenerationStrategy.DJANGO
+    assert spec.generation_order[0].path == "manage.py"
+
+
+def test_suitability_does_not_route_generic_crud_to_django_writer():
+    spec = build_project_spec(
+        parse_prd_text(
+            "# Notes\n\n"
+            "## Entities\n- Note: title (text), body (long text)\n",
+            markdown=True,
+        )
+    )
+
+    assert spec.suitability.strategy is GenerationStrategy.FREEFORM
+    assert [item.path for item in spec.generation_order] == ["index.html", "README.md"]
+
+
 def test_build_project_spec_attaches_contract_and_suitability():
     spec = build_project_spec(parse_prd_text(PONG_PRD, markdown=True))
     assert isinstance(spec.prd_contract, PRDContract)

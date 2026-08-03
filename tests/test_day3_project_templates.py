@@ -13,6 +13,9 @@ def test_build_project_spec_extracts_entities_pages_endpoints_and_order(tmp_path
     prd_path = tmp_path / "todo.md"
     prd_path.write_text(
         "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
         "## Entities\n"
         "- **Task**: title (text), done (boolean), user (FK to User)\n\n"
         "## API Endpoints\n"
@@ -52,6 +55,9 @@ def test_render_fixed_django_files_are_deterministic_and_python_valid(tmp_path):
     prd_path = tmp_path / "todo.md"
     prd_path.write_text(
         "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
         "## Entities\n"
         "- **Task**: title (text)\n",
         encoding="utf-8",
@@ -106,6 +112,9 @@ def test_resource_list_templates_use_consistent_urls_fields_and_htmx(tmp_path):
     prd_path = tmp_path / "todo.md"
     prd_path.write_text(
         "# Todo App\n\n"
+        "## Tech Stack\n"
+        "- Django\n"
+        "- SQLite\n\n"
         "## Entities\n"
         "- **Task**: title (text), done (boolean)\n\n"
         "## Pages\n"
