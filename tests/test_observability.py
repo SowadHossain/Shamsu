@@ -194,6 +194,25 @@ async def test_reasoning_model_is_asked_to_think(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_structured_generation_reports_reasoning_and_first_response(monkeypatch):
+    captured: list[dict] = []
+    _fake_ollama(monkeypatch, captured)
+    activities: list[str] = []
+    manager = LLMManager(on_activity=activities.append)
+
+    raw = await manager.generate_structured(
+        "planner",
+        "system",
+        "prompt",
+        {"type": "object"},
+    )
+
+    assert raw == "The answer is 42."
+    assert any("model is reasoning" in item for item in activities)
+    assert any("model started responding" in item for item in activities)
+
+
+@pytest.mark.asyncio
 async def test_non_reasoning_model_is_not_asked_to_think(monkeypatch):
     captured: list[dict] = []
     _fake_ollama(monkeypatch, captured)
@@ -250,10 +269,13 @@ def test_repl_wires_reasoning_to_the_console(tmp_path: Path):
     manager = repl._make_llm_manager(None, console, tmp_path)
 
     assert manager.on_thinking is not None
+    assert manager.on_activity is not None
     manager.on_thinking("deepseek-r1:7b", "I should check the index first.")
+    manager.on_activity("still waiting for planner model qwen3:8b... 15s (reasoning)")
     out = console.export_text()
     assert "Reasoning" in out
     assert "check the index first" in out
+    assert "still waiting for planner model" in out
 
 
 # ---------------------------------------------------------------------------

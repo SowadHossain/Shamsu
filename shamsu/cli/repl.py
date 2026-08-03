@@ -3504,6 +3504,8 @@ def _make_llm_manager(
         "model_pull_progress": lazy_progress.as_model_pull_progress(),
         "action_ledger": get_current_run(),
     }
+    if not lightweight and _call_accepts_keyword(LLMManager, "on_activity"):
+        kwargs["on_activity"] = lambda message: console.print(f"[dim]{message}[/dim]")
     if budget_manager is not None and _call_accepts_keyword(LLMManager, "budget_manager"):
         kwargs["budget_manager"] = budget_manager
     # Surface a reasoning model's chain-of-thought on the specialist path (QA,
@@ -7736,7 +7738,7 @@ async def _prepare_prd_development_plan(
         ledger.log_event("prd_development_plan_started", path=relative_path.as_posix())
     try:
         raw = await asyncio.wait_for(
-            LLMManager(session_logger=session_logger, action_ledger=ledger).generate_structured(
+            _make_llm_manager(session_logger, console, workspace).generate_structured(
                 "planner",
                 PRD_DEVELOPMENT_PLAN_SYSTEM,
                 json.dumps(payload, indent=2, ensure_ascii=True),
@@ -9556,7 +9558,7 @@ async def _structured_validation_rewrite(
     if not target_paths or not failures:
         return []
     ledger = get_current_run()
-    llm = LLMManager(session_logger=session_logger, action_ledger=ledger)
+    llm = _make_llm_manager(session_logger, console, workspace)
     registry = AgentToolRegistry(
         workspace,
         session_logger=session_logger,
@@ -11625,7 +11627,7 @@ async def _prepare_prd_milestone_preflight(
         ledger.log_event("prd_model_preflight_started", milestone_id=milestone_id)
     try:
         raw = await asyncio.wait_for(
-            LLMManager(session_logger=session_logger, action_ledger=ledger).generate_structured(
+            _make_llm_manager(session_logger, console, workspace).generate_structured(
                 "planner",
                 PRD_MODEL_PREFLIGHT_SYSTEM,
                 _build_prd_model_preflight_prompt(deterministic_preflight, workspace),

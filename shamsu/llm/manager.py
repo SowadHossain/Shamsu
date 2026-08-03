@@ -198,6 +198,7 @@ class LLMManager(ILLMManager):
         action_ledger: ActionLedger | None = None,
         budget_manager: ContextBudgetManager | None = None,
         on_thinking: Callable[[str, str], None] | None = None,
+        on_activity: Callable[[str], None] | None = None,
     ):
         _validate_local_llm_url(base_url)
         self.base_url = base_url
@@ -211,6 +212,7 @@ class LLMManager(ILLMManager):
         # in the session log. Receives the FULL trace; the display side decides
         # how much to show.
         self.on_thinking = on_thinking
+        self.on_activity = on_activity
 
     async def _ensure_model(self, model_name: str) -> None:
         """Lazily pull `model_name` the first time it's actually needed."""
@@ -272,7 +274,11 @@ class LLMManager(ILLMManager):
                 )
 
     async def _stream_once(
-        self, model: str, payload: dict, on_token: Callable[[str], None] | None = None
+        self,
+        model: str,
+        payload: dict,
+        on_token: Callable[[str], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> tuple[str, str, int]:
         """One POST to /api/generate; returns (text, thinking, prompt_eval_count)."""
         chunks: list[str] = []
@@ -292,6 +298,8 @@ class LLMManager(ILLMManager):
                         token = data.get("response", "")
                         if token:
                             chunks.append(token)
+                            if on_progress is not None:
+                                on_progress("response")
                             if on_token is not None:
                                 on_token(token)
                         # Reasoning models stream their chain-of-thought in a
@@ -299,6 +307,8 @@ class LLMManager(ILLMManager):
                         thinking_token = data.get("thinking", "")
                         if thinking_token:
                             thinking_chunks.append(thinking_token)
+                            if on_progress is not None:
+                                on_progress("thinking")
                         if data.get("done"):
                             prompt_eval_count = data.get("prompt_eval_count", 0)
                             break
@@ -315,6 +325,7 @@ class LLMManager(ILLMManager):
         model: str,
         payload: dict,
         on_token: Callable[[str], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
         role: str = "",
     ) -> tuple[str, str, int]:
         """Stream a completion, asking reasoning models to separate their CoT.
@@ -338,14 +349,16 @@ class LLMManager(ILLMManager):
             role_should_think(role, model) if role else model_is_reasoning(model)
         ) and model not in _THINK_UNSUPPORTED
         if not want_think:
-            return await self._stream_once(model, payload, on_token)
+            return await self._stream_once(model, payload, on_token, on_progress)
         try:
-            return await self._stream_once(model, {**payload, "think": True}, on_token)
+            return await self._stream_once(
+                model, {**payload, "think": True}, on_token, on_progress
+            )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in (400, 422):
                 raise
             _THINK_UNSUPPORTED.add(model)
-            return await self._stream_once(model, payload, on_token)
+            return await self._stream_once(model, payload, on_token, on_progress)
 
     async def _generate(
         self, model: str, system: str, prompt: str,
@@ -355,6 +368,8 @@ class LLMManager(ILLMManager):
         _estimated_tokens: int = 0,
         _ledger_call_id: str = "",
         _role: str = "",
+        _on_token: Callable[[str], None] | None = None,
+        _on_progress: Callable[[str], None] | None = None,
     ) -> str:
         payload = {
             "model": model,
@@ -374,7 +389,7 @@ class LLMManager(ILLMManager):
         if json_schema is not None:
             payload["format"] = json_schema   # Ollama-native structured output
         text, thinking, prompt_eval_count = await self._stream_completion(
-            model, payload, role=_role
+            model, payload, on_token=_on_token, on_progress=_on_progress, role=_role
         )
         # Capture the reasoning trace (surfaced/logged, kept out of the text).
         self._log_thinking(model, thinking, _ledger_call_id, _role)
@@ -569,6 +584,29 @@ class LLMManager(ILLMManager):
                 model_call_id=ledger_call_id,
             )
         started = time.perf_counter()
+        progress_phase = "waiting for first token"
+
+        def on_token(_token: str) -> None:
+            nonlocal progress_phase
+            if progress_phase == "streaming response":
+                return
+            progress_phase = "streaming response"
+            self._emit_activity(
+                f"{role} model started responding after {time.perf_counter() - started:.0f}s."
+            )
+
+        def on_progress(kind: str) -> None:
+            nonlocal progress_phase
+            if kind == "thinking" and progress_phase == "waiting for first token":
+                progress_phase = "reasoning"
+                self._emit_activity(
+                    f"{role} model is reasoning on {model} after "
+                    f"{time.perf_counter() - started:.0f}s."
+                )
+
+        heartbeat = asyncio.create_task(
+            self._structured_heartbeat(role, model, started, lambda: progress_phase)
+        )
         try:
             raw = await self._generate(
                 model,
@@ -579,6 +617,8 @@ class LLMManager(ILLMManager):
                 num_predict=num_predict,
                 _ledger_call_id=ledger_call_id,
                 _role=role,
+                _on_token=on_token,
+                _on_progress=on_progress,
             )
         except BaseException as exc:
             if self.action_ledger:
@@ -597,6 +637,12 @@ class LLMManager(ILLMManager):
                     workflow_id=workflow_id,
                 )
             raise
+        finally:
+            heartbeat.cancel()
+            try:
+                await heartbeat
+            except asyncio.CancelledError:
+                pass
         if self.session_logger:
             self.session_logger.log(
                 "llm.response",
@@ -620,6 +666,28 @@ class LLMManager(ILLMManager):
                 call_id=ledger_call_id,
             )
         return raw
+
+    async def _structured_heartbeat(
+        self,
+        role: str,
+        model: str,
+        started: float,
+        progress_phase: Callable[[], str],
+    ) -> None:
+        interval = _timeout_env("SHAMSU_LLM_HEARTBEAT_SECONDS", 15.0)
+        while True:
+            await asyncio.sleep(interval)
+            elapsed = time.perf_counter() - started
+            self._emit_activity(
+                f"still waiting for {role} model {model}... {elapsed:.0f}s ({progress_phase()})"
+            )
+
+    def _emit_activity(self, message: str) -> None:
+        if self.on_activity:
+            try:
+                self.on_activity(message)
+            except Exception:
+                pass
 
     async def route(self, prompt: str, project_summary: str) -> RoutingDecision:
         """
