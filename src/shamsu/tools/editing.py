@@ -123,6 +123,15 @@ class FilePatchTool(Tool[FilePatchInput]):
         self._sandbox = PathSandbox(workspace)
         self._undo: list[PatchUndo] = []
 
+    def write_targets(self, arguments: FilePatchInput) -> tuple[str, ...]:
+        """The one file this patch would change.
+
+        Reported as given, not as resolved: a `WriteScope` compares against
+        workspace-relative paths, and `run` refuses anything that escapes the
+        sandbox before it can be written anyway.
+        """
+        return (arguments.path,)
+
     @property
     def undo_stack(self) -> list[PatchUndo]:
         """Applied patches, oldest first. The runtime uses this to roll back."""

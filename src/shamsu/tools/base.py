@@ -70,6 +70,16 @@ class Tool(ABC, Generic[InputT]):
         escape into the runtime.
         """
 
+    def write_targets(self, arguments: InputT) -> tuple[str, ...]:
+        """Workspace paths this call would modify.
+
+        Empty by default, which is correct for every read-only tool. A
+        *mutating* tool that writes files must override this, or a `WriteScope`
+        cannot constrain it — `tests/unit/test_tool_gateway.py` asserts that
+        every mutating tool has made that choice deliberately.
+        """
+        return ()
+
     # -- helpers for implementations --------------------------------------
 
     def ok(

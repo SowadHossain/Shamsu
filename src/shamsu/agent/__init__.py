@@ -31,6 +31,12 @@ from shamsu.agent.readonly import (
     ReadOnlyAgent,
     is_grounded,
 )
+from shamsu.agent.repair import (
+    RepairController,
+    RepairDecision,
+    RepairScope,
+    looks_like_a_test,
+)
 
 __all__ = [
     "CHANGE_FLOOR",
@@ -45,9 +51,13 @@ __all__ = [
     "PlanValidation",
     "Planner",
     "ReadOnlyAgent",
+    "RepairController",
+    "RepairDecision",
+    "RepairScope",
     "allowed_tools_for",
     "evidence_floor",
     "is_grounded",
+    "looks_like_a_test",
     "map_required_evidence",
     "materialise",
     "render_plan_summary",

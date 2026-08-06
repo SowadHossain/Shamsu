@@ -14,6 +14,8 @@ honestly that it cannot test.
 from __future__ import annotations
 
 import asyncio
+import os
+import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -111,7 +113,8 @@ class TestRunTool(Tool[TestRunInput]):
             argv = (*argv, self._sandbox.relative(resolved))
 
         try:
-            code, stdout, stderr = await self._spawn(argv, cancel)
+            with tempfile.TemporaryDirectory(prefix="shamsu-pycache-") as cache:
+                code, stdout, stderr = await self._spawn(argv, cancel, pycache=cache)
         except FileNotFoundError:
             return self.failed(f"{argv[0]} is not installed or not on PATH", started=started)
         except OSError as exc:
@@ -134,8 +137,30 @@ class TestRunTool(Tool[TestRunInput]):
         # attaches no evidence, which is exactly the required behaviour.
         return self.failed(rendered, started=started)
 
+    @staticmethod
+    def _environment(pycache: str) -> dict[str, str]:
+        """The subprocess environment, with bytecode caching redirected.
+
+        This is not a tidiness measure. CPython validates a cached `.pyc`
+        against the source's *(mtime in whole seconds, size)* — and an agent
+        patching a file often changes neither. `return a - b` becoming
+        `return a + b` is the same size, and a repair lands within a second of
+        the run that motivated it. Python then executes the previous bytecode,
+        the tests fail against code that is already correct, and the agent
+        repairs a bug that no longer exists until same-failure detection
+        declares a finished task stuck.
+
+        A fresh cache directory per run makes every run compile from source.
+        It costs a recompile and buys the guarantee that a verification result
+        describes the code currently on disk. It also keeps `__pycache__` out
+        of the workspace, so a checkpoint diff shows only real changes.
+        """
+        environment = dict(os.environ)
+        environment["PYTHONPYCACHEPREFIX"] = pycache
+        return environment
+
     async def _spawn(
-        self, argv: tuple[str, ...], cancel: CancellationToken
+        self, argv: tuple[str, ...], cancel: CancellationToken, *, pycache: str
     ) -> tuple[int, str, str]:
         """Run the command, killing it if cancellation arrives.
 
@@ -148,6 +173,7 @@ class TestRunTool(Tool[TestRunInput]):
             cwd=self._workspace,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=self._environment(pycache),
         )
 
         communicate = asyncio.ensure_future(process.communicate())

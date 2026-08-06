@@ -17,7 +17,7 @@ Tracks progress of the rebuild described in
 | 4 | Read-only agent | 🟢 Done | Grounded plans produced without modifying files |
 | 5 | Controlled editing | 🟢 Done | Simple changes completed with verified evidence |
 | 6 | Structured planning | 🟢 Done | Bounded multi-file tasks completed step-by-step |
-| 7 | Repair | ⚪ Not started | Simple failures fixed without uncontrolled edits |
+| 7 | Repair | 🟢 Done | Simple failures fixed without uncontrolled edits |
 | 8 | Code intelligence | ⚪ Not started | Retrieval evals show accurate code selection |
 | 9 | Project memory | ⚪ Not started | Memory improves success without more stale-context errors |
 | 10 | Packages and documentation | ⚪ Not started | — |
@@ -46,7 +46,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 9 | Controlled authoring | 🟢 Done |
 | 10 | Planning contracts | 🟢 Done |
 | 11 | Completion gate | 🟢 Done |
-| 12 | Repair | ⚪ Not started |
+| 12 | Repair | 🟢 Done |
 | 13 | Structural code intelligence | ⚪ Not started |
 | 14 | Lightweight project memory | ⚪ Not started |
 | 15 | Legacy utility migration | ⚪ Not started |
@@ -357,6 +357,56 @@ run there at all.
   a list the agent can be wrong about. Failed calls are counted and reported.
 - **A report for a nonexistent task raises.** A plausible-looking report for a
   run that never happened is the worst possible output.
+
+---
+
+## PR 12 — Repair ✅
+
+- [x] `verification/failure` — failure classification and the failure capsule
+- [x] `agent/repair` — `RepairScope`, `RepairController`, bounded attempts
+- [x] `WriteScope` + `Tool.write_targets` + `ToolGateway.restricted_to`
+- [x] Same-failure stopping, resumable across a fresh controller
+- [x] `store.failures_for` — per-step repair history
+
+**Milestone 7's exit condition is met:** a broken `add()` is repaired from a
+real pytest failure, with `unrelated.py` and the test file both refused by the
+gateway, and a repair that changes nothing stops instead of spending its budget.
+
+### Design points worth keeping
+
+- **The write scope is enforced by the gateway, not the repair controller.** A
+  restriction that lives in the caller is one a different caller does not have.
+  `Tool.write_targets` puts the knowledge of what a call writes in the tool,
+  because a gateway that scanned arguments for something called `path` would be
+  wrong the first time a tool named it differently — and wrong silently.
+- **Test files are protected by default.** Editing the failing test is
+  indistinguishable from deleting the evidence, and it is the most attractive
+  wrong move available. `allow_test_edits` is the caller's decision, never the
+  model's.
+- **Traceback frames alone cannot scope a repair.** When a test fails on an
+  assertion the buggy function *returned normally*, so no frame names it — the
+  only file in the traceback is the test. The scope is therefore frames ∪ files
+  the step changed ∪ files the step declared, all recorded before the failure.
+- **A refused write does not spend the mutation budget.** Otherwise one
+  out-of-scope attempt costs the decision its only edit.
+- **Same-failure detection is rebuilt from persisted failures each call.** An
+  in-memory counter would hand a stuck step its whole budget again after a
+  resume.
+- **Classification is patterns over real output, never a model.** The
+  fall-through is documented rather than clever: unmatched `test.run` output is
+  a test failure, anything else is a tool failure.
+
+### Bug found and fixed during this PR
+
+`test.run` could report a *fixed* bug as still broken. CPython validates cached
+bytecode against the source's (mtime in whole seconds, size), and an agent
+patching a file frequently changes neither — `return a - b` → `return a + b` is
+the same size, and a repair lands within a second of the run that motivated it.
+Python then executed the previous bytecode. The agent would repair a bug that
+no longer existed until same-failure detection blocked a task that was already
+done. Each run now gets a fresh `PYTHONPYCACHEPREFIX`, which also keeps
+`__pycache__` out of the workspace so checkpoint diffs show only real changes.
+Both regression tests were confirmed to fail without the fix.
 
 ---
 

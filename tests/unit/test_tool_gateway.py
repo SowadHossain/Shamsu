@@ -9,6 +9,7 @@ on the exception.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, Field
@@ -80,6 +81,44 @@ class ExplodingTool(Tool[EchoInput]):
 
     async def run(self, arguments: EchoInput, cancel: CancelAfter) -> ToolResult:  # type: ignore[override]
         raise RuntimeError("something unexpected")
+
+
+class MutatingTool(Tool[EchoInput]):
+    """A tool that writes the file named in `text`."""
+
+    input_model = EchoInput
+
+    def __init__(self) -> None:
+        self.contract = _contract(
+            "demo.mutate",
+            allowed_phases=frozenset({Phase.AUTHOR, Phase.REPAIR}),
+            mutating=True,
+        )
+        self.calls: list[EchoInput] = []
+
+    def write_targets(self, arguments: EchoInput) -> tuple[str, ...]:
+        return (arguments.text,)
+
+    async def run(self, arguments: EchoInput, cancel: CancelAfter) -> ToolResult:  # type: ignore[override]
+        self.calls.append(arguments)
+        return self.ok(f"wrote {arguments.text}")
+
+
+class _AllowList:
+    """A minimal `WriteScope` for gateway tests."""
+
+    def __init__(self, allowed: set[str]) -> None:
+        self.allowed = allowed
+
+    def permits(self, path: str) -> bool:
+        return path in self.allowed
+
+    def describe(self) -> str:
+        return f"This step may write only {', '.join(sorted(self.allowed))}."
+
+
+def _scope(allowed: set[str]) -> _AllowList:
+    return _AllowList(allowed)
 
 
 def _invoke(
@@ -398,3 +437,58 @@ class TestTimeoutAndCancellation:
 
         asyncio.run(scenario())
         assert tool.finished is False
+
+
+class TestWriteScope:
+    """Restricting *which* files may be written, not just whether."""
+
+    def test_every_mutating_tool_declares_its_write_targets(self) -> None:
+        """A `WriteScope` cannot constrain a tool that does not say what it writes.
+
+        The exemption list is the point: a new mutating tool must either
+        declare its targets or be added here deliberately, with a reason. It
+        cannot become unconstrained by omission.
+        """
+        from shamsu.tools import authoring_tools
+
+        # `git.checkpoint` records what is already on disk; it writes no file
+        # the scope would have anything to say about.
+        exempt = {"git.checkpoint"}
+
+        for tool in authoring_tools(Path(".")):
+            if not tool.contract.mutating or tool.contract.name in exempt:
+                continue
+            declared = type(tool).write_targets is not Tool.write_targets
+            assert declared, (
+                f"{tool.contract.name} mutates but does not override write_targets, "
+                "so no write scope can constrain it"
+            )
+
+    def test_a_scope_refuses_a_write_outside_it(self) -> None:
+        gateway = ToolGateway([MutatingTool()])
+        with (
+            gateway.restricted_to(_scope({"allowed.py"})),
+            pytest.raises(ToolPolicyViolation, match="outside the permitted write scope"),
+        ):
+            _invoke(gateway, "demo.mutate", phase=Phase.AUTHOR, text="other.py")
+
+    def test_a_scope_permits_a_write_inside_it(self) -> None:
+        gateway = ToolGateway([MutatingTool()])
+        with gateway.restricted_to(_scope({"allowed.py"})):
+            result = _invoke(gateway, "demo.mutate", phase=Phase.AUTHOR, text="allowed.py")
+        assert result.ok is True
+
+    def test_no_scope_means_no_restriction(self) -> None:
+        """The gateway is not a write-blocker by default; phases handle that."""
+        gateway = ToolGateway([MutatingTool()])
+        assert _invoke(gateway, "demo.mutate", phase=Phase.AUTHOR, text="anything.py").ok is True
+
+    def test_the_refusal_explains_the_restriction(self) -> None:
+        """The model has to act on this text."""
+        gateway = ToolGateway([MutatingTool()])
+        with (
+            gateway.restricted_to(_scope({"allowed.py"})),
+            pytest.raises(ToolPolicyViolation) as caught,
+        ):
+            _invoke(gateway, "demo.mutate", phase=Phase.AUTHOR, text="other.py")
+        assert "only allowed.py" in str(caught.value)

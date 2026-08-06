@@ -45,6 +45,12 @@ from shamsu.verification.evidence import (
     check_completion,
     requirements_for,
 )
+from shamsu.verification.failure import (
+    FailureCapsule,
+    RepairAttempt,
+    build_capsule,
+    classify_failure,
+)
 
 __all__ = [
     "CLAIM_REQUIREMENTS",
@@ -54,14 +60,18 @@ __all__ = [
     "EvidenceEntry",
     "EvidenceRecorder",
     "EvidenceReport",
+    "FailureCapsule",
     "GateResult",
     "Recorded",
+    "RepairAttempt",
     "RepairTracker",
     "StepVerdict",
     "TaskCompletion",
     "TestDigest",
+    "build_capsule",
     "build_report",
     "check_completion",
+    "classify_failure",
     "digest_test_output",
     "error_signature",
     "known_claims",

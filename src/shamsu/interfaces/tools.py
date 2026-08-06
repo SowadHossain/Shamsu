@@ -111,6 +111,26 @@ class ToolPolicyViolation(Exception):
 
 
 @runtime_checkable
+class WriteScope(Protocol):
+    """A restriction on which files may be modified.
+
+    Exists so "a repair may only touch files related to the failure" (plan
+    §20.5) is enforced by the gateway, on the same path as every other policy,
+    rather than by the repair controller remembering to check. A restriction
+    that lives in the caller is a restriction that a different caller does not
+    have.
+    """
+
+    def permits(self, path: str) -> bool:
+        """Whether `path` may be written."""
+        ...
+
+    def describe(self) -> str:
+        """One line explaining the restriction, for the refusal message."""
+        ...
+
+
+@runtime_checkable
 class Tool(Protocol):
     """A single executable capability.
 
@@ -148,6 +168,18 @@ class Tool(Protocol):
         Return `ok=False` for expected failures. The gateway enforces the
         contract's timeout and output cap around this call, so implementations
         do not need to.
+        """
+        ...
+
+    def write_targets(self, arguments: Any) -> tuple[str, ...]:
+        """Workspace paths this call would modify.
+
+        Declared by the tool because the tool is what knows. A gateway that
+        guessed by looking for an argument called `path` would be wrong the
+        first time a tool named it something else, and wrong silently.
+
+        Empty means the call writes no file. A mutating tool that returns empty
+        is unconstrained by any `WriteScope`.
         """
         ...
 
@@ -197,4 +229,5 @@ __all__ = [
     "ToolPolicyViolation",
     "ToolRequest",
     "ToolResult",
+    "WriteScope",
 ]

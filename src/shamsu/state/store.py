@@ -31,12 +31,14 @@ from shamsu.interfaces.enums import (
     AgentState,
     ApprovalDecision,
     EvidenceKind,
+    FailureKind,
     Phase,
     RunStatus,
     StepOutcome,
 )
 from shamsu.interfaces.ids import (
     EvidenceId,
+    FailureId,
     PlanId,
     ProjectId,
     RunId,
@@ -875,6 +877,38 @@ class StateStore:
                 ),
             )
         return failure
+
+    @_synchronized
+    def failures_for(
+        self, task_id: TaskId, *, step_id: StepId | None = None
+    ) -> Sequence[FailureRecord]:
+        """Recorded failures, oldest first.
+
+        Failures are kept per step so a repair controller can see what this
+        step has already tried, rather than what the task has tried in total —
+        those are different questions and only the first bounds a repair.
+        """
+        query = "SELECT * FROM failures WHERE task_id = ?"
+        params: tuple[Any, ...] = (task_id,)
+        if step_id is not None:
+            query += " AND step_id = ?"
+            params += (step_id,)
+        rows = self._connection.execute(query + " ORDER BY created_at, rowid", params).fetchall()
+        return [
+            FailureRecord(
+                failure_id=FailureId(row["failure_id"]),
+                task_id=TaskId(row["task_id"]),
+                step_id=StepId(row["step_id"]) if row["step_id"] else None,
+                kind=FailureKind(row["kind"]),
+                signature=row["signature"],
+                expected=row["expected"],
+                actual=row["actual"],
+                detail=row["detail"],
+                attempt=row["attempt"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+            )
+            for row in rows
+        ]
 
     @_synchronized
     def repeated_failure(self, task_id: TaskId, signature: str, *, threshold: int = 2) -> bool:

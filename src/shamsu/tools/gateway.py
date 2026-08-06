@@ -12,9 +12,11 @@ Enforcement order, and why it is this order:
 3. **Check approval.** Before argument validation, so a high-risk call is not
    quietly rejected on a typo when the real answer is "a human must decide".
 4. **Validate arguments.** Against the same schema the model was shown.
-5. **Check the mutation budget.** Last gate before execution.
-6. **Execute** under timeout, racing cancellation.
-7. **Cap output** before it can reach any context.
+5. **Check the write scope.** A repair may only touch failure-related files
+   (plan §20.5), and a refused write must not spend the mutation budget.
+6. **Check the mutation budget.** Last gate before execution.
+7. **Execute** under timeout, racing cancellation.
+8. **Cap output** before it can reach any context.
 
 Every refusal happens *before* the side effect. `ToolPolicyViolation` from this
 class always means nothing was executed.
@@ -40,6 +42,7 @@ from shamsu.interfaces.tools import (
     ToolPolicyViolation,
     ToolRequest,
     ToolResult,
+    WriteScope,
 )
 from shamsu.tools.base import Tool
 
@@ -72,6 +75,7 @@ class ToolGateway:
         self._approval = approval or deny_all
         self._mutation_budget = mutating_calls_per_decision
         self._mutations_used = 0
+        self._scope: WriteScope | None = None
 
         for tool in tools or ():
             self.register(tool)
@@ -146,6 +150,27 @@ class ToolGateway:
     def mutations_remaining(self) -> int:
         return max(0, self._mutation_budget - self._mutations_used)
 
+    @contextmanager
+    def restricted_to(self, scope: WriteScope) -> Iterator[None]:
+        """Restrict which files may be written, for the duration of the block.
+
+        Used by repair (plan §20.5: modify failure-related files, not the
+        repository). Restoring the previous scope rather than clearing it means
+        nesting narrows and never widens — an inner block cannot hand back more
+        permission than it was given.
+        """
+        previous = self._scope
+        self._scope = scope
+        try:
+            yield
+        finally:
+            self._scope = previous
+
+    @property
+    def scope(self) -> WriteScope | None:
+        """The active write restriction, if any."""
+        return self._scope
+
     # -- execution ---------------------------------------------------------
 
     async def invoke(
@@ -170,6 +195,10 @@ class ToolGateway:
         arguments = tool.parse(request.arguments)
 
         if contract.mutating:
+            # Scope before budget: a call the scope forbids must not consume the
+            # one mutation this decision is allowed.
+            self._check_scope(tool, arguments)
+
             if self._mutations_used >= self._mutation_budget:
                 raise ToolPolicyViolation(
                     f"{contract.name}: mutation budget exhausted "
@@ -178,6 +207,23 @@ class ToolGateway:
             self._mutations_used += 1
 
         return await self._execute(tool, arguments, cancel)
+
+    def _check_scope(self, tool: Tool[Any], arguments: Any) -> None:
+        """Refuse a write the active scope does not cover.
+
+        A mutating tool that declares no write targets is not constrained. That
+        is correct for `git.checkpoint`, which records what is already on disk,
+        and it is the reason `write_targets` is a tool's own declaration rather
+        than something the gateway infers.
+        """
+        if self._scope is None:
+            return
+        for target in tool.write_targets(arguments):
+            if not self._scope.permits(target):
+                raise ToolPolicyViolation(
+                    f"{tool.contract.name}: {target} is outside the permitted "
+                    f"write scope. {self._scope.describe()}"
+                )
 
     def _resolve(self, request: ToolRequest, phase: Phase) -> Tool[Any]:
         tool = self._tools.get(request.tool)
