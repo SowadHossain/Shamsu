@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codebase-memory": {
+      "command": "/root/.shamsu/tools/codebase-memory-mcp/codebase-memory-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
