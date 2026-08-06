@@ -617,6 +617,54 @@ class StateStore:
         return event
 
     @_synchronized
+    def get_tool_event(self, event_id: ToolEventId) -> ToolEventRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM tool_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return None if row is None else self._event_from_row(row)
+
+    @_synchronized
+    def tool_events_for(
+        self, task_id: TaskId, *, step_id: StepId | None = None, tool: str | None = None
+    ) -> Sequence[ToolEventRecord]:
+        """Observed tool executions, oldest first.
+
+        The basis of every derived report. A final report built from these is
+        built from what the runtime *watched happen*; one built from model
+        prose is built from what the model says happened, and those differ
+        exactly when it matters.
+        """
+        query = "SELECT * FROM tool_events WHERE task_id = ?"
+        params: tuple[Any, ...] = (task_id,)
+        if step_id is not None:
+            query += " AND step_id = ?"
+            params += (step_id,)
+        if tool is not None:
+            query += " AND tool = ?"
+            params += (tool,)
+        rows = self._connection.execute(query + " ORDER BY created_at, rowid", params).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    @staticmethod
+    def _event_from_row(row: sqlite3.Row) -> ToolEventRecord:
+        return ToolEventRecord(
+            event_id=ToolEventId(row["event_id"]),
+            run_id=RunId(row["run_id"]),
+            task_id=TaskId(row["task_id"]),
+            step_id=StepId(row["step_id"]) if row["step_id"] else None,
+            tool=row["tool"],
+            phase=Phase(row["phase"]),
+            arguments_json=row["arguments_json"],
+            ok=bool(row["ok"]),
+            output=row["output"],
+            error=row["error"],
+            truncated=bool(row["truncated"]),
+            original_bytes=row["original_bytes"],
+            duration_seconds=row["duration_seconds"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @_synchronized
     def record_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
         """Register verified evidence.
 

@@ -24,14 +24,19 @@ from shamsu.agent.planning import Planner, render_plan_summary, render_step
 from shamsu.agent.readonly import ReadOnlyAgent
 from shamsu.context.compiler import ContextCompiler, FrameInputs
 from shamsu.interfaces.cancellation import NullCancellationToken
-from shamsu.interfaces.enums import EvidenceKind, Phase, StepOutcome
+from shamsu.interfaces.enums import AgentState, EvidenceKind, Phase, StepOutcome
 from shamsu.interfaces.ids import ProjectId, RunId, TaskId
 from shamsu.interfaces.tools import ToolPolicyViolation, ToolRequest
 from shamsu.models.contracts import ImplementationPlan, PlanStepProposal
 from shamsu.state import ProjectRecord, RunRecord, StateStore, TaskRecord, new_id
 from shamsu.tools import ToolGateway, authoring_tools
 from shamsu.tools.git import run_git
-from shamsu.verification import EvidenceRecorder
+from shamsu.verification import (
+    CompletionGate,
+    EvidenceRecorder,
+    build_report,
+    next_after_completion_gate,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -374,6 +379,94 @@ class TestReplanningMidTask:
             agent.replan("fix addition", previous_summary="Original.", reason="it failed")
         )
         assert plan is None
+
+
+class TestFinalCompletion:
+    def test_a_finished_task_completes_and_reports_what_it_actually_did(
+        self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
+    ) -> None:
+        """The end of the line: plan → steps → gate → report, from rows only."""
+        gateway = ToolGateway(authoring_tools(repo))
+        recorder = EvidenceRecorder(store, run.run_id, task.task_id)
+        planner = Planner(store)
+
+        materialised = planner.create(task, ImplementationPlan.model_validate_json(PLAN_JSON))
+        gate = CompletionGate(store, task.task_id)
+
+        # Nothing done yet: the final gate refuses before the first step runs.
+        assert gate.check_task(materialised.plan_id).satisfied is False
+
+        edits = (
+            {"path": "calc.py", "find": "return a - b", "replace": "return a + b"},
+            {"path": "report.py", "find": "    result = 0", "replace": "    result: int = 0"},
+        )
+        for edit in edits:
+            step = planner.next_step(materialised.plan_id)
+            assert step is not None
+            planner.begin_step(step)
+
+            for tool, phase, arguments in (
+                ("file.patch", Phase.AUTHOR, edit),
+                ("test.run", Phase.VERIFY, {"command": "pytest"}),
+                ("git.inspect", Phase.VERIFY, {"what": "diff"}),
+            ):
+                request, result = _invoke(gateway, tool, phase, **arguments)
+                assert result.ok is True, result.error
+                recorder.record(request, result, phase, step_id=step.step_id)
+
+            _, closed = planner.close_step(step, recorder.verified(step.step_id))
+            assert closed.satisfied is True
+
+        verdict = gate.check_task(materialised.plan_id)
+        assert verdict.satisfied is True
+        assert next_after_completion_gate(verdict, can_replan=True) is AgentState.FINAL_REPORT
+
+        report = build_report(store, task.task_id, materialised.plan_id)
+        rendered = report.render()
+
+        assert report.changed_files == ("calc.py", "report.py")
+        assert "COMPLETE" in rendered and "NOT COMPLETE" not in rendered
+        assert "tests_passed via test.run" in rendered
+        assert "git_diff_reviewed via git.inspect" in rendered
+        assert report.failed_calls == 0
+
+    def test_finishing_one_step_of_two_does_not_finish_the_task(
+        self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
+    ) -> None:
+        """A thorough first step satisfies every evidence kind the plan needs."""
+        gateway = ToolGateway(authoring_tools(repo))
+        recorder = EvidenceRecorder(store, run.run_id, task.task_id)
+        planner = Planner(store)
+
+        materialised = planner.create(task, ImplementationPlan.model_validate_json(PLAN_JSON))
+        step = planner.next_step(materialised.plan_id)
+        assert step is not None
+
+        for tool, phase, arguments in (
+            (
+                "file.patch",
+                Phase.AUTHOR,
+                {"path": "calc.py", "find": "return a - b", "replace": "return a + b"},
+            ),
+            ("test.run", Phase.VERIFY, {"command": "pytest"}),
+            ("git.inspect", Phase.VERIFY, {"what": "diff"}),
+        ):
+            request, result = _invoke(gateway, tool, phase, **arguments)
+            recorder.record(request, result, phase, step_id=step.step_id)
+
+        planner.close_step(step, recorder.verified(step.step_id))
+
+        # Every required kind now exists at task scope. The gate still refuses.
+        assert recorder.verified() >= {
+            EvidenceKind.FILE_CHANGED,
+            EvidenceKind.GIT_DIFF_REVIEWED,
+            EvidenceKind.TESTS_PASSED,
+        }
+        verdict = CompletionGate(store, task.task_id).check_task(materialised.plan_id)
+        assert verdict.satisfied is False
+        assert [item.title for item in verdict.unfinished] == [
+            "Confirm total() in report.py aggregates correctly"
+        ]
 
 
 class TestPlanEntersTheFrame:

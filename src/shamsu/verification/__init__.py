@@ -18,6 +18,19 @@ stable error signature so a repair loop can tell "same failure again" from
 Milestone 5. See plan sections 25, 26, 27.
 """
 
+from shamsu.verification.completion import (
+    TASK_COMPLETE,
+    ClaimVerdict,
+    CompletionGate,
+    EvidenceEntry,
+    EvidenceReport,
+    StepVerdict,
+    TaskCompletion,
+    build_report,
+    known_claims,
+    next_after_completion_gate,
+    validate_claim,
+)
 from shamsu.verification.digest import (
     RepairTracker,
     TestDigest,
@@ -35,13 +48,24 @@ from shamsu.verification.evidence import (
 
 __all__ = [
     "CLAIM_REQUIREMENTS",
+    "TASK_COMPLETE",
+    "ClaimVerdict",
+    "CompletionGate",
+    "EvidenceEntry",
     "EvidenceRecorder",
+    "EvidenceReport",
     "GateResult",
     "Recorded",
     "RepairTracker",
+    "StepVerdict",
+    "TaskCompletion",
     "TestDigest",
+    "build_report",
     "check_completion",
     "digest_test_output",
     "error_signature",
+    "known_claims",
+    "next_after_completion_gate",
     "requirements_for",
+    "validate_claim",
 ]

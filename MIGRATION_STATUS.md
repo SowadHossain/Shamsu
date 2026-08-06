@@ -45,7 +45,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 8 | Read-only agent | 🟢 Done |
 | 9 | Controlled authoring | 🟢 Done |
 | 10 | Planning contracts | 🟢 Done |
-| 11 | Completion gate | ⚪ Not started |
+| 11 | Completion gate | 🟢 Done |
 | 12 | Repair | ⚪ Not started |
 | 13 | Structural code intelligence | ⚪ Not started |
 | 14 | Lightweight project memory | ⚪ Not started |
@@ -319,6 +319,44 @@ scoped to that step.
   boundary so the next plan can be told what not to redo.
 - **There is one path to `StepOutcome.PASS`, and it reads the evidence table.**
   `fail_step` refuses to write a passing outcome.
+
+---
+
+## PR 11 — Completion gate ✅
+
+- [x] `CompletionClaim` — the shape a model uses to *propose* completion
+- [x] `validate_claim` — named claims checked against rows; unknown names refused
+- [x] Step gate — `required ⊆ verified`, scoped to the step that earned it
+- [x] Final gate — every step passed, at its own scope, or the task is not done
+- [x] `build_report` — the final report, derived from `tool_events` and `evidence`
+- [x] `next_after_completion_gate` — where a refusal sends the run
+- [x] `tests/adversarial/test_evidence_forgery.py` — the claim under attack
+
+**Plan §20.7 is enforced structurally:** the model cannot set completion
+directly. It proposes; the runtime decides from rows. No tool declares
+`Phase.COMPLETE`, so the complete phase has an empty tool surface — nothing can
+run there at all.
+
+### Design points worth keeping
+
+- **An unknown claim is refused, not defaulted.** `requirements_for` returns an
+  empty set for an unrecognised name, and an empty requirement set is trivially
+  satisfied — so `tests_pas` would otherwise sail through the check that exists
+  to stop it.
+- **The final gate is not the task-level union of evidence.** A four-step plan
+  whose first step patched a file, ran tests, and reviewed a diff satisfies a
+  union check outright, and the other three steps complete having done nothing.
+  Each step is judged at its own scope instead.
+- **Rows outrank the recorded outcome.** `StepOutcome.PASS` is a cached
+  decision; the evidence table is the fact. A step marked passed whose evidence
+  is missing does not complete the task.
+- **`evidence_cited` is never consulted.** It exists so a refusal can be
+  explained, not so a claim can be supported.
+- **The report is derived, including its file list.** Changed files are read
+  off successful `file.patch` executions, because a list the agent maintains is
+  a list the agent can be wrong about. Failed calls are counted and reported.
+- **A report for a nonexistent task raises.** A plausible-looking report for a
+  run that never happened is the worst possible output.
 
 ---
 

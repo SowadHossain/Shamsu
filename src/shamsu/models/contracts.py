@@ -111,6 +111,29 @@ class ImplementationPlan(BaseModel):
     open_questions: tuple[str, ...] = ()
 
 
+class CompletionClaim(BaseModel):
+    """The model's proposal that something is finished.
+
+    A *proposal*, and the naming is deliberate. Nothing in this shape can set
+    completion: `claim` names a requirement set the runtime already defined,
+    and `evidence_cited` is prose the runtime ignores when deciding. Both exist
+    so a refusal can be explained — "you claimed tests_pass and cited a run
+    that failed" is actionable, where "refused" is not.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    claim: str = Field(
+        min_length=1,
+        description="One of the known claim names, e.g. 'tests_pass' or 'task_complete'.",
+    )
+    summary: str = Field(default="", max_length=1000)
+    evidence_cited: tuple[str, ...] = Field(
+        default=(),
+        description="What the model believes proves the claim. Advisory; never checked against.",
+    )
+
+
 class ProjectAssessment(BaseModel):
     """What the agent concluded about a project after inspecting it."""
 
@@ -128,6 +151,7 @@ CONTRACTS: Mapping[str, type[BaseModel]] = {
     "InvestigationStep": InvestigationStep,
     "ImplementationPlan": ImplementationPlan,
     "ProjectAssessment": ProjectAssessment,
+    "CompletionClaim": CompletionClaim,
 }
 
 
@@ -181,6 +205,7 @@ def _reference_name(spec: Mapping[str, Any]) -> str | None:
 
 __all__ = [
     "CONTRACTS",
+    "CompletionClaim",
     "ImplementationPlan",
     "InvestigationStep",
     "PlanStepProposal",
