@@ -38,6 +38,10 @@ shamsu-launcher-test/
 dogfood-*/
 *-dogfood/
 
+# Tooling installed with `pip install --target` because this box is PEP-668
+# externally managed and has no python3-venv. See CLAUDE.md.
+.tools/
+
 # Scratch build/output dir used by the release scripts.
 tmp/
 ASE2_PRD_EVAL_ARTIFACTS/

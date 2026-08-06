@@ -16,7 +16,7 @@ Tracks progress of the rebuild described in
 | 3 | Artifact foundation | 🟢 Done | Artifacts regenerate correctly after source changes |
 | 4 | Read-only agent | 🟢 Done | Grounded plans produced without modifying files |
 | 5 | Controlled editing | 🟢 Done | Simple changes completed with verified evidence |
-| 6 | Structured planning | ⚪ Not started | Bounded multi-file tasks completed step-by-step |
+| 6 | Structured planning | 🟢 Done | Bounded multi-file tasks completed step-by-step |
 | 7 | Repair | ⚪ Not started | Simple failures fixed without uncontrolled edits |
 | 8 | Code intelligence | ⚪ Not started | Retrieval evals show accurate code selection |
 | 9 | Project memory | ⚪ Not started | Memory improves success without more stale-context errors |
@@ -44,7 +44,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 7 | Tool contracts and policy | 🟢 Done |
 | 8 | Read-only agent | 🟢 Done |
 | 9 | Controlled authoring | 🟢 Done |
-| 10 | Planning contracts | ⚪ Not started |
+| 10 | Planning contracts | 🟢 Done |
 | 11 | Completion gate | ⚪ Not started |
 | 12 | Repair | ⚪ Not started |
 | 13 | Structural code intelligence | ⚪ Not started |
@@ -277,6 +277,48 @@ executions.
 - **Error signatures ignore temp paths, durations, and line numbers**, so two
   attempts at the same failure sign identically and `RepairTracker` can tell
   grinding from progress.
+
+---
+
+## PR 10 — Planning contracts ✅
+
+- [x] `agent/planning` — proposal → `plans` / `plan_steps` rows
+- [x] Evidence vocabulary — prose requirements mapped onto `EvidenceKind`
+- [x] Evidence floor — a change step's minimum, set by the runtime
+- [x] Acceptance criteria — preserved, including phrases that mapped to nothing
+- [x] Step gate — `required ⊆ verified`, per step, against evidence rows
+- [x] Re-planning — versioned, superseding, bounded at 2 per task
+- [x] `render_plan_summary` / `render_step` — the compact plan view (plan §21)
+
+**Milestone 6's exit condition is met:** a two-step plan across two files runs
+to completion step by step, with each step's gate opening only on evidence rows
+scoped to that step.
+
+### Design points worth keeping
+
+- **A model may raise its own bar, never lower it.** `required_evidence` is the
+  union of what the plan asked for and what the runtime demands. A change step
+  always requires `FILE_CHANGED` and `GIT_DIFF_REVIEWED`, whatever the plan
+  says.
+- **The only discount on evidence costs the ability to write.** Declaring a
+  step `investigate` removes its floor *and* every mutating tool from its
+  allowlist. `change` is the default, so an omitted field lands on the stricter
+  side.
+- **Free-text evidence is mapped, not adopted.** "targeted authentication tests
+  pass" becomes `TESTS_PASSED` by a runtime vocabulary. A phrase matching
+  nothing is not guessed at — it survives as an acceptance criterion, where it
+  is readable prose rather than a requirement nothing can satisfy.
+- **A plan cannot pre-approve its own step.** `PlanStepProposal` has no
+  approval field; `approval_required` is derived from risk by the runtime.
+- **Paths are checked at plan time.** A step declaring it will edit
+  `../../etc/passwd` is refused before any row is written, not three decisions
+  later with the budget spent.
+- **Re-planning supersedes; it never edits.** Completed work is not copied
+  forward, because evidence rows key to the step that earned them and a copy
+  under a new id would orphan the proof. Finished step *titles* cross the
+  boundary so the next plan can be told what not to redo.
+- **There is one path to `StepOutcome.PASS`, and it reads the evidence table.**
+  `fail_step` refuses to write a passing outcome.
 
 ---
 

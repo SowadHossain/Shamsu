@@ -475,34 +475,101 @@ class StateStore:
         return plan
 
     @_synchronized
-    def get_steps(self, plan_id: PlanId) -> Sequence[PlanStepRecord]:
-        from shamsu.interfaces.enums import Risk
+    def get_plan(self, plan_id: PlanId) -> PlanRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM plans WHERE plan_id = ?", (plan_id,)
+        ).fetchone()
+        return None if row is None else self._plan_from_row(row)
 
+    @_synchronized
+    def latest_plan(self, task_id: TaskId) -> PlanRecord | None:
+        """The highest-versioned plan for a task.
+
+        Ordered by version rather than `created_at`: two plans written inside
+        the same clock tick would otherwise be returned in arbitrary order, and
+        "which plan is current?" must never depend on timer resolution.
+        """
+        row = self._connection.execute(
+            "SELECT * FROM plans WHERE task_id = ? ORDER BY version DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return None if row is None else self._plan_from_row(row)
+
+    @_synchronized
+    def plan_history(self, task_id: TaskId) -> Sequence[PlanRecord]:
+        """Every plan for a task, oldest first.
+
+        Superseded plans are kept, not deleted: "what did it think it was doing
+        before it re-planned?" is unanswerable otherwise.
+        """
+        rows = self._connection.execute(
+            "SELECT * FROM plans WHERE task_id = ? ORDER BY version", (task_id,)
+        ).fetchall()
+        return [self._plan_from_row(row) for row in rows]
+
+    @_synchronized
+    def supersede_plan(self, plan_id: PlanId, successor: PlanId) -> None:
+        """Mark `plan_id` as replaced by `successor`.
+
+        Raises:
+            KeyError: no such plan. A silent no-op here would leave a task with
+                two plans that both look current.
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE plans SET superseded_by = ? WHERE plan_id = ?", (successor, plan_id)
+            )
+        if cursor.rowcount == 0:
+            raise KeyError(f"no plan {plan_id!r} to supersede")
+
+    @staticmethod
+    def _plan_from_row(row: sqlite3.Row) -> PlanRecord:
+        return PlanRecord(
+            plan_id=PlanId(row["plan_id"]),
+            task_id=TaskId(row["task_id"]),
+            version=row["version"],
+            summary=row["summary"],
+            superseded_by=PlanId(row["superseded_by"]) if row["superseded_by"] else None,
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
+
+    @_synchronized
+    def get_step(self, step_id: StepId) -> PlanStepRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM plan_steps WHERE step_id = ?", (step_id,)
+        ).fetchone()
+        return None if row is None else self._step_from_row(row)
+
+    @_synchronized
+    def get_steps(self, plan_id: PlanId) -> Sequence[PlanStepRecord]:
         rows = self._connection.execute(
             "SELECT * FROM plan_steps WHERE plan_id = ? ORDER BY ordinal", (plan_id,)
         ).fetchall()
-        return [
-            PlanStepRecord(
-                step_id=StepId(row["step_id"]),
-                plan_id=PlanId(row["plan_id"]),
-                ordinal=row["ordinal"],
-                title=row["title"],
-                inputs=_load_tuple(row["inputs"]),
-                outputs=_load_tuple(row["outputs"]),
-                constraints=_load_tuple(row["constraints"]),
-                allowed_tools=_load_tuple(row["allowed_tools"]),
-                acceptance_criteria=_load_tuple(row["acceptance_criteria"]),
-                required_evidence=tuple(
-                    EvidenceKind(value) for value in json.loads(row["required_evidence"])
-                ),
-                risk=Risk(row["risk"]),
-                approval_required=bool(row["approval_required"]),
-                outcome=StepOutcome(row["outcome"]) if row["outcome"] else None,
-                attempts=row["attempts"],
-                created_at=datetime.fromisoformat(row["created_at"]),
-            )
-            for row in rows
-        ]
+        return [self._step_from_row(row) for row in rows]
+
+    @staticmethod
+    def _step_from_row(row: sqlite3.Row) -> PlanStepRecord:
+        from shamsu.interfaces.enums import Risk
+
+        return PlanStepRecord(
+            step_id=StepId(row["step_id"]),
+            plan_id=PlanId(row["plan_id"]),
+            ordinal=row["ordinal"],
+            title=row["title"],
+            inputs=_load_tuple(row["inputs"]),
+            outputs=_load_tuple(row["outputs"]),
+            constraints=_load_tuple(row["constraints"]),
+            allowed_tools=_load_tuple(row["allowed_tools"]),
+            acceptance_criteria=_load_tuple(row["acceptance_criteria"]),
+            required_evidence=tuple(
+                EvidenceKind(value) for value in json.loads(row["required_evidence"])
+            ),
+            risk=Risk(row["risk"]),
+            approval_required=bool(row["approval_required"]),
+            outcome=StepOutcome(row["outcome"]) if row["outcome"] else None,
+            attempts=row["attempts"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+        )
 
     @_synchronized
     def save_step(self, step: PlanStepRecord) -> PlanStepRecord:

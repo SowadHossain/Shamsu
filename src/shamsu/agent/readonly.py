@@ -20,10 +20,12 @@ behave.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from shamsu.context.compiler import ContextCompiler, FrameInputs
 from shamsu.interfaces.cancellation import CancellationToken, NullCancellationToken
+from shamsu.interfaces.context import ContextFrame
 from shamsu.interfaces.enums import Phase
 from shamsu.interfaces.models import (
     ModelClient,
@@ -220,6 +222,63 @@ class ReadOnlyAgent:
             (),
         )
 
+        return await self._request_plan(frame, token)
+
+    async def replan(
+        self,
+        task: str,
+        *,
+        previous_summary: str,
+        completed: Sequence[str] = (),
+        reason: str,
+        cancel: CancellationToken | None = None,
+    ) -> ImplementationPlan | None:
+        """Produce a replacement plan after the current one stopped working.
+
+        `completed` is what the previous plan already proved done. It is stated
+        as a prohibition rather than left implicit: a model shown only the
+        failure will cheerfully re-propose the steps that already succeeded,
+        and re-running a verified change is how a working repository gets
+        broken by a repair.
+
+        Returns None when no valid plan comes back — the runtime then has a
+        bounded re-plan that failed, which is a reportable outcome rather than
+        a plan it has to second-guess.
+        """
+        token = cancel or NullCancellationToken()
+        token.raise_if_cancelled()
+
+        done = (
+            "Already done — do NOT repeat these:\n" + "\n".join(f"- {title}" for title in completed)
+            if completed
+            else "Nothing has been completed yet."
+        )
+
+        frame = self._compiler.compile(
+            FrameInputs(
+                phase=Phase.PLAN,
+                task=task,
+                output_contract="ImplementationPlan",
+                plan_summary=previous_summary,
+                latest_observation=f"Why the previous plan was abandoned:\n{reason}",
+                previous_step_summary=done,
+                system_rules=(
+                    "The previous plan did not work. Produce a replacement that "
+                    "takes a different approach to the part that failed. Do not "
+                    "restate the previous plan with different wording.\n\n"
+                    + schema_hint(ImplementationPlan)
+                ),
+            ),
+            (),
+        )
+
+        return await self._request_plan(frame, token)
+
+    # -- internals ---------------------------------------------------------
+
+    async def _request_plan(
+        self, frame: ContextFrame, token: CancellationToken
+    ) -> ImplementationPlan | None:
         request = ModelRequest(
             messages=(ModelMessage(role="user", content=frame.render()),),
             max_output_tokens=frame.budget.output_reserve,
@@ -228,8 +287,6 @@ class ReadOnlyAgent:
             return await self._model.generate_typed(request, ImplementationPlan, token)
         except (ModelContractError, ModelUnavailable):
             return None
-
-    # -- internals ---------------------------------------------------------
 
     async def _decide(self, prompt: str, token: CancellationToken) -> InvestigationStep:
         request = ModelRequest(

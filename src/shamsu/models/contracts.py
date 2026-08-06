@@ -68,12 +68,22 @@ class PlanStepProposal(BaseModel):
     maps that onto real evidence kinds. Letting the model emit enum members
     directly would let a hallucinated member become a completion requirement
     nothing can ever satisfy.
+
+    `kind` defaults to the *stricter* option. A step that changes code carries
+    a mandatory evidence floor; the only way to get a weaker requirement is to
+    declare `investigate`, which also removes every mutating tool from the
+    step. Lowering the bar therefore costs the ability to write, which is the
+    only shape of that choice a model can be trusted with.
     """
 
     model_config = ConfigDict(frozen=True)
 
     title: str = Field(min_length=1, max_length=200)
     intent: str = Field(default="", max_length=600)
+    kind: Literal["change", "investigate"] = Field(
+        default="change",
+        description="'change' edits files; 'investigate' is read-only and cannot patch.",
+    )
     files: tuple[str, ...] = Field(
         default=(), description="Files this step expects to read or change."
     )
