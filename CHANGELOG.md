@@ -43,6 +43,25 @@ The v1 changelog is archived at
 - **Deterministic test double** — `tests/fixtures/fake_model.py` provides a
   scripted `ModelClient` and a `CancelAfter` token. No test contacts a model.
 - `README.md`, `ARCHITECTURE.md`, `MIGRATION_STATUS.md`, `LEGACY_COMPONENTS.md`.
+- **State and persistence** (`src/shamsu/state/`):
+  - `records` — frozen typed records for project, run, task, plan, plan step,
+    tool event, evidence, approval, checkpoint, and failure. The per-task
+    counters that v1 kept as loop-local attributes are persisted here, so they
+    survive a crash and can be asserted on.
+  - `schema` — SQLite DDL with enforced foreign keys, WAL journaling, and
+    append-only `user_version` migrations. Refuses a database written by a
+    newer build rather than risking semantics it does not implement.
+  - `transitions` — the state machine as a table rather than as the order of
+    `if` branches. Cancellation is a separate parameter, not an edge from every
+    node, so the graph stays readable.
+  - `store` — `StateStore`, which validates every state change against the
+    transition table, writes plans and their steps atomically, and resumes a
+    task from its latest checkpoint.
+
+  Two guarantees now hold at the storage layer: **transitions cannot be
+  bypassed** (`advance_task` raises without writing), and **evidence cannot be
+  forged** (`evidence.source_event_id` is a non-null foreign key to
+  `tool_events`, so no model assertion can become a row).
 
 ### Changed
 
