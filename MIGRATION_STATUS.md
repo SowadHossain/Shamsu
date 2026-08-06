@@ -64,20 +64,26 @@ Completed:
 - [x] `MIGRATION_STATUS.md` (this file) added
 - [x] CI separated — `legacy-ci.yml` scoped to `legacy-code/**`, non-gating
 
-- [x] **Legacy baseline established** — 2362 collected, **2339 passed, 17
-      failed, 6 skipped, 0 collection errors**. Recorded in
-      `legacy-code/LEGACY_README.md`.
+- [x] **Legacy baseline established and triaged** — 2362 collected,
+      **2349 passed, 7 failed, 6 skipped, 0 collection errors**. Full
+      breakdown in `legacy-code/LEGACY_README.md`.
 
-      The earlier blocker (74 collection errors from a missing `mcp`, and no
-      `python3-venv` to build an isolated environment) was solved with
-      `pip install --target` + `PYTHONPATH`, which sidesteps PEP 668 without
-      touching the system environment.
+      The original blocker (74 collection errors from a missing `mcp`, no
+      `python3-venv`) was solved with `pip install --target` + `PYTHONPATH`,
+      which sidesteps PEP 668 without touching the system environment.
 
-      **Caveat that limits what this number means:** `ollama` is not installed
-      on this machine, and v1 is a local-first agent. Eight of the 17 failures
-      show model-dependency directly in their output. **17 is an upper bound on
-      v1's defect count, not a measurement of it.** Re-run on a GPU machine to
-      separate genuine regressions from environmental ones.
+      A first run reported 17 failures. Ten were artefacts of how the suite
+      was being run: this machine has **no `python`, only `python3`**, so every
+      test shelling out to `python -c` silently produced no output. Notably
+      that included `test_command_output_secrets_are_redacted` — **secret
+      redaction works correctly.**
+
+      Of the 7 real failures: **5 environmental** (3 need a local model, 1
+      needs `python3-venv`, 1 needs playwright), **1 stale test** whose named
+      safety property still holds, and **1 genuine v1 bug** — `_FILE_TOKEN_RE`
+      cannot match a POSIX absolute path, making the contract layer's
+      workspace-relative normalization dead code on Linux and macOS. Written
+      up in `LEGACY_COMPONENTS.md` so v2 does not inherit it.
 
 ---
 

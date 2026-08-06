@@ -77,6 +77,53 @@ to import.
 
 ---
 
+## Known defects in migration candidates
+
+Bugs found in v1 code that is on the candidate list. Migrating any of these
+means fixing the defect, not porting it.
+
+### `_FILE_TOKEN_RE` cannot match a POSIX absolute path
+
+| | |
+|---|---|
+| **Location** | `legacy-code/shamsu/verify/contract.py:40` |
+| **Found** | Triaging the v1 baseline failure `test_contract_normalizes_absolute_workspace_target_to_relative_path` |
+| **Environment-dependent?** | No. Reproduces deterministically on any POSIX system. |
+
+The pattern is:
+
+```python
+r"(?:[A-Za-z]:[\\/])?[\w][\w./\\-]*\.(?:[a-z0-9_]{1,12}|[A-Z0-9_]{1,12})\b"
+```
+
+It starts at `[\w]`, so a leading `/` is never captured. `"/tmp/ws/notes.md"`
+matches as `"tmp/ws/notes.md"`. It *does* handle Windows drive letters — the
+optional `[A-Za-z]:[\\/]` prefix — so this was clearly meant to cover absolute
+paths and only half does.
+
+The consequence is downstream, in `_requested_path`:
+
+```python
+if workspace is not None and candidate_path.is_absolute():
+    return candidate_path.resolve().relative_to(...).as_posix()
+```
+
+`is_absolute()` is always `False` for POSIX input, so **the
+workspace-relative normalization branch is dead code on Linux and macOS.**
+
+Impact: a prompt saying "Create /home/me/proj/notes.md" records the requested
+path as `home/me/proj/notes.md`. Contract verification then looks for that
+relative path inside the workspace, does not find it, and reports a violation —
+a false failure on a task the agent completed correctly.
+
+**For v2:** path normalization belongs in `security/`, must be tested against
+POSIX-absolute, Windows-absolute, relative, and `../`-escaping inputs, and must
+never derive a path by regex-scraping prose in the first place. The v2 tool
+gateway takes typed arguments; a path is a parameter, not something recovered
+from a sentence.
+
+---
+
 ## Permanently rejected
 
 Per plan §8.4, these must **never** enter v2 as architecture. Rejection is not

@@ -164,11 +164,11 @@ The v1 changelog is archived at
 
 ### Known gaps
 
-- **The v1 baseline is an upper bound, not a measurement.** The suite now runs
-  (2339 passed / 17 failed / 6 skipped of 2362), but `ollama` is not installed
-  on the rebuild machine and v1 is a local-first agent, so eight of the
-  seventeen failures show model-dependency directly in their output. Re-run on
-  a GPU machine to separate genuine regressions from environmental ones.
+- **One genuine v1 bug is known and unfixed** (in archived code, so it does
+  not affect v2): `_FILE_TOKEN_RE` cannot match a POSIX absolute path, leaving
+  the run-contract layer's workspace-relative normalization dead on Linux and
+  macOS. Documented in `LEGACY_COMPONENTS.md` as a defect any migration must
+  fix. Three baseline failures still need a local model to verify.
 - v2 is not yet a usable agent. Milestones 4–15 remain.
 - Live local inference has never been exercised. The suite runs entirely
   against a deterministic fake; the `ModelClient` implementations arrive with
