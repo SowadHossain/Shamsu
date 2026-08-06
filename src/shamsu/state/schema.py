@@ -19,7 +19,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # --------------------------------------------------------------------------
 # Migration 1 -- initial runtime state
@@ -178,7 +178,59 @@ CREATE INDEX idx_failures_task ON failures(task_id);
 CREATE INDEX idx_failures_signature ON failures(task_id, signature);
 """
 
-MIGRATIONS: Sequence[str] = (_MIGRATION_1,)
+# --------------------------------------------------------------------------
+# Migration 2 -- artifact registry
+# --------------------------------------------------------------------------
+
+_MIGRATION_2 = """
+-- Artifact CONTENT lives on disk under .shamsu/artifacts/ so it stays
+-- human-readable, greppable, and diffable. This table is the registry: it owns
+-- freshness, versioning, and provenance, which are the parts that must be
+-- queryable and transactional.
+CREATE TABLE artifact_records (
+    artifact_id       TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    kind              TEXT NOT NULL,
+    key               TEXT NOT NULL,
+    content_path      TEXT NOT NULL,
+    artifact_version  INTEGER NOT NULL DEFAULT 1,
+    generator_version TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    confidence        REAL NOT NULL DEFAULT 1.0,
+    created_at        TEXT NOT NULL,
+    refreshed_at      TEXT NOT NULL,
+    UNIQUE (project_id, kind, key)
+);
+CREATE INDEX idx_artifacts_kind ON artifact_records(project_id, kind);
+CREATE INDEX idx_artifacts_status ON artifact_records(project_id, status);
+
+-- One row per source file an artifact claims to describe, with the hash at
+-- build time. Invalidation is a join against this table, which is why the
+-- path index matters: "which artifacts did this edit invalidate?" is the
+-- question asked after every mutating tool call.
+CREATE TABLE artifact_sources (
+    artifact_id  TEXT NOT NULL REFERENCES artifact_records(artifact_id) ON DELETE CASCADE,
+    path         TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    PRIMARY KEY (artifact_id, path)
+);
+CREATE INDEX idx_artifact_sources_path ON artifact_sources(path);
+
+-- Recorded disagreements between an artifact and a fresh tool result. The
+-- rate of these is the artifact_freshness_error_rate evaluation metric, so
+-- they are kept even after the artifact is regenerated.
+CREATE TABLE artifact_contradictions (
+    contradiction_id TEXT PRIMARY KEY,
+    artifact_id      TEXT NOT NULL,
+    observed_at      TEXT NOT NULL,
+    artifact_claim   TEXT NOT NULL,
+    fresh_observation TEXT NOT NULL,
+    source_tool      TEXT NOT NULL
+);
+CREATE INDEX idx_contradictions_artifact ON artifact_contradictions(artifact_id);
+"""
+
+MIGRATIONS: Sequence[str] = (_MIGRATION_1, _MIGRATION_2)
 
 
 def current_version(connection: sqlite3.Connection) -> int:

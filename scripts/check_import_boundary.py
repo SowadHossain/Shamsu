@@ -12,6 +12,15 @@ Detects, by AST rather than grep so comments and strings do not trip it:
   * ``sys.path`` manipulation mentioning the legacy directory
   * literal ``legacy-code`` / ``legacy_code`` path strings in source
 
+Two things are deliberately NOT violations:
+
+  * Docstrings. Documentation saying "never import legacy-code/" is the
+    opposite of a violation.
+  * A line marked ``# boundary-ok: <reason>``. Some code must *name* the
+    archive in order to *exclude* it -- the artifact scanner's ignore list is
+    the motivating case. A narrow, greppable, reason-carrying pragma is better
+    than either a blanket exemption or code that cannot say what it means.
+
 Usage:
     python scripts/check_import_boundary.py [--root .]
 
@@ -81,14 +90,28 @@ def _docstring_nodes(tree: ast.AST) -> set[int]:
     return ids
 
 
+#: Marks a line that may name the archive in order to exclude it.
+PRAGMA = "boundary-ok"
+
+
 class BoundaryVisitor(ast.NodeVisitor):
-    def __init__(self, path: Path, docstrings: set[int]) -> None:
+    def __init__(self, path: Path, docstrings: set[int], lines: list[str]) -> None:
         self.path = path
         self.docstrings = docstrings
+        self.lines = lines
         self.violations: list[Violation] = []
 
+    def _exempt(self, lineno: int) -> bool:
+        """Whether the source line carries the opt-out pragma."""
+        if not 1 <= lineno <= len(self.lines):
+            return False
+        return PRAGMA in self.lines[lineno - 1]
+
     def _flag(self, node: ast.AST, detail: str) -> None:
-        self.violations.append(Violation(self.path, getattr(node, "lineno", 0), detail))
+        lineno = getattr(node, "lineno", 0)
+        # An import is never exemptible -- the pragma exists for exclusion
+        # lists, not for smuggling a dependency past the check.
+        self.violations.append(Violation(self.path, lineno, detail))
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -103,7 +126,11 @@ class BoundaryVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Constant(self, node: ast.Constant) -> None:
-        if isinstance(node.value, str) and id(node) not in self.docstrings:
+        if (
+            isinstance(node.value, str)
+            and id(node) not in self.docstrings
+            and not self._exempt(getattr(node, "lineno", 0))
+        ):
             for fragment in BANNED_PATH_FRAGMENTS:
                 if fragment in node.value:
                     self._flag(
@@ -132,7 +159,7 @@ def check_file(path: Path) -> list[Violation]:
     except SyntaxError as exc:
         return [Violation(path, exc.lineno or 0, f"syntax error: {exc.msg}")]
 
-    visitor = BoundaryVisitor(path, _docstring_nodes(tree))
+    visitor = BoundaryVisitor(path, _docstring_nodes(tree), source.splitlines())
     visitor.visit(tree)
     return visitor.violations
 

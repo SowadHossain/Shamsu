@@ -143,6 +143,18 @@ class StateStore:
         with self._lock, self._connection:
             yield self._connection
 
+    @contextmanager
+    def reading(self) -> Iterator[sqlite3.Connection]:
+        """Borrow the connection for reads, under the lock.
+
+        The seam other subsystems use to share this database -- the artifact
+        registry in particular. Reading through the raw `connection` property
+        without the lock is unsafe now that cancellation can write from another
+        thread.
+        """
+        with self._lock:
+            yield self._connection
+
     # -- projects ----------------------------------------------------------
 
     @_synchronized

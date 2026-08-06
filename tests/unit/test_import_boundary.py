@@ -113,6 +113,50 @@ class TestCheckerAllowsLegitimateProse:
         assert boundary.main(["--root", str(root)]) == 0
 
 
+class TestExclusionPragma:
+    """`# boundary-ok` lets code NAME the archive in order to EXCLUDE it.
+
+    The motivating case is the artifact scanner's ignore list: the archive is
+    tracked by git, so without an explicit exclusion SHAMSU would generate
+    artifacts describing v1 while working on v2.
+    """
+
+    @staticmethod
+    def _tree(tmp_path: Path, source: str) -> Path:
+        src = tmp_path / "src" / "pkg"
+        src.mkdir(parents=True)
+        (src / "module.py").write_text(source, encoding="utf-8")
+        return tmp_path
+
+    def test_a_marked_exclusion_literal_is_allowed(self, tmp_path: Path) -> None:
+        root = self._tree(
+            tmp_path,
+            'IGNORED = {\n    "legacy-code",  # boundary-ok: excluded from scanning\n}\n',
+        )
+        assert boundary.main(["--root", str(root)]) == 0
+
+    def test_an_unmarked_literal_is_still_a_violation(self, tmp_path: Path) -> None:
+        """The pragma must be opt-in per line, never ambient."""
+        root = self._tree(tmp_path, 'IGNORED = {\n    "legacy-code",\n}\n')
+        assert boundary.main(["--root", str(root)]) == 1
+
+    def test_the_pragma_cannot_smuggle_an_import(self, tmp_path: Path) -> None:
+        """Exclusion lists, not dependencies. An import is never exemptible."""
+        root = self._tree(tmp_path, "import legacy_code  # boundary-ok: I promise\n")
+        assert boundary.main(["--root", str(root)]) == 1
+
+    def test_the_pragma_cannot_smuggle_a_from_import(self, tmp_path: Path) -> None:
+        root = self._tree(tmp_path, "from legacy_code.shamsu import x  # boundary-ok: nope\n")
+        assert boundary.main(["--root", str(root)]) == 1
+
+    def test_the_pragma_does_not_leak_to_other_lines(self, tmp_path: Path) -> None:
+        root = self._tree(
+            tmp_path,
+            'A = "legacy-code"  # boundary-ok: excluded\nB = "legacy-code/shamsu/x.py"\n',
+        )
+        assert boundary.main(["--root", str(root)]) == 1
+
+
 class TestPackaging:
     def test_flags_a_dependency_on_the_archive(self, tmp_path: Path) -> None:
         (tmp_path / "src").mkdir()
