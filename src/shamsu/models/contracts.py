@@ -111,6 +111,21 @@ class ImplementationPlan(BaseModel):
     open_questions: tuple[str, ...] = ()
 
 
+class TaskClassification(BaseModel):
+    """Whether a task needs a plan (plan §10's CLASSIFY_TASK branch).
+
+    One field and a reason, because that is the entire decision. `DIRECT` means
+    "this is one change, do not spend a model call planning it"; it does not
+    mean "skip the plan record" — every task executes through plan steps, so
+    there is exactly one execution path to get right.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["direct", "planned"]
+    reason: str = Field(default="", max_length=300)
+
+
 class CompletionClaim(BaseModel):
     """The model's proposal that something is finished.
 
@@ -152,6 +167,7 @@ CONTRACTS: Mapping[str, type[BaseModel]] = {
     "ImplementationPlan": ImplementationPlan,
     "ProjectAssessment": ProjectAssessment,
     "CompletionClaim": CompletionClaim,
+    "TaskClassification": TaskClassification,
 }
 
 
@@ -210,6 +226,7 @@ __all__ = [
     "InvestigationStep",
     "PlanStepProposal",
     "ProjectAssessment",
+    "TaskClassification",
     "ToolCall",
     "contract_for",
     "schema_hint",

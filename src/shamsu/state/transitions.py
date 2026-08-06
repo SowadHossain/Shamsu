@@ -28,12 +28,19 @@ TERMINAL: frozenset[AgentState] = frozenset(
 TRANSITIONS: Mapping[AgentState, frozenset[AgentState]] = {
     AgentState.RECEIVE_TASK: frozenset({AgentState.LOAD_PROJECT_STATE}),
     AgentState.LOAD_PROJECT_STATE: frozenset({AgentState.INSPECT_PROJECT}),
-    AgentState.INSPECT_PROJECT: frozenset({AgentState.CLASSIFY_TASK}),
+    # BLOCKED is reachable from the three states below because each depends on
+    # a model call that can simply not produce a usable answer. Leaving those
+    # edges out described a machine that cannot fail at planning time, and the
+    # first runtime to actually drive this table hit all three.
+    AgentState.INSPECT_PROJECT: frozenset({AgentState.CLASSIFY_TASK, AgentState.BLOCKED}),
     # DIRECT tasks skip planning; PLANNED tasks go through it.
     AgentState.CLASSIFY_TASK: frozenset({AgentState.CREATE_PLAN, AgentState.EXECUTE_CURRENT_STEP}),
-    AgentState.CREATE_PLAN: frozenset({AgentState.VALIDATE_PLAN}),
-    # A plan that fails validation is regenerated rather than executed.
-    AgentState.VALIDATE_PLAN: frozenset({AgentState.APPROVAL_CHECK, AgentState.CREATE_PLAN}),
+    AgentState.CREATE_PLAN: frozenset({AgentState.VALIDATE_PLAN, AgentState.BLOCKED}),
+    # A plan that fails validation is regenerated rather than executed -- until
+    # regenerating stops helping, which is what the BLOCKED edge is for.
+    AgentState.VALIDATE_PLAN: frozenset(
+        {AgentState.APPROVAL_CHECK, AgentState.CREATE_PLAN, AgentState.BLOCKED}
+    ),
     AgentState.APPROVAL_CHECK: frozenset(
         {AgentState.EXECUTE_CURRENT_STEP, AgentState.WAIT_APPROVAL}
     ),

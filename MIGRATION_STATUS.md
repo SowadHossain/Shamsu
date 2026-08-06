@@ -568,6 +568,51 @@ a rule someone eventually relaxes. Now `\bsudo\b`, with a test.
 
 ---
 
+## Post-PR: the orchestrator ✅
+
+Every PR in the plan's sequence built a *bounded controller*. Nothing composed
+them, so nothing could actually run a task — the integration tests called the
+pieces in the right order themselves, which proves the pieces fit, not that the
+runtime can drive them.
+
+`src/shamsu/runtime/session.py` is the composition. `AgentSession.run(request)`
+walks plan §10's state machine from `RECEIVE_TASK` to `FINAL_REPORT`, and
+`tests/integration/test_agent_session.py` runs plan §32's chain end to end
+against a real git repository, real pytest subprocesses, and real SQLite.
+
+### Design points worth keeping
+
+- **The state machine is a dispatch table, not control flow.** Each handler
+  returns the next state; the loop persists it through `advance_task`, which
+  validates against the transition table. An illegal move raises.
+- **Every transition passes through `RunController.checkpoint`** — cancellation,
+  pause, and wall clock checked between units of work rather than sprinkled
+  through them.
+- **Bounded twice.** Per-phase budgets from `ExecutionLimits`, plus a
+  transition cap so two states handing off to each other terminate loudly
+  instead of hanging.
+- **DIRECT skips the planning model call, not the plan record.** A direct task
+  gets a deterministic one-step plan carrying the same evidence floor, so there
+  is one execution path rather than two.
+- **Classification defaults to PLANNED** on any model failure. Defaulting to
+  DIRECT would route around plan validation and the approval check on the
+  strength of a call that did not happen.
+- **`WAIT_APPROVAL` stops rather than waits.** No approver is wired in yet, and
+  an unattended run that hangs is worse than one that reports it needs a human.
+- **Every exit is named.** `SessionResult.stopped_because` is always set.
+
+### Defect found and fixed
+
+Driving the table for the first time revealed that **`CREATE_PLAN`,
+`VALIDATE_PLAN`, and `INSPECT_PROJECT` had no `BLOCKED` edge** — the table
+described a machine that could not fail at planning time, when in fact all
+three depend on a model call that can simply not produce a usable answer. The
+edges were added. `_walk` now asserts `BLOCKED` is legal before routing an
+exhausted budget there, so a future state that forgets says so loudly instead of
+being coerced into an illegal move.
+
+---
+
 ## Standing constraints
 
 These hold for every subsequent PR:

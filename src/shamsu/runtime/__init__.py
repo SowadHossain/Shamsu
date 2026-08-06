@@ -16,9 +16,11 @@ Milestone 2. See plan sections 10, 11, 28.
 from shamsu.runtime.controller import RunAlreadyFinished, RunController, UnknownRun
 from shamsu.runtime.events import EventKind, RunEvent
 from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits, LimitExceeded
+from shamsu.runtime.session import AgentSession, SessionResult
 from shamsu.runtime.tokens import RunToken
 
 __all__ = [
+    "AgentSession",
     "DEFAULT_LIMITS",
     "EventKind",
     "ExecutionLimits",
@@ -27,5 +29,6 @@ __all__ = [
     "RunController",
     "RunEvent",
     "RunToken",
+    "SessionResult",
     "UnknownRun",
 ]
