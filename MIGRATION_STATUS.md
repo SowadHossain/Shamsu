@@ -48,7 +48,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 11 | Completion gate | 🟢 Done |
 | 12 | Repair | 🟢 Done |
 | 13 | Structural code intelligence | 🟢 Done |
-| 14 | Lightweight project memory | ⚪ Not started |
+| 14 | Lightweight project memory | 🟢 Done |
 | 15 | Legacy utility migration | ⚪ Not started |
 
 ---
@@ -472,6 +472,50 @@ recorded twice — once as a call, once as a plain use. Caught by a test asserti
 `is_call` on every reference to a called name. One occurrence is now one
 reference; otherwise `is_call` means nothing and every consumer has to
 deduplicate.
+
+---
+
+## PR 14 — Lightweight project memory ✅
+
+- [x] Schema migration 3 — `project_facts`, `architecture_decisions`, `memory_records`
+- [x] `memory/records` — typed facts, ADRs, and failure lessons
+- [x] `memory/store` — learn, confirm, contradict, revalidate, recall
+- [x] Confidence derived from origin, moved only by evidence
+- [x] Staleness from content hashes; context invalidation via `revalidate`
+- [x] Failure lessons keyed by error signature, wired into `RepairController`
+
+**Milestone 9's exit condition** has two halves and the second is the hard one:
+memory must improve task success **without increasing stale-context errors**.
+Both are covered — a prior task's fix reaches the next task's failure capsule,
+and no fact whose evidence changed is ever stated as current.
+
+### Design points worth keeping
+
+- **Confidence is derived, never declared.** It starts from *how* the fact was
+  learned and moves only on evidence. `learn()` has no `confidence` parameter,
+  and a test asserts that it does not.
+- **An OBSERVED fact needs its tool event.** Without the event id, "observed" is
+  an assertion wearing a better label, so it raises. Same rule as evidence, and
+  the foreign key enforces it in the schema too.
+- **A weaker origin may confirm but may not overwrite.** A model asserting
+  something cannot replace what a tool observed, however confidently phrased.
+  The disagreement is still recorded and still costs confidence.
+- **Statement comparison is exact, not fuzzy.** A similarity threshold would
+  eventually treat "uses pytest" and "does not use pytest" as agreement, and the
+  contradiction path exists precisely to catch that.
+- **Facts go stale; decisions do not.** A file changing invalidates a fact
+  learned from it. It must never invalidate an ADR — a decision that was made
+  stays made, even when the code it produced has since been rewritten. That is
+  why these are separate tables rather than one with a `kind` column.
+- **A stale fact is kept, marked, and outranked.** Deleting would lose a claim
+  that is probably still true; leaving it unmarked is the entire stale-context
+  failure mode. `recall` sorts verified facts ahead of stale ones so a trusted
+  current fact is never evicted by a stale one that once scored higher.
+- **A deleted file invalidates.** A missing path hashes as `<missing>` rather
+  than being skipped — skipping would make deletion the one change memory never
+  notices.
+- **Only a resolution crosses tasks.** "This failed before" without a fix is
+  noise in a repair frame; the capsule already says the failure is happening.
 
 ---
 

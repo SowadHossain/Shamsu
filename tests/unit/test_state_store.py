@@ -17,6 +17,8 @@ from shamsu.interfaces.enums import (
     AgentState,
     ApprovalDecision,
     EvidenceKind,
+    FactKind,
+    FactOrigin,
     FailureKind,
     Phase,
     Risk,
@@ -36,6 +38,7 @@ from shamsu.interfaces.ids import (
     TaskId,
     ToolEventId,
 )
+from shamsu.memory import MemoryStore
 from shamsu.state import (
     ApprovalRecord,
     CheckpointRecord,
@@ -51,7 +54,13 @@ from shamsu.state import (
     ToolEventRecord,
     new_id,
 )
-from shamsu.state.schema import SCHEMA_VERSION, connect, current_version, migrate
+from shamsu.state.schema import (
+    MIGRATIONS,
+    SCHEMA_VERSION,
+    connect,
+    current_version,
+    migrate,
+)
 
 
 @pytest.fixture
@@ -672,3 +681,53 @@ class TestFailures:
         store.record_failure(_failure(task, "shared-signature"))
         store.record_failure(_failure(other, "shared-signature"))
         assert store.repeated_failure(task.task_id, "shared-signature") is False
+
+
+class TestMemoryMigration:
+    """Migration 3 must land on an existing database, not only a fresh one."""
+
+    def test_an_existing_database_upgrades_in_place(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+
+        # Build a database at the pre-memory schema, with data in it.
+        connection = connect(str(path))
+        for index in range(2):
+            connection.executescript(MIGRATIONS[index])
+            connection.execute(f"PRAGMA user_version = {index + 1}")
+        connection.execute(
+            "INSERT INTO projects (project_id, root, name, created_at, updated_at)"
+            " VALUES ('p1', '/w', 'demo', '2026-01-01T00:00:00', '2026-01-01T00:00:00')"
+        )
+        connection.commit()
+        connection.close()
+
+        with StateStore(path) as store:
+            assert current_version(store.connection) == SCHEMA_VERSION
+            project = store.get_project(ProjectId("p1"))
+            assert project is not None, "existing rows must survive the migration"
+
+            memory = MemoryStore(store, project.project_id)
+            fact = memory.learn(FactKind.STACK, "runner", "pytest", origin=FactOrigin.USER)
+            assert memory.fact(FactKind.STACK, "runner") == fact
+
+    def test_the_memory_tables_exist_after_migration(self, store: StateStore) -> None:
+        names = {
+            row["name"]
+            for row in store.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert {"project_facts", "architecture_decisions", "memory_records"} <= names
+
+    def test_a_fact_cannot_cite_a_tool_event_that_does_not_exist(
+        self, store: StateStore, project: ProjectRecord
+    ) -> None:
+        """The same integrity rule as evidence: provenance is a foreign key."""
+        import sqlite3
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.connection.execute(
+                "INSERT INTO project_facts (fact_id, project_id, kind, subject, statement,"
+                " origin, source_event_id, confidence, created_at, updated_at)"
+                " VALUES ('f1', ?, 'stack', 's', 'x', 'observed', 'invented', 0.8,"
+                " '2026-01-01T00:00:00', '2026-01-01T00:00:00')",
+                (project.project_id,),
+            )

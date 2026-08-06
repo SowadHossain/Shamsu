@@ -192,9 +192,55 @@ class ApprovalDecision(StrEnum):
     TIMED_OUT = "timed_out"
 
 
+class FactKind(StrEnum):
+    """What a remembered project fact is about (plan section 13.1, layer 2)."""
+
+    CONVENTION = "convention"
+    STACK = "stack"
+    ENVIRONMENT = "environment"
+    LIMITATION = "limitation"
+    DEPENDENCY = "dependency"
+    CONSTRAINT = "constraint"
+
+
+class FactOrigin(StrEnum):
+    """How a fact was learned.
+
+    This is what confidence is derived from, and why it is not a number the
+    model chooses. An ``OBSERVED`` fact traces to a tool event; an ``ASSERTED``
+    one is a model's claim and starts low. ``USER`` outranks both, because a
+    user-stated constraint is not something the runtime gets to second-guess.
+    """
+
+    OBSERVED = "observed"
+    DERIVED = "derived"
+    ASSERTED = "asserted"
+    USER = "user"
+
+
+class DecisionStatus(StrEnum):
+    """ADR lifecycle (plan section 15.13)."""
+
+    PROPOSED = "proposed"
+    ACCEPTED = "accepted"
+    SUPERSEDED = "superseded"
+    REJECTED = "rejected"
+
+
+class MemoryKind(StrEnum):
+    """What a memory record holds."""
+
+    FAILURE_LESSON = "failure_lesson"
+    TASK_SUMMARY = "task_summary"
+
+
 __all__ = [
     "AgentState",
     "ApprovalDecision",
+    "DecisionStatus",
+    "FactKind",
+    "FactOrigin",
+    "MemoryKind",
     "ArtifactKind",
     "ArtifactStatus",
     "EvidenceKind",

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 from shamsu.interfaces.enums import FailureKind, StepOutcome
 from shamsu.interfaces.ids import FailureId, StepId, TaskId
+from shamsu.memory.store import MemoryStore
 from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits
 from shamsu.state.records import FailureRecord, new_id
 from shamsu.state.store import StateStore
@@ -133,6 +134,12 @@ class RepairController:
     limits: ExecutionLimits = DEFAULT_LIMITS
     allow_test_edits: bool = False
 
+    #: Optional project memory. When present, a failure whose signature has
+    #: been seen in an *earlier task* arrives with what fixed it last time, and
+    #: this failure is recorded so the next task inherits the same benefit.
+    #: Optional because repair must work on a project with no history at all.
+    memory: MemoryStore | None = None
+
     #: How many identical signatures in a row mean "not making progress".
     stuck_threshold: int = 2
 
@@ -164,6 +171,7 @@ class RepairController:
             changed_files=changed_files,
             related_files=related_files,
             previous_attempts=history,
+            prior_lesson=self._prior_lesson(digest.signature),
             raw=raw,
         )
 
@@ -180,6 +188,17 @@ class RepairController:
                 attempt=capsule.attempt,
             )
         )
+        if self.memory is not None and capsule.signature:
+            # Recorded on every attempt, not only on success: "this failure has
+            # happened five times and nothing fixed it" is worth knowing, and a
+            # memory that only remembers wins cannot say it.
+            self.memory.remember_failure(
+                capsule.signature,
+                f"{capsule.kind.value}: {capsule.actual or capsule.expected}"[:400],
+                task_id=self.task_id,
+                related_paths=capsule.editable(),
+            )
+
         scope = RepairScope.for_capsule(capsule, allow_test_edits=self.allow_test_edits)
 
         # Rebuilt from persisted history on every call rather than accumulated
@@ -242,6 +261,20 @@ class RepairController:
             scope=scope,
             outcome=StepOutcome.REPAIRABLE,
         )
+
+    def _prior_lesson(self, signature: str) -> str:
+        """What fixed this signature in an earlier task, if anything did.
+
+        Only a *resolution* crosses over. "This failed before" without a fix
+        is noise in a repair frame -- the capsule already says the failure is
+        happening now.
+        """
+        if self.memory is None or not signature:
+            return ""
+        lesson = self.memory.lesson(signature)
+        if lesson is None or not lesson.resolution:
+            return ""
+        return f"{lesson.resolution} (worked after {lesson.occurrences} occurrence(s))"
 
     def _history(self, step_id: StepId | None) -> tuple[RepairAttempt, ...]:
         """Previous failures for this step, oldest first."""

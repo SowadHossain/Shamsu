@@ -20,13 +20,19 @@ ApprovalId = NewType("ApprovalId", str)
 CheckpointId = NewType("CheckpointId", str)
 ArtifactId = NewType("ArtifactId", str)
 FailureId = NewType("FailureId", str)
+FactId = NewType("FactId", str)
+DecisionId = NewType("DecisionId", str)
+MemoryId = NewType("MemoryId", str)
 
 __all__ = [
     "ApprovalId",
     "ArtifactId",
     "CheckpointId",
+    "DecisionId",
     "EvidenceId",
+    "FactId",
     "FailureId",
+    "MemoryId",
     "PlanId",
     "ProjectId",
     "RunId",

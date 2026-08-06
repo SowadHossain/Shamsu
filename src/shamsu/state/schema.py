@@ -19,7 +19,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # --------------------------------------------------------------------------
 # Migration 1 -- initial runtime state
@@ -230,7 +230,83 @@ CREATE TABLE artifact_contradictions (
 CREATE INDEX idx_contradictions_artifact ON artifact_contradictions(artifact_id);
 """
 
-MIGRATIONS: Sequence[str] = (_MIGRATION_1, _MIGRATION_2)
+# --------------------------------------------------------------------------
+# Migration 3 -- project memory (plan section 13.1, layer 2)
+# --------------------------------------------------------------------------
+#
+# Three tables, three different kinds of knowledge, deliberately not merged:
+#
+# * `project_facts` are small, checkable claims about the project. Each records
+#   the paths it depends on, so a fact can be marked unverified when the code
+#   underneath it changes rather than quietly outliving its evidence.
+# * `architecture_decisions` are ADRs (plan section 15.13). They are narrative and
+#   human-authored, they supersede rather than update, and they are never
+#   invalidated by a file changing -- a decision that was made stays made.
+# * `memory_records` are lessons learned from failures, keyed by error
+#   signature so a recurrence can be recognised across tasks.
+#
+# `source_event_id` on a fact points at the tool event that produced it, with
+# the same intent as the evidence table: a fact learned by observation can be
+# told apart from one a model asserted, and the two must never carry the same
+# weight.
+
+_MIGRATION_3 = """
+CREATE TABLE project_facts (
+    fact_id           TEXT PRIMARY KEY,
+    project_id        TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    kind              TEXT NOT NULL,
+    subject           TEXT NOT NULL,
+    statement         TEXT NOT NULL,
+    origin            TEXT NOT NULL,
+    source_event_id   TEXT REFERENCES tool_events(event_id) ON DELETE SET NULL,
+    confidence        REAL NOT NULL,
+    confirmations     INTEGER NOT NULL DEFAULT 0,
+    contradictions    INTEGER NOT NULL DEFAULT 0,
+    evidence_paths    TEXT NOT NULL DEFAULT '[]',
+    evidence_hash     TEXT NOT NULL DEFAULT '',
+    verified          INTEGER NOT NULL DEFAULT 1,
+    superseded_by     TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    UNIQUE (project_id, kind, subject)
+);
+CREATE INDEX idx_facts_project ON project_facts(project_id, verified);
+
+CREATE TABLE architecture_decisions (
+    decision_id     TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    title           TEXT NOT NULL,
+    context         TEXT NOT NULL DEFAULT '',
+    decision        TEXT NOT NULL,
+    alternatives    TEXT NOT NULL DEFAULT '[]',
+    consequences    TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL,
+    related_paths   TEXT NOT NULL DEFAULT '[]',
+    related_tasks   TEXT NOT NULL DEFAULT '[]',
+    supersedes      TEXT REFERENCES architecture_decisions(decision_id),
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX idx_decisions_project ON architecture_decisions(project_id, status);
+
+CREATE TABLE memory_records (
+    memory_id       TEXT PRIMARY KEY,
+    project_id      TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+    task_id         TEXT REFERENCES tasks(task_id) ON DELETE SET NULL,
+    kind            TEXT NOT NULL,
+    signature       TEXT NOT NULL DEFAULT '',
+    statement       TEXT NOT NULL,
+    resolution      TEXT NOT NULL DEFAULT '',
+    confidence      REAL NOT NULL,
+    occurrences     INTEGER NOT NULL DEFAULT 1,
+    related_paths   TEXT NOT NULL DEFAULT '[]',
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+CREATE INDEX idx_memory_signature ON memory_records(project_id, signature);
+"""
+
+MIGRATIONS: Sequence[str] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)
 
 
 def current_version(connection: sqlite3.Connection) -> int:

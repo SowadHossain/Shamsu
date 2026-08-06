@@ -146,6 +146,10 @@ class FailureCapsule:
     changed_files: tuple[str, ...] = ()
     related_files: tuple[str, ...] = ()
     previous_attempts: tuple[RepairAttempt, ...] = ()
+    #: What worked the last time this signature appeared, from project memory.
+    #: Advisory: it describes a *different task's* fix, so it is offered as a
+    #: starting point and never as an instruction.
+    prior_lesson: str = ""
     probes: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_PROBES)
 
     @property
@@ -187,6 +191,9 @@ class FailureCapsule:
             lines.extend(
                 f"  attempt {item.attempt}: {item.summary}" for item in self.previous_attempts
             )
+        if self.prior_lesson:
+            lines.append(f"From a previous task: {self.prior_lesson}")
+
         if self.repeating:
             lines.append(
                 "This is the SAME failure as the last attempt. Repeating that "
@@ -228,6 +235,7 @@ def build_capsule(
     changed_files: Sequence[str] = (),
     related_files: Sequence[str] = (),
     previous_attempts: Sequence[RepairAttempt] = (),
+    prior_lesson: str = "",
     raw: str = "",
 ) -> FailureCapsule:
     """Turn a digested failure into a capsule.
@@ -250,6 +258,7 @@ def build_capsule(
         changed_files=tuple(dict.fromkeys(changed_files)),
         related_files=tuple(dict.fromkeys(related_files)),
         previous_attempts=tuple(previous_attempts),
+        prior_lesson=prior_lesson,
         probes=_PROBES.get(kind, _DEFAULT_PROBES),
     )
 
