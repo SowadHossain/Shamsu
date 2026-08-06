@@ -115,5 +115,20 @@ went wrong — read it before redesigning anything it already tried. Key facts:
 - Deeper v1 material: `legacy-code/docs/agent-context/` (AGENTS.md,
   CURRENT_STATE.md, AGENT_LOOP_AND_TOOLING_REPORT.md). Note AGENTS.md documents
   a Windows path (`F:\...`); this checkout is Linux at `/home/shamsu/Shamsu`.
-- **No v1 baseline test result exists** — the suite could not run on this
-  machine (missing `mcp`, no `python3-venv`). Do not cite v1 pass rates.
+- **v1 baseline: 2339 passed / 17 failed / 6 skipped** of 2362. Cite it with
+  the caveat: `ollama` is absent here and v1 is a local-first agent, so eight
+  of those failures are model-dependent. 17 is an upper bound on v1's defect
+  count, not a measurement.
+
+## Installing Python packages here
+
+The system Python is PEP-668 externally managed and `python3-venv` is not
+installed, so `pip install` and `python -m venv` both fail. Use:
+
+```
+pip install --target <dir> <packages>
+PYTHONPATH=<dir> python3 -m <tool>
+```
+
+This is how mypy and the legacy test dependencies were installed without
+touching the system environment. Do not reach for `--break-system-packages`.

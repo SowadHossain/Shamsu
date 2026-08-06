@@ -112,6 +112,18 @@ The v1 changelog is archived at
 
 ### Fixed
 
+- **mypy strict now passes** on all 35 source files, and every `type: ignore`
+  is gone from `src/`. Seven real errors surfaced on its first run: a
+  `functools.wraps` return-type widening in the state store's lock decorator,
+  and `dict[str, object]` manifest parsers that made every nested `.get()` an
+  error. The twelve `type: ignore` comments were hiding `object`-typed database
+  rows; typing them as `sqlite3.Row`/`sqlite3.Connection` removed the need, and
+  narrowing `ArtifactRegistry._evaluate` to `Sequence[tuple[str, str]]` also
+  made the invalidation rules testable without a database.
+- **The v1 legacy suite runs again.** `pip install --target` plus `PYTHONPATH`
+  sidesteps this machine's PEP-668 restriction and missing `python3-venv`,
+  which had blocked the baseline since archival. 74 collection errors → 0.
+
 - `RunController.cancel()` claimed thread safety but wrote run status through a
   thread-bound SQLite connection, so cancelling from a signal handler raised
   `ProgrammingError` after setting the token — leaving the token cancelled and
@@ -152,13 +164,15 @@ The v1 changelog is archived at
 
 ### Known gaps
 
-- **No legacy baseline test result.** The v1 suite could not be run on the
-  rebuild machine: 74 collection errors from
-  `ModuleNotFoundError: No module named 'mcp'`, with no `python3-venv`
-  available to build an isolated environment. Tracked in `MIGRATION_STATUS.md`.
-- **mypy is configured but unverified locally** — not installed in the rebuild
-  environment. First real run happens in CI.
-- v2 is not yet a usable agent. Milestones 2–15 remain.
+- **The v1 baseline is an upper bound, not a measurement.** The suite now runs
+  (2339 passed / 17 failed / 6 skipped of 2362), but `ollama` is not installed
+  on the rebuild machine and v1 is a local-first agent, so eight of the
+  seventeen failures show model-dependency directly in their output. Re-run on
+  a GPU machine to separate genuine regressions from environmental ones.
+- v2 is not yet a usable agent. Milestones 4–15 remain.
+- Live local inference has never been exercised. The suite runs entirely
+  against a deterministic fake; the `ModelClient` implementations arrive with
+  Milestone 4 and must be validated on a GPU-equipped machine.
 
 ---
 

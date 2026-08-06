@@ -64,15 +64,20 @@ Completed:
 - [x] `MIGRATION_STATUS.md` (this file) added
 - [x] CI separated — `legacy-ci.yml` scoped to `legacy-code/**`, non-gating
 
-Carried forward as an open item:
+- [x] **Legacy baseline established** — 2362 collected, **2339 passed, 17
+      failed, 6 skipped, 0 collection errors**. Recorded in
+      `legacy-code/LEGACY_README.md`.
 
-- [ ] **Legacy baseline test results are unrecorded.** The v1 suite could not be
-      executed on the rebuild machine (74 collection errors —
-      `ModuleNotFoundError: No module named 'mcp'`; no `python3-venv`). This is
-      an environment limitation, not a v1 regression. Re-run on a fully
-      provisioned machine and record results in
-      `legacy-code/LEGACY_README.md`. Until then there is no numeric baseline to
-      compare v2 evaluation results against.
+      The earlier blocker (74 collection errors from a missing `mcp`, and no
+      `python3-venv` to build an isolated environment) was solved with
+      `pip install --target` + `PYTHONPATH`, which sidesteps PEP 668 without
+      touching the system environment.
+
+      **Caveat that limits what this number means:** `ollama` is not installed
+      on this machine, and v1 is a local-first agent. Eight of the 17 failures
+      show model-dependency directly in their output. **17 is an upper bound on
+      v1's defect count, not a measurement of it.** Re-run on a GPU machine to
+      separate genuine regressions from environmental ones.
 
 ---
 
@@ -85,11 +90,11 @@ Carried forward as an open item:
 - [x] `.github/workflows/ci.yml` — boundary, lint, format, mypy, tests
 - [x] Deterministic `FakeModelClient`; no test contacts a model
 
-Open item:
-
-- [ ] **mypy has never actually run.** It is configured (strict, with the
-      pydantic plugin) but is not installed in the rebuild environment. First
-      real execution will be in CI; expect to fix annotations on that pass.
+- [x] **mypy strict passes.** First real run happened at commit `7ef4664`
+      (mypy 2.3.0, installed via `pip install --target`). Seven errors, all
+      genuine; fixed. `src/` now carries **zero** `type: ignore` comments —
+      the twelve that existed were hiding weak typing (`object` parameters on
+      database rows), not working around checker limitations.
 
 ## PR 3 — State and persistence ✅
 

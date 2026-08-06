@@ -19,6 +19,7 @@ from the repository root on branch `shamsu-v2.0.0`.
 | **Package version** | `0.4.0b1` |
 | **Python** | `>=3.11` |
 | **Archival commit** | `bb84e2f` (`chore: archive SHAMSU v1 under legacy-code`) |
+| **Baseline test result** | 2339 passed / 17 failed / 6 skipped — see below |
 
 Layout after archival:
 
@@ -147,23 +148,91 @@ CI equivalent: `.github/workflows/legacy-ci.yml` (manual dispatch, or on pushes
 touching `legacy-code/**`). It is `continue-on-error` — legacy results report
 but never gate v2.
 
-### ⚠️ Baseline test status: NOT ESTABLISHED
+### Baseline test result
 
-The suite was **not** successfully run at archival time. On the rebuild machine:
+Established on the rebuild machine (Linux, Python 3.12.3) at commit `7ef4664`.
+
+| | |
+|---|---:|
+| **Collected** | 2362 |
+| **Passed** | **2339** |
+| **Failed** | **17** |
+| Skipped | 6 |
+| Collection errors | 0 |
+
+Dependencies were installed with `pip install --target <dir>` and put on
+`PYTHONPATH`. That sidesteps both blockers this machine has — the system Python
+is PEP-668 externally managed, and `python3-venv` is unavailable — without
+touching the system environment. The heavy optional extras (`playwright`,
+`onnxruntime`, `rapidocr`, `pdfplumber`, `trafilatura`) were **not** installed
+and were not needed for collection.
+
+**pytest did not print its final count line**; the numbers above are counted
+from the per-test progress characters, which sum exactly to the 2362 collected.
+
+#### Important caveat: no local model on this machine
+
+`ollama` is **not installed and not reachable here**. v1 is a local-first agent,
+so every test that drives the agent loop end to end cannot pass in this
+environment. Several of the 17 failures show this directly in their output
+(`Waiting for model response`, `Agent stopped before completing`,
+`Build/verify failed ... after 0 repair attempt(s)`).
+
+**Therefore 17 is an upper bound on v1's real defect count, not a measurement of
+it.** Re-run on a GPU machine with Ollama available to separate genuine
+regressions from environmental ones.
+
+#### The 17 failures
+
+Showing model-dependency evidence in their output — expected to fail without a
+local model:
 
 ```text
-74 errors during collection
-E   ModuleNotFoundError: No module named 'mcp'
+tests/test_freeform_generator.py::test_freeform_regenerates_source_when_strict_repair_has_no_edit
+tests/test_freeform_generator.py::test_freeform_hardens_explicit_python_cli_prd
+tests/test_prd_eval_cases.py::test_prd_eval_case_scores_acceptance_commands
+tests/test_real_indexed_qa.py::test_repl_workspace_prd_request_finds_single_prd_without_routing
+tests/test_composite_routing.py::test_prd_acceptance_runner_records_exact_output_verdicts
+tests/test_composite_routing.py::test_prd_acceptance_runner_returns_failure_diagnostics
+tests/test_composite_routing.py::test_prd_conformance_checks_named_functions_and_invalid_cli
+tests/test_composite_routing.py::test_composite_verify_runs_clear_script_when_model_only_describes_command
 ```
 
-and an isolated environment could not be built (`ensurepip`/`python3-venv`
-unavailable; system Python is PEP-668 externally managed). Every one of the 74
-errors is a collection-time import failure, not a test assertion failure — so
-**no statement about v1 pass/fail rates can be made from this archive.**
+No model-dependency evidence visible — cause not established, worth triaging
+first on a properly provisioned machine:
 
-Before using this tag as an evaluation baseline, run the suite on a machine with
-the full dependency set and record the result here. Until then, treat the
-"known failures" list as unpopulated rather than empty.
+```text
+tests/test_action_ledger_storage.py::test_diagnostics_integrity_links_command_tool_raw_log_and_packet
+tests/test_build_run_2026_08_03_fixes.py::test_a_mutation_is_never_dispatched_to_web
+tests/test_diagnostics_workflow_integration.py::test_command_runner_calls_diagnostic_digest_after_successful_command
+tests/test_diagnostics_workflow_integration.py::test_successful_command_does_not_replace_last_error_packet
+tests/test_diagnostics_workflow_integration.py::test_command_runner_digest_failure_never_breaks_command_execution
+tests/test_dry_run_and_contract.py::test_contract_normalizes_absolute_workspace_target_to_relative_path
+tests/test_final_safety_audit.py::test_command_output_secrets_are_redacted
+tests/test_project_env.py::test_command_runner_installs_only_through_created_project_venv
+tests/test_runtime_doctor.py::test_run_doctor_combines_all_checks
+```
+
+Two in the second group are worth a look regardless of environment, because of
+what they cover: `test_command_output_secrets_are_redacted` (asserted
+`'[REDACTED]' in ''` — the captured output was empty) and
+`test_contract_normalizes_absolute_workspace_target_to_relative_path` (an
+absolute temp path survived where a relative one was expected). Both may still
+be environmental; neither has been triaged.
+
+#### Reproducing
+
+```bash
+cd legacy-code
+pip install --target /tmp/legacylibs \
+    "mcp>=1.28,<2" "prompt_toolkit>=3.0" "rich>=13.7" "httpx>=0.27" \
+    "ollama>=0.4" "pydantic>=2.7" "instructor>=1.3" "json-repair>=0.25" \
+    "tokenizers>=0.21" "tree-sitter>=0.23" tree-sitter-python \
+    tree-sitter-javascript tree-sitter-html "mistletoe>=1.3" "diskcache>=5.6" \
+    "psutil>=5.9" "watchdog>=4.0" "PyYAML>=6.0" "keyring>=25.0" \
+    "filelock>=3.15" "rank_bm25>=0.2" "yake>=0.4.8"
+PYTHONPATH=/tmp/legacylibs python3 -m pytest tests -q --tb=no
+```
 
 ---
 
