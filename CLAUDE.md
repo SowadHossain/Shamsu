@@ -1,19 +1,41 @@
 # SHAMSU — agent orientation
 
-Local-first autonomous coding agent (Python ≥3.11, package `shamsu`, v0.4.0b1).
-Inspects, indexes, searches, explains, edits, fixes, tests, documents, and
-generates projects **without cloud AI APIs for inference**. Inference is local.
+Local-first autonomous coding agent. Inference is local; no cloud AI APIs.
 
-**Prime directive:** use deterministic tools to find the right context, then use a
-small local model to reason over that context. Never dump a codebase into a
-prompt. Retrieve first, then build a compact context pack.
+**You are on branch `shamsu-v2.0.0`, a greenfield rebuild.** The working v1
+implementation is archived under `legacy-code/` and is *not* the production
+code. If a file you are reading lives under `legacy-code/`, it is reference
+material, not something to extend.
+
+- **New code goes in `src/shamsu/` only.** Nothing else.
+- **Never import from `legacy-code/`.** Enforced by
+  `scripts/check_import_boundary.py` in CI.
+- Authoritative spec: `docs/migration/v2-full-rebuild-plan.md`.
+  Progress: `MIGRATION_STATUS.md`. Design: `ARCHITECTURE.md`.
+
+## Prime directive
+
+> The runtime controls the loop. The model performs one narrow decision at a
+> time. Complete information lives outside the model; the context compiler
+> selects only what the next decision needs.
+
+Use deterministic tools to find the right context, then use a small local model
+to reason over it. Never dump a codebase into a prompt.
+
+## Do not run local models here
+
+The current environment is a VPS with no GPU. Do not invoke Ollama, embeddings,
+or any inference path. Build against the Protocols in `src/shamsu/interfaces/`
+and the deterministic fake in `tests/fixtures/fake_model.py`. Live inference is
+tested separately on a GPU machine — say so rather than reporting untested
+inference work as verified.
 
 ## Use the knowledge graph before grep/read
 
-This repo is indexed into a `codebase-memory-mcp` knowledge graph
-(161k nodes / 239k edges). For structural questions — "who calls X", "what's the
-architecture", "what breaks if I change Y" — query the graph. It answers in
-~1–2 KB where the equivalent file reads cost tens of KB.
+This repo is indexed into a `codebase-memory-mcp` knowledge graph. For
+structural questions — "who calls X", "what's the architecture", "what breaks
+if I change Y" — query the graph. It answers in ~1–2 KB where the equivalent
+file reads cost tens of KB.
 
 MCP tools (8, via `.mcp.json`): `search_graph`, `query_graph`, `trace_path`,
 `get_code_snippet`, `get_graph_schema`, `get_architecture`, `search_code`,
@@ -21,6 +43,11 @@ MCP tools (8, via `.mcp.json`): `search_graph`, `query_graph`, `trace_path`,
 
 **The graph project name is `home-shamsu-Shamsu`** — required by every tool
 except `index_repository`; it is not the directory name.
+
+⚠️ **The graph currently indexes the v1 tree at its old paths.** It was built
+before the archival move, so structural answers point at `shamsu/...` rather
+than `legacy-code/shamsu/...`, and it knows nothing about `src/shamsu/`.
+Re-index before trusting it for v2 work.
 
 Six more tools are **CLI-only** in 0.9.0 (`manage_adr`, `index_status`,
 `list_projects`, `detect_changes`, `delete_project`, `ingest_traces`):
@@ -32,78 +59,61 @@ Six more tools are **CLI-only** in 0.9.0 (`manage_adr`, `index_status`,
 
 Raw positional JSON is deprecated; use flags, `--args-file <path>`, or stdin.
 
-**After edits, refresh — or SHAMSU silently degrades:**
+## v2 layer map (`src/shamsu/`)
 
-```
-python3 -m shamsu.abstract.cli refresh     # then `status` → expect
-                                           # degraded:false, retrieval_mode:"external"
-```
-
-Driving the raw binary directly does **not** update `.shamsu/abstract/last-index.json`,
-and `AbstractService.ensure_ready()` gates off that file, not the graph.
-
-## Layer map
-
-- **entry** — `cli/`. REPL at `shamsu/cli/repl.py`. Only outbound calls.
-- **core** (high fan-in): `action_ledger/` (per-prompt run record — decisions,
-  tool/model calls, contexts, mutations, verification), `tools/`, `session/`,
-  `agents/` (QA, code-edit, bug-fix, audit, test-gen, docs), `memory/`,
-  `safety/` (path sandbox, command risk classifier, secret redaction — **not** an
-  OS sandbox).
-- **Memory** = Graphiti (external, `~/.shamsu/tools/graphiti/`) with a **SQLite
-  floor** (`memory/sqlite_store.py`) that is always available; Graphiti is
-  preferred when healthy, mirrored to asynchronously via a bounded queue.
-- **Live loop** is `AgentChatLoop` (`agents/chat_loop.py`), the only one
-  `repl.py` constructs. `ToolCallingAgentLoop` and `runtime/run_control.py` are
-  **test-only / dead code** — see `agent context/AGENT_LOOP_AND_TOOLING_REPORT.md`.
-- **leaf** — `abstract/`, `runtime/`, `telemetry/`, `templates/`, `diagnostics/`,
-  `repair/`, `patch/`, `verify/`, `retriever/`, `llm/`, `prd/`, `indexer/`,
-  `plans/`, `routing/`, `skills/`, `taskmaster/`, `tasks/`, `audit/`, `context/`,
-  `core/`, `registry/`, `ui/`.
-
-## Frozen contract
-
-`shamsu/types.py` and `shamsu/interfaces.py` are the shared team contract — do not
-change casually. `interfaces.py` splits ownership: Dev A `indexer/ retriever/
-patch/ storage/`, Dev B `llm/ agents/ context/ core/`, Dev C `cli/ safety/ prd/
-tools/`. Consumers of unbuilt deps import the interface and write a `Stub*` class
-(example: `shamsu/retriever/search.py`) rather than blocking on a PR.
-
-## Retrieval stack
-
-**codebase-memory-mcp is the only search/symbol backend.** There is no
-SHAMSU-owned index, parser, or code graph — every result traces to a real tool
-call (`search_code`, `search_graph`, `get_code_snippet`). See the explicit
-docstring at `shamsu/retriever/search.py:1-9`. The `search_index` tool gates on
-`AbstractService.ensure_ready()` before querying (`agent_tools.py:3188-3194`).
-
-**Last-resort semantic rescue** (`shamsu/retriever/semantic.py`): local Ollama
-embeddings (`nomic-embed-text`, ~274 MB), file-level granularity, JSON vector
-index under `.shamsu/` refreshed lazily per query. Runs only after the primary
-search returns nothing, degrades to "no hits" on any failure, and remembers the
-failure per-process. Disable with `SHAMSU_SEMANTIC_SEARCH=0`.
-
-Stale claims to ignore — **README and `pyproject.toml` are out of date here**:
-- README's `.shamsu/index.db` SQLite FTS5 index no longer exists in `shamsu/`;
-  the only FTS5 reference is a comment describing the *external* tool's index.
-- `rank_bm25` and `yake` are declared dependencies but imported nowhere.
+- **`interfaces/`** — Protocols for every seam. Depend on these, not on
+  concrete classes. Landed: `enums`, `ids`, `cancellation`, `tools`,
+  `artifacts`, `models`, `code_intelligence`, `context`. `state` and `runtime`
+  protocols land with their record types in PR 3 / PR 4.
+- **`state/`** — typed records + SQLite. **Authoritative.** If a fact is not
+  here, it is derived or advisory.
+- **`runtime/`** — run controller, state machine, execution limits. Owns the loop.
+- **`agent/`** — classifier, planner, step executor, repair, completion. Each is
+  a bounded controller, not a loop.
+- **`context/`** — the context compiler. Builds one frame per decision.
+- **`artifacts/`** — versioned, hash-traceable repository artifacts.
+- **`code_intelligence/`** — structural retrieval; semantic is stage 9 of 9.
+- **`tools/`** — the single typed tool gateway.
+- **`verification/`** — evidence and the verification pipeline.
+- **`memory/`**, **`models/`**, **`security/`**, **`telemetry/`**.
 
 ## Invariants
 
-1. Deterministic retrieval before inference; compact packs, never raw dumps.
-2. Mutations are approval-gated and ledger-logged; patches validated,
-   diff-previewed, applied, then re-indexed.
-3. File input passes the sandbox; commands pass the risk classifier; output
-   passes redaction.
-4. **Honest failure over fabrication** — `ok=False` beats an invented fact. The
-   code-memory adapter never fabricates a structural claim.
-5. Local-first: no cloud inference, no remote code-memory URI.
+1. Deterministic retrieval before inference; compact packets, never raw dumps.
+2. SQLite is authoritative. Artifacts are derived and invalidatable.
+3. Fresh tool results override stale artifacts; contradictions are recorded.
+4. Stale artifacts may reach the model only with an explicit label.
+5. Completion requires verified evidence: `required ⊆ verified`. Evidence is
+   registered after a tool produced it, never because a model asserted it.
+6. Every blocking call takes a `CancellationToken`. A component that cannot
+   accept one is not allowed to block.
+7. **Honest failure over fabrication** — `ok=False` beats an invented fact.
+8. Structural facts come from parsers, not from models. A model may summarise;
+   it may not be the source of a symbol name, path, or dependency edge.
+9. Local-first: no cloud inference.
 
 ## Conventions
 
+- Verify with: `ruff check src/ tests/ scripts/`, `ruff format --check ...`,
+  `mypy`, `pytest tests/`, `python scripts/check_import_boundary.py --root .`
 - No `[project.scripts]` on purpose — a managed launcher lives at `~/.shamsu/bin`;
   a pip console-script would shadow it.
 - Feature branches target `develop`; do not push directly to `main`.
-- Deeper context: `agent context/AGENTS.md`, then `agent context/CURRENT_STATE.md`
-  for ground truth. Note AGENTS.md documents a Windows path (`F:\...`); this
-  checkout is Linux at `/home/shamsu/Shamsu`.
+- Reusing v1 logic means *migrating* it: ten-step process in
+  `LEGACY_COMPONENTS.md`, recorded there. Copy or rewrite behind a clean v2
+  interface — never import.
+
+## Legacy context
+
+`legacy-code/LEGACY_README.md` is the honest account of what v1 was and what
+went wrong — read it before redesigning anything it already tried. Key facts:
+
+- The live v1 loop was `AgentChatLoop`; `ToolCallingAgentLoop` and
+  `runtime/run_control.py` were test-only dead code.
+- v1 had **no mid-run cancellation path at all**. This is the single defect
+  that most motivates v2's run controller.
+- Deeper v1 material: `legacy-code/docs/agent-context/` (AGENTS.md,
+  CURRENT_STATE.md, AGENT_LOOP_AND_TOOLING_REPORT.md). Note AGENTS.md documents
+  a Windows path (`F:\...`); this checkout is Linux at `/home/shamsu/Shamsu`.
+- **No v1 baseline test result exists** — the suite could not run on this
+  machine (missing `mcp`, no `python3-venv`). Do not cite v1 pass rates.

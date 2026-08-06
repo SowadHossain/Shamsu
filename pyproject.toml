@@ -1,0 +1,81 @@
+[project]
+name = "shamsu"
+version = "2.0.0a0"
+description = "Local-first autonomous coding agent with a typed, evidence-gated runtime"
+requires-python = ">=3.11"
+
+# v2 keeps the dependency surface deliberately small. The v1 set (playwright,
+# onnxruntime, rapidocr, trafilatura, pdfplumber, ...) is archived under
+# legacy-code/pyproject.toml and is NOT inherited. Dependencies are added per
+# milestone, only when a milestone actually needs them.
+dependencies = [
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+# NOTE: intentionally NO [project.scripts] entry point. SHAMSU ships a managed
+# launcher under ~/.shamsu/bin; a pip console-script named `shamsu` would create
+# a second executable in .venv/bin and shadow the launcher when the venv is on
+# PATH. This convention carries over from v1 -- see legacy-code/pyproject.toml.
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/shamsu"]
+
+# The archived v1 tree is not part of the distribution and is never importable.
+[tool.hatch.build]
+exclude = ["legacy-code/**"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+extend-exclude = ["legacy-code"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"legacy_code".msg = "v2 must not import legacy code. See LEGACY_COMPONENTS.md."
+"legacy-code".msg = "v2 must not import legacy code. See LEGACY_COMPONENTS.md."
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# legacy-code/tests belongs to the archived project and is collected only by
+# .github/workflows/legacy-ci.yml, which runs pytest from inside legacy-code/.
+norecursedirs = ["legacy-code", ".git", ".shamsu"]
+addopts = "-q --strict-markers"
+markers = [
+    "integration: exercises more than one subsystem",
+    "adversarial: asserts the runtime resists a hostile input",
+    "eval: scored evaluation task, not a pass/fail unit test",
+]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/shamsu"]
+exclude = ["legacy-code"]
+plugins = ["pydantic.mypy"]
+strict = true
+warn_unreachable = true
+
+# The archived tree is not type-checked and never will be. It is not on the
+# path, so mypy would fail to resolve it anyway; this makes that explicit.
+[[tool.mypy.overrides]]
+module = "legacy_code.*"
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.pydantic-mypy]
+init_typed = true
+warn_required_dynamic_aliases = true
