@@ -12,7 +12,7 @@ Tracks progress of the rebuild described in
 | # | Milestone | Status | Exit condition |
 |---|---|---|---|
 | 1 | Repository reset | 🟢 Done | V2 tests run without importing legacy agent code |
-| 2 | Runtime foundation | 🟡 In progress | Simulated runs pause, resume, cancel, reject invalid transitions |
+| 2 | Runtime foundation | 🟢 Done | Simulated runs pause, resume, cancel, reject invalid transitions |
 | 3 | Artifact foundation | ⚪ Not started | Artifacts regenerate correctly after source changes |
 | 4 | Read-only agent | ⚪ Not started | Grounded plans produced without modifying files |
 | 5 | Controlled editing | ⚪ Not started | Simple changes completed with verified evidence |
@@ -38,7 +38,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 1 | Archive legacy code | 🟢 Done |
 | 2 | V2 package skeleton | 🟢 Done |
 | 3 | State and persistence | 🟢 Done |
-| 4 | Run control | ⚪ Not started |
+| 4 | Run control | 🟢 Done |
 | 5 | Artifact registry | ⚪ Not started |
 | 6 | Repository artifacts | ⚪ Not started |
 | 7 | Tool contracts and policy | ⚪ Not started |
@@ -109,9 +109,44 @@ Two guarantees now hold at the storage layer:
    foreign key to `tool_events`, so evidence cannot exist without an observed
    tool execution. There is no path from a model assertion to a row.
 
-Not yet built (PR 4): the run controller that drives these records — process
-registration, live cancellation delivery, pause/resume, feedback injection,
-wall-clock enforcement.
+## PR 4 — Run control ✅
+
+- [x] `RunToken` — cancellation observable by polling from any thread and by
+      `await` on the event loop, so a long call can be *raced* against
+      cancellation rather than only checked between calls
+- [x] `RunController` — registration, status, cancel, pause/resume, feedback
+      injection, wall-clock enforcement, event log
+- [x] `ExecutionLimits` — plan §11's bounds in one frozen object
+- [x] `RunEvent` / `EventKind` — the observable run timeline
+
+**Milestone 2's exit condition is met:** simulated runs pause, resume, cancel,
+and reject invalid transitions, all under test.
+
+### The v1 defect is closed
+
+v1's `runtime/run_control.py` implemented the entire control plane and the live
+loop never imported it — `cancel_run` could be called and nothing happened. The
+fix is structural rather than a better implementation: the controller owns the
+token, and the token is a **required parameter** on every blocking call. A
+component cannot forget to observe cancellation, because it cannot block
+without being handed the thing that reports it.
+
+`CANCELLING` and `CANCELLED` are separate statuses. The first means the request
+was delivered; the second means the run acknowledged it. Collapsing them would
+let status claim a stop that has not happened.
+
+### Bug found and fixed during this PR
+
+`cancel()` advertised thread safety but wrote run status through a SQLite
+connection, which is thread-bound by default. Cancelling from a signal handler
+raised `ProgrammingError` *after* setting the token, leaving the token
+cancelled and the database still claiming `RUNNING`.
+
+Fixed by making `StateStore` genuinely thread-safe (`check_same_thread=False`
+plus a re-entrant lock on every method touching the connection), and by having
+`wait_if_paused` race the resume gate against the token instead of `cancel()`
+reaching into an asyncio primitive from another thread. Regression tests were
+confirmed to fail without the fix.
 
 ---
 

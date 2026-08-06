@@ -62,6 +62,37 @@ The v1 changelog is archived at
   bypassed** (`advance_task` raises without writing), and **evidence cannot be
   forged** (`evidence.source_event_id` is a non-null foreign key to
   `tool_events`, so no model assertion can become a row).
+- **Run control** (`src/shamsu/runtime/`):
+  - `tokens` — `RunToken`, observable by polling from any thread *and* by
+    `await` on the event loop, so a long model call can be raced against
+    cancellation rather than only checked between calls. Feedback uses the same
+    machinery with different semantics: the run continues, only the in-flight
+    call is abandoned.
+  - `controller` — `RunController`: registration, status, cancel, pause/resume,
+    feedback injection, wall-clock enforcement, and the event log. `CANCELLING`
+    and `CANCELLED` are separate statuses so status can never claim a stop that
+    has not happened.
+  - `limits` — `ExecutionLimits`, plan §11's bounds in one frozen object rather
+    than v1's nine files. Long-running mode and automatic production actions
+    are off by default.
+  - `events` — `RunEvent` / `EventKind`, the observable run timeline.
+
+  **This closes the defect that motivated the rebuild.** v1's control plane was
+  fully implemented and never imported by the live loop. Here the controller
+  owns the token and the token is a required parameter on every blocking call,
+  so a component cannot forget to observe cancellation — it cannot block
+  without being handed the thing that reports it.
+
+### Fixed
+
+- `RunController.cancel()` claimed thread safety but wrote run status through a
+  thread-bound SQLite connection, so cancelling from a signal handler raised
+  `ProgrammingError` after setting the token — leaving the token cancelled and
+  the database still reporting `RUNNING`. `StateStore` is now genuinely
+  thread-safe (`check_same_thread=False` plus a re-entrant lock on every method
+  that touches the connection), and `wait_if_paused` races the resume gate
+  against the token rather than having `cancel()` touch an asyncio primitive
+  from another thread.
 
 ### Changed
 

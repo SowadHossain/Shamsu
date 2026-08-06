@@ -222,8 +222,12 @@ def connect(path: str) -> sqlite3.Connection:
     * ``NORMAL`` synchronous: durable across process crashes, which is the
       failure mode that matters for resume. Full fsync per commit is not worth
       it for a local agent's event stream.
+    * ``check_same_thread=False`` because cancellation must work from a signal
+      handler or UI thread and cancelling writes run status. `StateStore`
+      serialises every access on a lock; do not share this connection without
+      equivalent protection.
     """
-    connection = sqlite3.connect(path, isolation_level="DEFERRED")
+    connection = sqlite3.connect(path, isolation_level="DEFERRED", check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA journal_mode = WAL")

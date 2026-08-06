@@ -1,6 +1,6 @@
 """The authoritative SQLite state store.
 
-Two properties this type is responsible for, beyond persistence:
+Three properties this type is responsible for, beyond persistence:
 
 1. **Transitions are validated on write.** ``advance_task`` consults the
    transition table; an illegal move raises instead of being persisted. There
@@ -8,17 +8,24 @@ Two properties this type is responsible for, beyond persistence:
 2. **Evidence is non-forgeable.** ``record_evidence`` takes a tool event id and
    the schema enforces the foreign key, so evidence cannot exist without an
    observed tool execution behind it.
+3. **It is safe to use from more than one thread.** Cancellation must work from
+   a signal handler or a UI thread, and cancelling writes run status. SQLite
+   connections are thread-bound by default, so the connection is opened with
+   ``check_same_thread=False`` and every method that touches it holds a
+   re-entrant lock.
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Concatenate, ParamSpec, TypeVar
 
 from shamsu.interfaces.enums import (
     AgentState,
@@ -70,17 +77,44 @@ def _parse_dt(raw: str | None) -> datetime | None:
     return datetime.fromisoformat(raw) if raw else None
 
 
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+def _synchronized(
+    method: Callable[Concatenate[StateStore, _P], _R],
+) -> Callable[Concatenate[StateStore, _P], _R]:
+    """Serialise access to the shared connection.
+
+    Re-entrant, so a method may call another without deadlocking.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: StateStore, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class StateStore:
     """SQLite-backed authoritative state.
 
-    Not thread-safe by construction; a run owns its store. Concurrent readers
-    are supported through WAL, which is what the status/watch path uses.
+    Safe to use from multiple threads: the connection is opened with
+    ``check_same_thread=False`` and every method that touches it serialises on
+    an ``RLock``. Concurrent readers in other *processes* are supported through
+    WAL journaling.
+
+    The threading requirement is not hypothetical. Cancelling a run writes its
+    status, and cancellation has to work from wherever the user triggers it --
+    a signal handler, a UI thread, an RPC handler.
     """
 
     def __init__(self, path: str | Path) -> None:
         self._path = str(path)
         if self._path != ":memory:":
             Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._connection = connect(self._path)
         migrate(self._connection)
 
@@ -101,12 +135,17 @@ class StateStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        """Group several writes so a partial update cannot be observed."""
-        with self._connection:
+        """Group several writes so a partial update cannot be observed.
+
+        Holds the store lock for the whole block, so another thread cannot
+        interleave a write into the middle of the group.
+        """
+        with self._lock, self._connection:
             yield self._connection
 
     # -- projects ----------------------------------------------------------
 
+    @_synchronized
     def upsert_project(self, project: ProjectRecord) -> ProjectRecord:
         record = project.model_copy(update={"updated_at": utcnow()})
         with self._connection:
@@ -146,6 +185,7 @@ class StateStore:
             )
         return record
 
+    @_synchronized
     def get_project(self, project_id: ProjectId) -> ProjectRecord | None:
         row = self._connection.execute(
             "SELECT * FROM projects WHERE project_id = ?", (project_id,)
@@ -170,6 +210,7 @@ class StateStore:
 
     # -- tasks -------------------------------------------------------------
 
+    @_synchronized
     def create_task(self, task: TaskRecord) -> TaskRecord:
         with self._connection:
             self._connection.execute(
@@ -200,6 +241,7 @@ class StateStore:
             )
         return task
 
+    @_synchronized
     def get_task(self, task_id: TaskId) -> TaskRecord | None:
         row = self._connection.execute(
             "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
@@ -228,6 +270,7 @@ class StateStore:
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
 
+    @_synchronized
     def save_task(self, task: TaskRecord) -> TaskRecord:
         """Persist a task without validating a state change.
 
@@ -262,6 +305,7 @@ class StateStore:
             )
         return record
 
+    @_synchronized
     def advance_task(
         self,
         task: TaskRecord,
@@ -285,6 +329,7 @@ class StateStore:
 
     # -- runs --------------------------------------------------------------
 
+    @_synchronized
     def create_run(self, run: RunRecord) -> RunRecord:
         with self._connection:
             self._connection.execute(
@@ -307,6 +352,7 @@ class StateStore:
             )
         return run
 
+    @_synchronized
     def save_run(self, run: RunRecord) -> RunRecord:
         with self._connection:
             self._connection.execute(
@@ -325,6 +371,7 @@ class StateStore:
             )
         return run
 
+    @_synchronized
     def get_run(self, run_id: RunId) -> RunRecord | None:
         row = self._connection.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         if row is None:
@@ -340,6 +387,7 @@ class StateStore:
             cancel_reason=row["cancel_reason"],
         )
 
+    @_synchronized
     def active_runs(self) -> Sequence[RunRecord]:
         """Runs that have not finished.
 
@@ -360,6 +408,7 @@ class StateStore:
 
     # -- plans -------------------------------------------------------------
 
+    @_synchronized
     def create_plan(self, plan: PlanRecord, steps: Sequence[PlanStepRecord]) -> PlanRecord:
         """Insert a plan and its steps atomically.
 
@@ -410,6 +459,7 @@ class StateStore:
                 )
         return plan
 
+    @_synchronized
     def get_steps(self, plan_id: PlanId) -> Sequence[PlanStepRecord]:
         from shamsu.interfaces.enums import Risk
 
@@ -439,6 +489,7 @@ class StateStore:
             for row in rows
         ]
 
+    @_synchronized
     def save_step(self, step: PlanStepRecord) -> PlanStepRecord:
         with self._connection:
             self._connection.execute(
@@ -453,6 +504,7 @@ class StateStore:
 
     # -- tool events and evidence -----------------------------------------
 
+    @_synchronized
     def record_tool_event(self, event: ToolEventRecord) -> ToolEventRecord:
         with self._connection:
             self._connection.execute(
@@ -482,6 +534,7 @@ class StateStore:
             )
         return event
 
+    @_synchronized
     def record_evidence(self, evidence: EvidenceRecord) -> EvidenceRecord:
         """Register verified evidence.
 
@@ -508,6 +561,7 @@ class StateStore:
             )
         return evidence
 
+    @_synchronized
     def verified_evidence(
         self, task_id: TaskId, step_id: StepId | None = None
     ) -> frozenset[EvidenceKind]:
@@ -523,6 +577,7 @@ class StateStore:
             ).fetchall()
         return frozenset(EvidenceKind(row["kind"]) for row in rows)
 
+    @_synchronized
     def evidence_for(
         self, task_id: TaskId, step_id: StepId | None = None
     ) -> Sequence[EvidenceRecord]:
@@ -547,6 +602,7 @@ class StateStore:
 
     # -- approvals ---------------------------------------------------------
 
+    @_synchronized
     def request_approval(self, approval: ApprovalRecord) -> ApprovalRecord:
         with self._connection:
             self._connection.execute(
@@ -569,6 +625,7 @@ class StateStore:
             )
         return approval
 
+    @_synchronized
     def decide_approval(
         self, approval: ApprovalRecord, decision: ApprovalDecision
     ) -> ApprovalRecord:
@@ -580,6 +637,7 @@ class StateStore:
             )
         return record
 
+    @_synchronized
     def pending_approvals(self, task_id: TaskId) -> Sequence[ApprovalRecord]:
         from shamsu.interfaces.enums import Risk
         from shamsu.interfaces.ids import ApprovalId
@@ -604,6 +662,7 @@ class StateStore:
 
     # -- checkpoints -------------------------------------------------------
 
+    @_synchronized
     def create_checkpoint(self, checkpoint: CheckpointRecord) -> CheckpointRecord:
         with self._connection:
             self._connection.execute(
@@ -625,6 +684,7 @@ class StateStore:
             )
         return checkpoint
 
+    @_synchronized
     def latest_checkpoint(self, task_id: TaskId) -> CheckpointRecord | None:
         """The most recent checkpoint -- the resume point."""
         from shamsu.interfaces.ids import CheckpointId
@@ -646,6 +706,7 @@ class StateStore:
             created_at=datetime.fromisoformat(row["created_at"]),
         )
 
+    @_synchronized
     def resume_task(self, task_id: TaskId) -> TaskRecord | None:
         """Reconstruct a task from its latest checkpoint.
 
@@ -660,6 +721,7 @@ class StateStore:
 
     # -- failures ----------------------------------------------------------
 
+    @_synchronized
     def record_failure(self, failure: FailureRecord) -> FailureRecord:
         with self._connection:
             self._connection.execute(
@@ -684,6 +746,7 @@ class StateStore:
             )
         return failure
 
+    @_synchronized
     def repeated_failure(self, task_id: TaskId, signature: str, *, threshold: int = 2) -> bool:
         """Whether `signature` has recurred enough to stop repairing.
 
@@ -696,6 +759,7 @@ class StateStore:
         ).fetchone()
         return int(row["n"]) >= threshold
 
+    @_synchronized
     def failure_count(self, task_id: TaskId) -> int:
         row = self._connection.execute(
             "SELECT COUNT(*) AS n FROM failures WHERE task_id = ?", (task_id,)
