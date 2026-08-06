@@ -1,18 +1,36 @@
-name: CI
+name: Legacy CI (v1)
+
+# Runs the archived SHAMSU v1 suite under legacy-code/.
+#
+# This workflow is NOT a gate on v2 development. It exists so the archived
+# implementation stays runnable as an evaluation baseline and as a donor for
+# selective component migration. It is manual-only plus a path filter, so
+# ordinary v2 pushes never trigger it.
+#
+# See legacy-code/LEGACY_README.md for the known-failure baseline.
 
 on:
+  workflow_dispatch:
   push:
-    branches: ["**"]
-  pull_request:
-    branches: [main]
+    paths:
+      - "legacy-code/**"
+      - ".github/workflows/legacy-ci.yml"
+
+permissions:
+  contents: read
 
 jobs:
   test:
+    # Legacy failures must not block v2. Report, do not gate.
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: legacy-code
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
