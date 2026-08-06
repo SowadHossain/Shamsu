@@ -13,6 +13,7 @@ statically obliged to accept a token. A component that does not take a
 
 from __future__ import annotations
 
+import asyncio
 from typing import Protocol, runtime_checkable
 
 
@@ -99,9 +100,17 @@ class NullCancellationToken:
         return None
 
     async def wait_cancelled(self) -> str:
-        raise NotImplementedError(
-            "NullCancellationToken is never cancelled; awaiting it would hang forever"
-        )
+        """Never resolves, because this token is never cancelled.
+
+        An earlier version raised instead, on the reasoning that a coroutine
+        which hangs forever is worse than a clear error. That was wrong: the
+        whole point of this method is to be *raced* against real work, and a
+        raising implementation completes instantly, which a race reads as
+        "cancelled". Never resolving is the semantically correct answer, and
+        the caller's timeout is what bounds the wait.
+        """
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 __all__ = [

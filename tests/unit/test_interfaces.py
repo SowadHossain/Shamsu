@@ -92,10 +92,20 @@ class TestCancellation:
         assert token.reason is None
         token.raise_if_cancelled()
 
-    def test_awaiting_the_null_token_fails_loudly(self) -> None:
-        """Better a clear error than a coroutine that hangs until the wall clock."""
-        with pytest.raises(NotImplementedError):
-            asyncio.run(NullCancellationToken().wait_cancelled())
+    def test_awaiting_the_null_token_never_resolves(self) -> None:
+        """It is never cancelled, so awaiting it must never complete.
+
+        This method exists to be *raced* against real work. An implementation
+        that returns or raises promptly would be read by the race as
+        "cancelled", which is how a timeout gets misreported as a user
+        interrupt. The caller's timeout bounds the wait.
+        """
+
+        async def scenario() -> None:
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(NullCancellationToken().wait_cancelled(), timeout=0.05)
+
+        asyncio.run(scenario())
 
     def test_raise_if_cancelled_raises_the_shamsu_type(self) -> None:
         """Distinct from asyncio.CancelledError, so cancel and feedback never blur."""

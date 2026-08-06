@@ -112,21 +112,43 @@ class ToolPolicyViolation(Exception):
 
 @runtime_checkable
 class Tool(Protocol):
-    """A single executable capability."""
+    """A single executable capability.
+
+    Validation and execution are separate calls on purpose. The gateway parses
+    first and only then executes, so a malformed call is refused before any
+    side effect -- an implementation cannot accidentally skip validation
+    because it never receives raw arguments.
+
+    `shamsu.tools.base.Tool` is the ABC to subclass; this protocol is what the
+    gateway depends on.
+    """
 
     @property
     def contract(self) -> ToolContract: ...
 
     def input_schema(self) -> Mapping[str, Any]:
-        """JSON Schema for the arguments, shown to the model."""
+        """JSON Schema for the arguments, shown to the model.
+
+        Must be derived from the same definition `parse` validates against, so
+        what the model is told and what it is held to cannot drift apart.
+        """
         ...
 
-    async def execute(
-        self,
-        arguments: Mapping[str, Any],
-        cancel: CancellationToken,
-    ) -> ToolResult:
-        """Run the tool. Must respect the contract's timeout and output cap."""
+    def parse(self, arguments: Mapping[str, Any]) -> Any:
+        """Validate raw arguments into whatever `run` accepts.
+
+        Raises:
+            ToolPolicyViolation: the arguments do not satisfy the schema.
+        """
+        ...
+
+    async def run(self, arguments: Any, cancel: CancellationToken) -> ToolResult:
+        """Execute with validated arguments.
+
+        Return `ok=False` for expected failures. The gateway enforces the
+        contract's timeout and output cap around this call, so implementations
+        do not need to.
+        """
         ...
 
 
@@ -134,10 +156,16 @@ class Tool(Protocol):
 class ToolGateway(Protocol):
     """The only path from a model decision to a side effect.
 
-    Responsible, in order: resolve the tool, validate arguments against the
-    schema, check the phase allowlist, check approval, enforce the
-    one-mutation-per-decision rule, execute under timeout and cancellation, cap
-    the output, and register evidence and artifact invalidation.
+    Responsible, in order: resolve the tool, check the phase allowlist, check
+    approval, validate arguments against the schema, enforce the
+    one-mutation-per-decision rule, execute under timeout and cancellation, and
+    cap the output before it can reach any context.
+
+    It *reports* the evidence a result is entitled to; it does not register it.
+    Evidence is non-forgeable precisely because `EvidenceRecord.source_event_id`
+    is a foreign key to a persisted `tool_events` row, so registration needs the
+    state store. The runtime records the event and registers the evidence,
+    which keeps policy free of persistence.
     """
 
     def available(self, phase: Phase) -> Sequence[ToolContract]:
