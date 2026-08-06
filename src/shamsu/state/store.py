@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Concatenate, ParamSpec, TypeVar
+from typing import Any, Concatenate, ParamSpec, TypeVar, cast
 
 from shamsu.interfaces.enums import (
     AgentState,
@@ -94,7 +94,10 @@ def _synchronized(
         with self._lock:
             return method(self, *args, **kwargs)
 
-    return wrapper
+    # `functools.wraps` widens the type to `_Wrapped`, which is not assignable
+    # to the declared return type even though it is call-compatible. The cast
+    # preserves the signature callers actually see.
+    return cast("Callable[Concatenate[StateStore, _P], _R]", wrapper)
 
 
 class StateStore:

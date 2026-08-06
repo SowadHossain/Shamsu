@@ -17,6 +17,7 @@ structured, wrong claim about the code.
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -323,10 +324,13 @@ class ArtifactRegistry:
                 artifact_id = ArtifactId(row["artifact_id"])
                 current = ArtifactStatus(row["status"])
 
-                sources = connection.execute(
-                    "SELECT path, content_hash FROM artifact_sources WHERE artifact_id=?",
-                    (artifact_id,),
-                ).fetchall()
+                sources = [
+                    (str(source["path"]), str(source["content_hash"]))
+                    for source in connection.execute(
+                        "SELECT path, content_hash FROM artifact_sources WHERE artifact_id=?",
+                        (artifact_id,),
+                    ).fetchall()
+                ]
 
                 target = self._evaluate(sources, current_hashes, current)
                 if target is not current:
@@ -340,20 +344,23 @@ class ArtifactRegistry:
 
     @staticmethod
     def _evaluate(
-        sources: Sequence[object],
+        sources: Sequence[tuple[str, str]],
         current_hashes: Mapping[str, str],
         current: ArtifactStatus,
     ) -> ArtifactStatus:
-        """Decide a status from source hashes. Pure, so it is directly testable."""
+        """Decide a status from `(path, recorded_hash)` pairs.
+
+        Pure and takes plain tuples rather than database rows, so the
+        invalidation rules -- the most consequential logic in this module --
+        can be tested without a database at all.
+        """
         # An artifact with no sources makes no falsifiable claim about files;
         # hash comparison cannot say anything about it either way.
         if not sources:
             return current
 
         drifted = False
-        for source in sources:
-            path = source["path"]  # type: ignore[index]
-            recorded = source["content_hash"]  # type: ignore[index]
+        for path, recorded in sources:
             actual = current_hashes.get(path)
             if actual is None:
                 return ArtifactStatus.INVALIDATED
@@ -501,26 +508,26 @@ class ArtifactRegistry:
             )
 
     @staticmethod
-    def _sources_for(connection: object, artifact_id: str) -> tuple[SourceRef, ...]:
-        rows = connection.execute(  # type: ignore[attr-defined]
+    def _sources_for(connection: sqlite3.Connection, artifact_id: str) -> tuple[SourceRef, ...]:
+        rows = connection.execute(
             "SELECT path, content_hash FROM artifact_sources WHERE artifact_id=? ORDER BY path",
             (artifact_id,),
         ).fetchall()
         return tuple(SourceRef(path=row["path"], content_hash=row["content_hash"]) for row in rows)
 
     @staticmethod
-    def _meta_from_row(row: object, sources: tuple[SourceRef, ...]) -> ArtifactMeta:
+    def _meta_from_row(row: sqlite3.Row, sources: tuple[SourceRef, ...]) -> ArtifactMeta:
         return ArtifactMeta(
-            artifact_id=ArtifactId(row["artifact_id"]),  # type: ignore[index]
-            kind=ArtifactKind(row["kind"]),  # type: ignore[index]
-            key=row["key"],  # type: ignore[index]
+            artifact_id=ArtifactId(row["artifact_id"]),
+            kind=ArtifactKind(row["kind"]),
+            key=row["key"],
             sources=sources,
-            artifact_version=row["artifact_version"],  # type: ignore[index]
-            generator_version=row["generator_version"],  # type: ignore[index]
-            created_at=datetime.fromisoformat(row["created_at"]),  # type: ignore[index]
-            refreshed_at=datetime.fromisoformat(row["refreshed_at"]),  # type: ignore[index]
-            status=ArtifactStatus(row["status"]),  # type: ignore[index]
-            confidence=row["confidence"],  # type: ignore[index]
+            artifact_version=row["artifact_version"],
+            generator_version=row["generator_version"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            refreshed_at=datetime.fromisoformat(row["refreshed_at"]),
+            status=ArtifactStatus(row["status"]),
+            confidence=row["confidence"],
         )
 
 

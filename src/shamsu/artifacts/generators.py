@@ -17,6 +17,7 @@ import json
 import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 from shamsu.artifacts.hashing import hash_file, hash_text, scan_repository
 from shamsu.artifacts.python_source import (
@@ -407,7 +408,13 @@ class RepositoryManifestGenerator:
             if Path(path).name.startswith(".env") or Path(path).name == "env.example"
         )
 
-    def _toml(self, path: str) -> dict[str, object]:
+    # `Any` rather than `object` in these two return types is deliberate, not a
+    # shortcut. A third-party manifest has no schema this code controls, so the
+    # value type genuinely is unknown; `object` would only force a cast at every
+    # access and claim a precision that does not exist. Every read below is
+    # defensive (`.get(...) or {}`, `isinstance` guards) precisely because of it.
+
+    def _toml(self, path: str) -> dict[str, Any]:
         try:
             return tomllib.loads(self._context.read(path))
         except (tomllib.TOMLDecodeError, ArtifactGenerationError):
@@ -415,7 +422,7 @@ class RepositoryManifestGenerator:
             # fail the whole artifact. It contributes nothing and says nothing.
             return {}
 
-    def _json(self, path: str) -> dict[str, object]:
+    def _json(self, path: str) -> dict[str, Any]:
         try:
             loaded = json.loads(self._context.read(path))
         except (json.JSONDecodeError, ArtifactGenerationError):

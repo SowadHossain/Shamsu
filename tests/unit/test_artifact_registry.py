@@ -457,6 +457,55 @@ class TestFreshnessRecomputation:
         )
 
 
+class TestInvalidationRules:
+    """The rules themselves, without a database.
+
+    `_evaluate` takes plain `(path, hash)` pairs precisely so the most
+    consequential logic in the module can be exercised directly.
+    """
+
+    @staticmethod
+    def _decide(
+        sources: list[tuple[str, str]],
+        current: dict[str, str],
+        status: ArtifactStatus = ArtifactStatus.FRESH,
+    ) -> ArtifactStatus:
+        return Registry._evaluate(sources, current, status)  # noqa: SLF001
+
+    def test_matching_hashes_are_fresh(self) -> None:
+        assert self._decide([("a.py", "h1")], {"a.py": "h1"}) is ArtifactStatus.FRESH
+
+    def test_a_changed_hash_is_stale(self) -> None:
+        assert self._decide([("a.py", "h1")], {"a.py": "h2"}) is ArtifactStatus.STALE
+
+    def test_an_absent_path_is_invalidated(self) -> None:
+        assert self._decide([("a.py", "h1")], {}) is ArtifactStatus.INVALIDATED
+
+    def test_absence_outranks_drift(self) -> None:
+        """A gone source is worse news than a changed one; report the worse."""
+        assert (
+            self._decide([("a.py", "h1"), ("b.py", "h2")], {"a.py": "CHANGED"})
+            is ArtifactStatus.INVALIDATED
+        )
+
+    def test_no_sources_leaves_the_status_untouched(self) -> None:
+        for status in ArtifactStatus:
+            assert self._decide([], {"a.py": "h1"}, status) is status
+
+    @pytest.mark.parametrize(
+        "status", [ArtifactStatus.INVALIDATED, ArtifactStatus.GENERATION_FAILED]
+    )
+    def test_matching_hashes_do_not_resurrect(self, status: ArtifactStatus) -> None:
+        """It may have been invalidated by a contradiction, not by a hash."""
+        assert self._decide([("a.py", "h1")], {"a.py": "h1"}, status) is status
+
+    def test_a_stale_artifact_recovers_when_the_edit_is_reverted(self) -> None:
+        assert (
+            self._decide([("a.py", "h1")], {"a.py": "h1"}, ArtifactStatus.STALE)
+            is ArtifactStatus.FRESH
+        )
+
+
 class TestPathInvalidation:
     def test_editing_a_file_stales_its_artifacts(self, registry: Registry) -> None:
         """What runs after every mutating tool call."""
