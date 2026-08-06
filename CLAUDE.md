@@ -115,10 +115,11 @@ went wrong — read it before redesigning anything it already tried. Key facts:
 - Deeper v1 material: `legacy-code/docs/agent-context/` (AGENTS.md,
   CURRENT_STATE.md, AGENT_LOOP_AND_TOOLING_REPORT.md). Note AGENTS.md documents
   a Windows path (`F:\...`); this checkout is Linux at `/home/shamsu/Shamsu`.
-- **v1 baseline: 2349 passed / 7 failed / 6 skipped** of 2362, fully triaged:
-  5 environmental (3 need a local model, 1 needs `python3-venv`, 1 needs
-  playwright), 1 stale test, and **1 genuine bug** (`_FILE_TOKEN_RE` cannot
-  match a POSIX absolute path — see `LEGACY_COMPONENTS.md`).
+- **v1 baseline: 2350 passed / 6 failed / 6 skipped** of 2362. No genuine bugs
+  remain: 5 are environmental (3 need a local model, 1 needs `python3-venv`,
+  1 needs playwright) and 1 is a stale test whose named safety property still
+  holds. The one real bug (`_FILE_TOKEN_RE`) was fixed — see
+  `LEGACY_COMPONENTS.md`.
 - Two traps when running the legacy suite: this box has **no `python`, only
   `python3`** (symlink one onto PATH or you get 10 spurious failures), and
   pre-archival `__pycache__` under `legacy-code/` makes every traceback show

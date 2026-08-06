@@ -19,7 +19,7 @@ from the repository root on branch `shamsu-v2.0.0`.
 | **Package version** | `0.4.0b1` |
 | **Python** | `>=3.11` |
 | **Archival commit** | `bb84e2f` (`chore: archive SHAMSU v1 under legacy-code`) |
-| **Baseline test result** | 2349 passed / 7 failed / 6 skipped — see below |
+| **Baseline test result** | 2350 passed / 6 failed / 6 skipped — see below |
 
 Layout after archival:
 
@@ -156,14 +156,20 @@ then fully triaged.
 | | |
 |---|---:|
 | **Collected** | 2362 |
-| **Passed** | **2349** |
-| **Failed** | **7** |
+| **Passed** | **2350** |
+| **Failed** | **6** |
 | Skipped | 6 |
 | Collection errors | 0 |
 
-**Of the 7 failures: 5 are environmental, 1 is a stale test, and 1 is a
-genuine v1 bug.** v1 is in considerably better shape than a raw failure count
+**Of the 6 failures: 5 are environmental and 1 is a stale test. No genuine v1
+bugs remain.** v1 is in considerably better shape than a raw failure count
 suggests.
+
+The one real bug found during triage — `_FILE_TOKEN_RE` could not match a POSIX
+absolute path — **was fixed** at the user's direction, taking the suite from
+2349 to 2350 passing with no regressions. `legacy-code/` is otherwise not
+maintained; the exception was made because this archive doubles as the
+evaluation baseline. Full write-up in `../LEGACY_COMPONENTS.md`.
 
 **pytest did not print its final count line**; the numbers above are counted
 from the per-test progress characters, which sum exactly to the 2362 collected.
@@ -188,7 +194,7 @@ suite was being run, not defects:
    makes triage impossible. Delete `__pycache__` under `legacy-code/` before
    trusting a traceback.
 
-#### The 7 remaining failures, triaged
+#### The 6 remaining failures, triaged
 
 **Environmental (5)** — would pass on a properly provisioned machine:
 
@@ -209,17 +215,9 @@ asserts `_route_for_kind("mutation", "web") == "file.write"` but gets
 no clause. **The safety property the test is named for still holds** — a
 mutation is not routed to web. Only the specific expectation is outdated.
 
-**Genuine bug (1)** — see `../LEGACY_COMPONENTS.md` for the full write-up:
-
-`test_dry_run_and_contract.py::test_contract_normalizes_absolute_workspace_target_to_relative_path`.
-`_FILE_TOKEN_RE` (`shamsu/verify/contract.py:40`) starts matching at `[\w]`, so
-a leading `/` is never captured: `/tmp/ws/notes.md` matches as
-`tmp/ws/notes.md`. `Path.is_absolute()` is therefore always `False` for POSIX
-input, and the workspace-relative normalization branch in `_requested_path` is
-**dead code on Linux and macOS**. It handles Windows drive letters correctly,
-so this was meant to cover absolute paths and only half does. A prompt saying
-"Create /home/me/proj/notes.md" records `home/me/proj/notes.md` and the
-contract check then reports a false violation.
+**Fixed (1)** — `test_dry_run_and_contract.py::test_contract_normalizes_absolute_workspace_target_to_relative_path`
+now passes. See `../LEGACY_COMPONENTS.md` for what was wrong and why the fix
+needed a lookbehind.
 
 #### Reproducing
 

@@ -37,8 +37,17 @@ from shamsu.safety import read_only
 # sentence in it" otherwise yields a requested file called `workspace.Put`, and
 # the contract then fails a perfectly good run because a phantom file was never
 # written. Real extensions do not look like that; sentence boundaries do.
+# The leading `/` alternative matters: without it the match started at the
+# first word character, so "/tmp/ws/notes.md" was captured as "tmp/ws/notes.md"
+# -- an absolute path silently demoted to a relative one. Path.is_absolute()
+# was then always False on POSIX, which made the workspace-relative
+# normalisation in _requested_path dead code on Linux and macOS, and the
+# contract reported a false violation on a task the agent had completed.
+# Windows drive letters were already handled; this covers POSIX roots too.
+# The lookbehind keeps "./notes.md" from matching as "/notes.md": the leading
+# slash is only a POSIX root when nothing path-like precedes it.
 _FILE_TOKEN_RE = re.compile(
-    r"(?:[A-Za-z]:[\\/])?[\w][\w./\\-]*\.(?:[a-z0-9_]{1,12}|[A-Z0-9_]{1,12})\b"
+    r"(?:[A-Za-z]:[\\/]|(?<![\w.])/)?[\w][\w./\\-]*\.(?:[a-z0-9_]{1,12}|[A-Z0-9_]{1,12})\b"
 )
 _NON_PATH_FILE_TOKENS = {
     "bun.js",

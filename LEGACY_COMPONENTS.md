@@ -82,7 +82,16 @@ to import.
 Bugs found in v1 code that is on the candidate list. Migrating any of these
 means fixing the defect, not porting it.
 
-### `_FILE_TOKEN_RE` cannot match a POSIX absolute path
+### ~~`_FILE_TOKEN_RE` cannot match a POSIX absolute path~~ — FIXED
+
+**Fixed in the archive** at the user's direction. `legacy-code/` is otherwise
+not maintained; this was worth an exception because the archive doubles as the
+evaluation baseline and a known-broken contract layer makes that baseline
+noisier. The v1 suite went from 2349 to 2350 passing with no regressions.
+
+The write-up below is kept because the *lesson* still governs v2.
+
+#### Original defect
 
 | | |
 |---|---|
@@ -116,11 +125,24 @@ path as `home/me/proj/notes.md`. Contract verification then looks for that
 relative path inside the workspace, does not find it, and reports a violation —
 a false failure on a task the agent completed correctly.
 
+#### The fix
+
+```python
+r"(?:[A-Za-z]:[\\/]|(?<![\w.])/)?[\w][\w./\\-]*\.(?:...)"
+#                     ^^^^^^^^^^^^^ added
+```
+
+The lookbehind is load-bearing: a bare `/` alternative made `./notes.md` match
+as `/notes.md`, which is a *new* silent corruption of exactly the kind being
+fixed. It was caught by testing all four path spellings rather than only the
+one the failing test covered.
+
 **For v2:** path normalization belongs in `security/`, must be tested against
-POSIX-absolute, Windows-absolute, relative, and `../`-escaping inputs, and must
-never derive a path by regex-scraping prose in the first place. The v2 tool
-gateway takes typed arguments; a path is a parameter, not something recovered
-from a sentence.
+POSIX-absolute, Windows-absolute, relative, `./`-prefixed, and `../`-escaping
+inputs, and must never derive a path by regex-scraping prose in the first
+place. The v2 tool gateway takes typed arguments; a path is a parameter, not
+something recovered from a sentence. `PathSandbox` implements this, and its
+adversarial suite covers every form above.
 
 ---
 
