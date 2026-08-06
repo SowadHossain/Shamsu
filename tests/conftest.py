@@ -24,6 +24,12 @@ SRC = REPO_ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+# `tests.fixtures` is imported by name. pytest's rootdir insertion usually
+# covers this, but it depends on invocation directory and import mode -- pin it
+# so `pytest tests/`, `pytest`, and a CI run from any cwd all behave the same.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 
 @pytest.fixture
 def repo_root() -> Path:
