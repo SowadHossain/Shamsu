@@ -18,7 +18,7 @@ Tracks progress of the rebuild described in
 | 5 | Controlled editing | 🟢 Done | Simple changes completed with verified evidence |
 | 6 | Structured planning | 🟢 Done | Bounded multi-file tasks completed step-by-step |
 | 7 | Repair | 🟢 Done | Simple failures fixed without uncontrolled edits |
-| 8 | Code intelligence | ⚪ Not started | Retrieval evals show accurate code selection |
+| 8 | Code intelligence | 🟢 Done | Retrieval evals show accurate code selection |
 | 9 | Project memory | ⚪ Not started | Memory improves success without more stale-context errors |
 | 10 | Packages and documentation | ⚪ Not started | — |
 | 11 | Docker | ⚪ Not started | — |
@@ -47,7 +47,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 10 | Planning contracts | 🟢 Done |
 | 11 | Completion gate | 🟢 Done |
 | 12 | Repair | 🟢 Done |
-| 13 | Structural code intelligence | ⚪ Not started |
+| 13 | Structural code intelligence | 🟢 Done |
 | 14 | Lightweight project memory | ⚪ Not started |
 | 15 | Legacy utility migration | ⚪ Not started |
 
@@ -407,6 +407,71 @@ no longer existed until same-failure detection blocked a task that was already
 done. Each run now gets a fresh `PYTHONPYCACHEPREFIX`, which also keeps
 `__pycache__` out of the workspace so checkpoint diffs show only real changes.
 Both regression tests were confirmed to fail without the fix.
+
+---
+
+## PR 13 — Structural code intelligence ✅
+
+- [x] `code_intelligence/index` — `PythonCodeIndex`, satisfying the `CodeIndex` protocol
+- [x] Symbol index, reference graph, callers, callees
+- [x] Related tests — import edge, package import + used name, then convention
+- [x] `impact()` — bounded traversal that reports its own truncation
+- [x] `code_intelligence/retrieval` — the ordered pipeline, semantic last
+- [x] `python_source` — call and reference edges, attributed to the innermost symbol
+- [x] `tests/evals/test_retrieval_accuracy.py` — scored against this repository
+
+**Milestone 8's exit condition is met:** the retrieval evaluation scores
+**precision@1 = 81%** over 16 queries spanning identifiers, qualified names,
+paths, and literals, with a 75% regression threshold asserted in CI. Every
+ground-truth related-test pair resolves.
+
+### Deviation from the plan: no tree-sitter
+
+The plan says "Add Tree-sitter". This ships on stdlib `ast` instead, and that
+is a considered choice rather than a shortcut:
+
+- For Python, `ast` is the language's own parser — exact where tree-sitter is
+  approximate.
+- It costs no dependency and no bundled grammar, and v2 adds dependencies only
+  when a milestone needs them.
+- `CodeIndex` is the seam a tree-sitter backend arrives through when other
+  languages need one. Nothing here has to change for that.
+
+Tree-sitter is deferred, not rejected. It becomes necessary the first time
+SHAMSU must index a repository it cannot parse.
+
+### Design points worth keeping
+
+- **The retrieval order is the product.** Any backend can be swapped; running
+  them in the wrong order cannot be fixed by improving any of them.
+- **Identifier queries are routed to the symbol stage ahead of text.** Plan §18
+  puts text at stage 2, which is right for a literal. For a bare identifier,
+  text search returns the definition *and* every import, call site, and mention,
+  and first-non-empty-wins then hands back the noisy set. Both behaviours are
+  asserted.
+- **Name-based, and it says so.** Python binding is not statically decidable,
+  so references and callers over-approximate. That is the safe direction for
+  scoping a change, but `provenance` and `truncated` exist so no caller mistakes
+  it for proof.
+- **`is_ready()` re-scans rather than trusting a marker.** v1 gated on a marker
+  file that could disagree with the index, so the agent silently answered from a
+  stale one. A stale index is reported on every retrieval result.
+- **A broken semantic backend degrades to no hits.** A fallback that can fail
+  the task is not a fallback.
+- **Related tests use three rules, strongest first.** The middle one matters:
+  `from shamsu.verification import digest_test_output` never names `digest.py`,
+  and a rule matching only full module paths would call that file untested.
+- **`related_files_for` is available but deliberately not wired into repair.**
+  Widening a write scope is a safety change and should land on the strength of
+  evaluations, not on the strength of being possible.
+
+### Bug found and fixed during this PR
+
+`ast.walk` yields a `Call` *and* the `Name` inside its `func`, so every call was
+recorded twice — once as a call, once as a plain use. Caught by a test asserting
+`is_call` on every reference to a called name. One occurrence is now one
+reference; otherwise `is_call` means nothing and every consumer has to
+deduplicate.
 
 ---
 

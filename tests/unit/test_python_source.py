@@ -150,3 +150,73 @@ class TestFailureHandling:
     def test_module_docstring_is_captured(self) -> None:
         module = extract_python("a.py", '"""What this module does."""\n')
         assert module.summary == "What this module does."
+
+
+class TestCallsAndReferences:
+    """The call and reference edges the code index is built from."""
+
+    SOURCE = '''"""Module."""
+
+
+def helper(x: int) -> int:
+    return x + 1
+
+
+def outer(values: list[int]) -> int:
+    total = 0
+    for value in values:
+        total = helper(total)
+
+    def inner() -> None:
+        helper(0)
+
+    inner()
+    return total
+
+
+class Runner:
+    def go(self) -> None:
+        helper(1)
+        self.stop()
+
+    def stop(self) -> None:
+        pass
+'''
+
+    def test_calls_are_attributed_to_the_enclosing_symbol(self) -> None:
+        module = extract_python("a.py", self.SOURCE)
+        calls = {symbol.qualified_name: set(symbol.calls) for symbol in module.symbols}
+
+        assert "helper" in calls["outer"]
+        assert calls["helper"] == set()
+
+    def test_a_method_owns_its_calls_not_its_class(self) -> None:
+        """Innermost wins, or every class appears to call everything."""
+        module = extract_python("a.py", self.SOURCE)
+        calls = {symbol.qualified_name: set(symbol.calls) for symbol in module.symbols}
+
+        assert calls["Runner.go"] == {"helper", "stop"}
+        assert calls["Runner"] == set()
+
+    def test_a_closures_calls_belong_to_its_enclosing_function(self) -> None:
+        """The closure is not separately reachable, so nothing else can stand for it."""
+        module = extract_python("a.py", self.SOURCE)
+        calls = {symbol.qualified_name: set(symbol.calls) for symbol in module.symbols}
+        assert {"helper", "inner"} <= calls["outer"]
+
+    def test_references_record_uses_with_lines(self) -> None:
+        module = extract_python("a.py", self.SOURCE)
+        helper_uses = [ref for ref in module.references if ref.name == "helper"]
+
+        assert len(helper_uses) >= 3
+        assert all(ref.is_call for ref in helper_uses)
+        assert all(ref.line >= 1 for ref in helper_uses)
+
+    def test_a_dotted_call_records_the_last_segment(self) -> None:
+        """Resolving the receiver needs type inference; a wrong answer is worse."""
+        module = extract_python("a.py", "def f():\n    a.b.run()\n")
+        assert module.symbols[0].calls == ("run",)
+
+    def test_a_syntax_error_yields_no_edges(self) -> None:
+        module = extract_python("a.py", "def broken(:\n")
+        assert module.references == []

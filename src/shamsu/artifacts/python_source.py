@@ -7,9 +7,10 @@ a line number, or an import edge. Those come from the parser or they do not
 appear.
 
 Python uses stdlib `ast`, which costs nothing and is exactly correct for the
-language SHAMSU is written in. Tree-sitter arrives in Milestone 8 for the
-other languages; the extracted types here are deliberately language-agnostic so
-that lands as a new extractor rather than a rewrite.
+language SHAMSU is written in. Milestone 8 kept it: for Python, tree-sitter
+would be a step backwards, since `ast` is the language's own parser. The
+extracted types here are deliberately language-agnostic, so a tree-sitter
+extractor for other languages lands as an addition rather than a rewrite.
 """
 
 from __future__ import annotations
@@ -47,6 +48,14 @@ class ExtractedSymbol(BaseModel):
     signature: str = ""
     summary: str = Field(default="", description="First docstring line, verbatim.")
     decorators: tuple[str, ...] = ()
+    calls: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Bare names called inside this symbol, deduplicated. `a.b.run()` is "
+            "recorded as 'run': resolving the receiver needs type inference, and "
+            "a wrong resolution is worse than an honest name match."
+        ),
+    )
 
     @property
     def is_public(self) -> bool:
@@ -58,6 +67,24 @@ class ExtractedSymbol(BaseModel):
         return not any(part.startswith("_") for part in self.qualified_name.split("."))
 
 
+class Reference(BaseModel):
+    """One occurrence of a name being *used* in a file.
+
+    Name-based, not binding-resolved. Python's binding rules are not decidable
+    statically in the general case, so this over-approximates: two unrelated
+    classes with a `save` method produce references to each other's name. That
+    is the safe direction for scoping a change — a missed reference is a
+    silently unsafe edit, while an extra one is a file the agent reads and
+    discards — but it must never be presented as proof.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str = Field(description="Bare identifier; the last segment of a dotted access.")
+    line: int = Field(ge=1)
+    is_call: bool = False
+
+
 class ExtractedModule:
     """Structure of one Python file. Not frozen: built incrementally by the visitor."""
 
@@ -67,6 +94,7 @@ class ExtractedModule:
         self.summary: str = ""
         self.imports: list[str] = []
         self.symbols: list[ExtractedSymbol] = []
+        self.references: list[Reference] = []
         self.parse_error: str | None = None
 
     @property
@@ -311,13 +339,88 @@ def extract_python(path: str, source: str) -> ExtractedModule:
     # than dictionary iteration order.
     module.symbols.sort(key=lambda symbol: (symbol.line_start, symbol.qualified_name))
     module.imports = sorted(set(module.imports))
+    module.references = _collect_references(tree)
+    module.symbols = _attribute_calls(module.symbols, module.references)
     return module
+
+
+def _collect_references(tree: ast.AST) -> list[Reference]:
+    """Every name used in the module, with its line.
+
+    Walks the whole tree rather than one level, unlike `_Visitor`: a reference
+    inside a closure is still a reference, and the question this feeds ("what
+    would a change to X reach?") gets the wrong answer if nesting hides it.
+    """
+    references: list[Reference] = []
+
+    # `ast.walk` yields a Call *and* the Name inside its `func`, so a single
+    # `helper()` would otherwise be recorded twice -- once as a call, once as a
+    # plain use. One occurrence is one reference, or `is_call` stops meaning
+    # anything and every consumer has to deduplicate.
+    called: set[int] = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = _called_name(node.func)
+            if name:
+                references.append(Reference(name=name, line=node.lineno, is_call=True))
+        elif id(node) in called:
+            continue
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            references.append(Reference(name=node.id, line=node.lineno))
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            references.append(Reference(name=node.attr, line=node.lineno))
+
+    return references
+
+
+def _called_name(func: ast.expr) -> str:
+    """The bare name being called, as written."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    return ""
+
+
+def _attribute_calls(
+    symbols: list[ExtractedSymbol], references: list[Reference]
+) -> list[ExtractedSymbol]:
+    """Assign each call to the innermost symbol whose span contains it.
+
+    Innermost wins, so a call inside a method belongs to the method rather than
+    to its class. Calls inside a closure attribute to the enclosing function,
+    which is correct: the closure is not separately reachable, so the enclosing
+    function is the only symbol that can stand for its behaviour.
+    """
+    calls: dict[str, list[str]] = {symbol.qualified_name: [] for symbol in symbols}
+
+    for reference in references:
+        if not reference.is_call:
+            continue
+        owner = _innermost(symbols, reference.line)
+        if owner is not None and reference.name not in calls[owner.qualified_name]:
+            calls[owner.qualified_name].append(reference.name)
+
+    return [
+        symbol.model_copy(update={"calls": tuple(calls[symbol.qualified_name])})
+        for symbol in symbols
+    ]
+
+
+def _innermost(symbols: list[ExtractedSymbol], line: int) -> ExtractedSymbol | None:
+    """The smallest-span symbol containing `line`, or None for module level."""
+    containing = [symbol for symbol in symbols if symbol.line_start <= line <= symbol.line_end]
+    if not containing:
+        return None
+    return min(containing, key=lambda symbol: symbol.line_end - symbol.line_start)
 
 
 __all__ = [
     "DEFAULT_SOURCE_ROOTS",
     "ExtractedModule",
     "ExtractedSymbol",
+    "Reference",
     "extract_python",
     "module_path_for",
 ]
