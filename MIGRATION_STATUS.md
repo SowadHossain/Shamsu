@@ -13,7 +13,7 @@ Tracks progress of the rebuild described in
 |---|---|---|---|
 | 1 | Repository reset | 🟢 Done | V2 tests run without importing legacy agent code |
 | 2 | Runtime foundation | 🟢 Done | Simulated runs pause, resume, cancel, reject invalid transitions |
-| 3 | Artifact foundation | ⚪ Not started | Artifacts regenerate correctly after source changes |
+| 3 | Artifact foundation | 🟢 Done | Artifacts regenerate correctly after source changes |
 | 4 | Read-only agent | ⚪ Not started | Grounded plans produced without modifying files |
 | 5 | Controlled editing | ⚪ Not started | Simple changes completed with verified evidence |
 | 6 | Structured planning | ⚪ Not started | Bounded multi-file tasks completed step-by-step |
@@ -39,8 +39,8 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 2 | V2 package skeleton | 🟢 Done |
 | 3 | State and persistence | 🟢 Done |
 | 4 | Run control | 🟢 Done |
-| 5 | Artifact registry | ⚪ Not started |
-| 6 | Repository artifacts | ⚪ Not started |
+| 5 | Artifact registry | 🟢 Done |
+| 6 | Repository artifacts | 🟢 Done |
 | 7 | Tool contracts and policy | ⚪ Not started |
 | 8 | Read-only agent | ⚪ Not started |
 | 9 | Controlled authoring | ⚪ Not started |
@@ -147,6 +147,55 @@ plus a re-entrant lock on every method touching the connection), and by having
 `wait_if_paused` race the resume gate against the token instead of `cancel()`
 reaching into an asyncio primitive from another thread. Regression tests were
 confirmed to fail without the fix.
+
+## PR 5 — Artifact registry ✅
+
+- [x] Content hashing (not timestamps — `touch` moves mtime, not content)
+- [x] Git-aware scanning: `ls-files --cached --others --exclude-standard`
+- [x] `ArtifactRegistry` — content on disk, freshness in SQLite
+- [x] Invalidation by source hash, by path, by generator version, by contradiction
+- [x] `usable()` gate so INVALIDATED/MISSING/FAILED cannot reach the model
+- [x] Schema migration 2
+
+Using git's view rather than a hand-maintained ignore list is the difference
+between scanning 894 files of this repository and scanning the 64 that are
+actually v2 — the archived v1 tree and the vendored SmallCTL checkout are both
+correctly excluded.
+
+## PR 6 — Repository artifacts ✅
+
+- [x] Deterministic Python extraction via stdlib `ast` (no new dependencies)
+- [x] Repository manifest (§15.1), repository map (§15.2), module cards
+      (§15.3), symbol cards (§15.4)
+- [x] `ArtifactRefresher` — scan → recompute → retire → regenerate → report
+- [x] Reverse import edges (real, computed from parsed imports)
+
+**Milestone 3's exit condition is met.** On this repository a full pass builds
+220 artifacts from 70 files; a second pass does no work; editing a file
+regenerates exactly its dependents; deleting one retires its card.
+
+### Honesty over completeness
+
+Callers, callees, and measured coverage need the reference graph from Milestone
+8. Cards say **"Not yet computed"** rather than leaving those sections blank —
+a blank "Callers" heading reads as *nothing calls this*, which is a structural
+claim nothing has earned. Related tests are labelled as matched by filename
+convention, not measured coverage.
+
+### Bugs found and fixed during these PRs
+
+1. **Repository-wide artifacts did not track add/delete.** The manifest reports
+   a file count and directory list, but declared only `pyproject.toml` as a
+   source — so deleting a module left it FRESH and wrong. Fixed with a
+   synthetic `<repository:file-list>` source whose hash covers the set of
+   indexed paths.
+2. **`src/` was stripped unconditionally when deriving module paths.** Correct
+   for a src-layout project, wrong when `src/__init__.py` exists — and it
+   silently broke every import edge in that case. The context now detects which
+   packaging roots actually apply.
+3. **A retired card was invalidated but not reported as retired**, because
+   hash-based recomputation had already invalidated it. The report now
+   describes what happened to the artifact, not which code path got there first.
 
 ---
 

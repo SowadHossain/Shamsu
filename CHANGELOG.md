@@ -83,6 +83,33 @@ The v1 changelog is archived at
   so a component cannot forget to observe cancellation — it cannot block
   without being handed the thing that reports it.
 
+- **Artifact foundation** (`src/shamsu/artifacts/`) — Milestone 3:
+  - `hashing` — content hashes rather than timestamps, and git-aware scanning
+    (`ls-files --cached --others --exclude-standard`) so the project's own
+    `.gitignore` decides what belongs to it. On this repository that is 64
+    files scanned instead of 894.
+  - `registry` — `ArtifactRegistry`: content on disk under `.shamsu/artifacts/`
+    so it stays readable and diffable, freshness in SQLite so it stays
+    queryable. Invalidation by source hash, by path, by generator version, and
+    by recorded contradiction. `usable()` gates INVALIDATED, MISSING, and
+    GENERATION_FAILED so they cannot reach the model.
+  - `python_source` — deterministic extraction via stdlib `ast`. No new
+    dependency; tree-sitter arrives with the other languages in Milestone 8.
+  - `generators` — repository manifest, repository map, module cards, and
+    symbol cards (plan §15.1–15.4), including real reverse import edges.
+  - `refresh` — `ArtifactRefresher`: scan, recompute freshness, retire absent
+    subjects, regenerate, report. Cancellable between artifacts.
+  - Schema migration 2: `artifact_records`, `artifact_sources` (indexed by
+    path), `artifact_contradictions`.
+
+  Cards state **"Not yet computed"** for callers, callees, and measured
+  coverage rather than leaving those sections blank — a blank "Callers" heading
+  reads as *nothing calls this*, which is a structural claim nothing has
+  earned.
+- Boundary checker: a `# boundary-ok: <reason>` pragma for code that must
+  *name* the archive in order to *exclude* it. Per-line, reason-carrying, and
+  unable to exempt an import.
+
 ### Fixed
 
 - `RunController.cancel()` claimed thread safety but wrote run status through a
@@ -93,6 +120,17 @@ The v1 changelog is archived at
   that touches the connection), and `wait_if_paused` races the resume gate
   against the token rather than having `cancel()` touch an asyncio primitive
   from another thread.
+- Repository-wide artifacts did not notice files being added or deleted. The
+  manifest reports a file count and directory list but declared only
+  `pyproject.toml` as a source, so deleting a module left it FRESH and wrong.
+  A synthetic `<repository:file-list>` source now covers the set of indexed
+  paths.
+- `src/` was stripped unconditionally when deriving dotted module paths.
+  Correct for a src-layout project, wrong when `src/__init__.py` exists — and
+  in that case it silently broke every import edge the module cards reported.
+  The repository context now detects which packaging roots actually apply.
+- A card whose subject was deleted was invalidated but not reported as retired,
+  because hash-based recomputation reached it first.
 
 ### Changed
 

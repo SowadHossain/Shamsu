@@ -20,6 +20,13 @@ The discipline that makes artifacts safe rather than dangerous:
 Milestone 3. See plan sections 14-17.
 """
 
+from shamsu.artifacts.generators import (
+    ModuleCardGenerator,
+    RepositoryContext,
+    RepositoryManifestGenerator,
+    RepositoryMapGenerator,
+    SymbolCardGenerator,
+)
 from shamsu.artifacts.hashing import (
     DEFAULT_IGNORED_DIRS,
     DEFAULT_IGNORED_SUFFIXES,
@@ -33,14 +40,31 @@ from shamsu.artifacts.hashing import (
     iter_files,
     scan_repository,
 )
+from shamsu.artifacts.python_source import (
+    ExtractedModule,
+    ExtractedSymbol,
+    extract_python,
+    module_path_for,
+)
+from shamsu.artifacts.refresh import ArtifactRefresher, RefreshReport
 from shamsu.artifacts.registry import ArtifactRegistry, content_filename
 
 __all__ = [
     "DEFAULT_IGNORED_DIRS",
     "DEFAULT_IGNORED_SUFFIXES",
+    "ArtifactRefresher",
     "ArtifactRegistry",
+    "ExtractedModule",
+    "ExtractedSymbol",
+    "ModuleCardGenerator",
+    "RefreshReport",
+    "RepositoryContext",
+    "RepositoryManifestGenerator",
+    "RepositoryMapGenerator",
+    "SymbolCardGenerator",
     "changed_paths",
     "content_filename",
+    "extract_python",
     "git_listed_files",
     "hash_bytes",
     "hash_file",
@@ -48,5 +72,6 @@ __all__ = [
     "hash_text",
     "is_ignored",
     "iter_files",
+    "module_path_for",
     "scan_repository",
 ]

@@ -140,6 +140,23 @@ class ArtifactStore(Protocol):
         ...
 
 
+class GeneratedArtifact(BaseModel):
+    """A generator's output, before the registry assigns it an identity.
+
+    Distinct from `Artifact` because identity, version, and freshness belong to
+    the registry. A generator that had to mint its own `ArtifactId` would
+    either duplicate the registry's bookkeeping or contradict it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    content: str
+    sources: tuple[SourceRef, ...] = Field(
+        description="Every file this artifact's claims were derived from, with hashes."
+    )
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+
+
 @runtime_checkable
 class ArtifactGenerator(Protocol):
     """Builds one kind of artifact from the repository.
@@ -153,9 +170,24 @@ class ArtifactGenerator(Protocol):
     def kind(self) -> ArtifactKind: ...
 
     @property
-    def generator_version(self) -> str: ...
+    def generator_version(self) -> str:
+        """Bumped whenever extraction changes.
 
-    def generate(self, key: str) -> Artifact:
+        Tracked separately from an artifact's own version because a fixed
+        extraction bug invalidates every artifact this generator ever produced,
+        including ones whose sources never changed.
+        """
+        ...
+
+    def keys(self) -> Sequence[str]:
+        """Every key this generator can currently produce.
+
+        Lets the refresher discover new artifacts -- a newly added module needs
+        a card before anything knows to ask for one.
+        """
+        ...
+
+    def generate(self, key: str) -> GeneratedArtifact:
         """Build the artifact for `key`.
 
         Raises:
@@ -180,5 +212,6 @@ __all__ = [
     "ArtifactMeta",
     "ArtifactStore",
     "Contradiction",
+    "GeneratedArtifact",
     "SourceRef",
 ]
