@@ -25,14 +25,26 @@ from shamsu.models.contracts import (
     contract_for,
     schema_hint,
 )
+from shamsu.models.normalization import (
+    Normalised,
+    extract_json_object,
+    normalise,
+    parse_json_response,
+    strip_reasoning,
+)
 
 __all__ = [
     "CONTRACTS",
+    "Normalised",
     "ImplementationPlan",
     "InvestigationStep",
     "PlanStepProposal",
     "ProjectAssessment",
     "ToolCall",
     "contract_for",
+    "extract_json_object",
+    "normalise",
+    "parse_json_response",
     "schema_hint",
+    "strip_reasoning",
 ]

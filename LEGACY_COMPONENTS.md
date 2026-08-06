@@ -30,7 +30,168 @@ A component may enter `src/shamsu/` only after all ten steps pass:
 
 ## Migrated components
 
-_None yet._
+Four components crossed in PR 15. Everything else in `src/shamsu/` was written
+fresh against the v2 interfaces — where v1 had an equivalent, the row below says
+so, because "we rewrote it" and "we never looked" are different claims.
+
+---
+
+### `shamsu.models.normalization`
+
+| Field | Value |
+|---|---|
+| **v1 source** | `legacy-code/shamsu/llm/output.py` (1,159 lines) |
+| **v2 destination** | `src/shamsu/models/normalization.py` (~200 lines) |
+| **Method** | rewritten — mostly a deletion |
+| **v2 interface** | `shamsu.interfaces.models.ModelClient` (contract parsing seam) |
+| **Tests** | `tests/unit/test_migrated_utilities.py::TestNormalisation`, `::TestNoRepair` |
+| **Steps 1-10** | ☑☑☑☑☑☑☑☑☑☑ |
+
+**Why migrated rather than rewritten from scratch:** one part of v1's parser is
+genuinely hard-won — the balanced-brace scanner that restarts past an
+unterminated opening brace. A single left-to-right scan gives up the moment
+depth stops returning to zero, so one truncated code fence swallowed everything
+after it, and a real 7B reply lost a valid tool call sitting behind a cut-off
+Python fence. That behaviour and its reason are carried across verbatim.
+
+**What was dropped:** everything else. Six salvage strategies
+(`_salvage_raw_tool_fences`, `_salvage_commented_tool_fences`,
+`_salvage_embedded_json`, `_salvage_search_replace`, `_salvage_xml_tool_call`,
+`_names_quote_repair_tool`), `_greedy_string_repair`, and
+`_repair_unescaped_quotes`. Plan §8.4 names this class of code explicitly.
+
+The line v2 draws: **normalisation removes wrapping and never edits content.**
+Removing a `<think>` span or a fence has exactly one correct result. Repairing
+an unescaped quote is a guess, and a wrong guess produces a *parseable* wrong
+answer — worse than a parse failure, because the failure is visible and a
+silently wrong `file.patch` argument is not.
+
+---
+
+### `shamsu.security.secrets`
+
+| Field | Value |
+|---|---|
+| **v1 source** | `legacy-code/shamsu/safety/commands.py:SECRET_PATTERNS`, `redact`; `safety/audit.py:_redact_data` |
+| **v2 destination** | `src/shamsu/security/secrets.py` |
+| **Method** | copied verbatim |
+| **v2 interface** | plain functions; no protocol needed |
+| **Tests** | `tests/unit/test_migrated_utilities.py::TestRedaction` |
+| **Steps 1-10** | ☑☑☑☑☑☑☑☑☑☑ |
+
+**Why copied rather than rewritten:** this is the one component migrated
+*verbatim*. The patterns are the accumulated result of real leaks, v1's
+`test_command_output_secrets_are_redacted` passes against them, and a rewrite
+would substitute untested guesses about what a secret looks like for evidence.
+Improving them is a task with an evaluation behind it, not a side effect of
+moving a file.
+
+**What was dropped:** nothing. `redact_structure` was added, because tool
+*arguments* are persisted as JSON on `tool_events` and a secret passed as an
+argument never reaches the string path.
+
+**Known limitation, carried deliberately:** the whole match is replaced, so
+`password = hunter2` becomes `[REDACTED]` rather than `password = [REDACTED]`.
+That loses the signal "a password is configured here". Narrowing the patterns
+to capture only the value would mean rewriting every one against no evidence.
+
+---
+
+### `shamsu.security.commands`
+
+| Field | Value |
+|---|---|
+| **v1 source** | `legacy-code/shamsu/safety/commands.py:classify_command`, `BLOCKED_PATTERNS`, `command_may_write_workspace` |
+| **v2 destination** | `src/shamsu/security/commands.py` |
+| **Method** | rewritten |
+| **v2 interface** | returns `shamsu.interfaces.enums.Risk` |
+| **Tests** | `tests/unit/test_migrated_utilities.py::TestCommandRisk` |
+| **Steps 1-10** | ☑☑☑☑☑☑☑☑☑☑ |
+
+**Why migrated:** the blocked-pattern list is real operational knowledge.
+
+**What changed, both in the safe direction:**
+
+1. **Unknown commands are `HIGH`, not `MEDIUM`.** v1 commented "unknown
+   commands default to requiring approval" — but MEDIUM was also the level for
+   `pip install`, so nothing above could tell a routine install from a command
+   the classifier had never seen.
+2. **Blocked patterns match the raw string, before normalisation**, and that
+   ordering is now stated rather than incidental. A normalisation rule that
+   accidentally rewrote `sudo rm -rf /` would otherwise downgrade a block to an
+   approval prompt.
+
+**Defect found and fixed during migration:** v1's `r"sudo"` was unanchored, so
+`python sudoku.py` classified as `BLOCKED`. Safe in direction, but a rule that
+fires on nonsense is a rule someone eventually relaxes. Now `\bsudo\b`.
+
+**Not used by `test.run`**, which takes an allowlisted command *key* and never a
+string (plan §24.3). This exists for the milestones that must accept a real
+command line.
+
+---
+
+### `shamsu.telemetry.metrics`
+
+| Field | Value |
+|---|---|
+| **v1 source** | `legacy-code/shamsu/telemetry/reliability.py` (788 lines) |
+| **v2 destination** | `src/shamsu/telemetry/metrics.py` |
+| **Method** | rewritten — the metric definitions are inverted |
+| **v2 interface** | queries `StateStore` directly |
+| **Tests** | `tests/unit/test_metrics.py` |
+| **Steps 1-10** | ☑☑☑☑☑☑☑☑☑☑ |
+
+**Why rewritten:** v1 counted what the loop *told* it — a counter incremented
+at the site that believed it had succeeded. `false_success_rate` was therefore
+the rate at which the loop *noticed* it had been wrong, which reads zero
+precisely when things are worst. Plan §31's metric names were kept; the
+computation was not.
+
+**What changed:** every metric is now a query over `tasks`, `evidence`,
+`tool_events`, and `failures`. Nothing is incremented by the component being
+measured. `_evidence_holds` re-derives the gate result from rows rather than
+reading a stored verdict, so it measures whether a conclusion was *earned*
+rather than what was concluded.
+
+`repeated_action_rate` counts *consecutive* identical calls rather than total
+repeats: reading a file at the start and end of a task is ordinary, reading it
+twice in a row is the loop spinning, and v1's total-repeat count was dominated
+by the first case.
+
+**The test that earns its place:** `test_a_bypassed_gate_is_caught` writes a
+completed task with no evidence straight into the database. `CompletionGate`
+cannot produce that state — and a metric that could never report it would be
+measuring the runtime's opinion of itself.
+
+---
+
+## Written fresh (v1 had an equivalent)
+
+These were on the §8.3 candidate list. Each was implemented against the v2
+interfaces without consulting the v1 code as a source, because the v2 design
+constrained the shape more than the old implementation could inform it. Listed
+so the candidate list has no silent gaps.
+
+| Candidate | v1 location | v2 home | What differs |
+|---|---|---|---|
+| Sandbox path validation | `shamsu/safety/sandbox.py` (32 lines) | `security/paths.py` | v2 resolves before deciding and follows symlinks; v1 did neither |
+| Command timeout handling | `shamsu/tools/executor.py` | `tools/gateway.py` | Timeout races cancellation rather than running after it |
+| Test-output digesting | `shamsu/verify/` | `verification/digest.py` | Keeps both ends of huge output; the exit code decides pass/fail |
+| Error-signature generation | `shamsu/agents/error_feedback_loop.py` | `verification/digest.py` | Normalises temp paths, durations, and shifted line numbers |
+| Tool-result truncation | `shamsu/agents/chat_loop.py:90-97` | `tools/gateway.py` | Capped *before* entering context, never after |
+| Git utility functions | `shamsu/tools/agent_tools.py` | `tools/git.py` | 23 v1 git tools became 2 typed ones with fixed argv |
+| Structural code-graph client | `shamsu/abstract/`, `shamsu/retriever/` | `code_intelligence/` | Rebuilt on stdlib `ast`; no external index service |
+
+---
+
+## Not migrated (plan §8.4)
+
+`AgentChatLoop`, the old task lifecycle, the prompt-conversation replay model,
+the planner orchestration, the completion logic, the memory orchestration, the
+two-registry tool architecture, the inline recovery counters, long-running
+mode, and implicit success classification. None of these are in `src/shamsu/`
+and none will be.
 
 <!--
 Template — copy one block per migrated component.
@@ -44,7 +205,6 @@ Template — copy one block per migrated component.
 | **Method** | rewritten \| copied-and-stripped |
 | **v2 interface** | `src/shamsu/interfaces/<file>.py:<Protocol>` |
 | **Tests** | `tests/unit/<file>.py` |
-| **Decision record** | `docs/decisions/<adr>.md` |
 | **Steps 1-10** | ☐☐☐☐☐☐☐☐☐☐ |
 | **Migrated in** | `<commit>` |
 
@@ -55,25 +215,24 @@ Template — copy one block per migrated component.
 
 ---
 
-## Approved candidates (not yet migrated)
+## Candidate list status (plan §8.3)
 
-Sourced from plan §8.3. Listing here is *permission to evaluate*, not approval
-to import.
+Every candidate is now resolved. Nothing on this list is still open.
 
-| Candidate | v1 location | Target v2 home | Status |
-|---|---|---|---|
-| Sandbox path validation | `shamsu/safety/` | `security/` | ⚪ Not started |
-| Command risk classification | `shamsu/safety/`, `shamsu/tools/executor.py` | `security/` | ⚪ Not started |
-| Command timeout handling | `shamsu/tools/executor.py` | `tools/` | ⚪ Not started |
-| Model-output normalization | `shamsu/llm/output.py` | `models/` | ⚪ Not started |
-| Tool-call salvage / quote repair | `shamsu/llm/output.py` | `models/` | ⚪ Not started |
-| Test-output digesting | `shamsu/verify/` | `verification/` | ⚪ Not started |
-| Error-signature generation | `shamsu/agents/error_feedback_loop.py` | `verification/` | ⚪ Not started |
-| Tool-result truncation | `shamsu/agents/chat_loop.py:90-97` | `context/` | ⚪ Not started |
-| Git utility functions | `shamsu/tools/agent_tools.py` | `tools/` | ⚪ Not started |
-| Structural code-graph client | `shamsu/abstract/`, `shamsu/retriever/` | `code_intelligence/` | ⚪ Not started |
-| Reliability metrics | `shamsu/telemetry/` | `telemetry/` | ⚪ Not started |
-| Secret-redaction utilities | `shamsu/safety/` | `security/` | ⚪ Not started |
+| Candidate | Outcome |
+|---|---|
+| Sandbox path validation | Written fresh — `security/paths.py` |
+| Command risk classification | **Migrated** — `security/commands.py` |
+| Command timeout handling | Written fresh — `tools/gateway.py` |
+| Model-output normalization | **Migrated** — `models/normalization.py` |
+| Tool-call salvage / quote repair | **Rejected** — plan §8.4; see the normalization entry |
+| Test-output digesting | Written fresh — `verification/digest.py` |
+| Error-signature generation | Written fresh — `verification/digest.py` |
+| Tool-result truncation | Written fresh — `tools/gateway.py` |
+| Git utility functions | Written fresh — `tools/git.py` |
+| Structural code-graph client | Written fresh — `code_intelligence/` |
+| Reliability metrics | **Migrated** — `telemetry/metrics.py` |
+| Secret-redaction utilities | **Migrated** (verbatim) — `security/secrets.py` |
 
 ---
 

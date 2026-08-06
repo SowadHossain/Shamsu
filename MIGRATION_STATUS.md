@@ -49,7 +49,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 12 | Repair | 🟢 Done |
 | 13 | Structural code intelligence | 🟢 Done |
 | 14 | Lightweight project memory | 🟢 Done |
-| 15 | Legacy utility migration | ⚪ Not started |
+| 15 | Legacy utility migration | 🟢 Done |
 
 ---
 
@@ -516,6 +516,55 @@ and no fact whose evidence changed is ever stated as current.
   notices.
 - **Only a resolution crosses tasks.** "This failed before" without a fix is
   noise in a repair frame; the capsule already says the failure is happening.
+
+---
+
+## PR 15 — Legacy utility migration ✅
+
+- [x] `models/normalization` — the selected parser, rewritten as a deletion
+- [x] `security/secrets` — redaction, migrated verbatim
+- [x] `security/commands` — command risk, rewritten with a stricter default
+- [x] `telemetry/metrics` — plan §31 metrics, computed from rows
+- [x] [`LEGACY_COMPONENTS.md`](LEGACY_COMPONENTS.md) — every §8.3 candidate resolved
+
+Four components crossed the boundary. Seven more on the candidate list were
+written fresh, and the ledger says which is which — "we rewrote it" and "we
+never looked" are different claims and both are now on the record. Nothing on
+the §8.3 list is still open.
+
+### Design points worth keeping
+
+- **The parser migration is mostly a deletion.** v1's `output.py` is 1,159
+  lines with six salvage strategies and greedy quote repair. What crossed is
+  ~200 lines and one hard-won behaviour: the balanced-brace scanner restarts
+  past an unterminated brace, because a single scan once lost a valid tool call
+  behind a truncated Python fence.
+- **Normalisation removes wrapping and never edits content.** Stripping a
+  `<think>` span or a fence has exactly one correct result. Repairing an
+  unescaped quote is a guess, and a wrong guess produces a *parseable* wrong
+  answer — worse than a parse failure, because the failure is visible and a
+  silently wrong `file.patch` argument is not.
+- **Redaction was copied verbatim, and that is the right call.** The patterns
+  are the residue of real leaks and v1's test passes against them. A rewrite
+  would swap evidence for fresh guesses about what a secret looks like.
+- **Unknown commands are HIGH, not MEDIUM.** v1 defaulted unknown to the same
+  level as `pip install`, so nothing above could tell them apart.
+- **Metrics are queries, not counters.** v1 incremented at the site that
+  believed it had succeeded, so `false_success_rate` measured whether the loop
+  had noticed its own mistake — zero exactly when things are worst. Every metric
+  here is a query over `tasks`, `evidence`, `tool_events`, and `failures`, and
+  `_evidence_holds` re-derives the gate result rather than reading a stored
+  verdict.
+- **`test_a_bypassed_gate_is_caught` writes a completed task with no evidence
+  straight into the database.** `CompletionGate` cannot produce that state, and
+  a metric that could never report it would be measuring the runtime's opinion
+  of itself.
+
+### Defect found and fixed during migration
+
+v1's blocked-command pattern `r"sudo"` was unanchored, so `python sudoku.py`
+classified as BLOCKED. Safe in direction, but a rule that fires on nonsense is
+a rule someone eventually relaxes. Now `\bsudo\b`, with a test.
 
 ---
 
