@@ -7,6 +7,7 @@ from pathlib import Path
 from shamsu.action_ledger.ids import new_run_id
 from shamsu.action_ledger.ledger import ActionLedger, start_run
 from shamsu.action_ledger import store
+from shamsu.session.manager import SessionManager
 
 
 def _events(ledger: ActionLedger) -> list[dict]:
@@ -843,6 +844,52 @@ def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path, monke
     assert (ledger.run_dir / records["finished"]["response_path"]).read_text(
         encoding="utf-8"
     ) == "done" * 3000
+
+
+def test_session_agent_development_log_is_single_prompt_and_verbose_evidence_file(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "verbose")
+    logger = SessionManager(tmp_path).create_session("debug run")
+    logger.log("user.prompt", {"prompt": "remove login from App.jsx"}, "User prompt")
+    logger.append_message("user", "remove login from App.jsx")
+
+    ledger = start_run(tmp_path, "remove login from App.jsx", session_logger=logger)
+    call_id = ledger.log_model_call_started(
+        "coder",
+        "m",
+        system="You are SHAMSU.",
+        messages=[{"role": "user", "content": "remove login from App.jsx"}],
+        tools=[{"name": "edit_file"}],
+    )
+    ledger.log_model_thinking(call_id, "coder", "m", "inspect file then edit")
+    ledger.log_model_call_finished("coder", "m", "edited", call_id=call_id)
+
+    path = logger.development_log_path
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert path.name == "agent-development-log.jsonl"
+    assert path.parent == tmp_path / ".shamsu" / "logs" / logger.session_id
+    assert any(record["kind"] == "chat.message" for record in records)
+    assert any(record["kind"] == "session.event" for record in records)
+    model_records = [
+        record for record in records
+        if record["kind"] == "run.evidence"
+        and record["stream"] == ".evidence/model-calls.jsonl"
+    ]
+    assert {record["record"]["phase"] for record in model_records} >= {
+        "started",
+        "thinking",
+        "finished",
+    }
+    assert any(
+        "remove login from App.jsx" in record.get("artifact_text", {}).get("prompt", "")
+        for record in model_records
+    )
+    assert any(
+        "inspect file then edit" in record.get("artifact_text", {}).get("reasoning", "")
+        for record in model_records
+    )
 
 
 def test_essential_log_level_keeps_previews_and_writes_no_model_artifacts(tmp_path: Path, monkeypatch):

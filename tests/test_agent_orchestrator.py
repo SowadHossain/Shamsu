@@ -260,6 +260,37 @@ def test_read_file_extracts_pdf_text(tmp_path):
     assert "Canvas" in text
 
 
+def test_read_file_accepts_react_jsx_source(tmp_path):
+    target = tmp_path / "frontend" / "src" / "App.jsx"
+    target.parent.mkdir(parents=True)
+    target.write_text("export default function App() { return <main /> }\n", encoding="utf-8")
+
+    text = WorkspaceTool(tmp_path).read_file("frontend/src/App.jsx")
+
+    assert "function App" in text
+    assert "<main" in text
+
+
+def test_workspace_reader_accepts_common_project_text_files(tmp_path):
+    paths = [
+        ".env.example",
+        ".npmrc",
+        "Dockerfile.dev",
+        "backend/schema.prisma",
+        "frontend/src/styles.scss",
+        "schema.graphql",
+    ]
+    for rel in paths:
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("VALUE=true\n", encoding="utf-8")
+
+    tool = WorkspaceTool(tmp_path)
+
+    for rel in paths:
+        assert tool.read_file(rel) == "VALUE=true\n"
+
+
 def test_read_file_still_rejects_a_binary_it_cannot_parse(tmp_path):
     (tmp_path / "blob.bin").write_bytes(b"\x00\x01\x02")
 

@@ -1,6 +1,7 @@
 """Read-only skill inspection commands."""
 from __future__ import annotations
 
+import difflib
 from pathlib import Path
 
 from rich.console import Console
@@ -26,13 +27,13 @@ def handle_skills_command(user_input: str, workspace: Path, console: Console) ->
             return
         _print_skill_detail(catalog, parts[2].strip(), console)
         return
-    if command == "explain":
+    if command in {"explain", "suggest"}:
         if len(parts) < 3 or not parts[2].strip():
             console.print("[red]Usage: /skills explain <prompt>[/red]")
             return
         _print_skill_explanation(workspace, parts[2].strip(), catalog, console)
         return
-    console.print("[red]Usage: /skills [list|show <name>|explain <prompt>][/red]")
+    console.print("[red]Usage: /skills [list|show <name>|explain <prompt>|suggest <prompt>][/red]")
 
 
 def _print_skill_list(catalog: SkillCatalog, console: Console) -> None:
@@ -54,6 +55,11 @@ def _print_skill_detail(catalog: SkillCatalog, name: str, console: Console) -> N
     skill = catalog.skills.get(name)
     if skill is None:
         console.print(f"[red]Skill not found: {name}[/red]")
+        suggestions = difflib.get_close_matches(name, sorted(catalog.skills), n=5, cutoff=0.45)
+        if suggestions:
+            console.print("[yellow]Did you mean:[/yellow] " + ", ".join(suggestions))
+        else:
+            console.print("[dim]Run `/skills list` to see available skill names.[/dim]")
         return
     metadata = skill.to_summary()
     detail = "\n".join(

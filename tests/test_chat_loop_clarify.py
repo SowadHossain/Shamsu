@@ -771,6 +771,40 @@ def test_content_question_is_suppressed_when_the_request_names_the_document(tmp_
     ) is False
 
 
+def test_planner_section_question_is_suppressed_when_request_names_option():
+    from shamsu.agents.chat_loop import _planner_question_answered_by_request
+
+    assert _planner_question_answered_by_request(
+        "Which section in App.jsx should be removed?",
+        [{"label": "Login Section"}, {"label": "Dashboard Section"}],
+        "the login section please remove it from App.jsx",
+    ) is True
+    assert _planner_question_answered_by_request(
+        "Which section in App.jsx should be removed?",
+        [{"label": "Login Section"}, {"label": "Dashboard Section"}],
+        "remove the extra section from App.jsx",
+    ) is False
+
+
+def test_planner_permission_question_is_suppressed_when_request_already_grants_it():
+    from shamsu.agents.chat_loop import _planner_question_answered_by_request
+
+    assert _planner_question_answered_by_request(
+        "Should the login section be removed from the main page of the frontend app?",
+        [
+            {"label": "Yes, remove it"},
+            {"label": "No, keep it"},
+        ],
+        "on the frontend of the app on the main page there is a login section "
+        "that is not required to show here can you remove it please",
+    ) is True
+    assert _planner_question_answered_by_request(
+        "Should the login section be removed from the main page of the frontend app?",
+        [{"label": "Yes, remove it"}, {"label": "No, keep it"}],
+        "look at the login section on the frontend main page",
+    ) is False
+
+
 def test_permission_question_for_an_explicitly_requested_file_is_declined():
     """Live 2026-08-02: "Create the file canvas_lms_lite/core/models.py..." got
     "The target file does not exist. Should I create it now?" and the turn ended

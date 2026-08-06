@@ -76,6 +76,19 @@ def test_move_file_respects_a_denied_approval(tmp_path: Path):
     assert not (tmp_path / "b.py").exists()
 
 
+def test_move_file_preserves_binary_bytes(tmp_path: Path):
+    payload = b"\x00\xffPNG-ish\x00\x10"
+    source = tmp_path / "assets" / "logo.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(payload)
+
+    result = _registry(tmp_path).move_file("assets/logo.bin", "public/logo.bin")
+
+    assert result.ok, result.message
+    assert not source.exists()
+    assert (tmp_path / "public" / "logo.bin").read_bytes() == payload
+
+
 # --- delete -------------------------------------------------------------------
 
 
@@ -107,6 +120,36 @@ def test_delete_file_respects_a_denied_approval(tmp_path: Path):
 def test_delete_file_rejects_a_missing_target(tmp_path: Path):
     result = _registry(tmp_path).delete_file("ghost.py")
     assert not result.ok
+
+
+def test_delete_file_allows_unique_basename_scope(tmp_path: Path):
+    target = tmp_path / "project" / "frontend" / "src" / "App.jsx"
+    target.parent.mkdir(parents=True)
+    target.write_text("export default null\n", encoding="utf-8")
+    registry = _registry(tmp_path)
+    registry.set_allowed_write_paths(["App.jsx"])
+
+    result = registry.delete_file("project/frontend/src/App.jsx")
+
+    assert result.ok, result.message
+    assert not target.exists()
+
+
+def test_delete_file_removes_binary_file_recoverably(tmp_path: Path):
+    payload = b"\x00\xffPNG-ish\x00\x10"
+    target = tmp_path / "assets" / "logo.bin"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(payload)
+
+    result = _registry(tmp_path).delete_file("assets/logo.bin")
+
+    assert result.ok, result.message
+    assert not target.exists()
+    latest = latest_undoable_transaction(tmp_path)
+    assert latest is not None
+    ok, _ = rollback_transaction(tmp_path, latest[0])
+    assert ok
+    assert target.read_bytes() == payload
 
 
 # --- wiring -------------------------------------------------------------------

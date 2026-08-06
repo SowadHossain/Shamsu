@@ -10,7 +10,7 @@ from shamsu.session.manager import SessionLogger
 # Compaction: hydrate only the most recent N transcript turns. The session
 # summary and long-term memory carry older context separately, so we never
 # replay the entire history into the model.
-HYDRATE_MAX_MESSAGES = 80
+HYDRATE_MAX_MESSAGES = 24
 
 # Harness-authored status text, not model output. Replaying it teaches the
 # model that a turn ends in this text and it starts producing the text instead
@@ -31,6 +31,17 @@ _HARNESS_STATUS_PREFIXES = (
 # How many times the same assistant answer may be replayed before the rest are
 # dropped. Repetition is what the model latches onto.
 _MAX_REPEATED_HYDRATED = 2
+
+_INTERNAL_USER_CONTEXT_MARKERS = (
+    "\n\n## SHAMSU Task Harness",
+    "\n\n## Active SHAMSU Skills",
+    "\n\n## Deterministic Context",
+    "\n\nAdditional SHAMSU context:",
+    "\n\nWorkspace root:",
+    "\n\nMentioned file context:",
+    "\n\nPlan from planner model:",
+    "\n\nCurrent task state:",
+)
 
 
 @dataclass
@@ -71,8 +82,16 @@ class ChatState:
         if hydrate:
             self._hydrate_from_session()
 
-    def append_user(self, content: str) -> None:
-        self._append(ChatMessage("user", content), persist=True)
+    def append_user(self, content: str, persisted_content: str | None = None) -> None:
+        self._append(
+            ChatMessage("user", content),
+            persist=True,
+            persisted_content=(
+                _clean_user_content_for_persistence(persisted_content)
+                if persisted_content is not None
+                else None
+            ),
+        )
 
     def append_assistant(self, content: str, tool_calls: list[dict[str, Any]] | None = None) -> None:
         self._append(ChatMessage("assistant", content, tool_calls=tool_calls or []), persist=True)
@@ -179,9 +198,15 @@ class ChatState:
     def all_messages(self) -> list[ChatMessage]:
         return list(self._messages)
 
-    def _append(self, message: ChatMessage, persist: bool) -> None:
+    def _append(
+        self,
+        message: ChatMessage,
+        persist: bool,
+        persisted_content: str | None = None,
+    ) -> None:
         self._messages.append(message)
         if persist and self.session_logger:
+            stored_content = persisted_content if persisted_content is not None else message.content
             # Two sinks: the rich `chat.message` event (kept for the trace/audit
             # timeline and backward compatibility) and the compact, redacted
             # `messages.jsonl` transcript that hydration prefers.
@@ -189,7 +214,7 @@ class ChatState:
                 "chat.message",
                 {
                     "role": message.role,
-                    "content": message.content,
+                    "content": stored_content,
                     "tool_call_id": message.tool_call_id,
                     "name": message.name,
                     "tool_calls": message.tool_calls,
@@ -199,7 +224,7 @@ class ChatState:
             )
             self.session_logger.append_message(
                 message.role,
-                message.content,
+                stored_content,
                 tool_call_id=message.tool_call_id,
                 name=message.name,
                 tool_calls=message.tool_calls,
@@ -226,6 +251,8 @@ class ChatState:
         for payload in records:
             role = str(payload.get("role", "")).strip()
             content = str(payload.get(key_content, ""))
+            if role == "user":
+                content = _clean_user_content_for_persistence(content)
             if role == "assistant":
                 # Drop repeats of an identical answer. A model that stalled the
                 # same way five times must not be shown five examples of it.
@@ -253,9 +280,21 @@ def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
 
 
 def _should_hydrate_chat_message(role: str, content: str) -> bool:
+    if role == "user" and not str(content or "").strip():
+        return False
     if role != "assistant":
         return True
     normalized = " ".join(content.strip().lower().split())
     if not normalized:
         return True
     return not normalized.startswith(_HARNESS_STATUS_PREFIXES)
+
+
+def _clean_user_content_for_persistence(content: str | None) -> str:
+    text = str(content or "")
+    cut_at = len(text)
+    for marker in _INTERNAL_USER_CONTEXT_MARKERS:
+        index = text.find(marker)
+        if index >= 0:
+            cut_at = min(cut_at, index)
+    return text[:cut_at].strip()

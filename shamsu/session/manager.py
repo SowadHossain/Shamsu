@@ -22,6 +22,7 @@ from shamsu.types import ContextPack
 SNIPPET_PREVIEW_CHARS = 600
 MAX_STRING_CHARS = 4000
 MESSAGE_PREVIEW_CHARS = 16000
+DEVELOPMENT_LOG_FILE = "agent-development-log.jsonl"
 
 DEFAULT_TITLE = "Untitled Session"
 # Legacy default titles that are treated as "not a real title yet" so the
@@ -348,6 +349,12 @@ class SessionLogger:
         )
 
     @property
+    def development_log_path(self) -> Path:
+        return self.manager.sandbox.validate(
+            Path(".shamsu") / "logs" / self.session_id / DEVELOPMENT_LOG_FILE
+        )
+
+    @property
     def pending_path(self) -> Path:
         return self.manager.sandbox.validate(
             Path(".shamsu") / "sessions" / self.session_id / "pending.json"
@@ -416,6 +423,7 @@ class SessionLogger:
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
         with self.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+        self.append_development_log("session.event", event)
         self.metadata.event_count += 1
         self.metadata.updated_at = event["timestamp"]
         if event_type == "user.prompt":
@@ -426,6 +434,25 @@ class SessionLogger:
         self.manager._write_metadata(self.metadata)
         self.manager._upsert_index(self.metadata)
         return event
+
+    def append_development_log(self, kind: str, record: dict[str, Any]) -> None:
+        """Append to the one-file human-debug stream for this session.
+
+        `events.jsonl`, `messages.jsonl`, and per-run evidence stay as stable
+        machine artifacts. This file is the single place a user can open when
+        they want the prompt history plus verbose agent-development evidence in
+        chronological order.
+        """
+        entry = {
+            "timestamp": str(record.get("timestamp") or _now()),
+            "session_id": self.session_id,
+            "kind": str(kind or "event"),
+            "record": sanitize_payload(record or {}),
+        }
+        path = self.development_log_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=True, default=str) + "\n")
 
     def log_context_pack(self, pack: ContextPack, workflow_id: str | None = None) -> None:
         snippets = [
@@ -494,6 +521,7 @@ class SessionLogger:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+        self.append_development_log("chat.message", record)
         return record
 
     def read_messages(self, count: int | None = None) -> list[dict[str, Any]]:

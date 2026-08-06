@@ -61,6 +61,29 @@ def _transactional_write(workspace: Path, relative_path: str, content: str) -> s
     return transaction_id
 
 
+def _stub_prd_development_plan(monkeypatch) -> None:
+    async def fake_development_plan(_parsed, _relative_path, _project, milestones, *_args, **_kwargs):
+        return {
+            "source": "test",
+            "plan_summary": "Stubbed PRD execution plan.",
+            "stack": [],
+            "milestones": [
+                {
+                    "id": repl._milestone_id_from_line(milestone),
+                    "title": milestone.split(":", 1)[1].strip()
+                    if ":" in milestone
+                    else milestone,
+                    "goal": "Execute this test milestone.",
+                }
+                for milestone in milestones[:12]
+            ],
+            "risks": [],
+            "first_actions": [],
+        }
+
+    monkeypatch.setattr(repl, "_prepare_prd_development_plan", fake_development_plan)
+
+
 def test_initialize_prd_execution_writes_state_preflights_and_artifacts(tmp_path: Path):
     root, state = initialize_prd_execution(
         tmp_path,
@@ -79,6 +102,60 @@ def test_initialize_prd_execution_writes_state_preflights_and_artifacts(tmp_path
     assert preflight["milestone_id"] == "M-002"
     assert preflight["requirement_ids"] == ["FEAT-001"]
     assert "developer" in preflight["active_skills"]
+
+
+def test_prd_execution_persists_stack_profile_in_state_and_preflight(tmp_path: Path):
+    contract = extract_contract(
+        parse_prd_text(
+            "# OpenBazaar\n\n"
+            "## Tech Stack\n"
+            "- Node.js Express backend\n"
+            "- React and Vite frontend\n"
+            "- PostgreSQL database\n\n"
+            "## Data Model\n"
+            "Item\n"
+            "- id, title\n\n"
+            "## Acceptance\n"
+            "- `docker compose config -q` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    root, state = initialize_prd_execution(tmp_path, "build from PRD", contract)
+    preflight = load_milestone_preflight(root, "M-001")
+    context = render_preflight_context(preflight)
+
+    assert state["stack_profile"]["backend"] == "node-express"
+    assert state["stack_profile"]["frontend"] == "react-vite"
+    assert state["stack_profile"]["database"] == "postgres"
+    assert preflight["stack_profile"] == state["stack_profile"]
+    assert "Stack lock:" in context
+    assert "backend=node-express" in context
+    assert "frontend=react-vite" in context
+    assert "database=postgres" in context
+    assert "Preserve the stack lock" in context
+
+
+def test_model_preflight_prompt_includes_stack_profile(tmp_path: Path):
+    contract = extract_contract(
+        parse_prd_text(
+            "# OpenBazaar\n\n"
+            "## Tech Stack\n- Node.js Express\n- React Vite\n- PostgreSQL\n\n"
+            "## Data Model\nListing\n- id, title\n\n"
+            "## Acceptance\n- `docker compose config -q` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    root, _state = initialize_prd_execution(tmp_path, "build from PRD", contract)
+    preflight = load_milestone_preflight(root, "M-001")
+    prompt = repl._build_prd_model_preflight_prompt(preflight, tmp_path)
+
+    assert '"stack_profile"' in prompt
+    assert '"backend": "node-express"' in prompt
+    assert '"frontend": "react-vite"' in prompt
+    assert '"database": "postgres"' in prompt
+    assert "Keep the stack_profile fixed" in prompt
 
 
 def test_prd_execution_without_acceptance_criteria_hard_stops(tmp_path: Path):
@@ -1901,40 +1978,19 @@ def test_prepare_prd_development_plan_uses_planner_model(monkeypatch, tmp_path: 
     assert plan["milestones"][0]["files"] == ["docker-compose.yml", "backend/server.js"]
 
 
-def test_prepare_prd_milestone_preflight_runs_by_default(
+def test_prepare_prd_milestone_preflight_defaults_to_deterministic(
     monkeypatch,
     tmp_path: Path,
 ):
     root, state = initialize_prd_execution(tmp_path, "build from PRD", _contract())
     deterministic = load_milestone_preflight(root, "M-002")
 
-    class FakeLLM:
+    class BoomLLM:  # pragma: no cover - must not be instantiated
         def __init__(self, **_kwargs):
-            pass
-
-        async def generate_structured(self, role, system, prompt, schema, **kwargs):
-            return json.dumps(
-                {
-                    "milestone_id": "M-002",
-                    "requirement_ids": ["FEAT-001"],
-                    "active_skills": ["developer"],
-                    "expected_files": ["src/SearchPanel.tsx"],
-                    "allowed_tools": ["read_file", "write_file"],
-                    "verifier": "focused app tests/build",
-                    "context_focus": ["Search task workflow"],
-                    "implementation_steps": [
-                        "Create the search panel target file.",
-                        "Wire the task search requirements into that file.",
-                        "Run the focused app check.",
-                    ],
-                    "risk_flags": [],
-                    "blocker_question": "",
-                    "notes": "Use existing app state.",
-                }
-            )
+            raise AssertionError("model preflight should be opt-in")
 
     monkeypatch.delenv("SHAMSU_PRD_MODEL_PREFLIGHT", raising=False)
-    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+    monkeypatch.setattr(repl, "LLMManager", BoomLLM)
 
     preflight, next_state = asyncio.run(
         repl._prepare_prd_milestone_preflight(
@@ -1948,12 +2004,9 @@ def test_prepare_prd_milestone_preflight_runs_by_default(
         )
     )
 
-    assert preflight["preflight_source"] == "model"
-    assert preflight["context_focus"] == ["Search task workflow"]
-    assert preflight["implementation_steps"][1] == (
-        "Wire the task search requirements into that file."
-    )
-    assert next_state["preflight_decisions"][0]["accepted"] is True
+    assert preflight["preflight_source"] == "deterministic"
+    assert next_state == state
+    assert not (root / "preflight-decisions.jsonl").exists()
 
 
 def test_prepare_prd_milestone_preflight_can_be_disabled_by_env(
@@ -2047,6 +2100,7 @@ def test_compiled_prd_build_uses_existing_checkpoint_to_resume(monkeypatch, tmp_
 
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
@@ -2057,6 +2111,7 @@ def test_compiled_prd_build_uses_existing_checkpoint_to_resume(monkeypatch, tmp_
             "build the product from prd.md",
             tmp_path,
             _console(),
+            execute_plan=True,
         )
     )
 
@@ -2067,6 +2122,137 @@ def test_compiled_prd_build_uses_existing_checkpoint_to_resume(monkeypatch, tmp_
     assert "[>]" in calls[0]
     final_state = json.loads((root / "state.json").read_text(encoding="utf-8"))
     assert {item["status"] for item in final_state["milestones"]} == {"verified"}
+
+
+def test_prd_build_defaults_to_plan_and_pending_selection(monkeypatch, tmp_path: Path):
+    from shamsu.session.manager import SessionManager
+
+    prd = tmp_path / "prd.md"
+    prd.write_text(
+        "# Demo\n\n## Features\n- Search tasks\n\n## Acceptance\n- `npm test` exits 0.\n",
+        encoding="utf-8",
+    )
+    project = SimpleNamespace(
+        project_name="demo",
+        generation_ready=True,
+        needs_input=False,
+        prd_contract=_contract(),
+        suitability=SimpleNamespace(strategy="generic"),
+        category="utility",
+        archetype=SimpleNamespace(value="utility"),
+    )
+
+    async def fake_development_plan(*_args, **_kwargs):
+        return {
+            "source": "model",
+            "plan_summary": "Build one verified slice at a time.",
+            "stack": ["backend", "frontend", "database"],
+            "milestones": [
+                {
+                    "id": "M-002",
+                    "title": "Search tasks",
+                    "goal": "Implement and verify task search.",
+                }
+            ],
+            "risks": [],
+            "first_actions": ["Start M-002."],
+        }
+
+    async def fail_agent_chat(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("plan-only PRD build must not execute agent writes")
+
+    def fail_git_init(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("plan-only PRD build must not initialize git")
+
+    logger = SessionManager(tmp_path).create_session("PRD plan")
+    monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
+    monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    monkeypatch.setattr(repl, "_prepare_prd_development_plan", fake_development_plan)
+    monkeypatch.setattr(repl, "_run_agent_chat", fail_agent_chat)
+    monkeypatch.setattr(repl, "_ensure_git_repo", fail_git_init)
+
+    asyncio.run(
+        repl._handle_prd_build_request(
+            "build the product from prd.md",
+            tmp_path,
+            _console(),
+            session_logger=logger,
+        )
+    )
+
+    pending = logger.get_pending_action()
+    assert pending["type"] == "prd_plan"
+    assert pending["awaiting"] == "prd_plan_selection"
+    assert pending["prd_path"] == "prd.md"
+    assert pending["project_root"] == "demo"
+    assert pending["next_milestone_id"] == "M-002"
+    assert not (tmp_path / "demo").exists()
+    assert not (tmp_path / ".git").exists()
+
+
+def test_pending_prd_plan_resume_executes_one_slice_or_all(monkeypatch, tmp_path: Path):
+    calls: list[dict[str, object]] = []
+    pending = {
+        "created_from_prompt": "build the product from prd.md",
+        "prd_path": "prd.md",
+        "next_milestone_id": "M-002",
+    }
+
+    async def fake_build(user_input, workspace, console, session_logger=None, **kwargs):
+        calls.append(
+            {
+                "user_input": user_input,
+                "workspace": workspace,
+                "execute_plan": kwargs.get("execute_plan"),
+                "max_milestones": kwargs.get("max_milestones"),
+            }
+        )
+
+    monkeypatch.setattr(repl, "_handle_prd_build_request", fake_build)
+
+    asyncio.run(repl._execute_pending_prd_plan(pending, "continue", tmp_path, _console()))
+    asyncio.run(
+        repl._execute_pending_prd_plan(
+            pending, "build all autonomously", tmp_path, _console()
+        )
+    )
+
+    assert calls[0]["user_input"] == "build the product from prd.md"
+    assert calls[0]["execute_plan"] is True
+    assert calls[0]["max_milestones"] == 1
+    assert calls[1]["execute_plan"] is True
+    assert calls[1]["max_milestones"] is None
+
+
+def test_pending_prd_plan_accepts_natural_boilerplate_start_reply():
+    assert repl._looks_like_prd_slice_execution_reply(
+        "okay perfect lets begin with importing the boilerplates for nodejs backend and react frontend with postgres database"
+    )
+    assert repl._looks_like_prd_slice_execution_reply(
+        "initiate the folder stucture for the project use boilerplates we mede"
+    )
+    assert repl._looks_like_prd_slice_execution_reply("yes please")
+    assert repl._looks_like_prd_slice_execution_reply("yes porceed")
+
+
+def test_named_prd_milestone_request_executes_instead_of_replanning(tmp_path: Path):
+    (tmp_path / "OpenBazaar_Marketplace_PRD.docx").write_bytes(b"placeholder")
+    prompt = "please make sure M-001 is implemented and the db model is properly configured based off of prd"
+
+    assert repl._looks_like_prd_milestone_execution_request(prompt)
+    assert repl._looks_like_prd_build_request(prompt, tmp_path)
+
+
+def test_fallback_prd_preflight_uses_sql_database_skill_for_postgres():
+    contract = _contract()
+    contract.stack_hint = "Node.js Express backend, React frontend, PostgreSQL database"
+    contract.required_stack = ["node", "express", "react", "vite", "postgres"]
+    project = SimpleNamespace(prd_contract=contract)
+
+    preflight = repl._prd_fallback_preflight(project, "openbazaar")
+
+    assert "sql-databases" in preflight["active_skills"]
+    assert "sqlite-persistence" not in preflight["active_skills"]
 
 
 def test_compiled_prd_build_stops_on_failed_milestone_verifier(monkeypatch, tmp_path: Path):
@@ -2116,6 +2302,7 @@ def test_compiled_prd_build_stops_on_failed_milestone_verifier(monkeypatch, tmp_
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     monkeypatch.setenv("SHAMSU_PRD_MILESTONE_REPAIR", "0")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
@@ -2126,6 +2313,7 @@ def test_compiled_prd_build_stops_on_failed_milestone_verifier(monkeypatch, tmp_
             "build the product from prd.md",
             tmp_path,
             _console(),
+            execute_plan=True,
         )
     )
 
@@ -2184,6 +2372,7 @@ def test_compiled_prd_build_rolls_back_failed_milestone_transactions(monkeypatch
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     monkeypatch.setenv("SHAMSU_PRD_MILESTONE_REPAIR", "0")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
@@ -2194,6 +2383,7 @@ def test_compiled_prd_build_rolls_back_failed_milestone_transactions(monkeypatch
             "build the product from prd.md",
             tmp_path,
             _console(),
+            execute_plan=True,
         )
     )
 
@@ -2262,6 +2452,7 @@ def test_compiled_prd_build_can_disable_failed_milestone_rollback(monkeypatch, t
     monkeypatch.setenv("SHAMSU_PRD_MILESTONE_REPAIR", "0")
     monkeypatch.setenv("SHAMSU_PRD_MILESTONE_ROLLBACK", "0")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
@@ -2272,6 +2463,7 @@ def test_compiled_prd_build_can_disable_failed_milestone_rollback(monkeypatch, t
             "build the product from prd.md",
             tmp_path,
             _console(),
+            execute_plan=True,
         )
     )
 
@@ -2347,6 +2539,7 @@ def test_compiled_prd_build_repairs_failed_milestone_and_continues(monkeypatch, 
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     monkeypatch.setenv("SHAMSU_PRD_REPAIR_MAX_ATTEMPTS", "2")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
@@ -2357,6 +2550,7 @@ def test_compiled_prd_build_repairs_failed_milestone_and_continues(monkeypatch, 
             "build the product from prd.md",
             tmp_path,
             _console(),
+            execute_plan=True,
         )
     )
 
@@ -2421,13 +2615,16 @@ def test_compiled_prd_build_repairs_a_stalled_agent_pass(monkeypatch, tmp_path: 
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     monkeypatch.setenv("SHAMSU_PRD_REPAIR_MAX_ATTEMPTS", "2")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
     monkeypatch.setattr(repl, "_verify_completed_plan", fake_final_verify)
 
     asyncio.run(
-        repl._handle_prd_build_request("build the product from prd.md", tmp_path, _console())
+        repl._handle_prd_build_request(
+            "build the product from prd.md", tmp_path, _console(), execute_plan=True
+        )
     )
 
     root = next((tmp_path / ".shamsu" / "prd-executions").iterdir())
@@ -2485,6 +2682,7 @@ def test_compiled_prd_build_stops_after_repair_budget(monkeypatch, tmp_path: Pat
     monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
     monkeypatch.setenv("SHAMSU_PRD_REPAIR_MAX_ATTEMPTS", "1")
     monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    _stub_prd_development_plan(monkeypatch)
     monkeypatch.setattr(repl, "_ensure_git_repo", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", fake_verify_milestone)
@@ -2495,6 +2693,7 @@ def test_compiled_prd_build_stops_after_repair_budget(monkeypatch, tmp_path: Pat
             "build the product from prd.md",
             tmp_path,
             _console(),
+            execute_plan=True,
         )
     )
 

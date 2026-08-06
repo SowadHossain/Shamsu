@@ -299,9 +299,64 @@ def test_dockerized_postgres_full_stack_files_are_foundation_targets():
         "frontend/.env.example",
         "frontend/package.json",
         "frontend/vite.config.ts",
+        "frontend/index.html",
+        "frontend/src/main.jsx",
+        "frontend/src/App.jsx",
+        "frontend/src/styles.css",
     }.issubset(set(foundation.expected_files))
     assert "sqlite-persistence" not in foundation.active_skills
     assert "sql-databases" in foundation.active_skills
+
+
+def test_openbazaar_web_only_stack_gets_frontend_shell_even_without_react_word():
+    contract = extract_contract(
+        parse_prd_text(
+            "# OpenBazaar: Web-Only Cash on Delivery Marketplace\n\n"
+            "## Overview\n"
+            "A web-only marketplace for buyers and sellers.\n\n"
+            "## Features\n"
+            "- Buyers browse listings from a responsive browser UI.\n\n"
+            "## Responsive Design Requirements\n"
+            "- The marketplace must work on mobile and desktop screens.\n\n"
+            "## Technical Architecture & Database Design\n"
+            "- Node.js backend API.\n"
+            "- PostgreSQL 16 database.\n"
+            "- Docker Compose runs postgres, backend, and frontend services.\n\n"
+            "## Data Model\n"
+            "Listing\n"
+            "- id, title, price\n\n"
+            "## Acceptance Criteria\n"
+            "- `npm test` exits 0.\n",
+            markdown=True,
+        )
+    )
+
+    artifacts = compile_prd_execution_artifacts(contract)
+    components = {component["id"] for component in artifacts.architecture["components"]}
+    foundation = next(
+        milestone for milestone in artifacts.requirement_ledger.milestones
+        if milestone.id == "M-001"
+    )
+    product = next(
+        milestone for milestone in artifacts.requirement_ledger.milestones
+        if milestone.id == "M-002"
+    )
+
+    assert {"backend", "frontend", "database"} <= components
+    assert {
+        "docker-compose.yml",
+        "backend/Dockerfile",
+        "backend/package.json",
+        "backend/server.js",
+        "frontend/Dockerfile",
+        "frontend/package.json",
+        "frontend/index.html",
+        "frontend/vite.config.ts",
+        "frontend/src/main.jsx",
+        "frontend/src/App.jsx",
+        "frontend/src/styles.css",
+    }.issubset(set(foundation.expected_files))
+    assert "react-vite" in product.active_skills
 
 
 def test_selected_node_backend_blueprint_declares_backend_source_files_with_react_present():

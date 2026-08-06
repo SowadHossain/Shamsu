@@ -70,13 +70,23 @@ _REPAIR_MODEL_MAX_OUTPUT_TOKENS: int = int(
 # call, so a slow local model reads as working rather than a frozen prompt.
 _HEARTBEAT_INTERVAL_SECONDS: int = int(_os.environ.get("SHAMSU_HEARTBEAT_SECONDS", "15"))
 
-# Interactive-chat context window. The budget module targets 8GB machines, so we
-# don't hand a 131k-window model (e.g. mistral-nemo) its full context by default;
-# a 32k cap already gives ~4x the previous hard-coded 8192. Override with
-# SHAMSU_CHAT_MAX_CTX. The rolling-summary budget is carved out of the usable
-# window to carry a compressed synopsis of turns evicted by budget-aware trimming.
-_CHAT_MAX_CTX: int = int(_os.environ.get("SHAMSU_CHAT_MAX_CTX", "32768"))
+def _env_int_at_least(name: str, default: int, minimum: int) -> int:
+    raw = _os.environ.get(name, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+# Interactive-chat context window. Local Ollama latency is dominated by prompt
+# prefill; filling a 32k window before every edit made small models appear
+# frozen. Keep ordinary tool-loop turns tighter by default. Override with
+# SHAMSU_CHAT_MAX_CTX on machines that can comfortably prefill larger prompts.
+_CHAT_MAX_CTX: int = _env_int_at_least("SHAMSU_CHAT_MAX_CTX", 12288, 6144)
 _CHAT_SUMMARY_BUDGET_TOKENS = 512
+_CHAT_PROMPT_TARGET_FRACTION = float(_os.environ.get("SHAMSU_CHAT_PROMPT_TARGET_FRACTION", "0.70"))
+_CHAT_HARD_TRIM_MARKER = "\n\n[...context hard-trimmed by SHAMSU to keep the local model responsive...]\n\n"
 
 # Per-tool-result token budget. A single big read_file/grep_files result can
 # otherwise blow the window mid-loop: the budget-aware history trimmer always
@@ -487,6 +497,7 @@ class AgentChatLoop:
         use_planner: bool = True,
         hydrate_history: bool = True,
         verify_changes: bool = True,
+        use_model_compaction: bool = True,
         original_user_request: str = "",
     ) -> None:
         _validate_local_llm_url(base_url)
@@ -543,6 +554,8 @@ class AgentChatLoop:
         self.use_long_term_memory = use_long_term_memory
         self.use_planner = use_planner
         self.verify_changes = verify_changes
+        self.use_model_compaction = use_model_compaction
+        self._last_context_evicted = False
         # The clean CURRENT user request, when the caller wraps it in an
         # internal contract (composite step, PRD repair). A pending ask_user
         # must resume from this - resuming from the internal wrapper re-routes
@@ -618,6 +631,8 @@ class AgentChatLoop:
         reserve = RESERVE_OUTPUT_TOKENS + SAFETY_MARGIN_TOKENS
         usable = max(1, num_ctx - reserve)
         history_budget = max(1, usable - _CHAT_SUMMARY_BUDGET_TOKENS)
+        target_budget = max(1, int(usable * max(0.25, min(1.0, _CHAT_PROMPT_TARGET_FRACTION))))
+        history_budget = min(history_budget, target_budget)
         evicted_anything = False
         tail, start_abs = self.state.select_for_budget(history_budget, count_tokens)
         if start_abs > 1:
@@ -634,9 +649,19 @@ class AgentChatLoop:
                         {"messages": len(pending)},
                         level="verbose",
                     )
-                else:
+                elif self.use_model_compaction:
                     summary = await self._summarize_evicted(
                         self.state.rolling_summary, pending, _CHAT_SUMMARY_BUDGET_TOKENS
+                    )
+                else:
+                    summary = self._deterministic_compaction_fallback(
+                        self.state.rolling_summary, pending
+                    )
+                    self._emit_trace(
+                        "context.compacted",
+                        "Compacted evicted turns deterministically; model summary disabled.",
+                        {"messages": len(pending)},
+                        level="verbose",
                     )
                 self.state.update_rolling_summary(summary, start_abs)
         messages = self.state.build_ollama_messages(tail, include_summary=start_abs > 1)
@@ -653,9 +678,103 @@ class AgentChatLoop:
                     f"Re-read {min(len(mutated_paths), _REGROUND_MAX_FILES)} changed "
                     "file(s) from disk after context eviction.",
                     {"files": list(mutated_paths)[-_REGROUND_MAX_FILES:]},
-                    level="verbose",
+                        level="verbose",
                 )
+        messages, hard_trimmed = self._hard_trim_messages(messages, num_ctx)
+        self._last_context_evicted = evicted_anything or hard_trimmed
         return messages
+
+    def _hard_trim_messages(
+        self, messages: list[dict[str, Any]], num_ctx: int
+    ) -> tuple[list[dict[str, Any]], bool]:
+        reserve = RESERVE_OUTPUT_TOKENS + SAFETY_MARGIN_TOKENS
+        target_tokens = max(1024, int(max(1, num_ctx - reserve) * max(0.25, min(1.0, _CHAT_PROMPT_TARGET_FRACTION))))
+        trimmed = [dict(message) for message in messages]
+
+        def total_tokens() -> int:
+            return count_tokens("\n".join(str(message.get("content", "")) for message in trimmed))
+
+        changed = False
+        # Drop oldest non-system, non-final messages first. The final user turn
+        # carries the current task; the system prompt carries the tool protocol.
+        while len(trimmed) > 2 and total_tokens() > target_tokens:
+            del trimmed[1]
+            changed = True
+
+        for _ in range(8):
+            current_total = total_tokens()
+            if current_total <= target_tokens:
+                break
+            candidates = [
+                (index, count_tokens(str(message.get("content", ""))))
+                for index, message in enumerate(trimmed)
+                if str(message.get("content", ""))
+            ]
+            if not candidates:
+                break
+            # Prefer trimming non-system context before the system prompt.
+            candidates.sort(key=lambda item: (item[0] != 0, item[1]), reverse=True)
+            index, token_count = candidates[0]
+            if token_count <= 256:
+                break
+            excess = max(1, current_total - target_tokens)
+            new_budget = max(256, token_count - excess - 256)
+            content = str(trimmed[index].get("content", ""))
+            new_content = self._truncate_content_to_token_budget(content, new_budget)
+            if new_content == content:
+                break
+            trimmed[index]["content"] = new_content
+            changed = True
+
+        if changed:
+            self._emit_trace(
+                "context.compacted",
+                "Hard-trimmed chat context before the model call.",
+                {"messages": len(messages), "target_tokens": target_tokens},
+                level="verbose",
+            )
+        return trimmed, changed
+
+    def _truncate_content_to_token_budget(self, content: str, budget_tokens: int) -> str:
+        if count_tokens(content) <= budget_tokens:
+            return content
+        char_budget = max(800, budget_tokens * 4)
+        if len(content) <= char_budget:
+            return content
+        marker = _CHAT_HARD_TRIM_MARKER
+        keep = max(200, char_budget - len(marker))
+        head = max(100, int(keep * 0.7))
+        tail = max(100, keep - head)
+        return content[:head].rstrip() + marker + content[-tail:].lstrip()
+
+    def _deterministic_compaction_fallback(
+        self, prior_summary: str, evicted: list[Any]
+    ) -> str:
+        lines: list[str] = []
+        if prior_summary.strip():
+            lines.append(prior_summary.strip())
+        user_requests: list[str] = []
+        assistant_notes = 0
+        tool_results = 0
+        for message in evicted:
+            role = str(getattr(message, "role", "") or "")
+            content = " ".join(str(getattr(message, "content", "") or "").split())
+            if role == "user" and content and not content.startswith("("):
+                user_requests.append(content[:200])
+            elif role == "assistant" and content and not getattr(message, "tool_calls", None):
+                assistant_notes += 1
+            elif role == "tool":
+                tool_results += 1
+        if user_requests:
+            lines.append(f"- earlier user requests: {'; '.join(dict.fromkeys(user_requests))}")
+        details: list[str] = []
+        if assistant_notes:
+            details.append(f"{assistant_notes} assistant note(s)")
+        if tool_results:
+            details.append(f"{tool_results} tool result(s)")
+        details_text = ", ".join(details) if details else f"{len(evicted)} message(s)"
+        lines.append(f"- compacted deterministically: {details_text}; model summary was disabled.")
+        return "\n".join(lines)
 
     def _structured_compact(self, prior_summary: str, evicted: list[Any]) -> str:
         """Tier 1 compaction: a deterministic digest of what the evicted turns DID.
@@ -779,7 +898,11 @@ class AgentChatLoop:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL_SECONDS)
                 elapsed += _HEARTBEAT_INTERVAL_SECONDS
                 if self.on_activity:
-                    self.on_activity(f"still waiting for the model... {elapsed}s")
+                    self.on_activity(
+                        f"still waiting for the model... {elapsed}s "
+                        f"(Ollama may be loading, queued, or generating; timeout "
+                        f"{_MODEL_CALL_TIMEOUT_SECONDS}s)"
+                    )
 
         chat_kwargs: dict[str, Any] = {
             "model": self.model_name,
@@ -915,7 +1038,7 @@ class AgentChatLoop:
         self._pending_upfront_question: dict[str, Any] | None = None
         if self.use_planner and (self.long_running or _CHAT_PLANNER_ENABLED):
             user_input = await self._append_plan(user_input)
-        self.state.append_user(user_input)
+        self.state.append_user(user_input, persisted_content=original_input)
         # The planner judged this needs a decision only the user can make. Ask
         # BEFORE doing any work (J6): mid-loop, a model that can always do
         # *something* just does it, which is why the prompt-only nudge toward
@@ -964,6 +1087,7 @@ class AgentChatLoop:
             if self.budget_manager:
                 _msg_text = "\n".join(str(m.get("content", "")) for m in messages)
                 _budget = self.budget_manager.compute(self.model_name, "chat", _msg_text)
+                _budget.compacted = self._last_context_evicted
                 self.budget_manager.show_indicator(_budget)
             # Surface what context is going to the model (verbose/raw trace).
             if self.on_trace is not None:
@@ -1870,8 +1994,14 @@ class AgentChatLoop:
             )
         except Exception:
             return user_input
-        if plan.needs_input and not _question_is_answerable_by_reading(
-            plan.question, self.workspace_root, user_input
+        if (
+            plan.needs_input
+            and not _question_is_answerable_by_reading(
+                plan.question, self.workspace_root, user_input
+            )
+            and not _planner_question_answered_by_request(
+                plan.question, plan.options, user_input
+            )
         ):
             self._pending_upfront_question = {
                 "question": plan.question,
@@ -2560,6 +2690,96 @@ def _question_is_answerable_by_reading(
         return bool(tool.names_in_text(text) or tool.names_in_text(user_input))
     except Exception:
         return False
+
+
+_GENERIC_OPTION_WORDS = {
+    "section",
+    "feature",
+    "functionality",
+    "page",
+    "screen",
+    "component",
+    "view",
+    "the",
+    "app",
+    "frontend",
+    "main",
+    "jsx",
+    "tsx",
+    "page",
+    "file",
+}
+_PLANNER_PERMISSION_RE = re.compile(
+    r"\b(should|shall|do you want|would you like|may i|can i)\b",
+    re.IGNORECASE,
+)
+_ACTION_WORDS_BY_STEM = {
+    "remov": ("remove", "removes", "removed", "removing"),
+    "delet": ("delete", "deletes", "deleted", "deleting"),
+    "add": ("add", "adds", "added", "adding"),
+    "creat": ("create", "creates", "created", "creating"),
+    "updat": ("update", "updates", "updated", "updating"),
+    "modif": ("modify", "modifies", "modified", "modifying"),
+    "fix": ("fix", "fixes", "fixed", "fixing"),
+}
+
+
+def _planner_question_answered_by_request(
+    question: str, options: Sequence[Any], user_input: str
+) -> bool:
+    """Suppress upfront questions whose own options are already named.
+
+    Live 2026-08-04: the planner asked "Which section in App.jsx should be
+    removed?" with option "Login Section" after the user had already said
+    "remove the login section from App.jsx". That is not a choice; it is the
+    request repeated back as a question, and it traps the user in clarification
+    instead of editing.
+    """
+    q = str(question or "").lower()
+    request = str(user_input or "").lower()
+    if _planner_permission_answered_by_request(q, request):
+        return True
+    if not re.search(r"\b(which|what)\b.*\b(section|feature|functionality|page|screen)\b", q):
+        return False
+    request_words = set(re.findall(r"[a-z0-9_]{3,}", request))
+    if not request_words:
+        return False
+    for option in options or ():
+        if isinstance(option, dict):
+            label = str(option.get("label") or "")
+        else:
+            label = str(option or "")
+        label_words = {
+            word
+            for word in re.findall(r"[a-z0-9_]{3,}", label.lower())
+            if word not in _GENERIC_OPTION_WORDS
+        }
+        if label_words and label_words <= request_words:
+            return True
+    return False
+
+
+def _planner_permission_answered_by_request(question: str, user_input: str) -> bool:
+    if not _PLANNER_PERMISSION_RE.search(question):
+        return False
+    request_words = set(re.findall(r"[a-z0-9_]{3,}", user_input))
+    question_words = set(re.findall(r"[a-z0-9_]{3,}", question))
+    for stem, variants in _ACTION_WORDS_BY_STEM.items():
+        if not any(word.startswith(stem) for word in question_words):
+            continue
+        if not any(word in request_words for word in variants):
+            continue
+        # The action matches; require at least one meaningful object word in
+        # common so a generic "yes" does not authorize an unrelated action.
+        object_words = (
+            question_words
+            - set(variants)
+            - _GENERIC_OPTION_WORDS
+            - {"should", "shall", "want", "would", "like", "main", "from"}
+        )
+        if object_words & request_words:
+            return True
+    return False
 
 
 def _looks_like_deferred_action(content: str) -> bool:

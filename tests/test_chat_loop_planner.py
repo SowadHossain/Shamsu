@@ -278,6 +278,36 @@ async def test_auth_tasks_with_a_decided_approach_or_no_design_choice_continue(
 
 
 @pytest.mark.asyncio
+async def test_planner_permission_question_already_granted_by_request_continues(tmp_path: Path):
+    llm = StructuredPlannerLLM(
+        {
+            "plan": "Remove the login section from frontend/src/App.jsx.",
+            "needs_input": True,
+            "question": "Should the login section be removed from the main page of the frontend app?",
+            "options": [
+                {"label": "Yes, remove it", "description": "The login section is not required."},
+                {"label": "No, keep it", "description": "Authentication may need it."},
+            ],
+        }
+    )
+    client = FakeOllamaClient()
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        llm=llm,
+    )
+
+    result = await loop.run(
+        "on the frontend of the app on the main page there is a login section "
+        "that is not required to show here can you remove it please"
+    )
+
+    assert result.awaiting_user is False
+    assert client.messages_seen
+
+
+@pytest.mark.asyncio
 async def test_a_clear_task_is_not_interrupted(tmp_path: Path):
     """The other half of the threshold: asking about everything is its own
     failure. needs_input=false must go straight to work."""

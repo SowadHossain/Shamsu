@@ -382,6 +382,7 @@ SHAMSU's workspace-local state and logs. Safe to delete: nothing here is needed
 to run SHAMSU again, and none of it is ever fed back into a model prompt.
 
 Every request produces one human-readable report.
+Each session also has one chronological deep-debug JSONL file under `logs/`.
 
 ## Human-readable reports
 
@@ -391,6 +392,14 @@ Every request produces one human-readable report.
 The report contains the prompt, approach, tools, changed files, verification,
 errors, and final answer. Start here. It is written even when `/trace quiet`
 silences the console.
+
+## One-file debug log
+
+    logs/<session-id>/agent-development-log.jsonl
+
+This is the first file to open when debugging SHAMSU itself. It contains prompt
+history, chat messages, session events, run evidence, tool/model call metadata,
+and in verbose mode the redacted model prompt, reasoning, and response text.
 
 ## Machine evidence
 

@@ -1,6 +1,7 @@
 """Budget-aware history trimming + rolling-summary bookkeeping in ChatState."""
 from __future__ import annotations
 
+from shamsu.session.manager import SessionManager
 from shamsu.agents.chat_state import ChatState
 
 
@@ -106,3 +107,31 @@ def test_build_ollama_messages_prepends_system_and_summary():
     built_no_summary = state.build_ollama_messages(tail, include_summary=False)
     assert len(built_no_summary) == 3
     assert built_no_summary[1]["content"] == "u1"
+
+
+def test_user_persistence_keeps_clean_request_not_internal_harness(tmp_path):
+    logger = SessionManager(tmp_path).create_session("clean")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+
+    state.append_user(
+        "remove login\n\n## SHAMSU Task Harness\nhuge internal prompt",
+        persisted_content="remove login",
+    )
+
+    stored = logger.read_messages(10)[-1]
+    assert stored["content"] == "remove login"
+    assert "SHAMSU Task Harness" not in stored["content"]
+
+
+def test_legacy_hydration_strips_internal_harness_blocks(tmp_path):
+    logger = SessionManager(tmp_path).create_session("legacy")
+    logger.append_message(
+        "user",
+        "remove login\n\n## SHAMSU Task Harness\n"
+        "Mode: code_edit\n\n## Active SHAMSU Skills\nlarge skill text",
+    )
+
+    state = ChatState("sys", session_logger=logger, hydrate=True)
+
+    hydrated = [message for message in state.all_messages if message.role == "user"]
+    assert hydrated[0].content == "remove login"

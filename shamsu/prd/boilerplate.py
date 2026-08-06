@@ -164,6 +164,21 @@ NODE_PACKAGE_JSON = """{
 }
 """
 
+NODE_POSTGRES_PACKAGE_JSON = """{
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "build": "node --check server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.0",
+    "pg": "^8.11.0"
+  }
+}
+"""
+
 NODE_ENV_EXAMPLE = """NODE_ENV=development
 PORT=8000
 DATABASE_URL=sqlite:./db.sqlite3
@@ -317,7 +332,7 @@ REACT_PACKAGE_JSON = """{
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.0.0",
@@ -327,6 +342,9 @@ REACT_PACKAGE_JSON = """{
     "typescript": "^5.0.0"
   },
   "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "jsdom": "^24.0.0",
     "vitest": "^1.0.0"
   }
 }
@@ -370,6 +388,235 @@ export default defineConfig({
 REACT_ENV_EXAMPLE = """VITE_API_BASE_URL=/api
 """
 
+REACT_MAIN_TSX = """import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+import "./styles.css";
+
+createRoot(document.getElementById("root") as HTMLElement).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+"""
+
+REACT_MAIN_JSX = """import React from "react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+import "./styles.css";
+
+createRoot(document.getElementById("root")).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+"""
+
+REACT_APP_TSX = """import { useEffect, useState } from "react";
+
+type Listing = {
+  id: number;
+  title: string;
+  price: string;
+  created_at: string;
+};
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
+
+export default function App() {
+  const [listings, setListings] = useState<Listing[]>([]);
+  const [status, setStatus] = useState("Loading marketplace...");
+
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/listings`)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`API returned ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((data) => {
+        setListings(Array.isArray(data.listings) ? data.listings : []);
+        setStatus("Marketplace ready");
+      })
+      .catch((error: Error) => {
+        setStatus(error.message || "Backend unavailable");
+      });
+  }, []);
+
+  return (
+    <main className="app-shell">
+      <section className="toolbar">
+        <div>
+          <p className="eyebrow">Cash on Delivery Marketplace</p>
+          <h1>OpenBazaar</h1>
+        </div>
+        <span className="status">{status}</span>
+      </section>
+      <section className="listing-grid" aria-label="Latest listings">
+        {listings.length ? (
+          listings.map((listing) => (
+            <article className="listing-card" key={listing.id}>
+              <h2>{listing.title}</h2>
+              <p>BDT {listing.price}</p>
+            </article>
+          ))
+        ) : (
+          <article className="empty-state">
+            <h2>No listings yet</h2>
+            <p>The backend API is wired. Product slices can now add catalogue, orders, and seller flows.</p>
+          </article>
+        )}
+      </section>
+    </main>
+  );
+}
+"""
+
+REACT_APP_JSX = """import { useEffect, useState } from "react";
+
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "/api";
+
+export default function App() {
+  const [listings, setListings] = useState([]);
+  const [status, setStatus] = useState("Loading marketplace...");
+
+  useEffect(() => {
+    fetch(`${API_BASE_URL}/listings`)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`API returned ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((data) => {
+        setListings(Array.isArray(data.listings) ? data.listings : []);
+        setStatus("Marketplace ready");
+      })
+      .catch((error) => {
+        setStatus(error.message || "Backend unavailable");
+      });
+  }, []);
+
+  return (
+    <main className="app-shell">
+      <section className="toolbar">
+        <div>
+          <p className="eyebrow">Cash on Delivery Marketplace</p>
+          <h1>OpenBazaar</h1>
+        </div>
+        <span className="status">{status}</span>
+      </section>
+      <section className="listing-grid" aria-label="Latest listings">
+        {listings.length ? (
+          listings.map((listing) => (
+            <article className="listing-card" key={listing.id}>
+              <h2>{listing.title}</h2>
+              <p>BDT {listing.price}</p>
+            </article>
+          ))
+        ) : (
+          <article className="empty-state">
+            <h2>No listings yet</h2>
+            <p>The backend API is wired. Product slices can now add catalogue, orders, and seller flows.</p>
+          </article>
+        )}
+      </section>
+    </main>
+  );
+}
+"""
+
+REACT_STYLES_CSS = """:root {
+  color: #18212f;
+  background: #f6f7f9;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app-shell {
+  min-height: 100vh;
+  padding: 32px;
+}
+
+.toolbar {
+  align-items: center;
+  display: flex;
+  gap: 24px;
+  justify-content: space-between;
+  margin: 0 auto 28px;
+  max-width: 1100px;
+}
+
+.eyebrow {
+  color: #53606f;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0;
+  margin: 0 0 6px;
+  text-transform: uppercase;
+}
+
+h1 {
+  font-size: clamp(2rem, 5vw, 4rem);
+  line-height: 1;
+  margin: 0;
+}
+
+.status {
+  background: #ffffff;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+
+.listing-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin: 0 auto;
+  max-width: 1100px;
+}
+
+.listing-card,
+.empty-state {
+  background: #ffffff;
+  border: 1px solid #dde3ea;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.listing-card h2,
+.empty-state h2 {
+  font-size: 1.1rem;
+  margin: 0 0 12px;
+}
+
+.listing-card p,
+.empty-state p {
+  color: #53606f;
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .app-shell {
+    padding: 20px;
+  }
+
+  .toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+"""
+
 REACT_DOCKERFILE = """FROM node:22-alpine
 
 WORKDIR /app
@@ -381,7 +628,7 @@ EXPOSE 5173
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
 """
 
-ROOT_ENV_EXAMPLE = """POSTGRES_DB=openbazaar
+DJANGO_ROOT_ENV_EXAMPLE = """POSTGRES_DB=openbazaar
 POSTGRES_USER=openbazaar
 POSTGRES_PASSWORD=openbazaar
 DJANGO_SECRET_KEY=change-me
@@ -390,7 +637,16 @@ DJANGO_ALLOWED_HOSTS=localhost,127.0.0.1,backend
 VITE_API_BASE_URL=/api
 """
 
-DOCKER_COMPOSE_TEMPLATE = """services:
+NODE_ROOT_ENV_EXAMPLE = """POSTGRES_DB=openbazaar
+POSTGRES_USER=openbazaar
+POSTGRES_PASSWORD=openbazaar
+NODE_ENV=development
+PORT=8000
+DATABASE_URL=postgres://openbazaar:openbazaar@postgres:5432/openbazaar
+VITE_API_BASE_URL=/api
+"""
+
+DJANGO_DOCKER_COMPOSE_TEMPLATE = """services:
   postgres:
     image: postgres:16
     environment:
@@ -419,6 +675,50 @@ DOCKER_COMPOSE_TEMPLATE = """services:
       POSTGRES_PASSWORD: openbazaar
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      DATABASE_URL: postgres://openbazaar:openbazaar@postgres:5432/openbazaar
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_BASE_URL: /api
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
+"""
+
+NODE_DOCKER_COMPOSE_TEMPLATE = """services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: openbazaar
+      POSTGRES_USER: openbazaar
+      POSTGRES_PASSWORD: openbazaar
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openbazaar -d openbazaar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      NODE_ENV: development
+      PORT: "8000"
       DATABASE_URL: postgres://openbazaar:openbazaar@postgres:5432/openbazaar
     ports:
       - "8000:8000"
@@ -554,7 +854,9 @@ def _docker_compose_content(expected_files: Sequence[str]) -> str:
     has_backend = any(_endswith_component_path(item, "backend/Dockerfile") for item in expected)
     has_frontend = any(_endswith_component_path(item, "frontend/Dockerfile") for item in expected)
     if has_backend and has_frontend:
-        return DOCKER_COMPOSE_TEMPLATE
+        if is_node_express_project(expected_files) and not is_django_project(expected_files):
+            return NODE_DOCKER_COMPOSE_TEMPLATE
+        return DJANGO_DOCKER_COMPOSE_TEMPLATE
     sections = [
         """services:
   postgres:
@@ -575,13 +877,13 @@ def _docker_compose_content(expected_files: Sequence[str]) -> str:
 """,
     ]
     if has_backend:
-        sections.append(
-            """
-  backend:
-    build:
-      context: ./backend
-    environment:
-      DJANGO_SECRET_KEY: change-me
+        backend_environment = (
+            """      NODE_ENV: development
+      PORT: "8000"
+      DATABASE_URL: postgres://openbazaar:openbazaar@postgres:5432/openbazaar
+"""
+            if is_node_express_project(expected_files) and not is_django_project(expected_files)
+            else """      DJANGO_SECRET_KEY: change-me
       DJANGO_DEBUG: "True"
       DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,backend
       POSTGRES_DB: openbazaar
@@ -590,6 +892,15 @@ def _docker_compose_content(expected_files: Sequence[str]) -> str:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
       DATABASE_URL: postgres://openbazaar:openbazaar@postgres:5432/openbazaar
+"""
+        )
+        sections.append(
+            f"""
+  backend:
+    build:
+      context: ./backend
+    environment:
+{backend_environment.rstrip()}
     ports:
       - "8000:8000"
     depends_on:
@@ -604,6 +915,12 @@ volumes:
 """
     )
     return "".join(sections)
+
+
+def _root_env_example_content(expected_files: Sequence[str]) -> str:
+    if is_node_express_project(expected_files) and not is_django_project(expected_files):
+        return NODE_ROOT_ENV_EXAMPLE
+    return DJANGO_ROOT_ENV_EXAMPLE
 
 
 def render_boilerplate(
@@ -631,7 +948,7 @@ def render_boilerplate(
             _endswith_component_path(normalized, "backend/.env.example")
             or _endswith_component_path(normalized, "frontend/.env.example")
         ):
-            return ROOT_ENV_EXAMPLE
+            return _root_env_example_content(expected_files)
     if is_react_vite_project(expected_files):
         if _endswith_component_path(normalized, "frontend/package.json"):
             return REACT_PACKAGE_JSON
@@ -646,9 +963,19 @@ def render_boilerplate(
             return REACT_ENV_EXAMPLE
         if _endswith_component_path(normalized, "frontend/Dockerfile"):
             return REACT_DOCKERFILE
+        if _endswith_component_path(normalized, "frontend/src/main.tsx"):
+            return REACT_MAIN_TSX
+        if _endswith_component_path(normalized, "frontend/src/main.jsx"):
+            return REACT_MAIN_JSX
+        if _endswith_component_path(normalized, "frontend/src/App.tsx"):
+            return REACT_APP_TSX
+        if _endswith_component_path(normalized, "frontend/src/App.jsx"):
+            return REACT_APP_JSX
+        if _endswith_component_path(normalized, "frontend/src/styles.css"):
+            return REACT_STYLES_CSS
     if is_node_express_project(expected_files):
         if _endswith_component_path(normalized, "backend/package.json"):
-            return NODE_PACKAGE_JSON
+            return NODE_POSTGRES_PACKAGE_JSON if uses_postgres_runtime(expected_files) else NODE_PACKAGE_JSON
         if _endswith_component_path(normalized, "backend/.env.example"):
             return (
                 NODE_POSTGRES_ENV_EXAMPLE

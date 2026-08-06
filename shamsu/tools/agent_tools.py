@@ -52,6 +52,7 @@ from shamsu.tools.workspace import (
     TEXT_EXTENSIONS,
     WorkspaceTool,
     extract_document_text,
+    is_readable_text_file,
 )
 from shamsu.types import ApprovalRequest
 
@@ -306,6 +307,28 @@ class AgentToolRegistry:
             return normalized
         return resolved if target.is_file() else normalized
 
+    def _allowed_by_unique_basename_scope(self, normalized: str, allowed: set[str]) -> bool:
+        """Allow a resolved path when the scope named its unique basename."""
+        name = PurePosixPath(normalized).name.lower()
+        if not name:
+            return False
+        basename_scopes = {
+            item
+            for item in allowed
+            if "/" not in item.strip("/") and PurePosixPath(item).name.lower() == name
+        }
+        if not basename_scopes:
+            return False
+
+        matches: set[str] = set()
+        for relative in _walk_workspace_files(self.workspace_root):
+            rel_path = _normalize_workspace_path(str(relative)).lower()
+            if PurePosixPath(rel_path).name != name:
+                continue
+            if self._inside_allowed_read_scope(rel_path):
+                matches.add(rel_path)
+        return len(matches) == 1 and normalized.lower() in matches
+
     def set_user_request(self, request: str) -> None:
         self._user_request = str(request or "")
 
@@ -346,6 +369,8 @@ class AgentToolRegistry:
             normalized == item or normalized.startswith(item.rstrip("/") + "/")
             for item in allowed
         ):
+            return None
+        if self._allowed_by_unique_basename_scope(normalized, allowed):
             return None
         return ToolResult(
             False,
@@ -502,6 +527,14 @@ class AgentToolRegistry:
                 {
                     "filepath": {"type": "string", "description": "Relative file path."},
                     "content": {"type": "string", "description": "Complete file content."},
+                    "overwrite": {
+                        "type": "string",
+                        "description": (
+                            "Use true to replace an existing file. Default true for model calls; "
+                            "new files are always created."
+                        ),
+                        "default": "true",
+                    },
                 },
                 required=["filepath", "content"],
             ),
@@ -997,7 +1030,7 @@ class AgentToolRegistry:
                 return self.write_file(
                     str(arguments.get("filepath") or ""),
                     str(arguments.get("content") or ""),
-                    overwrite=True,
+                    overwrite=_as_bool(arguments.get("overwrite"), default=True),
                 )
             if name == "move_file":
                 return self.move_file(
@@ -3476,7 +3509,11 @@ def _gutting_overwrite(target: Path, content: str) -> str:
 
 
 def _is_readable_text(target: Path) -> bool:
-    return target.suffix.lower() in _READABLE_TEXT_EXTENSIONS or target.name in _READABLE_FILENAMES
+    return (
+        is_readable_text_file(target)
+        or target.suffix.lower() in _READABLE_TEXT_EXTENSIONS
+        or target.name in _READABLE_FILENAMES
+    )
 
 
 def _parse_extensions(value: Any) -> set[str]:

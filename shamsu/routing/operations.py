@@ -13,8 +13,9 @@ CandidateFinder = Callable[[str, Path], list[str]]
 
 _ACTION = (
     r"(?:read|open|inspect|show|compare|summari[sz]e|explain|search|look\s+up|"
-    r"browse|create|write|build|implement|install|fix|repair|edit|update|modify|change|"
-    r"add|remove|delete|rename|move|run|rerun|re-run|test|verify|check|report|"
+    r"browse|create|write|build|implement|scaffold|bootstrap|initiate|initiali[sz]e|"
+    r"install|fix|repair|edit|update|modify|change|"
+    r"add|remove|removed|delete|deleted|rename|move|run|rerun|re-run|test|verify|check|report|"
     r"return|start|launch|serve|commit|stage|push|pull)"
 )
 _CLAUSE_SPLIT_RE = re.compile(
@@ -42,6 +43,17 @@ _FILE_TOKEN_RE = re.compile(
     r"(?:[A-Za-z0-9_.-]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}",
     re.IGNORECASE,
 )
+_SPECIAL_FILE_TOKEN_RE = re.compile(
+    r"(?:[A-Za-z0-9_.-]+[/\\])*(?:"
+    r"Dockerfile(?:\.[A-Za-z0-9_.-]+)?|"
+    r"Makefile(?:\.[A-Za-z0-9_.-]+)?|"
+    r"Procfile|"
+    r"\.env(?:\.[A-Za-z0-9_.-]+)?|"
+    r"\.dockerignore|\.gitignore|\.gitattributes|\.npmrc|\.nvmrc|"
+    r"\.prettierrc|\.eslintrc|\.babelrc|\.editorconfig"
+    r")",
+    re.IGNORECASE,
+)
 # Real file suffixes. The pattern above accepts ANY short trailing segment, so
 # a dotted Python module path counted as a filename: "Import AbstractUser from
 # django.contrib.auth.models" contributed `django.contrib.auth.models` AND
@@ -50,9 +62,25 @@ _FILE_TOKEN_RE = re.compile(
 _FILE_SUFFIXES = frozenset(
     """py pyi ipynb js jsx ts tsx mjs cjs json jsonc yaml yml toml ini cfg conf env
     md markdown rst txt csv tsv sql db sqlite sqlite3 html htm css scss sass less
+    prisma graphql gql properties proto gradle lock
     png jpg jpeg gif svg ico webp pdf docx doc xlsx lock sh bash ps1 bat cmd
     dockerfile gitignore go rs java kt rb php c h cpp hpp cs xml""".split()
 )
+_SPECIAL_FILE_PREFIXES = ("dockerfile.", "makefile.", ".env.")
+_SPECIAL_FILE_NAMES = {
+    "dockerfile",
+    "makefile",
+    "procfile",
+    ".dockerignore",
+    ".gitignore",
+    ".gitattributes",
+    ".npmrc",
+    ".nvmrc",
+    ".prettierrc",
+    ".eslintrc",
+    ".babelrc",
+    ".editorconfig",
+}
 
 
 def looks_like_real_file(token: str) -> bool:
@@ -63,6 +91,9 @@ def looks_like_real_file(token: str) -> bool:
     `config.settings` and then fail for not writing it.
     """
     normalized = token.replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1].lower()
+    if name in _SPECIAL_FILE_NAMES or any(name.startswith(prefix) for prefix in _SPECIAL_FILE_PREFIXES):
+        return True
     if "/" in normalized:
         return True
     return normalized.rsplit(".", 1)[-1].lower() in _FILE_SUFFIXES
@@ -86,13 +117,14 @@ def file_targets(text: str) -> set[str]:
     """
     body = text or ""
     targets: set[str] = set()
-    for match in _FILE_TOKEN_RE.finditer(body):
-        token = match.group(0)
-        if not looks_like_real_file(token):
-            continue
-        if _IMPORT_CONTEXT_RE.search(body[: match.start()]):
-            continue
-        targets.add(token.replace("\\", "/").casefold())
+    for pattern in (_FILE_TOKEN_RE, _SPECIAL_FILE_TOKEN_RE):
+        for match in pattern.finditer(body):
+            token = match.group(0)
+            if not looks_like_real_file(token):
+                continue
+            if _IMPORT_CONTEXT_RE.search(body[: match.start()]):
+                continue
+            targets.add(token.replace("\\", "/").casefold())
     return targets
 
 
@@ -208,7 +240,7 @@ def parse_operation_plan(
             continue
         classified = classify(clause, workspace)
         kind = _normalize_kind_for_route(kind, classified)
-        route = _route_for_kind(kind, classified)
+        route = _route_for_kind(kind, classified, clause)
         references_previous = bool(steps and _REFERENCE_RE.search(clause))
         dependencies = (steps[-1].id,) if steps else ()
         steps.append(
@@ -354,7 +386,8 @@ def recover_original_prompt(prompt: str) -> str:
 # (and not a question) is context/location, not a step of its own.
 _STANDALONE_VERB_RE = re.compile(
     r"\b(?:read|open|inspect|show|explain|summari[sz]e|compare|search|browse|"
-    r"look\s+up|create|write|build|implement|install|fix|repair|edit|update|modify|"
+    r"look\s+up|create|write|build|implement|scaffold|bootstrap|initiate|initiali[sz]e|"
+    r"install|fix|repair|edit|update|modify|"
     r"change|add|remove|delete|rename|move|run|rerun|re-run|test|verify|compile|"
     r"check|start|launch|serve|commit|stage|push|pull|stash|checkout|report|return)\b",
     re.IGNORECASE,
@@ -515,8 +548,9 @@ def _operation_kind(clause: str) -> str:
         # core/views.py so it contains ..." was not recognised as a mutation at
         # all and fell through to the answer route - the model described the
         # file instead of writing it.
-        r"\b(create|write|rewrite|overwrite|replace|append|build|implement|install"
-        r"|fix|repair|edit|update|modify|change|add|remove|delete|rename|move)\b",
+        r"\b(create|write|rewrite|overwrite|replace|append|build|implement|scaffold"
+        r"|bootstrap|initiate|initiali[sz]e|install"
+        r"|fix|repair|edit|update|modify|change|add|remove|removed|delete|deleted|rename|move)\b",
         action_text,
     ):
         return "mutation"
@@ -536,14 +570,22 @@ def _operation_kind(clause: str) -> str:
     return "answer"
 
 
-def _route_for_kind(kind: str, classified: str) -> str:
+def _route_for_kind(kind: str, classified: str, clause: str = "") -> str:
     # A turn whose instruction is to write a file is never a web search,
     # whatever the model's classifier decided. Without this the fall-through at
     # the end returned the classifier's answer verbatim, and a prompt dictating
     # HTML ("rewrite templates/browse.html ...") was dispatched to web search:
     # it changed nothing, reported failure, and left the file broken.
-    if kind == "mutation" and classified == "web":
-        return "file.write"
+    if kind == "mutation" and classified not in {
+        "file.write",
+        "prd.build",
+        "django",
+        "mcp",
+        "git",
+        "package.install",
+        "direct_code",
+    }:
+        return "file.write" if file_targets(clause) else "agent-chat"
     if kind in {"verify", "launch"} and classified in {
         "run_game",
         "dev_server",

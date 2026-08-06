@@ -19,6 +19,7 @@ from shamsu.prd.requirements import (
     compile_requirement_ledger,
     save_prd_execution_artifacts,
 )
+from shamsu.registry.blueprints import resolve_blueprints
 from shamsu.safety.sandbox import Sandbox
 
 SCHEMA_VERSION = 1
@@ -42,6 +43,7 @@ _SKILL_TOOL_HINTS = {
     "ui-designer": {"browser_open", "browser_read", "browser_screenshot"},
     "testing": {"run_command"},
     "sqlite-persistence": {"run_command"},
+    "sql-databases": {"run_command"},
     "mcp-tools": {"mcp:*"},
 }
 
@@ -81,17 +83,18 @@ def initialize_prd_execution(
 ) -> tuple[Path, dict[str, Any]]:
     """Create or load the durable execution state for a PRD contract."""
     ledger = compile_requirement_ledger(contract)
+    stack_profile = stack_profile_for_contract(contract)
     root = prd_execution_root(workspace, ledger.contract_hash, execution_key=execution_key)
     root.mkdir(parents=True, exist_ok=True)
     save_prd_execution_artifacts(contract, root)
-    _write_preflights(root, ledger)
+    _write_preflights(root, ledger, stack_profile)
 
     path = root / "state.json"
     existing = _read_json(path)
     if existing and existing.get("contract_hash") == ledger.contract_hash:
-        state = _merge_state(existing, ledger, user_request, prd_path)
+        state = _merge_state(existing, ledger, user_request, prd_path, stack_profile)
     else:
-        state = _new_state(ledger, user_request, prd_path)
+        state = _new_state(ledger, user_request, prd_path, stack_profile)
     if not _has_acceptance_criteria(ledger):
         state = _block_missing_acceptance_criteria(state)
     state["execution_key"] = execution_key
@@ -142,6 +145,32 @@ def load_milestone_preflight(root: Path, milestone_id: str) -> dict[str, Any]:
 
 def model_preflight_schema() -> dict[str, Any]:
     return json.loads(json.dumps(MODEL_PREFLIGHT_SCHEMA))
+
+
+def stack_profile_for_contract(contract: PRDContract) -> dict[str, Any]:
+    """Durable stack lock shared by every PRD milestone turn."""
+    resolution = resolve_blueprints(contract)
+    selected = {
+        slot: blueprint.id
+        for slot, blueprint in sorted(resolution.selected.items())
+    }
+    suggestions = {
+        slot: blueprint.id
+        for slot, blueprint in sorted(resolution.suggestions.items())
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "title": contract.title,
+        "project_kind": contract.project_kind,
+        "stack_hint": contract.stack_hint,
+        "required_stack": list(contract.required_stack),
+        "selected_blueprints": selected,
+        "suggested_blueprints": suggestions,
+        "backend": selected.get("backend", ""),
+        "frontend": selected.get("frontend", ""),
+        "database": selected.get("database", ""),
+        "locked": True,
+    }
 
 
 def validate_model_preflight(
@@ -516,6 +545,19 @@ def block_milestone(
 def render_preflight_context(preflight: dict[str, Any]) -> str:
     if not preflight:
         return ""
+    stack_profile = preflight.get("stack_profile") if isinstance(preflight, dict) else {}
+    stack_line = ""
+    if isinstance(stack_profile, dict) and stack_profile:
+        selected = stack_profile.get("selected_blueprints") or {}
+        if isinstance(selected, dict):
+            stack_line = "; ".join(
+                f"{slot}={value}"
+                for slot, value in selected.items()
+                if str(value).strip()
+            )
+        required_stack = ", ".join(str(item) for item in stack_profile.get("required_stack") or [])
+        if required_stack:
+            stack_line = f"{stack_line}; required_stack={required_stack}" if stack_line else f"required_stack={required_stack}"
     lines = [
         "## Milestone Preflight",
         f"Milestone: {preflight.get('milestone_id', '')} - {preflight.get('title', '')}",
@@ -529,6 +571,8 @@ def render_preflight_context(preflight: dict[str, Any]) -> str:
         "",
         "Requirements for this milestone:",
     ]
+    if stack_line:
+        lines.insert(4, f"Stack lock: {stack_line}")
     for requirement in list(preflight.get("requirements") or [])[:12]:
         lines.append(f"- {requirement.get('id')}: {requirement.get('text')}")
     context_focus = list(preflight.get("context_focus") or [])[:8]
@@ -549,6 +593,7 @@ def render_preflight_context(preflight: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
+            "Preserve the stack lock across every file and command. Do not introduce a different backend, frontend, database, ORM, or verifier unless the PRD stack profile explicitly names it.",
             "Use only the context and tools needed for these requirement IDs.",
             "Checkpoint evidence must come from files changed, commands run, or a blocker.",
         ]
@@ -556,7 +601,11 @@ def render_preflight_context(preflight: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _write_preflights(root: Path, ledger: RequirementLedger) -> None:
+def _write_preflights(
+    root: Path,
+    ledger: RequirementLedger,
+    stack_profile: dict[str, Any],
+) -> None:
     by_id = {record.id: record for record in ledger.requirements}
     preflight_dir = root / "preflight"
     preflight_dir.mkdir(parents=True, exist_ok=True)
@@ -569,6 +618,7 @@ def _write_preflights(root: Path, ledger: RequirementLedger) -> None:
         payload = {
             "schema_version": SCHEMA_VERSION,
             "contract_hash": ledger.contract_hash,
+            "stack_profile": dict(stack_profile),
             "milestone_id": milestone.id,
             "title": milestone.title,
             "requirement_ids": list(milestone.requirement_ids),
@@ -597,12 +647,14 @@ def _new_state(
     ledger: RequirementLedger,
     user_request: str,
     prd_path: str,
+    stack_profile: dict[str, Any],
 ) -> dict[str, Any]:
     now = _now()
     return {
         "schema_version": SCHEMA_VERSION,
         "title": ledger.title,
         "contract_hash": ledger.contract_hash,
+        "stack_profile": dict(stack_profile),
         "user_request": user_request,
         "prd_path": prd_path,
         "task_id": "",
@@ -660,6 +712,7 @@ def _merge_state(
     ledger: RequirementLedger,
     user_request: str,
     prd_path: str,
+    stack_profile: dict[str, Any],
 ) -> dict[str, Any]:
     old_by_id = {
         str(item.get("id")): item
@@ -689,6 +742,7 @@ def _merge_state(
             "schema_version": SCHEMA_VERSION,
             "title": ledger.title,
             "contract_hash": ledger.contract_hash,
+            "stack_profile": dict(stack_profile),
             "user_request": user_request,
             "prd_path": prd_path,
             "milestones": milestones,

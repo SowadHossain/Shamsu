@@ -193,6 +193,10 @@ _AUTH_APPROACH_RE = re.compile(
     r"firebase auth|auth0|clerk|supabase auth|nextauth|auth\.js)\b",
     re.IGNORECASE,
 )
+_PLAN_ONLY_RE = re.compile(
+    r"\b(plan|planning|development plan|implementation plan|breakdown|roadmap)\b",
+    re.IGNORECASE,
+)
 
 
 def deterministic_user_decision(
@@ -205,6 +209,8 @@ def deterministic_user_decision(
     an explicit request to introduce authentication with no scheme selected is
     stopped before execution.
     """
+    if _PLAN_ONLY_RE.search(goal):
+        return None
     if not _ADD_AUTH_RE.search(goal) or _AUTH_APPROACH_RE.search(goal):
         return None
     return (

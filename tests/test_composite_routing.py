@@ -67,6 +67,16 @@ def test_clear_single_file_write_keeps_fast_route(tmp_path: Path):
     assert repl._classify_route_label("create hello.py", tmp_path) == "file.write"
 
 
+def test_boilerplate_scaffold_request_routes_to_tool_agent(tmp_path: Path):
+    prompt = "initiate the folder stucture for the project use boilerplates we mede"
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert plan.steps[0].kind == "mutation"
+    assert plan.primary_route == "agent-chat"
+
+
 def test_package_install_and_import_probe_are_separate_mutating_and_verify_steps(
     tmp_path: Path,
 ):
@@ -411,6 +421,7 @@ async def test_direct_file_write_ignores_stale_memory_and_speculative_planner(
             return SimpleNamespace(handled=False, effective_input=prompt, context="", action="")
 
     async def _fake_agent(*args, **kwargs):
+        captured["prompt"] = args[0]
         captured.update(kwargs)
         return AgentLoopResult(final="stopped", stopped=True)
 
@@ -427,6 +438,8 @@ async def test_direct_file_write_ignores_stale_memory_and_speculative_planner(
 
     assert captured["use_long_term_memory"] is False
     assert captured["use_planner"] is False
+    assert captured["hydrate_history"] is False
+    assert "## Deterministic Context" not in str(captured["prompt"])
     assert captured["user_request"] == (
         "Create exact-output.txt containing hello. Do not modify any other files."
     )
@@ -1033,6 +1046,29 @@ def test_dotted_module_paths_are_not_counted_as_files(tmp_path: Path):
     assert file_targets(text) == {"canvas_lms_lite/core/models.py"}
 
 
+def test_special_project_filenames_are_counted_as_file_targets(tmp_path: Path):
+    from shamsu.routing.operations import file_targets
+
+    text = "Update Dockerfile.dev, .env.example, backend/schema.prisma, and frontend/src/styles.scss."
+
+    assert file_targets(text) == {
+        "dockerfile.dev",
+        ".env.example",
+        "backend/schema.prisma",
+        "frontend/src/styles.scss",
+    }
+
+
+def test_special_project_filename_prompts_route_to_file_tools(tmp_path: Path):
+    (tmp_path / "Dockerfile.dev").write_text("FROM node:22\n", encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text("FROM node:22\n", encoding="utf-8")
+    (tmp_path / ".env.example").write_text("PORT=4000\n", encoding="utf-8")
+
+    assert repl._classify_route_label("read Dockerfile.dev", tmp_path) == "file.read"
+    assert repl._classify_route_label("read Dockerfile", tmp_path) == "file.read"
+    assert repl._classify_route_label("update .env.example", tmp_path) == "file.write"
+
+
 def test_single_file_creation_with_import_instructions_stays_one_step(tmp_path: Path):
     prompt = (
         "Create the file canvas_lms_lite/core/models.py. It must contain a Django custom "
@@ -1062,3 +1098,30 @@ def test_single_file_spec_with_trailing_write_imperative_stays_one_step(tmp_path
     assert len(plan.steps) == 1
     assert "AUTH_USER_MODEL" in plan.steps[0].instruction
     assert "Write the complete file now" in plan.steps[0].instruction
+
+
+def test_passive_remove_after_clarification_routes_to_tool_agent(tmp_path: Path):
+    prompt = (
+        "login section be removed from the main page of the frontend app\n\n"
+        '(Answering the earlier question "Should the login section be removed '
+        'from the main page of the frontend app?": Yes, remove it)'
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert plan.steps[0].kind == "mutation"
+    assert plan.primary_route == "agent-chat"
+
+
+def test_explicit_react_remove_path_is_not_hijacked_by_run_game(tmp_path: Path):
+    prompt = (
+        "remove the login section from the main page in "
+        "open_bazaar_web_only_cash_on_delivery_co_d_marketplace/frontend/src/App.jsx"
+    )
+
+    plan = repl._operation_plan(prompt, tmp_path)
+
+    assert plan.is_composite is False
+    assert plan.steps[0].kind == "mutation"
+    assert plan.primary_route == "file.write"

@@ -80,9 +80,11 @@ def blueprint_by_id(blueprint_id: str) -> StackBlueprint | None:
 def resolve_blueprints(contract: PRDContract) -> BlueprintResolution:
     """Resolve explicit stack tokens and separately report suggestions.
 
-    Suggestions are not selected and never mutate ``required_stack``. They are
-    returned as assumptions so the planner can ask or log a defaultable slot
-    without pretending the PRD required it.
+    Suggestions are not selected for completely unspecified slots and never
+    mutate ``required_stack``. When the PRD explicitly requires a layer (for
+    example a web-only responsive frontend) but does not name that layer's
+    framework, the suggested blueprint is selected as the concrete local
+    implementation and recorded as an assumption.
     """
     prohibited = {_normalize_token(item) for item in contract.prohibitions}
     available = [
@@ -99,6 +101,7 @@ def resolve_blueprints(contract: PRDContract) -> BlueprintResolution:
     selected: dict[str, StackBlueprint] = {}
     unsupported: list[str] = []
     conflicts: list[str] = []
+    implied_selected: set[str] = set()
 
     for slot in ("backend", "frontend", "database"):
         slot_tokens = sorted(token for token in tokens if TECHNOLOGY_SLOTS.get(token) == slot)
@@ -124,10 +127,25 @@ def resolve_blueprints(contract: PRDContract) -> BlueprintResolution:
                 f"{slot} stack names several compatible blueprints; selected {matches[0].id}."
             )
 
+    if "frontend" not in selected and _contract_requires_frontend_layer(contract):
+        blueprint = blueprint_by_id(SUGGESTIONS["frontend"])
+        if blueprint is not None and blueprint in available:
+            selected["frontend"] = blueprint
+            implied_selected.add("frontend")
+        elif blueprint is not None:
+            conflicts.append(
+                f"Frontend layer is required, but suggested blueprint {blueprint.id} is prohibited."
+            )
+
     suggestions: dict[str, StackBlueprint] = {}
     assumptions: list[str] = []
     for slot, blueprint_id in SUGGESTIONS.items():
         if slot in selected:
+            if slot in implied_selected:
+                assumptions.append(
+                    "Frontend layer is required but no frontend framework was specified; "
+                    f"using suggested blueprint: {selected[slot].id}."
+                )
             continue
         blueprint = blueprint_by_id(blueprint_id)
         if blueprint is None:
@@ -190,6 +208,30 @@ def _contract_needs_backend_service(contract: PRDContract, tokens: set[str]) -> 
         return True
     text = " ".join([contract.product_summary, *contract.architecture, *contract.features]).lower()
     return any(token in text for token in ("backend", "api", "server", "database"))
+
+
+def _contract_requires_frontend_layer(contract: PRDContract) -> bool:
+    text = " ".join(
+        [
+            contract.title,
+            contract.product_summary,
+            contract.stack_hint,
+            *contract.required_stack,
+            *contract.architecture,
+            *contract.features,
+            *contract.screens,
+            *contract.nonfunctional_requirements,
+        ]
+    ).lower()
+    return bool(
+        "web-only" in text
+        or "web only" in text
+        or "frontend" in text
+        or "front-end" in text
+        or "browser ui" in text
+        or "responsive user interface" in text
+        or "responsive design" in text
+    )
 
 
 def _normalize_token(value: str) -> str:

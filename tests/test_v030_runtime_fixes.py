@@ -249,13 +249,20 @@ def test_greenfield_prd_html_css_js(tmp_path, monkeypatch):
     async def _fake_final(*_args, **_kwargs):
         return True
 
+    async def _fake_development_plan(*_args, **_kwargs):
+        return {"source": "test", "plan_summary": "test", "milestones": []}
+
     monkeypatch.setattr(repl, "_run_agent_chat", _fake_agent_chat)
     monkeypatch.setattr(repl, "_verify_prd_milestone", _fake_verify)
     monkeypatch.setattr(repl, "_verify_completed_plan", _fake_final)
+    monkeypatch.setattr(repl, "_prepare_prd_development_plan", _fake_development_plan)
 
     asyncio.run(
         repl._handle_prd_build_request(
-            "from the PRD implement with html css js", tmp_path, _quiet_console()
+            "from the PRD implement with html css js",
+            tmp_path,
+            _quiet_console(),
+            execute_plan=True,
         )
     )
 
@@ -416,7 +423,25 @@ def test_prd_summary_reads_and_summarizes(tmp_path):
     # Exactly one summarization call, fed the actual PRD text.
     assert len(llm.calls) == 1
     assert "notes app" in llm.calls[0].prd_context.lower()
+    assert "what is the project about" in llm.calls[0].user_request.lower()
     assert "notes app" in console.file.getvalue().lower()
+
+
+def test_prd_summary_answers_specific_prd_question(tmp_path):
+    (tmp_path / "prd.md").write_text(
+        "# Marketplace\n## Tech Stack\n- React\n- Node\n- PostgreSQL\n", encoding="utf-8"
+    )
+    llm = _SummaryLLM()
+    console = _quiet_console()
+
+    asyncio.run(
+        repl._handle_prd_summary_request(
+            "look in the prd and tell me the tech stack", tmp_path, console, llm
+        )
+    )
+
+    assert len(llm.calls) == 1
+    assert "tech stack" in llm.calls[0].user_request.lower()
 
 
 def test_agent_loop_runs_on_the_configured_executor_model(tmp_path):

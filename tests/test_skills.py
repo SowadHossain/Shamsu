@@ -165,3 +165,23 @@ def test_skills_slash_command_is_read_only_in_headless(tmp_path: Path):
     assert handled is True
     assert refusal == ""
     assert "SHAMSU Skills" in console.export_text()
+
+
+def test_skills_suggest_alias_and_close_name_hint(tmp_path: Path):
+    from shamsu.skills.cli import handle_skills_command
+
+    suggest_console = Console(record=True)
+    handle_skills_command(
+        "skills suggest build a React Vite frontend from the PRD",
+        tmp_path,
+        suggest_console,
+    )
+    suggest_output = suggest_console.export_text()
+
+    typo_console = Console(record=True)
+    handle_skills_command("skills show reactvite", tmp_path, typo_console)
+    typo_output = typo_console.export_text()
+
+    assert "react-vite" in suggest_output
+    assert "Did you mean:" in typo_output
+    assert "react-vite" in typo_output

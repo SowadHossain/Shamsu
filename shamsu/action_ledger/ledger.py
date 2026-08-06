@@ -1397,6 +1397,54 @@ class ActionLedger:
         safe = redact_value(record) if self.config.get("redact_secrets", True) else record
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(safe, ensure_ascii=True, default=str) + "\n")
+        self._mirror_session_development_log(path, safe)
+
+    def _mirror_session_development_log(self, source_path: Path, record: dict[str, Any]) -> None:
+        if not self.session_id or self.session_id.startswith("session_"):
+            return
+        log_dir = self.workspace / ".shamsu" / "logs" / self.session_id
+        try:
+            stream = source_path.relative_to(self.run_dir).as_posix()
+        except ValueError:
+            stream = source_path.name
+        entry = {
+            "timestamp": str(record.get("timestamp") or _now()),
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "run_id": self.run_id,
+            "kind": "run.evidence",
+            "stream": stream,
+            "record": record,
+        }
+        if self.full_artifacts:
+            artifact_text = self._inline_artifact_text(record)
+            if artifact_text:
+                entry["artifact_text"] = artifact_text
+        path = log_dir / "agent-development-log.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=True, default=str) + "\n")
+        except OSError:
+            pass
+
+    def _inline_artifact_text(self, record: dict[str, Any]) -> dict[str, str]:
+        texts: dict[str, str] = {}
+        for key, label in (
+            ("prompt_path", "prompt"),
+            ("response_path", "response"),
+            ("cot_path", "reasoning"),
+        ):
+            relative = str(record.get(key) or "")
+            if not relative:
+                continue
+            try:
+                path = (self.run_dir / relative).resolve()
+                path.relative_to(self.run_dir.resolve())
+                texts[label] = path.read_text(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                continue
+        return texts
 
     def _write_json(self, path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

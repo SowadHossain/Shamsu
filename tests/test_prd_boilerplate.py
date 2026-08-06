@@ -194,6 +194,11 @@ def test_react_vite_runtime_files_are_generated_deterministically():
     assert "http://backend:8000" in render_boilerplate("frontend/vite.config.ts", expected)
     assert "VITE_API_BASE_URL=/api" in render_boilerplate("frontend/.env.example", expected)
     assert "node:22-alpine" in render_boilerplate("frontend/Dockerfile", expected)
+    assert "createRoot" in render_boilerplate("frontend/src/main.tsx", expected)
+    assert "fetch(`${API_BASE_URL}/listings`)" in render_boilerplate(
+        "frontend/src/App.tsx", expected
+    )
+    assert ".app-shell" in render_boilerplate("frontend/src/styles.css", expected)
 
 
 def test_node_express_runtime_files_are_generated_deterministically():
@@ -238,10 +243,16 @@ def test_node_express_runtime_uses_postgres_when_compose_is_expected():
     package = render_boilerplate("backend/package.json", expected)
     env = render_boilerplate("backend/.env.example", expected)
     compose = render_boilerplate("docker-compose.yml", expected)
+    root_env = render_boilerplate(".env.example", expected)
 
     assert package is not None and '"pg"' in package
+    assert package is not None and "better-sqlite3" not in package
     assert env is not None and "postgres://openbazaar" in env
     assert compose is not None and "DATABASE_URL: postgres://openbazaar" in compose
+    assert compose is not None and "NODE_ENV: development" in compose
+    assert compose is not None and "DJANGO_" not in compose
+    assert root_env is not None and "NODE_ENV=development" in root_env
+    assert root_env is not None and "DJANGO_" not in root_env
 
 
 def test_react_index_html_matches_jsx_entrypoint_when_that_is_expected():

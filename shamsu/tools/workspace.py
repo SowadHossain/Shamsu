@@ -7,31 +7,67 @@ from pathlib import Path
 
 from shamsu.indexer.policy import (
     DEFAULT_EXCLUDED_DIRS,
+    SOURCE_SUFFIXES,
     is_workspace_path,
     walk_workspace_paths,
 )
 from shamsu.safety.sandbox import Sandbox, SecurityError
 
 IGNORED_DIRS = DEFAULT_EXCLUDED_DIRS
-TEXT_EXTENSIONS = {
+TEXT_EXTENSIONS = SOURCE_SUFFIXES | {
     ".cfg",
+    ".conf",
     ".css",
     ".env",
+    ".gql",
+    ".graphql",
     ".html",
     ".ini",
+    ".cjs",
     ".js",
+    ".jsx",
     ".json",
+    ".jsonc",
+    ".less",
+    ".lock",
     ".md",
+    ".mjs",
+    ".prisma",
+    ".properties",
+    ".proto",
     ".py",
     ".rst",
+    ".sass",
+    ".scss",
     ".sh",
+    ".svg",
     ".toml",
     ".txt",
     ".ts",
     ".tsx",
+    ".xml",
+    ".vue",
     ".yaml",
     ".yml",
 }
+TEXT_FILENAMES = {
+    ".babelrc",
+    ".dockerignore",
+    ".editorconfig",
+    ".env",
+    ".envrc",
+    ".eslintrc",
+    ".gitattributes",
+    ".gitignore",
+    ".npmrc",
+    ".nvmrc",
+    ".prettierrc",
+    "Dockerfile",
+    "LICENSE",
+    "Makefile",
+    "Procfile",
+}
+TEXT_FILENAME_PREFIXES = ("Dockerfile.", "Makefile.", ".env.")
 MENTION_RE = re.compile(
     r"(?<!\S)@(?:(?P<double>\"[^\"]+\")|(?P<single>'[^']+')|(?P<path>[\w./\\-]+))"
 )
@@ -54,6 +90,16 @@ def _truncate(text: str, max_chars: int) -> str:
     if len(text) > max_chars:
         return f"{text[:max_chars]}\n... [truncated {len(text) - max_chars} chars]"
     return text
+
+
+def is_readable_text_file(path: Path) -> bool:
+    """Whether SHAMSU should treat a workspace file as UTF-8 text."""
+    name = path.name
+    return (
+        path.suffix.lower() in TEXT_EXTENSIONS
+        or name in TEXT_FILENAMES
+        or any(name.startswith(prefix) for prefix in TEXT_FILENAME_PREFIXES)
+    )
 
 
 @dataclass(frozen=True)
@@ -120,7 +166,7 @@ class WorkspaceTool:
             # 2026-08-02 the plan route asked the user what `canvas lite.pdf`
             # was rather than reading the document sitting in the workspace.
             return _truncate(extract_document_text(target), max_chars)
-        if target.suffix.lower() not in TEXT_EXTENSIONS and target.name not in {"Dockerfile", "Makefile"}:
+        if not is_readable_text_file(target):
             raise ValueError(f"Not a supported text file: {path_text}")
         text = target.read_text(encoding="utf-8", errors="replace")
         if len(text) > max_chars:

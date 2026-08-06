@@ -11,6 +11,7 @@ from typing import Any
 
 from shamsu.prd.contract import PRDContract
 from shamsu.registry.blueprints import (
+    blueprint_by_id,
     resolve_blueprints,
     runtime_file_paths_for_contract,
     runtime_plan_for_contract,
@@ -544,7 +545,7 @@ def _active_skills_for_milestone(milestone_id: str, contract: PRDContract) -> li
         skills.append("prd-planner")
     if milestone_id == "M-002" and _has_ui_work(contract, tokens):
         skills.append("ui-designer")
-    if {"react", "vite", "typescript", "tsx", "jsx"} & tokens:
+    if {"react", "vite", "typescript", "tsx", "jsx"} & tokens or _requires_browser_frontend_shell(contract):
         if milestone_id in {"M-002", "M-004"}:
             skills.append("react-vite")
     if "sqlite" in tokens:
@@ -645,7 +646,9 @@ def _architecture_components(contract: PRDContract) -> list[dict[str, Any]]:
     frontend_blueprint = selected.get("frontend")
     backend_blueprint = selected.get("backend")
     database_blueprint = selected.get("database")
-    if frontend_blueprint or any(token in stack for token in ("react", "vite", "vue", "svelte", "frontend")):
+    if frontend_blueprint or _requires_browser_frontend_shell(contract) or any(
+        token in stack for token in ("react", "vite", "vue", "svelte", "frontend")
+    ):
         components.append(
             {
                 "id": "frontend",
@@ -721,6 +724,13 @@ def _architecture_expected_files_for_milestone(
     selected = resolve_blueprints(contract).selected
     backend_blueprint = selected.get("backend")
     frontend_blueprint = selected.get("frontend")
+    if frontend_blueprint is None and _requires_browser_frontend_shell(contract):
+        # This is deliberately narrower than "any web app". A generic
+        # full-stack PRD with no frontend technology named should stay stack
+        # neutral, but a web-only/responsive/browser marketplace has explicitly
+        # asked for a browser surface. Give that slice a concrete shell so the
+        # Docker runtime is not backend-only.
+        frontend_blueprint = blueprint_by_id("react-vite")
     number = int(milestone_id.removeprefix("M-") or 0)
     foundation = number == 1 or 100 <= number < 200
     product = number == 2 or 200 <= number < 300
@@ -794,7 +804,7 @@ def _architecture_expected_files_for_milestone(
         frontend_root
         and frontend_blueprint is not None
         and frontend_blueprint.id == "react-vite"
-        and (product or release)
+        and (foundation or product or release)
     ):
         typed = "typescript" in stack or "tsx" in stack
         extension = "tsx" if typed else "jsx"
@@ -803,6 +813,9 @@ def _architecture_expected_files_for_milestone(
             for path in (
                 "package.json",
                 "index.html",
+                "vite.config.ts",
+                ".env.example",
+                "Dockerfile",
                 f"src/main.{extension}",
                 f"src/App.{extension}",
                 "src/styles.css",
@@ -822,6 +835,30 @@ def _milestone_expected_files(
         for path in record.implementing_files
     ]
     return sorted(dict.fromkeys(files))
+
+
+def _requires_browser_frontend_shell(contract: PRDContract) -> bool:
+    text = " ".join(
+        [
+            contract.title,
+            contract.product_summary,
+            contract.stack_hint,
+            *contract.required_stack,
+            *contract.architecture,
+            *contract.features,
+            *contract.screens,
+            *contract.nonfunctional_requirements,
+        ]
+    ).lower()
+    return bool(
+        "web-only" in text
+        or "web only" in text
+        or "frontend" in text
+        or "front-end" in text
+        or "browser ui" in text
+        or "responsive user interface" in text
+        or "responsive design" in text
+    )
 
 
 def _is_react_stack(contract: PRDContract) -> bool:

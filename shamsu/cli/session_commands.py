@@ -154,6 +154,7 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
     runs_root = store.runs_dir(workspace)
     run_example = runs_root / "<run-id>"
     session_example = root / "sessions" / "<session-id>"
+    log_example = root / "logs" / "<session-id>"
     level = load_config(workspace).get("log_level", DEFAULT_LOG_LEVEL)
 
     if subcommand.startswith("mode"):
@@ -180,6 +181,9 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
         f"  this request             {run_example / 'report.md'}",
         f"  whole conversation       {session_example / 'report.md'}",
         "",
+        "[bold]One-file debug log[/bold]",
+        f"  prompts + agent events   {log_example / 'agent-development-log.jsonl'}",
+        "",
         "[bold]Internal evidence[/bold]",
         f"  {run_example / '.evidence'}",
         "",
@@ -205,6 +209,7 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
         for label, path in (
             ("runs", runs_root),
             ("sessions", root / "sessions"),
+            ("one-file log", log_example / "agent-development-log.jsonl"),
             ("audit", root / "audit"),
             ("ledger config", config_path(workspace)),
             ("layout notes", root / "README.md"),

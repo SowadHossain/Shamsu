@@ -50,9 +50,19 @@ PRD_CASES: list[tuple[str, str]] = [
     ("what is the prd about", "prd_summary"),
     ("summarize the prd", "prd_summary"),
     ("read the prd", "prd_summary"),
+    ("find the login requirements from the prd", "prd_summary"),
+    ("find the schema from the prd", "prd_summary"),
+    ("what database schema is in the prd", "prd_summary"),
+    ("use the prd to tell me the login requirements", "prd_summary"),
+    ("look in the prd and tell me the tech stack", "prd_summary"),
+    ("from the prd what are the user roles", "prd_summary"),
+    ("find the schema from the prd and create the database model", "prd.build"),
+    ("use the prd to configure the postgres schema", "prd.build"),
+    ("review the prd and make a development plan", "plan_prd"),
     # Narrow work must not trigger a full autonomous product build.
-    ("build the navbar", "qa"),
-    ("fix the build", "qa"),
+    ("build the navbar", "agent-chat"),
+    ("fix the build", "agent-chat"),
+    ("find App.jsx", "qa"),
 ]
 
 

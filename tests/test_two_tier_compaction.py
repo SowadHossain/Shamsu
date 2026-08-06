@@ -10,8 +10,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.agents.chat_state import ChatMessage
+from shamsu.context.budget import RESERVE_OUTPUT_TOKENS, SAFETY_MARGIN_TOKENS, count_tokens
 from shamsu.tools.agent_tools import AgentToolRegistry
 
 
@@ -139,3 +142,58 @@ def test_harness_status_user_messages_are_not_recorded_as_requests(tmp_path: Pat
 
 def test_nothing_to_report_yields_nothing(tmp_path: Path):
     assert _loop(tmp_path)._structured_compact("", []) == ""
+
+
+@pytest.mark.asyncio
+async def test_model_compaction_can_be_disabled_for_prd_style_runs(tmp_path: Path):
+    loop = AgentChatLoop(
+        tmp_path,
+        client=SilentClient(),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _request: True),
+        model_name="qwen2.5-coder:7b-instruct",
+        use_model_compaction=False,
+    )
+    loop.state.append_user("Build the marketplace from the PRD.")
+    loop.state.append_assistant(
+        "I considered several architecture options and chose a Dockerized "
+        "Postgres, backend, and frontend stack because the PRD needs a browser "
+        "marketplace experience. " * 20
+    )
+    loop.state.append_user("Continue with the approved slice.")
+
+    async def fail_summary(*_args, **_kwargs):
+        raise AssertionError("model summary should not be called")
+
+    loop._summarize_evicted = fail_summary  # type: ignore[method-assign]
+
+    messages = await loop._messages_within_budget(num_ctx=1)
+
+    summary = "\n".join(str(message.get("content", "")) for message in messages)
+    assert "Continue with the approved slice" in summary
+    assert "model summary was disabled" in loop.state.rolling_summary
+    assert loop._last_context_evicted is True
+
+
+@pytest.mark.asyncio
+async def test_chat_context_hard_trims_oversized_current_prompt(tmp_path: Path):
+    loop = AgentChatLoop(
+        tmp_path,
+        client=SilentClient(),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _request: True),
+        model_name="qwen2.5-coder:7b-instruct",
+    )
+    loop.state.append_user(
+        "Remove the login section from frontend/src/App.jsx.\n\n"
+        + ("large stale context block " * 12000)
+    )
+
+    num_ctx = 8192
+    messages = await loop._messages_within_budget(num_ctx=num_ctx)
+    text = "\n".join(str(message.get("content", "")) for message in messages)
+
+    assert "Remove the login section" in text
+    assert "context hard-trimmed" in text
+    assert count_tokens(text) <= int(
+        (num_ctx - RESERVE_OUTPUT_TOKENS - SAFETY_MARGIN_TOKENS) * 0.70
+    ) + 256
+    assert loop._last_context_evicted is True

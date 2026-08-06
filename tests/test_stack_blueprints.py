@@ -73,6 +73,25 @@ def test_node_react_postgres_prd_selects_a_backend_service():
     assert resolution.selected["database"].id == "postgres"
 
 
+def test_web_only_frontend_layer_uses_suggested_blueprint_without_mutating_stack():
+    contract = PRDContract(
+        title="OpenBazaar Web-Only Marketplace",
+        stack_hint="node",
+        required_stack=["node", "postgres"],
+        architecture=["responsive user interface"],
+        entities=[{"name": "Listing"}],
+        persistence_requirements=["Listings are stored in PostgreSQL."],
+    )
+
+    resolution = resolve_blueprints(contract)
+
+    assert resolution.selected["backend"].id == "node-express"
+    assert resolution.selected["frontend"].id == "react-vite"
+    assert resolution.selected["database"].id == "postgres"
+    assert contract.required_stack == ["node", "postgres"]
+    assert any("Frontend layer is required" in item for item in resolution.assumptions)
+
+
 def test_selected_blueprint_paths_match_the_compiled_expected_file_path():
     contract = PRDContract(title="Course Desk", stack_hint="django", required_stack=["django"])
     django = resolve_blueprints(contract).selected["backend"]

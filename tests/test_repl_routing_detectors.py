@@ -371,6 +371,8 @@ def test_prd_path_extraction_and_dependent_detectors():
     # prd plan: phrase AND a PRD path required.
     assert _looks_like_prd_plan_request("create a project plan from spec.md") is True
     assert _looks_like_prd_plan_request("make a project plan") is False   # no path
+    assert _looks_like_prd_plan_request("find the schema from the prd") is False
+    assert _looks_like_prd_plan_request("what database schema is in the prd") is False
 
     # django generation: phrase AND a PRD path required.
     assert _looks_like_django_generation_request("generate django from spec.md") is True
@@ -490,6 +492,25 @@ def test_prd_summary_still_wins_over_build(tmp_path: Path):
     """Reading the PRD is not building it - summary is checked first."""
     workspace = _workspace(tmp_path, "prd.md")
     assert _classify_route_label("what is the prd about", workspace) == "prd_summary"
+    assert _classify_route_label("find the schema from the prd", workspace) == "prd_summary"
+    assert _classify_route_label("what database schema is in the prd", workspace) == "prd_summary"
+
+
+def test_prd_schema_creation_routes_to_build_not_summary(tmp_path: Path):
+    workspace = _workspace(tmp_path, "prd.md")
+
+    assert (
+        _classify_route_label(
+            "find the schema from the prd and create the database model", workspace
+        )
+        == "prd.build"
+    )
+    assert (
+        _classify_route_label(
+            "use the prd to configure the postgres schema", workspace
+        )
+        == "prd.build"
+    )
 
 
 @pytest.mark.parametrize(

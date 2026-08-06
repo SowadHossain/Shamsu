@@ -40,6 +40,31 @@ def test_read_file_exact_path_works(tmp_path: Path):
     assert result.data["resolved_filepath"] == "app.py"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".env.example",
+        ".npmrc",
+        "Dockerfile.dev",
+        "frontend/src/styles.scss",
+        "frontend/src/theme.less",
+        "backend/schema.prisma",
+        "backend/schema.graphql",
+        "backend/src/schema.sql",
+        "assets/logo.svg",
+        "config/app.properties",
+    ],
+)
+def test_read_file_accepts_common_project_text_files(tmp_path: Path, path: str):
+    _write(tmp_path, path, "VALUE=true\n")
+    registry = _registry(tmp_path)
+
+    result = registry.read_file(path)
+
+    assert result.ok is True
+    assert result.data["content"] == "VALUE=true\n"
+
+
 def test_read_file_missing_path_returns_candidates(tmp_path: Path):
     _write(tmp_path, "a/notes.md", "one\n")
     _write(tmp_path, "b/notes.md", "two\n")
@@ -349,6 +374,34 @@ def test_edit_file_missing_file_returns_candidates(tmp_path: Path):
     assert not (tmp_path / "src" / "App.tsx").exists()
 
 
+def test_scoped_basename_edit_allows_unique_resolved_candidate(tmp_path: Path):
+    _write(tmp_path, "project/frontend/src/App.jsx", "old\n")
+    registry = _registry(tmp_path)
+    registry.set_allowed_write_paths(["App.jsx"])
+
+    result = registry.edit_file("project/frontend/src/App.jsx", "old", "new")
+
+    assert result.ok is True
+    assert (tmp_path / "project" / "frontend" / "src" / "App.jsx").read_text(
+        encoding="utf-8"
+    ) == "new\n"
+
+
+def test_scoped_basename_edit_refuses_ambiguous_resolved_candidate(tmp_path: Path):
+    _write(tmp_path, "project/frontend/src/App.jsx", "old\n")
+    _write(tmp_path, "project/admin/src/App.jsx", "old\n")
+    registry = _registry(tmp_path)
+    registry.set_allowed_write_paths(["App.jsx"])
+
+    result = registry.edit_file("project/frontend/src/App.jsx", "old", "new")
+
+    assert result.ok is False
+    assert "allowed changes only to app.jsx" in result.message
+    assert (tmp_path / "project" / "frontend" / "src" / "App.jsx").read_text(
+        encoding="utf-8"
+    ) == "old\n"
+
+
 def test_edit_file_uses_transaction_backup(tmp_path: Path):
     original = "print('before')\n"
     _write(tmp_path, "mod.py", original)
@@ -391,6 +444,19 @@ def test_write_file_reports_created_and_overwrote(tmp_path: Path):
     assert created.data["overwrote"] is False
     assert overwritten.data["created"] is False
     assert overwritten.data["overwrote"] is True
+
+
+def test_write_file_schema_exposes_overwrite_parameter(tmp_path: Path):
+    registry = _registry(tmp_path)
+
+    schema = next(
+        item for item in registry.tool_schemas()
+        if (item.get("function") or {}).get("name") == "write_file"
+    )
+
+    properties = schema["function"]["parameters"]["properties"]
+    assert "overwrite" in properties
+    assert properties["overwrite"]["default"] == "true"
 
 
 # ---------------------------------------------------------------------------

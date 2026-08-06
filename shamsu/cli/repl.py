@@ -343,6 +343,7 @@ SYSTEM_COMMANDS = (
     "/skills list",
     "/skills show ",
     "/skills explain ",
+    "/skills suggest ",
     "/mcp status",
     "/mcp servers",
     "/mcp tools ",
@@ -547,6 +548,7 @@ def _print_help(console: Console) -> None:
                     "  /skills list              Show bundled, user, and workspace skills",
                     "  /skills show <name>       Show one skill's instructions and policy",
                     "  /skills explain <prompt>  Preview deterministic skill selection",
+                    "  /skills suggest <prompt>  Alias for explain; shows skill names to use",
                     "  /mcp status              Connect to configured external MCP servers",
                     "  /mcp tools [server]      List discovered external tools",
                     "  /mcp config              Show MCP config locations and safe settings",
@@ -4238,6 +4240,14 @@ async def _handle_request(
         effective_input = _expand_followup_prompt(effective_input, previous_user_prompt)
     effective_input = recover_original_prompt(effective_input)
     agent_context = agent_result.context
+    if not agent_result.handled and _looks_like_prd_plan_request(effective_input):
+        await _handle_prd_development_plan_request(
+            effective_input,
+            workspace,
+            console,
+            session_logger=session_logger,
+        )
+        return
     operation_plan = _operation_plan(effective_input, workspace)
     # Record the routing decision in session state so `/sessions trace` and a
     # resumed session can see how the last prompt was dispatched.
@@ -4444,7 +4454,7 @@ async def _handle_request(
         harness_input, direct_plan = _direct_file_write_handoff(
             effective_input,
             workspace,
-            agent_context,
+            "",
         )
         _log_event(
             session_logger,
@@ -4472,6 +4482,7 @@ async def _handle_request(
             user_request=effective_input,
             use_long_term_memory=False,
             use_planner=False,
+            hydrate_history=False,
             required_tool_prefix=required_tool_prefix,
             allowed_write_paths=tuple(direct_plan.target_files) or None,
             force_long_running=bool(
@@ -5155,6 +5166,25 @@ def _looks_like_prd_plan_request(user_input: str) -> bool:
     return _looks_like_plan_intent(user_input) or any(
         phrase in text for phrase in ("plan project", "project plan", "plan-prd")
     )
+
+
+_PRD_SCHEMA_BUILD_RE = re.compile(
+    r"\b(?:build|implement|create|write|generate|configure|setup|set\s+up|make)\b",
+    re.IGNORECASE,
+)
+_PRD_SCHEMA_TARGET_RE = re.compile(
+    r"\b(?:schema|ddl|database|db|postgres|postgresql|model|models|migration|migrations)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_prd_schema_build_request(user_input: str) -> bool:
+    """Use the PRD as source material to implement database/schema files."""
+    text = user_input.lower()
+    has_prd = bool(_extract_prd_path_from_prompt(user_input)) or "prd" in text
+    if not has_prd or _looks_like_plan_intent(user_input):
+        return False
+    return bool(_PRD_SCHEMA_BUILD_RE.search(user_input) and _PRD_SCHEMA_TARGET_RE.search(text))
 
 
 def _looks_like_workspace_prd_request(user_input: str) -> bool:
@@ -6012,12 +6042,22 @@ _PRD_SUMMARY_TRIGGERS = (
     "describe the project",
     "describe the prd",
     "what is the app about",
+    "from the prd",
+    "in the prd",
+    "inside the prd",
+    "according to the prd",
+    "according to prd",
+    "use the prd",
+    "based on the prd",
+    "look in the prd",
 )
 
 
 def _looks_like_prd_summary_request(user_input: str, workspace: Path) -> bool:
     text = user_input.lower()
     if _looks_like_prd_plan_request(user_input):
+        return False
+    if _looks_like_prd_schema_build_request(user_input):
         return False
     explicit_prd = _extract_prd_path_from_prompt(user_input)
     explicit_summary = (
@@ -6028,7 +6068,32 @@ def _looks_like_prd_summary_request(user_input: str, workspace: Path) -> bool:
             for verb in ("summarize", "summarise", "explain", "describe", "review", "read")
         )
     )
-    if not explicit_summary and not any(trigger in text for trigger in _PRD_SUMMARY_TRIGGERS):
+    prd_reference_question = (
+        "prd" in text
+        and any(
+            phrase in text
+            for phrase in (
+                "find",
+                "look",
+                "tell me",
+                "what",
+                "which",
+                "where",
+                "who",
+                "how",
+                "requirements",
+                "features",
+                "roles",
+                "tech stack",
+                "constraints",
+            )
+        )
+    )
+    if (
+        not explicit_summary
+        and not prd_reference_question
+        and not any(trigger in text for trigger in _PRD_SUMMARY_TRIGGERS)
+    ):
         return False
     # A build verb ("build/implement the prd") is a build request, not a read.
     if any(verb in text for verb in ("build ", "implement ", "generate ", "scaffold ")):
@@ -6096,9 +6161,11 @@ async def _handle_prd_summary_request(
         step_id=1,
         specialist="qa",
         user_request=(
-            f"Summarize what this project/PRD is about. File: {relative_path}. "
-            "Give: (1) one-line purpose, (2) the main features/requirements, "
-            "(3) any stated tech stack or constraints. Be concise and only use the PRD text below."
+            f"Answer this request using only the PRD text. File: {relative_path}.\n"
+            f"User request: {user_input}\n\n"
+            "If the request asks for specific information, answer that directly. "
+            "If it asks generally, give: (1) one-line purpose, (2) main features/requirements, "
+            "(3) stated tech stack or constraints. Be concise and do not invent beyond the PRD."
         ),
         prd_context=f"PRD content ({relative_path}):\n\n{prd_text[:12000]}",
     )
@@ -6421,6 +6488,11 @@ _ACTION_VERBS = {
     "generate",
     "install",
     "setup",
+    "scaffold",
+    "bootstrap",
+    "initiate",
+    "initialize",
+    "initialise",
     "configure",
     "continue",
     "finish",
@@ -6721,6 +6793,11 @@ _FILE_HINT_WORDS = {
     "module",
     "readme",
     "gitignore",
+    "dockerfile",
+    "makefile",
+    "procfile",
+    "env",
+    "npmrc",
     "config",
     "page",
     "class",
@@ -6731,6 +6808,21 @@ _FILE_HINT_WORDS = {
 _FILELIKE_RE = re.compile(
     r"(?:^|\s|['\"`@])(?:[A-Za-z0-9_. -]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?:\s|$|['\"`,.;:])"
 )
+_SPECIAL_FILELIKE_RE = re.compile(
+    r"(?:^|\s|['\"`@])(?:[A-Za-z0-9_. -]+[/\\])*(?:"
+    r"Dockerfile(?:\.[A-Za-z0-9_.-]+)?|"
+    r"Makefile(?:\.[A-Za-z0-9_.-]+)?|"
+    r"Procfile|"
+    r"\.env(?:\.[A-Za-z0-9_.-]+)?|"
+    r"\.dockerignore|\.gitignore|\.gitattributes|\.npmrc|\.nvmrc|"
+    r"\.prettierrc|\.eslintrc|\.babelrc|\.editorconfig"
+    r")(?:\s|$|['\"`,.;:])",
+    re.IGNORECASE,
+)
+
+
+def _has_filelike_token(user_input: str) -> bool:
+    return bool(_FILELIKE_RE.search(user_input) or _SPECIAL_FILELIKE_RE.search(user_input))
 
 
 def _looks_like_file_write_request(user_input: str) -> bool:
@@ -6753,7 +6845,7 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     words = set(re.sub(r"[^\w\s]", " ", raw).split())
     if not (_FILE_WRITE_VERBS & words):
         return False
-    if _FILELIKE_RE.search(user_input):
+    if _has_filelike_token(user_input):
         return True
     return bool(words & _FILE_HINT_WORDS)
 
@@ -6765,7 +6857,7 @@ def _looks_like_file_read_request(user_input: str) -> bool:
     the program reads the file before the model gets the turn.
     """
     raw = user_input.strip().lower()
-    if not raw or not _FILELIKE_RE.search(user_input):
+    if not raw or not _has_filelike_token(user_input):
         return False
     words = set(re.sub(r"[^\w\s]", " ", raw).split())
     read_verbs = {
@@ -6805,7 +6897,7 @@ def _looks_like_docs_ingest_request(user_input: str) -> bool:
     )
     if not ingest_intent:
         return False
-    source_signal = bool(_FILELIKE_RE.search(user_input)) or "http://" in text or "https://" in text
+    source_signal = bool(_has_filelike_token(user_input)) or "http://" in text or "https://" in text
     doc_signal = any(
         word in text for word in ("doc", "documentation", "reference", "manual", "guide", "library")
     )
@@ -7512,6 +7604,10 @@ def _looks_like_prd_build_request(user_input: str, workspace: Path) -> bool:
     # .gitignore). A plan intent is never a build.
     if _looks_like_plan_intent(user_input):
         return False
+    if _looks_like_prd_schema_build_request(user_input):
+        return True
+    if _looks_like_prd_milestone_execution_request(user_input):
+        return True
     if (
         _looks_like_vague_action_request(user_input)
         and _resolve_build_prd(user_input, workspace) is not None
@@ -7746,7 +7842,7 @@ async def _prepare_prd_development_plan(
                 temperature=0.0,
                 num_predict=_env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 1400, 512),
             ),
-            timeout=float(os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "75")),
+            timeout=float(os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "30")),
         )
         candidate = _loads_freeform_json(raw or "")
         plan = _validate_prd_development_plan(candidate)
@@ -7843,6 +7939,8 @@ def _print_prd_development_plan(
     console: Console,
     *,
     build_after: bool,
+    execution_scope: str = "all",
+    skill_names: list[str] | None = None,
 ) -> None:
     section_names = list(parsed.sections.keys())
     lines = [
@@ -7858,6 +7956,14 @@ def _print_prd_development_plan(
     stack = list(development_plan.get("stack") or [])
     if stack:
         lines.extend(["", "Planned stack: " + ", ".join(stack[:10])])
+    if skill_names:
+        lines.extend(
+            [
+                "",
+                "Suggested SHAMSU skills: " + ", ".join(skill_names[:10]),
+                "Use `/skills show <name>` to inspect one, or `/skills explain <prompt>` to preview selection.",
+            ]
+        )
     plan_items = list(development_plan.get("milestones") or [])
     if plan_items:
         lines.append("")
@@ -7884,10 +7990,17 @@ def _print_prd_development_plan(
         lines.extend(f"  - {item}" for item in risks[:6])
     lines.append("")
     if build_after:
-        lines.append("I'll build this now, autonomously (long-running mode), writing files in")
-        lines.append("your workspace until it's implemented. Type `exit` to stop.")
+        if execution_scope == "slice":
+            lines.append("I'll execute one PRD slice now, writing only the files needed for")
+            lines.append("that milestone. Reply `continue` when you want the next slice.")
+        else:
+            lines.append("I'll build this now, autonomously (long-running mode), writing files in")
+            lines.append("your workspace until it's implemented. Type `exit` to stop.")
     else:
+        next_id = _milestone_id_from_line(milestones[0]) if milestones else "the first slice"
         lines.append("Plan only. No project files were created or modified.")
+        lines.append(f"Reply `start {next_id}` or `continue` to approve and execute one slice.")
+        lines.append("Reply `build all autonomously` only when you want the full plan to run.")
     console.print(Panel("\n".join(lines), title="PRD Development Plan"))
 
 
@@ -7896,6 +8009,9 @@ def _print_prd_build_plan(
     relative_path: Path,
     console: Console,
     development_plan: dict[str, Any] | None = None,
+    *,
+    execution_scope: str = "all",
+    skill_names: list[str] | None = None,
 ) -> None:
     if development_plan is not None:
         milestones, _ = _prd_milestones_for_execution(parsed)
@@ -7906,6 +8022,8 @@ def _print_prd_build_plan(
             development_plan,
             console,
             build_after=True,
+            execution_scope=execution_scope,
+            skill_names=skill_names,
         )
         return
     section_names = list(parsed.sections.keys())
@@ -7930,6 +8048,225 @@ def _print_prd_build_plan(
     lines.append("I'll build this now, autonomously (long-running mode), writing files in")
     lines.append("your workspace until it's implemented. Type `exit` to stop.")
     console.print(Panel("\n".join(lines), title="PRD Build Plan"))
+
+
+_PRD_AUTONOMOUS_PHRASES = (
+    "build all",
+    "build everything",
+    "execute all",
+    "run all",
+    "implement all",
+    "full autonomous",
+    "autonomous build",
+    "autonomously",
+    "without asking",
+)
+
+_PRD_SLICE_COMMAND_RE = re.compile(
+    r"\b(?:start|begin|execute|run|implement(?:ed|ing)?|proceed|porceed|continue|do|"
+    r"ensure|configure|complete|finish|scaffold|bootstrap|initiate|initiali[sz]e)\b",
+    re.IGNORECASE,
+)
+
+_PRD_SLICE_SCAFFOLD_HINTS = (
+    "boilerplate",
+    "boilerplates",
+    "scaffold",
+    "folder structure",
+    "project structure",
+    "backend",
+    "frontend",
+    "postgres",
+    "docker",
+)
+
+
+def _prd_autonomous_execution_requested(user_input: str) -> bool:
+    lowered = user_input.lower().strip()
+    if _explicitly_read_only(user_input):
+        return False
+    return any(phrase in lowered for phrase in _PRD_AUTONOMOUS_PHRASES)
+
+
+def _looks_like_prd_slice_execution_reply(user_input: str) -> bool:
+    text = user_input.lower().strip()
+    if not text:
+        return False
+    if _prd_autonomous_execution_requested(text):
+        return True
+    if _looks_like_affirmative_continue(text):
+        return True
+    if re.fullmatch(r"yes\s+(?:please\s+)?porceed", text):
+        return True
+    if is_affirmative(text):
+        return True
+    if text in {
+        "continue",
+        "proceed",
+        "start",
+        "start it",
+        "do it",
+        "run it",
+        "execute it",
+        "implement it",
+    }:
+        return True
+    if not _PRD_SLICE_COMMAND_RE.search(text):
+        return False
+    if any(hint in text for hint in _PRD_SLICE_SCAFFOLD_HINTS):
+        return True
+    return any(
+        token in text
+        for token in (
+            "plan",
+            "milestone",
+            "slice",
+            "phase",
+            "step",
+            "first",
+            "next",
+            "m-",
+            "m ",
+        )
+    )
+
+
+_PRD_MILESTONE_EXECUTION_RE = re.compile(
+    r"\b(?:m-\d{3}|milestone\s+\d{1,3})\b",
+    re.IGNORECASE,
+)
+_PRD_MILESTONE_EXECUTION_ACTION_RE = re.compile(
+    r"\b(?:start|begin|execute|run|implement(?:ed|ing)?|make\s+sure|ensure|"
+    r"configure|complete|finish|build|do|proceed)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_prd_milestone_execution_request(user_input: str) -> bool:
+    """A request to implement a named PRD milestone, not to make another plan."""
+    text = user_input.lower()
+    if _looks_like_plan_intent(user_input):
+        return False
+    if "prd" not in text and "plan" not in text:
+        return False
+    return bool(
+        _PRD_MILESTONE_EXECUTION_RE.search(user_input)
+        and _PRD_MILESTONE_EXECUTION_ACTION_RE.search(user_input)
+    )
+
+
+def _store_pending_prd_plan_execution(
+    session_logger: SessionLogger | None,
+    *,
+    user_input: str,
+    relative_path: Path,
+    project_root: str,
+    milestones: list[str],
+    development_plan: dict[str, Any],
+) -> None:
+    if session_logger is None:
+        return
+    next_id = _milestone_id_from_line(milestones[0]) if milestones else ""
+    try:
+        session_logger.set_pending_action(
+            {
+                "type": "prd_plan",
+                "awaiting": "prd_plan_selection",
+                "prd_path": relative_path.as_posix(),
+                "project_root": project_root,
+                "next_milestone_id": next_id,
+                "milestone_count": len(milestones),
+                "plan_source": str(development_plan.get("source") or ""),
+                "created_from_prompt": user_input,
+            }
+        )
+    except Exception as exc:
+        swallowed.record("repl.prd_pending_plan_execution", exc)
+
+
+def _prd_skill_names_for_project(project: Any) -> list[str]:
+    contract_obj = getattr(project, "prd_contract", None)
+    if contract_obj is None:
+        return []
+    try:
+        ledger = compile_requirement_ledger(contract_obj)
+    except Exception:
+        return []
+    names = [
+        str(skill)
+        for milestone in ledger.milestones
+        for skill in milestone.active_skills
+        if str(skill)
+    ]
+    return list(dict.fromkeys(names))
+
+
+def _pause_prd_build_after_slice(
+    session_logger: SessionLogger | None,
+    *,
+    user_input: str,
+    relative_path: Path,
+    project_root: str,
+    milestones: list[str],
+    current_index: int,
+    development_plan: dict[str, Any],
+    console: Console,
+    completed: bool = True,
+) -> bool:
+    remaining = milestones[current_index + 1 :]
+    if not remaining:
+        return False
+    next_id = _milestone_id_from_line(remaining[0])
+    _store_pending_prd_plan_execution(
+        session_logger,
+        user_input=user_input,
+        relative_path=relative_path,
+        project_root=project_root,
+        milestones=remaining,
+        development_plan=development_plan,
+    )
+    prefix = "Finished one PRD slice." if completed else "Paused after one PRD slice attempt."
+    message = (
+        f"{prefix} Next slice is {next_id}.\n\n"
+        f"Reply `continue` or `start {next_id}` to approve and run the next slice. "
+        "Reply `build all autonomously` to run the rest."
+    )
+    console.print(Panel(message, title="PRD Build Paused", border_style="cyan"))
+    _log_event(
+        session_logger,
+        "prd.build.slice_paused",
+        {"next_milestone_id": next_id, "remaining": len(remaining)},
+        "Paused PRD build after one requested slice",
+        workflow_id="prd-build",
+    )
+    return True
+
+
+async def _execute_pending_prd_plan(
+    pending_action: dict[str, Any],
+    reply: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    origin = str(pending_action.get("created_from_prompt") or "").strip()
+    prd_path = str(pending_action.get("prd_path") or "").strip()
+    if not origin:
+        origin = f"build the product from {prd_path}" if prd_path else "build the product from the PRD"
+    run_all = _prd_autonomous_execution_requested(reply)
+    if run_all:
+        console.print("[dim]Executing the full PRD plan because you asked for all milestones.[/dim]")
+    else:
+        next_id = str(pending_action.get("next_milestone_id") or "the next milestone").strip()
+        console.print(f"[dim]Executing one PRD slice: {next_id}.[/dim]")
+    await _handle_prd_build_request(
+        origin,
+        workspace,
+        console,
+        session_logger=session_logger,
+        execute_plan=True,
+        max_milestones=None if run_all else 1,
+    )
 
 
 async def _handle_prd_development_plan_request(
@@ -7988,10 +8325,20 @@ async def _handle_prd_development_plan_request(
         plan,
         console,
         build_after=False,
+        skill_names=_prd_skill_names_for_project(project),
+    )
+    project_root = _prd_target_directory(user_input, project)
+    _store_pending_prd_plan_execution(
+        session_logger,
+        user_input=user_input,
+        relative_path=relative_path,
+        project_root=project_root,
+        milestones=milestones,
+        development_plan=plan,
     )
     _log_assistant_message(
         session_logger,
-        "Prepared a PRD development plan without modifying project files.",
+        "Prepared a PRD development plan and paused for milestone selection.",
         workflow_id="plan-prd",
     )
 
@@ -8423,7 +8770,10 @@ async def _infer_prd_entities(parsed, console, session_logger) -> list:
         f"Asking the reasoning model to design the first {min(limit, len(names))}...[/dim]"
     )
     try:
-        entities = await entity_fields.infer_entity_fields(parsed, names)
+        entities = await asyncio.wait_for(
+            entity_fields.infer_entity_fields(parsed, names),
+            timeout=float(os.environ.get("SHAMSU_PRD_ENTITY_TIMEOUT_SECONDS", "20")),
+        )
     except Exception as exc:
         _log_event(
             session_logger,
@@ -8496,8 +8846,9 @@ async def _resolve_prd_headings(parsed, console, session_logger):
         f"reasoning model to place them...[/dim]"
     )
     try:
-        model_aliases = await prd_headings.resolve_headings_with_model(
-            parsed, resolution.unresolved
+        model_aliases = await asyncio.wait_for(
+            prd_headings.resolve_headings_with_model(parsed, resolution.unresolved),
+            timeout=float(os.environ.get("SHAMSU_PRD_HEADING_TIMEOUT_SECONDS", "20")),
         )
     except Exception as exc:  # never block a build on the optional pass
         _log_event(
@@ -8544,6 +8895,9 @@ async def _handle_prd_build_request(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None = None,
+    *,
+    execute_plan: bool = False,
+    max_milestones: int | None = None,
 ) -> None:
     prd_path = _resolve_build_prd(user_input, workspace)
     if prd_path is None:
@@ -8626,14 +8980,6 @@ async def _handle_prd_build_request(
     output_scope = contract.requested_paths(user_input)
     acceptance = _extract_prd_acceptance_commands(parsed.raw_text or "")
 
-    # `_ensure_git_repo` writes `.gitignore` directly (not through the tool
-    # registry), so it sidesteps the read-only / dry-run gate. A prompt that
-    # forbade changes ("make a plan, do not write any code") that mis-lands here
-    # would still mutate the workspace - the exact leak the dogfood contract
-    # flagged. Skip repo init when the request is read-only or a dry run.
-    if not output_scope and not _explicitly_read_only(user_input) and not dry_run.active():
-        _ensure_git_repo(workspace, console, session_logger)
-
     # A document that lists its data model as bare nouns parses to zero
     # entities, and zero entities leaves the planner with no model layer to
     # generate - a 45-entity specification degraded to a single index.html.
@@ -8673,7 +9019,59 @@ async def _handle_prd_build_request(
         console,
         session_logger,
     )
-    _print_prd_build_plan(parsed, relative_path, console, development_plan=development_plan)
+    milestone_execution_requested = _looks_like_prd_milestone_execution_request(user_input)
+    autonomous_requested = _prd_autonomous_execution_requested(user_input)
+    if milestone_execution_requested:
+        execute_plan = True
+        if max_milestones is None:
+            max_milestones = 1
+    if not execute_plan and not autonomous_requested:
+        _print_prd_development_plan(
+            parsed,
+            relative_path,
+            milestones,
+            development_plan,
+            console,
+            build_after=False,
+            skill_names=_prd_skill_names_for_project(project),
+        )
+        _store_pending_prd_plan_execution(
+            session_logger,
+            user_input=user_input,
+            relative_path=relative_path,
+            project_root=project_root,
+            milestones=milestones,
+            development_plan=development_plan,
+        )
+        _log_event(
+            session_logger,
+            "prd.build.awaiting_selection",
+            {
+                "path": str(prd_path),
+                "title": parsed.title,
+                "sections": list(parsed.sections),
+                "plan_source": development_plan.get("source"),
+                "project_root": project_root,
+                "milestones": len(milestones),
+            },
+            "Prepared PRD build plan and paused for user milestone selection",
+            workflow_id="prd-build",
+        )
+        _log_assistant_message(
+            session_logger,
+            "Prepared a PRD build plan and paused for milestone selection.",
+            workflow_id="prd-build",
+        )
+        return
+
+    _print_prd_build_plan(
+        parsed,
+        relative_path,
+        console,
+        development_plan=development_plan,
+        execution_scope="slice" if max_milestones == 1 else "all",
+        skill_names=_prd_skill_names_for_project(project),
+    )
     _log_event(
         session_logger,
         "prd.build.planned",
@@ -8687,11 +9085,11 @@ async def _handle_prd_build_request(
         workflow_id="prd-build",
     )
 
-    # The build request itself ("build the product from this prd") is the
-    # consent, and the plan above was shown for review - so start the build
-    # directly and let it write files without further prompts. This avoids the
-    # fragile mid-flow input() approval that could silently auto-deny on some
-    # interactive terminals.
+    # `_ensure_git_repo` writes `.gitignore` directly (not through the tool
+    # registry), so it runs only after execution is explicitly requested.
+    if not output_scope and not _explicitly_read_only(user_input) and not dry_run.active():
+        _ensure_git_repo(workspace, console, session_logger)
+
     console.print(
         "[green]Building now - I'll read the PRD and write files in your workspace. "
         "Type `exit` to stop.[/green]"
@@ -8849,6 +9247,7 @@ async def _handle_prd_build_request(
     # declare it as a dependency, never the whole build.
     failed_milestones: dict[str, str] = {}
     skipped_milestones: dict[str, str] = {}
+    attempted_milestones = 0
     for index in range(start_milestone_index, len(milestones)):
         milestone = milestones[index]
         step = task.steps[index]
@@ -9173,6 +9572,20 @@ async def _handle_prd_build_request(
                     f"[yellow]Milestone {milestone_id} failed; continuing with "
                     f"milestones that do not depend on it.[/yellow]"
                 )
+                attempted_milestones += 1
+                if max_milestones is not None and attempted_milestones >= max_milestones:
+                    if _pause_prd_build_after_slice(
+                        session_logger,
+                        user_input=user_input,
+                        relative_path=relative_path,
+                        project_root=project_root,
+                        milestones=milestones,
+                        current_index=index - 1,
+                        development_plan=development_plan,
+                        console=console,
+                        completed=False,
+                    ):
+                        return
                 continue
             step_done_message = (
                 "Milestone verified."
@@ -9188,6 +9601,19 @@ async def _handle_prd_build_request(
                 )
                 return
         save_task(task, workspace)
+        attempted_milestones += 1
+        if max_milestones is not None and attempted_milestones >= max_milestones:
+            if _pause_prd_build_after_slice(
+                session_logger,
+                user_input=user_input,
+                relative_path=relative_path,
+                project_root=project_root,
+                milestones=milestones,
+                current_index=index,
+                development_plan=development_plan,
+                console=console,
+            ):
+                return
     if failed_milestones or skipped_milestones:
         # Honest partial outcome: say which milestones landed and which did not,
         # instead of the old behaviour of aborting on the first failure. The
@@ -10436,7 +10862,13 @@ description instead of a tool call.
             allowed_write_paths=[target],
             allowed_tools=turn_tools,
             required_tool_prefix="write_file" if "edit_file" not in turn_tools else "",
-            long_running=True,
+            force_long_running=True,
+            auto_approve=True,
+            use_long_term_memory=False,
+            use_planner=False,
+            user_request=_prd_agent_safety_request(project_root),
+            hydrate_history=False,
+            verify_changes=False,
         )
         for path in getattr(result, "changed_files", ()) or ():
             if path not in changed:
@@ -11497,8 +11929,10 @@ def _prd_fallback_preflight(project: Any, project_root: str) -> dict[str, Any]:
         skills.append("react-vite")
     if getattr(contract_obj, "project_kind", "") in {"web_app", "game"}:
         skills.append("ui-designer")
-    if any(token in stack for token in ("sqlite", "database", "postgres")):
+    if "sqlite" in stack:
         skills.append("sqlite-persistence")
+    elif any(token in stack for token in ("postgres", "postgresql", "mysql", "mariadb", "mssql", "database")):
+        skills.append("sql-databases")
     skills.append("testing")
     return {
         "milestone_id": "M-FALLBACK",
@@ -11568,7 +12002,7 @@ def _milestone_id_from_line(line: str) -> str:
 
 
 def _prd_model_preflight_enabled() -> bool:
-    raw = os.environ.get("SHAMSU_PRD_MODEL_PREFLIGHT", "1").strip().lower()
+    raw = os.environ.get("SHAMSU_PRD_MODEL_PREFLIGHT", "0").strip().lower()
     return raw not in {"0", "false", "no", "off", "disabled"}
 
 
@@ -11635,7 +12069,7 @@ async def _prepare_prd_milestone_preflight(
                 temperature=0.0,
                 num_predict=_env_int_at_least("SHAMSU_PRD_PREFLIGHT_NUM_PREDICT", 768, 256),
             ),
-            timeout=float(os.environ.get("SHAMSU_PRD_PREFLIGHT_TIMEOUT_SECONDS", "45")),
+            timeout=float(os.environ.get("SHAMSU_PRD_PREFLIGHT_TIMEOUT_SECONDS", "20")),
         )
         candidate = _loads_freeform_json(raw or "")
         preflight, errors = validate_model_preflight(deterministic_preflight, candidate)
@@ -11671,6 +12105,7 @@ def _build_prd_model_preflight_prompt(preflight: dict[str, Any], workspace: Path
         "compiled_preflight": {
             "milestone_id": preflight.get("milestone_id"),
             "title": preflight.get("title"),
+            "stack_profile": preflight.get("stack_profile") or {},
             "requirement_ids": list(preflight.get("requirement_ids") or []),
             "active_skills_allowlist": list(preflight.get("active_skills") or []),
             "allowed_tools_allowlist": list(preflight.get("allowed_tools") or []),
@@ -11699,6 +12134,7 @@ def _build_prd_model_preflight_prompt(preflight: dict[str, Any], workspace: Path
             "Expected files must be safe relative file paths.",
             "Verifier is a short strategy label, not a shell command.",
             "implementation_steps must be concrete, ordered, and bounded to this milestone.",
+            "Keep the stack_profile fixed; do not introduce frameworks or commands outside its selected blueprints.",
         ],
     }
     return json.dumps(payload, indent=2, ensure_ascii=True)
@@ -11797,6 +12233,8 @@ def _looks_like_plan_request(user_input: str) -> bool:
     text = user_input.lower().strip()
     if any(text.startswith(prefix) for prefix in _PLAN_QUESTION_PREFIXES):
         return False
+    if re.match(r"^plan\s+(?:a|an|the|this|that|how|out)\b", text):
+        return True
     return any(phrase in text for phrase in _PLAN_REQUEST_PHRASES)
 
 
@@ -15145,6 +15583,7 @@ async def _run_agent_chat(
     required_tool_prefix: str = "",
     hydrate_history: bool = True,
     verify_changes: bool = True,
+    use_model_compaction: bool = True,
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -15174,6 +15613,8 @@ async def _run_agent_chat(
     )
     if allowed_tools is not None:
         tools.set_allowed_tools(allowed_tools)
+    if not hydrate_history and not use_long_term_memory and not use_planner:
+        use_model_compaction = False
     if required_tool_prefix:
         tools.require_tool_prefix(required_tool_prefix)
         user_input = (
@@ -15294,6 +15735,8 @@ async def _run_agent_chat(
         chat_kwargs["hydrate_history"] = hydrate_history
     if _call_accepts_keyword(AgentChatLoop, "verify_changes"):
         chat_kwargs["verify_changes"] = verify_changes
+    if _call_accepts_keyword(AgentChatLoop, "use_model_compaction"):
+        chat_kwargs["use_model_compaction"] = use_model_compaction
     if _call_accepts_keyword(AgentChatLoop, "original_user_request"):
         # A pending ask_user must resume from the clean user request, not an
         # internal wrapper (composite step / PRD repair contract).
@@ -16868,6 +17311,35 @@ def main(argv: list[str] | None = None) -> None:
         # this never bypasses safety.
         dispatch_input = user_input
         pending_action = session_logger.get_pending_action()
+        if pending_action.get("awaiting") == "prd_plan_selection":
+            if is_negative(user_input):
+                session_logger.clear_pending_action()
+                console.print("[yellow]Cancelled the pending PRD plan execution.[/yellow]")
+                continue
+            if _looks_like_prd_slice_execution_reply(user_input):
+                session_logger.clear_pending_action()
+                ledger = start_run(workspace, user_input, session_logger=session_logger)
+                set_current_run(ledger)
+                try:
+                    asyncio.run(
+                        _execute_pending_prd_plan(
+                            pending_action,
+                            user_input,
+                            workspace,
+                            console,
+                            session_logger,
+                        )
+                    )
+                except Exception as exc:
+                    ledger.fail(str(exc))
+                    clear_current_run()
+                    _report_request_error(exc, console, session_logger)
+                    continue
+                _finish_current_run(workspace, ledger)
+                clear_current_run()
+                continue
+            # The user may be asking a side question while a PRD plan is pending.
+            # Leave it armed unless they explicitly start, continue, run all, or cancel.
         if pending_action.get("awaiting") == "plan_approval":
             # A plan is awaiting the user's go-ahead: "proceed"/"follow the plan"
             # executes it step by step; "no" discards it (the file is kept).

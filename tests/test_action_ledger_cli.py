@@ -185,6 +185,7 @@ def test_logs_command_points_at_human_report_and_the_detail_level(tmp_path: Path
     output = output.getvalue()
 
     assert "report.md" in output
+    assert "agent-development-log.jsonl" in output
     assert ".evidence" in output
     assert "essential" in output
     assert "SHAMSU_LOG_LEVEL" in output
@@ -212,7 +213,7 @@ def test_logs_open_lists_every_path_including_the_layout_notes(tmp_path: Path):
     handle_logs("logs open", tmp_path, console)
     output = output.getvalue()
 
-    for label in ("runs", "sessions", "audit", "ledger config", "layout notes"):
+    for label in ("runs", "sessions", "one-file log", "audit", "ledger config", "layout notes"):
         assert label in output
 
 

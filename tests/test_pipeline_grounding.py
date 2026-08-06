@@ -316,12 +316,16 @@ def test_prd_parse_happens_before_template_build(tmp_path, monkeypatch):
 
         return AgentLoopResult(final="stopped for test", stopped=True)
 
+    async def fake_development_plan(*_args, **_kwargs):
+        return {"source": "test", "plan_summary": "test", "milestones": []}
+
     monkeypatch.setattr(repl_mod, "_run_agent_chat", fake_agent_chat)
+    monkeypatch.setattr(repl_mod, "_prepare_prd_development_plan", fake_development_plan)
 
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
     asyncio.run(repl_mod._handle_prd_build_request(
-        "build the product from this prd.md", tmp_path, console
+        "build the product from this prd.md", tmp_path, console, execute_plan=True
     ))
 
     assert parse_calls, "parse_prd_file was never called before scaffold"
@@ -378,10 +382,14 @@ def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
     async def fake_final_verify(*_args, **_kwargs):
         return True
 
+    async def fake_development_plan(*_args, **_kwargs):
+        return {"source": "test", "plan_summary": "test", "milestones": []}
+
     monkeypatch.setattr(repl_mod.FullDjangoPipeline, "run", fail_pipeline_run)
     monkeypatch.setattr(repl_mod, "_run_agent_chat", fake_react)
     monkeypatch.setattr(repl_mod, "_verify_prd_milestone", fake_verify)
     monkeypatch.setattr(repl_mod, "_verify_completed_plan", fake_final_verify)
+    monkeypatch.setattr(repl_mod, "_prepare_prd_development_plan", fake_development_plan)
 
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
@@ -390,6 +398,7 @@ def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
             "build the product from prd.md in a new folder named atlasops-freeform",
             tmp_path,
             console,
+            execute_plan=True,
         )
     )
 
