@@ -14,7 +14,7 @@ Tracks progress of the rebuild described in
 | 1 | Repository reset | 🟢 Done | V2 tests run without importing legacy agent code |
 | 2 | Runtime foundation | 🟢 Done | Simulated runs pause, resume, cancel, reject invalid transitions |
 | 3 | Artifact foundation | 🟢 Done | Artifacts regenerate correctly after source changes |
-| 4 | Read-only agent | ⚪ Not started | Grounded plans produced without modifying files |
+| 4 | Read-only agent | 🟢 Done | Grounded plans produced without modifying files |
 | 5 | Controlled editing | ⚪ Not started | Simple changes completed with verified evidence |
 | 6 | Structured planning | ⚪ Not started | Bounded multi-file tasks completed step-by-step |
 | 7 | Repair | ⚪ Not started | Simple failures fixed without uncontrolled edits |
@@ -41,8 +41,8 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 4 | Run control | 🟢 Done |
 | 5 | Artifact registry | 🟢 Done |
 | 6 | Repository artifacts | 🟢 Done |
-| 7 | Tool contracts and policy | ⚪ Not started |
-| 8 | Read-only agent | ⚪ Not started |
+| 7 | Tool contracts and policy | 🟢 Done |
+| 8 | Read-only agent | 🟢 Done |
 | 9 | Controlled authoring | ⚪ Not started |
 | 10 | Planning contracts | ⚪ Not started |
 | 11 | Completion gate | ⚪ Not started |
@@ -207,6 +207,46 @@ convention, not measured coverage.
 3. **A retired card was invalidated but not reported as retired**, because
    hash-based recomputation had already invalidated it. The report now
    describes what happened to the artifact, not which code path got there first.
+
+## PR 7 — Tool contracts and policy ✅
+
+- [x] `PathSandbox` — resolve before deciding, follow symlinks, accept
+      absolute paths that land inside the workspace
+- [x] Typed `Tool` base; the model-facing JSON schema is *derived* from the
+      input model, so what the model is shown and what it is held to cannot
+      drift
+- [x] `ToolGateway` — phase allowlist, approval, argument validation,
+      one-mutation-per-decision, timeout racing cancellation, output capping
+- [x] 29-test adversarial path-escape suite
+
+Default approval policy is `deny_all`. An unconfigured gateway that approves
+everything is decoration, not policy.
+
+### Bug found during this PR
+
+`NullCancellationToken.wait_cancelled()` raised `NotImplementedError`, on the
+reasoning that hanging forever is worse than a clear error. That was wrong: the
+method exists to be *raced* against real work, and a raising implementation
+completes instantly — which the gateway read as "cancelled", turning every
+tool timeout into a spurious cancellation. It now never resolves, and the
+gateway asks the token directly rather than inferring from watcher completion.
+
+## PR 8 — Read-only agent ✅
+
+- [x] `project.inspect`, `code.search`, `file.read` — logical tools, not
+      syscall wrappers
+- [x] `ContextCompiler` — priority budgeting, hot context never dropped,
+      stale artifacts labelled
+- [x] Output contracts (`InvestigationStep`, `ImplementationPlan`, …)
+- [x] `ReadOnlyAgent` — bounded investigate loop, then plan
+- [x] `is_grounded()` — a plan citing files the agent never read is rejected
+
+**Milestone 4's exit condition is met:** the agent produces grounded
+implementation plans without modifying files. Verified against this repository
+and by a test that hashes the whole tree before and after a full investigation.
+
+Read-only is enforced by *policy*, not by the agent behaving: the phase is
+INSPECT throughout and the gateway only exposes tools declaring INSPECT.
 
 ---
 

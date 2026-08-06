@@ -19,5 +19,22 @@ Milestone 5. See plan sections 22, 23.
 
 from shamsu.tools.base import Tool
 from shamsu.tools.gateway import ApprovalCallback, ToolGateway, deny_all
+from shamsu.tools.readonly import (
+    CodeSearchTool,
+    FileReadTool,
+    ProjectInspectTool,
+    read_only_tools,
+    summarise_manifest,
+)
 
-__all__ = ["ApprovalCallback", "Tool", "ToolGateway", "deny_all"]
+__all__ = [
+    "ApprovalCallback",
+    "CodeSearchTool",
+    "FileReadTool",
+    "ProjectInspectTool",
+    "Tool",
+    "ToolGateway",
+    "deny_all",
+    "read_only_tools",
+    "summarise_manifest",
+]

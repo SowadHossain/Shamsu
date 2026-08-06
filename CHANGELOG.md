@@ -110,6 +110,30 @@ The v1 changelog is archived at
   *name* the archive in order to *exclude* it. Per-line, reason-carrying, and
   unable to exempt an import.
 
+- **Tool gateway and path sandbox** (`src/shamsu/tools/`, `src/shamsu/security/`)
+  — Milestone 4:
+  - `security/paths` — `PathSandbox`. Resolves before deciding, follows
+    symlinks, and accepts absolute paths that land inside the workspace. The
+    third rule is the direct v1 lesson: v1 regex-scraped paths and silently
+    demoted `/tmp/ws/x.md` to `tmp/ws/x.md`.
+  - `tools/base` — typed `Tool`; the model-facing JSON schema is derived from
+    the input model, so the schema shown and the validation applied cannot
+    drift. `run` receives a validated object, never raw arguments.
+  - `tools/gateway` — one registry. Resolve, phase, approval, validate,
+    mutation budget, execute under timeout racing cancellation, cap output.
+    Every refusal happens before the side effect. Default approval is
+    `deny_all`.
+  - `tools/readonly` — `project.inspect`, `code.search`, `file.read`.
+- **Context compiler** (`src/shamsu/context/`) — priority budgeting where hot
+  context raises rather than being silently dropped, and stale artifacts are
+  labelled before they reach the model.
+- **Output contracts** (`src/shamsu/models/contracts.py`) — narrow shapes a
+  response is allowed to take, plus a compact `schema_hint` renderer that fits
+  the 400-token tool-definition budget.
+- **Read-only agent** (`src/shamsu/agent/readonly.py`) — the bounded
+  investigate loop and grounded planning. `is_grounded()` rejects a plan citing
+  files the agent never opened.
+
 ### Fixed
 
 - **mypy strict now passes** on all 35 source files, and every `type: ignore`
@@ -143,6 +167,10 @@ The v1 changelog is archived at
   The repository context now detects which packaging roots actually apply.
 - A card whose subject was deleted was invalidated but not reported as retired,
   because hash-based recomputation reached it first.
+- `NullCancellationToken.wait_cancelled()` raised instead of never resolving.
+  Since the method exists to be raced against real work, a raising
+  implementation completed instantly and the tool gateway read that as
+  cancellation — turning every timeout into a spurious user interrupt.
 
 ### Changed
 

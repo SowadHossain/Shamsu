@@ -1,0 +1,307 @@
+"""The read-only agent: investigate a repository, produce a grounded plan.
+
+Milestone 4's deliverable, and the first place the whole stack runs end to end
+— gateway, sandbox, compiler, contracts, limits, cancellation.
+
+The loop is bounded and the runtime owns it:
+
+    compile a frame -> ask for ONE decision -> validate it -> execute one tool
+    -> compress the observation -> repeat, until the model concludes or a
+    bound is reached
+
+The model never decides how long to keep going. It answers "what next?" and the
+runtime decides whether there is a next.
+
+**Nothing here can modify the repository.** The phase is INSPECT throughout, and
+the gateway only exposes tools that declare INSPECT — so read-only is enforced
+by the same mechanism as every other policy, not by this class remembering to
+behave.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from shamsu.context.compiler import ContextCompiler, FrameInputs
+from shamsu.interfaces.cancellation import CancellationToken, NullCancellationToken
+from shamsu.interfaces.enums import Phase
+from shamsu.interfaces.models import (
+    ModelClient,
+    ModelContractError,
+    ModelMessage,
+    ModelRequest,
+    ModelUnavailable,
+)
+from shamsu.interfaces.tools import ToolPolicyViolation, ToolRequest, ToolResult
+from shamsu.models.contracts import (
+    ImplementationPlan,
+    InvestigationStep,
+    schema_hint,
+)
+from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits
+from shamsu.tools.gateway import ToolGateway
+
+_SYSTEM_RULES = """\
+You are inspecting a repository. You cannot modify anything.
+
+Work one step at a time. Each response is a single decision: either call one
+tool, or conclude. Do not plan several tool calls in one response.
+
+Ground every claim in something a tool actually returned. If you have not read
+it, you do not know it."""
+
+
+@dataclass
+class Observation:
+    """One tool call and what came back, kept for the run record."""
+
+    tool: str
+    ok: bool
+    summary: str
+    reason: str = ""
+
+
+@dataclass
+class InvestigationResult:
+    """What an investigation produced.
+
+    `stopped_because` is always set, so "why did it stop?" never requires
+    inferring from the shape of the other fields. v1's exhaustion paths were
+    frequently indistinguishable from failure; this makes them distinct.
+    """
+
+    conclusion: str = ""
+    observations: list[Observation] = field(default_factory=list)
+    files_seen: list[str] = field(default_factory=list)
+    stopped_because: str = ""
+    ok: bool = False
+
+    @property
+    def actions_taken(self) -> int:
+        return len(self.observations)
+
+
+class ReadOnlyAgent:
+    """Investigates a repository without modifying it."""
+
+    #: How much of a tool result is carried forward as the "latest
+    #: observation". The full result was already capped by the gateway; this is
+    #: a second, tighter budget because an observation competes with the task
+    #: and the step for hot context.
+    OBSERVATION_CHARS = 2_000
+
+    def __init__(
+        self,
+        model: ModelClient,
+        gateway: ToolGateway,
+        compiler: ContextCompiler,
+        limits: ExecutionLimits | None = None,
+    ) -> None:
+        self._model = model
+        self._gateway = gateway
+        self._compiler = compiler
+        self._limits = limits or DEFAULT_LIMITS
+
+    async def investigate(
+        self,
+        task: str,
+        *,
+        project_facts: str = "",
+        cancel: CancellationToken | None = None,
+        max_actions: int | None = None,
+    ) -> InvestigationResult:
+        """Run the bounded investigation loop.
+
+        Raises:
+            Cancelled: the token fired. Propagated rather than swallowed — a
+                cancelled run must not return a result that looks like an
+                answer.
+        """
+        token = cancel or NullCancellationToken()
+        budget = max_actions or self._limits.actions_per_step
+        result = InvestigationResult()
+
+        latest = ""
+        consecutive_failures = 0
+
+        for _ in range(budget):
+            token.raise_if_cancelled()
+
+            frame = self._compiler.compile(
+                FrameInputs(
+                    phase=Phase.INSPECT,
+                    task=task,
+                    output_contract="InvestigationStep",
+                    project_facts=project_facts,
+                    latest_observation=latest,
+                    system_rules=_SYSTEM_RULES + "\n\n" + schema_hint(InvestigationStep),
+                ),
+                self._gateway.available(Phase.INSPECT),
+            )
+
+            try:
+                decision = await self._decide(frame.render(), token)
+            except ModelUnavailable as exc:
+                result.stopped_because = f"model unavailable: {exc}"
+                return result
+            except ModelContractError as exc:
+                # Recorded, not repaired. The runtime decides what a malformed
+                # response means; the client does not get to guess.
+                consecutive_failures += 1
+                latest = (
+                    "Your last response did not match the required JSON shape "
+                    f"({exc}). Respond with valid JSON only."
+                )
+                if consecutive_failures >= self._limits.consecutive_failed_actions:
+                    result.stopped_because = (
+                        f"model produced {consecutive_failures} unparseable responses"
+                    )
+                    return result
+                continue
+
+            if decision.action == "conclude":
+                result.conclusion = decision.conclusion
+                result.stopped_because = "the agent concluded"
+                result.ok = True
+                return result
+
+            assert decision.tool is not None  # guaranteed by validated()
+            observation = await self._execute(decision.tool, token)
+            result.observations.append(observation)
+
+            if observation.ok:
+                consecutive_failures = 0
+                self._record_file(result, decision.tool.arguments)
+            else:
+                consecutive_failures += 1
+                if consecutive_failures >= self._limits.consecutive_failed_actions:
+                    result.stopped_because = f"{consecutive_failures} consecutive failed actions"
+                    return result
+
+            latest = observation.summary
+
+        result.stopped_because = f"action budget exhausted ({budget} actions)"
+        return result
+
+    async def plan(
+        self,
+        task: str,
+        investigation: InvestigationResult,
+        *,
+        cancel: CancellationToken | None = None,
+    ) -> ImplementationPlan | None:
+        """Turn a completed investigation into a grounded plan.
+
+        Returns None when the model cannot produce a valid plan. A missing plan
+        is an honest outcome; a fabricated one is not.
+        """
+        token = cancel or NullCancellationToken()
+        token.raise_if_cancelled()
+
+        evidence = "\n\n".join(f"[{obs.tool}] {obs.summary}" for obs in investigation.observations)
+
+        frame = self._compiler.compile(
+            FrameInputs(
+                phase=Phase.PLAN,
+                task=task,
+                output_contract="ImplementationPlan",
+                latest_observation=evidence,
+                previous_step_summary=investigation.conclusion,
+                system_rules=(
+                    "Produce an implementation plan from the evidence below. "
+                    "You have not modified anything and must not claim to have. "
+                    "List only files you actually inspected in `grounded_in`.\n\n"
+                    + schema_hint(ImplementationPlan)
+                ),
+            ),
+            # No tools: planning is a pure reasoning step over gathered
+            # evidence. Offering tools here would invite another round of
+            # investigation inside what is supposed to be a decision.
+            (),
+        )
+
+        request = ModelRequest(
+            messages=(ModelMessage(role="user", content=frame.render()),),
+            max_output_tokens=frame.budget.output_reserve,
+        )
+        try:
+            return await self._model.generate_typed(request, ImplementationPlan, token)
+        except (ModelContractError, ModelUnavailable):
+            return None
+
+    # -- internals ---------------------------------------------------------
+
+    async def _decide(self, prompt: str, token: CancellationToken) -> InvestigationStep:
+        request = ModelRequest(
+            messages=(ModelMessage(role="user", content=prompt),),
+            max_output_tokens=self._compiler.budget.output_reserve,
+        )
+        decision = await self._model.generate_typed(request, InvestigationStep, token)
+        try:
+            return decision.validated()
+        except ValueError as exc:
+            raise ModelContractError(str(exc), raw_text=decision.model_dump_json()) from exc
+
+    async def _execute(self, call: object, token: CancellationToken) -> Observation:
+        from shamsu.models.contracts import ToolCall
+
+        assert isinstance(call, ToolCall)
+        request = ToolRequest(tool=call.tool, arguments=call.arguments)
+
+        try:
+            with self._gateway.decision():
+                result: ToolResult = await self._gateway.invoke(request, Phase.INSPECT, token)
+        except ToolPolicyViolation as exc:
+            # A refusal is information the model can act on, not a crash. It is
+            # reported back verbatim so the next decision can be better.
+            return Observation(
+                tool=call.tool, ok=False, summary=f"Refused: {exc}", reason=call.reason
+            )
+
+        body = result.output if result.ok else (result.error or "failed")
+        return Observation(
+            tool=call.tool,
+            ok=result.ok,
+            summary=self._compress(body),
+            reason=call.reason,
+        )
+
+    def _compress(self, text: str) -> str:
+        if len(text) <= self.OBSERVATION_CHARS:
+            return text
+        kept = text[: self.OBSERVATION_CHARS]
+        return (
+            f"{kept}\n[observation trimmed at {self.OBSERVATION_CHARS} characters; "
+            "narrow the query to see more]"
+        )
+
+    @staticmethod
+    def _record_file(result: InvestigationResult, arguments: object) -> None:
+        """Track which files were actually read, so grounding can be checked."""
+        if not isinstance(arguments, dict):
+            return
+        path = arguments.get("path")
+        if isinstance(path, str) and path and path not in result.files_seen:
+            result.files_seen.append(path)
+
+
+def is_grounded(plan: ImplementationPlan, investigation: InvestigationResult) -> tuple[bool, str]:
+    """Whether a plan only cites files the investigation actually opened.
+
+    The check that makes "grounded" mean something. A plan naming files the
+    agent never read is exactly the confident fabrication v2 exists to prevent,
+    and it is cheap to detect because the runtime knows what was read.
+    """
+    seen = set(investigation.files_seen)
+    invented = [path for path in plan.grounded_in if path not in seen]
+    if invented:
+        return False, f"plan cites files that were never read: {', '.join(sorted(invented))}"
+    return True, ""
+
+
+__all__ = [
+    "InvestigationResult",
+    "Observation",
+    "ReadOnlyAgent",
+    "is_grounded",
+]
