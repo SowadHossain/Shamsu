@@ -50,6 +50,12 @@ and `AbstractService.ensure_ready()` gates off that file, not the graph.
   `agents/` (QA, code-edit, bug-fix, audit, test-gen, docs), `memory/`,
   `safety/` (path sandbox, command risk classifier, secret redaction — **not** an
   OS sandbox).
+- **Memory** = Graphiti (external, `~/.shamsu/tools/graphiti/`) with a **SQLite
+  floor** (`memory/sqlite_store.py`) that is always available; Graphiti is
+  preferred when healthy, mirrored to asynchronously via a bounded queue.
+- **Live loop** is `AgentChatLoop` (`agents/chat_loop.py`), the only one
+  `repl.py` constructs. `ToolCallingAgentLoop` and `runtime/run_control.py` are
+  **test-only / dead code** — see `agent context/AGENT_LOOP_AND_TOOLING_REPORT.md`.
 - **leaf** — `abstract/`, `runtime/`, `telemetry/`, `templates/`, `diagnostics/`,
   `repair/`, `patch/`, `verify/`, `retriever/`, `llm/`, `prd/`, `indexer/`,
   `plans/`, `routing/`, `skills/`, `taskmaster/`, `tasks/`, `audit/`, `context/`,
@@ -65,9 +71,22 @@ tools/`. Consumers of unbuilt deps import the interface and write a `Stub*` clas
 
 ## Retrieval stack
 
-SQLite FTS5 (stdlib) + `rank_bm25` + tree-sitter + `yake`. Index at
-`.shamsu/index.db`. **No embedding model, no vector DB — a deliberate low-RAM
-constraint, not an oversight.**
+**codebase-memory-mcp is the only search/symbol backend.** There is no
+SHAMSU-owned index, parser, or code graph — every result traces to a real tool
+call (`search_code`, `search_graph`, `get_code_snippet`). See the explicit
+docstring at `shamsu/retriever/search.py:1-9`. The `search_index` tool gates on
+`AbstractService.ensure_ready()` before querying (`agent_tools.py:3188-3194`).
+
+**Last-resort semantic rescue** (`shamsu/retriever/semantic.py`): local Ollama
+embeddings (`nomic-embed-text`, ~274 MB), file-level granularity, JSON vector
+index under `.shamsu/` refreshed lazily per query. Runs only after the primary
+search returns nothing, degrades to "no hits" on any failure, and remembers the
+failure per-process. Disable with `SHAMSU_SEMANTIC_SEARCH=0`.
+
+Stale claims to ignore — **README and `pyproject.toml` are out of date here**:
+- README's `.shamsu/index.db` SQLite FTS5 index no longer exists in `shamsu/`;
+  the only FTS5 reference is a comment describing the *external* tool's index.
+- `rank_bm25` and `yake` are declared dependencies but imported nowhere.
 
 ## Invariants
 
