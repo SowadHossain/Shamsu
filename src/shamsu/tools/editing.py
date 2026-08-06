@@ -189,18 +189,14 @@ class FilePatchTool(Tool[FilePatchInput]):
             return self.failed(f"{arguments.path}: cannot write: {exc}", started=started)
 
         relative = self._sandbox.relative(target)
-        self._undo.append(
-            PatchUndo(path=relative, previous_content=previous, existed=existed)
-        )
+        self._undo.append(PatchUndo(path=relative, previous_content=previous, existed=existed))
 
         return self.ok(self._render(relative, previous, updated, existed), started=started)
 
     # -- internals ---------------------------------------------------------
 
     @staticmethod
-    def _compute(
-        arguments: FilePatchInput, previous: str, existed: bool
-    ) -> tuple[str, str | None]:
+    def _compute(arguments: FilePatchInput, previous: str, existed: bool) -> tuple[str, str | None]:
         """Produce the new content, or an error explaining why not."""
         if arguments.mode == "create":
             if existed:

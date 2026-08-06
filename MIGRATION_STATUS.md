@@ -15,7 +15,7 @@ Tracks progress of the rebuild described in
 | 2 | Runtime foundation | 🟢 Done | Simulated runs pause, resume, cancel, reject invalid transitions |
 | 3 | Artifact foundation | 🟢 Done | Artifacts regenerate correctly after source changes |
 | 4 | Read-only agent | 🟢 Done | Grounded plans produced without modifying files |
-| 5 | Controlled editing | ⚪ Not started | Simple changes completed with verified evidence |
+| 5 | Controlled editing | 🟢 Done | Simple changes completed with verified evidence |
 | 6 | Structured planning | ⚪ Not started | Bounded multi-file tasks completed step-by-step |
 | 7 | Repair | ⚪ Not started | Simple failures fixed without uncontrolled edits |
 | 8 | Code intelligence | ⚪ Not started | Retrieval evals show accurate code selection |
@@ -43,7 +43,7 @@ Legend: 🟢 done · 🟡 in progress · ⚪ not started · 🔴 blocked
 | 6 | Repository artifacts | 🟢 Done |
 | 7 | Tool contracts and policy | 🟢 Done |
 | 8 | Read-only agent | 🟢 Done |
-| 9 | Controlled authoring | ⚪ Not started |
+| 9 | Controlled authoring | 🟢 Done |
 | 10 | Planning contracts | ⚪ Not started |
 | 11 | Completion gate | ⚪ Not started |
 | 12 | Repair | ⚪ Not started |
@@ -247,6 +247,36 @@ and by a test that hashes the whole tree before and after a full investigation.
 
 Read-only is enforced by *policy*, not by the agent behaving: the phase is
 INSPECT throughout and the gateway only exposes tools declaring INSPECT.
+
+## PR 9 — Controlled authoring ✅
+
+- [x] `file.patch` — anchored replacement, reversible, ambiguity refused
+- [x] `git.inspect` / `git.checkpoint` — one logical call each, fixed argv
+- [x] `test.run` — allowlisted command *keys*, never a shell string
+- [x] `verification/digest` — test-output digesting and stable error signatures
+- [x] `verification/evidence` — `EvidenceRecorder` and the completion gate
+- [x] Rollback: `PatchUndo` per edit, `git reset` for multi-file changes
+
+**Milestone 5's exit condition is met:** a broken function is patched, the
+tests are run, the diff is inspected, a checkpoint is committed, and the gate
+only opens once all four pieces of evidence exist as rows keyed to real tool
+executions.
+
+### Design points worth keeping
+
+- **Anchored edits, not line numbers.** Line numbers drift; an anchor that no
+  longer matches simply fails, which is the honest outcome. An anchor matching
+  more than once is refused rather than resolved by taking the first — "it
+  edited the wrong one" is much worse than "it asked again".
+- **A no-op patch reports failure.** Otherwise it would register
+  `FILE_CHANGED` evidence for changing nothing.
+- **`test.run` takes a command key, not a command line.** There is no string
+  for a model to smuggle `; rm -rf /` into, because there is no string.
+- **Whole-file overwrite needs an explicit acknowledgement.** v1 defaulted to
+  it and lost work.
+- **Error signatures ignore temp paths, durations, and line numbers**, so two
+  attempts at the same failure sign identically and `RepairTracker` can tell
+  grinding from progress.
 
 ---
 
