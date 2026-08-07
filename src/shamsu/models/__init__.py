@@ -33,6 +33,7 @@ from shamsu.models.normalization import (
     parse_json_response,
     strip_reasoning,
 )
+from shamsu.models.scripted import ScriptedModel
 
 __all__ = [
     "CONTRACTS",
@@ -41,6 +42,7 @@ __all__ = [
     "InvestigationStep",
     "PlanStepProposal",
     "ProjectAssessment",
+    "ScriptedModel",
     "TaskClassification",
     "ToolCall",
     "contract_for",

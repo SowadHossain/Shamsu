@@ -144,6 +144,21 @@ class TaskCompletion:
             missing |= step.missing
         return frozenset(missing)
 
+    @property
+    def unverified(self) -> bool:
+        """Satisfied, but with no evidence behind it at all.
+
+        A plan made entirely of `investigate` steps requires nothing, so it
+        passes the gate trivially. That is correct — those steps cannot write —
+        but reporting it as plain "COMPLETE" would put the same word on a task
+        that changed code and proved it and a task that did nothing.
+
+        This is plan §31's `success_without_verification_rate` as a property
+        rather than a statistic: the distinction has to reach the user looking
+        at the report, not only the person reading the metrics later.
+        """
+        return self.satisfied and not any(step.required for step in self.steps)
+
 
 class CompletionGate:
     """Decides whether a step or a task is finished, from rows only."""
@@ -257,8 +272,22 @@ class EvidenceReport:
     failed_calls: int
 
     def render(self) -> str:
-        headline = "COMPLETE" if self.verdict.satisfied else "NOT COMPLETE"
+        if not self.verdict.satisfied:
+            headline = "NOT COMPLETE"
+        elif self.verdict.unverified:
+            # The same word must not describe a proven change and a plan that
+            # only looked at things.
+            headline = "COMPLETE (NOTHING VERIFIED)"
+        else:
+            headline = "COMPLETE"
+
         lines = [f"Task: {self.request}", "", f"{headline} — {self.verdict.reason}"]
+
+        if self.verdict.unverified:
+            lines.append(
+                "  No step required evidence, so nothing was proved. This plan "
+                "only inspected; it did not change anything."
+            )
 
         if self.verdict.steps:
             lines.extend(["", "Steps:"])

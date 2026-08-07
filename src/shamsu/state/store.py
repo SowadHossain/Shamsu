@@ -203,6 +203,20 @@ class StateStore:
         return record
 
     @_synchronized
+    def project_for_root(self, root: str) -> ProjectRecord | None:
+        """The project registered at this repository root, if any.
+
+        A project is identified by where it lives. `upsert_project` conflicts on
+        `project_id`, so a caller that mints a fresh id for an already-known
+        repository violates the UNIQUE constraint on `root` -- which is what a
+        second `shamsu` run in the same directory did before this existed.
+        """
+        row = self._connection.execute(
+            "SELECT project_id FROM projects WHERE root = ?", (root,)
+        ).fetchone()
+        return None if row is None else self.get_project(ProjectId(row["project_id"]))
+
+    @_synchronized
     def get_project(self, project_id: ProjectId) -> ProjectRecord | None:
         row = self._connection.execute(
             "SELECT * FROM projects WHERE project_id = ?", (project_id,)

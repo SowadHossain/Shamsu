@@ -613,6 +613,69 @@ being coerced into an illegal move.
 
 ---
 
+## Post-PR: the terminal interface ✅
+
+The plan never scheduled a UI — "User Interface / CLI / API" appears once, as a
+box in the §9 architecture diagram, with no PR and no milestone behind it. Until
+now, running SHAMSU meant writing Python and constructing an `AgentSession` by
+hand.
+
+`shamsu "fix the adder"` now works, with a full-screen interface and a plain
+line-oriented mode for pipes and CI.
+
+### Structure
+
+Three modules, split so two of them are pure:
+
+| Module | Responsibility | Testable without a TTY |
+|---|---|---|
+| `ui/view` | Folds `RunEvent`s into what is known about a run | yes |
+| `ui/render` | `(view, width, height, now) -> lines` | yes |
+| `ui/terminal` | Escape codes, raw mode, signals, key reads | no, and isolated |
+
+v1's CLI was 18,729 lines with 17,411 in `repl.py`, because display, input,
+session management, and agent control lived in one object. Nothing in it could
+be tested without driving a terminal, so in practice none of it was. That split
+is the whole lesson, and 25 unit tests exercise the layout at four window sizes
+without a terminal existing.
+
+### Design points worth keeping
+
+- **The UI observes; it never drives.** `RunController.subscribe` points one
+  way, and nothing in `runtime/` knows a UI exists. Pressing `^C` asks the
+  runtime to cancel rather than stopping anything itself.
+- **A listener that raises is dropped, not propagated.** A broken display is
+  not a reason to abandon work the agent has already done.
+- **The terminal is always restored.** Raw mode, the alternate screen, and the
+  hidden cursor are borrowed from the user's shell; restoration is in a
+  `finally`, because a crash that leaves raw mode set sends the user to `reset`.
+- **The plain path is not a degraded mode.** Same view model, rendered one line
+  at a time. `NO_COLOR`, `TERM=dumb`, and a non-TTY stream are all honoured.
+- **The footer sheds from the middle.** `^C cancel` is pinned; the clock and
+  evidence count are dropped first. Truncating from the right would cut off the
+  one thing a user may urgently need.
+- **`--model` names a factory, and an unconfigured backend says so immediately**
+  rather than failing three minutes into a task with a connection error.
+
+### Bugs found by running it
+
+1. **Header off-by-one** — the frame rendered one column too wide at every
+   size, wrapping the box. Caught by asserting `len(line) <= width` at four
+   widths rather than eyeballing one.
+2. **A second run in the same directory crashed.** `upsert_project` conflicts on
+   `project_id`, but `root` is UNIQUE, so minting a fresh id for a known
+   repository raised `IntegrityError`. Added `StateStore.project_for_root`; a
+   project is identified by where it lives.
+3. **A task could report plain `COMPLETE` having verified nothing.** A plan made
+   entirely of `investigate` steps requires no evidence, so it passes the gate
+   trivially — correct, since those steps cannot write, but the same word was
+   describing a proven change and a run that only looked at things. The report
+   now says `COMPLETE (NOTHING VERIFIED)` and explains why. This is plan §31's
+   `success_without_verification_rate` surfaced to the person reading the
+   report rather than only to whoever reads the metrics later.
+
+---
+
 ## Standing constraints
 
 These hold for every subsequent PR:

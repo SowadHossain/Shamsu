@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from shamsu.interfaces.cancellation import Cancelled
@@ -71,6 +71,7 @@ class RunController:
         self._store = store
         self._limits = limits or DEFAULT_LIMITS
         self._live: dict[RunId, _LiveRun] = {}
+        self._listeners: list[Callable[[RunEvent], None]] = []
         # Guards `_live` and each run's event list. `StateStore` has its own
         # lock, so persistence is safe independently of this one.
         self._lock = threading.RLock()
@@ -309,6 +310,24 @@ class RunController:
             raise UnknownRun(run_id)
         return live
 
+    def subscribe(self, listener: Callable[[RunEvent], None]) -> Callable[[], None]:
+        """Observe events as they happen. Returns a function that unsubscribes.
+
+        This is the only seam a user interface needs, and it points one way: the
+        runtime does not know a UI exists. A listener that raises is dropped
+        rather than allowed to break the run — a broken display is not a reason
+        to abandon work the agent has already done.
+        """
+        with self._lock:
+            self._listeners.append(listener)
+
+        def unsubscribe() -> None:
+            with self._lock:
+                if listener in self._listeners:
+                    self._listeners.remove(listener)
+
+        return unsubscribe
+
     def _emit(
         self,
         run_id: RunId,
@@ -321,9 +340,17 @@ class RunController:
         event = RunEvent(run_id=run_id, kind=kind, detail=detail, state=state, status=status)
         with self._lock:
             live = self._live.get(run_id)
-            if live is None:
-                return
-            live.events.append(event)
+            if live is not None:
+                live.events.append(event)
+            listeners = list(self._listeners)
+
+        # Outside the lock: a listener that paints a terminal must not hold the
+        # lock cancellation needs.
+        for listener in listeners:
+            try:
+                listener(event)
+            except Exception:  # noqa: BLE001 - see subscribe()
+                self._listeners = [item for item in self._listeners if item is not listener]
 
     def _set_status(
         self,
