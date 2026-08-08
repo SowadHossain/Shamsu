@@ -38,6 +38,7 @@ from shamsu.interfaces.tools import ToolPolicyViolation, ToolRequest, ToolResult
 from shamsu.models.contracts import (
     ImplementationPlan,
     InvestigationStep,
+    ToolCall,
     schema_hint,
 )
 from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits
@@ -125,6 +126,7 @@ class ReadOnlyAgent:
 
         latest = ""
         consecutive_failures = 0
+        attempted: list[tuple[str, str]] = []
 
         for _ in range(budget):
             token.raise_if_cancelled()
@@ -136,6 +138,7 @@ class ReadOnlyAgent:
                     output_contract="InvestigationStep",
                     project_facts=project_facts,
                     latest_observation=latest,
+                    attempted=tuple(attempted),
                     system_rules=_SYSTEM_RULES + "\n\n" + schema_hint(InvestigationStep),
                 ),
                 self._gateway.available(Phase.INSPECT),
@@ -170,6 +173,7 @@ class ReadOnlyAgent:
             assert decision.tool is not None  # guaranteed by validated()
             observation = await self._execute(decision.tool, token)
             result.observations.append(observation)
+            attempted.append((_describe_attempt(decision.tool), _outcome(observation)))
 
             if observation.ok:
                 consecutive_failures = 0
@@ -340,6 +344,25 @@ class ReadOnlyAgent:
         path = arguments.get("path")
         if isinstance(path, str) and path and path not in result.files_seen:
             result.files_seen.append(path)
+
+
+def _describe_attempt(call: ToolCall) -> str:
+    """A tool call as it appears in the "already tried" list.
+
+    Arguments are included because they are what makes two calls different:
+    `file.read` on two files is progress, and `file.read` on the same file
+    twice is the loop this list exists to stop.
+    """
+    arguments = ", ".join(f"{name}={value!r}" for name, value in sorted(call.arguments.items()))
+    return f"{call.tool}({arguments})" if arguments else f"{call.tool}()"
+
+
+def _outcome(observation: Observation) -> str:
+    """One line on how a call went, for the "already tried" list."""
+    if not observation.ok:
+        return f"failed: {observation.reason or observation.summary}".splitlines()[0][:90]
+    first = observation.summary.strip().splitlines()
+    return (first[0][:90] if first else "no output") or "no output"
 
 
 def is_grounded(plan: ImplementationPlan, investigation: InvestigationResult) -> tuple[bool, str]:

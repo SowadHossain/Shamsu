@@ -153,8 +153,11 @@ class RunView:
                 self.note(Level.STEP, self.phase.value, at=event.at)
 
         elif event.kind is EventKind.TOOL_INVOKED:
+            # Labelled with the phase rather than the word "tool": which phase a
+            # call belongs to is the thing that is not obvious from the detail,
+            # and "tool" repeated down the pane carries no information at all.
             level = Level.OK if not event.detail.startswith("!") else Level.FAIL
-            self.note(level, "tool", event.detail.lstrip("!"), at=event.at)
+            self.note(level, self.phase.value, event.detail.lstrip("!"), at=event.at)
 
         elif event.kind is EventKind.EVIDENCE_RECORDED:
             self.note(Level.OK, "evidence", event.detail, at=event.at)

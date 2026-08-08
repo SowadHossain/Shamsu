@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
@@ -29,12 +30,23 @@ from shamsu.security.paths import PathEscape, PathSandbox
 from shamsu.tools.base import Tool
 from shamsu.verification.digest import TestDigest, digest_test_output
 
+#: The interpreter running SHAMSU, rather than whatever `python3` resolves to.
+#:
+#: Three reasons, in order of how badly they bite. There is no `python3` on
+#: Windows at all -- the `WindowsApps\python3.exe` on PATH is a Store redirector
+#: that prints "Python was not found" and exits, so every `test.run` returned
+#: exit 9009 and no test could ever pass. Even where a `python3` exists it is
+#: usually not the one SHAMSU is running under, so the project's test
+#: dependencies may be missing from it. And `sys.executable` inside a venv is
+#: that venv's interpreter, which is what a developer means by "run the tests".
+_PYTHON = sys.executable or "python3"
+
 #: Command key -> fixed argv. Nothing here interpolates model input; a target
 #: path, when given, is sandbox-resolved and appended as a separate argument.
 DEFAULT_COMMANDS: Mapping[str, tuple[str, ...]] = {
-    "pytest": ("python3", "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider"),
-    "pytest-verbose": ("python3", "-m", "pytest", "-v", "--tb=long", "-p", "no:cacheprovider"),
-    "unittest": ("python3", "-m", "unittest", "discover"),
+    "pytest": (_PYTHON, "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider"),
+    "pytest-verbose": (_PYTHON, "-m", "pytest", "-v", "--tb=long", "-p", "no:cacheprovider"),
+    "unittest": (_PYTHON, "-m", "unittest", "discover"),
     "npm-test": ("npm", "test", "--silent"),
     "cargo-test": ("cargo", "test", "--quiet"),
     "go-test": ("go", "test", "./..."),

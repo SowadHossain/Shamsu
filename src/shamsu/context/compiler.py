@@ -77,6 +77,18 @@ class FrameInputs:
     previous_step_summary: str = ""
     system_rules: str = ""
 
+    #: Tool calls already made in this step, oldest first, as
+    #: `("tool", "one-line outcome")`.
+    #:
+    #: Without this a decision loop repeats itself. The frame shows only the
+    #: *latest* observation, so after one call the next frame is nearly
+    #: identical to the last — and at temperature 0 a nearly identical prompt
+    #: produces an identical answer. A live run called `git.inspect` four times
+    #: in a row and spent its whole action budget doing it. The model is not
+    #: being stubborn; it is being asked the same question repeatedly and
+    #: answering consistently.
+    attempted: Sequence[tuple[str, str]] = field(default_factory=tuple)
+
 
 #: Priority order. Lower survives longer under budget pressure.
 _SYSTEM = 0
@@ -207,12 +219,40 @@ class ContextCompiler:
                 )
             )
 
+        if inputs.attempted:
+            # Hot: this is the section that stops the loop, so it must survive
+            # budget pressure. Dropping it to fit more source back would
+            # restore exactly the behaviour it exists to prevent.
+            sections.append(
+                Section(
+                    "already tried in this step",
+                    self._render_attempts(inputs.attempted),
+                    _OBSERVATION,
+                    hot=True,
+                )
+            )
+
         if inputs.previous_step_summary:
             sections.append(
                 Section("previous step summary", inputs.previous_step_summary, _HISTORY)
             )
 
         return sections
+
+    @staticmethod
+    def _render_attempts(attempted: Sequence[tuple[str, str]]) -> str:
+        """What has been called, and how it went.
+
+        Numbered, because "you have already done these three things" is the
+        fact that has to land. The outcome is one line: enough to know whether
+        repeating it could produce anything new, without re-showing output the
+        latest-observation section already carries.
+        """
+        lines = [
+            f"{index}. {tool} — {outcome}" for index, (tool, outcome) in enumerate(attempted, 1)
+        ]
+        lines.append("Do not repeat a call above unless its arguments differ meaningfully.")
+        return "\n".join(lines)
 
     @staticmethod
     def _render_tools(contracts: Sequence[ToolContract]) -> str:

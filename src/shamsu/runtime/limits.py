@@ -38,7 +38,19 @@ class ExecutionLimits(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    actions_per_step: int = Field(default=4, ge=1)
+    #: Raised from 4 on measurement, which is what plan §34 asks for.
+    #:
+    #: The commonest step shape requires `file_changed`, `git_diff_reviewed`
+    #: and `tests_passed`. That is four calls before anything goes wrong —
+    #: locate, patch, review the diff, run the tests — so a budget of four left
+    #: no room to find the code first, and none at all for a mistake. A live
+    #: run against qwen2.5-coder:14b spent its whole budget on a search, one
+    #: patch rejected for a mistyped argument, the real patch, and the diff
+    #: review, then stopped one call short of the tests it needed.
+    #:
+    #: Eight is twice that minimum: enough to investigate, edit, verify, and
+    #: repair once. Still a bound, and still far below "let it run".
+    actions_per_step: int = Field(default=8, ge=1)
     repair_attempts_per_step: int = Field(default=2, ge=0)
     replans_per_task: int = Field(default=2, ge=0)
     consecutive_failed_actions: int = Field(default=3, ge=1)

@@ -464,9 +464,16 @@ class TestWallClock:
 
 class TestExecutionLimits:
     def test_defaults_match_the_plan(self) -> None:
-        """Plan section 11's initial table. Drift here changes agent behaviour."""
+        """Plan section 11's initial table. Drift here changes agent behaviour.
+
+        `actions_per_step` was raised from the plan's 4 to 8 on measurement,
+        which is what §34 requires of a higher ceiling: a step needing
+        file_changed, git_diff_reviewed and tests_passed cannot be finished in
+        four calls once locating the code is counted, and a live run proved it
+        by stopping one call short of the tests.
+        """
         limits = ExecutionLimits()
-        assert limits.actions_per_step == 4
+        assert limits.actions_per_step == 8
         assert limits.repair_attempts_per_step == 2
         assert limits.replans_per_task == 2
         assert limits.consecutive_failed_actions == 3
@@ -490,7 +497,7 @@ class TestExecutionLimits:
     @pytest.mark.parametrize(
         ("method", "count", "name"),
         [
-            ("check_actions", 4, "actions_per_step"),
+            ("check_actions", 8, "actions_per_step"),
             ("check_repairs", 2, "repair_attempts_per_step"),
             ("check_replans", 2, "replans_per_task"),
             ("check_consecutive_failures", 3, "consecutive_failed_actions"),
@@ -511,8 +518,8 @@ class TestExecutionLimits:
 
     def test_exhausted_reports_without_raising(self) -> None:
         limits = ExecutionLimits()
-        assert limits.exhausted(actions=3) is False
-        assert limits.exhausted(actions=4) is True
+        assert limits.exhausted(actions=7) is False
+        assert limits.exhausted(actions=8) is True
         assert limits.exhausted(repairs=2) is True
         assert limits.exhausted(replans=2) is True
 

@@ -42,11 +42,16 @@ def _view(**kwargs: object) -> RunView:
 
 class TestView:
     def test_events_become_activity(self) -> None:
+        """A tool line is labelled with its phase, not the word "tool".
+
+        Which phase a call belongs to is the thing the detail does not already
+        say; "tool" repeated down the pane carries no information.
+        """
         view = _view()
         view.apply(_event(EventKind.STARTED, status=RunStatus.RUNNING))
         view.apply(_event(EventKind.TOOL_INVOKED, detail="file.read calc.py"))
 
-        assert [item.label for item in view.activity] == ["started", "tool"]
+        assert [item.label for item in view.activity] == ["started", view.phase.value]
         assert view.activity[-1].detail == "file.read calc.py"
 
     def test_a_failed_tool_call_is_marked(self) -> None:
@@ -54,8 +59,8 @@ class TestView:
         view = _view()
         view.apply(_event(EventKind.TOOL_INVOKED, detail="!file.patch refused"))
 
-        assert view.activity[-1].level == Level.FAIL
         assert view.activity[-1].detail == "file.patch refused"
+        assert view.activity[-1].level == Level.FAIL
 
     def test_a_phase_change_is_noted_once_not_every_state(self) -> None:
         """Nineteen states, roughly five things a watcher cares about."""
@@ -113,6 +118,59 @@ class TestView:
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
+
+
+class TestToolDescription:
+    """What one tool call looks like on the activity line.
+
+    This is the display contract between `runtime.session` and `ui.theme`: the
+    session writes `tool  subject  extras`, and the theme colours those parts.
+    A change on either side that is not matched on the other shows up here.
+    """
+
+    @staticmethod
+    def _describe(tool: str, arguments: dict[str, object], **kwargs: object):
+        from shamsu.interfaces.tools import ToolRequest, ToolResult
+        from shamsu.runtime.session import _describe_call
+
+        return _describe_call(
+            ToolRequest(tool=tool, arguments=arguments),
+            ToolResult(tool=tool, **{"ok": True, **kwargs}),  # type: ignore[arg-type]
+        )
+
+    def test_the_subject_is_the_argument_that_identifies_the_target(self) -> None:
+        assert self._describe("file.patch", {"path": "calc.py", "find": "a - b"}) == (
+            "file.patch  calc.py"
+        )
+
+    def test_a_tool_with_no_known_subject_still_names_itself(self) -> None:
+        assert self._describe("project.inspect", {}) == "project.inspect"
+
+    def test_a_failure_is_prefixed_and_carries_the_first_error_line(self) -> None:
+        line = self._describe(
+            "file.patch", {"path": "calc.py"}, ok=False, error="no match\nsecond line"
+        )
+        assert line.startswith("!")
+        assert "no match" in line
+        assert "second line" not in line
+
+    def test_evidence_earns_its_place_on_the_line(self) -> None:
+        from shamsu.interfaces.enums import EvidenceKind
+
+        line = self._describe(
+            "test.run", {"command": "pytest"}, evidence=frozenset({EvidenceKind.TESTS_PASSED})
+        )
+        assert "✓ tests_passed" in line
+
+    def test_a_long_subject_is_elided_not_wrapped(self) -> None:
+        line = self._describe("file.read", {"path": "a/" * 40 + "z.py"})
+        assert "…" in line
+        assert len(line) < 70
+
+    def test_a_fast_call_does_not_report_a_timing(self) -> None:
+        """0.0s on every line is noise; a slow call is the signal."""
+        assert "s" not in self._describe("file.read", {"path": "x"}, duration_seconds=0.001)[-3:]
+        assert "2.4s" in self._describe("test.run", {"command": "pytest"}, duration_seconds=2.4)
 
 
 class TestRenderGeometry:

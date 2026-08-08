@@ -33,6 +33,7 @@ from shamsu.models.normalization import (
     parse_json_response,
     strip_reasoning,
 )
+from shamsu.models.ollama import OllamaClient
 from shamsu.models.scripted import ScriptedModel
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "Normalised",
     "ImplementationPlan",
     "InvestigationStep",
+    "OllamaClient",
     "PlanStepProposal",
     "ProjectAssessment",
     "ScriptedModel",

@@ -35,6 +35,7 @@ from shamsu.state.store import StateStore
 from shamsu.tools import ToolGateway, authoring_tools
 from shamsu.ui.render import render
 from shamsu.ui.terminal import managed_screen, read_key, supports_tui, terminal_size
+from shamsu.ui.theme import activity_line, supports_colour
 from shamsu.ui.view import Level, RunView
 
 #: How often the display repaints while waiting. Fast enough that the spinner
@@ -58,17 +59,27 @@ class AppOptions:
         return self.database or (self.workspace / ".shamsu" / "state.db")
 
 
-async def run_task(
-    model: ModelClient,
-    options: AppOptions,
-    *,
-    stream: TextIO | None = None,
-) -> SessionResult:
-    """Run one task, displaying it as it happens.
+@dataclass
+class Wiring:
+    """One assembled agent: the store, the run controller, and the session.
 
-    Returns the result rather than exiting, so a caller can decide the exit
-    code and a test can assert on the outcome.
+    Separated from `run_task` so an interactive session can build this once and
+    run many requests against it. `AgentSession.run` is already safe to call
+    repeatedly -- `test_a_session_can_run_a_second_task_without_leaking_state`
+    pins that -- so a REPL needs no new runtime machinery, only a way to hold
+    the wiring open across turns.
     """
+
+    store: StateStore
+    runs: RunController
+    session: AgentSession
+
+    def close(self) -> None:
+        self.store.close()
+
+
+def build_wiring(model: ModelClient, options: AppOptions) -> Wiring:
+    """Assemble an agent for one workspace."""
     store = StateStore(options.state_path)
     root = str(options.workspace.resolve())
 
@@ -95,17 +106,47 @@ async def run_task(
         limits=options.limits,
         memory=MemoryStore(store, project.project_id),
     )
+    return Wiring(store=store, runs=runs, session=session)
 
+
+async def run_task(
+    model: ModelClient,
+    options: AppOptions,
+    *,
+    stream: TextIO | None = None,
+) -> SessionResult:
+    """Run one task, displaying it as it happens.
+
+    Returns the result rather than exiting, so a caller can decide the exit
+    code and a test can assert on the outcome.
+    """
+    wiring = build_wiring(model, options)
+    try:
+        return await run_request(wiring, options, stream=stream)
+    finally:
+        wiring.close()
+
+
+async def run_request(
+    wiring: Wiring,
+    options: AppOptions,
+    *,
+    stream: TextIO | None = None,
+) -> SessionResult:
+    """Run `options.request` against an already-built agent.
+
+    Does not close the store: the caller owns the wiring's lifetime, which is
+    what lets an interactive session keep it across turns.
+    """
     view = RunView(request=options.request, workspace=str(options.workspace.resolve()))
-    unsubscribe = runs.subscribe(view.apply)
+    unsubscribe = wiring.runs.subscribe(view.apply)
 
     try:
         if options.tui and supports_tui(stream):
-            return await _run_with_tui(session, runs, view, options)
-        return await _run_plain(session, runs, view, options, stream)
+            return await _run_with_tui(wiring.session, wiring.runs, view, options)
+        return await _run_plain(wiring.session, wiring.runs, view, options, stream)
     finally:
         unsubscribe()
-        store.close()
 
 
 async def _run_with_tui(
@@ -162,16 +203,24 @@ async def _run_plain(
     options: AppOptions,
     stream: TextIO | None,
 ) -> SessionResult:
-    """One line per event. Scriptable, greppable, and CI-safe."""
+    """One line per event. Scriptable, greppable, and CI-safe.
+
+    Colour is decided per stream rather than per run: `supports_colour` refuses
+    to write escapes into anything that is not a terminal, so a piped run still
+    produces plain text a grep can read.
+    """
     import sys
 
     target = stream or sys.stdout
+    colour = options.colour and supports_colour(target)
     printed = 0
 
     def flush() -> None:
         nonlocal printed
         for item in view.activity[printed:]:
-            target.write(f"  {item.label:<10} {item.detail}\n".rstrip() + "\n")
+            target.write(
+                activity_line(item.level, item.label, item.detail, colour=colour).rstrip() + "\n"
+            )
         printed = len(view.activity)
         target.flush()
 
@@ -244,7 +293,10 @@ def describe_result(result: SessionResult) -> Sequence[str]:
 __all__ = [
     "FRAME_SECONDS",
     "AppOptions",
+    "Wiring",
+    "build_wiring",
     "describe_result",
     "exit_code",
+    "run_request",
     "run_task",
 ]

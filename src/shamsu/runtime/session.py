@@ -43,7 +43,7 @@ from shamsu.agent.repair import RepairController, RepairScope
 from shamsu.context.compiler import ContextCompiler, FrameInputs
 from shamsu.interfaces.cancellation import CancellationToken, Cancelled
 from shamsu.interfaces.context import ContextFrame
-from shamsu.interfaces.enums import AgentState, Phase, StepOutcome, TaskKind
+from shamsu.interfaces.enums import AgentState, EvidenceKind, Phase, StepOutcome, TaskKind
 from shamsu.interfaces.ids import CheckpointId, PlanId, ProjectId, RunId, StepId, TaskId
 from shamsu.interfaces.models import (
     ModelClient,
@@ -52,7 +52,7 @@ from shamsu.interfaces.models import (
     ModelRequest,
     ModelUnavailable,
 )
-from shamsu.interfaces.tools import ToolPolicyViolation, ToolRequest
+from shamsu.interfaces.tools import ToolPolicyViolation, ToolRequest, ToolResult
 from shamsu.memory.store import MemoryStore
 from shamsu.models.contracts import (
     ImplementationPlan,
@@ -430,11 +430,12 @@ class AgentSession:
         actions = 0
         failures = 0
         latest = context.capsule_text
+        attempted: list[tuple[str, str]] = []
 
         for _ in range(context.limits.actions_per_step):
             await self.runs.checkpoint(context.run_id)
 
-            frame = self._step_frame(context, step, latest)
+            frame = self._step_frame(context, step, latest, attempted)
             try:
                 decision = await self._decide(frame, self._token(context))
             except ModelUnavailable as exc:
@@ -454,9 +455,18 @@ class AgentSession:
                 return AgentState.VERIFY_CURRENT_STEP, decision.conclusion[:200]
 
             assert decision.tool is not None
-            latest, ok = await self._invoke(context, step, decision.tool, scope)
-            actions += 1
+            latest, ok, executed = await self._invoke(context, step, decision.tool, scope)
+
+            # A refusal did no work, so it does not spend the work budget. It
+            # is still a failure and `consecutive_failed_actions` still bounds
+            # it — but charging it twice meant one mistyped argument could cost
+            # a step the call that would have finished it. A live run spent its
+            # whole budget on search, a refused patch, the real patch, and a
+            # diff review, and never reached `test.run`.
+            if executed:
+                actions += 1
             failures = 0 if ok else failures + 1
+            attempted.append((_describe_attempt(decision.tool), _outcome_line(latest, ok)))
 
             if failures >= context.limits.consecutive_failed_actions:
                 return AgentState.VERIFY_CURRENT_STEP, f"{failures} consecutive failed actions"
@@ -560,12 +570,13 @@ class AgentSession:
         step: PlanStepRecord,
         call: ToolCall,
         scope: RepairScope | None,
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, bool]:
         """Run one tool call under the step's allowlist and the active scope."""
         if step.allowed_tools and call.tool not in step.allowed_tools:
             return (
                 f"Refused: {call.tool} is not available to this step. "
                 f"Allowed: {', '.join(step.allowed_tools)}.",
+                False,
                 False,
             )
 
@@ -584,7 +595,13 @@ class AgentSession:
                 else:
                     result = await self.gateway.invoke(request, phase, self._token(context))
         except ToolPolicyViolation as exc:
-            return f"Refused: {exc}", False
+            self.runs.note(context.run_id, EventKind.TOOL_INVOKED, f"!{call.tool}  refused")
+            return f"Refused: {exc}", False, False
+
+        # The interface only ever saw phase transitions, because this event kind
+        # was declared and never emitted. Without it a run shows "author" for a
+        # minute with no indication of what it is doing -- which reads as a hang.
+        self.runs.note(context.run_id, EventKind.TOOL_INVOKED, _describe_call(request, result))
 
         context.recorder.record(request, result, phase, step_id=step.step_id)
 
@@ -598,9 +615,15 @@ class AgentSession:
             context.last_digest = getattr(tool, "last_digest", None)
 
         body = result.output if result.ok else (result.error or "failed")
-        return body[:2000], result.ok
+        return body[:2000], result.ok, True
 
-    def _step_frame(self, context: _Context, step: PlanStepRecord, latest: str) -> ContextFrame:
+    def _step_frame(
+        self,
+        context: _Context,
+        step: PlanStepRecord,
+        latest: str,
+        attempted: Sequence[tuple[str, str]] = (),
+    ) -> ContextFrame:
         record = self.store.get_plan(context.plan_id) if context.plan_id else None
         steps = self.store.get_steps(context.plan_id) if context.plan_id else ()
 
@@ -616,7 +639,14 @@ class AgentSession:
                 ),
                 project_facts=self.memory.recall() if self.memory else "",
                 latest_observation=latest,
-                system_rules=_EXECUTE_RULES + "\n\n" + schema_hint(InvestigationStep),
+                attempted=tuple(attempted),
+                system_rules=(
+                    _EXECUTE_RULES
+                    + "\n\n"
+                    + _evidence_rule(step, self.gateway, context.recorder.verified(step.step_id))
+                    + "\n\n"
+                    + schema_hint(InvestigationStep)
+                ),
             ),
             [
                 contract
@@ -718,6 +748,136 @@ _PHASES: dict[AgentState, Phase] = {
     AgentState.COMPLETION_GATE: Phase.COMPLETE,
     AgentState.FINAL_REPORT: Phase.COMPLETE,
 }
+
+
+def _evidence_rule(
+    step: PlanStepRecord,
+    gateway: ToolGateway,
+    verified: frozenset[EvidenceKind] = frozenset(),
+) -> str:
+    """Tell the step what would make concluding it legitimate.
+
+    Without this the model concludes as soon as it believes the work is done,
+    which the gate then refuses — correctly, and uselessly, because nothing
+    told the model what "done" is measured by. A live run searched for
+    `def add(`, saw the signature line, and concluded the function was fine
+    without ever reading the body that held the bug.
+
+    The tool for each kind is **derived from the tool contracts**, not listed
+    here. `produces_evidence` already declares it, and a second copy would be
+    one that could drift — a renamed tool would leave this telling the model to
+    call something that no longer exists.
+
+    This does not lower the bar. The gate still reads the evidence table and a
+    model claim still proves nothing. It states the bar.
+    """
+    if not step.required_evidence:
+        return (
+            "This step requires no evidence, so concluding is enough once you "
+            "believe the work is done."
+        )
+
+    producers: dict[EvidenceKind, list[str]] = {}
+    for phase in (Phase.AUTHOR, Phase.VERIFY):
+        for contract in gateway.available(phase):
+            for kind in contract.produces_evidence:
+                producers.setdefault(kind, []).append(contract.name)
+
+    done: list[str] = []
+    todo: list[str] = []
+    for kind in step.required_evidence:
+        if kind in verified:
+            done.append(f"- {kind.value}: already done, do not repeat it")
+            continue
+
+        tools = sorted(set(producers.get(kind, ())))
+        if tools:
+            todo.append(f"- {kind.value}: call {' or '.join(tools)}")
+        else:
+            # Seven of eleven EvidenceKinds have no tool that can produce them
+            # (HANDOFF section 3). Saying so beats demanding the impossible in
+            # silence and letting the step fail without explanation.
+            todo.append(f"- {kind.value}: no available tool can produce this")
+
+    if not todo:
+        return (
+            "Every kind of evidence this step requires has been produced. "
+            "Conclude now; there is nothing further to do."
+        )
+
+    # Naming what is already satisfied is what stops the model redoing it. A
+    # live run patched the file, then spent the rest of its budget trying to
+    # patch it again, because the rule listed what was *required* and never
+    # said which parts were already met.
+    sections = [
+        "STILL NEEDED - the step is not finished until each of these happens:",
+        "\n".join(todo),
+    ]
+    if done:
+        sections.append("ALREADY SATISFIED:\n" + "\n".join(done))
+    sections.append(
+        "Do the next thing on the STILL NEEDED list. Concluding before it is "
+        "empty will be rejected and the step reopened."
+    )
+    return "\n\n".join(sections)
+
+
+#: Argument that identifies what a tool acted on, per tool. A generic "first
+#: string argument" rule picks up `command` for `test.run` and the find-text for
+#: `file.patch`, so the interesting one is named rather than guessed.
+_SUBJECT_ARGUMENT: dict[str, str] = {
+    "file.read": "path",
+    "file.patch": "path",
+    "file.write": "path",
+    "code.search": "query",
+    "test.run": "command",
+    "git.inspect": "what",
+    "project.inspect": "path",
+}
+
+
+def _describe_attempt(call: ToolCall) -> str:
+    """A tool call as it appears in the "already tried" list.
+
+    Arguments are included because they are what makes two calls different:
+    `file.read` on two files is progress; `file.read` on the same file twice is
+    the loop the list exists to stop.
+    """
+    arguments = ", ".join(f"{name}={value!r}" for name, value in sorted(call.arguments.items()))
+    return f"{call.tool}({arguments})" if arguments else f"{call.tool}()"
+
+
+def _outcome_line(body: str, ok: bool) -> str:
+    """One line on how a call went, for the "already tried" list."""
+    first = body.strip().splitlines()
+    summary = (first[0][:90] if first else "") or "no output"
+    return summary if ok else f"failed: {summary}"
+
+
+def _describe_call(request: ToolRequest, result: ToolResult) -> str:
+    """One line for the activity pane: what ran, on what, and how it went.
+
+    A leading `!` marks failure -- `RunView.apply` reads that to pick the glyph
+    and the colour. Keeping the convention here means the view needs no new
+    vocabulary to show a failed call.
+    """
+    subject = request.arguments.get(_SUBJECT_ARGUMENT.get(request.tool, ""), "")
+    parts = [request.tool]
+    if isinstance(subject, str) and subject:
+        parts.append(subject if len(subject) <= 48 else subject[:45] + "…")
+
+    if not result.ok:
+        parts.append(f"— {(result.error or 'failed').splitlines()[0][:60]}")
+    elif result.evidence:
+        # Evidence is the only thing a tool produces that the gate will accept,
+        # so it earns space on the line ahead of any output preview.
+        parts.append("✓ " + ", ".join(sorted(kind.value for kind in result.evidence)))
+
+    if result.duration_seconds >= 0.05:
+        parts.append(f"{result.duration_seconds:.1f}s")
+
+    line = "  ".join(parts)
+    return line if result.ok else f"!{line}"
 
 
 def _direct_plan(request: str, files: Sequence[str]) -> ImplementationPlan:

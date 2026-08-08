@@ -5,10 +5,10 @@ pick a model client; the work lives in `ui.app` and the runtime. v1's CLI was
 18,729 lines because it accumulated agent control, session management, and
 display alongside argument handling — this file should stay boring.
 
-**No model client is constructed here.** Local inference is a deployment
-concern and this box has no GPU, so `--model` selects a *factory* and an
-unconfigured run says so plainly rather than failing halfway through a task
-with a connection error.
+Selecting a backend never contacts a server. `OllamaClient` construction is
+pure, so an unreachable model surfaces on the first request as
+`ModelUnavailable` -- naming the host and the model -- rather than as a
+connection error thrown during argument parsing.
 """
 
 from __future__ import annotations
@@ -20,8 +20,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from shamsu.interfaces.models import ModelClient
+from shamsu.models.ollama import DEFAULT_HOST, OllamaClient, list_models
 from shamsu.runtime.limits import ExecutionLimits
 from shamsu.ui.app import AppOptions, exit_code, run_task
+from shamsu.ui.repl import Settings, run_repl
+
+#: Used when `--model ollama` names a backend but not a model. A coder-tuned
+#: model, because every contract in `models/contracts.py` is a coding decision.
+DEFAULT_OLLAMA_MODEL = "qwen2.5-coder:14b"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,7 +46,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         default="ollama",
-        help="Model backend. 'fake' runs a scripted client for smoke-testing the interface.",
+        help=(
+            "Model backend. 'ollama' uses the default local model, 'fake' runs a "
+            "scripted client for smoke-testing the interface, and any other value "
+            "is taken as an Ollama model name (e.g. 'qwen2.5-coder:14b')."
+        ),
+    )
+    parser.add_argument(
+        "--ollama-host",
+        default=DEFAULT_HOST,
+        help=f"Ollama server to use (default: {DEFAULT_HOST}).",
+    )
+    parser.add_argument(
+        "--context-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override the context window. Sent to Ollama as num_ctx and used as the "
+            "compiler's budget; larger windows cost VRAM."
+        ),
     )
     parser.add_argument(
         "--no-tui",
@@ -68,20 +92,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not args.request:
-        parser.print_help()
-        return 2
-
     workspace = args.workspace.resolve()
     if not workspace.is_dir():
         print(f"shamsu: {workspace} is not a directory", file=sys.stderr)
         return 2
 
-    try:
-        model = _model(args.model)
-    except NotImplementedError as exc:
-        print(f"shamsu: {exc}", file=sys.stderr)
-        return 2
+    # No request means an interactive session rather than a usage dump. The
+    # one-shot form is still the scriptable one; this is the one you sit in.
+    if not args.request:
+        return run_repl(
+            Settings(
+                model_name=DEFAULT_OLLAMA_MODEL if args.model == "ollama" else args.model,
+                host=args.ollama_host,
+                workspace=workspace,
+                context_tokens=args.context_tokens,
+                colour=not args.no_colour,
+                limits=(
+                    ExecutionLimits(actions_per_step=args.max_actions) if args.max_actions else None
+                ),
+                database=args.database,
+            ),
+            lambda settings: _model(
+                settings.model_name,
+                host=settings.host,
+                context_tokens=settings.context_tokens,
+            ),
+            list_models=lambda host: list_models(host),
+        )
+
+    model = _model(args.model, host=args.ollama_host, context_tokens=args.context_tokens)
 
     limits = ExecutionLimits(actions_per_step=args.max_actions) if args.max_actions else None
     options = AppOptions(
@@ -105,22 +144,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     return exit_code(result)
 
 
-def _model(name: str) -> ModelClient:
+def _model(
+    name: str,
+    *,
+    host: str = DEFAULT_HOST,
+    context_tokens: int | None = None,
+) -> ModelClient:
     """Resolve a model backend by name.
 
-    Raises:
-        NotImplementedError: the backend is not wired up. Said plainly and
-            early, because the alternative is failing three minutes into a task
-            with a connection error the user has to interpret.
+    `fake` is the scripted client; `ollama` is the default local model; any
+    other value names an Ollama model directly, so `--model qwen2.5-coder:14b`
+    works without a second flag. Nothing here contacts a server -- an
+    unreachable one is reported by the first request, which can name it.
     """
     if name == "fake":
         from shamsu.models.scripted import ScriptedModel
 
         return ScriptedModel()
 
-    raise NotImplementedError(
-        f"model backend {name!r} is not wired up yet. Local inference lands with the "
-        "GPU work; use --model fake to exercise the interface."
+    return OllamaClient(
+        DEFAULT_OLLAMA_MODEL if name == "ollama" else name,
+        host=host,
+        context_tokens=context_tokens,
     )
 
 
