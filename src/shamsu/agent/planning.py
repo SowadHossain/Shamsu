@@ -52,6 +52,7 @@ from shamsu.verification.evidence import GateResult, check_completion
 READ_ONLY_TOOLS: tuple[str, ...] = (
     "project.inspect",
     "code.search",
+    "file.list",
     "file.read",
     "git.inspect",
 )
@@ -59,6 +60,7 @@ CHANGE_TOOLS: tuple[str, ...] = (
     *READ_ONLY_TOOLS,
     "file.patch",
     "test.run",
+    "check.run",
     "git.checkpoint",
 )
 
@@ -140,6 +142,113 @@ def map_required_evidence(phrases: Sequence[str]) -> EvidenceMapping:
     return EvidenceMapping(kinds=frozenset(kinds), unrecognised=tuple(unrecognised))
 
 
+#: Verbs that mean a step only looks at things. Anchored to the start of the
+#: title, because a step *begins* with what it does.
+_INVESTIGATIVE = re.compile(
+    r"^(understand|review|analys|analyz|examine|inspect|investigat|identif|determin"
+    r"|assess|explor|read|locate|find|search|survey|audit|research|study|clarif"
+    r"|gather|collect|map|list|trace|diagnos|confirm|evaluat|consider|plan)\w*\b"
+)
+
+#: Verbs that mean a step intends to write. Searched anywhere in the text: a
+#: step titled "Understand and fix the login bug" is a change step, and the
+#: word that settles it is not at the front.
+#:
+#: Two rules make this reliable where a naive verb list is not.
+#:
+#: **Whole words, not `verb\w*` stems.** The stem form matched nouns:
+#: `configur\w*` claimed "Read the configuration" as a change step, which is
+#: precisely the misclassification this module exists to prevent.
+#:
+#: **A determiner in front makes it a noun.** English does the disambiguation
+#: for us — "examine the patch format" is a noun and "review the code and patch
+#: the parser" is a verb, and the word before it is what says so. Without this,
+#: every verb that doubles as a common noun (patch, build, fix, update, change)
+#: had to be dropped from the list entirely, which lost the real verb uses too.
+#:
+#: **No third-person `-s` forms.** A title *starting* with a mutating verb
+#: never reaches the investigative branch anyway, because `_INVESTIGATIVE` is
+#: anchored — so this pattern only has to catch mutating verbs in non-initial
+#: position. Step titles are imperative ("Add a route"), which means a
+#: non-initial `-s` form is almost always *describing* existing code rather
+#: than commanding a change: "Analyse how the planner builds a frame" is an
+#: investigation, and `builds` is the wrong word to read as intent.
+_MUTATING = re.compile(
+    r"(?<!\bthe )(?<!\ba )(?<!\bthis )(?<!\bits )(?<!\bany )"
+    r"\b("
+    r"add(?:ing|ed)?|creat(?:e|ing|ed)|writ(?:e|ing)|wrote"
+    r"|implement(?:ing|ed)?|fix(?:ing|ed)?|updat(?:e|ing|ed)"
+    r"|modif(?:y|ying|ied)|edit(?:ing|ed)?|chang(?:e|ing|ed)"
+    r"|remov(?:e|ing|ed)|delet(?:e|ing|ed)|renam(?:e|ing|ed)"
+    r"|refactor(?:ing|ed)?|patch(?:ing|ed)?|migrat(?:e|ing|ed)"
+    r"|install(?:ing|ed)?|configur(?:e|ing|ed)|wir(?:e|ing|ed)"
+    r"|replac(?:e|ing|ed)|introduc(?:e|ing|ed)|extend(?:ing|ed)?"
+    r"|build(?:ing)?|built|set up|setting up|generat(?:e|ing|ed)"
+    r"|appl(?:y|ying|ied)|rewrit(?:e|ing)|rewrote"
+    r"|correct(?:ing|ed)?|repair(?:ing|ed)?"
+    r")\b"
+)
+
+
+def effective_kind(proposal: PlanStepProposal, *, read_only: bool = False) -> str:
+    """The kind the runtime will actually execute a step as.
+
+    `read_only` is plan mode, and it is absolute: every step becomes
+    `investigate`, which strips every mutating tool from its allowlist. The
+    model is not asked to refrain from editing — it is not given anything that
+    can edit. That is the difference between a mode and a prompt instruction,
+    and it is the whole reason the setting is worth having.
+
+    `PlanStepProposal.kind` defaults to `change`, which is the stricter option
+    on the axis the default was chosen for — a change step cannot lower its
+    evidence floor. But strictness on that axis is not free on the other one: a
+    change step *must* produce `file_changed` and `git_diff_reviewed`, so a
+    step that was never going to write anything becomes unsatisfiable rather
+    than merely well-guarded. The gate then refuses forever, correctly and
+    uselessly.
+
+    That is not hypothetical. A small model asked to plan a greeting proposed a
+    single step titled "Understand the task", omitted `kind`, and the run ended
+    BLOCKED on missing `file_changed` — evidence no honest execution of that
+    step could ever have produced.
+
+    So a `change` proposal is re-read as `investigate` when its title opens with
+    an investigative verb and nothing in the title or intent says it will write.
+    The reclassification is *safe by construction* — `investigate` strips every
+    mutating tool — so the failure mode of being wrong here is a step that
+    cannot edit, which the repair path already reports honestly. Being wrong in
+    the other direction produces a run that can never finish.
+
+    **The verb outranks the file list, and that ordering was earned.** An
+    earlier version checked `proposal.files` first, on the theory that a step
+    naming files intends to edit them. The §31.1 evaluation showed otherwise:
+    qwen2.5-coder:7b planned *"Locate the add function"* with `files:
+    ["calc.py"]` and *"Locate the slugify function"* with `files: ["slug.py"]`,
+    because the file is where it intends to *look*. Both became change steps
+    carrying `file_changed` + `git_diff_reviewed`, so a plan's opening
+    orientation step demanded a patch and a diff review before the real work
+    began — and since evidence is scoped per step, every later step had to earn
+    the same pair again. Two of the first three eval tasks did the job
+    correctly and still ended BLOCKED on that.
+
+    Naming a file you will read is not naming a file you will write, and the
+    verb is what distinguishes them. `files` still decides when the title says
+    nothing either way.
+    """
+    if read_only or proposal.kind == "investigate":
+        return "investigate"
+
+    text = f"{proposal.title} {proposal.intent}".strip().lower()
+    if _MUTATING.search(text):
+        return "change"
+    if _INVESTIGATIVE.match(text):
+        return "investigate"
+
+    # The title said nothing either way. A named file is then the best signal
+    # available, and `change` is the safe default when there is none.
+    return "change"
+
+
 def evidence_floor(kind: str) -> frozenset[EvidenceKind]:
     """The minimum evidence the runtime requires for a step of this kind."""
     return CHANGE_FLOOR if kind == "change" else frozenset()
@@ -165,11 +274,60 @@ class PlanValidation:
     notes: tuple[str, ...] = ()
 
 
+#: Phrasings that mean a *request* wants something edited. Deliberately a
+#: separate pattern from `_MUTATING`, which reads step titles: a title is an
+#: imperative written by a model, while a request is prose written by a person
+#: and states requirements as often as actions. "charge() must raise a
+#: ValueError when amount is negative" contains no verb from `_MUTATING` and is
+#: unmistakably a change request.
+#:
+#: Tuned to over-detect. Deciding a request wants an edit when it only wanted
+#: an explanation costs a rejected plan and a re-plan; deciding the reverse
+#: lets an all-investigate plan report success with nothing done.
+_CHANGE_REQUEST = re.compile(
+    # A copula in front makes the word a predicate, not an instruction:
+    # "confirm add() is correct" describes a state, "correct the typo" asks for
+    # work. Same trick as `_MUTATING`'s determiner guard, one part of speech up.
+    r"(?<!\bis )(?<!\bare )(?<!\bwas )(?<!\bwere )(?<!\bbe )(?<!\bbeen )"
+    r"(?<!\blooks )(?<!\bseems )(?<!\bstays )"
+    # And a determiner in front makes it a noun, exactly as in `_MUTATING`:
+    # "is the build passing?" asks about a build, it does not ask for one.
+    r"(?<!\bthe )(?<!\ba )(?<!\bthis )(?<!\bits )(?<!\bany )(?<!\bour )"
+    r"\b("
+    # Direct actions.
+    r"add|creat\w*|writ\w*|implement\w*|fix\w*|updat\w*|modif\w*|edit\w*"
+    r"|chang\w*|remov\w*|delet\w*|renam\w*|refactor\w*|patch\w*|migrat\w*"
+    r"|install\w*|configur\w*|wire|replac\w*|introduc\w*|extend\w*|build"
+    r"|set up|generat\w*|appl\w*|rewrit\w*|correct\w*|repair\w*"
+    # Requirements. A person states what the code must do at least as often as
+    # they state what to do to it.
+    #
+    # Deliberately excludes `support`, `handle`, `allow`, `prevent`, `enable`
+    # and `improve`. Each is as often a question about a capability as a demand
+    # for one — "do you support typescript" and "does the parser handle
+    # unicode" are questions, and reading them as change requests sent them
+    # down a path that can only edit and prove. The requirement sense is
+    # carried well enough by `must`, `should` and `needs to`.
+    r"|must|should|needs? to|has to|make|ensure|reject\w*|raise|validat\w*|clean up"
+    # Not when it is a symbol name. "look at add()" is a question about a
+    # function that happens to be called `add`, not an instruction to add
+    # something — and `\b` alone cannot tell those apart.
+    r")\b(?!\s*\()"
+)
+
+
+def asks_for_a_change(request: str) -> bool:
+    """Whether the request wants something edited, rather than explained."""
+    return bool(_CHANGE_REQUEST.search(request.strip().lower()))
+
+
 def validate_plan(
     plan: ImplementationPlan,
     *,
     sandbox: PathSandbox | None = None,
     files_seen: Sequence[str] = (),
+    request: str = "",
+    read_only: bool = False,
 ) -> PlanValidation:
     """Check a proposal before it becomes state.
 
@@ -197,15 +355,40 @@ def validate_plan(
             notes.append(f"{label} repeats an earlier step title; the run log will be ambiguous")
         titles.add(lowered)
 
-        if step.kind == "change" and not step.acceptance_criteria:
+        kind = effective_kind(step)
+        if kind != step.kind:
+            notes.append(
+                f"{label} was proposed as a change but names no files and reads as "
+                "investigation; it will run read-only"
+            )
+        if kind == "change" and not step.acceptance_criteria:
             notes.append(f"{label} changes code but defines no acceptance criteria")
-        if step.kind == "change" and not step.files:
+        if kind == "change" and not step.files:
             notes.append(f"{label} changes code but names no files")
 
     if files_seen:
         invented = [path for path in plan.grounded_in if path not in seen]
         if invented:
             problems.append(f"plan cites files that were never read: {', '.join(sorted(invented))}")
+
+    # A plan that only investigates cannot satisfy a request to change
+    # something, and — because an `investigate` step requires no evidence — it
+    # passes every gate it meets. The §31.1 evaluation caught exactly that: a
+    # 7B asked to fix a failing test planned "Inspect the Project Structure",
+    # "Identify Dependencies", "Review Failing Tests", all three legitimately
+    # read-only, all three trivially satisfied. The run reported completion
+    # with the bug untouched — a **false success**, the one outcome the
+    # evidence architecture exists to prevent.
+    #
+    # A problem rather than a note, so it forces a re-plan instead of being
+    # reported after the damage. Skipped in read-only mode, where a plan with
+    # no change step is the entire point.
+    wants_a_change = bool(request) and not read_only and asks_for_a_change(request)
+    if wants_a_change and not any(effective_kind(step) == "change" for step in plan.steps):
+        problems.append(
+            "the request asks for a change but no step in this plan would edit "
+            "anything; a plan made only of investigation cannot carry it out"
+        )
 
     return PlanValidation(ok=not problems, problems=tuple(problems), notes=tuple(notes))
 
@@ -218,6 +401,11 @@ class MaterialisedPlan:
     steps: tuple[PlanStepRecord, ...]
     unmapped_evidence: tuple[str, ...] = ()
 
+    #: Titles of steps the runtime executed as `investigate` despite the
+    #: proposal saying `change`. Surfaced rather than silent: a step that
+    #: quietly lost its ability to write is a confusing run to debug.
+    reclassified: tuple[str, ...] = ()
+
     @property
     def plan_id(self) -> PlanId:
         return self.record.plan_id
@@ -228,6 +416,7 @@ def materialise(
     plan: ImplementationPlan,
     *,
     version: int = 1,
+    read_only: bool = False,
 ) -> MaterialisedPlan:
     """Build plan and step records from a proposal. Pure; touches no store.
 
@@ -238,14 +427,27 @@ def materialise(
     plan_id = PlanId(new_id())
     steps: list[PlanStepRecord] = []
     unmapped: list[str] = []
+    reclassified: list[str] = []
 
     for ordinal, proposal in enumerate(plan.steps):
         mapping = map_required_evidence(proposal.required_evidence)
         unmapped.extend(mapping.unrecognised)
 
+        # What the step *is*, which is not always what the proposal called it.
+        kind = effective_kind(proposal, read_only=read_only)
+        if kind != proposal.kind:
+            reclassified.append(proposal.title)
+
         # Union, never replacement. A plan proposing no evidence at all still
         # gets the floor for its kind.
-        required = mapping.kinds | evidence_floor(proposal.kind)
+        required = mapping.kinds | evidence_floor(kind)
+
+        # An investigate step cannot patch, so a mapped requirement for
+        # FILE_CHANGED is a requirement it has no tool to satisfy. Dropping it
+        # keeps the model's *raised* bar meaningful while refusing to build a
+        # gate with no key -- the phrase survives as an acceptance criterion.
+        if kind == "investigate":
+            required -= CHANGE_FLOOR
 
         steps.append(
             PlanStepRecord(
@@ -256,7 +458,7 @@ def materialise(
                 inputs=proposal.files,
                 outputs=(),
                 constraints=(proposal.intent,) if proposal.intent else (),
-                allowed_tools=allowed_tools_for(proposal.kind),
+                allowed_tools=allowed_tools_for(kind),
                 acceptance_criteria=_criteria(proposal, mapping),
                 required_evidence=tuple(sorted(required, key=lambda kind: kind.value)),
                 risk=Risk(proposal.risk),
@@ -273,6 +475,7 @@ def materialise(
         ),
         steps=tuple(steps),
         unmapped_evidence=tuple(dict.fromkeys(unmapped)),
+        reclassified=tuple(dict.fromkeys(reclassified)),
     )
 
 
@@ -322,10 +525,17 @@ class Planner:
         *,
         limits: ExecutionLimits | None = None,
         sandbox: PathSandbox | None = None,
+        read_only: bool = False,
     ) -> None:
         self._store = store
         self._limits = limits or DEFAULT_LIMITS
         self._sandbox = sandbox
+        self._read_only = read_only
+
+    @property
+    def read_only(self) -> bool:
+        """Whether every step is forced to `investigate` (plan mode)."""
+        return self._read_only
 
     # -- creating and replacing plans --------------------------------------
 
@@ -389,11 +599,17 @@ class Planner:
         version: int,
         files_seen: Sequence[str],
     ) -> MaterialisedPlan:
-        validation = validate_plan(plan, sandbox=self._sandbox, files_seen=files_seen)
+        validation = validate_plan(
+            plan,
+            sandbox=self._sandbox,
+            files_seen=files_seen,
+            request=task.request,
+            read_only=self._read_only,
+        )
         if not validation.ok:
             raise PlanRejected(validation.problems)
 
-        materialised = materialise(task.task_id, plan, version=version)
+        materialised = materialise(task.task_id, plan, version=version, read_only=self._read_only)
         self._store.create_plan(materialised.record, materialised.steps)
 
         if version == 1:
@@ -525,6 +741,8 @@ __all__ = [
     "PlanValidation",
     "Planner",
     "allowed_tools_for",
+    "asks_for_a_change",
+    "effective_kind",
     "evidence_floor",
     "map_required_evidence",
     "materialise",

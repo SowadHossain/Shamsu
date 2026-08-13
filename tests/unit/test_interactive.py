@@ -120,6 +120,57 @@ class TestCommandDropdown:
         assert session._press(Key.ENTER) == QUIT
 
 
+class TestArgumentDropdown:
+    """After a command is chosen, the dropdown offers its argument's values."""
+
+    def test_a_space_after_a_command_offers_its_values(self, tmp_path: Path) -> None:
+        _type(session := _session(tmp_path), "/mode ")
+        assert session.state.choices == ("build", "plan")
+
+    def test_the_command_list_closes_once_an_argument_starts(self, tmp_path: Path) -> None:
+        _type(session := _session(tmp_path), "/mode ")
+        assert session.state.suggestions == ()
+
+    def test_it_narrows_as_the_value_is_typed(self, tmp_path: Path) -> None:
+        _type(session := _session(tmp_path), "/mode p")
+        assert session.state.choices == ("plan",)
+
+    def test_tab_fills_the_argument_in(self, tmp_path: Path) -> None:
+        _type(session := _session(tmp_path), "/mode p")
+        session._press(Key.TAB)
+        assert session.state.text == "/mode plan"
+
+    def test_tab_takes_the_highlighted_value(self, tmp_path: Path) -> None:
+        _type(session := _session(tmp_path), "/theme ")
+        session._press(Key.DOWN)
+        session._press(Key.TAB)
+        assert session.state.text == "/theme off"
+
+    def test_a_completed_argument_runs(self, tmp_path: Path) -> None:
+        _type(session := _session(tmp_path), "/mode plan")
+        assert session._press(Key.ENTER) == ""
+        assert session.settings.mode == "plan"
+
+    def test_models_are_only_fetched_for_the_command_that_wants_them(self, tmp_path: Path) -> None:
+        """A session that never touches /model must never wait on Ollama."""
+        asked: list[str] = []
+        settings = Settings(model_name="m", host="http://localhost:11434", workspace=tmp_path)
+        session = InteractiveSession(
+            settings,
+            lambda _s: pytest.fail("no model"),
+            handle_command=handle_command,
+            list_models=lambda host: (asked.append(host), ("a:1",))[1],
+        )
+        _type(session, "/mode ")
+        assert asked == [], "the mode list is fixed; the server was not needed"
+
+        _type(session, "")
+        session._buffer = session._buffer.__class__(text="/model ", cursor=7)
+        session._sync()
+        assert asked, "the model list does need the server"
+        assert session.state.choices == ("a:1",)
+
+
 class TestPalette:
     def test_ctrl_p_offers_everything_from_a_blank_prompt(self, tmp_path: Path) -> None:
         session = _session(tmp_path)
@@ -167,11 +218,11 @@ class TestLeaderKey:
 class TestFileReference:
     def test_an_at_opens_the_file_list(self, tmp_path: Path) -> None:
         _type(session := _session(tmp_path), "look at @")
-        assert session.state.files == ("calc.py", "src/theme.py", "tests/test_calc.py")
+        assert session.state.choices == ("calc.py", "src/theme.py", "tests/test_calc.py")
 
     def test_it_narrows_as_you_type(self, tmp_path: Path) -> None:
         _type(session := _session(tmp_path), "@theme")
-        assert session.state.files == ("src/theme.py",)
+        assert session.state.choices == ("src/theme.py",)
 
     def test_tab_inserts_the_chosen_path(self, tmp_path: Path) -> None:
         _type(session := _session(tmp_path), "look at @theme")
@@ -181,11 +232,11 @@ class TestFileReference:
     def test_choosing_a_file_closes_the_list(self, tmp_path: Path) -> None:
         _type(session := _session(tmp_path), "@theme")
         session._press(Key.TAB)
-        assert session.state.files == ()
+        assert session.state.choices == ()
 
     def test_commands_and_files_are_never_offered_together(self, tmp_path: Path) -> None:
         _type(session := _session(tmp_path), "/mo")
-        assert session.state.files == ()
+        assert session.state.choices == ()
 
     def test_the_arrows_select_a_file(self, tmp_path: Path) -> None:
         _type(session := _session(tmp_path), "@")

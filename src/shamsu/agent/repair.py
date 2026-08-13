@@ -28,17 +28,22 @@ it and records why.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from shamsu.interfaces.enums import FailureKind, StepOutcome
+from shamsu.interfaces.enums import EvidenceKind, FailureKind, StepOutcome
 from shamsu.interfaces.ids import FailureId, StepId, TaskId
 from shamsu.memory.store import MemoryStore
 from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits
 from shamsu.state.records import FailureRecord, new_id
 from shamsu.state.store import StateStore
 from shamsu.verification.digest import RepairTracker, TestDigest
-from shamsu.verification.failure import FailureCapsule, RepairAttempt, build_capsule
+from shamsu.verification.failure import (
+    FailureCapsule,
+    RepairAttempt,
+    build_capsule,
+    evidence_capsule,
+)
 
 #: Path shapes treated as tests. A heuristic, and named as one: it covers the
 #: conventions of the ecosystems v2 targets first and will need extending. The
@@ -175,6 +180,47 @@ class RepairController:
             raw=raw,
         )
 
+        self._record(capsule, step_id)
+        return self._decide(capsule, history)
+
+    def consider_unmet_evidence(
+        self,
+        missing: Sequence[EvidenceKind],
+        *,
+        producers: Mapping[EvidenceKind, Sequence[str]] | None = None,
+        step_id: StepId | None = None,
+        changed_files: Sequence[str] = (),
+        related_files: Sequence[str] = (),
+    ) -> RepairDecision:
+        """Decide about a step that ended without the evidence its gate needs.
+
+        The same budget, the same stuck detection, the same persistence as a
+        test failure — because it is the same question, asked about a different
+        kind of shortfall. What differs is that the remedy is often a single
+        read-only call, so the write scope is only required when the missing
+        evidence is `FILE_CHANGED`: refusing to retry a missing `git.inspect`
+        because no file may be edited would block on a permission the fix does
+        not need.
+        """
+        history = self._history(step_id)
+        signature = "unmet-evidence:" + "+".join(sorted(kind.value for kind in missing))
+        capsule = evidence_capsule(
+            missing,
+            producers=producers,
+            changed_files=changed_files,
+            related_files=related_files,
+            previous_attempts=history,
+            prior_lesson=self._prior_lesson(signature),
+        )
+        self._record(capsule, step_id)
+        return self._decide(capsule, history, require_writable=EvidenceKind.FILE_CHANGED in missing)
+
+    def _record(self, capsule: FailureCapsule, step_id: StepId | None) -> None:
+        """Persist the failure *before* the decision.
+
+        A run that stops here still leaves a complete account of why. v1
+        recorded outcomes and lost the reasons.
+        """
         self.store.record_failure(
             FailureRecord(
                 failure_id=FailureId(new_id()),
@@ -199,6 +245,14 @@ class RepairController:
                 related_paths=capsule.editable(),
             )
 
+    def _decide(
+        self,
+        capsule: FailureCapsule,
+        history: Sequence[RepairAttempt],
+        *,
+        require_writable: bool = True,
+    ) -> RepairDecision:
+        """Budget, stuck detection, and scope — the decision every failure shares."""
         scope = RepairScope.for_capsule(capsule, allow_test_edits=self.allow_test_edits)
 
         # Rebuilt from persisted history on every call rather than accumulated
@@ -235,9 +289,14 @@ class RepairController:
                 outcome=StepOutcome.BLOCKED,
             )
 
-        if not scope.allowed:
+        if require_writable and not scope.allowed:
             # Nothing the failure implicates may be edited. Reporting that is
             # honest; widening the scope to have something to do is not.
+            #
+            # Skipped when the remedy needs no write at all — a missing
+            # `git_diff_reviewed` is fixed by one `git.inspect` call, and
+            # refusing that because the step's only changed file was a
+            # protected test would block on a permission it never wanted.
             return RepairDecision(
                 proceed=False,
                 reason=(

@@ -20,10 +20,10 @@ failure mode is a documented fall-through to `TEST_FAILURE`.
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
-from shamsu.interfaces.enums import FailureKind
+from shamsu.interfaces.enums import EvidenceKind, FailureKind
 from shamsu.verification.digest import TestDigest, error_signature
 
 #: Ordered patterns, most specific first. The first match wins. Order matters
@@ -98,6 +98,10 @@ _PROBES: dict[FailureKind, tuple[str, ...]] = {
         "Check the path is inside the workspace; the sandbox refuses anything else.",
     ),
     FailureKind.MISSING_CONTEXT: ("Search for the symbol before assuming where it lives.",),
+    FailureKind.INCOMPLETE_EVIDENCE: (
+        "The work may already be done; what is missing is the proof.",
+        "Call the tool that produces the missing evidence before concluding again.",
+    ),
 }
 
 _DEFAULT_PROBES: tuple[str, ...] = (
@@ -263,6 +267,52 @@ def build_capsule(
     )
 
 
+def evidence_capsule(
+    missing: Sequence[EvidenceKind],
+    *,
+    producers: Mapping[EvidenceKind, Sequence[str]] | None = None,
+    changed_files: Sequence[str] = (),
+    related_files: Sequence[str] = (),
+    previous_attempts: Sequence[RepairAttempt] = (),
+    prior_lesson: str = "",
+) -> FailureCapsule:
+    """A capsule for a step that ended without the evidence its gate requires.
+
+    Distinct from `build_capsule` because there is no failing command to digest.
+    Every tool call may have succeeded; what is missing is proof, and often only
+    one call's worth of it.
+
+    That case is common and was previously unrecoverable. A live §31.1 run fixed
+    `add()` correctly, produced `file_changed`, and stopped one `git.inspect`
+    short of `git_diff_reviewed` — then blocked, because repair was reachable
+    only from a *test* failure. The capsule says which evidence is outstanding
+    and which tool produces it, so the next attempt is a single call rather than
+    a re-derivation.
+
+    The signature is the sorted missing kinds, so two identical refusals look
+    identical to `RepairTracker` and the run stops rather than looping.
+    """
+    names = sorted(kind.value for kind in missing)
+    tools = producers or {}
+
+    wanted: list[str] = []
+    for kind in sorted(missing, key=lambda item: item.value):
+        available = sorted(set(tools.get(kind, ())))
+        wanted.append(f"{kind.value} (call {' or '.join(available)})" if available else kind.value)
+
+    return FailureCapsule(
+        kind=FailureKind.INCOMPLETE_EVIDENCE,
+        signature=f"unmet-evidence:{'+'.join(names)}",
+        expected="verified evidence: " + ", ".join(wanted),
+        actual="the step concluded without producing it",
+        changed_files=tuple(dict.fromkeys(changed_files)),
+        related_files=tuple(dict.fromkeys(related_files)),
+        previous_attempts=tuple(previous_attempts),
+        prior_lesson=prior_lesson,
+        probes=_PROBES[FailureKind.INCOMPLETE_EVIDENCE],
+    )
+
+
 def _expected(digest: TestDigest) -> str:
     """What the run was supposed to produce, stated plainly."""
     if digest.failed_tests:
@@ -287,4 +337,5 @@ __all__ = [
     "RepairAttempt",
     "build_capsule",
     "classify_failure",
+    "evidence_capsule",
 ]

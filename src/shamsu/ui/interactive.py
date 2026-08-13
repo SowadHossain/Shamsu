@@ -27,8 +27,17 @@ from typing import TYPE_CHECKING
 from shamsu.artifacts.hashing import git_listed_files, is_ignored
 from shamsu.interfaces.cancellation import Cancelled
 from shamsu.interfaces.models import ModelClient, ModelUnavailable
-from shamsu.ui.app import Wiring, build_wiring, exit_code
-from shamsu.ui.commands import COMMANDS, common_prefix, complete, file_fragment, match_files
+from shamsu.ui.app import Wiring, build_wiring, exit_code, small_talk
+from shamsu.ui.approval import ScreenApprover
+from shamsu.ui.commands import (
+    COMMANDS,
+    common_prefix,
+    complete,
+    complete_argument,
+    file_fragment,
+    lookup,
+    match_files,
+)
 from shamsu.ui.editor import CANCELLED, EOF, Buffer, History
 from shamsu.ui.render import SPINNER
 from shamsu.ui.repl import recent_runs
@@ -90,6 +99,10 @@ class InteractiveSession:
         self._palette = False
         self._file_cache: tuple[str, ...] | None = None
 
+        # One approver for the session's lifetime: the key loop needs a stable
+        # object to ask "is a question open?" on every frame.
+        self._approver = ScreenApprover()
+
     @property
     def settings(self) -> Settings:
         return self._settings
@@ -105,7 +118,7 @@ class InteractiveSession:
         if self._wiring is None:
             self._wiring = build_wiring(
                 self._build_model(self._settings),
-                self._settings.options(""),
+                self._settings.options("", approver=self._approver),
             )
         return self._wiring
 
@@ -186,7 +199,7 @@ class InteractiveSession:
     @property
     def _open(self) -> bool:
         """Whether a dropdown is showing anything."""
-        return bool(self._state.suggestions or self._state.files)
+        return bool(self._state.suggestions or self._state.choices)
 
     def _dropdown(self, key: str) -> bool:
         """Handle a key the open dropdown owns. Returns whether it did.
@@ -195,7 +208,7 @@ class InteractiveSession:
         and ordinary editing get them back the moment it closes.
         """
         state = self._state
-        count = len(state.suggestions) or len(state.files)
+        count = len(state.suggestions) or len(state.choices)
 
         if key == Key.UP:
             state.selected = (state.selected - 1) % count
@@ -205,7 +218,7 @@ class InteractiveSession:
             self._accept_suggestion()
         elif key == Key.ESCAPE:
             state.suggestions = ()
-            state.files = ()
+            state.choices = ()
             self._palette = False
         else:
             return False
@@ -221,8 +234,12 @@ class InteractiveSession:
         """
         state = self._state
 
-        if state.files:
-            self._replace_fragment(state.files[state.selected])
+        if state.choices:
+            chosen = state.choices[state.selected]
+            if file_fragment(self._buffer.text, self._buffer.cursor) is not None:
+                self._replace_fragment(chosen)
+            else:
+                self._replace_argument(chosen)
             return
 
         if state.selected:
@@ -231,6 +248,13 @@ class InteractiveSession:
             text = common_prefix(state.suggestions) or state.suggestions[0].name
 
         self._palette = False
+        self._buffer = Buffer(text=text, cursor=len(text), history=self._buffer.history)
+        self._sync()
+
+    def _replace_argument(self, value: str) -> None:
+        """Swap a command's partly-typed argument for a chosen value."""
+        head, _, _ = self._buffer.text.partition(" ")
+        text = f"{head} {value}"
         self._buffer = Buffer(text=text, cursor=len(text), history=self._buffer.history)
         self._sync()
 
@@ -261,7 +285,7 @@ class InteractiveSession:
         """
         self._palette = True
         self._state.suggestions = COMMANDS
-        self._state.files = ()
+        self._state.choices = ()
         self._state.selected = 0
 
     def _sync(self) -> None:
@@ -273,12 +297,50 @@ class InteractiveSession:
         if self._palette:
             return
 
-        previous = (state.suggestions, state.files)
+        previous = (state.suggestions, state.choices)
         state.suggestions = complete(self._buffer.text)
-        state.files = self._files_for(self._buffer) if not state.suggestions else ()
 
-        if (state.suggestions, state.files) != previous:
+        # Three sources, in the order they can apply: a command being named, a
+        # command's argument being filled in, an `@` reference. They are
+        # mutually exclusive by construction — the text cannot be two of them.
+        if state.suggestions:
+            state.choices = ()
+        else:
+            state.choices = self._arguments_for(self._buffer) or self._files_for(self._buffer)
+
+        if (state.suggestions, state.choices) != previous:
             state.selected = 0
+
+    def _arguments_for(self, buffer: Buffer) -> tuple[str, ...]:
+        """Values for the argument of the command being typed.
+
+        Model names are fetched only when the command being completed actually
+        wants them, so a session that never touches `/model` never waits on
+        Ollama.
+        """
+        command = lookup(buffer.text.partition(" ")[0])
+        if command is None:
+            return ()
+
+        models = self._list_models(self._settings.host) if command.source == "model" else ()
+        paths = self._directories() if command.source == "path" else ()
+        return complete_argument(buffer.text, models=models, paths=paths)
+
+    def _directories(self) -> tuple[str, ...]:
+        """Sibling and child directories, for `/workspace`.
+
+        Neighbours as well as children: moving to a sibling project is at least
+        as common as descending into a subdirectory, and typing the whole path
+        is what the dropdown exists to avoid.
+        """
+        here = self._settings.workspace
+        found = {str(here.parent)}
+        for base in (here, here.parent):
+            try:
+                found.update(str(child) for child in base.iterdir() if child.is_dir())
+            except OSError:  # pragma: no cover - unreadable directory
+                continue
+        return tuple(sorted(found))
 
     def _files_for(self, buffer: Buffer) -> tuple[str, ...]:
         """Workspace paths matching the `@…` under the cursor."""
@@ -353,19 +415,61 @@ class InteractiveSession:
             state.note(Level.FAIL, "model", str(exc))
             return
 
+        # Small talk gets an answer, not a run. Checked before anything is
+        # registered, so a greeting leaves no task, plan, or run behind.
+        try:
+            reply = await small_talk(
+                wiring.session.model,
+                request,
+                workspace=self._settings.workspace,
+                limits=self._settings.limits,
+            )
+        except Cancelled:
+            state.busy = False
+            state.note(Level.STOP, "stopped", "cancelled")
+            return
+        if reply is not None:
+            state.busy = False
+            state.status = ""
+            if reply:
+                state.note(Level.NOTE, "shamsu", reply)
+            self._paint(screen)
+            return
+
         view = RunView(request=request, workspace=state.workspace)
         unsubscribe = wiring.runs.subscribe(view.apply)
         work = asyncio.ensure_future(wiring.session.run(request))
         drained = 0
 
+        asked = False
         try:
             while not work.done():
                 drained = self._drain(view, drained)
-                state.status = view.phase.value
                 state.evidence = len(view.evidence)
-                self._paint(screen)
 
-                if read_key(FRAME_SECONDS) == Key.CTRL_C:
+                # An open approval question outranks the phase: "waiting for
+                # you" is the only status that tells the user the run has
+                # stopped for a reason they can act on.
+                if self._approver.waiting:
+                    if not asked:
+                        for line in self._approver.question:
+                            state.note(Level.STOP, "approve", line.strip())
+                        asked = True
+                    state.status = "approve? y / any other key denies"
+                else:
+                    asked = False
+                    state.status = view.phase.value
+
+                self._paint(screen)
+                key = read_key(FRAME_SECONDS)
+
+                if self._approver.waiting:
+                    # A keystroke answers the question rather than cancelling
+                    # the run — including Ctrl-C, which `parse_answer` reads as
+                    # "not yes" and therefore denies.
+                    if self._approver.answer_key(key):
+                        state.note(Level.NOTE, "approve", "answered")
+                elif key == Key.CTRL_C:
                     # The UI never stops anything itself: it asks the runtime,
                     # which owns cancellation and knows how to stop cleanly.
                     for run_id in wiring.runs.active():

@@ -56,6 +56,24 @@ LEVEL_GLYPH: dict[str, str] = {
     Level.STOP: "■",
 }
 
+#: The same five meanings in characters every byte-oriented encoding has.
+#:
+#: The module docstring claims the display "survives a pipe, a mono terminal,
+#: `--no-colour`" — but it did not survive a stdout that cannot *encode* the
+#: glyphs. On a default Windows console (cp1252) the first activity line raised
+#: `UnicodeEncodeError: 'charmap' codec can't encode character '▸'` and
+#: took the whole run down with it, after the work was already done.
+#:
+#: `use_utf8_output` fixes the common case at the process boundary; this is the
+#: floor under it, for a stream that cannot be reconfigured at all.
+ASCII_GLYPH: dict[str, str] = {
+    Level.STEP: ">",
+    Level.OK: "*",
+    Level.FAIL: "x",
+    Level.NOTE: "-",
+    Level.STOP: "#",
+}
+
 PHASE_COLOUR: dict[Phase, str] = {
     Phase.INSPECT: BLUE,
     Phase.PLAN: VIOLET,
@@ -94,14 +112,89 @@ def supports_colour(stream: TextIO | None = None) -> bool:
         return False
 
 
-def activity_line(level: str, label: str, detail: str, *, colour: bool = True) -> str:
+def supports_unicode(stream: TextIO | None = None) -> bool:
+    """Whether `stream` can actually encode the glyphs this module draws.
+
+    Asked by *encoding the glyphs*, not by inspecting a platform or an encoding
+    name. A name-based guess is a guess; `str.encode` is the same operation the
+    write will perform, so agreement is guaranteed rather than hoped for.
+    """
+    target = stream if stream is not None else sys.stdout
+    encoding = getattr(target, "encoding", None)
+    if not encoding:
+        # A stream with no declared encoding (StringIO, a test double) holds
+        # text, not bytes, and cannot raise UnicodeEncodeError on write.
+        return True
+
+    try:
+        "".join(LEVEL_GLYPH.values()).encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def use_utf8_output() -> None:
+    """Ask stdout and stderr for UTF-8, ignoring streams that refuse.
+
+    Called once from the CLI entry point. The managed launcher already sets
+    `PYTHONIOENCODING=utf-8`, which is why `shamsu` worked while
+    `python -m shamsu` crashed on its first glyph — doing it here means the
+    program is correct on its own rather than correct because of how it
+    happened to be started.
+
+    Best-effort by construction: a redirected or already-wrapped stream may not
+    support reconfiguration, and `supports_unicode` is the fallback for exactly
+    that case.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):  # pragma: no cover - stream refuses
+            continue
+
+
+def fit_encoding(text: str, stream: TextIO | None = None) -> str:
+    """Make `text` writable to `stream`, replacing what it cannot encode.
+
+    For text this module does not own — an evidence report's `✓`, a path with
+    a non-Latin character, a model's reply. `ASCII_GLYPH` handles the glyphs we
+    choose ourselves and gives them meaningful substitutes; this is the
+    last-resort net for everything else, and it degrades a character rather
+    than losing the run.
+    """
+    target = stream if stream is not None else sys.stdout
+    encoding = getattr(target, "encoding", None)
+    if not encoding:
+        return text
+
+    try:
+        text.encode(encoding)
+    except LookupError:
+        return text
+    except UnicodeEncodeError:
+        return text.encode(encoding, "replace").decode(encoding, "replace")
+    return text
+
+
+def activity_line(
+    level: str,
+    label: str,
+    detail: str,
+    *,
+    colour: bool = True,
+    unicode: bool = True,
+) -> str:
     """One activity line, coloured, for the line-oriented renderer.
 
     The glyph and the label take the level's colour; the detail is split so the
     tool name reads as a tool and its subject reads as a path. The trailing
     timing is dimmed because it is context, not content.
     """
-    glyph = paint(LEVEL_GLYPH.get(level, "·"), LEVEL_COLOUR.get(level, ""), colour)
+    glyphs = LEVEL_GLYPH if unicode else ASCII_GLYPH
+    glyph = paint(glyphs.get(level, glyphs[Level.NOTE]), LEVEL_COLOUR.get(level, ""), colour)
     painted_label = paint(f"{label:<9}", LEVEL_COLOUR.get(level, GREY), colour)
     return f"  {glyph} {painted_label} {_detail(detail, colour)}".rstrip()
 
@@ -137,6 +230,7 @@ def _detail(detail: str, colour: bool) -> str:
 
 __all__ = [
     "AMBER",
+    "ASCII_GLYPH",
     "BLUE",
     "BOLD",
     "DIM",
@@ -149,6 +243,9 @@ __all__ = [
     "RESET",
     "VIOLET",
     "activity_line",
+    "fit_encoding",
     "paint",
     "supports_colour",
+    "supports_unicode",
+    "use_utf8_output",
 ]

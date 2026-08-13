@@ -19,11 +19,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# PDF text extraction. Optional rather than core because a repository that
+# holds no PDFs should not pay for one, and `tools/documents.py` degrades to a
+# message naming this extra when it is absent -- never to a crash, and never to
+# a silent wrong answer.
+#
+# `pypdf` and not v1's `pdfplumber`: pure Python, no native build step, and it
+# does the one thing needed here. Word documents need nothing at all, being a
+# zip of XML that `zipfile` and `xml.etree` already read.
+documents = [
+    "pypdf>=4.2",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.10",
+    "pypdf>=4.2",
 ]
 
 # NOTE: intentionally NO [project.scripts] entry point. SHAMSU ships a managed
@@ -79,6 +91,21 @@ warn_unreachable = true
 # path, so mypy would fail to resolve it anyway; this makes that explicit.
 [[tool.mypy.overrides]]
 module = "legacy_code.*"
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# numpy's own stubs use `type` statements, which need Python 3.12, and this
+# project targets 3.11. `pypdf` references numpy under TYPE_CHECKING for image
+# extraction, so following that import fails on a file we neither own nor call.
+# Skipped rather than the python_version raised: the runtime floor is a product
+# decision, not something a transitive stub gets to make.
+#
+# Skipped at `pypdf` rather than at `numpy`: `follow_imports` cannot help once
+# mypy has already *parsed* the offending stub, so the import has to be cut
+# before it is reached. Treating an optional extra as untyped is the same thing
+# mypy would do if it were not installed, which is the common case anyway.
+[[tool.mypy.overrides]]
+module = ["pypdf", "pypdf.*", "numpy", "numpy.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 

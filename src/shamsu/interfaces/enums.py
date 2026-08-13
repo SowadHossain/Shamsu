@@ -174,6 +174,12 @@ class FailureKind(StrEnum):
     BUILD_FAILURE = "build_failure"
     RUNTIME_FAILURE = "runtime_failure"
     TOOL_FAILURE = "tool_failure"
+
+    #: The step ended without producing the evidence its gate requires. Not a
+    #: tool failure -- every call may have succeeded -- and not a test failure.
+    #: The work is simply unfinished, and naming that is what lets the runtime
+    #: offer another attempt instead of blocking.
+    INCOMPLETE_EVIDENCE = "incomplete_evidence"
     PERMISSION_FAILURE = "permission_failure"
     MISSING_CONTEXT = "missing_context"
     PLAN_INVALIDATION = "plan_invalidation"

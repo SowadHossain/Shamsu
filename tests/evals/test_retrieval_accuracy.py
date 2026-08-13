@@ -77,7 +77,9 @@ CASES: tuple[Case, ...] = (
     Case("store.py", "src/shamsu/state/store.py", within=2),
     # Literal queries — the shape text search exists for.
     Case("required_evidence ⊆ verified_evidence", "src/shamsu/verification/evidence.py", within=3),
-    Case("PYTHONPYCACHEPREFIX", "src/shamsu/tools/testing.py", within=2),
+    # Moved to tools/process.py when check.run needed the same cancellation-safe
+    # spawn; the bytecode-cache redirection went with it.
+    Case("PYTHONPYCACHEPREFIX", "src/shamsu/tools/process.py", within=2),
 )
 
 #: Files whose tests the index must be able to name. Structural, so it stays

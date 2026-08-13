@@ -79,6 +79,11 @@ class InvestigationResult:
     stopped_because: str = ""
     ok: bool = False
 
+    #: The model could not be reached at all. Distinct from any other stop:
+    #: nothing downstream can succeed either, so a caller should report the
+    #: environment problem rather than continue and blame what follows.
+    unavailable: bool = False
+
     @property
     def actions_taken(self) -> int:
         return len(self.observations)
@@ -112,8 +117,25 @@ class ReadOnlyAgent:
         project_facts: str = "",
         cancel: CancellationToken | None = None,
         max_actions: int | None = None,
+        require_lookup: bool = False,
+        must_read: Sequence[str] = (),
     ) -> InvestigationResult:
         """Run the bounded investigation loop.
+
+        `require_lookup` refuses a conclusion reached without calling anything.
+        Off by default and on when the conclusion is the *deliverable* —
+        answering a user's question. During INSPECT the conclusion is only
+        input to planning, and the plan is separately checked against the files
+        actually read (`is_grounded`), so a quick conclusion there is cheap
+        rather than dishonest.
+
+        `must_read` names files the answer cannot be given without. Pointing at
+        a file is the most explicit instruction a user can give, and it was
+        being ignored: asked to review `@OpenBazaar_Marketplace_PRD.docx`, a
+        live run called `project.inspect` once and described the *repository* —
+        never opening the document it was handed. Both nudges are bounded by
+        `consecutive_failed_actions`, so a model that will not read still
+        leaves.
 
         Raises:
             Cancelled: the token fired. Propagated rather than swallowed — a
@@ -126,6 +148,10 @@ class ReadOnlyAgent:
 
         latest = ""
         consecutive_failures = 0
+        #: Conclusions refused for want of any look at the repository. Bounded
+        #: by the same counter as any other unproductive response, so a model
+        #: that will not look still leaves.
+        sent_back = 0
         attempted: list[tuple[str, str]] = []
 
         for _ in range(budget):
@@ -148,6 +174,7 @@ class ReadOnlyAgent:
                 decision = await self._decide(frame.render(), token)
             except ModelUnavailable as exc:
                 result.stopped_because = f"model unavailable: {exc}"
+                result.unavailable = True
                 return result
             except ModelContractError as exc:
                 # Recorded, not repaired. The runtime decides what a malformed
@@ -165,6 +192,40 @@ class ReadOnlyAgent:
                 continue
 
             if decision.action == "conclude":
+                # Concluding before looking at anything is not an investigation,
+                # it is a guess with a citation-shaped surface. A live run
+                # described a Node project with `package.json` and Jest in a
+                # directory holding one Python file, having called no tool at
+                # all — and nothing downstream can catch that, because a
+                # question has no evidence gate to fail.
+                #
+                # Bounded rather than once: a 7B often answers the first
+                # refusal with a *statement of intent* — "to understand this I
+                # would need to identify the entry points" — which is another
+                # conclusion, not a tool call. A second and third nudge are
+                # cheap, and the bound is the same one that ends any other
+                # unproductive exchange.
+                unread = [path for path in must_read if path not in result.files_seen]
+                blind = require_lookup and not result.observations
+
+                if (blind or unread) and sent_back < self._limits.consecutive_failed_actions:
+                    sent_back += 1
+                    if unread:
+                        listed = ", ".join(unread)
+                        latest = (
+                            f"You have not read {listed} yet, and the user asked about "
+                            f"it specifically. Call file.read with path='{unread[0]}' "
+                            "before concluding."
+                        )
+                    else:
+                        latest = (
+                            "You have not looked at anything in this repository yet, so "
+                            "that is a guess rather than an answer. Do not describe what "
+                            "you would do — call a tool now. `project.inspect` takes no "
+                            "arguments and is the usual place to start."
+                        )
+                    continue
+
                 result.conclusion = decision.conclusion
                 result.stopped_because = "the agent concluded"
                 result.ok = True
@@ -289,8 +350,16 @@ class ReadOnlyAgent:
         )
         try:
             return await self._model.generate_typed(request, ImplementationPlan, token)
-        except (ModelContractError, ModelUnavailable):
+        except ModelContractError:
+            # The model answered and the answer was unusable. `None` is the
+            # honest report of that, and the runtime turns it into a bounded
+            # retry.
             return None
+        # `ModelUnavailable` is deliberately *not* caught. A server that is down
+        # or a model that was never pulled is an environment problem, and
+        # folding it into "no usable plan" blames the model for the absence of
+        # one — the report a user then acts on sends them to their prompt
+        # instead of to `ollama serve` or `ollama pull`.
 
     async def _decide(self, prompt: str, token: CancellationToken) -> InvestigationStep:
         request = ModelRequest(

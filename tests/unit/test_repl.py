@@ -176,7 +176,7 @@ class TestTheLoop:
         from shamsu.models.scripted import ScriptedModel
 
         out = io.StringIO()
-        script = _Script(["do something", "/exit"])
+        script = _Script(["fix the adder", "/exit"])
         repl = Repl(
             _settings(tmp_path),
             lambda settings: ScriptedModel(),
@@ -212,7 +212,7 @@ class TestTheLoop:
             raise ModelUnavailable("could not reach Ollama at http://localhost:11434")
 
         out = io.StringIO()
-        script = _Script(["do something", "/model other:1b", "/exit"])
+        script = _Script(["fix the adder", "/model other:1b", "/exit"])
         repl = Repl(_settings(tmp_path), build, read_line=script, stream=out)  # type: ignore[arg-type]
 
         assert asyncio.run(repl.run()) == 0

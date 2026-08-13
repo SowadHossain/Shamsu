@@ -126,7 +126,7 @@ class TestRepairStaysInScope:
     def test_a_failure_becomes_a_capsule_and_a_scope(
         self, store: StateStore, task: TaskRecord, run: RunRecord, step_id: StepId, repo: Path
     ) -> None:
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
 
         request, result = _invoke(gateway, "test.run", Phase.VERIFY, command="pytest")
@@ -159,7 +159,7 @@ class TestRepairStaysInScope:
         self, store: StateStore, task: TaskRecord, repo: Path
     ) -> None:
         """A restriction that lives in the caller is one a different caller lacks."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         scope = RepairScope(allowed=frozenset({"calc.py"}), protected=frozenset({"tests/"}))
 
         with (
@@ -182,7 +182,7 @@ class TestRepairStaysInScope:
         self, store: StateStore, task: TaskRecord, repo: Path
     ) -> None:
         """Otherwise one out-of-scope attempt costs the decision its only edit."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         scope = RepairScope(allowed=frozenset({"calc.py"}))
 
         with gateway.restricted_to(scope), gateway.decision():
@@ -221,7 +221,7 @@ class TestRepairStaysInScope:
 
     def test_the_scope_is_restored_when_the_block_ends(self, repo: Path) -> None:
         """Nesting narrows; it never widens."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         assert gateway.scope is None
 
         outer = RepairScope(allowed=frozenset({"calc.py"}))
@@ -234,14 +234,14 @@ class TestRepairStaysInScope:
 
     def test_reads_are_never_restricted(self, repo: Path) -> None:
         """Repair may read affected files; it is writing that is bounded."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         with gateway.restricted_to(RepairScope(allowed=frozenset())):
             _, result = _invoke(gateway, "file.read", Phase.REPAIR, path="unrelated.py")
         assert result.ok is True
 
     def test_checkpointing_is_not_blocked_by_a_write_scope(self, repo: Path) -> None:
         """`git.checkpoint` records what is already on disk; it writes no file."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         _invoke(
             gateway,
             "file.patch",
@@ -268,7 +268,7 @@ class TestVerificationReadsTheCurrentSource:
         agent repairs a bug that no longer exists, and same-failure detection
         eventually blocks a task that was already finished.
         """
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
 
         _, first = _invoke(gateway, "test.run", Phase.VERIFY, command="pytest")
         assert first.ok is False
@@ -288,7 +288,7 @@ class TestVerificationReadsTheCurrentSource:
 
     def test_running_tests_leaves_no_bytecode_in_the_workspace(self, repo: Path) -> None:
         """A checkpoint diff should show real changes, not compilation debris."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         _invoke(gateway, "test.run", Phase.VERIFY, command="pytest")
 
         assert list(repo.rglob("__pycache__")) == []
@@ -299,7 +299,7 @@ class TestRepairFixesTheBug:
         self, store: StateStore, task: TaskRecord, run: RunRecord, step_id: StepId, repo: Path
     ) -> None:
         """Milestone 7's exit condition, end to end."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         controller = RepairController(store, task.task_id)
 
@@ -348,7 +348,7 @@ class TestRepairFixesTheBug:
         self, store: StateStore, task: TaskRecord, run: RunRecord, step_id: StepId, repo: Path
     ) -> None:
         """The most attractive wrong move: edit the test until it passes."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
 
         request, result = _invoke(gateway, "test.run", Phase.VERIFY, command="pytest")
@@ -384,7 +384,7 @@ class TestRepairFixesTheBug:
         self, store: StateStore, task: TaskRecord, run: RunRecord, step_id: StepId, repo: Path
     ) -> None:
         """A repair that changes nothing must not consume the whole budget."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         controller = RepairController(store, task.task_id)
         tool = gateway.get("test.run")
         assert tool is not None

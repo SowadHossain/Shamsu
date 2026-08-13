@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from shamsu.interfaces.cancellation import CancellationToken
+from shamsu.interfaces.enums import EvidenceKind
 from shamsu.interfaces.tools import ToolContract, ToolPolicyViolation, ToolResult
 
 InputT = TypeVar("InputT", bound=BaseModel)
@@ -80,6 +81,30 @@ class Tool(ABC, Generic[InputT]):
         """
         return ()
 
+    def read_targets(self, arguments: InputT) -> tuple[str, ...]:
+        """Workspace paths this call reveals the contents of.
+
+        The mirror of `write_targets`, and declared by the tool for the same
+        reason: the tool is what knows. A gateway inferring it from an argument
+        called `path` would be wrong the first time a tool named it something
+        else, and wrong silently.
+        """
+        return ()
+
+    def requires_prior_read(self, arguments: InputT) -> tuple[str, ...]:
+        """Paths this call may not touch until they have been read.
+
+        Empty by default. A tool that edits *existing* content should return
+        the file it is about to change: small models routinely supply an anchor
+        they never saw, which either wastes the turn on a failed exact match or
+        — worse — matches the wrong span silently.
+
+        Not the same as `write_targets`. Creating a new file needs no prior
+        read, so `file.patch` returns nothing here for `mode='create'` while
+        still declaring the write target.
+        """
+        return ()
+
     # -- helpers for implementations --------------------------------------
 
     def ok(
@@ -87,15 +112,39 @@ class Tool(ABC, Generic[InputT]):
         output: str,
         *,
         started: float | None = None,
+        evidence: Iterable[EvidenceKind] | None = None,
         **extra: Any,
     ) -> ToolResult:
-        """A successful result, with this tool's declared evidence attached."""
+        """A successful result, with this tool's declared evidence attached.
+
+        `evidence` narrows the grant for tools whose contract covers several
+        kinds but whose individual calls prove only one of them — `check.run`
+        declares lint, typecheck, and build, and a successful `ruff` run proves
+        linting alone. Granting the full contract there would be the forgery
+        the evidence architecture exists to prevent.
+
+        Widening is refused. A tool cannot mint evidence its contract never
+        declared, so the contract stays the single readable statement of what
+        this tool can prove, and a typo in a per-call grant fails loudly
+        instead of quietly certifying something nothing checked.
+
+        Raises:
+            ValueError: `evidence` contains a kind the contract does not declare.
+        """
+        granted = self.contract.produces_evidence if evidence is None else frozenset(evidence)
+        undeclared = granted - self.contract.produces_evidence
+        if undeclared:
+            names = ", ".join(sorted(kind.value for kind in undeclared))
+            raise ValueError(
+                f"{self.name} tried to grant evidence its contract does not declare: {names}"
+            )
+
         return ToolResult(
             tool=self.name,
             ok=True,
             output=output,
             duration_seconds=_elapsed(started),
-            evidence=self.contract.produces_evidence,
+            evidence=granted,
             invalidated=self.contract.invalidates,
             **extra,
         )

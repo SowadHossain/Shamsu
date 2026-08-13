@@ -33,10 +33,11 @@ def _inputs(**overrides: object) -> FrameInputs:
     return FrameInputs(**base)  # type: ignore[arg-type]
 
 
-def _tool(name: str = "file.read") -> ToolContract:
+def _tool(name: str = "file.read", arguments: tuple[str, ...] = ()) -> ToolContract:
     return ToolContract(
         name=name,
         purpose="Read a file.",
+        arguments=arguments,
         allowed_phases=frozenset({Phase.INSPECT}),
         risk=Risk.LOW,
         reversible=True,
@@ -80,7 +81,18 @@ class TestFrameStructure:
     def test_allowed_tools_are_rendered_by_name_and_purpose(self) -> None:
         frame = _compiler().compile(_inputs(), [_tool()])
         tools = next(s for s in frame.sections if s.name == "allowed tools")
-        assert "file.read: Read a file." in tools.content
+        assert "file.read(): Read a file." in tools.content
+
+    def test_a_tools_arguments_are_named(self) -> None:
+        """Omitting them made the model guess parameter names and be refused.
+
+        `*` marks required. The names come from the tool's own input model via
+        `ToolGateway.available`, so a listing cannot describe an argument that
+        does not exist.
+        """
+        frame = _compiler().compile(_inputs(), [_tool(arguments=("path*", "start_line"))])
+        tools = next(s for s in frame.sections if s.name == "allowed tools")
+        assert "file.read(path*, start_line): Read a file." in tools.content
 
     def test_the_rendered_frame_uses_bracketed_headers(self) -> None:
         rendered = _compiler().compile(_inputs(), [_tool()]).render()

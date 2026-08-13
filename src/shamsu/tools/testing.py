@@ -13,10 +13,7 @@ honestly that it cannot test.
 
 from __future__ import annotations
 
-import asyncio
-import os
 import sys
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -28,6 +25,7 @@ from shamsu.interfaces.enums import EvidenceKind, Phase, Risk
 from shamsu.interfaces.tools import ToolContract, ToolResult
 from shamsu.security.paths import PathEscape, PathSandbox
 from shamsu.tools.base import Tool
+from shamsu.tools.process import run_process
 from shamsu.verification.digest import TestDigest, digest_test_output
 
 #: The interpreter running SHAMSU, rather than whatever `python3` resolves to.
@@ -125,8 +123,8 @@ class TestRunTool(Tool[TestRunInput]):
             argv = (*argv, self._sandbox.relative(resolved))
 
         try:
-            with tempfile.TemporaryDirectory(prefix="shamsu-pycache-") as cache:
-                code, stdout, stderr = await self._spawn(argv, cancel, pycache=cache)
+            completed = await run_process(argv, cwd=self._workspace, cancel=cancel)
+            code, stdout, stderr = completed.exit_code, completed.stdout, completed.stderr
         except FileNotFoundError:
             return self.failed(f"{argv[0]} is not installed or not on PATH", started=started)
         except OSError as exc:
@@ -148,86 +146,6 @@ class TestRunTool(Tool[TestRunInput]):
         # negative result — but it must not register TESTS_PASSED. `failed`
         # attaches no evidence, which is exactly the required behaviour.
         return self.failed(rendered, started=started)
-
-    @staticmethod
-    def _environment(pycache: str) -> dict[str, str]:
-        """The subprocess environment, with bytecode caching redirected.
-
-        This is not a tidiness measure. CPython validates a cached `.pyc`
-        against the source's *(mtime in whole seconds, size)* — and an agent
-        patching a file often changes neither. `return a - b` becoming
-        `return a + b` is the same size, and a repair lands within a second of
-        the run that motivated it. Python then executes the previous bytecode,
-        the tests fail against code that is already correct, and the agent
-        repairs a bug that no longer exists until same-failure detection
-        declares a finished task stuck.
-
-        A fresh cache directory per run makes every run compile from source.
-        It costs a recompile and buys the guarantee that a verification result
-        describes the code currently on disk. It also keeps `__pycache__` out
-        of the workspace, so a checkpoint diff shows only real changes.
-        """
-        environment = dict(os.environ)
-        environment["PYTHONPYCACHEPREFIX"] = pycache
-        return environment
-
-    async def _spawn(
-        self, argv: tuple[str, ...], cancel: CancellationToken, *, pycache: str
-    ) -> tuple[int, str, str]:
-        """Run the command, killing it if cancellation arrives.
-
-        The kill matters: an abandoned pytest process keeps writing to the
-        workspace long after the run was 'stopped', which is precisely the
-        behaviour v2 exists to prevent.
-        """
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=self._workspace,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=self._environment(pycache),
-        )
-
-        communicate = asyncio.ensure_future(process.communicate())
-        watcher = asyncio.ensure_future(cancel.wait_cancelled())
-
-        done, _ = await asyncio.wait({communicate, watcher}, return_when=asyncio.FIRST_COMPLETED)
-
-        if communicate in done:
-            watcher.cancel()
-            await asyncio.gather(watcher, return_exceptions=True)
-            out, err = communicate.result()
-            return (
-                process.returncode or 0,
-                out.decode("utf-8", "replace"),
-                err.decode("utf-8", "replace"),
-            )
-
-        # Cancelled: terminate, then wait briefly before escalating.
-        with _suppress_process_errors():
-            process.terminate()
-        try:
-            await asyncio.wait_for(communicate, timeout=5.0)
-        except (TimeoutError, asyncio.CancelledError):
-            with _suppress_process_errors():
-                process.kill()
-        finally:
-            communicate.cancel()
-            await asyncio.gather(communicate, return_exceptions=True)
-
-        from shamsu.interfaces.cancellation import Cancelled
-
-        raise Cancelled(cancel.reason or "run cancelled")
-
-
-class _suppress_process_errors:
-    """Terminating an already-dead process is not an error worth propagating."""
-
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type: type[BaseException] | None, *_: object) -> bool:
-        return exc_type is not None and issubclass(exc_type, (ProcessLookupError, OSError))
 
 
 __all__ = ["DEFAULT_COMMANDS", "TestRunInput", "TestRunTool"]

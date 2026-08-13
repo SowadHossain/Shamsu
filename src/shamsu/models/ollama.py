@@ -95,9 +95,17 @@ DEFAULT_HOST = "http://localhost:11434"
 FALLBACK_CONTEXT_TOKENS = 8192
 
 #: Ceiling applied to a probed window. A model's maximum is not free: `num_ctx`
-#: allocates a KV cache, and qwen2.5-coder:14b's full 32k costs more VRAM than
-#: many machines have alongside the weights. Callers who have the headroom can
-#: raise it; callers who need the whole window can set it exactly.
+#: allocates a KV cache up front, and a window a machine cannot hold does not
+#: fail — it spills into system RAM and runs slowly enough to look broken.
+#:
+#: 16384 is chosen against the same 8 GB budget as `cli.DEFAULT_OLLAMA_MODEL`.
+#: For a 7B with 28 layers and 4 KV heads at head_dim 128, fp16 KV costs about
+#: 56 KiB per token, so this window is ~0.9 GB on top of ~4.7 GB of Q4 weights.
+#: The model's full 32k would roughly double the cache and leave nothing for
+#: compute buffers.
+#:
+#: Callers with more headroom can raise it; callers who need the whole window
+#: can set `context_tokens` exactly.
 DEFAULT_MAX_CONTEXT_TOKENS = 16384
 
 #: Long, because a cold model has to be loaded into VRAM before the first token
@@ -330,7 +338,7 @@ class OllamaClient:
             ):
                 if response.status_code != httpx.codes.OK:
                     raw = await response.aread()
-                    raise _http_error(self._model, response.status_code, raw)
+                    raise _http_error(self._model, response.status_code, raw, self._host)
 
                 async for line in response.aiter_lines():
                     chunk = _decode_line(line)
@@ -521,11 +529,16 @@ def _response_from(body: Mapping[str, Any]) -> ModelResponse:
     )
 
 
-def _http_error(model: str, status: int, raw: bytes) -> Exception:
+def _http_error(model: str, status: int, raw: bytes, host: str = DEFAULT_HOST) -> Exception:
     detail = raw.decode("utf-8", "replace").strip()
     if status == httpx.codes.NOT_FOUND:
+        # Say what *is* there. "Pull it first" is right but unhelpful when the
+        # real situation is a typo, or a model that was removed since the
+        # session started — both of which are answered by the list.
+        pulled = list_models(host)
+        available = f" Available: {', '.join(pulled)}." if pulled else ""
         return ModelUnavailable(
-            f"Ollama has no model {model!r}. Pull it first: ollama pull {model}"
+            f"Ollama has no model {model!r}.{available} Pull it with: ollama pull {model}"
         )
     message = f"Ollama returned HTTP {status}: {detail[:400]}"
     # The server could not compile the supplied schema into a sampling grammar.

@@ -31,7 +31,7 @@ and registers it. Splitting it that way keeps policy free of persistence.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
 
@@ -49,6 +49,11 @@ from shamsu.tools.base import Tool
 #: Asked whether a risky call may proceed. Returning False is a refusal, not an
 #: error -- the runtime turns it into a pending approval.
 ApprovalCallback = Callable[[ToolContract, ToolRequest], bool]
+
+
+def _normalise(path: str) -> str:
+    """One spelling per file, so `./src/a.py` and `src\\a.py` are the same key."""
+    return path.replace("\\", "/").lstrip("./")
 
 
 def deny_all(contract: ToolContract, request: ToolRequest) -> bool:
@@ -70,12 +75,23 @@ class ToolGateway:
         *,
         approval: ApprovalCallback | None = None,
         mutating_calls_per_decision: int = 1,
+        require_read_before_edit: bool = True,
     ) -> None:
         self._tools: dict[str, Tool[Any]] = {}
         self._approval = approval or deny_all
         self._mutation_budget = mutating_calls_per_decision
         self._mutations_used = 0
         self._scope: WriteScope | None = None
+        #: Files read (or authored) through this gateway. Held here rather than
+        #: in a tool because it is a fact about the *run*, and the tool that
+        #: reads is not the tool that edits.
+        self._read: set[str] = set()
+
+        #: On by default. Turned off by tests that exercise a *tool* rather
+        #: than the policy — the same opt-out `WriteScope` and `approval` have,
+        #: for the same reason: a mechanism has to be testable without every
+        #: policy that guards it in production.
+        self._require_read_before_edit = require_read_before_edit
 
         for tool in tools or ():
             self.register(tool)
@@ -98,6 +114,19 @@ class ToolGateway:
         return self._tools.get(name)
 
     @property
+    def files_read(self) -> tuple[str, ...]:
+        """Files opened through this gateway, in no particular order.
+
+        Exposed because a file the agent *looked at* is the best available
+        statement of what a step was about when nothing else says. A live
+        repair refused with "the failure implicates no editable file" on a run
+        whose only action had been reading the very file it was asked to fix —
+        the plan named no files, nothing had been written yet, and the one real
+        signal was sitting here unused.
+        """
+        return tuple(sorted(self._read))
+
+    @property
     def names(self) -> Sequence[str]:
         return tuple(sorted(self._tools))
 
@@ -110,9 +139,14 @@ class ToolGateway:
         call, which makes a wrong-phase call a runtime bug rather than an
         expected model mistake -- and means the failure gets fixed in the
         runtime instead of patched with another prompt instruction.
+
+        The same reasoning is why `arguments` is filled in here from each
+        tool's own input model. A tool the model can call but whose parameters
+        it has to guess produces exactly the wrong-shaped call this method
+        exists to prevent, and the names are already known.
         """
         return tuple(
-            tool.contract
+            tool.contract.model_copy(update={"arguments": _argument_names(tool)})
             for _, tool in sorted(self._tools.items())
             if phase in tool.contract.allowed_phases
         )
@@ -195,6 +229,10 @@ class ToolGateway:
         arguments = tool.parse(request.arguments)
 
         if contract.mutating:
+            # Read before scope: an edit to a file the model has not looked at
+            # is refused whatever the scope says, and the reason is more useful.
+            self._check_read_first(tool, arguments)
+
             # Scope before budget: a call the scope forbids must not consume the
             # one mutation this decision is allowed.
             self._check_scope(tool, arguments)
@@ -206,7 +244,45 @@ class ToolGateway:
                 )
             self._mutations_used += 1
 
-        return await self._execute(tool, arguments, cancel)
+        result = await self._execute(tool, arguments, cancel)
+
+        # Recorded after success only. A read that failed revealed nothing, and
+        # crediting it would license an edit against contents never seen.
+        if result.ok:
+            self._read.update(_normalise(path) for path in tool.read_targets(arguments))
+            # Authoring a file counts: the model supplied the contents, so a
+            # follow-up edit to it is grounded in something it actually knows.
+            self._read.update(_normalise(path) for path in tool.write_targets(arguments))
+
+        return result
+
+    def _check_read_first(self, tool: Tool[Any], arguments: Any) -> None:
+        """Refuse an edit to a file that has not been read in this run.
+
+        The invariant every editor a user is accustomed to enforces, and one
+        SHAMSU lacked. A §31.1 run asked to add a section to `README.md` opened
+        with `file.patch` on an anchor it had guessed, failed the exact match,
+        and never recovered — two of seven tasks died that way.
+
+        Refused *before* execution, so a guess costs a turn and not a file.
+        """
+        if not self._require_read_before_edit:
+            return
+
+        unseen = [
+            path
+            for path in tool.requires_prior_read(arguments)
+            if _normalise(path) not in self._read
+        ]
+        if not unseen:
+            return
+
+        listed = ", ".join(unseen)
+        raise ToolPolicyViolation(
+            f"{tool.contract.name}: {listed} has not been read in this run. "
+            f"Call file.read on it first — an anchor you have not seen either "
+            f"fails to match or matches the wrong place."
+        )
 
     def _check_scope(self, tool: Tool[Any], arguments: Any) -> None:
         """Refuse a write the active scope does not cover.
@@ -332,6 +408,32 @@ class ToolGateway:
                 "original_bytes": len(encoded),
             }
         )
+
+
+def _argument_names(tool: Tool[Any]) -> tuple[str, ...]:
+    """A tool's parameters, required first and marked with `*`.
+
+    Required first because that ordering is itself information: a model reading
+    `path*, mode, find, replace` learns which one it cannot omit without having
+    to parse a schema. Derived from `input_schema()`, which is the same document
+    `parse` validates against, so the two cannot disagree.
+    """
+    try:
+        schema = tool.input_schema()
+    except Exception:  # noqa: BLE001 - a tool must not break the listing
+        return ()
+
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        return ()
+
+    required = schema.get("required")
+    mandatory = set(required) if isinstance(required, list) else set()
+
+    names = list(properties)
+    ordered = [name for name in names if name in mandatory]
+    ordered += [name for name in names if name not in mandatory]
+    return tuple(f"{name}*" if name in mandatory else name for name in ordered)
 
 
 __all__ = ["ApprovalCallback", "ToolGateway", "deny_all"]

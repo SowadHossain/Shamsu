@@ -57,7 +57,7 @@ def repo(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def gateway(repo: Path) -> ToolGateway:
-    return ToolGateway(authoring_tools(repo))
+    return ToolGateway(authoring_tools(repo), require_read_before_edit=False)
 
 
 def _run(gateway: ToolGateway, tool: str, phase: Phase, **arguments: object):

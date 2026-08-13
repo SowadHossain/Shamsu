@@ -256,7 +256,22 @@ class ContextCompiler:
 
     @staticmethod
     def _render_tools(contracts: Sequence[ToolContract]) -> str:
-        return "\n".join(f"- {c.name}: {c.purpose}" for c in contracts)
+        """Name, arguments, purpose — one line each.
+
+        The arguments are not decoration. Without them the model was shown only
+        `name: purpose` and had to *guess* parameter names; it guessed
+        `file_path` at a tool wanting `path`, was refused, guessed again, and
+        spent half a step's budget on rejected calls. Naming them costs a few
+        tokens per tool and removes an entire class of failure.
+
+        `*` marks required, and required arguments are listed first.
+        """
+        lines = []
+        for contract in contracts:
+            signature = ", ".join(contract.arguments)
+            head = f"- {contract.name}({signature})" if signature else f"- {contract.name}()"
+            lines.append(f"{head}: {contract.purpose}")
+        return "\n".join(lines)
 
     @staticmethod
     def _render_source(excerpts: Sequence[tuple[str, str]]) -> str:

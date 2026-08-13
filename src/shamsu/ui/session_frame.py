@@ -74,7 +74,7 @@ class SessionState:
     #: Workspace paths offered for an `@…` reference. Only one of this and
     #: `suggestions` is ever populated: the dropdown shows commands or files,
     #: never both, because `@` and `/` cannot both be being typed.
-    files: tuple[str, ...] = ()
+    choices: tuple[str, ...] = ()
 
     selected: int = 0
 
@@ -142,21 +142,91 @@ def _transcript(state: SessionState, width: int, height: int, *, colour: bool) -
         return []
 
     inner = width - 2
-    visible = state.transcript[-height:]
-    lines = [
-        f"│{_pad(_activity(item, inner - 2, colour=colour), inner, colour=colour)}│"
-        for item in visible
-    ]
 
+    # Built from the newest backwards, because an entry can now occupy several
+    # lines and the tail is what must survive. Taking the last `height` *items*
+    # and hoping they fit would push the newest line off the bottom exactly
+    # when an answer is long enough to be worth reading.
+    rendered: list[str] = []
+    for item in reversed(state.transcript):
+        block = _activity(item, inner - 2, colour=colour)
+        if len(rendered) + len(block) > height:
+            block = block[: max(0, height - len(rendered))]
+        rendered = [*block, *rendered]
+        if len(rendered) >= height:
+            break
+
+    lines = [f"│{_pad(line, inner, colour=colour)}│" for line in rendered[-height:]]
     blank = "│" + " " * inner + "│"
     return [*[blank] * (height - len(lines)), *lines] if len(lines) < height else lines
 
 
-def _activity(item: Activity, width: int, *, colour: bool) -> str:
+def _activity(item: Activity, width: int, *, colour: bool) -> list[str]:
+    """One transcript entry, wrapped rather than truncated.
+
+    It used to be a single `_fit` to one line, which was fine for
+    `file.patch  calc.py  0.2s` and useless for everything SHAMSU actually
+    *says*: a capability listing, an answer to a question, an evidence report.
+    A user could not read the reply to their own question.
+
+    Continuation lines are indented under the label so the column still reads
+    as one entry rather than as several.
+    """
     glyph = paint(_LEVEL_GLYPH.get(item.level, "·"), _LEVEL_COLOUR.get(item.level, ""), colour)
     label = paint(f"{item.label:<9}", _LEVEL_COLOUR.get(item.level, GREY), colour)
-    detail = _fit(item.detail, max(0, width - 13))
-    return f"  {glyph} {label} {paint(detail, GREY, colour)}".rstrip()
+
+    body = max(8, width - 13)
+    wrapped = _wrap(item.detail, body)
+    if not wrapped:
+        return [f"  {glyph} {label}".rstrip()]
+
+    # 2 + glyph + space + 9-wide label + space, so continuations line up under
+    # the detail column rather than one short of it.
+    indent = " " * 14
+    first = f"  {glyph} {label} {paint(wrapped[0], GREY, colour)}".rstrip()
+    rest = [f"{indent}{paint(line, GREY, colour)}".rstrip() for line in wrapped[1:]]
+    return [first, *rest]
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Break `text` onto lines of at most `width`, honouring its own newlines.
+
+    Long unbroken runs — a path, a URL, a base64 blob — are cut rather than
+    allowed to overflow the box, because the frame owes the caller exactly
+    `width` columns.
+    """
+    if width <= 0 or not text.strip():
+        return []
+
+    lines: list[str] = []
+    for paragraph in text.splitlines():
+        if not paragraph.strip():
+            lines.append("")
+            continue
+
+        # Kept verbatim when it already fits. Splitting on spaces and rejoining
+        # collapses runs of them, which destroys the column alignment of things
+        # like the capability listing — the one output whose whole readability
+        # is its columns.
+        if len(paragraph) <= width:
+            lines.append(paragraph)
+            continue
+
+        current = ""
+        for word in paragraph.split(" "):
+            candidate = f"{current} {word}".strip()
+            if len(candidate) <= width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+            while len(word) > width:
+                lines.append(word[:width])
+                word = word[width:]
+            current = word
+        if current:
+            lines.append(current)
+    return lines
 
 
 def _status(state: SessionState, width: int, *, colour: bool) -> list[str]:
@@ -171,6 +241,15 @@ def _status(state: SessionState, width: int, *, colour: bool) -> list[str]:
         parts.append(paint("^C stop", GREY, colour))
     elif state.status:
         parts.append(paint(state.status, GREY, colour))
+    else:
+        # Idle used to say nothing at all, which left `/`, `@` and the leader
+        # key discoverable only by reading the source. The status bar is the one
+        # place always on screen, and shedding it under width pressure is
+        # already handled below.
+        parts.append(paint("/ commands", GREY, colour))
+        parts.append(paint("@ file", GREY, colour))
+        parts.append(paint("^P palette", GREY, colour))
+        parts.append(paint("^X keys", GREY, colour))
 
     body = paint(" · ", GREY, colour).join(parts)
     while _visible(body) > width - 3 and len(parts) > 2:
@@ -188,12 +267,12 @@ def _input(state: SessionState, *, colour: bool) -> str:
 
 def _suggestions(state: SessionState, width: int, *, colour: bool) -> list[str]:
     """The dropdown: commands for `/`, workspace paths for `@`."""
-    if state.files:
+    if state.choices:
         return _dropdown(
-            [(path, "") for path in state.files],
+            [(path, "") for path in state.choices],
             state.selected,
             width,
-            total=len(state.files),
+            total=len(state.choices),
             colour=colour,
         )
 

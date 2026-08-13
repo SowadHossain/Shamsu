@@ -32,6 +32,20 @@ class ToolContract(BaseModel):
     name: str = Field(description="Stable dotted name, e.g. 'file.patch'.")
     purpose: str = Field(description="One line, shown to the model.")
 
+    arguments: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Argument names, required ones first and marked. Filled in by the "
+            "gateway from the tool's own input model rather than declared here, "
+            "so it cannot describe a parameter that does not exist.\n\n"
+            "This exists because omitting it was a real and expensive bug: the "
+            "model was shown only `name: purpose`, so it guessed argument names "
+            "-- `file_path` against a tool wanting `path` -- and every guess was "
+            "refused. A live run spent half its action budget on rejected calls "
+            "and one malformed patch corrupted the file it was editing."
+        ),
+    )
+
     allowed_phases: frozenset[Phase] = Field(
         description="Phases in which this tool may execute. Enforced by the gateway."
     )

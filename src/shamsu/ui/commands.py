@@ -25,6 +25,16 @@ class Command:
     argument: str = ""
     aliases: tuple[str, ...] = ()
 
+    #: Fixed values the argument accepts. Where the set is known and small,
+    #: naming it here means the dropdown can offer it and `handle_command` can
+    #: reject anything else against the same list.
+    values: tuple[str, ...] = ()
+
+    #: Where the argument's values come from when they are not fixed:
+    #: "model" (what Ollama has pulled) or "path" (workspace directories).
+    #: A name rather than a callable, so this table stays data.
+    source: str = ""
+
     @property
     def usage(self) -> str:
         return f"{self.name} {self.argument}".rstrip()
@@ -39,14 +49,36 @@ class Command:
 COMMANDS: tuple[Command, ...] = (
     Command("/help", "this list", aliases=("/?",)),
     Command("/new", "start a fresh task, keeping the workspace", aliases=("/clear",)),
+    Command("/tools", "what the agent can run, and the arguments each takes"),
     Command("/sessions", "recent runs in this workspace", aliases=("/runs",)),
     Command("/status", "model, workspace, database, mode"),
-    Command("/mode", "build (can edit) or plan (read-only)", argument="[build|plan]"),
-    Command("/model", "show the model, or switch to another", argument="[name]"),
-    Command("/workspace", "show the workspace, or move to another", argument="[path]"),
+    Command(
+        "/mode",
+        "build (can edit) or plan (read-only)",
+        argument="[build|plan]",
+        values=("build", "plan"),
+    ),
+    Command(
+        "/model",
+        "show the model, or switch to another",
+        argument="[name]",
+        source="model",
+    ),
+    Command(
+        "/workspace",
+        "show the workspace, or move to another",
+        argument="[path]",
+        source="path",
+    ),
     Command("/context", "show the context window, or set it", argument="[tokens]"),
     Command("/details", "show full tool output, or just the summary line"),
-    Command("/theme", "colour on or off", argument="[on|off]", aliases=("/themes",)),
+    Command(
+        "/theme",
+        "colour on or off",
+        argument="[on|off]",
+        values=("on", "off"),
+        aliases=("/themes",),
+    ),
     Command("/exit", "leave", aliases=("/quit", "/q")),
 )
 
@@ -82,6 +114,64 @@ def complete(text: str) -> tuple[Command, ...]:
         return COMMANDS
 
     return tuple(command for command in COMMANDS if command.matches(prefix))
+
+
+def allowed_values(name: str) -> tuple[str, ...]:
+    """The fixed values a command's argument accepts, or `()`.
+
+    So a handler validates against the same list the dropdown offers, instead
+    of holding a second copy that can drift from it.
+    """
+    command = lookup(name)
+    return command.values if command else ()
+
+
+def complete_argument(
+    text: str,
+    *,
+    models: Sequence[str] = (),
+    paths: Sequence[str] = (),
+    limit: int = 8,
+) -> tuple[str, ...]:
+    """Values for the argument being typed, once a command has been chosen.
+
+    The counterpart to `complete`, which deliberately stops at the space. Where
+    the valid set is known — two modes, two theme states, whatever Ollama has
+    pulled — leaving the user to remember it is a worse interface than showing
+    it, and every one of these sets is already known to the program.
+
+    Dynamic values arrive as arguments rather than being fetched here, for the
+    same reason `complete` takes `models`: this stays pure, and a slow or absent
+    Ollama cannot wedge the prompt.
+    """
+    if not text.startswith("/"):
+        return ()
+
+    head, separator, rest = text.partition(" ")
+    if not separator:
+        return ()
+
+    command = lookup(head)
+    if command is None:
+        return ()
+
+    # Only the first argument. Nothing here takes a second, and guessing at one
+    # would offer values for a position that does not exist.
+    if " " in rest.strip():
+        return ()
+
+    if command.values:
+        available: Sequence[str] = command.values
+    elif command.source == "model":
+        available = models
+    elif command.source == "path":
+        available = paths
+    else:
+        return ()
+
+    fragment = rest.strip().lower()
+    matches = [value for value in available if value.lower().startswith(fragment)]
+    return tuple(matches[:limit])
 
 
 def common_prefix(commands: tuple[Command, ...]) -> str:
@@ -171,7 +261,9 @@ def help_lines() -> tuple[str, ...]:
 __all__ = [
     "COMMANDS",
     "Command",
+    "allowed_values",
     "common_prefix",
+    "complete_argument",
     "complete",
     "file_fragment",
     "help_lines",

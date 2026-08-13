@@ -439,6 +439,53 @@ class TestTimeoutAndCancellation:
         assert tool.finished is False
 
 
+class TestArgumentsAreShown:
+    """A tool the model can call but whose parameters it must guess.
+
+    That was the state before this: `available()` returned name and purpose
+    only, so the model guessed `file_path` at a tool wanting `path`, was
+    refused, and burned its action budget on rejected calls.
+    """
+
+    def test_available_names_each_tools_arguments(self) -> None:
+        from pathlib import Path
+
+        from shamsu.tools import authoring_tools
+
+        gateway = ToolGateway(authoring_tools(Path(".")))
+        by_name = {c.name: c for c in gateway.available(Phase.AUTHOR)}
+
+        assert "path*" in by_name["file.read"].arguments
+        assert "path*" in by_name["file.patch"].arguments
+
+    def test_required_arguments_come_first_and_are_marked(self) -> None:
+        from pathlib import Path
+
+        from shamsu.tools import authoring_tools
+
+        gateway = ToolGateway(authoring_tools(Path(".")))
+        arguments = {c.name: c.arguments for c in gateway.available(Phase.AUTHOR)}["file.read"]
+
+        assert arguments[0].endswith("*"), "a required argument leads"
+        optional = [name for name in arguments if not name.endswith("*")]
+        required = [name for name in arguments if name.endswith("*")]
+        assert list(arguments) == required + optional
+
+    def test_the_names_come_from_the_schema_the_gateway_validates_against(self) -> None:
+        """Derived, not declared — so the two cannot describe different tools."""
+        from pathlib import Path
+
+        from shamsu.tools import authoring_tools
+
+        tools = {tool.name: tool for tool in authoring_tools(Path("."))}
+        gateway = ToolGateway(list(tools.values()))
+
+        for contract in gateway.available(Phase.AUTHOR):
+            declared = {name.rstrip("*") for name in contract.arguments}
+            actual = set(tools[contract.name].input_schema().get("properties", {}))
+            assert declared == actual, contract.name
+
+
 class TestWriteScope:
     """Restricting *which* files may be written, not just whether."""
 

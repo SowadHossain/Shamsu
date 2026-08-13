@@ -31,6 +31,7 @@ from typing import TextIO
 from shamsu.interfaces.cancellation import Cancelled
 from shamsu.interfaces.models import ModelClient, ModelUnavailable
 from shamsu.runtime.limits import ExecutionLimits
+from shamsu.runtime.session import Approver
 from shamsu.ui.app import (
     AppOptions,
     Wiring,
@@ -38,8 +39,10 @@ from shamsu.ui.app import (
     describe_result,
     exit_code,
     run_request,
+    small_talk,
 )
-from shamsu.ui.commands import complete, help_lines, lookup
+from shamsu.ui.approval import ConsoleApprover
+from shamsu.ui.commands import allowed_values, complete, help_lines, lookup
 from shamsu.ui.editor import History, prompt
 from shamsu.ui.terminal import supports_tui
 from shamsu.ui.theme import AMBER, BOLD, GREEN, GREY, RED, VIOLET, paint, supports_colour
@@ -68,7 +71,21 @@ class Settings:
     #: Whether tool output is shown in full or as the summary line.
     details: bool = False
 
-    def options(self, request: str) -> AppOptions:
+    @property
+    def read_only(self) -> bool:
+        """Whether the next turn withholds every mutating tool."""
+        return self.mode == "plan"
+
+    def options(self, request: str, *, approver: Approver | None = None) -> AppOptions:
+        """The settings, as the options one turn runs under.
+
+        `read_only` is threaded here rather than read from `mode` further down,
+        because this is the one place a `Settings` becomes an `AppOptions` —
+        and `mode` used to stop at this boundary. `/mode plan` set the field,
+        `_status` printed it, the session frame coloured it, and nothing else
+        ever looked: the runtime built an authoring gateway either way, so plan
+        mode was a label on a build agent.
+        """
         return AppOptions(
             workspace=self.workspace,
             request=request,
@@ -76,6 +93,8 @@ class Settings:
             colour=self.colour,
             limits=self.limits,
             database=self.database,
+            read_only=self.read_only,
+            approver=approver,
         )
 
 
@@ -134,6 +153,9 @@ def handle_command(line: str, settings: Settings, models: Sequence[str] = ()) ->
     if command.name == "/sessions":
         return Outcome(lines=_sessions(settings))
 
+    if command.name == "/tools":
+        return Outcome(lines=tool_lines(settings))
+
     if command.name == "/model":
         return _set_model(args, settings, models)
 
@@ -170,18 +192,28 @@ def _set_mode(args: Sequence[str], settings: Settings) -> Outcome:
     if not args:
         return Outcome(lines=(f"  mode {settings.mode}",))
 
+    # Checked against the registry's own list, so what the dropdown offers and
+    # what the handler accepts cannot drift apart.
+    allowed = allowed_values("/mode")
     wanted = args[0].lower()
-    if wanted not in ("build", "plan"):
-        return Outcome(lines=(f"  unknown mode {wanted!r} — build or plan",))
+    if wanted not in allowed:
+        return Outcome(lines=(f"  unknown mode {wanted!r} — {' or '.join(allowed)}",))
     if wanted == settings.mode:
         return Outcome(lines=(f"  already in {wanted}",))
 
-    note = (
-        "  mode -> plan (read-only: mutating tools are withheld, not discouraged)"
+    lines = (
+        (
+            "  mode -> plan",
+            "  the gateway is rebuilt without file.patch, test.run, check.run or git.checkpoint",
+            "  every plan step is materialised as investigate",
+        )
         if wanted == "plan"
-        else "  mode -> build (edits allowed, evidence still required)"
+        else (
+            "  mode -> build",
+            "  edits allowed; completion still requires verified evidence",
+        )
     )
-    return Outcome(lines=(note,), settings=replace(settings, mode=wanted))
+    return Outcome(lines=lines, settings=replace(settings, mode=wanted))
 
 
 def _toggle_details(settings: Settings) -> Outcome:
@@ -194,9 +226,10 @@ def _set_theme(args: Sequence[str], settings: Settings) -> Outcome:
     if not args:
         return Outcome(lines=(f"  colour {'on' if settings.colour else 'off'}",))
 
+    allowed = allowed_values("/theme")
     wanted = args[0].lower()
-    if wanted not in ("on", "off"):
-        return Outcome(lines=(f"  unknown theme {wanted!r} — on or off",))
+    if wanted not in allowed:
+        return Outcome(lines=(f"  unknown theme {wanted!r} — {' or '.join(allowed)}",))
     return Outcome(
         lines=(f"  colour -> {wanted}",),
         settings=replace(settings, colour=wanted == "on"),
@@ -232,6 +265,34 @@ def recent_runs(settings: Settings, limit: int = 10) -> tuple[tuple[str, str, st
         (str(started_at)[11:16] or "--:--", str(status), str(request))
         for started_at, status, request in rows
     )
+
+
+def tool_lines(settings: Settings) -> tuple[str, ...]:
+    """What the agent can run, and the arguments each tool takes.
+
+    Rendered from `Tool.input_schema()`, so it is the same shape the gateway
+    validates against and cannot describe an argument that does not exist.
+
+    Worth having for its own sake — "what can this thing actually do" is the
+    first question anyone asks — and worth noting that the model is currently
+    shown *less* than this: `ContextCompiler._render_tools` emits only name and
+    purpose, which is why it guesses argument names and gets refused.
+    """
+    from shamsu.tools import authoring_tools
+
+    lines: list[str] = []
+    for tool in sorted(authoring_tools(settings.workspace), key=lambda t: t.name):
+        schema = tool.input_schema()
+        required = set(schema.get("required", ()))
+        arguments = [
+            f"{name}*" if name in required else name for name in (schema.get("properties") or {})
+        ]
+        signature = ", ".join(arguments) or "no arguments"
+        lines.append(f"  {tool.name:<16} {signature}")
+        lines.append(f"  {'':<16} {_fit(tool.contract.purpose, 58)}")
+
+    lines.append("  * = required")
+    return tuple(lines)
 
 
 def _sessions(settings: Settings) -> tuple[str, ...]:
@@ -376,11 +437,18 @@ class Repl:
         *request*, which can say so, not on the first prompt.
         """
         if self._wiring is None:
+            # `read_only` and `approver` are bound into the session here, not
+            # per turn, which is why `/mode` must rewire -- and it does, because
+            # every command returning new settings invalidates the agent.
             self._wiring = build_wiring(
                 self._build_model(self._settings),
-                self._settings.options(""),
+                self._settings.options("", approver=self._approver()),
             )
         return self._wiring
+
+    def _approver(self) -> Approver:
+        """Ask at this session's prompt, on this session's stream."""
+        return ConsoleApprover(read_line=self._read_line, stream=self._stream)
 
     def _rewire(self) -> None:
         if self._wiring is not None:
@@ -431,8 +499,33 @@ class Repl:
     async def _turn(self, request: str) -> None:
         """Run one request, keeping the session alive whatever it does."""
         options = self._settings.options(request)
+
         try:
-            result = await run_request(self._wired(), options, stream=self._stream)
+            wiring = self._wired()
+        except ModelUnavailable as exc:
+            self._write(f"  {exc}")
+            return
+
+        # Small talk gets an answer, not a run. Checked before the session is
+        # started so no task, plan, or run row is created for a greeting.
+        try:
+            reply = await small_talk(
+                wiring.session.model,
+                request,
+                workspace=self._settings.workspace,
+                limits=self._settings.limits,
+            )
+        except Cancelled:
+            self._write("  stopped.")
+            return
+        if reply is not None:
+            if reply:
+                self._write(f"  {reply}")
+            self._write()
+            return
+
+        try:
+            result = await run_request(wiring, options, stream=self._stream)
         except Cancelled:
             self._write("  stopped.")
             return

@@ -132,6 +132,18 @@ class FilePatchTool(Tool[FilePatchInput]):
         """
         return (arguments.path,)
 
+    def requires_prior_read(self, arguments: FilePatchInput) -> tuple[str, ...]:
+        """Editing existing content requires having seen it. Creating does not.
+
+        `replace_text` matches an anchor the model supplies, and a small model
+        will supply one it never saw — which fails the exact match at best and
+        silently hits the wrong span at worst. `replace_file` discards content
+        wholesale, so it earns the same requirement. `create` writes a file
+        that does not exist yet, and demanding a read of it would be asking for
+        the impossible.
+        """
+        return () if arguments.mode == "create" else (arguments.path,)
+
     @property
     def undo_stack(self) -> list[PatchUndo]:
         """Applied patches, oldest first. The runtime uses this to roll back."""

@@ -21,11 +21,13 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.tools.base import Tool
+from shamsu.tools.checks import CheckRunTool
 from shamsu.tools.editing import FilePatchTool, PatchUndo
 from shamsu.tools.gateway import ApprovalCallback, ToolGateway, deny_all
 from shamsu.tools.git import GitCheckpointTool, GitInspectTool, rollback_to, run_git
 from shamsu.tools.readonly import (
     CodeSearchTool,
+    FileListTool,
     FileReadTool,
     ProjectInspectTool,
     read_only_tools,
@@ -35,7 +37,9 @@ from shamsu.tools.testing import TestRunTool
 
 __all__ = [
     "ApprovalCallback",
+    "CheckRunTool",
     "CodeSearchTool",
+    "FileListTool",
     "FilePatchTool",
     "FileReadTool",
     "GitCheckpointTool",
@@ -55,7 +59,7 @@ __all__ = [
 
 
 def authoring_tools(workspace: "Path", *, use_git: bool = True) -> "list[Tool[Any]]":
-    """The full Milestone 5 surface: read-only tools plus editing and verification.
+    """The full surface: read-only tools plus editing and verification.
 
     Assembled in one place so a caller cannot accidentally build a gateway with
     write tools but no way to verify what it wrote.
@@ -66,4 +70,5 @@ def authoring_tools(workspace: "Path", *, use_git: bool = True) -> "list[Tool[An
         GitInspectTool(workspace),
         GitCheckpointTool(workspace),
         TestRunTool(workspace),
+        CheckRunTool(workspace),
     ]

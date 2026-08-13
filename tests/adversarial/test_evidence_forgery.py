@@ -152,7 +152,7 @@ class TestEvidenceCannotBeManufactured:
         self, store: StateStore, task: TaskRecord, run: RunRecord, plan_id: PlanId, repo: Path
     ) -> None:
         """The bug is still in the file. The gate must know."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         step = store.get_steps(plan_id)[0]
 
@@ -188,7 +188,7 @@ class TestEvidenceCannotBeManufactured:
         self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
     ) -> None:
         """Writing a file's existing content back is not a change."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
 
         request = ToolRequest(
@@ -213,7 +213,7 @@ class TestEvidenceCannotBeManufactured:
         remembering to behave: no tool declares COMPLETE, so the surface is
         empty and every call is refused.
         """
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         assert gateway.available(Phase.COMPLETE) == ()
 
         with pytest.raises(ToolPolicyViolation), gateway.decision():

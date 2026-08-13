@@ -134,7 +134,7 @@ def _session(
         store=store,
         runs=runs,
         model=model,
-        gateway=ToolGateway(authoring_tools(repo)),
+        gateway=ToolGateway(authoring_tools(repo), require_read_before_edit=False),
         compiler=ContextCompiler(model),
         workspace=repo,
         project_id=project.project_id,
@@ -236,7 +236,12 @@ class TestTheGateStillGoverns:
                 ],
                 grounded_in=[],
             ),
-            _conclude("I have fixed it, all tests pass."),
+            # A premature conclusion is refused *within* the step while budget
+            # remains, then the gate refuses, then an unmet-evidence shortfall
+            # is repairable — so insisting has to be tried many times before
+            # the run gives up. None of them may complete it. That is a
+            # stronger property than the original single claim.
+            *[_conclude("I have fixed it, all tests pass.") for _ in range(12)],
         ]
         session, _, _ = _session(store, project, repo, script)
 
@@ -340,7 +345,7 @@ class TestBoundsAndControl:
             store=store,
             runs=RunController(store),
             model=model,
-            gateway=ToolGateway(authoring_tools(repo)),
+            gateway=ToolGateway(authoring_tools(repo), require_read_before_edit=False),
             compiler=ContextCompiler(FakeModelClient([])),
             workspace=repo,
             project_id=project.project_id,

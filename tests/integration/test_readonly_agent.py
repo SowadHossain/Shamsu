@@ -199,13 +199,79 @@ class TestReadOnlyIsEnforcedByPolicy:
             assert tool.contract.reversible is True
 
     def test_no_write_tool_is_reachable_in_inspect(self, gateway: ToolGateway) -> None:
-        names = {contract.name for contract in gateway.available(Phase.INSPECT)}
-        assert names == {"project.inspect", "code.search", "file.read"}
+        """The property is "nothing here can write", not a fixed roster.
+
+        Asserting the exact set made adding a read-only tool look like a policy
+        regression: `file.list` is non-mutating and produces no evidence, and
+        pinning the names failed on it while the safety property was untouched.
+        """
+        reachable = gateway.available(Phase.INSPECT)
+        assert reachable, "the inspect phase must expose something"
+        for contract in reachable:
+            assert contract.mutating is False, contract.name
+            assert not contract.produces_evidence, contract.name
 
 
 # ---------------------------------------------------------------------------
 # The investigation loop
 # ---------------------------------------------------------------------------
+
+
+class TestConcludingWithoutLooking:
+    """An answer produced without reading anything is a guess.
+
+    Nothing downstream catches it: a question has no evidence gate, so the
+    fabrication reaches the user unchallenged. A live run described a Node
+    project with `package.json` and Jest in a directory holding one Python
+    file, having called no tool at all.
+    """
+
+    def test_a_conclusion_before_any_lookup_is_refused_once(
+        self, repo: Path, gateway: ToolGateway
+    ) -> None:
+        import asyncio
+
+        agent = _agent(
+            repo,
+            gateway,
+            [
+                _conclude("it is a Node project with Jest"),
+                _call("project.inspect"),
+                _conclude("it is a Python project"),
+            ],
+        )
+        found = asyncio.run(agent.investigate("what is this project?", require_lookup=True))
+
+        assert found.ok is True
+        assert found.conclusion == "it is a Python project"
+        assert found.observations, "the agent must have looked at something"
+
+    def test_it_gives_up_rather_than_looping(self, repo: Path, gateway: ToolGateway) -> None:
+        """Bounded, so a model that will not look still leaves."""
+        import asyncio
+
+        agent = _agent(repo, gateway, [_conclude(f"guess {n}") for n in range(8)])
+        found = asyncio.run(
+            agent.investigate(
+                "what is this project?",
+                require_lookup=True,
+                max_actions=8,
+            )
+        )
+
+        assert found.ok is True
+        assert found.conclusion.startswith("guess ")
+        assert not found.observations
+
+    def test_a_conclusion_after_a_lookup_is_accepted_immediately(
+        self, repo: Path, gateway: ToolGateway
+    ) -> None:
+        import asyncio
+
+        agent = _agent(repo, gateway, [_call("project.inspect"), _conclude("a grounded answer")])
+        found = asyncio.run(agent.investigate("what is this project?", require_lookup=True))
+
+        assert found.conclusion == "a grounded answer"
 
 
 class TestInvestigation:

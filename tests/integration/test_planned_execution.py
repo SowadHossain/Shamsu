@@ -151,7 +151,7 @@ class TestPlannedExecution:
     def test_a_two_step_plan_runs_to_completion_on_evidence_alone(
         self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
     ) -> None:
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         planner = Planner(store)
 
@@ -234,7 +234,7 @@ class TestPlannedExecution:
         Without this, a plan's first step could satisfy every later step, and a
         twelve-step plan would complete on one patch.
         """
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         planner = Planner(store)
 
@@ -258,7 +258,7 @@ class TestPlannedExecution:
         self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
     ) -> None:
         """The bug is still there; the gate must stay shut."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         planner = Planner(store)
 
@@ -291,7 +291,14 @@ class TestPlannedExecution:
                 ),
             ),
         )
-        materialised = planner.create(task, plan)
+        # An investigation-shaped request, to match an investigation-only plan.
+        # `validate_plan` now refuses a plan that cannot carry out a *change*
+        # request, and the shared fixture's "fix addition ..." would trip it —
+        # which is a different property from the one under test here.
+        looking = store.create_task(
+            task.model_copy(update={"task_id": TaskId(new_id()), "request": "show me calc.py"})
+        )
+        materialised = planner.create(looking, plan)
         step = planner.next_step(materialised.plan_id)
         assert step is not None
 
@@ -299,7 +306,7 @@ class TestPlannedExecution:
         assert "file.patch" not in step.allowed_tools
 
         # And the phase allowlist backs it up independently of the step record.
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         with pytest.raises(ToolPolicyViolation):
             _invoke(gateway, "file.patch", Phase.INSPECT, path="calc.py", find="a", replace="b")
 
@@ -308,7 +315,7 @@ class TestReplanningMidTask:
     def test_a_replan_keeps_finished_work_and_tells_the_next_plan_about_it(
         self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
     ) -> None:
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         planner = Planner(store)
 
@@ -386,7 +393,7 @@ class TestFinalCompletion:
         self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
     ) -> None:
         """The end of the line: plan → steps → gate → report, from rows only."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         planner = Planner(store)
 
@@ -434,7 +441,7 @@ class TestFinalCompletion:
         self, store: StateStore, task: TaskRecord, run: RunRecord, repo: Path
     ) -> None:
         """A thorough first step satisfies every evidence kind the plan needs."""
-        gateway = ToolGateway(authoring_tools(repo))
+        gateway = ToolGateway(authoring_tools(repo), require_read_before_edit=False)
         recorder = EvidenceRecorder(store, run.run_id, task.task_id)
         planner = Planner(store)
 

@@ -28,9 +28,11 @@ stopped" was not a report anyone could act on.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from shamsu.agent.planning import (
     Planner,
@@ -43,8 +45,23 @@ from shamsu.agent.repair import RepairController, RepairScope
 from shamsu.context.compiler import ContextCompiler, FrameInputs
 from shamsu.interfaces.cancellation import CancellationToken, Cancelled
 from shamsu.interfaces.context import ContextFrame
-from shamsu.interfaces.enums import AgentState, EvidenceKind, Phase, StepOutcome, TaskKind
-from shamsu.interfaces.ids import CheckpointId, PlanId, ProjectId, RunId, StepId, TaskId
+from shamsu.interfaces.enums import (
+    AgentState,
+    ApprovalDecision,
+    EvidenceKind,
+    Phase,
+    StepOutcome,
+    TaskKind,
+)
+from shamsu.interfaces.ids import (
+    ApprovalId,
+    CheckpointId,
+    PlanId,
+    ProjectId,
+    RunId,
+    StepId,
+    TaskId,
+)
 from shamsu.interfaces.models import (
     ModelClient,
     ModelContractError,
@@ -65,7 +82,13 @@ from shamsu.models.contracts import (
 from shamsu.runtime.controller import RunController
 from shamsu.runtime.events import EventKind
 from shamsu.runtime.limits import ExecutionLimits, LimitExceeded
-from shamsu.state.records import CheckpointRecord, PlanStepRecord, TaskRecord, new_id
+from shamsu.state.records import (
+    ApprovalRecord,
+    CheckpointRecord,
+    PlanStepRecord,
+    TaskRecord,
+    new_id,
+)
 from shamsu.state.store import StateStore
 from shamsu.state.transitions import (
     can_transition,
@@ -105,6 +128,31 @@ Decide whether this task needs a multi-step plan.
 touches several files, needs investigation first, or has ordering constraints.
 
 If you are unsure, answer 'planned'."""
+
+
+@runtime_checkable
+class Approver(Protocol):
+    """Asked whether a high-risk step may proceed.
+
+    A Protocol rather than a callback type so an implementation can hold state
+    — a TUI approver needs the screen it is drawing on — without the runtime
+    knowing anything about interfaces.
+
+    Returning `ApprovalDecision.PENDING` is not allowed: the runtime asked a
+    question and a non-answer is not one of the outcomes it can act on. An
+    approver that cannot reach a human returns `TIMED_OUT`, which is a distinct
+    decision from `APPROVED` precisely so that silence never becomes consent.
+    """
+
+    async def decide(
+        self,
+        step: PlanStepRecord,
+        *,
+        reason: str,
+        cancel: CancellationToken,
+    ) -> ApprovalDecision:
+        """Approve, deny, or time out. Must not return PENDING."""
+        ...
 
 
 @dataclass
@@ -158,6 +206,17 @@ class AgentSession:
     limits: ExecutionLimits | None = None
     memory: MemoryStore | None = None
 
+    #: Plan mode. Every step is materialised as `investigate`, which strips
+    #: every mutating tool from its allowlist. Enforced here rather than asked
+    #: for in a prompt — the caller is also expected to build the gateway from
+    #: `read_only_tools`, so the restriction holds at both layers.
+    read_only: bool = False
+
+    #: Asked to decide when a step requires approval. `None` means no approver
+    #: is configured, and WAIT_APPROVAL then stops the run rather than assuming
+    #: consent.
+    approver: Approver | None = None
+
     _visited: list[AgentState] = field(default_factory=list, repr=False)
 
     async def run(self, request: str) -> SessionResult:
@@ -180,7 +239,7 @@ class AgentSession:
             run_id=run_id,
             limits=bounds,
             recorder=EvidenceRecorder(self.store, run_id, task.task_id),
-            planner=Planner(self.store, limits=bounds),
+            planner=Planner(self.store, limits=bounds, read_only=self.read_only),
             gate=CompletionGate(self.store, task.task_id),
             repair=RepairController(self.store, task.task_id, limits=bounds, memory=self.memory),
         )
@@ -260,10 +319,7 @@ class AgentSession:
             return self._approval_check(context)
 
         if state is AgentState.WAIT_APPROVAL:
-            # No interactive approver is wired in yet. Waiting forever would be
-            # worse than stopping: an unattended run would hang rather than
-            # report that it needs a human.
-            return AgentState.STOPPED, "a step requires approval and no approver is configured"
+            return await self._wait_approval(context)
 
         if state is AgentState.EXECUTE_CURRENT_STEP:
             return await self._execute_step(context)
@@ -299,6 +355,14 @@ class AgentSession:
         investigation = await agent.investigate(context.task.request, cancel=self._token(context))
         context.investigation_files = tuple(investigation.files_seen)
         context.investigation_summary = investigation.conclusion
+
+        if investigation.unavailable:
+            # Nothing after this can succeed, and each attempt would report a
+            # different symptom of the same cause. Stopping here means the run
+            # says "the server is unreachable" once, rather than classifying,
+            # planning, and finally blaming the plan.
+            return AgentState.BLOCKED, investigation.stopped_because
+
         return AgentState.CLASSIFY_TASK, investigation.stopped_because
 
     async def _classify(self, context: _Context) -> tuple[AgentState, str]:
@@ -342,11 +406,23 @@ class AgentSession:
         return next_after_classification(kind), reason
 
     async def _create_plan(self, context: _Context) -> tuple[AgentState, str]:
-        plan = (
-            _direct_plan(context.task.request, context.investigation_files)
-            if context.direct
-            else await self._ask_for_plan(context)
-        )
+        try:
+            plan = (
+                _direct_plan(
+                    context.task.request,
+                    context.investigation_files,
+                    has_tests=has_test_suite(self.workspace),
+                )
+                if context.direct
+                else await self._ask_for_plan(context)
+            )
+        except ModelUnavailable as exc:
+            # Reported as what it is. "The model did not produce a usable plan"
+            # is true of an unreachable server and useless: it points a user at
+            # their request when the answer is `ollama serve`, or `ollama pull`
+            # for a model that was never fetched.
+            return AgentState.BLOCKED, str(exc)
+
         if plan is None:
             return AgentState.BLOCKED, "the model did not produce a usable plan"
 
@@ -355,12 +431,20 @@ class AgentSession:
 
     async def _ask_for_plan(self, context: _Context) -> ImplementationPlan | None:
         agent = ReadOnlyAgent(self.model, self.gateway, self.compiler, context.limits)
-        if context.replan_reason:
+
+        # A *rejected* plan is asked for again — and used to be asked for with
+        # the identical prompt, because only the REPLAN state set a reason. At
+        # temperature 0 that is a guaranteed identical plan: a §31.1 task
+        # proposed an investigation-only plan three times, was refused three
+        # times, and blocked having persisted no plan and run no tool at all.
+        # Telling the model why is the difference between a retry and a rerun.
+        reason = context.replan_reason or context.rejection_reason
+        if reason:
             return await agent.replan(
                 context.task.request,
                 previous_summary=context.previous_summary,
                 completed=context.completed_titles,
-                reason=context.replan_reason,
+                reason=reason,
                 cancel=self._token(context),
             )
 
@@ -391,10 +475,16 @@ class AgentSession:
             context.rejections += 1
             if context.rejections > context.limits.replans_per_task:
                 return AgentState.BLOCKED, f"plan rejected repeatedly: {exc}"
+
+            # Carried into the next request so the model is told what was wrong
+            # with the plan it just produced, and what it proposed.
+            context.rejection_reason = str(exc)
+            context.previous_summary = context.proposal.summary
             return AgentState.CREATE_PLAN, f"plan rejected: {exc}"
         except LimitExceeded as exc:
             return AgentState.BLOCKED, str(exc)
 
+        context.rejection_reason = ""
         context.plan_id = materialised.plan_id
         return AgentState.APPROVAL_CHECK, f"plan v{materialised.record.version} persisted"
 
@@ -406,11 +496,87 @@ class AgentSession:
             return AgentState.WAIT_APPROVAL, f"step {step.ordinal + 1} needs approval"
         return AgentState.EXECUTE_CURRENT_STEP, "no approval required"
 
+    async def _wait_approval(self, context: _Context) -> tuple[AgentState, str]:
+        """Ask a human whether a high-risk step may run.
+
+        Three properties this handler exists to hold:
+
+        **A missing approver stops the run; it never proceeds.** Waiting
+        forever would hang an unattended run, and defaulting to yes would route
+        around the only human gate in the system. Stopping is the honest third
+        option, and it is what happens when `approver is None`.
+
+        **The request is persisted before it is asked and the decision after
+        it is given.** The `approvals` table is the record of what a human was
+        actually asked to authorise, so it has to survive the process that
+        asked. Writing only the outcome would leave a denied step and an
+        abandoned one indistinguishable.
+
+        **`TIMED_OUT` is not `APPROVED`.** An approver that could not reach
+        anyone returns it, and it blocks exactly like a denial. Silence is
+        never consent.
+        """
+        step = self._next_step(context)
+        if step is None:  # pragma: no cover - approval_check found one to get here
+            return AgentState.EXECUTE_CURRENT_STEP, "nothing left to approve"
+
+        reason = f"step {step.ordinal + 1} ({step.title}) is {step.risk.value} risk" + (
+            f" and would edit {', '.join(step.inputs)}" if step.inputs else ""
+        )
+
+        if self.approver is None:
+            return AgentState.STOPPED, (
+                f"{reason}; no approver is configured, so it cannot be authorised"
+            )
+
+        record = self.store.request_approval(
+            ApprovalRecord(
+                approval_id=ApprovalId(new_id()),
+                task_id=context.task.task_id,
+                step_id=step.step_id,
+                reason=reason,
+                risk=step.risk,
+            )
+        )
+        self.runs.note(context.run_id, EventKind.APPROVAL_REQUESTED, reason)
+
+        try:
+            decision = await self.approver.decide(step, reason=reason, cancel=self._token(context))
+        except Exception as exc:  # noqa: BLE001 - an approver must not kill a run
+            # A broken approver is a failure to obtain consent, not a grant of
+            # it. Recorded as TIMED_OUT so the row says a decision never
+            # arrived rather than that a human refused.
+            self.store.decide_approval(record, ApprovalDecision.TIMED_OUT)
+            return AgentState.STOPPED, f"the approver failed ({exc}); {reason}"
+
+        if decision is ApprovalDecision.PENDING:
+            # The Protocol forbids it; enforce rather than trust, because
+            # treating a non-answer as anything else is how a gate leaks.
+            decision = ApprovalDecision.TIMED_OUT
+
+        self.store.decide_approval(record, decision)
+        self.runs.note(context.run_id, EventKind.APPROVAL_DECIDED, decision.value)
+
+        if decision is ApprovalDecision.APPROVED:
+            return AgentState.EXECUTE_CURRENT_STEP, f"approved: {reason}"
+
+        # Denied or timed out: the step is closed, not retried. A step a human
+        # refused is not a step that needs repairing.
+        context.current = context.planner.fail_step(step, StepOutcome.APPROVAL_REQUIRED)
+        return AgentState.STOPPED, f"{decision.value}: {reason}"
+
     async def _execute_step(self, context: _Context) -> tuple[AgentState, str]:
         """The bounded inner loop (plan §11), for one step."""
         step = self._next_step(context)
         if step is None:
             return AgentState.VERIFY_CURRENT_STEP, "no step to execute"
+
+        # A new step starts with a clean history. Only a *retry of the same
+        # step* inherits one — carrying another step's calls forward would tell
+        # the model not to repeat work it has not done.
+        if context.current is None or context.current.step_id != step.step_id:
+            context.attempted = []
+            context.attempted_writes = ()
 
         try:
             step = context.planner.begin_step(step)
@@ -429,8 +595,20 @@ class AgentSession:
         scope = context.repair_scope
         actions = 0
         failures = 0
+        #: Conclusions refused because the step's evidence was not yet in.
+        premature = 0
         latest = context.capsule_text
-        attempted: list[tuple[str, str]] = []
+
+        # Carried across repair attempts of the same step, not rebuilt per
+        # entry. The "already tried" section exists to stop a loop, and a
+        # retry that forgets what the first attempt did is precisely where the
+        # loop restarts: a live run patched the file, was sent back for a
+        # missing diff review, and spent the retry re-running the same
+        # `code.search` three times because its history had been cleared.
+        attempted = context.attempted
+        #: Signatures called during *this* attempt. The refusal is a loop
+        #: breaker for one execute pass, not a lifetime ban on a tool.
+        tried_this_attempt: set[str] = set()
 
         for _ in range(context.limits.actions_per_step):
             await self.runs.checkpoint(context.run_id)
@@ -452,9 +630,65 @@ class AgentSession:
 
             if decision.action == "conclude":
                 # A proposal, not a decision. VERIFY reads the evidence table.
-                return AgentState.VERIFY_CURRENT_STEP, decision.conclusion[:200]
+                outstanding = frozenset(step.required_evidence) - context.recorder.verified(
+                    step.step_id
+                )
+                if not outstanding or premature >= context.limits.consecutive_failed_actions:
+                    return AgentState.VERIFY_CURRENT_STEP, decision.conclusion[:200]
+
+                # Concluding with the budget untouched is the commonest way a
+                # step fails: a §31.1 run read a test twice and stopped with
+                # seven of eight actions unused, then spent both repair
+                # attempts concluding again. Sending it back costs one model
+                # call; letting it through costs a verify, a repair, and a
+                # re-execute to arrive at the same place.
+                #
+                # Bounded by the same counter as any other unproductive
+                # response, so a model that only ever concludes still leaves.
+                premature += 1
+                latest = (
+                    "You concluded, but this step is not finished: "
+                    + _evidence_rule(step, self.gateway, context.recorder.verified(step.step_id))
+                    + f"\n\nYou have {context.limits.actions_per_step - actions} action(s) left. "
+                    "Take the next one."
+                )
+                continue
 
             assert decision.tool is not None
+
+            # Asking the model not to repeat itself is a request; refusing to
+            # run the same call twice is a guarantee. The "already tried" list
+            # tells a capable model enough — a 7B read the same file seven times
+            # with that list in front of it — so the rule is enforced here, in
+            # the same spirit as the gateway refusing a wrong-phase tool rather
+            # than adding another line of prompt about it.
+            #
+            # **Scoped to this attempt, not the whole step.** `context.attempted`
+            # deliberately survives a repair so the model can see what it did;
+            # enforcing against that history too made the ban permanent. A live
+            # run called `project.inspect` once, was refused on every later call
+            # in the step *and in both repair attempts*, and blocked having done
+            # nothing — the tool takes no arguments, so its signature never
+            # varies and it can never be legitimately re-run. A repair is a
+            # fresh attempt with new information; re-reading the project at the
+            # start of one is exactly right.
+            signature = _describe_attempt(decision.tool)
+            if signature in tried_this_attempt:
+                failures += 1
+                latest = (
+                    f"Refused: you already called {signature} in this step and the "
+                    "result has not changed. Do something different — the STILL "
+                    "NEEDED list says what is outstanding."
+                )
+                self.runs.note(
+                    context.run_id,
+                    EventKind.TOOL_INVOKED,
+                    f"!{decision.tool.tool}  repeated, refused",
+                )
+                if failures >= context.limits.consecutive_failed_actions:
+                    return AgentState.VERIFY_CURRENT_STEP, "the model repeated itself"
+                continue
+
             latest, ok, executed = await self._invoke(context, step, decision.tool, scope)
 
             # A refusal did no work, so it does not spend the work budget. It
@@ -466,7 +700,8 @@ class AgentSession:
             if executed:
                 actions += 1
             failures = 0 if ok else failures + 1
-            attempted.append((_describe_attempt(decision.tool), _outcome_line(latest, ok)))
+            tried_this_attempt.add(signature)
+            attempted.append((signature, _outcome_line(latest, ok)))
 
             if failures >= context.limits.consecutive_failed_actions:
                 return AgentState.VERIFY_CURRENT_STEP, f"{failures} consecutive failed actions"
@@ -485,14 +720,32 @@ class AgentSession:
         if result.satisfied:
             context.capsule_text = ""
             context.repair_scope = None
+            context.unmet = frozenset()
             return next_after_verification(StepOutcome.PASS), result.explain()
 
-        outcome = StepOutcome.REPAIRABLE if context.last_digest is not None else StepOutcome.BLOCKED
-        if outcome is StepOutcome.BLOCKED:
-            context.planner.fail_step(step, StepOutcome.BLOCKED)
-            return next_after_verification(outcome), result.explain()
+        # A failing test is repairable, and used to be the *only* thing that
+        # was: `last_digest` is set by `test.run` alone, so a step that fell
+        # short for any other reason went straight to BLOCKED with its repair
+        # budget untouched. The §31.1 evaluation showed what that costs — a run
+        # fixed `add()` correctly, produced `file_changed`, and blocked one
+        # `git.inspect` short of the diff review, with no way to make that call.
+        #
+        # So an evidence gap is repairable too, provided some available tool can
+        # actually close it. When nothing can, blocking remains the honest
+        # answer: another attempt at an impossible requirement is not repair.
+        # `last_digest` is set after *any* `test.run`, including a passing one,
+        # so "a digest exists" is not "the tests failed". Repairing a passing
+        # digest would build a capsule describing a failure that did not happen.
+        if context.last_digest is not None and not context.last_digest.passed:
+            return next_after_verification(StepOutcome.REPAIRABLE), result.explain()
 
-        return next_after_verification(outcome), result.explain()
+        actionable = {kind: _producers(self.gateway).get(kind, ()) for kind in result.missing}
+        if any(tools for tools in actionable.values()):
+            context.unmet = frozenset(result.missing)
+            return next_after_verification(StepOutcome.REPAIRABLE), result.explain()
+
+        context.planner.fail_step(step, StepOutcome.BLOCKED)
+        return next_after_verification(StepOutcome.BLOCKED), result.explain()
 
     def _checkpoint(self, context: _Context) -> tuple[AgentState, str]:
         """A verified step boundary — the only resume point v2 promises."""
@@ -506,16 +759,33 @@ class AgentSession:
     def _repair(self, context: _Context) -> tuple[AgentState, str]:
         """Ask the repair controller whether another attempt is warranted."""
         step = context.current
-        digest = context.last_digest
-        if step is None or digest is None:
+        # Same rule as the gate: only a *failing* digest describes a failure.
+        digest = (
+            context.last_digest if context.last_digest and not context.last_digest.passed else None
+        )
+        if step is None or (digest is None and not context.unmet):
             return AgentState.BLOCKED, "nothing to repair"
 
-        decision = context.repair.consider(
-            digest,
-            step_id=step.step_id,
-            related_files=step.inputs,
-            changed_files=context.changed_files,
-        )
+        if digest is not None:
+            decision = context.repair.consider(
+                digest,
+                step_id=step.step_id,
+                related_files=(*step.inputs, *context.attempted_writes, *self.gateway.files_read),
+                changed_files=context.changed_files,
+            )
+        else:
+            decision = context.repair.consider_unmet_evidence(
+                sorted(context.unmet, key=lambda kind: kind.value),
+                producers=_producers(self.gateway),
+                step_id=step.step_id,
+                related_files=(*step.inputs, *context.attempted_writes, *self.gateway.files_read),
+                changed_files=context.changed_files,
+            )
+            # Cleared whatever happens next: the gate is re-read from rows on
+            # the next verification, and a stale set would describe the shortfall
+            # of an attempt that has already been superseded.
+            context.unmet = frozenset()
+
         if not decision.proceed:
             context.planner.fail_step(step, decision.outcome or StepOutcome.BLOCKED)
             return AgentState.BLOCKED, decision.reason
@@ -605,10 +875,20 @@ class AgentSession:
 
         context.recorder.record(request, result, phase, step_id=step.step_id)
 
-        if call.tool == "file.patch" and result.ok:
+        if call.tool == "file.patch":
             path = call.arguments.get("path")
-            if isinstance(path, str) and path not in context.changed_files:
-                context.changed_files = (*context.changed_files, path)
+            if isinstance(path, str) and path:
+                if result.ok and path not in context.changed_files:
+                    context.changed_files = (*context.changed_files, path)
+                # Recorded whether or not it worked. A patch that failed on a
+                # bad `find` anchor still names the file the step is about, and
+                # without it a repair had nothing in scope: a §31.1 run
+                # mis-anchored its only patch, so `changed_files` stayed empty,
+                # the plan named no files, and repair refused with "the failure
+                # implicates no editable file" — on the very file the task was
+                # asking it to edit.
+                if path not in context.attempted_writes:
+                    context.attempted_writes = (*context.attempted_writes, path)
 
         if call.tool == "test.run":
             tool = self.gateway.get("test.run")
@@ -722,11 +1002,35 @@ class _Context:
     investigation_summary: str = ""
     changed_files: tuple[str, ...] = ()
 
+    #: Files `file.patch` was *aimed* at, successful or not. A mis-anchored
+    #: patch still identifies the file the step is about, and it is often the
+    #: only such signal when the plan named none.
+    attempted_writes: tuple[str, ...] = ()
+
     last_digest: TestDigest | None = None
+
+    #: Evidence the step's gate wanted and did not get. Set only when some
+    #: available tool could still produce it, which is what separates "try
+    #: again" from "this requirement is unsatisfiable here".
+    unmet: frozenset[EvidenceKind] = frozenset()
+
+    #: Tool calls made during the current step, across all of its attempts.
+    #: Lives here rather than in `_execute_step` so a repair inherits it —
+    #: "you have already tried this" is the one thing a retry most needs to
+    #: know, and it was being thrown away exactly when it started to matter.
+    attempted: list[tuple[str, str]] = field(default_factory=list)
+
     capsule_text: str = ""
     repair_scope: RepairScope | None = None
 
     replan_reason: str = ""
+
+    #: Why the last proposed plan was refused, carried into the next request.
+    #: Separate from `replan_reason`, which also decides whether the planner
+    #: *supersedes* a persisted plan — a rejected plan was never persisted, so
+    #: it must still be created as version 1.
+    rejection_reason: str = ""
+
     previous_summary: str = ""
     completed_titles: tuple[str, ...] = ()
     rejections: int = 0
@@ -748,6 +1052,22 @@ _PHASES: dict[AgentState, Phase] = {
     AgentState.COMPLETION_GATE: Phase.COMPLETE,
     AgentState.FINAL_REPORT: Phase.COMPLETE,
 }
+
+
+def _producers(gateway: ToolGateway) -> dict[EvidenceKind, list[str]]:
+    """Which tools can produce each kind of evidence, from the contracts.
+
+    Derived rather than listed, so a renamed or withheld tool cannot leave the
+    runtime telling a model to call something that is not there. Used both to
+    tell a step what is outstanding and to decide whether an evidence gap is
+    worth another attempt at all.
+    """
+    producers: dict[EvidenceKind, list[str]] = {}
+    for phase in (Phase.AUTHOR, Phase.VERIFY):
+        for contract in gateway.available(phase):
+            for kind in contract.produces_evidence:
+                producers.setdefault(kind, []).append(contract.name)
+    return producers
 
 
 def _evidence_rule(
@@ -777,11 +1097,7 @@ def _evidence_rule(
             "believe the work is done."
         )
 
-    producers: dict[EvidenceKind, list[str]] = {}
-    for phase in (Phase.AUTHOR, Phase.VERIFY):
-        for contract in gateway.available(phase):
-            for kind in contract.produces_evidence:
-                producers.setdefault(kind, []).append(contract.name)
+    producers = _producers(gateway)
 
     done: list[str] = []
     todo: list[str] = []
@@ -880,13 +1196,57 @@ def _describe_call(request: ToolRequest, result: ToolResult) -> str:
     return line if result.ok else f"!{line}"
 
 
-def _direct_plan(request: str, files: Sequence[str]) -> ImplementationPlan:
+#: Requests whose work has nothing to run. Matched against a DIRECT task's own
+#: words, so the requirement follows what was asked rather than a default.
+_PROSE_ONLY = re.compile(
+    r"\b(readme|changelog|licen[cs]e|docs?|documentation|comment|docstring"
+    r"|typo|wording|markdown|\.md\b|\.rst\b|\.txt\b)\b",
+    re.IGNORECASE,
+)
+
+
+def has_test_suite(workspace: Path) -> bool:
+    """Whether this project has tests that `test.run` could actually run.
+
+    Cheap and conservative: a name-level check, not an execution. Used to
+    decide whether `tests_passed` is a requirement a run could ever satisfy —
+    demanding it of a project with no tests builds a gate with no key.
+    """
+    for pattern in ("test_*.py", "*_test.py", "*.test.js", "*.spec.ts"):
+        if next(workspace.rglob(pattern), None) is not None:
+            return True
+    return any((workspace / name).is_dir() for name in ("tests", "test", "spec", "__tests__"))
+
+
+def _direct_plan(
+    request: str, files: Sequence[str], *, has_tests: bool = True
+) -> ImplementationPlan:
     """A one-step plan for a DIRECT task, built without a model call.
 
     The step still carries the change floor and the standard tool allowlist, so
     a direct task is gated exactly as strictly as a planned one. What DIRECT
     buys is one fewer model call, not one fewer check.
+
+    **`tests_passed` is asked for only when tests could speak to the change.**
+    This used to require it unconditionally, and the §31.1 evaluation showed
+    what that costs: "Add an 'Installation' section to README.md" became a step
+    requiring `file_changed`, `git_diff_reviewed` *and* `tests_passed`. A
+    documentation repository has no test that a README section could pass, so
+    the gate was unsatisfiable before the run began — the same shape of bug as
+    a change floor on a step that cannot write, in a different place.
+
+    Dropping it for prose is not a weaker gate. `file_changed` and
+    `git_diff_reviewed` still apply, so the edit must still happen and still be
+    reviewed; what is removed is a demand for proof that no honest execution
+    could produce.
     """
+    # `tests_passed` is unproducible in a project that has no tests: `test.run`
+    # fails, so the gate can never open however good the change is. Measured
+    # live — "create todo.py with a Todo dataclass" wrote the file, registered
+    # `file_changed` and `git_diff_reviewed`, and blocked on a test suite that
+    # does not exist. Prose never needs tests; code needs them only when there
+    # are some to run.
+    prose = bool(_PROSE_ONLY.search(request)) or not has_tests
     return ImplementationPlan(
         summary=f"Direct change: {request}",
         steps=(
@@ -894,8 +1254,12 @@ def _direct_plan(request: str, files: Sequence[str]) -> ImplementationPlan:
                 title=request[:200],
                 intent=request[:600],
                 files=tuple(files[:5]),
-                acceptance_criteria=("The requested change is made and the tests pass.",),
-                required_evidence=("targeted tests pass",),
+                acceptance_criteria=(
+                    ("The requested edit is made.",)
+                    if prose
+                    else ("The requested change is made and the tests pass.",)
+                ),
+                required_evidence=() if prose else ("targeted tests pass",),
             ),
         ),
         grounded_in=tuple(files),
@@ -920,4 +1284,4 @@ def _request(frame: ContextFrame) -> ModelRequest:
     )
 
 
-__all__ = ["MAX_TRANSITIONS", "AgentSession", "SessionResult"]
+__all__ = ["MAX_TRANSITIONS", "AgentSession", "Approver", "SessionResult"]

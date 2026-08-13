@@ -126,6 +126,24 @@ class TaskClassification(BaseModel):
     reason: str = Field(default="", max_length=300)
 
 
+class RequestIntent(BaseModel):
+    """What the user is asking for: an answer, or a change.
+
+    One field and a reason, like `TaskClassification`, and for the same reason
+    — a narrow decision is one a small model gets right, and a wide one is not.
+
+    Note what is *not* here. Greetings, capability questions and empty input are
+    decided deterministically before this is ever asked, because they are
+    certain and free; spending a round trip to classify "hi" would make the
+    cheapest interaction the slowest one.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    intent: Literal["question", "change", "chatter"]
+    reason: str = Field(default="", max_length=200)
+
+
 class CompletionClaim(BaseModel):
     """The model's proposal that something is finished.
 
@@ -168,6 +186,7 @@ CONTRACTS: Mapping[str, type[BaseModel]] = {
     "ProjectAssessment": ProjectAssessment,
     "CompletionClaim": CompletionClaim,
     "TaskClassification": TaskClassification,
+    "RequestIntent": RequestIntent,
 }
 
 
@@ -226,6 +245,7 @@ __all__ = [
     "InvestigationStep",
     "PlanStepProposal",
     "ProjectAssessment",
+    "RequestIntent",
     "TaskClassification",
     "ToolCall",
     "contract_for",
