@@ -88,7 +88,10 @@ from shamsu.core.coordinator import Coordinator
 from shamsu.indexer.policy import walk_workspace_files
 from shamsu.llm.manager import LLMManager, LLMStalledError, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
-from shamsu.integrations.telegram.local import handle_remote_control_command
+from shamsu.integrations.telegram.local import (
+    handle_remote_control_command,
+    redact_remote_control_command,
+)
 from shamsu.memory.queue import flush_memory_queues, get_memory_queue
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
@@ -272,6 +275,7 @@ SYSTEM_COMMANDS = (
     "/remote_control",
     "/remote_control status",
     "/remote_control connect",
+    "/remote_control configure ",
     "/remote_control disconnect",
     "/remote_control repair",
     "/doctor",
@@ -17007,9 +17011,10 @@ def main(argv: list[str] | None = None) -> None:
         if not user_input:
             continue
         previous_user_prompt = session_logger.metadata.last_user_prompt
+        logged_user_input = redact_remote_control_command(user_input)
         session_logger.log(
             "user.prompt",
-            {"prompt": user_input},
+            {"prompt": logged_user_input},
             "User submitted prompt",
             workflow_id="repl",
         )

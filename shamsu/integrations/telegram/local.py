@@ -8,7 +8,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 
-from shamsu.integrations.telegram.service import TelegramService
+from shamsu.integrations.telegram.service import TelegramService, configure_telegram_bot_token
 
 
 class LocalTelegramBridgeManager:
@@ -25,6 +25,13 @@ class LocalTelegramBridgeManager:
             if self._service is None or self._workspace != resolved:
                 self._service = TelegramService(resolved)
                 self._workspace = resolved
+            return self._service
+
+    def reload_service(self, workspace: Path) -> TelegramService:
+        resolved = Path(workspace).resolve()
+        with self._lock:
+            self._service = TelegramService(resolved)
+            self._workspace = resolved
             return self._service
 
     def start(self, workspace: Path) -> None:
@@ -68,7 +75,37 @@ _MANAGER = LocalTelegramBridgeManager()
 
 def handle_remote_control_command(user_input: str, workspace: Path, console: Console) -> None:
     parts = user_input.split(maxsplit=1)
-    subcommand = parts[1].strip().lower() if len(parts) > 1 else ""
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    subcommand = rest.lower()
+    if subcommand.startswith("configure"):
+        token = rest.partition(" ")[2].strip()
+        if not token:
+            console.print(
+                Panel(
+                    "Usage:\n\n/remote_control configure <bot-token>\n\n"
+                    "The token will be saved to .shamsu/telegram.env and will not be displayed.",
+                    title="Remote Control",
+                    border_style="yellow",
+                )
+            )
+            return
+        try:
+            path = configure_telegram_bot_token(workspace, token)
+        except ValueError as exc:
+            console.print(Panel(str(exc), title="Remote Control", border_style="red"))
+            return
+        _MANAGER.stop()
+        service = _MANAGER.reload_service(workspace)
+        _MANAGER.start(workspace)
+        panel = service.local_panel("status")
+        console.print(
+            Panel(
+                f"Telegram bot token saved to {path}.\n\n{panel.message}",
+                title="Remote Control",
+                border_style="green",
+            )
+        )
+        return
     if subcommand == "disconnect":
         panel = _MANAGER.service_for(workspace).local_panel("disconnect")
         _MANAGER.stop()
@@ -80,3 +117,15 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
         _MANAGER.start(workspace)
     console.print(Panel(panel.message, title="Remote Control"))
 
+
+def redact_remote_control_command(text: str) -> str:
+    stripped = (text or "").strip()
+    lowered = stripped.lower()
+    prefixes = ("/remote_control configure", "remote_control configure")
+    if not any(lowered.startswith(prefix) for prefix in prefixes):
+        return text
+    head = stripped.split(maxsplit=2)[:2]
+    if len(head) < 2:
+        return text
+    prefix = " ".join(head)
+    return f"{prefix} [REDACTED]"

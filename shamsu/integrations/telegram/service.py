@@ -18,6 +18,7 @@ from shamsu.integrations.telegram.pairing import PairingCode, PairingManager
 from shamsu.integrations.telegram.sessions import LocalShamsuSessionGateway, SessionGateway
 from shamsu.integrations.telegram.storage import TelegramStateStore
 from shamsu.integrations.telegram.transport import TelegramBotApiTransport, TelegramTransport
+from shamsu.safety.sandbox import Sandbox
 
 TOKEN_ENV_VAR = "SHAMSU_TELEGRAM_BOT_TOKEN"
 
@@ -48,7 +49,9 @@ class TelegramService:
         self.pairing = PairingManager(self.store, installation_id=self.installation_id)
         self.authenticator = TelegramAuthenticator(self.store)
         self.status = RemoteControlStatus.DISABLED
-        self.token = token if token is not None else os.environ.get(TOKEN_ENV_VAR, "")
+        self.token, self.token_source = (
+            (token, "injected") if token is not None else load_telegram_bot_token(self.workspace)
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self.transport = transport or (
             TelegramBotApiTransport(
@@ -91,7 +94,13 @@ class TelegramService:
         if not self.token:
             return RemoteControlPanel(
                 RemoteControlStatus.DISABLED,
-                "Telegram is not configured.\n\n1. Set SHAMSU_TELEGRAM_BOT_TOKEN\n2. Run /remote_control again\n3. Open your Telegram bot\n\nThe bot token is never displayed.",
+                "Telegram is not configured.\n\n"
+                "Use one of:\n"
+                "1. Set SHAMSU_TELEGRAM_BOT_TOKEN\n"
+                "2. Create .shamsu/telegram.env with SHAMSU_TELEGRAM_BOT_TOKEN=...\n"
+                "3. Create .env with SHAMSU_TELEGRAM_BOT_TOKEN=...\n\n"
+                "Then run /remote_control again.\n\n"
+                "The bot token is never displayed.",
             )
         if subcommand == "status":
             return RemoteControlPanel(self._status_from_store(), self._render_status())
@@ -204,7 +213,7 @@ class TelegramService:
                 f"Owner: {owner}",
                 f"Active remote users: {len(users)}",
                 "",
-                "Bot token: configured" if self.token else "Bot token: missing",
+                f"Bot token: configured ({self.token_source})" if self.token else "Bot token: missing",
             ]
         )
 
@@ -217,3 +226,55 @@ class TelegramService:
 
     def _offset_setter(self, offset: int) -> None:
         self.store.set_meta("telegram_update_offset", str(int(offset)))
+
+
+def load_telegram_bot_token(workspace: Path) -> tuple[str, str]:
+    env_token = os.environ.get(TOKEN_ENV_VAR, "").strip()
+    if env_token:
+        return env_token, "environment"
+    workspace = Path(workspace).resolve()
+    candidates = [
+        workspace / ".shamsu" / "telegram.env",
+        workspace / ".env",
+    ]
+    for path in candidates:
+        token = _read_token_file(path)
+        if token:
+            source = ".shamsu/telegram.env" if path.name == "telegram.env" else ".env"
+            return token, source
+    return "", "missing"
+
+
+def configure_telegram_bot_token(workspace: Path, token: str) -> Path:
+    clean = (token or "").strip().strip("'\"")
+    if not _looks_like_bot_token(clean):
+        raise ValueError("That does not look like a Telegram bot token.")
+    sandbox = Sandbox(Path(workspace).resolve())
+    path = sandbox.validate(Path(".shamsu") / "telegram.env")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{TOKEN_ENV_VAR}={clean}\n", encoding="utf-8")
+    return path
+
+
+def _read_token_file(path: Path) -> str:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() != TOKEN_ENV_VAR:
+            continue
+        value = value.strip().strip("'\"")
+        return value
+    return ""
+
+
+def _looks_like_bot_token(token: str) -> bool:
+    if ":" not in token:
+        return False
+    left, _, right = token.partition(":")
+    return left.isdigit() and len(right) >= 20 and not any(char.isspace() for char in token)

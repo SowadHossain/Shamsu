@@ -25,7 +25,12 @@ from shamsu.integrations.telegram.models import (
 from shamsu.integrations.telegram.notifications import NotificationFilter
 from shamsu.integrations.telegram.pairing import PairingManager
 from shamsu.integrations.telegram.sessions import RoutedMessageResult
-from shamsu.integrations.telegram.service import TelegramService
+from shamsu.integrations.telegram.local import redact_remote_control_command
+from shamsu.integrations.telegram.service import (
+    TelegramService,
+    configure_telegram_bot_token,
+    load_telegram_bot_token,
+)
 from shamsu.integrations.telegram.storage import TelegramStateStore
 from shamsu.integrations.telegram.transport import FakeTelegramTransport
 from shamsu.runtime.run_control import complete_run, get_run_status, pause_run, register_run
@@ -364,6 +369,71 @@ def test_bot_token_never_appears_in_local_panel_or_audit(tmp_path: Path) -> None
     raw = service.store.list_audit()[0]["payload"]
     assert secret not in raw
     assert "[REDACTED]" in raw
+
+
+def test_token_can_load_from_ignored_local_files(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("SHAMSU_TELEGRAM_BOT_TOKEN", raising=False)
+    (tmp_path / ".env").write_text(
+        "SHAMSU_TELEGRAM_BOT_TOKEN=from-dotenv\n",
+        encoding="utf-8",
+    )
+    token, source = load_telegram_bot_token(tmp_path)
+    assert token == "from-dotenv"
+    assert source == ".env"
+
+    shamsu_dir = tmp_path / ".shamsu"
+    shamsu_dir.mkdir()
+    (shamsu_dir / "telegram.env").write_text(
+        "SHAMSU_TELEGRAM_BOT_TOKEN='from-shamsu-file'\n",
+        encoding="utf-8",
+    )
+    token, source = load_telegram_bot_token(tmp_path)
+    assert token == "from-shamsu-file"
+    assert source == ".shamsu/telegram.env"
+
+
+def test_environment_token_wins_over_local_files(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / ".env").write_text(
+        "SHAMSU_TELEGRAM_BOT_TOKEN=from-dotenv\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("SHAMSU_TELEGRAM_BOT_TOKEN", "from-env")
+
+    token, source = load_telegram_bot_token(tmp_path)
+
+    assert token == "from-env"
+    assert source == "environment"
+
+
+def test_remote_control_configure_writes_ignored_local_token_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("SHAMSU_TELEGRAM_BOT_TOKEN", raising=False)
+    token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+
+    path = configure_telegram_bot_token(tmp_path, token)
+    loaded, source = load_telegram_bot_token(tmp_path)
+
+    assert path == tmp_path / ".shamsu" / "telegram.env"
+    assert loaded == token
+    assert source == ".shamsu/telegram.env"
+
+
+def test_remote_control_configure_command_redacts_logged_token() -> None:
+    token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+    assert redact_remote_control_command(f"/remote_control configure {token}") == (
+        "/remote_control configure [REDACTED]"
+    )
+    assert redact_remote_control_command(f"remote_control configure {token}") == (
+        "remote_control configure [REDACTED]"
+    )
+
+
+def test_invalid_telegram_token_is_rejected(tmp_path: Path) -> None:
+    try:
+        configure_telegram_bot_token(tmp_path, "not-a-token")
+    except ValueError as exc:
+        assert "Telegram bot token" in str(exc)
+    else:
+        raise AssertionError("invalid token was accepted")
 
 
 def test_service_sends_shamsu_response_to_telegram(tmp_path: Path) -> None:

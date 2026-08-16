@@ -698,12 +698,16 @@ def _block_missing_acceptance_criteria(state: dict[str, Any]) -> dict[str, Any]:
     if not any(item.get("kind") == blocker["kind"] for item in blockers if isinstance(item, dict)):
         blockers.append(blocker)
     updated["blockers"] = blockers
-    updated["milestones"] = [
-        {**milestone, "status": "blocked", "last_message": summary}
-        if isinstance(milestone, dict)
-        else milestone
-        for milestone in updated.get("milestones", [])
-    ]
+    milestones: list[dict[str, Any] | Any] = []
+    for milestone in updated.get("milestones", []):
+        if not isinstance(milestone, dict):
+            milestones.append(milestone)
+            continue
+        if str(milestone.get("status") or "") in COMPLETED_STATUSES:
+            milestones.append(milestone)
+            continue
+        milestones.append({**milestone, "status": "blocked", "last_message": summary})
+    updated["milestones"] = milestones
     return updated
 
 

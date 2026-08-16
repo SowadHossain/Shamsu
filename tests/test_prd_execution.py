@@ -177,6 +177,33 @@ def test_prd_execution_without_acceptance_criteria_hard_stops(tmp_path: Path):
     assert state["blockers"][0]["kind"] == "missing_acceptance_criteria"
 
 
+def test_missing_acceptance_reinitialize_preserves_verified_checkpoint(tmp_path: Path):
+    contract = extract_contract(
+        parse_prd_text(
+            "# Demo\n\n"
+            "## Features\n"
+            "- Search tasks\n",
+            markdown=True,
+        )
+    )
+
+    root, state = initialize_prd_execution(tmp_path, "build from PRD", contract)
+    milestone_id = str(state["milestones"][0]["id"])
+    state = checkpoint_milestone(
+        root,
+        state,
+        milestone_id,
+        changed_files=["demo/src/App.tsx"],
+        evidence=["changed:demo/src/App.tsx"],
+        status="verified",
+    )
+    _root, reloaded = initialize_prd_execution(tmp_path, "resume build from PRD", contract)
+
+    assert reloaded["milestones"][0]["status"] == "verified"
+    assert reloaded["milestones"][0]["changed_files"] == ["demo/src/App.tsx"]
+    assert first_incomplete_milestone_index(reloaded) == len(reloaded["milestones"])
+
+
 def test_prd_execution_isolated_by_target_project_root(tmp_path: Path):
     first_root, first_state = initialize_prd_execution(
         tmp_path,
