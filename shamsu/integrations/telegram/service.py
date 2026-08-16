@@ -66,6 +66,7 @@ class TelegramService:
             else None
         )
         self._poll_task: asyncio.Task[Any] | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self.approval_broker = TelegramApprovalBroker(
             self.store,
             self.callbacks,
@@ -148,6 +149,12 @@ class TelegramService:
                 await self._poll_task
             except asyncio.CancelledError:
                 pass
+        if self._background_tasks:
+            tasks = list(self._background_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._background_tasks.clear()
         if self.transport is not None:
             await self.transport.close()
         self.status = RemoteControlStatus.DISCONNECTED
@@ -155,12 +162,48 @@ class TelegramService:
     async def process_update(self, update: TelegramUpdate) -> None:
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
+        if self._should_process_in_background(update):
+            self._start_background_update(update)
+            return
+        await self._handle_update_and_send(update)
+
+    async def _handle_update_and_send(self, update: TelegramUpdate) -> None:
         messages = await self.controller.handle_update(update)
         if not messages:
             return
         self._mirror_inbound(update)
         for message in messages:
             await self._send(message)
+
+    def _start_background_update(self, update: TelegramUpdate) -> None:
+        task = asyncio.create_task(self._handle_update_and_send(update))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._record_background_task_result)
+
+    def _record_background_task_result(self, task: asyncio.Task[Any]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            self.status = RemoteControlStatus.ERROR
+            self.store.increment_metric("telegram_send_failures")
+
+    def _should_process_in_background(self, update: TelegramUpdate) -> bool:
+        message = update.message
+        if message is None or update.callback_query is not None:
+            return False
+        if message.document is not None:
+            return False
+        text = (message.text or "").strip()
+        if not text:
+            return False
+        if _looks_like_pairing_code(text):
+            return False
+        if parse_command(text) is not None:
+            return False
+        return self.authenticator.authorize(message.user, message.chat).ok
 
     async def _poll_loop(self) -> None:
         assert self.transport is not None

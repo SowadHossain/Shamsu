@@ -124,6 +124,18 @@ class FakeGateway:
         return True
 
 
+@dataclass
+class BlockingGateway(FakeGateway):
+    started: asyncio.Event
+    release: asyncio.Event
+
+    async def route_user_message(self, text: str, *, metadata: TelegramInboundMetadata):
+        self.routed.append((text, metadata))
+        self.started.set()
+        await self.release.wait()
+        return RoutedMessageResult("Finished slow work.", run_id="run-bg", status="success")
+
+
 def _store(tmp_path: Path) -> TelegramStateStore:
     return TelegramStateStore(tmp_path, db_path=tmp_path / "telegram.db")
 
@@ -168,6 +180,15 @@ def _controller(tmp_path: Path):
 
 def _message(text: str, *, user: TelegramUser = USER, chat: TelegramChat = CHAT, message_id: int = 1):
     return TelegramMessage(message_id=message_id, user=user, chat=chat, text=text)
+
+
+async def _drain_service_background(service: TelegramService) -> None:
+    for _ in range(20):
+        tasks = list(service._background_tasks)
+        if not tasks:
+            return
+        await asyncio.gather(*tasks)
+    raise AssertionError("Telegram background tasks did not finish")
 
 
 def test_command_parsing() -> None:
@@ -504,10 +525,63 @@ def test_service_sends_shamsu_response_to_telegram(tmp_path: Path) -> None:
     assert pairing.verify(pairing.create_code().code, user=USER, chat=CHAT).ok
     store.set_active_session(USER.user_id, "session-1")
 
-    asyncio.run(service.process_update(TelegramUpdate(50, message=_message("Do work"))))
+    async def scenario() -> None:
+        await service.process_update(TelegramUpdate(50, message=_message("Do work")))
+        await _drain_service_background(service)
+
+    asyncio.run(scenario())
 
     assert transport.sent[-1].text == "Task accepted by SHAMSU."
     assert gateway.routed[0][0] == "Do work"
+
+
+def test_service_processes_status_while_task_is_running(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        store = _store(tmp_path)
+        gateway = BlockingGateway(
+            sessions=[
+                TelegramSessionSummary(
+                    "session-1",
+                    "auth-refactor",
+                    str(tmp_path),
+                    status="running",
+                    current_task="Do slow work",
+                    current_run="run-bg",
+                )
+            ],
+            routed=[],
+            cancelled=[],
+            paused=[],
+            resumed=[],
+            started=asyncio.Event(),
+            release=asyncio.Event(),
+        )
+        transport = FakeTelegramTransport()
+        service = TelegramService(
+            tmp_path,
+            token="fake-token",
+            transport=transport,
+            store=store,
+            gateway=gateway,
+            installation_id="install-test",
+        )
+        assert service.pairing.verify(service.pairing.create_code().code, user=USER, chat=CHAT).ok
+        store.set_active_session(USER.user_id, "session-1")
+
+        await service.process_update(TelegramUpdate(60, message=_message("Do slow work")))
+        await asyncio.wait_for(gateway.started.wait(), timeout=1)
+
+        await service.process_update(TelegramUpdate(61, message=_message("/status", message_id=2)))
+
+        assert any(message.text.startswith("SHAMSU - Running") for message in transport.sent)
+        assert not gateway.release.is_set()
+
+        gateway.release.set()
+        await _drain_service_background(service)
+
+        assert transport.sent[-1].text == "Finished slow work."
+
+    asyncio.run(scenario())
 
 
 def test_service_mirrors_authorized_telegram_messages_to_cli(tmp_path: Path) -> None:
@@ -533,7 +607,11 @@ def test_service_mirrors_authorized_telegram_messages_to_cli(tmp_path: Path) -> 
     assert service.pairing.verify(service.pairing.create_code().code, user=USER, chat=CHAT).ok
     store.set_active_session(USER.user_id, "session-1")
 
-    asyncio.run(service.process_update(TelegramUpdate(51, message=_message("Do work"))))
+    async def scenario() -> None:
+        await service.process_update(TelegramUpdate(51, message=_message("Do work")))
+        await _drain_service_background(service)
+
+    asyncio.run(scenario())
 
     assert ("Telegram Ada", "Do work") in mirrored
     assert ("SHAMSU -> Telegram", "Task accepted by SHAMSU.") in mirrored
