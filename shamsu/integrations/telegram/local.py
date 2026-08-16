@@ -9,6 +9,19 @@ from rich.console import Console
 from rich.panel import Panel
 
 from shamsu.integrations.telegram.service import TelegramService, configure_telegram_bot_token
+from shamsu.safety.commands import redact
+
+
+class ConsoleTelegramMirror:
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self._lock = threading.Lock()
+
+    def __call__(self, title: str, text: str) -> None:
+        body = _mirror_text(text)
+        with self._lock:
+            self.console.print()
+            self.console.print(Panel(body, title=title, border_style="cyan"))
 
 
 class LocalTelegramBridgeManager:
@@ -17,25 +30,32 @@ class LocalTelegramBridgeManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._workspace: Path | None = None
+        self._mirror: ConsoleTelegramMirror | None = None
         self._lock = threading.Lock()
 
-    def service_for(self, workspace: Path) -> TelegramService:
+    def service_for(self, workspace: Path, console: Console | None = None) -> TelegramService:
         resolved = Path(workspace).resolve()
         with self._lock:
+            if console is not None:
+                self._mirror = ConsoleTelegramMirror(console)
             if self._service is None or self._workspace != resolved:
-                self._service = TelegramService(resolved)
+                self._service = TelegramService(resolved, cli_mirror=self._mirror)
                 self._workspace = resolved
+            elif self._mirror is not None:
+                self._service.set_cli_mirror(self._mirror)
             return self._service
 
-    def reload_service(self, workspace: Path) -> TelegramService:
+    def reload_service(self, workspace: Path, console: Console | None = None) -> TelegramService:
         resolved = Path(workspace).resolve()
         with self._lock:
-            self._service = TelegramService(resolved)
+            if console is not None:
+                self._mirror = ConsoleTelegramMirror(console)
+            self._service = TelegramService(resolved, cli_mirror=self._mirror)
             self._workspace = resolved
             return self._service
 
-    def start(self, workspace: Path) -> None:
-        service = self.service_for(workspace)
+    def start(self, workspace: Path, console: Console | None = None) -> None:
+        service = self.service_for(workspace, console)
         if service.transport is None:
             return
         with self._lock:
@@ -95,8 +115,8 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
             console.print(Panel(str(exc), title="Remote Control", border_style="red"))
             return
         _MANAGER.stop()
-        service = _MANAGER.reload_service(workspace)
-        _MANAGER.start(workspace)
+        service = _MANAGER.reload_service(workspace, console)
+        _MANAGER.start(workspace, console)
         panel = service.local_panel("status")
         console.print(
             Panel(
@@ -107,14 +127,14 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
         )
         return
     if subcommand == "disconnect":
-        panel = _MANAGER.service_for(workspace).local_panel("disconnect")
+        panel = _MANAGER.service_for(workspace, console).local_panel("disconnect")
         _MANAGER.stop()
         console.print(Panel(panel.message, title="Remote Control"))
         return
-    service = _MANAGER.service_for(workspace)
+    service = _MANAGER.service_for(workspace, console)
     panel = service.local_panel(subcommand)
     if subcommand in {"", "connect", "repair"}:
-        _MANAGER.start(workspace)
+        _MANAGER.start(workspace, console)
     console.print(Panel(panel.message, title="Remote Control"))
 
 
@@ -129,3 +149,10 @@ def redact_remote_control_command(text: str) -> str:
         return text
     prefix = " ".join(head)
     return f"{prefix} [REDACTED]"
+
+
+def _mirror_text(text: str) -> str:
+    clean = redact(text or "").strip()
+    if len(clean) <= 1200:
+        return clean or "-"
+    return clean[:1200].rstrip() + "\n\n[truncated for CLI mirror]"

@@ -162,6 +162,7 @@ function Install-ShamsuLauncher {
 
     $PsLauncher = Join-Path $ResolvedBinDir "shamsu.ps1"
     $CmdLauncher = Join-Path $ResolvedBinDir "shamsu.cmd"
+    $BareLauncher = Join-Path $ResolvedBinDir "shamsu"
     $EscapedRunScript = $RunScript.Replace("'", "''")
     $PsContent = @"
 `$ErrorActionPreference = "Stop"
@@ -184,14 +185,29 @@ else {
 @echo off
 powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "%CD%" %*
 "@
+    $BashRunScript = $RunScript.Replace("\", "/")
+    $BareContent = @"
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v cygpath >/dev/null 2>&1; then
+  WORKSPACE="`$(cygpath -aw "`$PWD")"
+else
+  WORKSPACE="`$PWD"
+fi
+
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$BashRunScript" -Workspace "`$WORKSPACE" "`$@"
+"@
 
     Set-Content -Path $PsLauncher -Value $PsContent -Encoding UTF8
     Set-Content -Path $CmdLauncher -Value $CmdContent -Encoding ASCII
+    Set-Content -Path $BareLauncher -Value $BareContent -Encoding UTF8
     $script:InstalledLauncher = $PsLauncher
 
     Write-Host "Installed SHAMSU launchers:"
     Write-Host "  $PsLauncher"
     Write-Host "  $CmdLauncher"
+    Write-Host "  $BareLauncher"
 
     $PathForCheck = $env:PATH
     if ($WillUpdatePath) {
@@ -217,11 +233,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$CmdRunScript" -Workspace "
     else {
         $ResolvedPsLauncher = [System.IO.Path]::GetFullPath($PsLauncher)
         $ResolvedCmdLauncher = [System.IO.Path]::GetFullPath($CmdLauncher)
+        $ResolvedBareLauncher = [System.IO.Path]::GetFullPath($BareLauncher)
         $ExistingCommand = Get-Command shamsu -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($ExistingCommand) {
             $ResolvedExisting = [System.IO.Path]::GetFullPath($ExistingCommand.Source)
         }
-        if ($ExistingCommand -and $ResolvedExisting -ine $ResolvedPsLauncher -and $ResolvedExisting -ine $ResolvedCmdLauncher) {
+        if ($ExistingCommand -and $ResolvedExisting -ine $ResolvedPsLauncher -and $ResolvedExisting -ine $ResolvedCmdLauncher -and $ResolvedExisting -ine $ResolvedBareLauncher) {
             Write-Host ""
             Write-Warning "Plain 'shamsu' currently resolves to a different command:"
             Write-Host "  $($ExistingCommand.Source)"

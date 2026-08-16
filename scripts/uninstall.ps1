@@ -14,6 +14,7 @@ $VenvDir = Join-Path $RepoRoot ".venv"
 $RuntimeDir = Join-Path $RepoRoot ".shamsu"
 $PsLauncher = Join-Path $BinDir "shamsu.ps1"
 $CmdLauncher = Join-Path $BinDir "shamsu.cmd"
+$BareLauncher = Join-Path $BinDir "shamsu"
 $PathManifest = Join-Path (Split-Path $BinDir -Parent) "path.json"
 
 function Normalize-PathEntry {
@@ -62,7 +63,7 @@ Write-Host "SHAMSU uninstall"
 Write-Host "Repo: $RepoRoot"
 
 if (-not $KeepLauncher) {
-    foreach ($launcher in @($PsLauncher, $CmdLauncher)) {
+    foreach ($launcher in @($PsLauncher, $CmdLauncher, $BareLauncher)) {
         if (Test-Path $launcher) {
             Remove-Item -LiteralPath $launcher -Force
             Write-Host "Removed launcher: $launcher"

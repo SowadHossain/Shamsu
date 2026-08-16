@@ -11,6 +11,7 @@ from shamsu.action_ledger import store as action_store
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import start_run
 from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
+from shamsu.cli.request_lifecycle import finish_current_run
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
 from shamsu.integrations.telegram.models import (
     TelegramInboundMetadata,
@@ -225,6 +226,12 @@ class LocalShamsuSessionGateway:
     def _run_agent_sync(self, text: str, metadata: TelegramInboundMetadata) -> RoutedMessageResult:
         logger = self.session_manager.resume_session(metadata.session_id)
         logger.log(
+            "user.prompt",
+            {"prompt": text},
+            "Telegram user submitted prompt",
+            workflow_id="telegram",
+        )
+        logger.log(
             "telegram.user_message",
             {
                 "telegram_user_id": metadata.telegram_user_id,
@@ -260,8 +267,15 @@ class LocalShamsuSessionGateway:
                 original_user_request=text,
             )
             result: AgentLoopResult = asyncio.run(loop.run(text))
-            ledger.close_success(result.final)
-            return RoutedMessageResult(result.final, run_id=result.run_id, status=result.status.value)
+            ledger.record_final_response(result.final)
+            finish_current_run(self.workspace, ledger)
+            summary = action_store.load_summary(self.workspace, ledger.run_id) or {}
+            manifest = action_store.load_manifest(self.workspace, ledger.run_id) or {}
+            return RoutedMessageResult(
+                result.final,
+                run_id=result.run_id or ledger.run_id,
+                status=str(summary.get("status") or manifest.get("status") or result.status.value),
+            )
         except Exception as exc:
             ledger.fail(str(exc))
             raise

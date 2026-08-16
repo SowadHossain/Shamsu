@@ -6,14 +6,15 @@ import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
 from shamsu.integrations.telegram.callbacks import CallbackRegistry
+from shamsu.integrations.telegram.commands import parse_command
 from shamsu.integrations.telegram.controller import TelegramController
 from shamsu.integrations.telegram.formatter import TelegramFormatter
-from shamsu.integrations.telegram.models import OutboundMessage, RemoteControlStatus
+from shamsu.integrations.telegram.models import OutboundMessage, RemoteControlStatus, TelegramUpdate
 from shamsu.integrations.telegram.pairing import PairingCode, PairingManager
 from shamsu.integrations.telegram.sessions import LocalShamsuSessionGateway, SessionGateway
 from shamsu.integrations.telegram.storage import TelegramStateStore
@@ -40,6 +41,7 @@ class TelegramService:
         store: TelegramStateStore | None = None,
         gateway: SessionGateway | None = None,
         installation_id: str | None = None,
+        cli_mirror: Callable[[str, str], None] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.store = store or TelegramStateStore(self.workspace)
@@ -49,6 +51,7 @@ class TelegramService:
         self.pairing = PairingManager(self.store, installation_id=self.installation_id)
         self.authenticator = TelegramAuthenticator(self.store)
         self.status = RemoteControlStatus.DISABLED
+        self.cli_mirror = cli_mirror
         self.token, self.token_source = (
             (token, "injected") if token is not None else load_telegram_bot_token(self.workspace)
         )
@@ -83,6 +86,9 @@ class TelegramService:
             formatter=self.formatter,
             approval_resolver=self.resolve_approval_callback,
         )
+
+    def set_cli_mirror(self, cli_mirror: Callable[[str, str], None] | None) -> None:
+        self.cli_mirror = cli_mirror
 
     def local_panel(self, subcommand: str = "") -> RemoteControlPanel:
         subcommand = (subcommand or "").strip().lower()
@@ -146,10 +152,13 @@ class TelegramService:
             await self.transport.close()
         self.status = RemoteControlStatus.DISCONNECTED
 
-    async def process_update(self, update) -> None:
+    async def process_update(self, update: TelegramUpdate) -> None:
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
         messages = await self.controller.handle_update(update)
+        if not messages:
+            return
+        self._mirror_inbound(update)
         for message in messages:
             await self._send(message)
 
@@ -174,6 +183,7 @@ class TelegramService:
         try:
             await self.transport.send(message)
             self.store.increment_metric("telegram_messages_sent")
+            self._mirror_outbound(message)
         except Exception:
             self.store.increment_metric("telegram_send_failures")
 
@@ -216,6 +226,40 @@ class TelegramService:
                 f"Bot token: configured ({self.token_source})" if self.token else "Bot token: missing",
             ]
         )
+
+    def _mirror_inbound(self, update: TelegramUpdate) -> None:
+        if self.cli_mirror is None:
+            return
+        if update.message is not None:
+            message = update.message
+            if not self.authenticator.authorize(message.user, message.chat).ok:
+                return
+            self.cli_mirror(
+                f"Telegram {message.user.display_name}",
+                _safe_inbound_preview(message.text, has_document=message.document is not None),
+            )
+            return
+        if update.callback_query is not None:
+            callback = update.callback_query
+            if not self.authenticator.authorize(callback.user, callback.message.chat).ok:
+                return
+            self.cli_mirror(
+                f"Telegram {callback.user.display_name}",
+                "pressed a Telegram action button.",
+            )
+
+    def _mirror_outbound(self, message: OutboundMessage) -> None:
+        if self.cli_mirror is None:
+            return
+        if not self._chat_is_authorized(message.chat_id):
+            return
+        text = message.text
+        if message.edit_message_id is not None:
+            text = f"(edited Telegram message)\n{text}"
+        self.cli_mirror("SHAMSU -> Telegram", text)
+
+    def _chat_is_authorized(self, chat_id: int) -> bool:
+        return any(int(user["telegram_chat_id"]) == int(chat_id) for user in self.store.authorized_users())
 
     def _offset_getter(self) -> int:
         raw = self.store.get_meta("telegram_update_offset", "0")
@@ -278,3 +322,19 @@ def _looks_like_bot_token(token: str) -> bool:
         return False
     left, _, right = token.partition(":")
     return left.isdigit() and len(right) >= 20 and not any(char.isspace() for char in token)
+
+
+def _safe_inbound_preview(text: str, *, has_document: bool = False) -> str:
+    stripped = (text or "").strip()
+    if _looks_like_pairing_code(stripped):
+        return "entered a pairing code."
+    command = parse_command(stripped)
+    if command and command.name == "/start":
+        return "/start"
+    if has_document and not stripped:
+        return "sent a file."
+    return stripped or "sent a message."
+
+
+def _looks_like_pairing_code(text: str) -> bool:
+    return len(text) == 6 and text.isdigit()

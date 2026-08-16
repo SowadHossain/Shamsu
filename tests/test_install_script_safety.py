@@ -91,6 +91,7 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert "scripts\\run-shamsu.ps1" in ps1
     assert "shamsu.ps1" in ps1
     assert "shamsu.cmd" in ps1
+    assert '$BareLauncher = Join-Path $ResolvedBinDir "shamsu"' in ps1
     assert "@ShamsuArgs" in ps1
     assert '$ShamsuArgs = `$args' in ps1
     assert "`$PipedInput = @(`$input)" in ps1
@@ -98,6 +99,7 @@ def test_install_scripts_create_thin_launchers_without_profile_edits():
     assert "-InputObject (`$PipedInput -join [Environment]::NewLine)" in ps1
     assert "-Workspace `$Workspace @ShamsuArgs" in ps1
     assert '-Workspace "%CD%" %*' in ps1
+    assert "powershell.exe -NoProfile -ExecutionPolicy Bypass" in ps1
     assert "$LauncherOnPath" in ps1
     assert "Plain 'shamsu' currently resolves to a different command" in ps1
     assert "Add $BinDir to PATH if you want plain 'shamsu'" in ps1
@@ -156,6 +158,7 @@ def test_uninstall_scripts_remove_only_shamsu_managed_files():
     assert ".shamsu" in ps1
     assert "shamsu.ps1" in ps1
     assert "shamsu.cmd" in ps1
+    assert '$BareLauncher = Join-Path $BinDir "shamsu"' in ps1
     assert "Remove-ShamsuUserPath" in ps1
     assert "added_by_shamsu" in ps1
     assert "path.json" in ps1

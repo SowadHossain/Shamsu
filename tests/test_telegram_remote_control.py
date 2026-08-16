@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from shamsu.action_ledger import store as action_store
+from shamsu.agents.chat_loop import AgentLoopResult
+import shamsu.integrations.telegram.sessions as telegram_sessions
 from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.callbacks import CallbackRegistry
 from shamsu.integrations.telegram.commands import parse_command
@@ -331,6 +334,49 @@ def test_real_run_control_pause_and_cancel_for_session(tmp_path: Path) -> None:
     complete_run(run.run_id, RunStatus.CANCELLED, "done")
 
 
+def test_local_gateway_free_text_closes_action_ledger_without_false_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    logger = SessionManager(tmp_path).create_session("remote")
+
+    class FakeAgentChatLoop:
+        def __init__(self, *_args, action_ledger=None, **_kwargs) -> None:
+            self.action_ledger = action_ledger
+
+        async def run(self, text: str) -> AgentLoopResult:
+            return AgentLoopResult(
+                final=f"Echo: {text}",
+                run_id=self.action_ledger.run_id,
+                status=RunStatus.COMPLETED,
+            )
+
+    monkeypatch.setattr(telegram_sessions, "AgentChatLoop", FakeAgentChatLoop)
+    gateway = telegram_sessions.LocalShamsuSessionGateway(tmp_path)
+
+    result = asyncio.run(
+        gateway.route_user_message(
+            "Hi",
+            metadata=TelegramInboundMetadata(
+                source="telegram",
+                telegram_user_id=USER.user_id,
+                telegram_chat_id=CHAT.chat_id,
+                telegram_message_id=44,
+                session_id=logger.session_id,
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+    )
+
+    assert result.text == "Echo: Hi"
+    assert result.status == "success"
+    manifest = action_store.load_manifest(tmp_path, result.run_id)
+    assert manifest is not None
+    assert manifest["status"] == "success"
+    reloaded = SessionManager(tmp_path).resolve(logger.session_id)
+    assert reloaded.last_user_prompt == "Hi"
+
+
 def test_message_formatting_and_pagination_redact_secrets() -> None:
     formatter = TelegramFormatter()
     pages = formatter.paginate("token=abc123\n" + ("x" * 5000), max_chars=1000)
@@ -462,6 +508,63 @@ def test_service_sends_shamsu_response_to_telegram(tmp_path: Path) -> None:
 
     assert transport.sent[-1].text == "Task accepted by SHAMSU."
     assert gateway.routed[0][0] == "Do work"
+
+
+def test_service_mirrors_authorized_telegram_messages_to_cli(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gateway = FakeGateway(
+        sessions=[TelegramSessionSummary("session-1", "auth-refactor", str(tmp_path))],
+        routed=[],
+        cancelled=[],
+        paused=[],
+        resumed=[],
+    )
+    transport = FakeTelegramTransport()
+    mirrored: list[tuple[str, str]] = []
+    service = TelegramService(
+        tmp_path,
+        token="fake-token",
+        transport=transport,
+        store=store,
+        gateway=gateway,
+        installation_id="install-test",
+        cli_mirror=lambda title, text: mirrored.append((title, text)),
+    )
+    assert service.pairing.verify(service.pairing.create_code().code, user=USER, chat=CHAT).ok
+    store.set_active_session(USER.user_id, "session-1")
+
+    asyncio.run(service.process_update(TelegramUpdate(51, message=_message("Do work"))))
+
+    assert ("Telegram Ada", "Do work") in mirrored
+    assert ("SHAMSU -> Telegram", "Task accepted by SHAMSU.") in mirrored
+
+
+def test_service_masks_pairing_code_in_cli_mirror(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    gateway = FakeGateway(
+        sessions=[],
+        routed=[],
+        cancelled=[],
+        paused=[],
+        resumed=[],
+    )
+    mirrored: list[tuple[str, str]] = []
+    service = TelegramService(
+        tmp_path,
+        token="fake-token",
+        transport=FakeTelegramTransport(),
+        store=store,
+        gateway=gateway,
+        installation_id="install-test",
+        cli_mirror=lambda title, text: mirrored.append((title, text)),
+    )
+    code = service.pairing.create_code().code
+
+    asyncio.run(service.process_update(TelegramUpdate(52, message=_message(code))))
+
+    assert ("Telegram Ada", "entered a pairing code.") in mirrored
+    assert not any(code in text for _title, text in mirrored)
+    assert any("Connected to this SHAMSU installation." in text for _title, text in mirrored)
 
 
 def test_bot_restart_keeps_pairing_active_session_and_offset(tmp_path: Path) -> None:
