@@ -115,6 +115,7 @@ class ReadOnlyAgent:
         task: str,
         *,
         project_facts: str = "",
+        repository_map: str = "",
         cancel: CancellationToken | None = None,
         max_actions: int | None = None,
         require_lookup: bool = False,
@@ -163,6 +164,7 @@ class ReadOnlyAgent:
                     task=task,
                     output_contract="InvestigationStep",
                     project_facts=project_facts,
+                    repository_map=repository_map,
                     latest_observation=latest,
                     attempted=tuple(attempted),
                     system_rules=_SYSTEM_RULES + "\n\n" + schema_hint(InvestigationStep),
@@ -255,12 +257,20 @@ class ReadOnlyAgent:
         task: str,
         investigation: InvestigationResult,
         *,
+        project_facts: str = "",
+        repository_map: str = "",
         cancel: CancellationToken | None = None,
     ) -> ImplementationPlan | None:
         """Turn a completed investigation into a grounded plan.
 
         Returns None when the model cannot produce a valid plan. A missing plan
         is an honest outcome; a fabricated one is not.
+
+        `project_facts` carries the pinned stack. Planning without it was how a
+        *command-line bookmark manager, standard library only* came back as a
+        plan to configure a database and implement routes and services: asked
+        what to build with no statement of what this project is, the model
+        supplied the most common shape it knows.
         """
         token = cancel or NullCancellationToken()
         token.raise_if_cancelled()
@@ -272,12 +282,17 @@ class ReadOnlyAgent:
                 phase=Phase.PLAN,
                 task=task,
                 output_contract="ImplementationPlan",
+                project_facts=project_facts,
+                repository_map=repository_map,
                 latest_observation=evidence,
                 previous_step_summary=investigation.conclusion,
                 system_rules=(
                     "Produce an implementation plan from the evidence below. "
                     "You have not modified anything and must not claim to have. "
                     "List only files you actually inspected in `grounded_in`.\n\n"
+                    "Plan for the project described under project facts — its "
+                    "language, its dependencies, its layout. Do not introduce a "
+                    "framework, a database or a service it does not already use.\n\n"
                     + schema_hint(ImplementationPlan)
                 ),
             ),
@@ -296,6 +311,8 @@ class ReadOnlyAgent:
         previous_summary: str,
         completed: Sequence[str] = (),
         reason: str,
+        project_facts: str = "",
+        repository_map: str = "",
         cancel: CancellationToken | None = None,
     ) -> ImplementationPlan | None:
         """Produce a replacement plan after the current one stopped working.
@@ -324,6 +341,8 @@ class ReadOnlyAgent:
                 phase=Phase.PLAN,
                 task=task,
                 output_contract="ImplementationPlan",
+                project_facts=project_facts,
+                repository_map=repository_map,
                 plan_summary=previous_summary,
                 latest_observation=f"Why the previous plan was abandoned:\n{reason}",
                 previous_step_summary=done,

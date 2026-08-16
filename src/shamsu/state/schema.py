@@ -19,7 +19,7 @@ from __future__ import annotations
 import sqlite3
 from collections.abc import Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # --------------------------------------------------------------------------
 # Migration 1 -- initial runtime state
@@ -306,7 +306,19 @@ CREATE TABLE memory_records (
 CREATE INDEX idx_memory_signature ON memory_records(project_id, signature);
 """
 
-MIGRATIONS: Sequence[str] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3)
+#: Step dependencies, so a failed step can take only its dependents down with
+#: it. Added as a nullable-with-default column rather than a table: a step's
+#: dependencies are part of the step, they are written once when the plan is
+#: materialised, and nothing ever queries them in the other direction.
+#:
+#: `DEFAULT '[]'` is what makes this safe on a database written by an older
+#: build — every existing step reads back as independent, which is exactly the
+#: behaviour those rows had when they were written.
+_MIGRATION_4 = """
+ALTER TABLE plan_steps ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]';
+"""
+
+MIGRATIONS: Sequence[str] = (_MIGRATION_1, _MIGRATION_2, _MIGRATION_3, _MIGRATION_4)
 
 
 def current_version(connection: sqlite3.Connection) -> int:

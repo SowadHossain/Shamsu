@@ -105,12 +105,21 @@ def _run(
     return asyncio.run(session.run(request))
 
 
-#: Investigate, classify — then a plan that only investigates, which
-#: `validate_plan` refuses for a change request.
+#: The plan `validate_plan` refuses: every step is investigation, so it cannot
+#: carry out a change request. Named rather than indexed out of `PREFIX` — it is
+#: re-sent to test repeated refusal, and a positional reference silently became
+#: the classification when a step was added ahead of it.
+INVESTIGATION_ONLY = _plan("Inspect the project structure", "Review the README")
+
 PREFIX = [
+    # The request names README.md, so the investigation is required to read it
+    # before concluding — a plan for a file nobody opened is a guess. Scripting
+    # the read here rather than letting the nudge fire keeps these tests about
+    # plan rejection instead of about investigation.
+    _tool("file.read", path="README.md"),
     _say(action="conclude", conclusion="a README and a module"),
     _say(kind="planned", reason="needs care"),
-    _plan("Inspect the project structure", "Review the README"),
+    INVESTIGATION_ONLY,
 ]
 
 
@@ -175,7 +184,12 @@ class TestTheRefusalReachesTheModel:
         self, store: StateStore, project: ProjectRecord, repo: Path
     ) -> None:
         """Telling the model why must not become an unbounded retry loop."""
-        session, _ = _session(store, project, repo, [*PREFIX, PREFIX[2], PREFIX[2], PREFIX[2]])
+        session, _ = _session(
+            store,
+            project,
+            repo,
+            [*PREFIX, INVESTIGATION_ONLY, INVESTIGATION_ONLY, INVESTIGATION_ONLY],
+        )
         result = _run(session)
 
         assert result.completed is False
@@ -198,10 +212,14 @@ class TestAFailedPatchStillNamesItsFile:
             project,
             repo,
             [
+                # README.md is named in the request, so it is read first.
+                _tool("file.read", path="README.md"),
                 _say(action="conclude", conclusion="a README"),
                 _say(kind="planned", reason="one edit"),
-                # A change step naming no files at all.
-                _plan("Add an Installation section to README.md"),
+                # The step names its file, as validation now requires — but
+                # the first patch mis-anchors, so `changed_files` stays empty
+                # and the repair scope has to come from the failed attempt.
+                _plan("Add an Installation section to README.md", files=["README.md"]),
                 # The anchor does not exist, so this fails.
                 _tool(
                     "file.patch", path="README.md", mode="replace_text", find="NOPE", replace="x"

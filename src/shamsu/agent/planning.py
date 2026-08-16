@@ -10,12 +10,22 @@ Three rules shape it.
 
 **The model may raise its own bar, never lower it.** `required_evidence` on a
 step is the union of what the model asked for and what the runtime demands for
-that kind of step. A change step always requires `FILE_CHANGED` and
+that kind of step. A change step requires `FILE_CHANGED` and
 `GIT_DIFF_REVIEWED`, whatever the plan says. The only way to get a weaker
 requirement is to declare the step `investigate`, which also strips every
 mutating tool from its allowlist — so weakening the gate costs the ability to
 write. That is a trade a model can be trusted with; "please require less proof"
 is not.
+
+**But no bar is set where nothing can clear it.** Both the floor and the
+model's additions are intersected with `producible`: what this workspace and
+this tool set can actually prove. Outside a git repository there is no diff to
+review; in a project with no tests there is no suite to pass; and four evidence
+kinds have no producing tool at all while the vocabulary above still maps prose
+onto them. Requiring any of those does not make the gate stricter, it makes it
+unopenable — the run then fails for a reason no execution could have avoided.
+What is dropped is reported in `MaterialisedPlan.unsatisfiable_evidence`, never
+discarded quietly.
 
 **Free-text evidence phrases are mapped, not adopted.** The model writes
 "targeted authentication tests pass"; the runtime decides that means
@@ -35,13 +45,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+from shamsu.agent.mentions import filenames_in
 from shamsu.interfaces.enums import EvidenceKind, Risk, StepOutcome
 from shamsu.interfaces.ids import PlanId, StepId, TaskId
 from shamsu.models.contracts import ImplementationPlan, PlanStepProposal
 from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits
-from shamsu.security.paths import PathEscape, PathSandbox
+from shamsu.security.paths import PathEscape, PathSandbox, workspace_key
 from shamsu.state.records import PlanRecord, PlanStepRecord, TaskRecord, new_id
 from shamsu.state.store import StateStore
 from shamsu.verification.evidence import GateResult, check_completion
@@ -147,7 +158,11 @@ def map_required_evidence(phrases: Sequence[str]) -> EvidenceMapping:
 _INVESTIGATIVE = re.compile(
     r"^(understand|review|analys|analyz|examine|inspect|investigat|identif|determin"
     r"|assess|explor|read|locate|find|search|survey|audit|research|study|clarif"
-    r"|gather|collect|map|list|trace|diagnos|confirm|evaluat|consider|plan)\w*\b"
+    r"|gather|collect|map|list|trace|diagnos|confirm|evaluat|consider|plan"
+    # Added from a live plan: "Check for existing Python files" was a *change*
+    # step demanding `file_changed`, because `check` was not on this list.
+    # Looking for something is not making it.
+    r"|check|verif|look|compare|count)\w*\b"
 )
 
 #: Verbs that mean a step intends to write. Searched anywhere in the text: a
@@ -249,14 +264,102 @@ def effective_kind(proposal: PlanStepProposal, *, read_only: bool = False) -> st
     return "change"
 
 
-def evidence_floor(kind: str) -> frozenset[EvidenceKind]:
-    """The minimum evidence the runtime requires for a step of this kind."""
-    return CHANGE_FLOOR if kind == "change" else frozenset()
+def evidence_floor(
+    kind: str, *, producible: frozenset[EvidenceKind] | None = None
+) -> frozenset[EvidenceKind]:
+    """The minimum evidence the runtime requires for a step of this kind.
+
+    `producible` is what this workspace and this tool set can actually prove,
+    and the floor is intersected with it. `None` means "do not filter", which
+    is what a caller testing the floor itself wants.
+
+    **A requirement nothing can satisfy is not a strict gate, it is a broken
+    one.** Outside a git repository `git.inspect` fails on every call, so
+    `GIT_DIFF_REVIEWED` becomes a gate with no key — a live run in a plain
+    folder spent both repair attempts calling `git.checkpoint`, failed
+    identically each time, and blocked. In a project with no tests,
+    `TESTS_PASSED` is the same shape of impossibility, and four evidence kinds
+    (health check, smoke test, migration, schema) have no producing tool
+    anywhere yet while the planner's vocabulary still maps prose onto them.
+
+    Each of those used to need its own patch here. Filtering against what is
+    producible handles all of them, including the next one nobody has hit yet.
+
+    Dropping an impossible requirement is an honest reading, not a discount:
+    every requirement that *can* be produced still applies, so the edit must
+    still happen and still register `FILE_CHANGED`. The run reports the weaker
+    guarantee rather than pretending to the stronger one.
+    """
+    if kind != "change":
+        return frozenset()
+    return CHANGE_FLOOR if producible is None else CHANGE_FLOOR & producible
 
 
-def allowed_tools_for(kind: str) -> tuple[str, ...]:
-    """The tools a step of this kind may reach."""
-    return CHANGE_TOOLS if kind == "change" else READ_ONLY_TOOLS
+#: Steps that intend to take a file away. Deliberately narrow — the cost of
+#: missing one is a re-plan, and the cost of matching too eagerly is handing a
+#: destructive tool to every step that happens to say "clean up".
+_REMOVES = re.compile(
+    r"\b(delete|remove|rename|move|drop|deprecate|retire|split)\w*\b", re.IGNORECASE
+)
+
+#: Steps whose work is only finished if the project actually runs. Narrow for
+#: the same reason `_REMOVES` is: `project.run` executes whatever the project
+#: declares, and a step that merely edits a file has no business starting a
+#: server to prove it.
+_RUNS = re.compile(
+    r"\b(run|runs|running|start|starts|serve|serves|boot|boots|launch"
+    r"|migrat|smoke|health|deploy)\w*\b",
+    re.IGNORECASE,
+)
+
+
+def step_may_run(title: str, criteria: Sequence[str] = ()) -> bool:
+    """Whether this step's own words say it needs to run the project.
+
+    Read from the acceptance criteria as well as the title, because "the app
+    starts" is how a criterion says it and "Fix the import error" is how the
+    title does — the requirement lives in the first and the action in the
+    second.
+    """
+    return bool(_RUNS.search(" ".join([title, *criteria])))
+
+
+def allowed_tools_for(
+    kind: str, *, may_remove: bool = False, may_run: bool = False
+) -> tuple[str, ...]:
+    """The tools a step of this kind may reach.
+
+    **`file.remove` is granted per step, not globally.** Adding it to every
+    change step measurably degraded the agent: the §31.1 suite went from 5/7 to
+    a steady 3/7, with call counts collapsing across the board and one task
+    taking zero actions at all. Nothing about the tool is wrong — it is the
+    tenth entry in a list a 7B has to discriminate among on every single turn,
+    and the eleventh way to answer "what next?".
+
+    That is the scaffold-size effect, measured rather than assumed: little-coder
+    ships four tools and works; capability surface is not free, and the model
+    pays for it on turns that had no use for it.
+
+    So a step gets the destructive tool when its own title says it destroys
+    something, and not otherwise. The capability is intact; the tax is not
+    levied on every turn.
+
+    `project.run` is granted on the same terms and for the same reason. It is
+    the only tool that can prove a program starts — the gap that made four
+    evidence kinds unproducible — and it is also the one that executes whatever
+    the project declares. A step that edits a docstring should not be offered
+    it, and a step whose acceptance criterion is "the app starts" cannot finish
+    without it.
+    """
+    if kind != "change":
+        return READ_ONLY_TOOLS
+
+    tools = CHANGE_TOOLS
+    if may_remove:
+        tools += ("file.remove",)
+    if may_run:
+        tools += ("project.run",)
+    return tools
 
 
 @dataclass(frozen=True)
@@ -321,6 +424,23 @@ def asks_for_a_change(request: str) -> bool:
     return bool(_CHANGE_REQUEST.search(request.strip().lower()))
 
 
+def _exists_in_workspace(path: str, sandbox: PathSandbox | None) -> bool:
+    """Whether a cited path is a real file here.
+
+    Without a sandbox there is no workspace to ask, and the honest answer is
+    then "assume it exists" — refusing a plan on the strength of a check that
+    could not run would be the same false rejection in a different place.
+    """
+    if sandbox is None:
+        return True
+    try:
+        return sandbox.resolve(path).exists()
+    except PathEscape:
+        # Outside the workspace. Already reported as a problem by the per-step
+        # path check above, and definitely not something to accept here.
+        return False
+
+
 def validate_plan(
     plan: ImplementationPlan,
     *,
@@ -367,9 +487,25 @@ def validate_plan(
             notes.append(f"{label} changes code but names no files")
 
     if files_seen:
-        invented = [path for path in plan.grounded_in if path not in seen]
+        # **Invented, not merely unread.** This check exists to stop a plan
+        # being grounded in files that do not exist — the hallucinated citation
+        # that makes a plan unexecutable. It used to refuse any path the
+        # investigation had not opened, and that is a different and much larger
+        # set: a §31.1 task was rejected three times, and blocked having run no
+        # tool at all, for citing `test_payments.py` — a real file, sitting in
+        # the workspace, correctly identified as relevant. The investigation
+        # simply had not happened to read it.
+        #
+        # A file that exists is evidence the model knows the repository, not
+        # evidence it is making things up. Only a path that is neither read nor
+        # present is a fabrication.
+        invented = [
+            path
+            for path in plan.grounded_in
+            if path not in seen and not _exists_in_workspace(path, sandbox)
+        ]
         if invented:
-            problems.append(f"plan cites files that were never read: {', '.join(sorted(invented))}")
+            problems.append(f"plan cites files that do not exist: {', '.join(sorted(invented))}")
 
     # A plan that only investigates cannot satisfy a request to change
     # something, and — because an `investigate` step requires no evidence — it
@@ -390,6 +526,32 @@ def validate_plan(
             "anything; a plan made only of investigation cannot carry it out"
         )
 
+    # A change step that names no file is a gate with nothing behind it. It
+    # requires FILE_CHANGED, and nothing in it says which file would change, so
+    # the model is left to pick — and in a live PRD build one picked `PRD.md`
+    # and edited the specification it was supposed to be implementing.
+    #
+    # Naming files is also what makes a plan tractable. `coalesce_by_file` can
+    # only merge steps whose targets match, so "implement the add
+    # functionality", "implement the list functionality" and four more like them
+    # stayed six separate steps against one script, each owing its own proof.
+    #
+    # Rejected rather than repaired: the runtime cannot invent the missing
+    # filename without guessing, and a re-plan carrying this reason is exactly
+    # the recovery the rejection path exists for.
+    unnamed = [
+        step.title
+        for step in plan.steps
+        if effective_kind(step, read_only=read_only) == "change" and not step.files
+    ]
+    if unnamed and not read_only:
+        listed = "; ".join(unnamed[:4])
+        problems.append(
+            f"these steps would change something but name no file: {listed}. "
+            "Every step that edits must list the file(s) it edits in `files`, "
+            "and a step whose work is not a file change is not a step"
+        )
+
     return PlanValidation(ok=not problems, problems=tuple(problems), notes=tuple(notes))
 
 
@@ -406,9 +568,253 @@ class MaterialisedPlan:
     #: quietly lost its ability to write is a confusing run to debug.
     reclassified: tuple[str, ...] = ()
 
+    #: Evidence the plan asked for that nothing in this workspace can produce.
+    #: Dropped from the requirements and reported here, because a run that
+    #: silently proves less than it was asked to prove is exactly the kind of
+    #: quiet discount the evidence architecture exists to prevent — the
+    #: requirement is gone, so the fact that it is gone has to be visible.
+    unsatisfiable_evidence: tuple[EvidenceKind, ...] = ()
+
+    #: Titles of steps removed by `drop_unexecutable_steps`. Reported for the
+    #: same reason as `unsatisfiable_evidence`: the plan the user is shown must
+    #: account for every step the model proposed, including the ones that could
+    #: not be run.
+    dropped_steps: tuple[str, ...] = ()
+
     @property
     def plan_id(self) -> PlanId:
         return self.record.plan_id
+
+
+#: Suffixes that name a *specification*, not a target. Kept in step with
+#: `tools/documents.EXTRACTABLE`; duplicated as a literal set rather than
+#: imported so `agent/` does not depend on `tools/`.
+_DOCUMENTS = frozenset({".docx", ".pdf", ".xlsx", ".pptx", ".doc", ".odt"})
+
+
+def recover_named_files(plan: ImplementationPlan) -> ImplementationPlan:
+    """Fill in `files` from a step's own words when it left the field empty.
+
+    A live incremental build died here. Asked to "Create manage.py", the 7B
+    proposed one step titled **"Create manage.py File"** with `files: []`, and
+    `validate_plan` refused it three times — *"these steps would change
+    something but name no file"* — so a one-file task blocked without running a
+    single tool.
+
+    The filename was in the title the whole time. Refusing a plan for putting a
+    fact in the wrong field discards work the model actually did, and this
+    repository has the scar tissue to prove how expensive that is: the §31.1
+    suite lost tasks to a tool layer that rejected *correct* calls on
+    technicalities.
+
+    Strictly additive and only from the step's own text — nothing is invented,
+    and a step that named files keeps exactly what it named. Recovered names are
+    filtered through `editable_files` so this can never reintroduce the
+    specification document that `strip_documents` just removed.
+    """
+    return plan.model_copy(
+        update={
+            "steps": tuple(
+                step
+                if step.files
+                else step.model_copy(
+                    update={"files": editable_files(filenames_in(f"{step.title} {step.intent}"))}
+                )
+                for step in plan.steps
+            )
+        }
+    )
+
+
+def drop_unexecutable_steps(plan: ImplementationPlan) -> tuple[ImplementationPlan, tuple[str, ...]]:
+    """Remove change steps that name no file, and report which were removed.
+
+    Run *after* `recover_named_files`, so a step whose filename was merely in
+    the wrong field has already been rescued. What is left is a step that
+    names no target anywhere in its own text — and a small model emits these
+    constantly as procedural filler: *"Navigate to the project directory"*,
+    *"Open a terminal"*, *"Install the dependencies"*.
+
+    Such a step cannot be executed. It requires `FILE_CHANGED`, nothing says
+    which file, and the runtime has no target to scope the evidence to. The
+    previous behaviour — refuse the whole plan and re-plan — threw away every
+    *good* step alongside it, and a fresh OpenBazaar build blocked on exactly
+    that: one junk step next to a perfectly executable "create
+    openbazaar/settings.py".
+
+    This is not the guessing the rejection path was written to avoid. Nothing
+    is invented; an unexecutable step is removed and named. The plan is
+    returned untouched when dropping would empty it, so `validate_plan` still
+    refuses a plan made entirely of filler rather than silently running
+    nothing.
+    """
+    keep = tuple(step for step in plan.steps if step.files or effective_kind(step) != "change")
+    if not keep or len(keep) == len(plan.steps):
+        return plan, ()
+    dropped = tuple(step.title for step in plan.steps if step not in keep)
+    return plan.model_copy(update={"steps": keep}), dropped
+
+
+def strip_documents(plan: ImplementationPlan) -> ImplementationPlan:
+    """The plan with specification documents removed from every step's `files`."""
+    return plan.model_copy(
+        update={
+            "steps": tuple(
+                step.model_copy(update={"files": editable_files(step.files)}) for step in plan.steps
+            )
+        }
+    )
+
+
+def editable_files(files: Sequence[str]) -> tuple[str, ...]:
+    """A step's `files`, minus anything that is a document rather than code.
+
+    A live PRD build made the cost of not doing this vivid. The workspace held
+    exactly one file — `OpenBazaar_Marketplace_PRD.docx` — so every step the
+    model proposed named it, and two things followed. `file.patch` spent the
+    run trying to edit a zip archive; and `coalesce_by_file`, seeing four steps
+    with identical `files`, merged them into one step titled *"Design System
+    Architecture; develop frontend; develop backend; integrate frontend and
+    backend"* — the entire project as a single unit of work.
+
+    Merging is justified by "same file, so one unit of work". A specification
+    is not a unit of work, so it must not license the merge. The document stays
+    available to read; it stops being something a step claims to change.
+    """
+    return tuple(path for path in files if not _is_document(path))
+
+
+def _is_document(path: str) -> bool:
+    lowered = workspace_key(path).lower()
+    return any(lowered.endswith(suffix) for suffix in _DOCUMENTS)
+
+
+def coalesce_by_file(
+    proposals: Sequence[PlanStepProposal], *, read_only: bool = False
+) -> tuple[PlanStepProposal, ...]:
+    """Merge adjacent change steps that target the same file.
+
+    A plan is a decomposition of work, and the right grain depends on how much
+    the executor produces per turn. A 7B writes a *whole file* per turn, so a
+    plan reading
+
+        2. Define the TaskList class      → tasks.py
+        3. Implement the add method       → tasks.py
+        4. Implement the all method       → tasks.py
+        5. Implement the complete method  → tasks.py
+
+    describes four steps and one unit of work. That is not a hypothetical: in
+    a live build the model wrote all three methods in step 2, correctly and
+    completely — and steps 3, 4 and 5 then failed, each demanding its own
+    `FILE_CHANGED` for work that was already on disk. The task reported NOT
+    COMPLETE with the file finished.
+
+    Nothing weakens here. The merged step keeps the union of what its parts
+    required and every acceptance criterion they carried, so the same proof is
+    owed; it is owed once, by the one step that does the work.
+
+    **Adjacent and identical only.** Same file tuple, back to back, both
+    changing it. A step that reads the file in between is a different intent
+    and breaks the run, because merging across it would reorder the work.
+    """
+    merged: list[PlanStepProposal] = []
+
+    #: Original 1-based position -> position in `merged`. Dependencies are
+    #: written against the plan the model produced, and merging renumbers it;
+    #: without this remap, "step 4 needs step 2" would silently come to mean a
+    #: different step, which is worse than having no dependencies at all.
+    moved: dict[int, int] = {}
+
+    for index, proposal in enumerate(proposals, start=1):
+        previous = merged[-1] if merged else None
+        mergeable = (
+            previous is not None
+            and bool(proposal.files)
+            and previous.files == proposal.files
+            and effective_kind(previous, read_only=read_only) == "change"
+            and effective_kind(proposal, read_only=read_only) == "change"
+        )
+        if not mergeable:
+            merged.append(proposal)
+            moved[index] = len(merged)
+            continue
+
+        assert previous is not None  # narrowed by `mergeable`
+        merged[-1] = previous.model_copy(
+            update={
+                "title": f"{previous.title}; {proposal.title.lower()}",
+                "required_evidence": tuple(
+                    dict.fromkeys([*previous.required_evidence, *proposal.required_evidence])
+                ),
+                "acceptance_criteria": tuple(
+                    dict.fromkeys([*previous.acceptance_criteria, *proposal.acceptance_criteria])
+                ),
+                "risk": max(previous.risk, proposal.risk, key=_RISK_ORDER.__getitem__),
+            }
+        )
+        moved[index] = len(merged)
+
+    # No dependency remap here any more: a proposal carries no dependencies at
+    # all, because the model is not asked for them. `derive_dependencies` runs
+    # over this merged list, so the positions it produces are already the final
+    # ones and there is nothing to renumber.
+    return tuple(merged)
+
+
+def derive_dependencies(steps: Sequence[PlanStepProposal]) -> tuple[tuple[int, ...], ...]:
+    """Work out which steps need which, from the files they name.
+
+    **Derived rather than asked for, because asking does not work.** The
+    planner prompt describes `steps` as an array and never describes a step's
+    fields, so a model is never told `depends_on` exists and never populates
+    it. Left as the model's job the graph is empty on every plan — which makes
+    `skip_dependents` skip nothing and the local-failure fix inert.
+
+    Invariant 8 applies exactly here: structural facts come from parsers, not
+    from models. Two steps touching the same file are ordered by construction —
+    you cannot edit `pkg/calc.py` in step 3 before step 1 creates it — and that
+    is a fact about the plan, readable without asking anyone.
+
+    Only the *nearest* earlier step sharing a file is recorded. Dependency is
+    transitive and `skip_dependents` walks it, so linking to the whole history
+    would add edges that say nothing new.
+
+    **The model is not asked.** It used to carry a `depends_on` field, and a
+    live PRD build showed exactly what that costs: qwen2.5-coder emitted
+    `"depends_on": [0, 1, 2, ... 74` and ran out of output tokens mid-JSON, so
+    the whole plan failed to parse and the run blocked before its first tool
+    call. A field a small model can fill in wrongly is a field that can destroy
+    the response around it — and this one is derivable, so it is derived.
+    """
+    derived: list[tuple[int, ...]] = []
+
+    for index, step in enumerate(steps):
+        files = {_file_key(path) for path in step.files}
+        needs: set[int] = set()
+
+        if files:
+            for earlier in range(index - 1, -1, -1):
+                if files & {_file_key(path) for path in steps[earlier].files}:
+                    needs.add(earlier + 1)  # 1-based, as the field documents
+                    break
+
+        derived.append(tuple(sorted(needs)))
+
+    return tuple(derived)
+
+
+def _file_key(path: str) -> str:
+    return workspace_key(path).lower()
+
+
+#: Severity order for `Risk`, which is a `StrEnum` and so compares
+#: alphabetically — "critical" < "low" is not what a merge should mean.
+_RISK_ORDER: dict[str, int] = {
+    Risk.LOW: 0,
+    Risk.MEDIUM: 1,
+    Risk.HIGH: 2,
+    Risk.CRITICAL: 3,
+}
 
 
 def materialise(
@@ -417,6 +823,7 @@ def materialise(
     *,
     version: int = 1,
     read_only: bool = False,
+    producible: frozenset[EvidenceKind] | None = None,
 ) -> MaterialisedPlan:
     """Build plan and step records from a proposal. Pure; touches no store.
 
@@ -428,8 +835,15 @@ def materialise(
     steps: list[PlanStepRecord] = []
     unmapped: list[str] = []
     reclassified: list[str] = []
+    unsatisfiable: set[EvidenceKind] = set()
 
-    for ordinal, proposal in enumerate(plan.steps):
+    # Idempotent: `Planner._persist` already stripped these before validating,
+    # and `materialise` is also called directly by tests and tooling. Doing it
+    # again costs nothing and means neither caller can forget.
+    merged = coalesce_by_file(strip_documents(plan).steps, read_only=read_only)
+    dependencies = derive_dependencies(merged)
+
+    for ordinal, proposal in enumerate(merged):
         mapping = map_required_evidence(proposal.required_evidence)
         unmapped.extend(mapping.unrecognised)
 
@@ -438,9 +852,19 @@ def materialise(
         if kind != proposal.kind:
             reclassified.append(proposal.title)
 
+        # The model may raise its own bar — but only as far as something can
+        # actually clear it. `_VOCABULARY` maps "verify the migration applies"
+        # onto MIGRATION_APPLIED, which no tool produces, and the step then
+        # cannot complete however well it is executed. The runtime told the
+        # model "no available tool can produce this" and blocked anyway.
+        asked = mapping.kinds
+        if producible is not None:
+            unsatisfiable |= asked - producible
+            asked &= producible
+
         # Union, never replacement. A plan proposing no evidence at all still
         # gets the floor for its kind.
-        required = mapping.kinds | evidence_floor(kind)
+        required = asked | evidence_floor(kind, producible=producible)
 
         # An investigate step cannot patch, so a mapped requirement for
         # FILE_CHANGED is a requirement it has no tool to satisfy. Dropping it
@@ -448,6 +872,8 @@ def materialise(
         # gate with no key -- the phrase survives as an acceptance criterion.
         if kind == "investigate":
             required -= CHANGE_FLOOR
+
+        risk = _effective_risk(proposal, kind)
 
         steps.append(
             PlanStepRecord(
@@ -458,11 +884,16 @@ def materialise(
                 inputs=proposal.files,
                 outputs=(),
                 constraints=(proposal.intent,) if proposal.intent else (),
-                allowed_tools=allowed_tools_for(kind),
+                allowed_tools=allowed_tools_for(
+                    kind,
+                    may_remove=bool(_REMOVES.search(proposal.title)),
+                    may_run=step_may_run(proposal.title, proposal.acceptance_criteria),
+                ),
                 acceptance_criteria=_criteria(proposal, mapping),
                 required_evidence=tuple(sorted(required, key=lambda kind: kind.value)),
-                risk=Risk(proposal.risk),
-                approval_required=_needs_approval(proposal),
+                depends_on=dependencies[ordinal],
+                risk=risk,
+                approval_required=_needs_approval(risk),
             )
         )
 
@@ -476,6 +907,7 @@ def materialise(
         steps=tuple(steps),
         unmapped_evidence=tuple(dict.fromkeys(unmapped)),
         reclassified=tuple(dict.fromkeys(reclassified)),
+        unsatisfiable_evidence=tuple(sorted(unsatisfiable, key=lambda kind: kind.value)),
     )
 
 
@@ -489,14 +921,38 @@ def _criteria(proposal: PlanStepProposal, mapping: EvidenceMapping) -> tuple[str
     return tuple(dict.fromkeys([*proposal.acceptance_criteria, *mapping.unrecognised]))
 
 
-def _needs_approval(proposal: PlanStepProposal) -> bool:
+def _effective_risk(proposal: PlanStepProposal, kind: str) -> Risk:
+    """The risk a step can actually carry, which caps what it claims.
+
+    Same reasoning as the evidence floor above: an `investigate` step holds
+    `READ_ONLY_TOOLS` and has no way to write, so `high` describes a
+    consequence it cannot produce. Left uncapped it is worse than cosmetic —
+    high risk demands approval, and a headless run has no approver, so the
+    whole task stops to authorise something that could never have happened.
+
+    A live build died exactly there: a 7B labelled *"Check for existing
+    storage.py file"* high risk, and the run stopped before writing anything.
+    Models are consistently poor at this judgement, which is the argument for
+    deriving the ceiling from the allowlist rather than trusting the label.
+
+    The cap only ever lowers. A model calling a read `critical` is wrong in a
+    way the runtime can prove; one calling a write `critical` may know
+    something the runtime does not, so that is left alone.
+    """
+    declared = Risk(proposal.risk)
+    if kind == "investigate" and declared in (Risk.HIGH, Risk.CRITICAL):
+        return Risk.LOW
+    return declared
+
+
+def _needs_approval(risk: Risk) -> bool:
     """The runtime decides approval, not the plan.
 
     `PlanStepProposal` has no approval field on purpose: a model that could
     declare its own step pre-approved would route around the only human gate in
-    the system.
+    the system. It takes the *effective* risk, so the cap above carries here.
     """
-    return Risk(proposal.risk) in (Risk.HIGH, Risk.CRITICAL)
+    return risk in (Risk.HIGH, Risk.CRITICAL)
 
 
 @dataclass(frozen=True)
@@ -526,11 +982,13 @@ class Planner:
         limits: ExecutionLimits | None = None,
         sandbox: PathSandbox | None = None,
         read_only: bool = False,
+        producible: frozenset[EvidenceKind] | None = None,
     ) -> None:
         self._store = store
         self._limits = limits or DEFAULT_LIMITS
         self._sandbox = sandbox
         self._read_only = read_only
+        self._producible = producible
 
     @property
     def read_only(self) -> bool:
@@ -599,6 +1057,30 @@ class Planner:
         version: int,
         files_seen: Sequence[str],
     ) -> MaterialisedPlan:
+        # Documents are stripped *before* validation, not between validation and
+        # materialisation. Otherwise the two disagree: validation sees a step
+        # naming `PRD.docx`, accepts it as "names a file", and materialise then
+        # removes it — so a step that in fact names no editable target sails
+        # through the one check that exists to catch exactly that. Stripping
+        # first means such a step is refused, and the model is told to name the
+        # files it will actually create.
+        # Strip before recovering, not after. A step whose only named file is
+        # the specification is, once stripped, a step that names nothing --- and
+        # `recover_named_files` is a no-op on a step that already named
+        # something, so recovering first would look at the *unstripped* step,
+        # decline to help, and leave the stripping to empty it. That is not
+        # hypothetical: the first prompt of a fresh OpenBazaar build proposed
+        # `files: ["OpenBazaar_Marketplace_PRD.docx"]` for a step titled
+        # "... Create manage.py at the workspace root ...", and blocked without
+        # running a tool. Stripping first lets recovery see the empty field and
+        # take `manage.py` from the step's own title.
+        plan = recover_named_files(strip_documents(plan))
+
+        # Only now, with every filename rescued from wherever the model put it,
+        # is a step with no target genuinely unexecutable. Dropping those beats
+        # refusing the plan they arrived in, which discarded the good steps too.
+        plan, dropped = drop_unexecutable_steps(plan)
+
         validation = validate_plan(
             plan,
             sandbox=self._sandbox,
@@ -609,7 +1091,15 @@ class Planner:
         if not validation.ok:
             raise PlanRejected(validation.problems)
 
-        materialised = materialise(task.task_id, plan, version=version, read_only=self._read_only)
+        materialised = materialise(
+            task.task_id,
+            plan,
+            version=version,
+            read_only=self._read_only,
+            producible=self._producible,
+        )
+        if dropped:
+            materialised = replace(materialised, dropped_steps=dropped)
         self._store.create_plan(materialised.record, materialised.steps)
 
         if version == 1:
@@ -678,6 +1168,38 @@ class Planner:
         self._store.save_step(updated)
         return updated
 
+    def skip_dependents(self, step: PlanStepRecord) -> tuple[PlanStepRecord, ...]:
+        """Close every step that transitively needed `step`, as SKIPPED.
+
+        Transitive because a dependency chain is only as good as its weakest
+        link: if 4 needs 3 and 3 needs 2, then 2 failing makes 4 unreachable
+        just as surely as it makes 3 unreachable, and stopping at direct
+        dependents would hand 4 to the executor with its precondition missing.
+
+        Only *unfinished* steps are touched. A step that already passed keeps
+        its outcome and its evidence — work that was done and proven stays
+        done, whatever failed afterwards.
+
+        Returns what it closed, so the caller can say so rather than leaving
+        the user to infer it from a report full of steps that never ran.
+        """
+        steps = self._store.get_steps(step.plan_id)
+        doomed = {step.ordinal}
+
+        # One forward pass suffices: `depends_on` only ever points backwards
+        # (`_remap` drops anything else), so a step's dependencies are always
+        # resolved before it is reached.
+        skipped: list[PlanStepRecord] = []
+        for candidate in sorted(steps, key=lambda item: item.ordinal):
+            if candidate.ordinal in doomed or candidate.outcome is not None:
+                continue
+            # `depends_on` is 1-based, `ordinal` is 0-based.
+            if any(position - 1 in doomed for position in candidate.depends_on):
+                doomed.add(candidate.ordinal)
+                skipped.append(self.fail_step(candidate, StepOutcome.SKIPPED))
+
+        return tuple(skipped)
+
     # -- reporting ---------------------------------------------------------
 
     def progress(self, plan_id: PlanId) -> PlanProgress:
@@ -711,10 +1233,28 @@ def render_plan_summary(
     """
     lines = [plan.summary, ""]
     for step in steps:
-        marker = "✓" if step.outcome is StepOutcome.PASS else " "
+        marker = _MARKERS.get(step.outcome, " ") if step.outcome else " "
         pointer = " ← current" if current is not None and step.step_id == current else ""
         lines.append(f"[{marker}] {step.ordinal + 1}. {step.title}{pointer}")
     return "\n".join(lines).strip()
+
+
+#: How each closed outcome appears in the plan view.
+#:
+#: A blank used to mean everything that was not `PASS`, which was harmless while
+#: the only alternative to passing was ending the run. Now that a failed step
+#: leaves the rest of the plan running, a skipped step and a pending step would
+#: render identically — so the model would be told work is still coming that
+#: nothing intends to do.
+_MARKERS: dict[StepOutcome, str] = {
+    StepOutcome.PASS: "✓",
+    StepOutcome.SKIPPED: "–",
+    StepOutcome.BLOCKED: "✗",
+    StepOutcome.CANCELLED: "✗",
+    StepOutcome.APPROVAL_REQUIRED: "✗",
+    StepOutcome.PLAN_INVALID: "✗",
+    StepOutcome.REPAIRABLE: " ",
+}
 
 
 def render_step(step: PlanStepRecord) -> str:
@@ -741,8 +1281,13 @@ __all__ = [
     "PlanValidation",
     "Planner",
     "allowed_tools_for",
+    "step_may_run",
     "asks_for_a_change",
     "effective_kind",
+    "derive_dependencies",
+    "editable_files",
+    "recover_named_files",
+    "strip_documents",
     "evidence_floor",
     "map_required_evidence",
     "materialise",

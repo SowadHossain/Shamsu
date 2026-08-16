@@ -524,6 +524,275 @@ def _check_validation_rule(workspace: Path) -> Outcome:
     return ok("negative amounts rejected, valid charges unaffected")
 
 
+# ===========================================================================
+# 8-11. The diagnostic four
+# ===========================================================================
+#
+# The seven above are all single-file toy repositories, and they share a blind
+# spot: each is satisfiable by one edit to one file that a syntax check can
+# confirm. That is exactly the shape the harness is already good at, so the
+# suite reports on the part of the system that works.
+#
+# These four are chosen to fail on the four defects the audit found, one each.
+# They are expected to score badly at first. A task nobody can pass yet is a
+# measurement; a suite of tasks that all pass is a thermometer in a drawer.
+
+
+# ---------------------------------------------------------------------------
+# 8. A plan with several steps  (probes: one failed step ends the task)
+# ---------------------------------------------------------------------------
+
+_SETTINGS = '''\
+"""Application settings."""
+
+
+class Settings:
+    """Runtime configuration."""
+
+    def __init__(self) -> None:
+        self.name = "app"
+'''
+
+_LOGGING = '''\
+"""Logging helpers."""
+
+
+def describe(level: str) -> str:
+    """Return a human-readable description of a log level."""
+    return f"logging at {level}"
+'''
+
+_APP_MAIN = '''\
+"""Entry point."""
+
+from settings import Settings
+
+
+def summary() -> str:
+    """One line describing how the application is configured."""
+    settings = Settings()
+    return f"{settings.name}"
+'''
+
+
+def _check_multi_step_feature(workspace: Path) -> Outcome:
+    """Three independent sub-goals, reported as a count.
+
+    The count is the point. A binary result cannot distinguish "the agent could
+    not do this" from "the agent did two thirds of it and the runtime threw the
+    rest away when one step failed" — and those want opposite fixes. The detail
+    string carries the fraction so a failure is legible in the suite output.
+    """
+    met: list[str] = []
+    missing: list[str] = []
+
+    for label, code in (
+        (
+            "level defaults to INFO",
+            "from settings import Settings\nassert Settings().level == 'INFO', Settings().level\n",
+        ),
+        (
+            "level is a keyword argument",
+            "from settings import Settings\n"
+            "assert Settings(level='DEBUG').level == 'DEBUG', Settings(level='DEBUG').level\n",
+        ),
+        (
+            "summary() reports the level",
+            "import app\nout = app.summary()\n"
+            "assert 'INFO' in out, out\nassert 'app' in out, out\n",
+        ),
+    ):
+        status, _ = run_python(workspace, code)
+        (met if status == 0 else missing).append(label)
+
+    if missing:
+        return no(f"{len(met)}/3 sub-goals: missing {', '.join(missing)}")
+    return ok("3/3 sub-goals")
+
+
+# ---------------------------------------------------------------------------
+# 9. A symbol behind a re-export  (probes: structural retrieval)
+# ---------------------------------------------------------------------------
+#
+# The request names `format_price`. Grep finds three files; only one defines it,
+# and the definition is behind a re-export in a private module the request never
+# mentions. An agent with a structural index knows where the symbol is defined
+# before it spends a turn; an agent with grep has to read its way there.
+
+_MONEY_INIT = '''\
+"""Money formatting."""
+
+from money._impl import format_price
+
+__all__ = ["format_price"]
+'''
+
+_MONEY_IMPL = '''\
+"""Formatting internals. Not part of the public interface."""
+
+
+def format_price(cents: int) -> str:
+    """Render a price in whole currency units."""
+    return f"${cents / 100:.3f}"
+'''
+
+_RECEIPT = '''\
+"""Receipt rendering."""
+
+from money import format_price
+
+
+def render(items: dict[str, int]) -> str:
+    """One line per item, name and price."""
+    return "\\n".join(f"{name} {format_price(cents)}" for name, cents in items.items())
+'''
+
+
+def _check_symbol_behind_reexport(workspace: Path) -> Outcome:
+    code, output = run_python(
+        workspace,
+        "from money import format_price\n"
+        "assert format_price(1234) == '$12.34', format_price(1234)\n"
+        "assert format_price(500) == '$5.00', format_price(500)\n"
+        "assert format_price(0) == '$0.00', format_price(0)\n"
+        "from store.receipt import render\n"
+        "assert render({'pen': 250}) == 'pen $2.50', render({'pen': 250})\n"
+        "print('ok')\n",
+    )
+    if code != 0:
+        return no(f"prices still wrong: {output[-200:]}")
+    return ok("format_price rounds to 2 decimals, through the re-export")
+
+
+# ---------------------------------------------------------------------------
+# 10. A change that must be wired in  (probes: syntax-only verification)
+# ---------------------------------------------------------------------------
+#
+# THE task this suite was missing. The obvious edit — append a handler function
+# to the end of the file — is valid Python, passes `compile`, passes the write
+# probe, passes ruff, and does nothing, because the dispatch table above it is
+# never touched. v1 shipped exactly this bug in a Django `urlpatterns` and
+# reported "[verified] Verification passed 1 required stage(s): syntax."
+#
+# Nothing in the pipeline can currently tell this apart from a correct fix.
+
+_DISPATCH = '''\
+"""Command dispatch."""
+
+
+def _start() -> str:
+    return "starting"
+
+
+def _stop() -> str:
+    return "stopping"
+
+
+HANDLERS = {
+    "start": _start,
+    "stop": _stop,
+}
+
+
+def dispatch(command: str) -> str:
+    """Run a command by name."""
+    handler = HANDLERS.get(command)
+    if handler is None:
+        raise KeyError(f"unknown command: {command}")
+    return handler()
+'''
+
+_DISPATCH_TEST = """\
+from dispatch import dispatch
+
+
+def test_start() -> None:
+    assert dispatch("start") == "starting"
+
+
+def test_stop() -> None:
+    assert dispatch("stop") == "stopping"
+"""
+
+
+def _check_wired_in(workspace: Path) -> Outcome:
+    code, output = run_python(
+        workspace,
+        "from dispatch import dispatch\n"
+        "assert dispatch('restart') == 'restarting', dispatch('restart')\n"
+        "assert dispatch('start') == 'starting', dispatch('start')\n"
+        "assert dispatch('stop') == 'stopping', dispatch('stop')\n"
+        "print('ok')\n",
+    )
+    if code != 0:
+        source = (workspace / "dispatch.py").read_text(encoding="utf-8")
+        if "restart" in source:
+            # The distinctive failure, called by name: the code is *there* and
+            # is not reachable. This is the one a syntax gate cannot see.
+            return no("a restart handler was written but never registered — dead code")
+        return no(f"restart is not handled: {output[-160:]}")
+    return ok("restart dispatches, existing commands unaffected")
+
+
+# ---------------------------------------------------------------------------
+# 11. A project that has to run  (probes: nothing can run the project)
+# ---------------------------------------------------------------------------
+#
+# The failure is an ImportError at module scope: `python -m compileall` compiles
+# it, ruff passes it, mypy is not configured, and there is no test. Every
+# verification tool in the current allowlist reports success on a program that
+# cannot start. The only way to know is to run it.
+
+_BROKEN_MAIN = '''\
+"""Entry point. Run with `python main.py`."""
+
+from greeting import make_greeting, DEFAULT_NAME
+
+
+def main() -> None:
+    print(make_greeting(DEFAULT_NAME))
+    print("ready")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+_GREETING = '''\
+"""Greetings."""
+
+
+def make_greeting(name: str) -> str:
+    """Return a greeting for `name`."""
+    return f"hello, {name}"
+'''
+
+
+def _check_project_runs(workspace: Path) -> Outcome:
+    try:
+        finished = subprocess.run(
+            [sys.executable, "main.py"],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            timeout=CHECK_TIMEOUT_SECONDS,
+            env=_environment(),
+        )
+    except subprocess.TimeoutExpired:
+        return no(f"main.py did not exit within {CHECK_TIMEOUT_SECONDS:.0f}s")
+    except OSError as exc:
+        return no(f"could not run main.py: {exc}")
+
+    output = (finished.stdout + finished.stderr).strip()
+    if finished.returncode != 0:
+        return no(f"main.py exits {finished.returncode}: {output[-200:]}")
+    if "ready" not in finished.stdout:
+        return no(f"main.py ran but never printed 'ready': {output[-160:]}")
+    if "hello," not in finished.stdout:
+        return no("the greeting was removed rather than fixed")
+    return ok("main.py starts and prints 'ready'")
+
+
 # ---------------------------------------------------------------------------
 # The suite
 # ---------------------------------------------------------------------------
@@ -600,6 +869,56 @@ TASKS: tuple[EvalTask, ...] = (
         files={"payments.py": _PAYMENTS, "test_payments.py": _PAYMENTS_TEST},
         frozen=("test_payments.py",),
     ),
+    EvalTask(
+        name="multi_step_feature",
+        summary="Three-part change",
+        request=(
+            "Give Settings in settings.py a 'level' field defaulting to 'INFO' "
+            "and accepted as a keyword argument, and make summary() in app.py "
+            "include the level in the line it returns. Leave logging_helpers.py "
+            "alone."
+        ),
+        files={
+            "settings.py": _SETTINGS,
+            "logging_helpers.py": _LOGGING,
+            "app.py": _APP_MAIN,
+        },
+        frozen=("logging_helpers.py",),
+    ),
+    EvalTask(
+        name="symbol_behind_reexport",
+        summary="Symbol behind a re-export",
+        request=(
+            "format_price shows three decimal places and should show two, so "
+            "1234 renders as $12.34. Fix it where it is defined."
+        ),
+        files={
+            "money/__init__.py": _MONEY_INIT,
+            "money/_impl.py": _MONEY_IMPL,
+            "store/__init__.py": "",
+            "store/receipt.py": _RECEIPT,
+        },
+    ),
+    EvalTask(
+        name="must_be_wired_in",
+        summary="Change that must be wired in",
+        request=(
+            "Add a 'restart' command to dispatch.py that returns the string "
+            "'restarting'. dispatch('restart') must return it. The existing "
+            "commands must keep working."
+        ),
+        files={"dispatch.py": _DISPATCH, "test_dispatch.py": _DISPATCH_TEST},
+        frozen=("test_dispatch.py",),
+    ),
+    EvalTask(
+        name="project_must_run",
+        summary="Project that has to run",
+        request=(
+            "Running `python main.py` fails. Fix it so the program starts, "
+            "prints a greeting, and then prints 'ready'."
+        ),
+        files={"main.py": _BROKEN_MAIN, "greeting.py": _GREETING},
+    ),
 )
 
 CHECKS = {
@@ -610,6 +929,10 @@ CHECKS = {
     "multi_file_feature": _check_multi_file_feature,
     "refactor_a_function": _check_refactor_a_function,
     "validation_rule": _check_validation_rule,
+    "multi_step_feature": _check_multi_step_feature,
+    "symbol_behind_reexport": _check_symbol_behind_reexport,
+    "must_be_wired_in": _check_wired_in,
+    "project_must_run": _check_project_runs,
 }
 
 BY_NAME = {task.name: task for task in TASKS}

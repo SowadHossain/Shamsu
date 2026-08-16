@@ -40,6 +40,7 @@ from shamsu.artifacts.python_source import (
     module_path_for,
 )
 from shamsu.interfaces.code_intelligence import ImpactReport, LineRange, SearchHit, SymbolRef
+from shamsu.security.paths import workspace_key
 
 #: How far `impact` walks the caller graph. A change's reach is unbounded in
 #: principle; a report nobody can read is not more useful than a bounded one
@@ -124,7 +125,7 @@ class PythonCodeIndex:
 
     def symbols_in(self, path: str) -> Sequence[SymbolRef]:
         """Every symbol defined in one file."""
-        module = self._modules.get(path.replace("\\", "/").lstrip("./"))
+        module = self._modules.get(workspace_key(path))
         if module is None:
             return ()
         return tuple(_to_ref(module, symbol) for symbol in module.symbols)
@@ -138,7 +139,7 @@ class PythonCodeIndex:
 
     def find_file(self, pattern: str) -> Sequence[str]:
         """Exact path, then glob, then basename. Most specific match first."""
-        needle = pattern.replace("\\", "/").lstrip("./")
+        needle = workspace_key(pattern)
         if needle in self._hashes:
             return (needle,)
 
@@ -281,7 +282,7 @@ class PythonCodeIndex:
         3. The test's filename follows the `test_<stem>` convention. A
            heuristic, consulted last, and only when neither import rule fired.
         """
-        normalised = path.replace("\\", "/").lstrip("./")
+        normalised = workspace_key(path)
         module = self._modules.get(normalised)
         module_path = module.module_path if module else module_path_for(normalised)
         stem = Path(normalised).stem

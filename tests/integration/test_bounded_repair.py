@@ -273,6 +273,13 @@ class TestVerificationReadsTheCurrentSource:
         _, first = _invoke(gateway, "test.run", Phase.VERIFY, command="pytest")
         assert first.ok is False
 
+        # Measured against the file itself, not against `BROKEN.encode()`: the
+        # premise is that the edit leaves the size *unchanged*, and a fixture
+        # written in text mode stores CRLF on Windows, where an LF constant is
+        # five bytes short and the comparison fails for a reason the test is
+        # not about.
+        before = (repo / "calc.py").stat().st_size
+
         _invoke(
             gateway,
             "file.patch",
@@ -281,7 +288,7 @@ class TestVerificationReadsTheCurrentSource:
             find="return a - b",
             replace="return a + b",
         )
-        assert len((repo / "calc.py").read_bytes()) == len(BROKEN.encode())
+        assert (repo / "calc.py").stat().st_size == before
 
         _, second = _invoke(gateway, "test.run", Phase.VERIFY, command="pytest")
         assert second.ok is True, second.error

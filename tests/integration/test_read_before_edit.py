@@ -80,8 +80,15 @@ class TestAnUnreadFileCannotBeEdited:
 
         assert (repo / "README.md").read_text(encoding="utf-8") == README
 
-    def test_the_refusal_says_what_to_do(self, gateway: ToolGateway) -> None:
-        with pytest.raises(ToolPolicyViolation, match="Call file.read on it first"):
+    def test_the_refusal_carries_the_file_it_asked_for(self, gateway: ToolGateway) -> None:
+        """The refusal runs the errand rather than assigning it.
+
+        It used to say "call file.read on it first", which is a turn spent on
+        something the runtime can do itself — and in the §31.1 suite the errand
+        did not come back: the run read the file, read it again, and concluded,
+        having arrived with a correct anchor on its very first call.
+        """
+        with pytest.raises(ToolPolicyViolation, match="A small widget library"):
             call(
                 gateway,
                 "file.patch",
@@ -91,6 +98,37 @@ class TestAnUnreadFileCannotBeEdited:
                 find="x",
                 replace="y",
             )
+
+    def test_the_call_still_fails(self, gateway: ToolGateway, repo: Path) -> None:
+        """Reading it for the model does not make the guessed anchor good."""
+        with pytest.raises(ToolPolicyViolation, match="has not been read"):
+            call(
+                gateway,
+                "file.patch",
+                Phase.AUTHOR,
+                path="README.md",
+                mode="replace_text",
+                find="x",
+                replace="y",
+            )
+        assert (repo / "README.md").read_text(encoding="utf-8") == README
+
+    def test_the_retry_is_permitted(self, gateway: ToolGateway, repo: Path) -> None:
+        """The point of reading it: the next call goes straight through."""
+        with pytest.raises(ToolPolicyViolation):
+            call(gateway, "file.patch", Phase.AUTHOR, path="README.md", find="x", replace="y")
+
+        result = call(
+            gateway,
+            "file.patch",
+            Phase.AUTHOR,
+            path="README.md",
+            mode="replace_text",
+            find="A small widget library.",
+            replace="A small widget library.\n\n## Installation\n\npip install .",
+        )
+        assert result.ok, result.error
+        assert "## Installation" in (repo / "README.md").read_text(encoding="utf-8")
 
     def test_reading_first_permits_the_edit(self, gateway: ToolGateway, repo: Path) -> None:
         assert call(gateway, "file.read", Phase.AUTHOR, path="README.md").ok
@@ -154,11 +192,37 @@ class TestCreatingIsNotEditing:
         assert result.ok, result.error
         assert (repo / "NOTES.md").read_text(encoding="utf-8") == "notes\n"
 
-    def test_authoring_a_file_licenses_editing_it(self, gateway: ToolGateway, repo: Path) -> None:
-        """The model supplied the contents, so it knows them."""
+    def test_authoring_a_file_does_not_license_anchoring_in_it(self, gateway: ToolGateway) -> None:
+        """Having written a file once is not the same as knowing it now.
+
+        This asserted the opposite until a live build disproved it. The agent
+        created `tasks.py` with stubbed methods, and two steps later anchored a
+        `replace_text` on `"# Define the TaskList class"` — a line it had never
+        written. Its context had rolled over in between, so the authorship
+        credit outlived the memory it was standing in for, and the guess was
+        let through to fail on a missing anchor.
+        """
         assert call(
             gateway, "file.patch", Phase.AUTHOR, path="NOTES.md", mode="create", content="one\n"
         ).ok
+
+        with pytest.raises(ToolPolicyViolation, match="has not been read"):
+            call(
+                gateway,
+                "file.patch",
+                Phase.AUTHOR,
+                path="NOTES.md",
+                mode="replace_text",
+                find="one",
+                replace="two",
+            )
+
+    def test_reading_it_back_restores_the_licence(self, gateway: ToolGateway, repo: Path) -> None:
+        """The requirement is a read, and a read satisfies it. Nothing is stuck."""
+        assert call(
+            gateway, "file.patch", Phase.AUTHOR, path="NOTES.md", mode="create", content="one\n"
+        ).ok
+        assert call(gateway, "file.read", Phase.AUTHOR, path="NOTES.md").ok
 
         result = call(
             gateway,
@@ -171,6 +235,47 @@ class TestCreatingIsNotEditing:
         )
         assert result.ok, result.error
         assert (repo / "NOTES.md").read_text(encoding="utf-8") == "two\n"
+
+    def test_its_own_draft_can_be_rewritten_without_a_read(
+        self, gateway: ToolGateway, repo: Path
+    ) -> None:
+        """The escape hatch that keeps the stricter rule from trapping the agent.
+
+        `create` on a file this run created from nothing is a redraft, not the
+        destruction of someone else's work — so it is allowed, and an agent
+        that has forgotten its own file is never cornered.
+        """
+        assert call(
+            gateway, "file.patch", Phase.AUTHOR, path="NOTES.md", mode="create", content="one\n"
+        ).ok
+
+        result = call(
+            gateway, "file.patch", Phase.AUTHOR, path="NOTES.md", mode="create", content="two\n"
+        )
+        assert result.ok, result.error
+        assert (repo / "NOTES.md").read_text(encoding="utf-8") == "two\n"
+
+    def test_a_pre_existing_file_is_still_protected(self, gateway: ToolGateway, repo: Path) -> None:
+        """The provenance rule must not become a blanket licence to overwrite.
+
+        `README.md` was in the repo before the run. `create` on it stays
+        refused — this is the v1 data-loss case the awkward path exists for.
+
+        A returned failure rather than a raised one: `create` declares no
+        `requires_prior_read`, so it never reaches the gateway's policy check,
+        and the tool itself decides. The file must be untouched either way.
+        """
+        result = call(
+            gateway,
+            "file.patch",
+            Phase.AUTHOR,
+            path="README.md",
+            mode="create",
+            content="gone\n",
+        )
+        assert result.ok is False
+        assert "already exists" in (result.error or "")
+        assert (repo / "README.md").read_text(encoding="utf-8") == README
 
     def test_a_wholesale_overwrite_still_needs_a_read(self, gateway: ToolGateway) -> None:
         """`replace_file` discards content, which is the case for knowing it."""

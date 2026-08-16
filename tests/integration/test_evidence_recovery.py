@@ -1,12 +1,20 @@
 """A step that did the work but not the proof gets another attempt.
 
-The scenario is taken verbatim from a §31.1 evaluation run: the agent fixed
-`add()`, registered `file_changed`, and concluded without calling `git.inspect`
-— so the gate refused on `git_diff_reviewed` alone. Before this, that ended the
-run: `REPAIRABLE` required `context.last_digest`, which only `test.run` sets.
+The scenario came verbatim from a §31.1 run: the agent fixed `add()`,
+registered `file_changed`, and concluded without calling `git.inspect` — so the
+gate refused on `git_diff_reviewed` alone. Before the recovery path existed
+that ended the run, because `REPAIRABLE` required `context.last_digest`, which
+only `test.run` sets.
 
-What is asserted here is the recovery, not the model: the same first three
-responses in both tests, and only what comes after the refusal differs.
+**That exact scenario can no longer happen, and one test here now asserts so.**
+The runtime performs the diff review itself, outside the action budget, so
+forgetting `git.inspect` is not a way to lose a finished piece of work any
+more. The recovery path it motivated is still needed and still tested — with a
+gap the runtime cannot close on the model's behalf. `tests_passed` is that gap:
+only running the tests can produce it, and only the model can decide to.
+
+What is asserted here is the recovery, not the model: the same first responses
+in each test, and only what comes after the refusal differs.
 """
 
 from __future__ import annotations
@@ -33,6 +41,11 @@ pytestmark = pytest.mark.integration
 
 BROKEN = '"""Arithmetic."""\n\n\ndef add(a: int, b: int) -> int:\n    return a - b\n'
 
+#: Present so `tests_passed` is producible here at all. A gate demanding it in a
+#: repository with no tests would be unopenable rather than strict, which is
+#: what `producible_evidence` now refuses to build.
+TESTS = "from calc import add\n\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+
 
 def _say(**payload: object) -> str:
     return json.dumps(payload)
@@ -52,7 +65,7 @@ def _plan() -> str:
                 "kind": "change",
                 "files": ["calc.py"],
                 "acceptance_criteria": ["add(2, 3) == 5"],
-                "required_evidence": [],
+                "required_evidence": ["targeted tests pass"],
                 "risk": "low",
             }
         ],
@@ -60,8 +73,9 @@ def _plan() -> str:
     )
 
 
-#: Investigate, classify, plan — then patch and conclude *without* the diff
-#: review. This is what the live model did.
+#: Investigate, classify, plan — then patch and conclude without running the
+#: tests the plan asked for. The shape of the original live failure, moved onto
+#: the one piece of evidence the runtime cannot produce for the model.
 PREFIX = [
     _say(action="conclude", conclusion="add() subtracts"),
     # `planned`, not `direct`: DIRECT builds its plan without a model call, so
@@ -78,6 +92,7 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()
     (root / "calc.py").write_text(BROKEN, encoding="utf-8")
+    (root / "test_calc.py").write_text(TESTS, encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(root)], check=True, capture_output=True)
     run_git(root, "config", "user.email", "eval@shamsu.local")
     run_git(root, "config", "user.name", "SHAMSU")
@@ -134,13 +149,13 @@ class TestTheStepGetsAnotherAttempt:
         result = _run(store, project, repo, [*PREFIX, *INSISTS])
         failures = store.failures_for(result.task_id)
 
-        # More than one: the retry concluded without the diff again, which is
+        # More than one: the retry concluded without the tests again, which is
         # recorded and is what the stuck detector then acts on.
         assert failures
         assert {failure.kind for failure in failures} == {FailureKind.INCOMPLETE_EVIDENCE}
-        assert all("git_diff_reviewed" in failure.expected for failure in failures)
+        assert all("tests_passed" in failure.expected for failure in failures)
 
-    def test_a_second_attempt_that_reviews_the_diff_completes(
+    def test_a_second_attempt_that_runs_the_tests_completes(
         self, store: StateStore, project: ProjectRecord, repo: Path
     ) -> None:
         """The whole point: one more call was all the run needed."""
@@ -150,8 +165,8 @@ class TestTheStepGetsAnotherAttempt:
             repo,
             [
                 *PREFIX,
-                _tool("git.inspect", subcommand="diff"),
-                _say(action="conclude", conclusion="reviewed"),
+                _tool("test.run"),
+                _say(action="conclude", conclusion="tests pass"),
             ],
         )
 
@@ -169,7 +184,7 @@ class TestTheStepGetsAnotherAttempt:
         model = FakeModelClient(
             [
                 *PREFIX,
-                _tool("git.inspect", subcommand="diff"),
+                _tool("test.run"),
                 _say(action="conclude", conclusion="ok"),
             ]
         )
@@ -186,7 +201,7 @@ class TestTheStepGetsAnotherAttempt:
         asyncio.run(session.run("fix add() so it sums"))
 
         prompts = [message.content for request in model.requests for message in request.messages]
-        assert any("git_diff_reviewed" in prompt and "git.inspect" in prompt for prompt in prompts)
+        assert any("tests_passed" in prompt and "test.run" in prompt for prompt in prompts)
 
 
 class TestTheRetryRemembersTheFirstAttempt:
@@ -203,7 +218,7 @@ class TestTheRetryRemembersTheFirstAttempt:
         model = FakeModelClient(
             [
                 *PREFIX,
-                _tool("git.inspect", subcommand="diff"),
+                _tool("test.run"),
                 _say(action="conclude", conclusion="reviewed"),
             ]
         )
@@ -227,11 +242,109 @@ class TestTheRetryRemembersTheFirstAttempt:
         assert any("file.patch" in prompt for prompt in retries[-2:])
 
 
+class TestTheDiffReviewIsNoLongerTheModelsProblem:
+    """The original failure, replayed: it now finishes.
+
+    A live build produced a `cli.py` that worked perfectly and ended NOT
+    COMPLETE, because both its attempts went on a junk anchor and `git.inspect`
+    was never called. The §31.1 suite lost tasks the same way — correct fix,
+    `file_changed` in hand, blocked one call short of a review the runtime was
+    perfectly capable of performing itself.
+    """
+
+    def test_a_patch_and_a_conclusion_are_enough(
+        self, store: StateStore, project: ProjectRecord, repo: Path
+    ) -> None:
+        """No `git.inspect` anywhere in the script, and the evidence is there."""
+        result = _run(
+            store,
+            project,
+            repo,
+            [
+                _say(action="conclude", conclusion="add() subtracts"),
+                _say(kind="planned", reason="one file"),
+                _say(
+                    summary="Fix the adder.",
+                    steps=[
+                        {
+                            "title": "Fix the add function",
+                            "intent": "make it sum",
+                            "kind": "change",
+                            "files": ["calc.py"],
+                            "acceptance_criteria": ["add(2, 3) == 5"],
+                            "required_evidence": [],
+                            "risk": "low",
+                        }
+                    ],
+                    grounded_in=[],
+                ),
+                _tool("file.patch", path="calc.py", find="return a - b", replace="return a + b"),
+                _say(action="conclude", conclusion="fixed it"),
+            ],
+        )
+
+        assert result.completed is True, result.render()
+        assert EvidenceKind.GIT_DIFF_REVIEWED in store.verified_evidence(result.task_id)
+        assert AgentState.REPAIR not in result.transitions
+
+    def test_the_evidence_still_comes_from_a_real_tool_event(
+        self, store: StateStore, project: ProjectRecord, repo: Path
+    ) -> None:
+        """The invariant that must not have moved.
+
+        `required ⊆ verified` is only worth anything because every row traces
+        to an observed execution. The runtime choosing to make the call does
+        not change that; a runtime *asserting* the evidence would.
+        """
+        result = _run(
+            store,
+            project,
+            repo,
+            [
+                _say(action="conclude", conclusion="add() subtracts"),
+                _say(kind="planned", reason="one file"),
+                _plan(),
+                _tool("file.patch", path="calc.py", find="return a - b", replace="return a + b"),
+                _tool("test.run"),
+                _say(action="conclude", conclusion="done"),
+            ],
+        )
+
+        events = store.tool_events_for(result.task_id)
+        assert any(event.tool == "git.inspect" and event.ok for event in events), (
+            "the runtime must have actually run the tool, not simply recorded its evidence"
+        )
+
+    def test_an_unchanged_tree_earns_nothing(
+        self, store: StateStore, project: ProjectRecord, repo: Path
+    ) -> None:
+        """The check the old ceremony could not make.
+
+        `git.inspect` reports success on a clean working tree, so a model could
+        earn the diff review having changed nothing at all. The runtime asks git
+        whether anything changed and declines to register when the answer is no.
+        """
+        result = _run(
+            store,
+            project,
+            repo,
+            [
+                _say(action="conclude", conclusion="looked around"),
+                _say(kind="planned", reason="one file"),
+                _plan(),
+                *[_say(action="conclude", conclusion="nothing to do") for _ in range(12)],
+            ],
+        )
+
+        assert result.completed is False
+        assert EvidenceKind.GIT_DIFF_REVIEWED not in store.verified_evidence(result.task_id)
+
+
 class TestItStillStopsWhenItShould:
     def test_an_unrepeatable_gap_does_not_loop_forever(
         self, store: StateStore, project: ProjectRecord, repo: Path
     ) -> None:
-        """Concluding without the diff every time must terminate, not spin."""
+        """Concluding without the tests every time must terminate, not spin."""
         result = _run(store, project, repo, [*PREFIX, *INSISTS])
 
         assert result.completed is False

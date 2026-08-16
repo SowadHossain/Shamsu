@@ -171,14 +171,110 @@ class TestReadingAPdf:
             extract(_pdf(tmp_path / "spec.pdf", "text"))
 
 
+SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+DRAW_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _xlsx(path: Path, rows: list[list[str]]) -> Path:
+    """A workbook built the way Excel builds one: strings held once, by index."""
+    shared = list(dict.fromkeys(cell for row in rows for cell in row))
+    sst = "".join(f"<si><t>{value}</t></si>" for value in shared)
+    body = "".join(
+        "<row>" + "".join(f'<c t="s"><v>{shared.index(c)}</v></c>' for c in row) + "</row>"
+        for row in rows
+    )
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("xl/sharedStrings.xml", f'<sst xmlns="{SHEET_NS}">{sst}</sst>')
+        archive.writestr(
+            "xl/worksheets/sheet1.xml",
+            f'<worksheet xmlns="{SHEET_NS}"><sheetData>{body}</sheetData></worksheet>',
+        )
+    return path
+
+
+def _pptx(path: Path, slides: dict[int, list[str]]) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        for number, lines in slides.items():
+            text = "".join(f"<a:t>{line}</a:t>" for line in lines)
+            archive.writestr(
+                f"ppt/slides/slide{number}.xml", f'<sld xmlns:a="{DRAW_NS}">{text}</sld>'
+            )
+    return path
+
+
+class TestReadingASpreadsheet:
+    def test_shared_strings_are_resolved(self, tmp_path: Path) -> None:
+        """The whole job. `<v>3</v>` with t="s" is the fourth string, not three."""
+        document = extract(_xlsx(tmp_path / "reqs.xlsx", [["Requirement", "Priority"]]))
+        assert "Requirement\tPriority" in document.text
+
+    def test_rows_stay_rows(self, tmp_path: Path) -> None:
+        """A requirements matrix read column-first says something else entirely."""
+        rows = [["Requirement", "Priority"], ["Login page", "High"]]
+        assert extract(_xlsx(tmp_path / "r.xlsx", rows)).text.splitlines() == [
+            "Requirement\tPriority",
+            "Login page\tHigh",
+        ]
+
+    def test_a_workbook_with_no_sheets_fails_honestly(self, tmp_path: Path) -> None:
+        path = tmp_path / "empty.xlsx"
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("xl/workbook.xml", "<workbook/>")
+        with pytest.raises(ExtractionFailed, match="no worksheets"):
+            extract(path)
+
+    def test_something_renamed_to_xlsx_fails_honestly(self, tmp_path: Path) -> None:
+        path = tmp_path / "reqs.xlsx"
+        path.write_text("id,name\n1,a\n", encoding="utf-8")
+        with pytest.raises(ExtractionFailed, match="not a readable Excel file"):
+            extract(path)
+
+
+class TestReadingADeck:
+    def test_slides_come_out_in_numeric_order(self, tmp_path: Path) -> None:
+        """`slide10.xml` sorts before `slide2.xml` as text, which reorders a deck."""
+        deck = _pptx(tmp_path / "d.pptx", {1: ["one"], 2: ["two"], 10: ["ten"], 11: ["eleven"]})
+        assert [line for line in extract(deck).text.splitlines() if not line.startswith("---")] == [
+            "one",
+            "two",
+            "ten",
+            "eleven",
+        ]
+
+    def test_each_slide_is_labelled(self, tmp_path: Path) -> None:
+        text = extract(_pptx(tmp_path / "d.pptx", {1: ["hello"]})).text
+        assert "--- slide 1 ---" in text
+
+    def test_an_image_only_deck_says_so(self, tmp_path: Path) -> None:
+        """Better than an empty string, which invites describing an unread deck."""
+        with pytest.raises(ExtractionFailed, match="images rather than text"):
+            extract(_pptx(tmp_path / "d.pptx", {1: [], 2: []}))
+
+
 class TestFormatsItCannotRead:
     @pytest.mark.parametrize("name", ["logo.png", "app.exe", "data.sqlite", "font.woff2"])
     def test_binary_formats_are_recognised(self, name: str) -> None:
         assert describe_unreadable(Path(name)) is not None
 
-    def test_source_is_not_treated_as_binary(self) -> None:
-        assert describe_unreadable(Path("calc.py")) is None
-        assert is_extractable(Path("calc.py")) is False
+    @pytest.mark.parametrize("name", ["old.doc", "sheet.xls"])
+    def test_the_pre_2007_binaries_are_still_out_of_reach(self, name: str) -> None:
+        """Their `x` successors are zips of XML; these are neither."""
+        assert describe_unreadable(Path(name)) is not None
+        assert is_extractable(Path(name)) is False
+
+    @pytest.mark.parametrize("name", ["prd.docx", "reqs.xlsx", "deck.pptx", "spec.pdf"])
+    def test_the_document_formats_are_claimed(self, name: str) -> None:
+        assert is_extractable(Path(name)) is True
+        assert describe_unreadable(Path(name)) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        ["calc.py", "main.rs", "app.go", "Main.java", "q.sql", "Dockerfile", "Makefile", "x.zig"],
+    )
+    def test_source_in_any_language_is_left_to_the_text_decoder(self, name: str) -> None:
+        """There is no language allowlist — that is the point of this being small."""
+        assert describe_unreadable(Path(name)) is None
+        assert is_extractable(Path(name)) is False
 
 
 class TestResolvingMentions:
@@ -237,3 +333,83 @@ class TestResolvingMentions:
     def test_several_mentions_all_resolve(self, workspace: Path) -> None:
         found = resolve("compare @auth.py and @OpenBazaar_PRD.docx", workspace)
         assert set(found.resolved) == {"src/auth.py", "OpenBazaar_PRD.docx"}
+
+
+def _para(text: str, *, style: str = "", bold: bool = False, numbered: bool = False) -> str:
+    parts = []
+    if style:
+        parts.append(f'<w:pStyle w:val="{style}"/>')
+    if numbered:
+        parts.append('<w:numPr><w:ilvl w:val="0"/></w:numPr>')
+    properties = f"<w:pPr>{''.join(parts)}</w:pPr>" if parts else ""
+    run = "<w:rPr><w:b/></w:rPr>" if bold else ""
+    return f"<w:p>{properties}<w:r>{run}<w:t>{text}</w:t></w:r></w:p>"
+
+
+def _worddoc(path: Path, *paragraphs: str) -> Path:
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(paragraphs)
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            f'<?xml version="1.0"?><w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>',
+        )
+    return path
+
+
+class TestAWordDocumentBecomesMarkdown:
+    """Structure is the most valuable thing in a specification.
+
+    Extraction used to emit bare text, so a `.docx` PRD arrived as an
+    undifferentiated wall of lines — "Features" indistinguishable from the
+    feature beneath it. The same document saved as `.md` planned a real project
+    precisely because `## Features` was visible as a heading.
+    """
+
+    def test_a_styled_heading_keeps_its_level(self, tmp_path: Path) -> None:
+        document = _worddoc(
+            tmp_path / "prd.docx",
+            _para("Overview", style="Heading1"),
+            _para("Details", style="Heading2"),
+        )
+        assert extract(document).text.splitlines() == ["# Overview", "## Details"]
+
+    def test_a_title_outranks_a_subtitle(self, tmp_path: Path) -> None:
+        document = _worddoc(
+            tmp_path / "prd.docx", _para("PRD", style="Title"), _para("v2", style="Subtitle")
+        )
+        assert extract(document).text.splitlines() == ["# PRD", "## v2"]
+
+    def test_a_bold_line_is_treated_as_a_heading(self, tmp_path: Path) -> None:
+        """The case that matters most: authors bold a line far more often than
+        they apply a heading style, and v1's extractor missed exactly this."""
+        document = _worddoc(tmp_path / "prd.docx", _para("Features", bold=True))
+        assert extract(document).text == "## Features"
+
+    def test_a_long_bold_sentence_is_not_a_heading(self, tmp_path: Path) -> None:
+        """Bold prose is emphasis; promoting it would invent structure."""
+        sentence = "This whole sentence is bold for emphasis " * 4
+        document = _worddoc(tmp_path / "prd.docx", _para(sentence.strip(), bold=True))
+        assert not extract(document).text.startswith("#")
+
+    def test_list_items_become_bullets(self, tmp_path: Path) -> None:
+        document = _worddoc(
+            tmp_path / "prd.docx",
+            _para("Add a bookmark", numbered=True),
+            _para("List all bookmarks", numbered=True),
+        )
+        assert extract(document).text.splitlines() == ["- Add a bookmark", "- List all bookmarks"]
+
+    def test_ordinary_paragraphs_are_left_alone(self, tmp_path: Path) -> None:
+        document = _worddoc(tmp_path / "prd.docx", _para("A command-line bookmark manager."))
+        assert extract(document).text == "A command-line bookmark manager."
+
+    def test_the_rendering_says_it_converted(self, tmp_path: Path) -> None:
+        """The model should know it is reading markdown, not a Word file."""
+        document = _worddoc(tmp_path / "prd.docx", _para("Overview", style="Heading1"))
+        assert "markdown" in extract(document).render("prd.docx")
+
+    def test_a_heading_deeper_than_six_is_clamped(self, tmp_path: Path) -> None:
+        """Markdown has no `#######`."""
+        document = _worddoc(tmp_path / "prd.docx", _para("Deep", style="Heading9"))
+        assert extract(document).text == "###### Deep"

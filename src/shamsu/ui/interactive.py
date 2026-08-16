@@ -41,7 +41,14 @@ from shamsu.ui.commands import (
 from shamsu.ui.editor import CANCELLED, EOF, Buffer, History
 from shamsu.ui.render import SPINNER
 from shamsu.ui.repl import recent_runs
-from shamsu.ui.session_frame import MAX_SUGGESTIONS, SessionState, render_session
+from shamsu.ui.session_frame import (
+    INPUT_PREFIX,
+    MAX_SUGGESTIONS,
+    SessionState,
+    input_rows,
+    input_width,
+    render_session,
+)
 from shamsu.ui.terminal import Key, Screen, managed_screen, read_key, terminal_size
 from shamsu.ui.view import Level, RunView
 
@@ -515,14 +522,29 @@ class InteractiveSession:
     def _cursor(self, drawn: int) -> tuple[int, int]:
         """Where the terminal cursor belongs, one-indexed.
 
-        The input line sits above the dropdown, so its row is counted back from
-        the bottom of what was actually drawn rather than from the window size —
-        a frame clipped by a short window would otherwise misplace it.
+        The input sits above the dropdown, so its row is counted back from the
+        bottom of what was actually drawn rather than from the window size — a
+        frame clipped by a short window would otherwise misplace it.
+
+        The input can occupy several rows once a request outgrows the window
+        width, so the cursor's own row is found within them. Returning
+        `4 + cursor` unconditionally walked the cursor off the right edge and
+        left it there.
         """
         shown = min(len(self._state.suggestions), MAX_SUGGESTIONS)
         overflow = 1 if len(self._state.suggestions) > MAX_SUGGESTIONS else 0
-        row = drawn - shown - overflow
-        return row, 4 + self._state.cursor
+
+        rows = input_rows(self._state, terminal_size().width)
+        body = input_width(terminal_size().width)
+
+        # `divmod` on the *cursor*, not on the text: the caret sits after the
+        # last character, so a cursor exactly at a row boundary belongs at the
+        # start of the next row rather than past the end of the previous one.
+        line, column = divmod(self._state.cursor, body)
+        line = min(line, len(rows) - 1)
+
+        first_row = drawn - shown - overflow - (len(rows) - 1)
+        return first_row + line, INPUT_PREFIX + 1 + column
 
 
 __all__ = ["FRAME_SECONDS", "QUIT", "InteractiveSession"]

@@ -123,7 +123,7 @@ def build_wiring(model: ModelClient, options: AppOptions) -> Wiring:
         store=store,
         runs=runs,
         model=model,
-        gateway=ToolGateway(tools),
+        gateway=ToolGateway(tools, workspace=options.workspace),
         compiler=ContextCompiler(model),
         workspace=options.workspace,
         project_id=project.project_id,

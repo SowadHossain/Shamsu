@@ -54,7 +54,7 @@ class Tool(ABC, Generic[InputT]):
                 `run` at all -- refusal happens before any side effect.
         """
         try:
-            return self.input_model.model_validate(dict(arguments))
+            return self.input_model.model_validate(_without_nulls(arguments))
         except ValidationError as exc:
             raise ToolPolicyViolation(
                 f"{self.name}: invalid arguments — {_summarise(exc)}"
@@ -166,6 +166,33 @@ class Tool(ABC, Generic[InputT]):
 
 def _elapsed(started: float | None) -> float:
     return 0.0 if started is None else max(0.0, time.monotonic() - started)
+
+
+def _without_nulls(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop keys the caller set to `null`.
+
+    A field explicitly set to null is a field the caller did not set — and a
+    small model emits null for optional arguments constantly, because a JSON
+    schema listing six properties reads as six questions to answer. Pydantic
+    then rejects `content: null` against `content: str = ""`, and the call dies
+    on a technicality with nothing wrong with its intent.
+
+    The §31.1 suite showed what that costs. Every one of these was refused:
+
+        file.patch(path='grade.py', mode='replace_text', find='(pass)',
+                   replace='PASSED', content=None)   → content: Input should be
+                                                       a valid string
+
+    That call is *correct*. The model had found the text, knew the replacement,
+    and named the file; it simply also said "no content", which is true. Three
+    of the suite's failures were this, and each looked from the ledger like a
+    model that never tried to edit anything.
+
+    Dropping nulls loses nothing: a field whose value is genuinely `None` is
+    expressed by omitting it, and any field that must be present is still
+    missing afterwards and still reported as missing.
+    """
+    return {key: value for key, value in arguments.items() if value is not None}
 
 
 def _summarise(exc: ValidationError, limit: int = 3) -> str:

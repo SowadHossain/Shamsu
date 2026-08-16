@@ -467,8 +467,8 @@ class StateStore:
                     INSERT INTO plan_steps (
                         step_id, plan_id, ordinal, title, inputs, outputs, constraints,
                         allowed_tools, acceptance_criteria, required_evidence, risk,
-                        approval_required, outcome, attempts, created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        approval_required, outcome, attempts, created_at, depends_on
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         step.step_id,
@@ -486,6 +486,7 @@ class StateStore:
                         step.outcome.value if step.outcome else None,
                         step.attempts,
                         step.created_at.isoformat(),
+                        _dump_list([str(item) for item in step.depends_on]),
                     ),
                 )
         return plan
@@ -582,6 +583,7 @@ class StateStore:
             ),
             risk=Risk(row["risk"]),
             approval_required=bool(row["approval_required"]),
+            depends_on=tuple(int(item) for item in json.loads(row["depends_on"] or "[]")),
             outcome=StepOutcome(row["outcome"]) if row["outcome"] else None,
             attempts=row["attempts"],
             created_at=datetime.fromisoformat(row["created_at"]),

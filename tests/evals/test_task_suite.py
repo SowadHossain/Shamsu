@@ -29,9 +29,29 @@ def built(task: EvalTask, workspace: Path) -> Path:
 
 
 class TestTheSuiteIsWellFormed:
-    def test_there_are_seven_tasks(self) -> None:
-        """Plan §31.1 names seven. A suite that drifts is a moving baseline."""
-        assert len(TASKS) == 7
+    def test_the_suite_is_the_seven_plus_the_diagnostic_four(self) -> None:
+        """A suite that drifts is a moving baseline, so the count is pinned.
+
+        Plan §31.1 names seven, and all seven are single-file toy repositories
+        satisfiable by one edit a syntax check can confirm — which is the shape
+        the harness was already good at. Four more were added to fail on the
+        things it is not: a multi-step plan, a symbol behind a re-export, an
+        edit that is valid Python and never runs, and a project that has to
+        start. They are expected to score badly; that is what makes them worth
+        running.
+        """
+        assert len(TASKS) == 11
+
+        original = {
+            "documentation_edit",
+            "single_file_bug_fix",
+            "add_a_unit_test",
+            "fix_a_failing_test",
+            "multi_file_feature",
+            "refactor_a_function",
+            "validation_rule",
+        }
+        assert original <= {task.name for task in TASKS}, "§31.1's seven must stay"
 
     def test_every_task_has_a_checker(self) -> None:
         assert {task.name for task in TASKS} == set(CHECKS)

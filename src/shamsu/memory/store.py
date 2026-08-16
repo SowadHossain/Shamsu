@@ -50,6 +50,7 @@ from shamsu.memory.records import (
     MemoryRecord,
     ProjectFact,
 )
+from shamsu.security.paths import workspace_key
 from shamsu.state.records import new_id, utcnow
 from shamsu.state.store import StateStore
 
@@ -335,11 +336,15 @@ class MemoryStore:
         edit `src/shamsu/state/store.py` should see the decision that says why
         SQLite is authoritative, and not the other eleven.
         """
-        wanted = {path.replace("\\", "/").lstrip("./") for path in paths}
+        # Both sides normalised. Comparing a normalised query against raw
+        # stored strings only worked while the two happened to be spelled
+        # identically — a stored `src/shamsu/memory/` and a queried
+        # `src/shamsu/memory` are the same location and must match.
+        wanted = {workspace_key(path) for path in paths}
         return tuple(
             record
             for record in self.decisions(status=DecisionStatus.ACCEPTED)
-            if wanted & set(record.related_paths)
+            if wanted & {workspace_key(item) for item in record.related_paths}
         )
 
     # -- lessons -----------------------------------------------------------
@@ -404,6 +409,35 @@ class MemoryStore:
                 (self._project_id, signature),
             ).fetchone()
         return None if row is None else _memory_from_row(row)
+
+    def lessons_for(self, paths: Sequence[str], *, limit: int = 3) -> str:
+        """Lessons about these files, as a frame section.
+
+        `lessons` has been written on every repair since the memory layer
+        landed and read by nothing but the repair controller, which looks one
+        up by exact error signature *after* the failure has already happened.
+        So a step about to edit the file that produced the same failure last
+        week was never told — the layer remembered and never spoke.
+
+        Filtered by path rather than recalled wholesale, because a lesson about
+        an unrelated module is noise competing for a small model's attention,
+        and the §31.1 measurements are unambiguous about what noise costs.
+
+        Ordered by how often the failure has recurred: a mistake made four
+        times is a better warning than one made once.
+        """
+        wanted = {workspace_key(path) for path in paths}
+        if not wanted:
+            return ""
+
+        relevant = [
+            record
+            for record in self.lessons()
+            if wanted & {workspace_key(item) for item in record.related_paths}
+        ]
+        if not relevant:
+            return ""
+        return "\n".join(record.render() for record in relevant[:limit])
 
     def lessons(self) -> Sequence[MemoryRecord]:
         with self._store.reading() as connection:

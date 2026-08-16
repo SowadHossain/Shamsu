@@ -103,10 +103,13 @@ def render_session(
         return _cramped(state, width, height, colour=colour)
 
     suggestions = _suggestions(state, width, colour=colour)
-    input_line = _input(state, colour=colour)
+    input_lines = _input(state, width, colour=colour)
 
-    # The box takes whatever is left after the input and its dropdown.
-    box_height = height - len(suggestions) - 1
+    # The box takes whatever is left after the input and its dropdown. The
+    # input can now be several rows, and counting it as one was exactly the
+    # bug: everything below shifted down by the overflow and was redrawn
+    # rather than replaced.
+    box_height = height - len(suggestions) - len(input_lines)
     header = _header(state, width, colour=colour)
     status = _status(state, width, colour=colour)
 
@@ -118,7 +121,7 @@ def render_session(
     recent = _recent(state, width, colour=colour) if state.recent and not state.transcript else []
     body = _transcript(state, width, max(0, body_height - len(recent)), colour=colour)
 
-    return [*header, *body, *recent, *status, input_line, *suggestions][:height]
+    return [*header, *body, *recent, *status, *input_lines, *suggestions][:height]
 
 
 def _header(state: SessionState, width: int, *, colour: bool) -> list[str]:
@@ -260,9 +263,41 @@ def _status(state: SessionState, width: int, *, colour: bool) -> list[str]:
     return [divider, f"│ {_pad(body, width - 3, colour=colour)}│", "└" + "─" * (width - 2) + "┘"]
 
 
-def _input(state: SessionState, *, colour: bool) -> str:
-    """The prompt line. The terminal's own cursor marks the position."""
-    return f" {paint('›', AMBER, colour)} {state.text}"
+#: Columns the prompt marker occupies before the text begins: " › ".
+INPUT_PREFIX = 3
+
+
+def input_width(width: int) -> int:
+    """How many columns of a typed request fit on one row."""
+    return max(8, width - INPUT_PREFIX - 1)
+
+
+def input_rows(state: SessionState, width: int) -> list[str]:
+    """The typed text, split into rows. Never coloured — this is geometry.
+
+    Exists because the frame promises exactly `height` rows of at most `width`
+    columns, and a single over-long string breaks that promise silently: the
+    terminal wraps it, every row below shifts down by the overflow, and the
+    old rows are never cleared. Typing past the first line redrew the prompt
+    once per keystroke, eight copies down the screen.
+    """
+    body = input_width(width)
+    text = state.text
+    if not text:
+        return [""]
+    return [text[start : start + body] for start in range(0, len(text), body)]
+
+
+def _input(state: SessionState, width: int, *, colour: bool) -> list[str]:
+    """The prompt line(s). The terminal's own cursor marks the position.
+
+    Continuations are indented to the text column so a wrapped request reads
+    as one request rather than as several.
+    """
+    rows = input_rows(state, width)
+    marker = paint("›", AMBER, colour)
+    first = f" {marker} {rows[0]}"
+    return [first, *[f"{' ' * INPUT_PREFIX}{row}" for row in rows[1:]]]
 
 
 def _suggestions(state: SessionState, width: int, *, colour: bool) -> list[str]:

@@ -75,7 +75,7 @@ class TestAnAllInvestigatePlanIsRejected:
 
     def test_one_change_step_is_enough(self) -> None:
         validation = validate_plan(
-            plan_of("Review the failing test", "Fix temperature.py"),
+            plan_of("Review the failing test", "Fix temperature.py", files=("temperature.py",)),
             request="Fix temperature.py so the tests pass",
         )
         assert validation.ok is True
@@ -112,7 +112,21 @@ class TestItDoesNotOverreach:
 
     def test_a_plan_whose_steps_all_change_is_fine(self) -> None:
         validation = validate_plan(
-            plan_of("Fix temperature.py", "Update the docstring"),
+            plan_of("Fix temperature.py", "Update the docstring", files=("temperature.py",)),
             request="Fix temperature.py",
         )
         assert validation.ok is True
+
+    def test_but_every_change_step_must_still_name_its_file(self) -> None:
+        """Naming the file in the *title* is not naming it in `files`.
+
+        A live PRD build planned six changes this way and completed none of
+        them: each owed `file_changed` while declaring no target, so nothing
+        could satisfy them and nothing could merge them.
+        """
+        validation = validate_plan(
+            plan_of("Fix temperature.py", "Update the docstring"),
+            request="Fix temperature.py",
+        )
+        assert validation.ok is False
+        assert any("name no file" in problem for problem in validation.problems)

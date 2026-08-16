@@ -80,6 +80,12 @@ class StepOutcome(StrEnum):
     CANCELLED = "cancelled"
     BLOCKED = "blocked"
 
+    #: Never attempted, because a step it depended on failed. Distinct from
+    #: ``BLOCKED``, which means *this* step was tried and could not be proven:
+    #: a report that cannot tell "we could not do this" from "we never got to
+    #: it" is telling the reader the run failed in the wrong place.
+    SKIPPED = "skipped"
+
 
 class RunStatus(StrEnum):
     """Lifecycle of a registered run.

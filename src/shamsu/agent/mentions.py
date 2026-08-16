@@ -26,12 +26,27 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from shamsu.artifacts.hashing import is_ignored
+from shamsu.security.paths import workspace_key
 
 #: An `@` that begins a word, followed by everything up to whitespace. Matches
 #: `ui.commands.file_fragment`, which is what puts these in the text — a
 #: reference the picker can create and this cannot read would be worse than no
 #: picker at all.
 _MENTION = re.compile(r"(?:(?<=\s)|^)@(?P<path>[^\s]+)")
+
+#: A filename written without the `@` marker — "build the system described in
+#: PRD.md". The picker inserts `@`, but a person typing a sentence does not,
+#: and a live PRD build turned on exactly that: the request named `PRD.md`,
+#: nothing resolved it, the planner never saw the document, and it planned a
+#: generic web application for what the PRD described as a standard-library
+#: command-line tool.
+#:
+#: Deliberately permissive about *what* it matches and strict about what it
+#: accepts: anything shaped like `name.ext` is a candidate, and only candidates
+#: that resolve to a real file in the workspace survive. Existence is a far
+#: better filter than an extension allowlist — it costs nothing to be wrong
+#: about "e.g." because there is no such file.
+_BARE = re.compile(r"(?:(?<=\s)|^)(?P<path>[\w./\\-]+\.[A-Za-z][\w]{0,7})\b")
 
 #: Trailing punctuation that belongs to the sentence rather than the filename:
 #: "look at @auth.py, then fix it".
@@ -56,6 +71,22 @@ class Mentions:
         return bool(self.resolved)
 
 
+def filenames_in(text: str) -> tuple[str, ...]:
+    """Anything shaped like a filename, in order, deduplicated.
+
+    Shared with the planner. A 7B routinely puts the file in the *title* and
+    leaves `files` empty — "Create manage.py File" with `files: []` — and
+    refusing that plan discards a fact the model plainly stated, just in the
+    wrong field.
+    """
+    found: list[str] = []
+    for match in _BARE.finditer(f" {text}"):
+        candidate = match.group("path").strip(_TRAILING)
+        if candidate and candidate not in found:
+            found.append(candidate)
+    return tuple(found)
+
+
 def resolve(request: str, workspace: Path) -> Mentions:
     """Turn `@path` references into real workspace-relative paths.
 
@@ -65,12 +96,26 @@ def resolve(request: str, workspace: Path) -> Mentions:
     a guess: picking one of three `__init__.py` would be wrong twice.
     """
     found = list(_MENTION.finditer(request))
-    if not found:
-        return Mentions(text=request)
 
     resolved: list[str] = []
     unresolved: list[str] = []
     replacements: list[tuple[int, int, str]] = []
+
+    # A bare filename is only a reference if it is really there. Unmarked names
+    # are gathered but never rewritten and never reported as unresolved: the
+    # user did not claim `e.g.` was a file, so failing to find one is not a
+    # finding, and editing their sentence would be presumptuous.
+    marked = {match.group("path").rstrip(_TRAILING) for match in found}
+    for match in _BARE.finditer(request):
+        raw = match.group("path").rstrip(_TRAILING)
+        if raw in marked:
+            continue
+        target = _locate(raw, workspace)
+        if target is not None and target not in resolved:
+            resolved.append(target)
+
+    if not found and not resolved:
+        return Mentions(text=request)
 
     for match in found:
         raw = match.group("path").rstrip(_TRAILING)
@@ -98,7 +143,7 @@ def resolve(request: str, workspace: Path) -> Mentions:
 
 def _locate(reference: str, workspace: Path) -> str | None:
     """The workspace-relative path a reference names, or None."""
-    cleaned = reference.replace("\\", "/").lstrip("./")
+    cleaned = workspace_key(reference)
     if not cleaned:
         return None
 
@@ -119,4 +164,4 @@ def _locate(reference: str, workspace: Path) -> str | None:
     return None
 
 
-__all__ = ["Mentions", "resolve"]
+__all__ = ["Mentions", "filenames_in", "resolve"]

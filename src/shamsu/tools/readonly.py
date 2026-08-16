@@ -285,7 +285,8 @@ class FileReadTool(Tool[FileReadInput]):
             # Honest failure over fabrication. "I cannot read a PDF" is worth
             # more than a page of mojibake the model will summarise regardless.
             return self.failed(
-                f"{arguments.path} is a {kind} file, which cannot be read as text. "
+                f"{arguments.path} is {'an' if kind[0] in 'aeiou' else 'a'} {kind} file, "
+                f"which cannot be read as text. "
                 "Its contents are not available to me.",
                 started=started,
             )

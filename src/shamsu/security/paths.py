@@ -26,6 +26,7 @@ than a side effect of a regex.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
@@ -127,4 +128,53 @@ class PathSandbox:
         return resolved.is_relative_to(self._workspace)
 
 
-__all__ = ["PathEscape", "PathSandbox"]
+def workspace_key(path: str) -> str:
+    """One spelling per workspace-relative file, for comparing paths as strings.
+
+    Exists because the idiom it replaces was wrong in a way that reads as
+    correct. Fourteen call sites across the package normalised paths with
+
+        path.replace("\\\\", "/").lstrip("./")
+
+    and `str.lstrip` strips a *character set*, not a prefix — so `.shamsu/`
+    became `shamsu/`, `.github/workflows/ci.yml` became `github/...`, and any
+    dot-file lost its leading dot. Mostly this was invisible, because both
+    sides of a comparison were mangled identically. It stopped being invisible
+    the moment one side was a literal: a check for `.shamsu` against a key that
+    had already been shortened to `shamsu` never matched, so the agent's own
+    state directory counted as a project change on every single step.
+
+    Strips one leading `./` and nothing else. Trailing slashes go too, because
+    `git status --porcelain` reports an untracked directory with one and no
+    other caller ever wants it.
+    """
+    cleaned = path.replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.rstrip("/")
+
+
+#: Test-file conventions. Deliberately the ecosystems v2 targets first, and it
+#: will need extending. The failure mode is the safe direction — an
+#: unrecognised test file is merely editable, not silently exempt from
+#: verification.
+#:
+#: Lives here rather than in `agent/repair.py`, where it started, because the
+#: gateway needs it too: protecting tests only during *repair* left ordinary
+#: authoring free to edit them, which is how this runtime produced its first
+#: false success.
+_TEST_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(^|/)tests?/"),
+    re.compile(r"(^|/)test_[^/]+\.py$"),
+    re.compile(r"[^/]+_test\.py$"),
+    re.compile(r"\.(test|spec)\.[jt]sx?$"),
+    re.compile(r"(^|/)conftest\.py$"),
+)
+
+
+def looks_like_a_test(path: str) -> bool:
+    """Whether a path is a test file by convention."""
+    return any(pattern.search(path.replace("\\", "/")) for pattern in _TEST_PATTERNS)
+
+
+__all__ = ["PathEscape", "PathSandbox", "looks_like_a_test", "workspace_key"]

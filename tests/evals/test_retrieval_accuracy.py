@@ -158,9 +158,21 @@ class TestImpactAccuracy:
         assert report.transitive_modules or report.truncated is False
 
     def test_a_private_helper_has_a_small_blast_radius(self, index: PythonCodeIndex) -> None:
-        """Impact has to discriminate, or it is just 'the whole repository'."""
-        narrow = index.impact(index.lookup_symbol("shamsu.agent.repair.looks_like_a_test")[0])
+        """Impact has to discriminate, or it is just 'the whole repository'.
+
+        The subject used to be `looks_like_a_test`, which stopped being a
+        private helper when test protection moved from the repair scope to the
+        gateway: it now lives in `security/paths.py` and is used across layers,
+        so its blast radius of 15 is the index being *right*. A module-private
+        function is what this property is about.
+        """
+        narrow = index.impact(index.lookup_symbol("shamsu.runtime.session._porcelain_paths")[0])
         assert len(narrow.transitive_modules) <= 5
+
+    def test_a_shared_helper_reports_a_wider_one(self, index: PythonCodeIndex) -> None:
+        """The other half of discriminating: wide things must read as wide."""
+        shared = index.impact(index.lookup_symbol("shamsu.security.paths.workspace_key")[0])
+        assert len(shared.transitive_modules) > 5
 
 
 def _ranked_paths(hits: Sequence[SearchHit]) -> list[str]:

@@ -196,6 +196,16 @@ class PlanStepRecord(_Record):
     acceptance_criteria: tuple[str, ...] = ()
     required_evidence: tuple[EvidenceKind, ...] = ()
 
+    #: Ordinals of steps this one needs finished first. Empty means independent
+    #: — it can run whatever happened earlier in the plan.
+    #:
+    #: This exists so that one step failing does not end the task. Without it
+    #: every plan is a chain by assumption, and a chain has no independent work
+    #: to fall back on: v1 shipped the non-fatal edge without a dependency graph
+    #: and still scored 1/23 and 2/23, because everything downstream cascaded
+    #: anyway. The edge makes failure survivable; this is what makes it useful.
+    depends_on: tuple[int, ...] = ()
+
     risk: Risk = Risk.LOW
     approval_required: bool = False
 

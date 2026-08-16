@@ -347,7 +347,9 @@ class TestReplanningMidTask:
             current,
             ImplementationPlan(
                 summary="Different approach to the reporting half.",
-                steps=(PlanStepProposal(title="Rewrite total() without add()"),),
+                steps=(
+                    PlanStepProposal(title="Rewrite total() without add()", files=("calc.py",)),
+                ),
             ),
         )
 

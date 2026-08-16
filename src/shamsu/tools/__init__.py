@@ -22,9 +22,10 @@ from typing import Any
 
 from shamsu.tools.base import Tool
 from shamsu.tools.checks import CheckRunTool
-from shamsu.tools.editing import FilePatchTool, PatchUndo
+from shamsu.tools.editing import FilePatchTool, FileRemoveTool, PatchUndo
 from shamsu.tools.gateway import ApprovalCallback, ToolGateway, deny_all
 from shamsu.tools.git import GitCheckpointTool, GitInspectTool, rollback_to, run_git
+from shamsu.tools.project_run import ProjectCommand, ProjectRunTool, load_commands
 from shamsu.tools.readonly import (
     CodeSearchTool,
     FileListTool,
@@ -41,16 +42,20 @@ __all__ = [
     "CodeSearchTool",
     "FileListTool",
     "FilePatchTool",
+    "FileRemoveTool",
     "FileReadTool",
     "GitCheckpointTool",
     "GitInspectTool",
     "PatchUndo",
+    "ProjectCommand",
     "ProjectInspectTool",
+    "ProjectRunTool",
     "TestRunTool",
     "Tool",
     "ToolGateway",
     "authoring_tools",
     "deny_all",
+    "load_commands",
     "read_only_tools",
     "rollback_to",
     "run_git",
@@ -64,11 +69,23 @@ def authoring_tools(workspace: "Path", *, use_git: bool = True) -> "list[Tool[An
     Assembled in one place so a caller cannot accidentally build a gateway with
     write tools but no way to verify what it wrote.
     """
-    return [
+    tools: list[Tool[Any]] = [
         *read_only_tools(workspace, use_git=use_git),
         FilePatchTool(workspace),
+        FileRemoveTool(workspace),
         GitInspectTool(workspace),
         GitCheckpointTool(workspace),
         TestRunTool(workspace),
         CheckRunTool(workspace),
     ]
+
+    # Registered only when this project actually offers commands. An empty
+    # `project.run` would be one more entry for a 7B to discriminate among on
+    # every turn, and that cost is measured rather than assumed: adding
+    # `file.remove` to every change step took the §31.1 suite from 5/7 to a
+    # steady 3/7. A tool that can do nothing here is pure tax.
+    runner = ProjectRunTool(workspace)
+    if runner.available:
+        tools.append(runner)
+
+    return tools

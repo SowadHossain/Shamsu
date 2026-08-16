@@ -27,7 +27,6 @@ it and records why.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -35,6 +34,7 @@ from shamsu.interfaces.enums import EvidenceKind, FailureKind, StepOutcome
 from shamsu.interfaces.ids import FailureId, StepId, TaskId
 from shamsu.memory.store import MemoryStore
 from shamsu.runtime.limits import DEFAULT_LIMITS, ExecutionLimits
+from shamsu.security.paths import looks_like_a_test, workspace_key
 from shamsu.state.records import FailureRecord, new_id
 from shamsu.state.store import StateStore
 from shamsu.verification.digest import RepairTracker, TestDigest
@@ -45,25 +45,8 @@ from shamsu.verification.failure import (
     evidence_capsule,
 )
 
+
 #: Path shapes treated as tests. A heuristic, and named as one: it covers the
-#: conventions of the ecosystems v2 targets first and will need extending. The
-#: failure mode is the safe direction — an unrecognised test file is merely
-#: editable, not silently exempt from verification.
-_TEST_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(^|/)tests?/"),
-    re.compile(r"(^|/)test_[^/]+\.py$"),
-    re.compile(r"[^/]+_test\.py$"),
-    re.compile(r"\.(test|spec)\.[jt]sx?$"),
-    re.compile(r"(^|/)conftest\.py$"),
-)
-
-
-def looks_like_a_test(path: str) -> bool:
-    """Whether a path is a test file by convention."""
-    normalised = path.replace("\\", "/")
-    return any(pattern.search(normalised) for pattern in _TEST_PATTERNS)
-
-
 @dataclass(frozen=True)
 class RepairScope:
     """The files a repair is permitted to modify.
@@ -76,7 +59,7 @@ class RepairScope:
     protected: frozenset[str] = frozenset()
 
     def permits(self, path: str) -> bool:
-        normalised = path.replace("\\", "/").lstrip("./")
+        normalised = workspace_key(path)
         return normalised in self.allowed
 
     def describe(self) -> str:
@@ -99,7 +82,7 @@ class RepairScope:
         from the step's own recorded edits, so the scope is as narrow as the
         evidence and no narrower.
         """
-        candidates = [path.replace("\\", "/").lstrip("./") for path in capsule.editable()]
+        candidates = [workspace_key(path) for path in capsule.editable()]
 
         if allow_test_edits:
             return cls(allowed=frozenset(candidates))

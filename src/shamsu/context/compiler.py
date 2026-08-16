@@ -71,6 +71,12 @@ class FrameInputs:
     current_step: str = ""
     plan_summary: str = ""
     project_facts: str = ""
+
+    #: What is already in this repository: directories, their purpose, and
+    #: the file paths themselves. Distinct from `artifacts` because it is
+    #: generated live rather than stored and version-tracked, and distinct
+    #: from `project_facts` because it is structure rather than convention.
+    repository_map: str = ""
     artifacts: Sequence[Artifact] = field(default_factory=tuple)
     source_excerpts: Sequence[tuple[str, str]] = field(default_factory=tuple)
     latest_observation: str = ""
@@ -205,6 +211,9 @@ class ContextCompiler:
 
         if inputs.project_facts:
             sections.append(Section("project facts", inputs.project_facts, _FACTS))
+
+        if inputs.repository_map:
+            sections.append(Section("repository map", inputs.repository_map, _ARTIFACTS))
 
         artifact_section = self._render_artifacts(inputs.artifacts)
         if artifact_section is not None:

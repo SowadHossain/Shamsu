@@ -18,6 +18,7 @@ printed with the result.
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 import tempfile
 from collections.abc import Sequence
@@ -30,8 +31,12 @@ for entry in (REPO_ROOT, REPO_ROOT / "src"):
 
 from tests.evals.harness import (  # noqa: E402
     DEFAULT_WALL_CLOCK_SECONDS,
+    Comparison,
+    SuiteResult,
     TaskResult,
-    run_suite,
+    load_baseline,
+    run_repeated,
+    save_baseline,
 )
 from tests.evals.tasks import BY_NAME, TASKS  # noqa: E402
 
@@ -79,6 +84,31 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override the per-step action budget.",
     )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help=(
+            "Run the whole suite this many times at identical paths and report "
+            "per-task pass rates. One run is a sample, not a measurement: this "
+            "suite has spanned four tasks between repetitions of the same code."
+        ),
+    )
+    parser.add_argument(
+        "--save-baseline",
+        type=Path,
+        default=None,
+        help="Write the result to this JSON file, to compare a later run against.",
+    )
+    parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=None,
+        help=(
+            "Compare against a previously saved baseline. A direction is only "
+            "claimed when the two sets of per-run scores do not overlap."
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -107,14 +137,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         **({"actions_per_step": args.actions} if args.actions else {}),
     )
 
-    root = args.workspaces or Path(tempfile.mkdtemp(prefix="shamsu-evals-"))
+    # A *fixed* directory, wiped rather than freshly minted. `mkdtemp` put a
+    # random component in every absolute path, and absolute paths reach the
+    # model — through error messages, through git output, through anything that
+    # echoes a location back. A benchmark whose inputs differ every run cannot
+    # measure a change smaller than its own noise, and this one was swinging by
+    # two tasks out of seven.
+    root = args.workspaces or Path(tempfile.gettempdir()) / "shamsu-evals"
+    if args.workspaces is None and root.exists():
+        shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
 
-    print(f"running {len(tasks)} task(s) against {args.model}")
+    repeat = max(1, args.repeat)
+    print(f"running {len(tasks)} task(s) against {args.model}, {repeat} repetition(s)")
     print(f"workspaces: {root}\n", flush=True)
 
-    def report(result: TaskResult) -> None:
-        print(result.line(), flush=True)
+    def report(repetition: int, result: TaskResult) -> None:
+        prefix = f"[{repetition}/{repeat}]" if repeat > 1 else "     "
+        print(f"{prefix}{result.line()}", flush=True)
         if args.verbose:
             print(f"      state={result.state} stopped={result.stopped_because}")
             print(f"      changed={', '.join(result.files_changed) or 'nothing'}")
@@ -122,17 +162,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"      error={result.error}")
             print(f"      workspace={root / result.task}", flush=True)
 
-    suite = run_suite(
-        tasks, build_model, root, model_name=args.model, limits=limits, on_result=report
+    def report_suite(repetition: int, suite: SuiteResult) -> None:
+        if repeat > 1:
+            print(
+                f"  -- repetition {repetition}: {suite.correct}/{suite.total} correct\n",
+                flush=True,
+            )
+
+    result = run_repeated(
+        tasks,
+        build_model,
+        root,
+        repeat=repeat,
+        model_name=args.model,
+        limits=limits,
+        on_result=report,
+        on_suite=report_suite,
     )
 
     print()
-    print(suite.render())
+    print(result.render())
+
+    if args.save_baseline:
+        save_baseline(result, args.save_baseline)
+        print(f"\nbaseline written to {args.save_baseline}")
+
+    if args.baseline:
+        print()
+        print(Comparison(baseline=load_baseline(args.baseline), current=result).render())
+
     print(f"\nworkspaces kept at {root}")
 
     # Non-zero on any false success, whatever the pass rate: a run that reported
     # verified completion for work it did not do is not a run to shrug at.
-    return 1 if suite.false_successes else 0
+    return 1 if result.false_successes else 0
 
 
 if __name__ == "__main__":

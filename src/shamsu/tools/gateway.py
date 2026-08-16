@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from shamsu.interfaces.cancellation import CancellationToken, Cancelled
@@ -44,6 +45,7 @@ from shamsu.interfaces.tools import (
     ToolResult,
     WriteScope,
 )
+from shamsu.security.paths import looks_like_a_test, workspace_key
 from shamsu.tools.base import Tool
 
 #: Asked whether a risky call may proceed. Returning False is a refusal, not an
@@ -53,7 +55,7 @@ ApprovalCallback = Callable[[ToolContract, ToolRequest], bool]
 
 def _normalise(path: str) -> str:
     """One spelling per file, so `./src/a.py` and `src\\a.py` are the same key."""
-    return path.replace("\\", "/").lstrip("./")
+    return workspace_key(path)
 
 
 def deny_all(contract: ToolContract, request: ToolRequest) -> bool:
@@ -76,6 +78,8 @@ class ToolGateway:
         approval: ApprovalCallback | None = None,
         mutating_calls_per_decision: int = 1,
         require_read_before_edit: bool = True,
+        workspace: Path | None = None,
+        allow_test_edits: bool = False,
     ) -> None:
         self._tools: dict[str, Tool[Any]] = {}
         self._approval = approval or deny_all
@@ -86,6 +90,16 @@ class ToolGateway:
         #: in a tool because it is a fact about the *run*, and the tool that
         #: reads is not the tool that edits.
         self._read: set[str] = set()
+
+        #: Where the workspace is, needed only to answer "does this test file
+        #: already exist?". `None` means the check cannot run and no edit is
+        #: refused on its account -- a policy that cannot be evaluated must not
+        #: be enforced on a guess.
+        self._workspace = Path(workspace).resolve() if workspace is not None else None
+
+        #: Whether existing test files may be modified. The caller's decision,
+        #: never the model's, exactly as `RepairScope` has always had it.
+        self._allow_test_edits = allow_test_edits
 
         #: On by default. Turned off by tests that exercise a *tool* rather
         #: than the policy — the same opt-out `WriteScope` and `approval` have,
@@ -231,7 +245,12 @@ class ToolGateway:
         if contract.mutating:
             # Read before scope: an edit to a file the model has not looked at
             # is refused whatever the scope says, and the reason is more useful.
-            self._check_read_first(tool, arguments)
+            await self._check_read_first(tool, arguments, cancel)
+
+            # Before scope, because this refusal is about *what* the file is
+            # rather than which files this repair may touch, and saying so is
+            # more useful than "outside the permitted write scope".
+            self._check_tests_protected(tool, arguments)
 
             # Scope before budget: a call the scope forbids must not consume the
             # one mutation this decision is allowed.
@@ -250,13 +269,25 @@ class ToolGateway:
         # crediting it would license an edit against contents never seen.
         if result.ok:
             self._read.update(_normalise(path) for path in tool.read_targets(arguments))
-            # Authoring a file counts: the model supplied the contents, so a
-            # follow-up edit to it is grounded in something it actually knows.
-            self._read.update(_normalise(path) for path in tool.write_targets(arguments))
+            # Authoring deliberately does *not* count. It used to, on the
+            # reasoning that the model supplied the contents and so knows them
+            # — true within a single decision, false by the next one. A live
+            # build created `tasks.py` with stubbed methods in step 2, and in
+            # step 3 anchored a `replace_text` on "# Define the TaskList class",
+            # a line it had never written. Its context had rolled over; the
+            # credit outlived the memory it stood for, and the edit was let
+            # through to fail on an invented anchor.
+            #
+            # A file this run created is still reachable without a read, via
+            # `mode="create"` — `FilePatchTool` allows overwriting its own
+            # drafts. So nothing is unreachable here, and an edit that needs an
+            # anchor now has to look at the anchor first.
 
         return result
 
-    def _check_read_first(self, tool: Tool[Any], arguments: Any) -> None:
+    async def _check_read_first(
+        self, tool: Tool[Any], arguments: Any, cancel: CancellationToken
+    ) -> None:
         """Refuse an edit to a file that has not been read in this run.
 
         The invariant every editor a user is accustomed to enforces, and one
@@ -265,6 +296,16 @@ class ToolGateway:
         and never recovered — two of seven tasks died that way.
 
         Refused *before* execution, so a guess costs a turn and not a file.
+
+        **The refusal performs the read.** Telling a model to go and read
+        something is asking it to spend a turn on an errand the runtime can run
+        itself, and the §31.1 suite showed the errand does not reliably come
+        back: a run refused here read `payments.py`, read it a second time, and
+        concluded — having arrived with a correct anchor and a correct patch on
+        its first call. So the gateway reads the file, credits it, and puts the
+        contents *in the refusal*. The call still fails, because an anchor
+        composed without seeing the file is still a guess; but the retry is
+        immediate and informed rather than another round trip.
         """
         if not self._require_read_before_edit:
             return
@@ -278,11 +319,85 @@ class ToolGateway:
             return
 
         listed = ", ".join(unseen)
+        shown = await self._read_now(unseen, cancel)
         raise ToolPolicyViolation(
             f"{tool.contract.name}: {listed} has not been read in this run. "
+            f"An anchor you have not seen either fails to match or matches the "
+            f"wrong place — so it has been read for you. Send the call again "
+            f"with 'find' copied exactly from below.\n{shown}"
+            if shown
+            else f"{tool.contract.name}: {listed} has not been read in this run. "
             f"Call file.read on it first — an anchor you have not seen either "
             f"fails to match or matches the wrong place."
         )
+
+    async def _read_now(self, paths: Sequence[str], cancel: CancellationToken) -> str:
+        """Read the files an edit needed, crediting each one that succeeds.
+
+        Uses the registered `file.read`, so the output is the line-numbered
+        form the model already knows, and a workspace the gateway never has to
+        be told about. A path that cannot be read is simply omitted — it is
+        about to be reported as unread anyway.
+        """
+        reader = self._tools.get("file.read")
+        if reader is None:  # pragma: no cover - authoring_tools always has it
+            return ""
+
+        parts: list[str] = []
+        for path in paths:
+            try:
+                result = await reader.run(reader.parse({"path": path}), cancel)
+            except (ToolPolicyViolation, OSError):
+                continue
+            if result.ok:
+                self._read.add(_normalise(path))
+                parts.append(result.output)
+        return "\n".join(parts)
+
+    def _check_tests_protected(self, tool: Tool[Any], arguments: Any) -> None:
+        """Refuse an edit to a test file that already existed.
+
+        The hole that produced this runtime's first false success. `RepairScope`
+        protects test files during *repair*, on the reasoning that editing the
+        failing test is indistinguishable from deleting the evidence — and
+        nothing applied that reasoning to ordinary authoring, where the model
+        spends most of its actions.
+
+        Measured: the §31.1 task `must_be_wired_in` asks for a handler to be
+        registered in a dispatch table. The model wrote the handler, was told by
+        the reachability check that nothing reached it, and resolved that by
+        editing `test_dispatch.py`. The runtime reported the task **complete**.
+        A modified test that passes is indistinguishable from working code, so
+        this is the one failure the evidence gate cannot see by construction —
+        it has to be prevented instead.
+
+        **Creating a new test file is always allowed.** "Write a unit test for
+        `slugify` in a new file" is a legitimate task and a common one; what is
+        refused is rewriting a test that was already there to agree with the
+        code. Existence is the whole distinction, and it is exactly the line
+        between writing tests and editing away the evidence.
+
+        `allow_test_edits` is the caller's decision, never the model's — same
+        rule the repair scope has always had.
+        """
+        if self._allow_test_edits:
+            return
+
+        for target in tool.write_targets(arguments):
+            if not looks_like_a_test(target):
+                continue
+            try:
+                exists = (self._workspace / target).exists() if self._workspace else False
+            except OSError:  # pragma: no cover - defensive
+                exists = False
+            if not exists:
+                continue
+            raise ToolPolicyViolation(
+                f"{tool.contract.name}: {target} is an existing test file, and this "
+                "run may not modify tests. A test that was changed to agree with "
+                "the code proves nothing about the code. Change the code it tests "
+                "instead, or write a new test file."
+            )
 
     def _check_scope(self, tool: Tool[Any], arguments: Any) -> None:
         """Refuse a write the active scope does not cover.

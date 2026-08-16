@@ -167,17 +167,20 @@ class TestFilePatch:
         assert (repo / "calc.py").read_text() == CALC
 
     def test_acknowledged_overwrite_proceeds(self, repo: Path, gateway: ToolGateway) -> None:
+        # Real Python, not a placeholder word: the write gate parses `.py`
+        # content before it lands, and this test is about the overwrite path,
+        # not about what the file says.
         result = _run(
             gateway,
             "file.patch",
             Phase.AUTHOR,
             path="calc.py",
             mode="replace_file",
-            content="wiped\n",
+            content="WIPED = True\n",
             acknowledge_overwrite=True,
         )
         assert result.ok is True
-        assert (repo / "calc.py").read_text() == "wiped\n"
+        assert (repo / "calc.py").read_text() == "WIPED = True\n"
 
     def test_a_path_escape_is_refused(self, repo: Path, gateway: ToolGateway) -> None:
         result = _run(
@@ -232,7 +235,7 @@ class TestRollback:
         patcher = gateway.get("file.patch")
         assert patcher is not None
 
-        _run(gateway, "file.patch", Phase.AUTHOR, path="new.py", mode="create", content="X\n")
+        _run(gateway, "file.patch", Phase.AUTHOR, path="new.py", mode="create", content="X = 1\n")
         assert (repo / "new.py").exists()
 
         patcher.rollback_last()  # type: ignore[attr-defined]

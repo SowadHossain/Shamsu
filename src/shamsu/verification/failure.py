@@ -104,6 +104,23 @@ _PROBES: dict[FailureKind, tuple[str, ...]] = {
     ),
 }
 
+#: The same failure when *nothing was written*, which is a different situation
+#: and needs the opposite advice.
+#:
+#: The §31.1 suite measured what the wrong advice costs. Four of five failures
+#: ended after exactly two tool calls, every call successful, no edit ever
+#: attempted: the agent read `README.md`, concluded, was told "the work may
+#: already be done; what is missing is the proof" — and so read `README.md` a
+#: second time, looking for the proof of work it had never performed. Told that
+#: repeating a failure means it should investigate first, it investigated more.
+#:
+#: Both messages are true of a step that edited something and forgot to verify.
+#: Both are false, and actively misleading, for one that never edited at all.
+_NOTHING_WRITTEN_PROBES: tuple[str, ...] = (
+    "No file has been changed yet — this is not a missing-proof problem.",
+    "Make the edit now with file.patch. Reading the file again cannot satisfy this.",
+)
+
 _DEFAULT_PROBES: tuple[str, ...] = (
     "Re-read the failing output; state what was expected before changing anything.",
 )
@@ -199,8 +216,16 @@ class FailureCapsule:
             lines.append(f"From a previous task: {self.prior_lesson}")
 
         if self.repeating:
+            # "Investigate before editing" is the right lesson for a change
+            # that did not work, and the wrong one for a step that never made a
+            # change — it sent an agent that had only read files off to read
+            # more. What repeated there is the *inaction*, so say that instead.
             lines.append(
-                "This is the SAME failure as the last attempt. Repeating that "
+                "This is the SAME failure as the last attempt. You did not edit "
+                "anything last time either — investigating again will repeat it. "
+                "Call file.patch."
+                if not self.changed_files
+                else "This is the SAME failure as the last attempt. Repeating that "
                 "change will not work; investigate before editing."
             )
 
@@ -300,16 +325,25 @@ def evidence_capsule(
         available = sorted(set(tools.get(kind, ())))
         wanted.append(f"{kind.value} (call {' or '.join(available)})" if available else kind.value)
 
+    changed = tuple(dict.fromkeys(changed_files))
+    wrote_nothing = not changed and EvidenceKind.FILE_CHANGED in missing
+
     return FailureCapsule(
         kind=FailureKind.INCOMPLETE_EVIDENCE,
         signature=f"unmet-evidence:{'+'.join(names)}",
         expected="verified evidence: " + ", ".join(wanted),
-        actual="the step concluded without producing it",
-        changed_files=tuple(dict.fromkeys(changed_files)),
+        actual=(
+            "no file was changed and the step concluded anyway"
+            if wrote_nothing
+            else "the step concluded without producing it"
+        ),
+        changed_files=changed,
         related_files=tuple(dict.fromkeys(related_files)),
         previous_attempts=tuple(previous_attempts),
         prior_lesson=prior_lesson,
-        probes=_PROBES[FailureKind.INCOMPLETE_EVIDENCE],
+        probes=_NOTHING_WRITTEN_PROBES
+        if wrote_nothing
+        else _PROBES[FailureKind.INCOMPLETE_EVIDENCE],
     )
 
 
@@ -323,12 +357,20 @@ def _expected(digest: TestDigest) -> str:
 
 
 def _files_from_frames(frames: Sequence[str]) -> tuple[str, ...]:
-    """Source paths named by traceback frames, in order, deduplicated."""
+    """Source paths named by traceback frames, in order, deduplicated.
+
+    Separators are normalised to `/`. These are not for display: they are
+    compared against `changed_files` and turned into the `WriteScope` a repair
+    is confined to, and every other path in the system is POSIX-shaped. On
+    Windows a traceback says `tests\\test_calc.py`, which matched nothing, so a
+    repair scope silently excluded the very file the failure implicated.
+    """
     paths: list[str] = []
     for frame in frames:
         path = frame.rsplit(":", 1)[0] if ":" in frame else frame
-        if path and path not in paths:
-            paths.append(path)
+        normalised = path.replace("\\", "/")
+        if normalised and normalised not in paths:
+            paths.append(normalised)
     return tuple(paths)
 
 

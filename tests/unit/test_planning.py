@@ -152,7 +152,11 @@ class TestTheModelCannotLowerItsOwnBar:
 
 class TestMaterialise:
     def test_steps_are_ordered_and_uniquely_identified(self) -> None:
-        plan = _plan(_step(title="one"), _step(title="two"), _step(title="three"))
+        plan = _plan(
+            _step(title="one"),
+            _step(title="two", files=("two.py",)),
+            _step(title="three", files=("three.py",)),
+        )
         steps = materialise(TaskId("t"), plan).steps
         assert [step.ordinal for step in steps] == [0, 1, 2]
         assert len({step.step_id for step in steps}) == 3
@@ -160,7 +164,8 @@ class TestMaterialise:
 
     def test_risk_carries_over_and_high_risk_demands_approval(self) -> None:
         steps = materialise(
-            TaskId("t"), _plan(_step(risk="high"), _step(title="safe", risk="low"))
+            TaskId("t"),
+            _plan(_step(risk="high"), _step(title="safe", risk="low", files=("safe.py",))),
         ).steps
         assert steps[0].risk is Risk.HIGH
         assert steps[0].approval_required is True
@@ -193,23 +198,60 @@ class TestValidation:
         assert result.ok is False
         assert "outside the workspace" in result.problems[0]
 
-    def test_a_plan_citing_unread_files_is_fatal(self) -> None:
-        plan = ImplementationPlan(summary="s", steps=(_step(),), grounded_in=("never_opened.py",))
-        result = validate_plan(plan, files_seen=("calc.py",))
+    def test_a_plan_citing_a_file_that_does_not_exist_is_fatal(self, tmp_path: Path) -> None:
+        """A hallucinated citation makes a plan unexecutable."""
+        plan = ImplementationPlan(summary="s", steps=(_step(),), grounded_in=("invented.py",))
+        result = validate_plan(plan, sandbox=PathSandbox(tmp_path), files_seen=("calc.py",))
         assert result.ok is False
-        assert "never read" in result.problems[0]
+        assert "do not exist" in result.problems[0]
+
+    def test_a_real_file_the_investigation_missed_is_accepted(self, tmp_path: Path) -> None:
+        """Unread is not invented, and refusing it cost a whole §31.1 task.
+
+        A run was rejected three times — and blocked having executed no tool at
+        all — for citing `test_payments.py`: a real file, in the workspace,
+        correctly identified as relevant. The read-only investigation simply had
+        not opened it. Knowing the repository is evidence *for* a plan.
+        """
+        (tmp_path / "test_payments.py").write_text("x = 1\n", encoding="utf-8")
+        plan = ImplementationPlan(summary="s", steps=(_step(),), grounded_in=("test_payments.py",))
+        result = validate_plan(plan, sandbox=PathSandbox(tmp_path), files_seen=("payments.py",))
+        assert result.ok is True
+
+    def test_without_a_sandbox_existence_cannot_be_checked_so_nothing_is_refused(self) -> None:
+        """Refusing on a check that could not run is the same false rejection."""
+        plan = ImplementationPlan(summary="s", steps=(_step(),), grounded_in=("never_opened.py",))
+        assert validate_plan(plan, files_seen=("calc.py",)).ok is True
 
     def test_grounding_is_only_checked_when_the_caller_knows_what_was_read(self) -> None:
         """An empty `files_seen` means 'no investigation', not 'nothing was read'."""
         plan = ImplementationPlan(summary="s", steps=(_step(),), grounded_in=("calc.py",))
         assert validate_plan(plan).ok is True
 
-    def test_a_weak_plan_is_noted_not_refused(self) -> None:
-        plan = _plan(_step(acceptance_criteria=(), files=()))
-        result = validate_plan(plan)
+    def test_missing_acceptance_criteria_is_noted_not_refused(self) -> None:
+        """Vagueness about *done* is advisory; the step can still do its work."""
+        result = validate_plan(_plan(_step(acceptance_criteria=())))
         assert result.ok is True
         assert any("acceptance criteria" in note for note in result.notes)
-        assert any("names no files" in note for note in result.notes)
+
+    def test_a_change_step_naming_no_file_is_refused(self) -> None:
+        """This was a note until a live PRD build showed what the note costs.
+
+        Seven steps, six of them changes naming no file — "implement the add
+        functionality", "implement the list functionality", and so on. Each
+        required `file_changed` while saying nothing about what would change,
+        so none could be satisfied and none could be merged with its siblings.
+        The one step that did act picked the only filename it had seen and
+        edited `PRD.md`: the specification, not the software.
+
+        A change step with no target is a gate with no key — the same bug class
+        as an unproducible evidence requirement, and refused for the same
+        reason. The runtime cannot supply the missing filename without
+        guessing, so the plan goes back with the reason attached.
+        """
+        result = validate_plan(_plan(_step(files=())), request="fix the adder")
+        assert result.ok is False
+        assert any("name no file" in problem for problem in result.problems)
 
     def test_duplicate_titles_are_noted(self) -> None:
         result = validate_plan(_plan(_step(title="Fix it"), _step(title="fix it")))
@@ -226,7 +268,9 @@ class TestPlanner:
     def test_creating_a_plan_persists_it_and_points_the_task_at_it(
         self, store: StateStore, task: TaskRecord
     ) -> None:
-        materialised = Planner(store).create(task, _plan(_step(), _step(title="two")))
+        materialised = Planner(store).create(
+            task, _plan(_step(), _step(title="two", files=("two.py",)))
+        )
 
         assert store.get_plan(materialised.plan_id) is not None
         assert len(store.get_steps(materialised.plan_id)) == 2
@@ -310,7 +354,7 @@ class TestPlanner:
 
     def test_progress_counts_only_gated_steps(self, store: StateStore, task: TaskRecord) -> None:
         planner = Planner(store)
-        plan = planner.create(task, _plan(_step(), _step(title="two")))
+        plan = planner.create(task, _plan(_step(), _step(title="two", files=("two.py",))))
         first = planner.next_step(plan.plan_id)
         assert first is not None
 
@@ -366,7 +410,9 @@ class TestReplanning:
     ) -> None:
         """Copying a step would orphan the evidence keyed to its id."""
         planner = Planner(store)
-        first = planner.create(task, _plan(_step(title="done already"), _step(title="two")))
+        first = planner.create(
+            task, _plan(_step(title="done already"), _step(title="two", files=("two.py",)))
+        )
         step = planner.next_step(first.plan_id)
         assert step is not None
         planner.close_step(step, CHANGE_FLOOR)
@@ -397,7 +443,7 @@ class TestReplanning:
         self, store: StateStore, task: TaskRecord, tmp_path: Path
     ) -> None:
         planner = Planner(store, sandbox=PathSandbox(tmp_path))
-        first = planner.create(task, _plan(_step(files=())))
+        first = planner.create(task, _plan(_step()))
 
         current = store.get_task(task.task_id)
         assert current is not None
@@ -423,7 +469,7 @@ class TestRendering:
             task,
             _plan(
                 _step(title="one", intent="a long intent that must not appear"),
-                _step(title="two"),
+                _step(title="two", files=("two.py",)),
             ),
         )
         steps = store.get_steps(plan.plan_id)
@@ -438,7 +484,9 @@ class TestRendering:
 
     def test_a_completed_step_is_marked(self, store: StateStore, task: TaskRecord) -> None:
         planner = Planner(store)
-        plan = planner.create(task, _plan(_step(title="one"), _step(title="two")))
+        plan = planner.create(
+            task, _plan(_step(title="one"), _step(title="two", files=("two.py",)))
+        )
         step = planner.next_step(plan.plan_id)
         assert step is not None
         planner.close_step(step, CHANGE_FLOOR)

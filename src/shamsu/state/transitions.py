@@ -47,9 +47,16 @@ TRANSITIONS: Mapping[AgentState, frozenset[AgentState]] = {
     # Denial ends the run. It does not fall through to execution.
     AgentState.WAIT_APPROVAL: frozenset({AgentState.EXECUTE_CURRENT_STEP, AgentState.STOPPED}),
     AgentState.EXECUTE_CURRENT_STEP: frozenset({AgentState.VERIFY_CURRENT_STEP}),
+    # CHECK_REMAINING_STEPS is here because a step that fails is not the same
+    # thing as a task that fails. One unprovable step used to end the whole run
+    # — a five-step plan at 85% per step finished 44% of the time, and a
+    # ten-step plan 20% — with steps that had nothing to do with the failure
+    # never attempted. The failed step is recorded, its dependents are marked
+    # SKIPPED, and anything independent still runs.
     AgentState.VERIFY_CURRENT_STEP: frozenset(
         {
             AgentState.CREATE_CHECKPOINT,
+            AgentState.CHECK_REMAINING_STEPS,
             AgentState.REPAIR,
             AgentState.REPLAN,
             AgentState.WAIT_APPROVAL,
@@ -58,8 +65,15 @@ TRANSITIONS: Mapping[AgentState, frozenset[AgentState]] = {
         }
     ),
     AgentState.CREATE_CHECKPOINT: frozenset({AgentState.CHECK_REMAINING_STEPS}),
-    # Repair retries the step, or gives up. It never declares success itself.
-    AgentState.REPAIR: frozenset({AgentState.EXECUTE_CURRENT_STEP, AgentState.BLOCKED}),
+    # Repair retries the step, gives up and moves on, or gives up entirely.
+    # It never declares success itself.
+    AgentState.REPAIR: frozenset(
+        {
+            AgentState.EXECUTE_CURRENT_STEP,
+            AgentState.CHECK_REMAINING_STEPS,
+            AgentState.BLOCKED,
+        }
+    ),
     AgentState.REPLAN: frozenset({AgentState.CREATE_PLAN, AgentState.BLOCKED}),
     AgentState.CHECK_REMAINING_STEPS: frozenset(
         {AgentState.EXECUTE_CURRENT_STEP, AgentState.FINAL_VERIFICATION}
@@ -141,7 +155,12 @@ def next_after_verification(outcome: StepOutcome) -> AgentState:
         StepOutcome.PLAN_INVALID: AgentState.REPLAN,
         StepOutcome.APPROVAL_REQUIRED: AgentState.WAIT_APPROVAL,
         StepOutcome.CANCELLED: AgentState.STOPPED,
+        # A step that could not be proven ends the *step*. Whether it ends the
+        # run is a separate question the runtime answers by asking whether any
+        # independent step is still waiting, so the caller chooses between this
+        # and CHECK_REMAINING_STEPS rather than being forced into a terminal.
         StepOutcome.BLOCKED: AgentState.BLOCKED,
+        StepOutcome.SKIPPED: AgentState.CHECK_REMAINING_STEPS,
     }
     return mapping[outcome]
 

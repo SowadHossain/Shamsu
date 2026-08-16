@@ -159,6 +159,39 @@ class TaskCompletion:
         """
         return self.satisfied and not any(step.required for step in self.steps)
 
+    @property
+    def only_file_changes(self) -> bool:
+        """Satisfied, but nothing was proved beyond "files moved".
+
+        The sibling of `unverified`, and it exists because of a live PRD build
+        that reported **COMPLETE — All 4 step(s) passed with verified
+        evidence** having produced a single 34-line markdown file. Every step
+        earned exactly the change floor: a file changed, and a diff was
+        reviewed. Neither says the code does anything.
+
+        This does not refuse the task — the gate's job is to check what was
+        asked for, and the change floor genuinely was met. What it refuses is
+        the *word*. "COMPLETE" on a run that proved only that bytes moved reads
+        as the same outcome as a run whose tests passed, and it is not.
+
+        The real fix is an acceptance probe that turns each step's criteria
+        into something executable. Until that exists, this makes the weakness
+        legible instead of silent — the same reasoning as `unverified`.
+        """
+        if not self.satisfied or self.unverified:
+            return False
+
+        proving = frozenset(
+            kind for step in self.steps for kind in step.verified if kind not in _CHANGE_FLOOR_KINDS
+        )
+        return not proving
+
+
+#: Evidence that a change happened, as opposed to evidence that it works.
+_CHANGE_FLOOR_KINDS: frozenset[EvidenceKind] = frozenset(
+    {EvidenceKind.FILE_CHANGED, EvidenceKind.GIT_DIFF_REVIEWED, EvidenceKind.CHECKPOINT_CREATED}
+)
+
 
 class CompletionGate:
     """Decides whether a step or a task is finished, from rows only."""
@@ -278,6 +311,8 @@ class EvidenceReport:
             # The same word must not describe a proven change and a plan that
             # only looked at things.
             headline = "COMPLETE (NOTHING VERIFIED)"
+        elif self.verdict.only_file_changes:
+            headline = "COMPLETE (ONLY FILE CHANGES VERIFIED)"
         else:
             headline = "COMPLETE"
 
@@ -287,6 +322,12 @@ class EvidenceReport:
             lines.append(
                 "  No step required evidence, so nothing was proved. This plan "
                 "only inspected; it did not change anything."
+            )
+        elif self.verdict.only_file_changes:
+            lines.append(
+                "  Files were written and the diff was reviewed. Nothing ran, so "
+                "nothing here shows the code works — no tests, no build, no "
+                "start-up. Treat this as an unreviewed draft."
             )
 
         if self.verdict.steps:

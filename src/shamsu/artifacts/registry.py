@@ -17,9 +17,11 @@ structured, wrong claim about the code.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Mapping, Sequence
 from datetime import datetime
+from hashlib import sha256
 from pathlib import Path
 
 from shamsu.interfaces.artifacts import (
@@ -61,6 +63,26 @@ _SUBDIR: Mapping[ArtifactKind, str] = {
 }
 
 
+#: Characters Windows forbids in a filename. `:` is the one that mattered: a
+#: symbol key is `path::symbol`, so every symbol card raised `OSError: [Errno
+#: 22] Invalid argument` and no symbol card could be written on Windows at all.
+#: The control range is included because a key ultimately derives from file
+#: contents, and a stray byte should not become an unopenable file.
+_ILLEGAL = re.compile(r'[<>:"|?*\x00-\x1f]')
+
+#: Device names Windows reserves at *any* extension — `NUL.md` is still the
+#: null device. Compared against the stem before the first dot.
+_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(1, 10)}
+    | {f"LPT{n}" for n in range(1, 10)}
+)
+
+#: Room for the digest and suffix inside the 255-byte limit every major
+#: filesystem shares.
+_MAX_STEM = 120
+
+
 def content_filename(kind: ArtifactKind, key: str) -> str:
     """Repository-relative path for an artifact's content file.
 
@@ -68,8 +90,27 @@ def content_filename(kind: ArtifactKind, key: str) -> str:
     `modules/apps__api__auth.md`. Flat beats nested here: a module card for
     `a/b/c.py` and one for `a/b` cannot collide as directory-vs-file, and
     listing a kind is one readdir.
+
+    **A key that will not fit a filename gets a digest.** Replacing `:` with
+    `_` alone would make `a:b` and `a_b` the same file, and two symbol cards
+    silently overwriting each other is worse than the crash it replaced. So
+    anything that had to be altered — an illegal character, a reserved device
+    name, an over-long stem — carries a hash of the *original* key, which
+    restores uniqueness and stays stable across runs.
+
+    Keys needing no alteration are untouched, so the documented
+    `modules/apps__api__auth.md` form still holds for the common case.
     """
-    safe = key.replace("/", "__").replace("\\", "__").strip("._") or "_root"
+    flat = key.replace("/", "__").replace("\\", "__").strip("._ ") or "_root"
+    safe = _ILLEGAL.sub("_", flat)
+
+    altered = safe != flat or safe.split(".")[0].upper() in _RESERVED
+    if len(safe) > _MAX_STEM:
+        safe, altered = safe[:_MAX_STEM], True
+    if altered:
+        digest = sha256(key.encode("utf-8")).hexdigest()[:12]
+        safe = f"{safe}-{digest}"
+
     stem = f"{safe}{_SUFFIX.get(kind, '.json')}"
     subdir = _SUBDIR.get(kind)
     return f"{subdir}/{stem}" if subdir else stem

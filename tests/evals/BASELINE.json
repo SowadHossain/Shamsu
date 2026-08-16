@@ -1,0 +1,102 @@
+{
+  "model": "qwen2.5-coder:7b-instruct-q4_K_M",
+  "repetitions": 3,
+  "recorded_at": "2026-08-14T14:30:47",
+  "per_run_scores": [
+    3,
+    3,
+    3
+  ],
+  "tasks_per_run": 11,
+  "tasks": {
+    "documentation_edit": {
+      "summary": "Documentation edit",
+      "runs": 3,
+      "passes": 3,
+      "claims": 3,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "single_file_bug_fix": {
+      "summary": "Single-file bug fix",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "add_a_unit_test": {
+      "summary": "Add one unit test",
+      "runs": 3,
+      "passes": 3,
+      "claims": 3,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "fix_a_failing_test": {
+      "summary": "Fix one failing test",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "multi_file_feature": {
+      "summary": "Small multi-file feature",
+      "runs": 3,
+      "passes": 3,
+      "claims": 3,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "refactor_a_function": {
+      "summary": "Refactor one function",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "validation_rule": {
+      "summary": "Add one API validation rule",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "multi_step_feature": {
+      "summary": "Three-part change",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "symbol_behind_reexport": {
+      "summary": "Symbol behind a re-export",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "must_be_wired_in": {
+      "summary": "Change that must be wired in",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    },
+    "project_must_run": {
+      "summary": "Project that has to run",
+      "runs": 3,
+      "passes": 0,
+      "claims": 0,
+      "false_successes": 0,
+      "unproven": 0
+    }
+  },
+  "root": "C:\\Users\\so_what_\\AppData\\Local\\Temp\\shamsu-evals-baseline"
+}

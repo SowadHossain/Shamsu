@@ -148,4 +148,16 @@ class TestARepairMayReuseATool:
 
         events = store.tool_events_for(result.task_id)
         inspections = [event for event in events if event.tool == "project.inspect"]
-        assert len(inspections) <= 2, "an identical call ran more than once per attempt"
+
+        # Counted on `ok`, because refusals are now recorded too. The property
+        # here has always been about *execution* — the loop breaker stops the
+        # tool running again — and the ledger previously dropped the refused
+        # calls entirely, so "rows" and "executions" happened to be the same
+        # number. Making refusals visible separated them.
+        assert sum(1 for event in inspections if event.ok) <= 2, (
+            "an identical call ran more than once per attempt"
+        )
+        assert any(not event.ok for event in inspections), (
+            "the refused repeats must appear in the ledger, or a step that "
+            "looped on one call is indistinguishable from one that did nothing"
+        )
