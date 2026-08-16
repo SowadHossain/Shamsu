@@ -287,8 +287,10 @@ class ToolResult:
 
 
 class RunStatus(str, Enum):
+    CREATED = "created"
     QUEUED = "queued"
     RUNNING = "running"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     CANCELLING = "cancelling"
     CANCELLED = "cancelled"
     COMPLETED = "completed"

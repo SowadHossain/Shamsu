@@ -88,6 +88,7 @@ from shamsu.core.coordinator import Coordinator
 from shamsu.indexer.policy import walk_workspace_files
 from shamsu.llm.manager import LLMManager, LLMStalledError, ModelPullProgress
 from shamsu.memory.service import MemoryService, REQUIRED_MEMORY_MESSAGE
+from shamsu.integrations.telegram.local import handle_remote_control_command
 from shamsu.memory.queue import flush_memory_queues, get_memory_queue
 from shamsu.context.progress import render_progress_checklist
 from shamsu.prd.contract import extract_contract
@@ -268,6 +269,11 @@ _RUN_SUBCOMMANDS = frozenset(
 
 SYSTEM_COMMANDS = (
     "/help",
+    "/remote_control",
+    "/remote_control status",
+    "/remote_control connect",
+    "/remote_control disconnect",
+    "/remote_control repair",
     "/doctor",
     "/abstract status",
     "/abstract setup",
@@ -498,12 +504,12 @@ def _print_help(console: Console) -> None:
                     "  /diagnostics parse       Re-parse latest raw command log",
                     "  /diagnostics explain     Explain root selection policy",
                     "  /diagnostics sources     Show parser/helper chain for latest log",
-                    "  /memory status           Show Graphiti long-term memory health",
-                    "  /memory setup            Install/configure local Graphiti memory",
-                    "  /memory repair           Re-check and repair Graphiti config",
+                    "  /memory status           Show local project memory and optional Graphiti mirror",
+                    "  /memory setup            Install/configure optional Graphiti mirror",
+                    "  /memory repair           Re-check and repair optional Graphiti config",
                     "  /memory remember <text>  Store explicit durable memory",
-                    "  /memory search <query>   Search Graphiti memory",
-                    "  /memory forget <query>   Forget/mark memory via Graphiti adapter",
+                    "  /memory search <query>   Search local project memory",
+                    "  /memory forget <query>   Forget/mark local project memory",
                     "  /parse-prd <file>         Parse a Markdown, TXT, or PDF PRD",
                     "  /plan                     Plan mode: your next prompt gets planned, not built",
                     "  /plan <task>              Plan that task now; review .shamsu/plans/*.md",
@@ -620,7 +626,8 @@ def _print_help(console: Console) -> None:
                     "  /test-gen <request>       Force test-generation workflow",
                     "  /audit <request>          Force audit workflow",
                     "  /docs <request>           Force README documentation workflow",
-                    "  /help                     Show commands",
+                "  /help                     Show commands",
+                "  /remote_control           Enable Telegram remote control",
                     "  /exit                     Quit",
                     "",
                     "File edits are previewed and require approval before applying.",
@@ -1268,23 +1275,16 @@ def _format_diagnostic_packet(packet: dict[str, Any]) -> str:
 def _ensure_graphiti_ready_at_startup(workspace: Path, console: Console) -> None:
     try:
         service = MemoryService(workspace)
-        # Start the FalkorDB container if memory is set up but it isn't running
-        # yet (no-op otherwise). SHAMSU never stops it again on its own - once
-        # started it stays up across sessions until `docker stop`ped manually.
+        # Graphiti is an optional mirror. This is a no-op unless explicitly
+        # enabled/configured; SQLite project memory is the normal path.
         service.ensure_backend_started()
-        # Report status without hard-blocking: agent work now runs in degraded
-        # mode (local SQLite fallback) when Graphiti isn't set up, so the banner
-        # must not claim "SHAMSU will not start" - that's no longer true.
         if service.healthcheck().ok:
-            console.print("[dim]Graphiti memory: ready[/dim]")
+            console.print("[dim]Project memory: SQLite ready; Graphiti mirror ready[/dim]")
         else:
-            console.print(
-                "[yellow]Graphiti memory: not set up - using local SQLite memory "
-                "(degraded). Run /memory setup for the richer Graphiti backend.[/yellow]"
-            )
+            console.print("[dim]Project memory: SQLite ready[/dim]")
     except Exception as exc:
         console.print(
-            f"[yellow]Graphiti memory: startup check failed ({exc}). Run /memory repair or /doctor.[/yellow]"
+            f"[yellow]Project memory startup check failed ({exc}). Local memory will retry on use.[/yellow]"
         )
 
 
@@ -1313,7 +1313,9 @@ def _handle_memory(
 
     if subcommand == "status":
         status = service.status()
-        console.print(f"Available: {status.health.available} ({status.health.message})")
+        console.print("Local SQLite: available")
+        console.print(f"Graphiti mirror: {'enabled' if service.graphiti_enabled else 'disabled'}")
+        console.print(f"Graphiti health: {status.health.available} ({status.health.message})")
         console.print(f"Config: {status.health.config_path or service._config_path()}")
         console.print(f"Workspace memory path: {status.memory_path}")
         console.print(f"Normal agent mode allowed: {status.normal_mode_allowed}")
@@ -1355,7 +1357,11 @@ def _handle_memory(
                 message = (
                     "Memory already existed."
                     if outcome.get("deduped")
-                    else "Memory stored locally; Graphiti mirror queued."
+                    else (
+                        "Memory stored locally; Graphiti mirror queued."
+                        if outcome.get("queued")
+                        else "Memory stored locally."
+                    )
                 )
                 console.print(f"[green]{message}[/green]")
             elif bridge.get("local"):
@@ -1391,15 +1397,21 @@ def _handle_memory(
             return
         rows = result.get("results", [])
         if not rows:
-            console.print("[dim]No Graphiti memories found.[/dim]")
+            console.print("[dim]No project memories found.[/dim]")
             return
-        table = Table(title="Graphiti Memory")
+        table = Table(title="Project Memory")
         table.add_column("ID")
         table.add_column("Memory")
         for item in rows[:8]:
+            if isinstance(item, dict):
+                memory_id = str(item.get("id") or item.get("uuid") or "")
+                text = str(item.get("text") or item.get("fact") or item)
+            else:
+                memory_id = ""
+                text = str(item)
             table.add_row(
-                str(item.get("id") or item.get("uuid") or ""),
-                str(item.get("text") or item.get("fact") or item)[:240],
+                memory_id,
+                text[:240],
             )
         console.print(table)
         return
@@ -17086,6 +17098,9 @@ def main(argv: list[str] | None = None) -> None:
             break
         if lowered_input == "help":
             _print_help(console)
+            continue
+        if lowered_input == "remote_control" or lowered_input.startswith("remote_control "):
+            handle_remote_control_command(normalized_input, workspace, console)
             continue
         if lowered_input == "doctor":
             _handle_doctor(workspace, console)

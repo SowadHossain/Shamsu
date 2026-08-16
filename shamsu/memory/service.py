@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -12,15 +13,11 @@ from shamsu.memory.sqlite_store import SQLiteMemoryStore
 from shamsu.memory.types import GraphitiHealth, LongTermMemory, MemoryGate, MemoryKind, MemoryStatus
 
 REQUIRED_MEMORY_MESSAGE = (
-    "Graphiti memory backend is required but not available.\n\n"
-    "Run: /memory setup\n\n"
-    "or: shamsu doctor\n\n"
-    "SHAMSU will not start normal agent mode until local Graphiti memory is ready."
+    "Local SQLite memory is available; Graphiti is optional and disabled by default."
 )
 
 DEGRADED_MEMORY_MESSAGE = (
-    "Graphiti is not available; using local SQLite memory (degraded). Long-term "
-    "recall still works. Run `/memory setup` to enable the richer Graphiti backend."
+    "Using local SQLite memory. Graphiti is optional and disabled unless explicitly enabled."
 )
 
 
@@ -30,9 +27,13 @@ class MemoryService:
         workspace: Path,
         adapter: GraphitiAdapter | None = None,
         policy: MemoryPolicy | None = None,
+        enable_graphiti: bool | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
-        self.adapter = adapter or GraphitiAdapter()
+        self._graphiti_enabled = (
+            bool(adapter) if enable_graphiti is None else bool(enable_graphiti)
+        ) or _env_truthy("SHAMSU_ENABLE_GRAPHITI_MEMORY")
+        self.adapter = adapter or (GraphitiAdapter() if self._graphiti_enabled else None)
         self.policy = policy or MemoryPolicy()
         self.memory_dir = self.workspace / ".shamsu" / "memory"
         self._fallback: SQLiteMemoryStore | None = None
@@ -45,7 +46,11 @@ class MemoryService:
         return self._fallback
 
     def _use_fallback(self) -> bool:
-        return not self.healthcheck().ok
+        return not self.graphiti_enabled or not self.healthcheck().ok
+
+    @property
+    def graphiti_enabled(self) -> bool:
+        return self._graphiti_enabled and self.adapter is not None
 
     def _status_path(self) -> Path:
         return self.memory_dir / "status.json"
@@ -126,9 +131,11 @@ class MemoryService:
             handle.write(line + "\n")
 
     def is_available(self) -> bool:
-        return self.healthcheck().ok
+        return True
 
     def healthcheck(self) -> GraphitiHealth:
+        if not self.graphiti_enabled or self.adapter is None:
+            return GraphitiHealth(available=False, message="Graphiti disabled; local SQLite memory is authoritative")
         return self.adapter.healthcheck(self.workspace)
 
     def status(self) -> MemoryStatus:
@@ -139,34 +146,36 @@ class MemoryService:
             memory_path=str(self.memory_dir),
             normal_mode_allowed=True,
             local_available=True,
-            degraded=not health.ok,
-            storage_mode="local+graphiti" if health.ok else "local",
+            degraded=False,
+            storage_mode="local+graphiti" if self.graphiti_enabled and health.ok else "local",
         )
         self._write_json(self._status_path(), status.to_dict())
         return status
 
     def ensure_ready(self) -> MemoryGate:
         status = self.status()
-        if not status.health.ok:
-            return MemoryGate(False, REQUIRED_MEMORY_MESSAGE, status)
         return MemoryGate(True, status=status)
 
     def ensure_ready_degraded(self) -> MemoryGate:
-        """Non-blocking readiness: allowed via Graphiti when healthy, otherwise
-        allowed via the always-available local SQLite store (degraded). This is
-        what lets SHAMSU run without Graphiti instead of hard-blocking startup."""
+        """Compatibility alias: local SQLite memory always allows normal mode."""
         status = self.status()
         if status.health.ok:
             return MemoryGate(True, status=status)
         return MemoryGate(True, DEGRADED_MEMORY_MESSAGE, status)
 
     def setup(self) -> dict[str, Any]:
+        if self.adapter is None:
+            self.adapter = GraphitiAdapter()
+        self._graphiti_enabled = True
         result = self.adapter.setup(self.workspace)
         self._log_event("setup", result)
         self.status()
         return result
 
     def repair(self) -> dict[str, Any]:
+        if self.adapter is None:
+            self.adapter = GraphitiAdapter()
+        self._graphiti_enabled = True
         result = self.adapter.repair(self.workspace)
         self._log_event("repair", result)
         self.status()
@@ -180,6 +189,8 @@ class MemoryService:
         on every session start. SHAMSU never auto-stops this container on its
         own (see `shamsu.runtime.ollama.shutdown_if_last_session`) - once
         started it stays running until stopped manually via `docker stop`."""
+        if not self.graphiti_enabled or self.adapter is None:
+            return None
         if not self.adapter.config_path(self.workspace).exists():
             return None
         result = self.adapter.ensure_backend_running(self.workspace)
@@ -188,6 +199,13 @@ class MemoryService:
         return result
 
     def add_episode(self, text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not self.graphiti_enabled or self.adapter is None:
+            return self.remember_project_memory(
+                kind="task_summary",
+                content=text,
+                source="episode",
+                metadata=metadata,
+            )
         result = self.adapter.add_episode(self.workspace, text, metadata)
         self._log_event("add_episode", {"ok": bool(result.get("ok")), "error": result.get("error", "")})
         return result
@@ -205,10 +223,19 @@ class MemoryService:
             self._log_event("remember_skipped", result)
             return result
         full_metadata = _memory_metadata(metadata)
+        project_id = str(full_metadata.get("project_id") or self.workspace.name)
+        source = str(full_metadata.get("source") or "memory_service")
         # Deliberately storing a fact un-forgets it (clears a prior tombstone) so
         # a wrong-then-corrected fact can come back.
         self._remove_tombstone(decision.text)
-        result = self.fallback.remember(decision.text, decision.kind, full_metadata)
+        result = self.fallback.remember(
+            decision.text,
+            decision.kind,
+            full_metadata,
+            project_id=project_id,
+            source=source,
+            confidence=float(full_metadata.get("confidence", 0.85)),
+        )
         self._log_event(
             "remember_local",
             {
@@ -232,6 +259,10 @@ class MemoryService:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Best-effort external mirror; local persistence must happen first."""
+        if not self.graphiti_enabled or self.adapter is None:
+            result = {"ok": False, "skipped": True, "reason": "Graphiti disabled"}
+            self._log_event("mirror_disabled", {"kind": kind})
+            return result
         if self._is_tombstoned(LongTermMemory(kind=kind, text=text)):  # type: ignore[arg-type]
             result = {"ok": False, "skipped": True, "reason": "tombstoned"}
             self._log_event("mirror_skipped", result)
@@ -284,12 +315,69 @@ class MemoryService:
             "degraded": not bool(mirror.get("ok")),
         }
 
+    def remember_project_memory(
+        self,
+        *,
+        kind: MemoryKind | str,
+        content: str,
+        source: str,
+        project_id: str | None = None,
+        confidence: float = 0.85,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        full_metadata = _memory_metadata(
+            {
+                **(metadata or {}),
+                "project_id": project_id or self.workspace.name,
+                "source": source,
+                "confidence": confidence,
+            }
+        )
+        return self.remember_local(content, kind, full_metadata)  # type: ignore[arg-type]
+
+    def remember_repository_evidence(
+        self,
+        content: str,
+        *,
+        kind: MemoryKind | str = "project_fact",
+        project_id: str | None = None,
+        source: str = "repository_evidence",
+        confidence: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        full_metadata = _memory_metadata(
+            {
+                **(metadata or {}),
+                "project_id": project_id or self.workspace.name,
+                "source": source,
+                "confidence": confidence,
+            }
+        )
+        result = self.fallback.remember_evidence(
+            content,
+            str(kind),
+            full_metadata,
+            project_id=str(full_metadata.get("project_id") or self.workspace.name),
+            source=source,
+            confidence=confidence,
+        )
+        self._log_event(
+            "repository_evidence_remembered",
+            {"ok": bool(result.get("ok")), "kind": str(kind), "memory_id": result.get("memory_id", "")},
+        )
+        return {**result, "local": bool(result.get("ok"))}
+
+    def mark_stale(self, memory_id_or_query: str, *, reason: str = "stale") -> dict[str, Any]:
+        result = self.fallback.mark_stale(memory_id_or_query, reason=reason)
+        self._log_event("mark_stale", {"ok": bool(result.get("ok")), "reason": reason})
+        return result
+
     def search(self, query: str, limit: int = 8, filters: dict[str, Any] | None = None) -> dict[str, Any]:
         local = self.fallback.search(query, limit)
         tombstones = self._load_tombstones()
         local = [item for item in local if not self._is_tombstoned(item, tombstones)]
-        if self._use_fallback():
-            return {"ok": True, "degraded": True, "results": [m.text for m in local]}
+        if self._use_fallback() or self.adapter is None:
+            return {"ok": True, "degraded": False, "storage_mode": "local", "results": [m.text for m in local]}
         result = self.adapter.search(self.workspace, query, limit, filters)
         self._log_event("search", {"ok": bool(result.get("ok")), "limit": limit, "error": result.get("error", "")})
         external = list(result.get("results") or [])
@@ -312,7 +400,7 @@ class MemoryService:
         extra = len(tombstones["ids"]) + len(tombstones["texts"])
         fetch = min(limit + extra, limit + 50) if extra else limit
         memories = self.fallback.get_relevant(user_prompt, task_type, fetch)
-        if not self._use_fallback():
+        if not self._use_fallback() and self.adapter is not None:
             try:
                 memories.extend(self.adapter.get_relevant(self.workspace, user_prompt, task_type, fetch))
             except Exception as exc:
@@ -342,7 +430,7 @@ class MemoryService:
             return {"ok": False, "error": "forget needs a memory id or a query text."}
         self._add_tombstone(value)
         local = self.fallback.forget(value)
-        if self._use_fallback():
+        if self._use_fallback() or self.adapter is None:
             backend = {"ok": False, "error": "Graphiti unavailable"}
         else:
             try:
@@ -449,3 +537,7 @@ def _search_result_tombstoned(
     else:
         memory = LongTermMemory(kind="task_summary", text=str(item))
     return service._is_tombstoned(memory, tombstones)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}

@@ -1,21 +1,5 @@
-"""SHAMSU task-success and architecture reliability eval harnesses.
+"""Compatibility exports for architecture reliability metrics."""
 
-Run headlessly against the active model tier:
-
-    python -m evals                 # run all seed cases, print the benchmark
-    python -m evals --list          # list case names
-    python -m evals --prd-only      # run only medium/long PRD benchmarks
-    python -m evals --artifacts-dir eval-artifacts
-    python -m evals --out BENCHMARK.md   # also write the report to a file
-"""
-from evals.harness import (
-    CheckOutcome,
-    EvalCase,
-    EvalReport,
-    EvalResult,
-    render_report,
-    run_evals,
-)
 from shamsu.evaluation import (
     ARCHITECTURE_METRIC_NAMES,
     ADVERSARIAL_TASK_SPECS,
@@ -24,7 +8,9 @@ from shamsu.evaluation import (
     ArchitectureEvaluationReport,
     ArchitectureTaskSample,
     AdvancedReadinessResult,
+    BenchmarkCategory,
     BenchmarkTaskSpec,
+    CheckOutcome,
     CoreBenchmarkThresholds,
     MetricName,
     RetrievalJudgement,
@@ -44,12 +30,10 @@ __all__ = [
     "ArchitectureEvaluationReport",
     "ArchitectureTaskSample",
     "AdvancedReadinessResult",
+    "BenchmarkCategory",
     "BenchmarkTaskSpec",
-    "CoreBenchmarkThresholds",
     "CheckOutcome",
-    "EvalCase",
-    "EvalReport",
-    "EvalResult",
+    "CoreBenchmarkThresholds",
     "MetricName",
     "RetrievalJudgement",
     "TaskEvaluationResult",
@@ -58,6 +42,4 @@ __all__ = [
     "evaluate_architecture_samples",
     "evaluate_advanced_readiness",
     "evaluate_task_sample",
-    "render_report",
-    "run_evals",
 ]

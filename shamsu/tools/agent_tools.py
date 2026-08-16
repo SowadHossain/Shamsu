@@ -22,6 +22,14 @@ from shamsu.retriever.documents import (
     PreparedDocument,
 )
 from shamsu.retriever.search import SearchAgent
+from shamsu.tools.policy import (
+    ExecutionPhase,
+    evaluate_phase_tool_policy,
+    normalize_phase,
+    phase_allowed_tools,
+)
+from shamsu.runtime.advanced_capabilities import AdvancedCapability, normalize_advanced_capabilities
+from shamsu.runtime.task_state import current_task_context
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import command_may_write_workspace, redact
@@ -38,6 +46,7 @@ from shamsu.skills.ingest import (
 from shamsu.skills.loader import discover_skills
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitCommandResult, GitTool
+from shamsu.tools.logical import LogicalToolLayer, all_logical_tool_names
 from shamsu.tools.path_resolve import (
     _find_files_by_query,
     _find_path_candidates,
@@ -199,6 +208,17 @@ class AgentToolRegistry:
         self._user_request = ""
         self._required_tool_prefix = ""
         self._allowed_tool_names: set[str] | None = None
+        self._current_phase: ExecutionPhase | None = None
+        self._task_risk = "medium"
+        self._enabled_advanced_capabilities: frozenset[AdvancedCapability] = frozenset()
+        self._logical_tools_enabled = False
+        self._logical_tools = LogicalToolLayer(
+            self,
+            lambda ok, message, data: ToolResult(ok, message, data),
+            phase_getter=self._effective_phase,
+            risk_getter=lambda: self._task_risk,
+            enabled_advanced_getter=lambda: self._enabled_advanced_capabilities,
+        )
         self._resolved_read_aliases: dict[str, str] = {}
 
     def set_read_only(self, read_only: bool) -> None:
@@ -343,6 +363,50 @@ class AgentToolRegistry:
             return
         self._allowed_tool_names = {str(name) for name in names if str(name)}
 
+    def use_logical_tools(self, enabled: bool = True) -> None:
+        """Expose compact logical tools to the model while keeping low-level internals."""
+        self._logical_tools_enabled = bool(enabled)
+
+    def model_tool_names(self) -> set[str]:
+        if self._logical_tools_enabled:
+            return all_logical_tool_names()
+        return {
+            str((schema.get("function") or {}).get("name") or "")
+            for schema in self.tool_schemas()
+        }
+
+    def set_phase(self, phase: str | ExecutionPhase | None, *, task_risk: str | None = None) -> None:
+        """Set the runtime phase used by deterministic tool policy."""
+        self._current_phase = normalize_phase(phase)
+        if task_risk is not None:
+            self._task_risk = str(task_risk or "medium")
+
+    def set_enabled_advanced_capabilities(self, names: Iterable[str] | None) -> None:
+        """Enable advanced capability gates after benchmark readiness is proven."""
+        self._enabled_advanced_capabilities = normalize_advanced_capabilities(
+            {str(name) for name in names or []}
+        )
+
+    def clear_phase(self) -> None:
+        self._current_phase = None
+        self._task_risk = "medium"
+
+    def _effective_phase(self) -> ExecutionPhase:
+        if self._current_phase is not None:
+            return self._current_phase
+        context = current_task_context()
+        if context is not None:
+            try:
+                state = context.store.load_task(context.task_id)
+                if state is not None:
+                    return normalize_phase(state.current_phase)
+            except Exception:
+                pass
+        return ExecutionPhase.AUTHOR
+
+    def _phase_context_active(self) -> bool:
+        return self._current_phase is not None or current_task_context() is not None
+
     def _tool_is_allowed(self, name: str) -> bool:
         allowed = self._allowed_tool_names
         if allowed is None:
@@ -354,7 +418,44 @@ class AgentToolRegistry:
 
     def is_tool_allowed(self, name: str) -> bool:
         """Public capability check for harness-owned fallback paths."""
-        return self._tool_is_allowed(name)
+        return self._tool_is_allowed(name) and self._tool_allowed_by_phase(name)
+
+    def _logical_tool_allowed(self, name: str) -> bool:
+        if self._allowed_tool_names is None:
+            return True
+        return name in self._allowed_tool_names
+
+    def _tool_allowed_by_phase(self, name: str) -> bool:
+        if not self._phase_context_active():
+            return True
+        phase_tools = set(
+            phase_allowed_tools(
+                self._effective_phase(),
+                enabled_advanced_capabilities=self._enabled_advanced_capabilities,
+            )
+        )
+        return name in phase_tools or any(
+            pattern.endswith("*") and name.startswith(pattern[:-1])
+            for pattern in phase_tools
+        )
+
+    def _phase_policy_denial(self, name: str, arguments: dict[str, Any]) -> ToolResult | None:
+        if not self._phase_context_active():
+            return None
+        decision = evaluate_phase_tool_policy(
+            name,
+            arguments,
+            phase=self._effective_phase(),
+            task_risk=self._task_risk,
+            enabled_advanced_capabilities=self._enabled_advanced_capabilities,
+        )
+        if decision.allowed:
+            return None
+        return ToolResult(
+            False,
+            f"Tool {name} denied by phase contract: {decision.reason}",
+            decision.denial_payload(),
+        )
 
     def _outside_allowed_scope(self, path: str) -> ToolResult | None:
         allowed = self._allowed_write_paths
@@ -407,6 +508,8 @@ class AgentToolRegistry:
         )
 
     def tool_schemas(self) -> list[dict[str, Any]]:
+        if self._logical_tools_enabled:
+            return self._logical_tools.schemas(allowed_names=self._allowed_tool_names)
         local_schemas = [
             _tool_schema(
                 "list_files",
@@ -956,20 +1059,43 @@ class AgentToolRegistry:
         return [
             schema
             for schema in schemas
-            if self._tool_is_allowed(
-                str((schema.get("function") or {}).get("name") or "")
-            )
+            if self.is_tool_allowed(str((schema.get("function") or {}).get("name") or ""))
         ]
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         try:
+            if self._logical_tools_enabled:
+                alias = None
+                if not self._logical_tools.is_logical_tool(name):
+                    alias = self._logical_tools.alias(name, arguments)
+                logical_name, logical_args = alias or (name, arguments)
+                if self._logical_tools.is_logical_tool(logical_name):
+                    if not self._logical_tool_allowed(logical_name):
+                        return ToolResult(
+                            False,
+                            f"Tool {logical_name} is not allowed for the current orchestrated step.",
+                            {
+                                "blocked_tool": logical_name,
+                                "requested_tool": name,
+                                "current_phase": self._effective_phase().value,
+                                "allowed_tools": sorted(self._allowed_tool_names or []),
+                                "reason": "Logical tool is not in the active plan step's allowed tools.",
+                            },
+                        )
+                    return self._logical_tools.execute(logical_name, logical_args)
+            phase_denial = self._phase_policy_denial(name, arguments)
+            if phase_denial is not None:
+                return phase_denial
             if not self._tool_is_allowed(name):
                 return ToolResult(
                     False,
                     f"Tool {name} is not allowed for the current orchestrated step.",
                     {
                         "blocked_tool": name,
+                        "requested_tool": name,
+                        "current_phase": self._effective_phase().value,
                         "allowed_tools": sorted(self._allowed_tool_names or []),
+                        "reason": "Tool is not in the active plan step's allowed tools.",
                     },
                 )
             if (
@@ -3132,6 +3258,10 @@ class AgentToolRegistry:
             "stderr": stderr,
             "cwd": effective_cwd,
         }
+        if code == 124:
+            data["timeout"] = True
+            data["timeout_category"] = "TOOL_TIMEOUT"
+            data["timeout_seconds"] = getattr(self.command_runner, "timeout_seconds", 0)
         if touched_files:
             data["touched_files"] = touched_files
             data["deleted_files"] = [path for path in touched_files if path not in after_files]

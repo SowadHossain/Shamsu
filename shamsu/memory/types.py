@@ -1,7 +1,8 @@
-﻿"""Shared types for SHAMSU's required Graphiti long-term memory backend."""
+"""Shared types for SHAMSU's local authoritative project memory."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Literal
 
 MemoryKind = Literal[
@@ -12,7 +13,25 @@ MemoryKind = Literal[
     "architecture_note",
     "task_summary",
     "safety_rule",
+    "project_fact",
+    "failure_lesson",
+    "environment_info",
+    "checkpoint",
+    "evidence_reference",
 ]
+
+
+class MemoryFreshness(str, Enum):
+    FRESH = "FRESH"
+    STALE = "STALE"
+    UNKNOWN = "UNKNOWN"
+
+
+class MemoryRecordStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    SUPERSEDED = "SUPERSEDED"
+    INVALIDATED = "INVALIDATED"
+    FORGOTTEN = "FORGOTTEN"
 
 
 @dataclass(frozen=True)
@@ -70,3 +89,10 @@ class LongTermMemory:
     memory_id: str = ""
     score: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    project_id: str = ""
+    source: str = ""
+    confidence: float = 0.85
+    created_at: float = 0.0
+    last_verified_at: float = 0.0
+    freshness: MemoryFreshness | str = MemoryFreshness.UNKNOWN
+    status: MemoryRecordStatus | str = MemoryRecordStatus.ACTIVE

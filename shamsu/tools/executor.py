@@ -23,6 +23,7 @@ from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.tools.project_env import CommandResolution, ProjectEnvironmentResolver
+from shamsu.runtime.timeouts import TimeoutConfig
 from shamsu.types import ApprovalRequest, CommandRisk, TestRunResult
 
 BLOCKED_EXIT_CODE = 126
@@ -48,7 +49,7 @@ class CommandRunner(ICommandRunner):
         self,
         workspace_root: Path,
         approval_func: Callable[[ApprovalRequest], bool] = ask_approval,
-        timeout_seconds: int = 120,
+        timeout_seconds: int | None = None,
         session_logger: SessionLogger | None = None,
         approval_manager: ApprovalManager | None = None,
         diagnostic_digest: DiagnosticDigest | None = None,
@@ -59,7 +60,7 @@ class CommandRunner(ICommandRunner):
         self.sandbox = Sandbox(self.workspace_root)
         self.approval_func = approval_func
         self.approval_manager = approval_manager or ApprovalManager(approval_func, session_logger)
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = int(timeout_seconds if timeout_seconds is not None else TimeoutConfig.from_env().tool_timeout)
         self.session_logger = session_logger
         self.action_ledger = action_ledger
         self.audit_logger = AuditLogger(self.workspace_root)

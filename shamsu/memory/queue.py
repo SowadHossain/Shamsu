@@ -1,4 +1,4 @@
-"""Bounded, best-effort Graphiti mirroring for locally stored memories."""
+"""Bounded, best-effort optional Graphiti mirroring for local memories."""
 from __future__ import annotations
 
 import os
@@ -25,7 +25,7 @@ class MirrorJob:
 
 
 class MemoryWriteQueue:
-    """One daemon worker per workspace with bounded pending Graphiti writes."""
+    """One daemon worker per workspace with bounded optional mirror writes."""
 
     def __init__(
         self,
@@ -61,6 +61,9 @@ class MemoryWriteQueue:
         clean_metadata = dict(local.get("metadata") or metadata or {})
         source_run_id = str(clean_metadata.get("source_run_id") or clean_metadata.get("run_id") or "")
         key = (clean_kind, _norm(clean_text), source_run_id)
+        if not service.graphiti_enabled:
+            service.log_queue_event("mirror_not_queued", {"kind": clean_kind, "reason": "Graphiti disabled"})
+            return {**local, "local": True, "queued": False, "mirror": {"skipped": True, "reason": "Graphiti disabled"}}
 
         with self._lock:
             if key in self._pending_keys:

@@ -7,22 +7,40 @@ import hashlib
 import json
 import os as _os
 import re
+import time
+import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
 
+import httpx
 import ollama
 
 from shamsu.action_ledger.ledger import ActionLedger
+from shamsu.artifacts.code import (
+    hash_source_text,
+    invalidate_artifacts_if_hash_mismatch,
+    mark_artifacts_stale_for_paths,
+    refresh_artifacts_for_paths,
+)
 from shamsu.audit import SessionAuditLog
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.clarification import format_question
+from shamsu.agents.executor import (
+    AgentExecutor,
+    StepExecutionController,
+    StepExecutionDecision,
+    StepExecutionLimits,
+    StepExecutionOutcome,
+)
 from shamsu.agents.markdown_fallback import MarkdownWriteFallback
-from shamsu.agents.planner import create_plan
+from shamsu.agents.planner import AgentPlanner, create_plan
+from shamsu.agents.prompting import PromptProfile, compose_agent_prompt, prompt_profile_for_model
 from shamsu.context.budget import (
     RESERVE_OUTPUT_TOKENS,
     SAFETY_MARGIN_TOKENS,
@@ -35,6 +53,7 @@ from shamsu.safety import read_only
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
 from shamsu.agents.project_instructions import load_project_instructions
+from shamsu.agents.repair import RepairRecorder
 from shamsu.llm.output import ParseFailure, parse_model_turn, tool_call_to_message_dict
 from shamsu.memory.service import MemoryService
 from shamsu.routing.operations import file_targets
@@ -43,10 +62,24 @@ from shamsu.runtime.models import (
     model_supports_native_tools,
     role_should_think,
 )
+from shamsu.context.compiler import ContextCompiler
+from shamsu.runtime.engine import RuntimeEngine
+from shamsu.runtime.failures import FailureTracker, FailureType, RecoveryAction, failure_type_for_timeout
+from shamsu.runtime.run_control import ControlledRun, time_remaining, timed_out, wait_if_paused
+from shamsu.runtime.timeouts import ShamsuTimeoutError, TimeoutCategory, TimeoutConfig, timeout_failure_detail
+from shamsu.runtime.phase_contracts import ExecutionPhase, normalize_phase, phase_for_step
+from shamsu.runtime.task_state import (
+    PlanStepStatus,
+    RuntimeStateStore,
+    TaskStepStatus,
+    TaskState,
+)
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
+from shamsu.tools.dispatcher import ToolDispatcher
 from shamsu.ui.progress import ProgressReporter, summarize_tool_args, summarize_tool_result
-from shamsu.verify.gate import verify_only
+from shamsu.verification.verifier import ChangeVerifier
+from shamsu.types import RunStatus
 
 # Circuit-breaker ceiling used only in long-running mode — a backstop, not
 # the normal stop condition (the repetition guard is what actually catches
@@ -59,6 +92,7 @@ LONG_RUNNING_MAX_TOOL_ROUNDS = 50
 # bound the worst-case wall-clock cost on a developer machine.
 # Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
 _MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
+_RUN_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_RUN_TIMEOUT_SECONDS", "300"))
 _REPAIR_MODEL_TIMEOUT_SECONDS: int = int(
     _os.environ.get("SHAMSU_REPAIR_MODEL_TIMEOUT_SECONDS", "120")
 )
@@ -301,7 +335,7 @@ _EMPTY_RESPONSE_CORRECTION = (
 
 # Tools whose failed parse means a MUTATION was attempted and lost, as opposed to
 # a turn that never tried to change anything.
-_MUTATION_TOOL_NAMES = frozenset({"write_file", "append_file", "edit_file"})
+_MUTATION_TOOL_NAMES = frozenset({"write_file", "append_file", "edit_file", "file.patch"})
 # Failure kinds that are a mutation attempt even when `tool` was not recoverable.
 _MUTATION_FAILURE_KINDS = frozenset(
     {
@@ -427,7 +461,7 @@ _DEFERRED_ACTION_PATTERNS = (
 )
 
 _MUTATION_TOOL_NAMES = frozenset(
-    {"write_file", "edit_file", "append_file", "move_file", "delete_file"}
+    {"write_file", "edit_file", "append_file", "move_file", "delete_file", "file.patch"}
 )
 
 _WORKSPACE_CHANGE_RE = re.compile(
@@ -453,6 +487,13 @@ TraceCallback = Callable[[str, str, "dict[str, Any] | None", str], None]
 # Timeout / stall categories, so the CLI and logs can distinguish a genuine LLM
 # timeout from an agent-loop stall (the model already answered but no valid tool
 # call followed) instead of always blaming the GPU. See run().
+TIMEOUT_CONNECT = TimeoutCategory.CONNECT_TIMEOUT.value
+TIMEOUT_FIRST_TOKEN = TimeoutCategory.FIRST_TOKEN_TIMEOUT.value
+TIMEOUT_TOKEN_IDLE = TimeoutCategory.TOKEN_IDLE_TIMEOUT.value
+TIMEOUT_TOTAL_GENERATION = TimeoutCategory.TOTAL_GENERATION_TIMEOUT.value
+TIMEOUT_TOOL = TimeoutCategory.TOOL_TIMEOUT.value
+TIMEOUT_STEP = TimeoutCategory.STEP_TIMEOUT.value
+TIMEOUT_TASK = TimeoutCategory.TASK_TIMEOUT.value
 TIMEOUT_LLM_NO_FIRST_TOKEN = "llm_no_first_token_timeout"
 TIMEOUT_LLM_GENERATION = "llm_generation_timeout"
 TIMEOUT_PLANNER_STALL = "planner_returned_but_executor_stalled"
@@ -467,6 +508,9 @@ class AgentLoopResult:
     stopped: bool = False
     awaiting_user: bool = False
     timeout_category: str | None = None
+    run_id: str = ""
+    task_id: str = ""
+    status: RunStatus = RunStatus.COMPLETED
     # Workspace-relative files this run confirmed writing, so a caller (e.g. the
     # plan runner) can verify the whole set once at the end.
     changed_files: tuple[str, ...] = ()
@@ -499,12 +543,27 @@ class AgentChatLoop:
         verify_changes: bool = True,
         use_model_compaction: bool = True,
         original_user_request: str = "",
+        run_id: str | None = None,
+        max_runtime_seconds: float | None = None,
+        runtime_state_store: RuntimeStateStore | None = None,
     ) -> None:
         _validate_local_llm_url(base_url)
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
         self.action_ledger = action_ledger
+        self.timeout_config = TimeoutConfig.from_env()
+        self.run_id = run_id or (
+            action_ledger.run_id if action_ledger is not None else f"agentrun-{uuid.uuid4().hex[:12]}"
+        )
+        self.max_runtime_seconds = (
+            float(max_runtime_seconds)
+            if max_runtime_seconds is not None
+            else float(self.timeout_config.task_timeout)
+        )
+        self.runtime_state_store = runtime_state_store or RuntimeStateStore(self.workspace_root)
+        self.runtime_task_id = f"task-{self.run_id}"
         self.model_name = model_name or model_for_role(_CHAT_EXECUTOR_ROLE)
+        self.prompt_profile = prompt_profile_for_model(self.model_name)
         # Capability flags drive the model I/O boundary: whether to hand this
         # model a native tools schema (vs. an in-prompt protocol + salvager) and
         # whether to ask it to `think` so reasoning stays out of the answer.
@@ -515,14 +574,63 @@ class AgentChatLoop:
         self._is_reasoning = role_should_think(_CHAT_EXECUTOR_ROLE, self.model_name)
         self.llm = llm or LLMManager(session_logger=session_logger, action_ledger=action_ledger)
         self.context_builder = context_builder or ContextBuilder()
-        self.client = client or ollama.AsyncClient(host=base_url)
+        self.client = client or _default_ollama_client(base_url, self.timeout_config)
         self.tools = tools or AgentToolRegistry(self.workspace_root, session_logger=session_logger)
+        use_logical_tools = getattr(self.tools, "use_logical_tools", None)
+        if callable(use_logical_tools):
+            use_logical_tools(True)
+        self.tool_dispatcher = ToolDispatcher(self.tools)
+        self.context_compiler = ContextCompiler(
+            self._messages_within_budget,
+            store=self.runtime_state_store,
+            task_id_getter=lambda: self.runtime_task_id,
+            workspace_root=self.workspace_root,
+            system_prompt_getter=lambda: self.state.system_prompt,
+            allowed_tools_getter=self.tools.tool_schemas,
+            recent_messages_getter=lambda: [
+                message.to_ollama() for message in self.state.all_messages[-8:]
+            ],
+            trace=lambda event, message, data: self._emit_trace(
+                event,
+                message,
+                data or {},
+                level="verbose",
+            ),
+        )
+        self.change_verifier = ChangeVerifier(
+            self.workspace_root,
+            command_runner=self.tools.command_runner,
+            session_logger=self.session_logger,
+        )
+        self.failure_tracker = FailureTracker(
+            self.runtime_state_store,
+            self.runtime_task_id,
+            step_id_getter=self._current_failure_step_id,
+        )
+        self.step_execution_limits = StepExecutionLimits()
+        self.executor = AgentExecutor(
+            self._run_inner,
+            step_runner=self.run_step,
+            limits=self.step_execution_limits,
+        )
+        self.repair_recorder = RepairRecorder(self.runtime_state_store, self.runtime_task_id)
         # Names the salvager is allowed to recover calls for (a JSON blob naming
         # an unregistered "tool" is treated as prose, not a call).
-        self._registered_tool_names = {
-            str((schema.get("function") or {}).get("name") or "")
-            for schema in self.tools.tool_schemas()
-        }
+        model_tool_names = getattr(self.tools, "model_tool_names", None)
+        if callable(model_tool_names):
+            self._registered_tool_names = {name for name in model_tool_names() if name}
+        else:
+            self._registered_tool_names = {
+                str((schema.get("function") or {}).get("name") or "")
+                for schema in self.tools.tool_schemas()
+            }
+        self.agent_planner = AgentPlanner(
+            store=self.runtime_state_store,
+            tool_policy=self.tools,
+            registered_tool_names=self._registered_tool_names,
+            run_id=self.run_id,
+            task_id=self.runtime_task_id,
+        )
         # Optional hook to surface live tool activity (e.g. "Writing game.js")
         # to the REPL while the loop runs. None keeps the loop silent (tests).
         self.on_activity = on_activity
@@ -539,6 +647,9 @@ class AgentChatLoop:
             # A read-only turn must not be taught to write, and skipping it
             # returns ~250 tokens to a 7B's window.
             include_raw_write_protocol=not read_only,
+            profile=self.prompt_profile,
+            phase=ExecutionPhase.EXPLORE,
+            available_tools=(),
         )
         self.state = state or ChatState(
             self._base_system_prompt + load_project_instructions(self.workspace_root),
@@ -573,9 +684,41 @@ class AgentChatLoop:
         file keeps the rules byte-exact for the whole run no matter how much
         history gets evicted.
         """
+        phase, current_step, available_tools = self._prompt_runtime_context()
+        self._base_system_prompt = _system_prompt(
+            self.workspace_root,
+            include_tool_protocol=not self._supports_native_tools,
+            include_raw_write_protocol=not self.read_only,
+            profile=self.prompt_profile,
+            phase=phase,
+            current_step=current_step,
+            available_tools=available_tools,
+        )
         self.state.set_system_prompt(
             self._base_system_prompt + load_project_instructions(self.workspace_root)
         )
+
+    def _prompt_runtime_context(self) -> tuple[ExecutionPhase, Any, tuple[str, ...]]:
+        phase = ExecutionPhase.EXPLORE
+        current_step = None
+        try:
+            task = self.runtime_state_store.load_task(self.runtime_task_id)
+            if task is not None:
+                phase = normalize_phase(task.current_phase)
+                current_step = self.runtime_state_store.current_active_step(task.task_id)
+        except Exception:
+            current_step = None
+        try:
+            available_tools = tuple(
+                sorted(
+                    str((schema.get("function") or {}).get("name") or "")
+                    for schema in self.tools.tool_schemas()
+                    if str((schema.get("function") or {}).get("name") or "")
+                )
+            )
+        except Exception:
+            available_tools = ()
+        return phase, current_step, available_tools
 
     def _regrounding_block(self, mutated_paths: Sequence[str]) -> str:
         """Current on-disk contents of the files this run most recently changed.
@@ -884,9 +1027,9 @@ class AgentChatLoop:
         round_index: int = 0,
         *,
         options_override: dict[str, Any] | None = None,
+        control: ControlledRun | None = None,
     ) -> Any:
-        """Call the model, emitting a periodic 'still waiting' heartbeat so a slow
-        local model reads as working, not frozen. The timeout is unchanged.
+        """Call the model with layer-specific timeout diagnostics.
 
         ``options_override`` raises sampling for a retry that would otherwise be
         byte-identical (see :class:`_RetryEscalation`).
@@ -900,8 +1043,9 @@ class AgentChatLoop:
                 if self.on_activity:
                     self.on_activity(
                         f"still waiting for the model... {elapsed}s "
-                        f"(Ollama may be loading, queued, or generating; timeout "
-                        f"{_MODEL_CALL_TIMEOUT_SECONDS}s)"
+                        "(Ollama may be loading, queued, or generating; "
+                        f"first-token timeout {self.timeout_config.first_token_timeout:.0f}s, "
+                        f"token-idle timeout {self.timeout_config.token_idle_timeout:.0f}s)"
                     )
 
         chat_kwargs: dict[str, Any] = {
@@ -945,14 +1089,16 @@ class AgentChatLoop:
             )
 
         beat = asyncio.ensure_future(_beat())
+        model_task: asyncio.Task[Any] | None = None
         try:
-            try:
-                coro = self.client.chat(**chat_kwargs)
-            except TypeError:
-                # Older ollama clients (or test doubles) may not accept `think`.
-                chat_kwargs.pop("think", None)
-                coro = self.client.chat(**chat_kwargs)
-            response = await asyncio.wait_for(coro, timeout=_MODEL_CALL_TIMEOUT_SECONDS)
+            coro = self._chat_with_layered_timeouts(chat_kwargs, control, round_index)
+            model_task = asyncio.create_task(coro)
+            if control is not None:
+                control.current_model_task = model_task
+                control.record_event("model_call_started", round=round_index, model=self.model_name)
+            response = await model_task
+            if control is not None:
+                control.record_event("model_call_finished", round=round_index, model=self.model_name)
             if self.action_ledger:
                 message = _message_from_response(response)
                 visible = str(_get(message, "content", "") or "")
@@ -970,6 +1116,15 @@ class AgentChatLoop:
                     meta={"round": round_index, "tool_call_count": len(tool_calls)},
                 )
             return response
+        except asyncio.CancelledError:
+            if control is not None:
+                control.record_event(
+                    "model_call_cancelled",
+                    round=round_index,
+                    cancel_requested=control.cancel_event.is_set(),
+                    feedback_pending=control.feedback_queue.qsize(),
+                )
+            raise
         except Exception as exc:
             if self.action_ledger:
                 self.action_ledger.log_model_call_finished(
@@ -981,7 +1136,201 @@ class AgentChatLoop:
                 )
             raise
         finally:
+            if control is not None and control.current_model_task is model_task:
+                control.current_model_task = None
             beat.cancel()
+
+    async def _chat_with_layered_timeouts(
+        self,
+        chat_kwargs: dict[str, Any],
+        control: ControlledRun | None,
+        round_index: int,
+    ) -> Any:
+        streaming_kwargs = {**chat_kwargs, "stream": True}
+        try:
+            raw_stream = self.client.chat(**streaming_kwargs)
+        except TypeError:
+            streaming_kwargs.pop("think", None)
+            try:
+                raw_stream = self.client.chat(**streaming_kwargs)
+            except TypeError:
+                return await self._chat_non_streaming_with_timeout(chat_kwargs, control, round_index)
+        try:
+            stream = await self._await_generation_boundary(
+                raw_stream,
+                TimeoutCategory.FIRST_TOKEN_TIMEOUT,
+                control,
+                round_index,
+            )
+        except TypeError:
+            return await self._chat_non_streaming_with_timeout(chat_kwargs, control, round_index)
+        if isinstance(stream, dict) or not hasattr(stream, "__aiter__"):
+            return stream
+        return await self._collect_streaming_chat(stream, control, round_index)
+
+    async def _chat_non_streaming_with_timeout(
+        self,
+        chat_kwargs: dict[str, Any],
+        control: ControlledRun | None,
+        round_index: int,
+    ) -> Any:
+        fallback_kwargs = {**chat_kwargs, "stream": False}
+        try:
+            raw_response = self.client.chat(**fallback_kwargs)
+        except TypeError:
+            fallback_kwargs.pop("think", None)
+            raw_response = self.client.chat(**fallback_kwargs)
+        category = (
+            TimeoutCategory.TOTAL_GENERATION_TIMEOUT
+            if self.timeout_config.total_generation_timeout > 0
+            else TimeoutCategory.FIRST_TOKEN_TIMEOUT
+        )
+        return await self._await_generation_boundary(raw_response, category, control, round_index)
+
+    async def _collect_streaming_chat(
+        self,
+        stream: Any,
+        control: ControlledRun | None,
+        round_index: int,
+    ) -> dict[str, Any]:
+        chunks: list[str] = []
+        thinking_chunks: list[str] = []
+        tool_calls: list[Any] = []
+        started = False
+        total_deadline = (
+            time.monotonic() + self.timeout_config.total_generation_timeout
+            if self.timeout_config.total_generation_timeout > 0
+            else None
+        )
+        iterator = stream.__aiter__()
+        while True:
+            category = TimeoutCategory.TOKEN_IDLE_TIMEOUT if started else TimeoutCategory.FIRST_TOKEN_TIMEOUT
+            wait_category, seconds = self._timeout_for_generation_wait(category, control, total_deadline)
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=seconds)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError as exc:
+                raise ShamsuTimeoutError(
+                    wait_category,
+                    seconds,
+                    self._timeout_message_for_category(wait_category, seconds),
+                ) from exc
+            message = _message_from_response(chunk)
+            content = str(_get(message, "content", "") or "")
+            thinking = str(_get(message, "thinking", "") or "")
+            current_tool_calls = _get(message, "tool_calls", []) or []
+            if content or thinking or current_tool_calls:
+                started = True
+            if content:
+                chunks.append(content)
+            if thinking:
+                thinking_chunks.append(thinking)
+            if current_tool_calls:
+                tool_calls.extend(current_tool_calls)
+            if control is not None:
+                control.record_event(
+                    "model_stream_chunk",
+                    round=round_index,
+                    has_content=bool(content),
+                    has_tool_calls=bool(current_tool_calls),
+                )
+            if bool(_get(chunk, "done", False)):
+                break
+        response: dict[str, Any] = {
+            "message": {
+                "role": "assistant",
+                "content": "".join(chunks),
+                "tool_calls": tool_calls,
+            }
+        }
+        if thinking_chunks:
+            response["message"]["thinking"] = "".join(thinking_chunks)
+        return response
+
+    async def _await_generation_boundary(
+        self,
+        value: Any,
+        category: TimeoutCategory,
+        control: ControlledRun | None,
+        round_index: int,
+    ) -> Any:
+        wait_category, seconds = self._timeout_for_generation_wait(category, control, None)
+        try:
+            if hasattr(value, "__await__"):
+                return await asyncio.wait_for(value, timeout=seconds)
+            return value
+        except asyncio.TimeoutError as exc:
+            raise ShamsuTimeoutError(
+                wait_category,
+                seconds,
+                self._timeout_message_for_category(wait_category, seconds),
+            ) from exc
+        except Exception as exc:
+            lowered = f"{type(exc).__name__}: {exc}".lower()
+            if "connect" in lowered or "connection" in lowered:
+                raise ShamsuTimeoutError(
+                    TimeoutCategory.CONNECT_TIMEOUT,
+                    self.timeout_config.connect_timeout,
+                    self._timeout_message_for_category(
+                        TimeoutCategory.CONNECT_TIMEOUT,
+                        self.timeout_config.connect_timeout,
+                    ),
+                ) from exc
+            raise
+        finally:
+            if control is not None:
+                control.record_event(
+                    "model_timeout_boundary_checked",
+                    round=round_index,
+                    category=wait_category.value,
+                    seconds=seconds,
+                )
+
+    def _timeout_for_generation_wait(
+        self,
+        category: TimeoutCategory,
+        control: ControlledRun | None,
+        total_deadline: float | None,
+    ) -> tuple[TimeoutCategory, float]:
+        candidates: list[tuple[TimeoutCategory, float]] = []
+        if category == TimeoutCategory.FIRST_TOKEN_TIMEOUT:
+            candidates.append((category, self.timeout_config.first_token_timeout))
+        elif category == TimeoutCategory.TOKEN_IDLE_TIMEOUT:
+            candidates.append((category, self.timeout_config.token_idle_timeout))
+        elif category == TimeoutCategory.TOTAL_GENERATION_TIMEOUT:
+            candidates.append((category, self.timeout_config.total_generation_timeout))
+        else:
+            candidates.append((category, self.timeout_config.connect_timeout))
+        if total_deadline is not None:
+            candidates.append((TimeoutCategory.TOTAL_GENERATION_TIMEOUT, max(0.0, total_deadline - time.monotonic())))
+        if control is not None:
+            remaining = time_remaining(control)
+            if remaining is not None:
+                candidates.append((TimeoutCategory.TASK_TIMEOUT, remaining))
+        chosen_category, seconds = min(candidates, key=lambda item: item[1])
+        if seconds <= 0:
+            raise ShamsuTimeoutError(
+                chosen_category,
+                0.0,
+                self._timeout_message_for_category(chosen_category, 0.0),
+            )
+        return chosen_category, max(0.001, seconds)
+
+    def _timeout_message_for_category(self, category: TimeoutCategory, seconds: float) -> str:
+        if category == TimeoutCategory.CONNECT_TIMEOUT:
+            return f"Could not connect to the local model transport within {seconds:.0f}s."
+        if category == TimeoutCategory.FIRST_TOKEN_TIMEOUT:
+            return f"The model did not start generating within {seconds:.0f}s."
+        if category == TimeoutCategory.TOKEN_IDLE_TIMEOUT:
+            return f"The model started generating, then produced no token for {seconds:.0f}s."
+        if category == TimeoutCategory.TOTAL_GENERATION_TIMEOUT:
+            return f"The optional total generation cap of {seconds:.0f}s was reached."
+        if category == TimeoutCategory.TASK_TIMEOUT:
+            return "The overall task deadline was reached."
+        if category == TimeoutCategory.STEP_TIMEOUT:
+            return "The current plan step deadline was reached."
+        return f"The tool deadline of {seconds:.0f}s was reached."
 
     def _audit_final(self, final: str) -> None:
         if self.audit:
@@ -1023,8 +1372,499 @@ class AgentChatLoop:
             transaction_id=str(data.get("transaction_id", "")),
         )
 
+    def _cancelled_result(self, control: ControlledRun, round_index: int = 0) -> AgentLoopResult:
+        final = "Run cancelled."
+        self.state.append_assistant(final)
+        control.record_event("run_cancelled_checkpoint", round=round_index)
+        self._audit_final(final)
+        return AgentLoopResult(
+            final=final,
+            tool_rounds=round_index,
+            stopped=True,
+            run_id=self.run_id,
+            status=RunStatus.CANCELLED,
+        )
+
+    def _timeout_result(
+        self,
+        control: ControlledRun,
+        round_index: int,
+        category: str = TIMEOUT_TASK,
+        *,
+        seconds: float = 0.0,
+    ) -> AgentLoopResult:
+        try:
+            timeout_category = TimeoutCategory(category)
+        except ValueError:
+            timeout_category = TimeoutCategory.TASK_TIMEOUT
+        final = _timeout_message(timeout_category.value, int(seconds))
+        layer = "step" if timeout_category == TimeoutCategory.STEP_TIMEOUT else "task"
+        action = "plan.step" if timeout_category == TimeoutCategory.STEP_TIMEOUT else "task.run"
+        self._record_failure(
+            failure_type_for_timeout(timeout_category),
+            action=action,
+            evidence=[timeout_category.value],
+            detail=timeout_failure_detail(
+                timeout_category,
+                seconds=seconds,
+                layer=layer,
+                round=round_index,
+            ),
+        )
+        self.state.append_assistant(final)
+        control.record_event("run_deadline_reached", round=round_index, timeout_category=timeout_category.value)
+        self._audit_final(final)
+        return AgentLoopResult(
+            final=final,
+            tool_rounds=round_index,
+            stopped=True,
+            timeout_category=timeout_category.value,
+            run_id=self.run_id,
+            status=RunStatus.TIMED_OUT,
+        )
+
+    def _inject_feedback(self, control: ControlledRun) -> bool:
+        injected = False
+        while True:
+            try:
+                text = control.feedback_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            self.state.append_user(
+                "High-priority user feedback for this active run:\n"
+                f"{text}\n\n"
+                "Incorporate this feedback into the current task state before continuing."
+            )
+            control.record_event("feedback_injected", text_preview=text[:500])
+            injected = True
+        if injected:
+            control.feedback_event.clear()
+        return injected
+
+    def _initialize_runtime_task(self, user_input: str, control: ControlledRun) -> TaskState:
+        self.runtime_state_store.create_run(
+            self.run_id,
+            status=RunStatus.RUNNING,
+            deadline_at=control.deadline_at,
+        )
+        state = self.runtime_state_store.create_task(
+            run_id=self.run_id,
+            task_id=self.runtime_task_id,
+            user_request=user_input,
+            project_id=self.workspace_root.name,
+        )
+        state.status = RunStatus.RUNNING
+        state.current_phase = ExecutionPhase.EXPLORE.value
+        self.tools.set_phase(ExecutionPhase.EXPLORE, task_risk="low")
+        return self.runtime_state_store.save_task(state, checkpoint_kind="task_started")
+
+    def _checkpoint_task_status(
+        self,
+        status: RunStatus,
+        phase: str,
+        checkpoint_kind: str,
+    ) -> None:
+        try:
+            self.runtime_state_store.update_task_status(
+                self.runtime_task_id,
+                status,
+                phase=phase,
+                checkpoint_kind=checkpoint_kind,
+            )
+        except Exception:
+            # Runtime state must be durable, but checkpointing must not turn a
+            # successful user-visible task into data loss. Tests cover the store
+            # itself; production keeps going and the action ledger/session logs
+            # still record the failure path.
+            pass
+
+    def _checkpoint_successful_tool(
+        self,
+        *,
+        round_index: int,
+        name: str,
+        arguments: dict[str, Any],
+        result: Any,
+        changed_files: list[str],
+    ) -> None:
+        try:
+            result_data = result.data if isinstance(result.data, dict) else {}
+            existing = self.runtime_state_store.load_task(self.runtime_task_id)
+            action_number = (existing.action_count + 1) if existing is not None else 1
+            active = self.runtime_state_store.current_active_step(self.runtime_task_id)
+            step_id = active.step_id if active is not None else f"round-{round_index + 1}-action-{action_number}"
+            required_evidence = active.required_evidence if active is not None else []
+            self.runtime_state_store.record_successful_step(
+                self.runtime_task_id,
+                step_id=step_id,
+                tool_call={"name": name, "arguments": arguments},
+                tool_result={
+                    "tool": name,
+                    "ok": bool(getattr(result, "ok", False)),
+                    "message": str(getattr(result, "message", "")),
+                    "data": result_data,
+                },
+                changed_files=changed_files,
+                required_evidence=required_evidence,
+            )
+        except Exception:
+            pass
+
+    def _checkpoint_latest_observation(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        result: Any,
+    ) -> None:
+        try:
+            state = self.runtime_state_store.require_task(self.runtime_task_id)
+            state.last_tool_call = {"name": name, "arguments": arguments}
+            state.last_tool_result = self._compress_observation(
+                name=name,
+                arguments=arguments,
+                result=result,
+            )
+            self.runtime_state_store.save_task(state, checkpoint_kind="latest_observation")
+        except Exception:
+            pass
+
+    def _sync_artifacts_after_tool_result(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        result: Any,
+    ) -> None:
+        if not bool(getattr(result, "ok", False)):
+            return
+        data = result.data if isinstance(result.data, dict) else {}
+        try:
+            if name in {"read_file", "file.read"} and not bool(data.get("truncated", False)):
+                path = str(
+                    data.get("resolved_filepath")
+                    or data.get("filepath")
+                    or arguments.get("filepath")
+                    or ""
+                )
+                content = data.get("content")
+                if path and isinstance(content, str):
+                    invalidate_artifacts_if_hash_mismatch(
+                        self.workspace_root,
+                        path,
+                        hash_source_text(content),
+                        source=name,
+                    )
+                return
+
+            changed = self._artifact_touched_paths(name=name, arguments=arguments, data=data)
+            if not changed:
+                return
+            mark_artifacts_stale_for_paths(
+                self.workspace_root,
+                changed,
+                reason=f"successful tool mutation: {name}",
+            )
+            refresh_artifacts_for_paths(self.workspace_root, changed)
+        except Exception:
+            self._emit_trace(
+                "artifacts.refresh_failed",
+                f"Could not refresh code artifacts after {name}.",
+                {"tool": name},
+            )
+
+    def _artifact_touched_paths(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        data: dict[str, Any],
+    ) -> list[str]:
+        mutating = name in _MUTATION_TOOL_NAMES or name in {"file.patch"}
+        command_mutation = name in {"run_command", "test.run"} and bool(data.get("touched_files"))
+        mcp_mutation = (
+            name.startswith("mcp__")
+            and not bool(data.get("read_only", False))
+            and bool(data.get("touched_files"))
+        )
+        if not (mutating or command_mutation or mcp_mutation):
+            return []
+        touched = [str(path) for path in data.get("touched_files", []) if str(path)]
+        path = str(data.get("resolved_filepath") or data.get("filepath") or arguments.get("filepath") or "")
+        if path:
+            touched.append(path)
+        deleted = {str(path) for path in data.get("deleted_files", [])}
+        return sorted(dict.fromkeys(path for path in touched if path and path not in deleted))
+
+    def _current_failure_step_id(self) -> str:
+        try:
+            active = self.runtime_state_store.current_active_step(self.runtime_task_id)
+        except Exception:
+            active = None
+        return active.step_id if active is not None else ""
+
+    def _start_step_controller(self, control: ControlledRun) -> StepExecutionController:
+        try:
+            active = self.runtime_state_store.current_active_step(self.runtime_task_id)
+        except Exception:
+            active = None
+        step_id = active.step_id if active is not None else "unplanned-step"
+        controller = StepExecutionController(
+            step_id=step_id,
+            limits=self.step_execution_limits,
+        )
+        control.record_event(
+            "step_execution_started",
+            step_id=step_id,
+            max_actions_per_step=controller.limits.max_actions_per_step,
+            max_repairs_per_step=controller.limits.max_repairs_per_step,
+            max_replans_per_task=controller.limits.max_replans_per_task,
+            max_consecutive_failures=controller.limits.max_consecutive_failures,
+        )
+        return controller
+
+    async def run_step(
+        self,
+        step: Any,
+        user_input: str,
+        control: ControlledRun,
+        limits: StepExecutionLimits | None = None,
+    ) -> AgentLoopResult:
+        previous_limits = self.step_execution_limits
+        if limits is not None:
+            self.step_execution_limits = limits
+        try:
+            control.record_event(
+                "run_step_entered",
+                step_id=str(getattr(step, "step_id", "") or "unplanned-step"),
+            )
+            return await self._run_inner(user_input, control)
+        finally:
+            self.step_execution_limits = previous_limits
+
+    def _step_blocked_result(
+        self,
+        outcome: StepExecutionOutcome,
+        control: ControlledRun,
+        round_index: int,
+        written_files: list[str],
+    ) -> AgentLoopResult:
+        self._mark_active_step_blocked(outcome.reason)
+        final = (
+            "I stopped this step because it hit the bounded step executor limit. "
+            f"Reason: {outcome.reason or 'no progress'}."
+        )
+        self.state.append_assistant(final)
+        control.record_event(
+            "step_execution_blocked",
+            round=round_index,
+            reason=outcome.reason,
+        )
+        self._record_failure(
+            FailureType.UNKNOWN_FAILURE,
+            action="step.execute",
+            evidence=[outcome.reason or "step execution blocked"],
+            detail={"round": round_index, "step_limit": True},
+        )
+        self._audit_final(final)
+        return AgentLoopResult(
+            final=final,
+            tool_rounds=round_index,
+            stopped=True,
+            changed_files=tuple(written_files),
+        )
+
+    def _mark_active_step_blocked(self, reason: str = "") -> None:
+        try:
+            active = self.runtime_state_store.current_active_step(self.runtime_task_id)
+            if active is None:
+                self._checkpoint_task_status(RunStatus.FAILED, "blocked", "step_blocked")
+                return
+            self.runtime_state_store.update_plan_step_status(
+                self.runtime_task_id,
+                active.step_id,
+                PlanStepStatus.BLOCKED,
+                checkpoint_kind="step_blocked",
+            )
+            self._checkpoint_task_status(RunStatus.RUNNING, "blocked", "step_blocked")
+            self._emit_trace(
+                "step.blocked",
+                f"Active step blocked: {reason}",
+                {"step_id": active.step_id, "reason": reason},
+            )
+        except Exception:
+            pass
+
+    def _apply_step_outcome(
+        self,
+        controller: StepExecutionController,
+        outcome: StepExecutionOutcome,
+        *,
+        round_index: int,
+        failure_policy: Any = None,
+    ) -> StepExecutionOutcome:
+        if outcome.decision == StepExecutionDecision.CONTINUE:
+            return outcome
+        if outcome.decision == StepExecutionDecision.VERIFY:
+            self._checkpoint_task_status(RunStatus.RUNNING, ExecutionPhase.VERIFY.value, "step_verify")
+            return outcome
+        if outcome.decision == StepExecutionDecision.REPAIR:
+            self._checkpoint_task_status(RunStatus.RUNNING, ExecutionPhase.REPAIR.value, "step_repair")
+            self.state.append_user(
+                "The last action failed but is repairable. Use the latest observation, "
+                "change only related files or arguments, and do not repeat the same action unchanged."
+            )
+            return outcome
+        if outcome.decision == StepExecutionDecision.REPLAN:
+            try:
+                state = self.runtime_state_store.require_task(self.runtime_task_id)
+                if state.replan_count >= controller.limits.max_replans_per_task:
+                    return StepExecutionOutcome(
+                        StepExecutionDecision.BLOCK,
+                        "replan budget exhausted",
+                    )
+                self.runtime_state_store.record_replan(self.runtime_task_id)
+            except Exception:
+                pass
+            self._checkpoint_task_status(RunStatus.RUNNING, ExecutionPhase.PLAN.value, "step_replan")
+            self.state.append_user(
+                "The current plan appears wrong. Stop authoring and produce a corrected "
+                "next-step plan using only the current task evidence."
+            )
+            return outcome
+        if failure_policy is not None:
+            self._emit_trace(
+                "step.failure_policy",
+                f"{outcome.decision.value}: {getattr(failure_policy.action, 'value', '')}",
+                {"round": round_index, "step_id": controller.step_id},
+                level="verbose",
+            )
+        return outcome
+
+    def _compress_observation(self, *, name: str, arguments: dict[str, Any], result: Any) -> dict[str, Any]:
+        data = result.data if isinstance(result.data, dict) else {}
+        compact_data = _compact_value(data, limit=2200)
+        return {
+            "tool": name,
+            "ok": bool(getattr(result, "ok", False)),
+            "message": str(getattr(result, "message", ""))[:1000],
+            "data": compact_data,
+            "arguments": _compact_value(arguments, limit=1200),
+        }
+
+    def _record_failure(
+        self,
+        failure_type: FailureType,
+        *,
+        action: str = "",
+        evidence: list[str] | None = None,
+        detail: Any = None,
+    ):
+        try:
+            failure, policy = self.failure_tracker.decision(
+                failure_type,
+                action=action,
+                evidence=evidence or [],
+                detail=detail,
+            )
+        except Exception:
+            return None, None
+        self._emit_trace(
+            "failure.recorded",
+            f"{failure.failure_type.value}: {policy.action.value}",
+            {
+                "failure_type": failure.failure_type.value,
+                "action": failure.action,
+                "retry_count": failure.retry_count,
+                "recovery_action": policy.action.value,
+            },
+            level="verbose",
+        )
+        return failure, policy
+
+    def _apply_active_step_phase(self) -> None:
+        try:
+            active = self.runtime_state_store.current_active_step(self.runtime_task_id)
+            if active is None:
+                return
+            risk = _enum_value(active.risk_level)
+            phase = phase_for_step(
+                allowed_tools=active.allowed_tools,
+                required_evidence=active.required_evidence,
+                approval_required=active.approval_required,
+                risk_level=risk,
+            )
+            self.tools.set_phase(phase, task_risk=risk)
+            self._checkpoint_task_status(RunStatus.RUNNING, phase.value, "active_step_selected")
+        except Exception:
+            pass
+
+    def _active_step_elapsed_seconds(self) -> float | None:
+        if self.timeout_config.step_timeout <= 0:
+            return None
+        try:
+            task = self.runtime_state_store.load_task(self.runtime_task_id)
+            if task is None or not task.current_step_id:
+                return None
+            step = self.runtime_state_store.load_step(task.task_id, task.current_step_id)
+            if step is None or not step.started_at:
+                return None
+            started = datetime.fromisoformat(step.started_at)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
+        except Exception:
+            return None
+
+    def _active_step_timed_out(self) -> bool:
+        elapsed = self._active_step_elapsed_seconds()
+        return elapsed is not None and elapsed >= self.timeout_config.step_timeout
+
+    def _mark_active_step_timed_out(self) -> None:
+        try:
+            task = self.runtime_state_store.require_task(self.runtime_task_id)
+            if not task.current_step_id:
+                return
+            try:
+                self.runtime_state_store.update_plan_step_status(
+                    task.task_id,
+                    task.current_step_id,
+                    PlanStepStatus.FAILED,
+                    checkpoint_kind="step_timeout",
+                )
+            except Exception:
+                pass
+            step = self.runtime_state_store.load_step(task.task_id, task.current_step_id)
+            if step is not None:
+                step.status = TaskStepStatus.FAILED
+                self.runtime_state_store.record_step(step)
+        except Exception:
+            pass
+
     async def run(self, user_input: str) -> AgentLoopResult:
+        return await RuntimeEngine(self).run(user_input)
+
+    def _make_terminal_result(
+        self,
+        final: str,
+        status: RunStatus,
+        *,
+        stopped: bool = True,
+    ) -> AgentLoopResult:
+        return AgentLoopResult(
+            final=final,
+            stopped=stopped,
+            run_id=self.run_id,
+            task_id=self.runtime_task_id,
+            status=status,
+        )
+
+    async def _run_inner(self, user_input: str, control: ControlledRun) -> AgentLoopResult:
         original_input = user_input
+        if control.cancel_event.is_set():
+            return self._cancelled_result(control, 0)
+        if timed_out(control):
+            return self._timeout_result(control, 0)
         if self.audit:
             self.audit.log_prompt(original_input)
         self._refresh_system_prompt()
@@ -1038,6 +1878,30 @@ class AgentChatLoop:
         self._pending_upfront_question: dict[str, Any] | None = None
         if self.use_planner and (self.long_running or _CHAT_PLANNER_ENABLED):
             user_input = await self._append_plan(user_input)
+            self.runtime_state_store.record_plan_created(self.runtime_task_id)
+            self._apply_active_step_phase()
+            if self._active_step_timed_out():
+                self._mark_active_step_timed_out()
+                return self._timeout_result(
+                    control,
+                    0,
+                    TIMEOUT_STEP,
+                    seconds=self.timeout_config.step_timeout,
+                )
+        else:
+            phase = (
+                ExecutionPhase.AUTHOR
+                if _request_requires_workspace_change(user_input)
+                else ExecutionPhase.EXPLORE
+            )
+            risk = "medium" if phase == ExecutionPhase.AUTHOR else "low"
+            self.tools.set_phase(phase, task_risk=risk)
+            self._checkpoint_task_status(RunStatus.RUNNING, phase.value, "phase_selected")
+        if control.cancel_event.is_set():
+            return self._cancelled_result(control, 0)
+        if timed_out(control):
+            return self._timeout_result(control, 0)
+        self._inject_feedback(control)
         self.state.append_user(user_input, persisted_content=original_input)
         # The planner judged this needs a decision only the user can make. Ask
         # BEFORE doing any work (J6): mid-loop, a model that can always do
@@ -1079,10 +1943,30 @@ class AgentChatLoop:
         # Raised sampling for the NEXT call once a byte-identical repeat is proven.
         escalation = _RetryEscalation()
         pending_options: dict[str, Any] | None = None
-        for round_index in range(self.max_tool_rounds):
+        step_controller = self._start_step_controller(control)
+        step_round_limit = min(self.max_tool_rounds, step_controller.limits.max_actions_per_step)
+        for round_index in range(step_round_limit):
+            control.iterations = round_index
+            await wait_if_paused(control)
+            decision = step_controller.before_model_decision()
+            if decision.should_stop:
+                return self._step_blocked_result(decision, control, round_index, written_files)
+            if control.cancel_event.is_set():
+                return self._cancelled_result(control, round_index)
+            if timed_out(control):
+                return self._timeout_result(control, round_index)
+            if self._active_step_timed_out():
+                self._mark_active_step_timed_out()
+                return self._timeout_result(
+                    control,
+                    round_index,
+                    TIMEOUT_STEP,
+                    seconds=self.timeout_config.step_timeout,
+                )
+            self._inject_feedback(control)
             num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
             self._refresh_system_prompt()
-            messages = await self._messages_within_budget(num_ctx, written_files)
+            messages = await self.context_compiler.compile(num_ctx, written_files)
             # Show context-window usage before each model call.
             if self.budget_manager:
                 _msg_text = "\n".join(str(m.get("content", "")) for m in messages)
@@ -1100,17 +1984,41 @@ class AgentChatLoop:
                 )
             try:
                 response = await self._chat_with_heartbeat(
-                    messages, num_ctx, round_index, options_override=pending_options
+                    messages,
+                    num_ctx,
+                    round_index,
+                    options_override=pending_options,
+                    control=control,
                 )
                 pending_options = None
-            except asyncio.TimeoutError:
-                category = self._timeout_category(round_index, ran_any_tool)
-                final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
+            except asyncio.CancelledError:
+                if control.cancel_event.is_set():
+                    return self._cancelled_result(control, round_index)
+                if self._inject_feedback(control):
+                    pending_options = None
+                    continue
+                raise
+            except ShamsuTimeoutError as exc:
+                category = exc.category.value
+                self._record_failure(
+                    failure_type_for_timeout(exc.category),
+                    action="model.chat",
+                    evidence=[category],
+                    detail=timeout_failure_detail(
+                        exc.category,
+                        seconds=exc.seconds,
+                        layer="model",
+                        round=round_index,
+                        produced_plan=self._produced_plan,
+                        ran_any_tool=ran_any_tool,
+                    ),
+                )
+                final = _timeout_message(category, int(exc.seconds or 0))
                 self.state.append_assistant(final)
                 self._emit_trace(
                     "llm.timeout",
                     f"Model call timed out (category: {category}).",
-                    {"category": category, "round": round_index, "seconds": _MODEL_CALL_TIMEOUT_SECONDS},
+                    {"category": category, "round": round_index, "seconds": exc.seconds},
                 )
                 if self.session_logger:
                     self.session_logger.log(
@@ -1121,6 +2029,16 @@ class AgentChatLoop:
                     )
                 if self.audit:
                     self.audit.log_error(category, final)
+                self._audit_final(final)
+                return AgentLoopResult(
+                    final=final, tool_rounds=round_index, stopped=True, timeout_category=category
+                )
+            except asyncio.TimeoutError:
+                if timed_out(control):
+                    return self._timeout_result(control, round_index)
+                category = self._timeout_category(round_index, ran_any_tool)
+                final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
+                self.state.append_assistant(final)
                 self._audit_final(final)
                 return AgentLoopResult(
                     final=final, tool_rounds=round_index, stopped=True, timeout_category=category
@@ -1188,6 +2106,22 @@ class AgentChatLoop:
                     f"Recovered {len(tool_calls)} tool call(s) from unstructured model output.",
                     {"round": round_index, "tools": [_tool_call_name(call) for call in tool_calls]},
                 )
+            if len(tool_calls) > 1:
+                tool_calls, single_action_outcome = step_controller.enforce_single_action(tool_calls)
+                self._record_failure(
+                    FailureType.WRONG_TOOL,
+                    action="model.multiple_actions",
+                    evidence=[single_action_outcome.reason],
+                    detail={
+                        "round": round_index,
+                        "accepted_tool": _tool_call_name(tool_calls[0]) if tool_calls else "",
+                    },
+                )
+                self._emit_trace(
+                    "step.action_limited",
+                    single_action_outcome.reason,
+                    {"round": round_index, "accepted": _tool_call_name(tool_calls[0]) if tool_calls else ""},
+                )
             self.state.append_assistant(content, tool_calls=tool_calls)
             repair_targets = self.tools.allowed_write_paths()
             should_handoff_to_strict_repair = (
@@ -1208,6 +2142,9 @@ class AgentChatLoop:
                 # An empty model reply (no content, no tool call) is the "No
                 # response returned" the user saw. Retry with a nudge rather than
                 # ending the turn on nothing.
+                empty_outcome = step_controller.note_no_progress("empty model response")
+                if empty_outcome.should_stop:
+                    return self._step_blocked_result(empty_outcome, control, round_index, written_files)
                 if empty_responses < _MAX_EMPTY_RESPONSES:
                     empty_responses += 1
                     self.state.append_user(_EMPTY_RESPONSE_CORRECTION)
@@ -1322,13 +2259,26 @@ class AgentChatLoop:
                     # next") but did not call a tool. Do not end the turn on an
                     # empty promise: demand a real tool call, an ask_user, or an
                     # explicit "I am blocked" and give it one more round.
+                    _failure, policy = self._record_failure(
+                        FailureType.TOOL_NOT_CALLED,
+                        action="assistant.prose",
+                        evidence=[content[:500]],
+                        detail={"round": round_index},
+                    )
                     if prose_corrections < _MAX_PROSE_CORRECTIONS:
                         prose_corrections += 1
                         self.state.append_user(_PROSE_ONLY_CORRECTION)
                         self._emit_trace(
                             "workflow.blocked",
                             "Assistant promised a tool action without calling one; asking it to act or ask.",
-                            {"attempt": prose_corrections, "category": "tool_call_missing_after_promise"},
+                            {
+                                "attempt": prose_corrections,
+                                "category": "tool_call_missing_after_promise",
+                                "failure_type": FailureType.TOOL_NOT_CALLED.value,
+                                "recovery_action": (
+                                    policy.action.value if policy is not None else ""
+                                ),
+                            },
                         )
                         continue
                     # Corrections exhausted: the model kept promising a tool
@@ -1489,12 +2439,17 @@ class AgentChatLoop:
                     final=final, tool_rounds=round_index, changed_files=tuple(written_files)
                 )
             for call in tool_calls:
+                if control.cancel_event.is_set():
+                    return self._cancelled_result(control, round_index)
+                if timed_out(control):
+                    return self._timeout_result(control, round_index)
+                self._inject_feedback(control)
                 name = _tool_call_name(call)
                 arguments = _tool_call_arguments(call)
                 signature = (name, json.dumps(arguments, sort_keys=True, default=str))
                 requested_read = str(arguments.get("filepath") or "").replace("\\", "/").lower()
                 if (
-                    name == "read_file"
+                    name in {"read_file", "file.read"}
                     and requested_read in successful_read_paths
                     and (
                         len(successful_read_paths) >= 2
@@ -1509,7 +2464,7 @@ class AgentChatLoop:
                     self.state.append_user(
                         "The relevant files have already been read successfully, including "
                         f"{requested_read}. Do not read them again. Your NEXT response must call "
-                        "edit_file, append_file, or write_file on the allowed mutation target using "
+                        "file.patch on the allowed mutation target using "
                         "the source evidence already in context."
                     )
                     self._emit_trace(
@@ -1527,6 +2482,12 @@ class AgentChatLoop:
                     continue
                 repeated_calls[signature] += 1
                 if repeated_calls[signature] >= _MAX_REPEATED_CALLS:
+                    failure, policy = self._record_failure(
+                        FailureType.REPEATED_ACTION,
+                        action=name,
+                        evidence=[json.dumps(arguments, sort_keys=True, default=str)],
+                        detail={"round": round_index, "successful_before": signature in successful_call_signatures},
+                    )
                     if signature in successful_call_signatures:
                         failed_targets = sorted(unconfirmed_failed_writes)
                         target_hint = (
@@ -1534,16 +2495,19 @@ class AgentChatLoop:
                             if failed_targets
                             else ""
                         )
-                        self.state.append_user(
-                            _repetition_correction(name) + target_hint
-                        )
+                        if policy is None or policy.action == RecoveryAction.BLOCK_IDENTICAL_CALL:
+                            self.state.append_user(
+                                _repetition_correction(name) + target_hint
+                            )
                         self._emit_trace(
                             "workflow.recovering",
                             f"Skipped a repeated successful {name} call and required a different action.",
                             {
                                 "category": "successful_tool_repetition",
+                                "failure_type": FailureType.REPEATED_ACTION.value,
                                 "tool": name,
                                 "target": failed_targets[-1] if failed_targets else "",
+                                "retry_count": failure.retry_count if failure is not None else 0,
                             },
                         )
                         break
@@ -1566,10 +2530,12 @@ class AgentChatLoop:
                 if self.audit:
                     self.audit.log_tool_call(name, arguments)
                 ledger_call_id = self.action_ledger.log_tool_call(name, arguments) if self.action_ledger else ""
-                result = self.tools.execute(name, arguments)
+                result = self.tool_dispatcher.dispatch(name, arguments)
+                self._checkpoint_latest_observation(name=name, arguments=arguments, result=result)
+                self._sync_artifacts_after_tool_result(name=name, arguments=arguments, result=result)
                 if result.ok:
                     successful_call_signatures.add(signature)
-                    if name == "read_file":
+                    if name in {"read_file", "file.read"}:
                         result_data = result.data if isinstance(result.data, dict) else {}
                         read_path = str(
                             result_data.get("resolved_filepath")
@@ -1593,7 +2559,7 @@ class AgentChatLoop:
                     and bool(result_data.get("touched_files"))
                 )
                 command_mutation = (
-                    name == "run_command"
+                    name in {"run_command", "test.run"}
                     and result.ok
                     and bool(result_data.get("touched_files"))
                 )
@@ -1607,7 +2573,7 @@ class AgentChatLoop:
                         name, bool(result.ok), result.message, _compact_value(result.data, limit=4000)
                     )
                     self._audit_file_change(name, arguments, result)
-                    if name == "run_command":
+                    if name in {"run_command", "test.run"}:
                         _data = result.data if isinstance(result.data, dict) else {}
                         self.audit.log_command(
                             str(arguments.get("command", "")),
@@ -1639,6 +2605,64 @@ class AgentChatLoop:
                     name,
                     budgeted_tool_json,
                 )
+                tool_failure = None
+                tool_failure_policy = None
+                if not result.ok:
+                    try:
+                        tool_failure = self.failure_tracker.record_tool_result(name, arguments, result)
+                        tool_failure_policy = self.failure_tracker.policy_for(tool_failure)
+                    except Exception:
+                        tool_failure = None
+                        tool_failure_policy = None
+                    if tool_failure is not None and tool_failure_policy is not None:
+                        self._emit_trace(
+                            "failure.recorded",
+                            f"{tool_failure.failure_type.value}: {tool_failure_policy.action.value}",
+                            {
+                                "failure_type": tool_failure.failure_type.value,
+                                "tool": name,
+                                "retry_count": tool_failure.retry_count,
+                                "recovery_action": tool_failure_policy.action.value,
+                            },
+                            level="verbose",
+                        )
+                if not result.ok:
+                    repairable = bool(
+                        tool_failure_policy is not None
+                        and tool_failure_policy.action
+                        in {
+                            RecoveryAction.ENTER_REPAIR,
+                            RecoveryAction.SAFE_ARGUMENT_REPAIR,
+                            RecoveryAction.RETRY_WITH_TOOL_CONTRACT,
+                        }
+                    )
+                    replan_needed = bool(
+                        tool_failure_policy is not None
+                        and tool_failure_policy.action == RecoveryAction.REPLAN
+                    )
+                    step_outcome = self._apply_step_outcome(
+                        step_controller,
+                        step_controller.note_failure(
+                            repairable=repairable,
+                            replan_needed=replan_needed,
+                        ),
+                        round_index=round_index,
+                        failure_policy=tool_failure_policy,
+                    )
+                    control.record_event(
+                        "step_action_failed",
+                        round=round_index,
+                        step_id=step_controller.step_id,
+                        tool=name,
+                        decision=step_outcome.decision.value,
+                    )
+                    if step_outcome.decision == StepExecutionDecision.BLOCK:
+                        return self._step_blocked_result(
+                            step_outcome,
+                            control,
+                            round_index,
+                            written_files,
+                        )
                 if name.startswith("mcp__") and not result.ok:
                     self.state.append_user(
                         f"The MCP call {name} failed: {result.message} "
@@ -1647,6 +2671,12 @@ class AgentChatLoop:
                         "it with a shell command or ask for confirmation that was already given."
                     )
                 if not result.ok and "denied by user" in result.message.lower():
+                    self._record_failure(
+                        FailureType.PERMISSION_DENIED,
+                        action=name,
+                        evidence=[result.message],
+                        detail={"arguments": arguments},
+                    )
                     final = (
                         f"{name} was not run because approval was denied. "
                         "No action was taken."
@@ -1664,7 +2694,7 @@ class AgentChatLoop:
                         stopped=True,
                         changed_files=tuple(written_files),
                     )
-                if name in {"write_file", "edit_file", "append_file"} and result.ok:
+                if name in {"write_file", "edit_file", "append_file", "file.patch"} and result.ok:
                     _data = result.data if isinstance(result.data, dict) else {}
                     written = str(
                         _data.get("resolved_filepath")
@@ -1702,6 +2732,26 @@ class AgentChatLoop:
                         written = str(written)
                         if written and written not in deleted and written not in written_files:
                             written_files.append(written)
+                if result.ok:
+                    self._checkpoint_successful_tool(
+                        round_index=round_index,
+                        name=name,
+                        arguments=arguments,
+                        result=result,
+                        changed_files=list(written_files),
+                    )
+                    step_outcome = self._apply_step_outcome(
+                        step_controller,
+                        step_controller.note_success(),
+                        round_index=round_index,
+                    )
+                    control.record_event(
+                        "step_action_succeeded",
+                        round=round_index,
+                        step_id=step_controller.step_id,
+                        tool=name,
+                        decision=step_outcome.decision.value,
+                    )
                 if name == "search_index" and result.ok and isinstance(result.data, dict):
                     # Make the context feed visible (G9): the query + top hits with
                     # scores, at normal verbosity instead of behind a debug flag.
@@ -1901,11 +2951,14 @@ class AgentChatLoop:
                         final = correction
                         self.state.append_assistant(final)
                         return AgentLoopResult(final=final, tool_rounds=round_index, stopped=True)
-        final = f"I stopped after {self.max_tool_rounds} tool rounds to avoid looping."
+        final = (
+            f"I stopped after {step_round_limit} bounded step action(s) to avoid looping."
+        )
         self.state.append_assistant(final)
+        self._mark_active_step_blocked("step action budget exhausted")
         self._audit_final(final)
         return AgentLoopResult(
-            final=final, tool_rounds=self.max_tool_rounds, stopped=True,
+            final=final, tool_rounds=step_round_limit, stopped=True,
             changed_files=tuple(written_files),
         )
 
@@ -1966,7 +3019,7 @@ class AgentChatLoop:
             self.session_logger.log(
                 "memory.retrieved",
                 {"specialist": "agent-chat", "has_memory": True},
-                "Retrieved relevant Graphiti memories",
+                "Retrieved relevant local project memories",
                 workflow_id="agent-chat",
             )
         if self.action_ledger:
@@ -2030,7 +3083,18 @@ class AgentChatLoop:
         # Surface the plan as a visible trace event (never the hidden reasoning
         # behind it - just the short, action-focused plan text).
         self._emit_trace("plan.created", plan.text)
-        return f"{user_input}\n\nPlan from planner model:\n{plan.text}"
+        try:
+            contract = self.agent_planner.persist_contract(user_input, plan.text)
+            if contract.phase is not None:
+                self._checkpoint_task_status(
+                    RunStatus.RUNNING,
+                    contract.phase.value,
+                    "active_step_selected",
+                )
+            contract_text = contract.text
+        except Exception:
+            contract_text = f"Plan from planner model:\n{plan.text}"
+        return f"{user_input}\n\n{contract_text}"
 
     async def _maybe_verify(self, content: str, written_files: list[str]) -> str:
         """After writes, run a deterministic lightweight verifier once.
@@ -2043,16 +3107,7 @@ class AgentChatLoop:
         if not self.verify_changes or not _VERIFY_GATE_ENABLED or not written_files:
             return content
         try:
-            outcome = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: verify_only(
-                    self.workspace_root,
-                    list(written_files),
-                    command_runner=self.tools.command_runner,
-                    lightweight=True,
-                    session_logger=self.session_logger,
-                ),
-            )
+            outcome = await self.change_verifier.verify(list(written_files))
         except Exception:
             return content
         self._emit_trace(
@@ -2100,6 +3155,12 @@ class AgentChatLoop:
         if outcome.unverifiable:
             return content
         if outcome.failed:
+            _failure, policy = self._record_failure(
+                FailureType.VERIFICATION_FAILURE,
+                action=outcome.command or "verify",
+                evidence=[outcome.summary],
+                detail={"files": list(written_files), "exit_code": outcome.exit_code},
+            )
             # One bounded repair pass before giving up (gap E1), itself capped
             # at _AUTO_REPAIR_MAX_ATTEMPTS iterations. The machinery to fix
             # a one-line syntax error after a 30-minute run existed all along
@@ -2107,7 +3168,12 @@ class AgentChatLoop:
             # invited here - the loop verified, reported failure, and left the
             # user to start over. Best-effort and capped: a repair error or a
             # still-failing repair falls through to the honest UNCONFIRMED note.
-            repaired = await self._attempt_repair(written_files) if self.long_running else None
+            repaired = (
+                await self._attempt_repair(written_files)
+                if self.long_running
+                and (policy is None or policy.action == RecoveryAction.ENTER_REPAIR)
+                else None
+            )
             if repaired is not None and repaired.verified:
                 self._emit_trace(
                     "verify.result",
@@ -2139,6 +3205,10 @@ class AgentChatLoop:
         mid-chat repair can never be the thing that runs pip/npm installs."""
         if not _AUTO_REPAIR_ENABLED:
             return None
+        try:
+            self.repair_recorder.record_attempt(list(written_files))
+        except Exception:
+            pass
         generate_async = getattr(self.llm, "generate_structured", None)
         if not callable(generate_async):
             return None
@@ -2501,6 +3571,32 @@ def _timeout_message(category: str, seconds: int) -> str:
     """Human-facing timeout message that names the real category instead of
     always attributing the stall to a saturated GPU."""
     base = f"The model call timed out after {seconds}s (category: {category})."
+    if category == TIMEOUT_CONNECT:
+        return (
+            f"{base} SHAMSU could not connect to the local model transport. "
+            "Start or repair Ollama, then try again."
+        )
+    if category == TIMEOUT_FIRST_TOKEN:
+        return (
+            f"{base} The model connection succeeded, but generation did not start. "
+            "This usually means model load or prompt prefill is too slow for the current settings."
+        )
+    if category == TIMEOUT_TOKEN_IDLE:
+        return (
+            f"{base} Generation started, then no token arrived before the idle deadline. "
+            "This is a token-idle stall, not healthy slow generation."
+        )
+    if category == TIMEOUT_TOTAL_GENERATION:
+        return (
+            f"{base} The optional total generation cap fired. "
+            "Increase SHAMSU_TOTAL_GENERATION_TIMEOUT_SECONDS or leave it unset for slow-but-active generation."
+        )
+    if category == TIMEOUT_TASK:
+        return "The task-level timeout expired before the run finished."
+    if category == TIMEOUT_STEP:
+        return "The step-level timeout expired before the active plan step finished."
+    if category == TIMEOUT_TOOL:
+        return f"A tool timed out after {seconds}s."
     if category == TIMEOUT_PLANNER_STALL:
         return (
             f"{base} The planner already returned a plan, so this is an agent-loop / executor "
@@ -2518,6 +3614,17 @@ def _timeout_message(category: str, seconds: int) -> str:
         "(GPU saturated, model swapping, or the context is too large). "
         "Try `/models tier light`, reduce context, or restart Ollama."
     )
+
+
+def _default_ollama_client(base_url: str, timeout_config: TimeoutConfig) -> ollama.AsyncClient:
+    timeout = httpx.Timeout(
+        timeout=None,
+        connect=timeout_config.connect_timeout,
+        read=None,
+        write=None,
+        pool=None,
+    )
+    return ollama.AsyncClient(host=base_url, timeout=timeout)
 
 
 def _empty_response_final() -> str:
@@ -3139,6 +4246,10 @@ def _basename(filepath: str) -> str:
     return filepath.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or filepath
 
 
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
+
+
 def _read_failure_correction(
     filepath: str,
     message: str,
@@ -3409,13 +4520,20 @@ def _system_prompt(
     workspace: Path,
     include_tool_protocol: bool = False,
     include_raw_write_protocol: bool = True,
+    profile: PromptProfile | str = PromptProfile.SMALL,
+    phase: ExecutionPhase | str | None = ExecutionPhase.EXPLORE,
+    current_step: Any = None,
+    available_tools: Iterable[str] = (),
 ) -> str:
-    prompt = f"{AGENT_SYSTEM_PROMPT}\nWorkspace: {workspace}\n"
-    if include_tool_protocol:
-        prompt += _TOOL_PROTOCOL_PROMPT
-    if include_raw_write_protocol:
-        prompt += _RAW_WRITE_PROTOCOL_PROMPT
-    return prompt
+    return compose_agent_prompt(
+        workspace,
+        profile=profile,
+        phase=phase,
+        current_step=current_step,
+        available_tools=available_tools,
+        include_tool_protocol=include_tool_protocol,
+        include_raw_write_protocol=include_raw_write_protocol,
+    )
 
 
 

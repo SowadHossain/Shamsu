@@ -11,6 +11,8 @@ from shamsu.safety.commands import is_auto_approvable_action
 from shamsu.safety.permission_store import PermissionMemory
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
+from shamsu.runtime.run_control import mark_waiting_for_approval, restore_after_approval
+from shamsu.runtime.task_state import current_task_context
 
 
 class ApprovalManager:
@@ -60,41 +62,50 @@ class ApprovalManager:
             f"Approval requested: {request.action_type}",
         )
 
-        if self.menu_prompt is not None:
-            offer_remember = bool(auto_approvable and self.memory)
-            approved, scope = self.menu_prompt(request, offer_remember)
+        previous_status = mark_waiting_for_approval(f"Waiting for approval: {request.action_type}")
+        task_context = current_task_context()
+        if task_context is not None:
+            task_context.store.record_approval_requested(task_context.task_id, asdict(request))
+        try:
+            if self.menu_prompt is not None:
+                offer_remember = bool(auto_approvable and self.memory)
+                approved, scope = self.menu_prompt(request, offer_remember)
+                self._log(
+                    "approval.result",
+                    {
+                        "request": asdict(request),
+                        "action_type": request.action_type,
+                        "approved": approved,
+                        "decision_scope": scope if approved else "none",
+                        "decision_source": "interactive_menu",
+                    },
+                    f"Approval {'granted' if approved else 'denied'}: {request.action_type}",
+                )
+                if approved and offer_remember and scope in {"session", "workspace"}:
+                    self.memory.remember(request.action_type, scope)
+                    self._log(
+                        "approval.remembered",
+                        {"action_type": request.action_type, "scope": scope},
+                        f"Will auto-approve future '{request.action_type}' actions ({scope})",
+                    )
+                return approved
+
+            approved = self.approval_func(request)
             self._log(
                 "approval.result",
                 {
                     "request": asdict(request),
                     "action_type": request.action_type,
                     "approved": approved,
-                    "decision_scope": scope if approved else "none",
-                    "decision_source": "interactive_menu",
+                    "decision_scope": "once" if approved else "none",
+                    "decision_source": "approval_callback",
                 },
                 f"Approval {'granted' if approved else 'denied'}: {request.action_type}",
             )
-            if approved and offer_remember and scope in {"session", "workspace"}:
-                self.memory.remember(request.action_type, scope)
-                self._log(
-                    "approval.remembered",
-                    {"action_type": request.action_type, "scope": scope},
-                    f"Will auto-approve future '{request.action_type}' actions ({scope})",
-                )
-            return approved
-
-        approved = self.approval_func(request)
-        self._log(
-            "approval.result",
-            {
-                "request": asdict(request),
-                "action_type": request.action_type,
-                "approved": approved,
-                "decision_scope": "once" if approved else "none",
-                "decision_source": "approval_callback",
-            },
-            f"Approval {'granted' if approved else 'denied'}: {request.action_type}",
-        )
+        finally:
+            restore_after_approval(previous_status)
+            if task_context is not None and "approved" in locals():
+                task_context.store.record_approval_resolved(task_context.task_id, bool(approved))
 
         if approved and auto_approvable and self.memory and self.remember_prompt:
             scope = self.remember_prompt(request.action_type)

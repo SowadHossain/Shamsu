@@ -120,6 +120,6 @@ def test_the_run_loop_wires_it_in(tmp_path: Path):
     of the bug this fixes."""
     import inspect
 
-    source = inspect.getsource(chat_loop_module.AgentChatLoop.run)
+    source = inspect.getsource(chat_loop_module.AgentChatLoop._run_inner)
 
     assert "_append_codebase_memory" in source

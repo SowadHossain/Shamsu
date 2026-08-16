@@ -274,12 +274,12 @@ def test_save_long_term_memory_survives_backend_failure(tmp_path: Path, monkeypa
     monkeypatch.setattr(memory_service.MemoryService, "mirror_to_graphiti", boom)
 
     result = logger.save_long_term_memory("session_summary", "A durable, meaningful task summary")
-    # Local memory is immediate; the queued mirror failure is only telemetry.
+    # Local memory is immediate and authoritative; Graphiti is disabled unless explicitly enabled.
     assert result["local"] is True
-    assert result["long_term"]["queued"] is True
+    assert result["long_term"]["queued"] is False
     assert get_memory_queue(tmp_path).flush(1.0) is True
     assert logger.read_local_memory()[0]["kind"] == "session_summary"
-    assert "memory.long_term.failed" in [event["event_type"] for event in logger.tail(20)]
+    assert "memory.long_term.local_only" in [event["event_type"] for event in logger.tail(20)]
 
 
 def test_save_long_term_memory_records_metadata(tmp_path: Path, monkeypatch):

@@ -32,12 +32,15 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from json_repair import repair_json
 
 from shamsu.agents.plan_mode import workspace_source_files
 from shamsu.interfaces import IContextBuilder, ILLMManager
+from shamsu.runtime.phase_contracts import ExecutionPhase, phase_for_step
+from shamsu.runtime.task_state import EvidenceType, ExecutionPlan, PlanStep, RuntimeStateStore
+from shamsu.safety import read_only
 from shamsu.types import ContextPack, SearchResult
 
 PLANNER_INSTRUCTIONS = """You are SHAMSU's planner.
@@ -83,6 +86,16 @@ DECISION_SCHEMA: dict = {
     "required": ["needs_input"],
 }
 
+_WORKSPACE_CHANGE_RE = re.compile(
+    r"\b(create|write|build|implement|fix|edit|update|modify|change|add|remove|delete|rename|move|make)\b",
+    re.IGNORECASE,
+)
+_INFORMATION_REQUEST_RE = re.compile(
+    r"^\s*(how|what|why|where|when|who|which|can you explain|could you explain|"
+    r"would you explain|tell me|show me)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class PlanResult:
@@ -94,6 +107,94 @@ class PlanResult:
     needs_input: bool = False
     question: str = ""
     options: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PlannerContractResult:
+    text: str
+    phase: ExecutionPhase | None = None
+    active_step_id: str = ""
+
+
+class PlannerToolPolicy(Protocol):
+    def set_allowed_tools(self, names: list[str]) -> None:
+        ...
+
+    def set_phase(self, phase: str | ExecutionPhase | None, *, task_risk: str | None = None) -> None:
+        ...
+
+
+class AgentPlanner:
+    """Persist planner output as an executable runtime contract."""
+
+    def __init__(
+        self,
+        *,
+        store: RuntimeStateStore,
+        tool_policy: PlannerToolPolicy,
+        registered_tool_names: set[str],
+        run_id: str,
+        task_id: str,
+    ) -> None:
+        self.store = store
+        self.tool_policy = tool_policy
+        self.registered_tool_names = set(registered_tool_names)
+        self.run_id = run_id
+        self.task_id = task_id
+
+    def persist_contract(self, user_input: str, plan_text: str) -> PlannerContractResult:
+        plan_id = f"plan-{self.run_id}"
+        tools = sorted(self.registered_tool_names)
+        mutating = _request_requires_workspace_change(user_input)
+        allowed_tools = default_plan_tools(mutating, tools)
+        required_evidence = [EvidenceType.FILE_CHANGED.value] if mutating else []
+        step = PlanStep(
+            step_id="step-1",
+            title=compact_plan_title(user_input),
+            goal=plan_text.strip() or user_input.strip(),
+            inputs=[user_input.strip()],
+            expected_outputs=[plan_text.strip() or "Complete the requested task."],
+            constraints=[
+                "Do not skip this active step.",
+                "Use only the tools allowed for this step.",
+                "Do not declare completion until runtime evidence gates pass.",
+            ],
+            allowed_tools=allowed_tools,
+            acceptance_criteria=[plan_text.strip() or "The requested task is completed."],
+            required_evidence=required_evidence,
+            risk_level="medium" if mutating else "low",
+            approval_required=mutating,
+        )
+        execution_plan = ExecutionPlan(
+            plan_id=plan_id,
+            task_id=self.task_id,
+            run_id=self.run_id,
+            title=step.title,
+            summary=plan_text.strip(),
+            steps=[step],
+        )
+        self.store.save_execution_plan(
+            execution_plan,
+            valid_tool_names=self.registered_tool_names,
+        )
+        active = self.store.current_active_step(self.task_id)
+        reloaded = self.store.load_execution_plan(plan_id) or execution_plan
+        phase = None
+        if active is not None:
+            self.tool_policy.set_allowed_tools(active.allowed_tools)
+            risk = _enum_value(active.risk_level)
+            phase = phase_for_step(
+                allowed_tools=active.allowed_tools,
+                required_evidence=active.required_evidence,
+                approval_required=active.approval_required,
+                risk_level=risk,
+            )
+            self.tool_policy.set_phase(phase, task_risk=risk)
+        return PlannerContractResult(
+            text=render_plan_contract_for_model(reloaded, active),
+            phase=phase,
+            active_step_id=active.step_id if active is not None else "",
+        )
 
 
 async def create_plan(
@@ -146,6 +247,74 @@ async def create_plan(
         question=decision[1],
         options=decision[2],
     )
+
+
+def compact_plan_title(user_input: str) -> str:
+    title = " ".join((user_input or "").strip().split())
+    if not title:
+        return "Agent task"
+    return title[:80]
+
+
+def default_plan_tools(mutating: bool, tools: list[str]) -> list[str]:
+    preferred = [
+        "project.inspect",
+        "code.search",
+        "file.read",
+        "git.inspect",
+        "test.run",
+        "search_index",
+        "find_file",
+        "grep_files",
+        "read_file",
+        "file_info",
+        "run_command",
+    ]
+    if mutating:
+        preferred.extend(["file.patch", "write_file", "edit_file", "append_file"])
+    selected = [name for name in preferred if name in tools]
+    return selected or tools
+
+
+def render_plan_contract_for_model(plan: ExecutionPlan, active: PlanStep | None) -> str:
+    lines = [
+        "Plan from planner model:",
+        plan.summary.strip() or plan.title,
+        "",
+        "Runtime execution contract:",
+        f"- overall: {plan.compact_summary()}",
+        f"- completed: {plan.completed_summary()}",
+    ]
+    if active is None:
+        lines.append("- current step: none available")
+        return "\n".join(lines)
+    lines.extend(
+        [
+            "- current step:",
+            f"  id: {active.step_id}",
+            f"  title: {active.title}",
+            f"  goal: {active.goal}",
+            "  allowed_tools: " + ", ".join(active.allowed_tools),
+            "  acceptance_criteria: " + "; ".join(active.acceptance_criteria),
+            "  required_evidence: " + (", ".join(active.required_evidence) or "none"),
+        ]
+    )
+    if active.constraints:
+        lines.append("  constraints: " + "; ".join(active.constraints))
+    return "\n".join(lines)
+
+
+def _request_requires_workspace_change(prompt: str) -> bool:
+    if read_only.applies(prompt):
+        return False
+    text = " ".join(read_only.strip(prompt or "").strip().split())
+    if not text or _INFORMATION_REQUEST_RE.search(text):
+        return False
+    return bool(_WORKSPACE_CHANGE_RE.search(text))
+
+
+def _enum_value(value: Any) -> str:
+    return str(getattr(value, "value", value) or "")
 
 
 async def _decide_needs_input(
