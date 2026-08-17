@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from shamsu.llm.manager import OLLAMA_BASE_URL
@@ -144,6 +145,44 @@ def list_loaded_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
         if name:
             names.append(name)
     return names
+
+
+@lru_cache(maxsize=32)
+def declared_context_length(model: str, base_url: str = OLLAMA_BASE_URL) -> int:
+    """The context window *model* actually declares, or 0 if it cannot be read.
+
+    Ground truth beats a hardcoded table. SHAMSU kept a cookbook of context
+    windows keyed by exact model name, so pulling anything newer than the
+    cookbook silently cost three quarters of the window (live 2026-08-17:
+    `qwen3.5:9b` fell to the 8192 unknown-model default and the agent ran at
+    "ctx 3.8k/8.2k 100%"). Guessing HIGH is no better - a num_ctx above what the
+    model was trained for degrades quality without erroring, which is the same
+    silent failure in the other direction.
+
+    Cached per process: one HTTP call per model, on a short timeout, and any
+    failure returns 0 so the caller falls back to the static table.
+    """
+    if os.environ.get("SHAMSU_DISABLE_CTX_PROBE", "").strip():
+        return 0
+    data = json.dumps({"model": model}).encode("utf-8")
+    request = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/show",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=HEALTH_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return 0
+    info = payload.get("model_info")
+    if not isinstance(info, dict):
+        return 0
+    # The key is architecture-scoped: "qwen3.context_length", "llama.context_length".
+    for key, value in info.items():
+        if key.endswith(".context_length") and isinstance(value, int) and value > 0:
+            return value
+    return 0
 
 
 def unload_model(model: str, base_url: str = OLLAMA_BASE_URL) -> bool:

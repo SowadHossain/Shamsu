@@ -14,6 +14,22 @@ def _memory_queue_cleanup():
     reset_memory_queues(timeout=0.2)
 
 
+@pytest.fixture(autouse=True)
+def _no_live_context_probe(monkeypatch):
+    """Keep context-window sizing deterministic.
+
+    `ctx_window_for_model` asks the local Ollama what a model's real window is,
+    which is right in production and poison in a test suite: results would
+    depend on which models happen to be installed on the machine running it.
+    """
+    from shamsu.runtime.ollama import declared_context_length
+
+    monkeypatch.setenv("SHAMSU_DISABLE_CTX_PROBE", "1")
+    declared_context_length.cache_clear()
+    yield
+    declared_context_length.cache_clear()
+
+
 class _AlwaysOpenAbstractService:
     """Stand-in used only for AgentOrchestrator's default (no explicit
     abstract_service passed). Tests that construct their own AbstractService

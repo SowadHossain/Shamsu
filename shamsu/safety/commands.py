@@ -99,12 +99,68 @@ def command_may_write_workspace(command: str) -> bool:
     return bool(_SHELL_WRITE_RE.search(command or ""))
 
 
+# Git subcommands that cannot change anything, whatever flags follow.
+_READ_ONLY_GIT_SUBCOMMANDS = frozenset(
+    {"status", "diff", "log", "show", "rev-parse", "ls-files", "describe",
+     "shortlog", "blame", "cat-file", "symbolic-ref"}
+)
+# Subcommands that read in one form and MUTATE in another. Each maps to the
+# flag set that keeps it read-only; a bare invocation (no arguments) also reads.
+# `git branch --show-current` reads; `git branch -D old` deletes a branch.
+_CONDITIONAL_GIT_READS: dict[str, frozenset[str]] = {
+    "branch": frozenset({"--show-current", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose"}),
+    "remote": frozenset({"-v", "--verbose", "show"}),
+    "config": frozenset({"--get", "--get-all", "--list", "-l"}),
+    "stash": frozenset({"list", "show"}),
+    "tag": frozenset({"-l", "--list"}),
+}
+
+
+def is_read_only_git(cmd: str) -> bool:
+    """Whether *cmd* is a git query that cannot modify the repository.
+
+    `project.inspect` runs `git branch --show-current` and
+    `git rev-parse --is-inside-work-tree` to describe a workspace. Neither was
+    in SAFE_COMMANDS, so both fell through to "unknown -> MEDIUM" and stopped
+    the agent for manual approval: live 2026-08-17, a single "create the base
+    files" turn raised two approval prompts to ask git which branch it was on,
+    and both were spent before any file was written. A read that needs
+    permission is a read the agent learns not to do.
+    """
+    parts = (cmd or "").strip().split()
+    if len(parts) < 2 or parts[0].lower() != "git":
+        return False
+    index = 1
+    while index + 1 < len(parts) and parts[index] in {"-C", "-c", "--git-dir", "--work-tree"}:
+        index += 2  # skip `git -C <path> ...` style global options
+    if index >= len(parts):
+        return False
+    subcommand = parts[index].lower()
+    rest = [part for part in parts[index + 1:] if part != "--"]
+    if subcommand in _READ_ONLY_GIT_SUBCOMMANDS:
+        return True
+    allowed = _CONDITIONAL_GIT_READS.get(subcommand)
+    if allowed is None:
+        return False
+    if not rest:
+        return True  # bare `git branch` / `git remote` lists, it does not write
+    if subcommand in {"branch", "tag"}:
+        # EVERY argument must be a listing flag: a bare name creates
+        # (`git branch feature`) or deletes (`git branch -D feature`).
+        return all(part in allowed for part in rest)
+    # `remote`/`config`/`stash` take a read verb first, then its operands:
+    # `git config --get user.name` reads, `git config user.name value` writes.
+    return rest[0] in allowed
+
+
 def classify_command(cmd: str) -> CommandRisk:
     for pattern in BLOCKED_PATTERNS:
         if re.search(pattern, cmd, re.IGNORECASE):
             return CommandRisk.BLOCKED
     normalized = _classification_view(cmd)
     if any(normalized.startswith(safe) for safe in SAFE_COMMANDS):
+        return CommandRisk.SAFE
+    if is_read_only_git(normalized):
         return CommandRisk.SAFE
     if any(normalized.startswith(medium) for medium in MEDIUM_COMMANDS):
         return CommandRisk.MEDIUM

@@ -195,6 +195,21 @@ def _prompt_toolkit_answer() -> str | None:
     is unavailable or the read was interrupted/closed.
     """
     try:
+        import asyncio
+
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass  # no loop running - the synchronous prompt below is safe
+    else:
+        # prompt_toolkit's sync `prompt()` builds an Application and runs it with
+        # its own event loop, which cannot start inside one that is already
+        # running. It raised, the bare `except Exception` swallowed it, and the
+        # orphaned coroutine surfaced as
+        # "RuntimeWarning: coroutine 'Application.run_async' was never awaited"
+        # in the middle of an approval prompt. Every approval raised inside the
+        # agent loop hit this. Don't create the coroutine at all.
+        return None
+    try:
         from prompt_toolkit import prompt as ptk_prompt
     except Exception:
         return None

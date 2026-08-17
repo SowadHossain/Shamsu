@@ -3665,11 +3665,13 @@ def _handle_context(
             )
     elif sub == "show":
         from shamsu.agents.chat_loop import _CHAT_MAX_CTX, _TOOL_RESULT_MAX_TOKENS
+        from shamsu.context.budget import RESERVE_OUTPUT_TOKENS
         from shamsu.ui.trace import read_trace_mode
 
         lines = [
             f"Trace mode         : {read_trace_mode(workspace)}",
             f"Chat context window: {_CHAT_MAX_CTX // 1024}k tokens (SHAMSU_CHAT_MAX_CTX)",
+            f"Response reserve   : {RESERVE_OUTPUT_TOKENS:,} tokens (SHAMSU_RESERVE_OUTPUT_TOKENS)",
             f"Per-tool-result cap: {_TOOL_RESULT_MAX_TOKENS:,} tokens (SHAMSU_TOOL_RESULT_MAX_TOKENS)",
             "",
             "The working trace now surfaces (at 'normal' verbosity):",
@@ -8180,7 +8182,7 @@ def _prd_plan_num_predict(planner_thinks: bool) -> int:
     on the chain of thought first, so a cap sized for the JSON alone leaves
     nothing to emit the JSON with.
     """
-    return _env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 3072 if planner_thinks else 1400, 512)
+    return _env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 6144 if planner_thinks else 3072, 512)
 
 
 async def _prepare_prd_development_plan(
@@ -8248,6 +8250,16 @@ async def _prepare_prd_development_plan(
                 ),
                 timeout=_prd_plan_timeout_seconds(planner_thinks),
             )
+            if not (raw or "").strip():
+                # Reached only after the manager has already tried to salvage the
+                # reasoning channel AND retried with thinking off, so this really
+                # is a model that produced nothing - say that, rather than the old
+                # "did not return a JSON object", which described a model that had
+                # in fact written a whole plan into the wrong channel.
+                raise ValueError(
+                    f"the planner model {planner_model} produced no JSON at all "
+                    "(empty answer channel, and no object in its reasoning either)"
+                )
             candidate = _loads_freeform_json(raw or "")
             plan = _validate_prd_development_plan(candidate, payload.get("user_request") or "")
             break
@@ -8325,13 +8337,23 @@ _STACK_LICENCE_WORDS = {
 }
 
 
-def _architecture_conformance_errors(plan: dict[str, Any], request: str) -> list[str]:
+def _architecture_conformance_errors(
+    plan: dict[str, Any], request: str, request_label: str = ""
+) -> list[str]:
     """Reject a plan whose architecture does not match what was asked for.
 
     A pygame request came back as a plan targeting `backend/core/forms.py` and
     HTML templates, and nothing checked: the planner was validated for SHAPE
     (ids, titles, goals present) and never for whether it was building the thing
     the user described. Structure was well-formed; the product was wrong.
+
+    *request* is the whole statement of what is being built - for a PRD run that
+    is the SPEC, not the chat message. Reading only the chat message rejected a
+    CORRECT plan live 2026-08-17: the spec mandates Node.js/SQLite, the planner
+    proposed package.json, and the user had typed "make a comprehensive plan on
+    how to complete this project @SPEC.md" - which licenses no stack at all,
+    because the stack is in the file they pointed at. A guard against drift must
+    read the same source the planner was told to follow.
     """
     text = request.lower()
     proposed = " ".join(
@@ -8356,14 +8378,38 @@ def _architecture_conformance_errors(plan: dict[str, Any], request: str) -> list
             continue
         errors.append(
             f"plan proposes {stack} files ({', '.join(hits)}) but the request "
-            f"never asks for that: {request.strip()[:120]}"
+            f"never asks for that: {(request_label or request).strip()[:120]}"
         )
     return errors
 
 
-def _validate_prd_development_plan(candidate: Any, request: str = "") -> dict[str, Any]:
+def _prd_stack_licence_text(payload: dict[str, Any]) -> str:
+    """Everything that legitimately declares this build's stack.
+
+    The chat message is only the smallest part of it: for a PRD run the spec
+    title, its section headings, the contract and the compiled milestones are
+    what actually say "Browser-Based 3D Asteroid Shooter using Node.js/SQLite".
+    """
+    parts: list[str] = [
+        str(payload.get("user_request") or ""),
+        str(payload.get("prd_file") or ""),
+        str(payload.get("title") or ""),
+        str(payload.get("contract") or ""),
+    ]
+    for key in ("sections", "compiled_milestones"):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple)):
+            parts.extend(str(item) for item in value)
+    return "\n".join(part for part in parts if part)
+
+
+def _validate_prd_development_plan(
+    candidate: Any, request: str = "", request_label: str = ""
+) -> dict[str, Any]:
     if not isinstance(candidate, dict):
-        raise ValueError("planner did not return a JSON object")
+        raise ValueError(
+            f"planner did not return a JSON object (got {type(candidate).__name__})"
+        )
     raw_milestones = candidate.get("milestones")
     if not isinstance(raw_milestones, list) or not raw_milestones:
         raise ValueError("planner returned no milestones")
@@ -8394,7 +8440,7 @@ def _validate_prd_development_plan(candidate: Any, request: str = "") -> dict[st
         "risks": _safe_plan_list(candidate.get("risks"), 8, 160),
         "first_actions": _safe_plan_list(candidate.get("first_actions"), 8, 160),
     }
-    drift = _architecture_conformance_errors(plan, request)
+    drift = _architecture_conformance_errors(plan, request, request_label)
     if drift:
         # Raised, not warned: this joins the same retry-then-stop path a
         # malformed plan takes, so a drifting architecture is never silently

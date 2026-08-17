@@ -532,3 +532,339 @@ def test_the_previous_session_can_be_resumed_after_starting_a_new_one(tmp_path):
     )
 
     assert back.session_id == current.session_id
+
+
+# --- The planner answered in its reasoning channel and the plan was discarded --
+#
+# Live 2026-08-17: `qwen3.5:9b-q4_K_M` was handed `think: true` AND a `format`
+# schema. Ollama constrains only the `response` stream, so the model wrote the
+# whole plan into `thinking`, emitted an empty `response`, and the run died on
+# "planner did not return a JSON object" - describing as a failure a model that
+# had produced a complete, valid plan.
+
+
+_PLAN_JSON = (
+    '{"plan_summary": "Browser-Based 3D Asteroid Shooter", '
+    '"stack": ["node", "three.js"], '
+    '"milestones": [{"id": "M-002", "title": "Scaffold", "goal": "Create the project"}]}'
+)
+
+
+def _manager():
+    from shamsu.llm.manager import LLMManager
+
+    return LLMManager(base_url="http://localhost:11434")
+
+
+def _structured(manager, streams):
+    """Run generate_structured against a scripted list of (text, thinking) pairs."""
+    import asyncio
+
+    calls: list[dict] = []
+
+    async def fake_stream(model, payload, on_token=None, on_progress=None, role="", force_no_think=False):
+        calls.append({"payload": payload, "force_no_think": force_no_think})
+        text, thinking = streams[len(calls) - 1]
+        if thinking and on_progress:
+            on_progress("thinking")
+        if text and on_token:
+            on_token(text)
+        return text, thinking, 0
+
+    manager._stream_completion = fake_stream  # type: ignore[assignment]
+    raw = asyncio.run(
+        manager.generate_structured(
+            "planner", "SYSTEM", "PROMPT", {"type": "object"}, num_predict=3072
+        )
+    )
+    return raw, calls
+
+
+def test_a_plan_written_to_the_reasoning_channel_is_recovered():
+    import json
+
+    raw, calls = _structured(_manager(), [("", _PLAN_JSON)])
+
+    assert json.loads(raw)["plan_summary"] == "Browser-Based 3D Asteroid Shooter"
+    assert len(calls) == 1, "salvage must not cost a second generation"
+
+
+def test_reasoning_prose_around_the_object_does_not_defeat_recovery():
+    import json
+
+    thinking = f"Okay, the user wants a game. Let me plan.\n{_PLAN_JSON}\nThat covers it."
+    raw, _ = _structured(_manager(), [("", thinking)])
+
+    assert json.loads(raw)["stack"] == ["node", "three.js"]
+
+
+def test_an_empty_answer_with_no_salvageable_reasoning_retries_without_thinking():
+    """Thinking is what starved the answer channel, so the retry must drop it."""
+    import json
+
+    raw, calls = _structured(
+        _manager(),
+        [("", "I am still considering the options."), (_PLAN_JSON, "")],
+    )
+
+    assert json.loads(raw)["plan_summary"] == "Browser-Based 3D Asteroid Shooter"
+    assert len(calls) == 2
+    assert calls[0]["force_no_think"] is False
+    assert calls[1]["force_no_think"] is True
+
+
+def test_a_good_answer_channel_is_never_second_guessed():
+    raw, calls = _structured(_manager(), [(_PLAN_JSON, "some stray reasoning")])
+
+    assert raw == _PLAN_JSON
+    assert len(calls) == 1
+
+
+def test_a_structured_prompt_gets_a_context_window_that_fits_it():
+    """8192 was hardcoded, so a big PRD payload was truncated - and Ollama drops
+    the OLDEST tokens, which is the system prompt telling it to answer the schema."""
+    from shamsu.llm.manager import STRUCTURED_MAX_CTX, _structured_num_ctx
+
+    small = _structured_num_ctx("hello", 1400)
+    large = _structured_num_ctx("x" * 200_000, 3072)
+
+    assert small == 8192, "a tiny prompt must not pay for a 32k KV cache"
+    assert large > 8192
+    assert large <= STRUCTURED_MAX_CTX
+
+
+def test_the_structured_context_window_reaches_the_prompt_it_is_given():
+    _, calls = _structured(_manager(), [(_PLAN_JSON, "")])
+
+    assert calls[0]["payload"]["options"]["num_ctx"] >= 8192
+
+
+def test_the_failure_message_no_longer_blames_the_model_for_bad_json():
+    """When the model truly produces nothing, the panel must say THAT - the old
+    "did not return a JSON object" sent the user hunting a parsing bug."""
+    import inspect
+
+    source = inspect.getsource(repl._prepare_prd_development_plan)
+
+    assert "produced no JSON at all" in source
+    assert "empty answer channel" in source
+
+
+def test_json_object_from_text_refuses_to_invent_an_object_from_prose():
+    from shamsu.llm.output import json_object_from_text
+
+    assert json_object_from_text("The plan could not be built.") == ""
+    assert json_object_from_text("") == ""
+    assert json_object_from_text("{}") == ""
+
+
+def test_json_object_from_text_prefers_the_largest_object():
+    """Reasoning text carries fragments alongside the real answer."""
+    from shamsu.llm.output import json_object_from_text
+
+    got = json_object_from_text('{"id": "M-1"} ... and finally ' + _PLAN_JSON)
+
+    assert "plan_summary" in got
+
+
+def test_a_truncated_answer_also_earns_the_no_thinking_retry():
+    """A chain of thought that eats the num_predict budget cuts the JSON off
+    mid-object as often as it starves it entirely; both are the same failure."""
+    import json
+
+    truncated = '{"plan_summary": "Browser-Based 3D Aste'
+    raw, calls = _structured(
+        _manager(), [(truncated, "long reasoning, no object"), (_PLAN_JSON, "")]
+    )
+
+    assert json.loads(raw)["plan_summary"] == "Browser-Based 3D Asteroid Shooter"
+    assert len(calls) == 2
+    assert calls[1]["force_no_think"] is True
+
+
+# --- The agent stopped creating files (live trace, 2026-08-17 evening) --------
+#
+# "yes please proceed and make these base files first" ended with
+# "Agent stopped before completing all requested work" and nothing written. Four
+# separate defects conspired; each gets a test so none can come back quietly.
+
+
+def test_a_model_the_cookbook_never_heard_of_still_gets_its_real_context_window():
+    """`qwen3.5:9b` matched no cookbook entry and fell back to 8192, so the agent
+    ran at "ctx chat 3.8k/8.2k 100%" and could not hold the plan or the spec."""
+    from shamsu.context.budget import ctx_window_for_model
+
+    assert ctx_window_for_model("qwen3.5:9b-q4_K_M") == 32_768
+    assert ctx_window_for_model("qwen3:8b") == 32_768
+    assert ctx_window_for_model("gemma3:12b") == 131_072
+    # An unrecognised family stays conservative - this is a rescue, not a blanket raise.
+    assert ctx_window_for_model("some-vendor-model:1b") == 8_192
+
+
+def test_read_only_git_no_longer_interrupts_the_agent_for_approval():
+    """project.inspect runs `git branch --show-current`; it was classified
+    "medium risk or unknown" and stopped the run for a manual y/n. Twice."""
+    from shamsu.types import CommandRisk
+    from shamsu.safety.commands import classify_command
+
+    for command in (
+        "git branch --show-current",
+        "git rev-parse --is-inside-work-tree",
+        "git status --short",
+        "git remote -v",
+        "git config --get user.name",
+        "git blame src/app.py",
+    ):
+        assert classify_command(command) == CommandRisk.SAFE, command
+
+
+def test_git_commands_that_change_the_repo_still_need_approval():
+    from shamsu.types import CommandRisk
+    from shamsu.safety.commands import classify_command
+
+    for command in (
+        "git branch -D main",        # deletes a branch
+        "git branch feature",        # creates one
+        "git remote add origin url",
+        "git config user.name bob",  # writes config
+        "git checkout -b topic",
+        "git tag v1.0",
+    ):
+        assert classify_command(command) != CommandRisk.SAFE, command
+
+
+def test_the_same_call_with_flipped_path_separators_counts_as_a_repeat():
+    r"""The agent ran project.inspect twice on one path - `F:/Work/asteroid` then
+    `F:\Work\asteroid` - and repeat detection saw two different calls."""
+    from shamsu.agents.chat_loop import _call_signature
+
+    forward = _call_signature("project.inspect", {"path": "F:/Work/asteroid", "include_git": True})
+    backward = _call_signature("project.inspect", {"path": r"F:\Work\asteroid", "include_git": True})
+    trailing = _call_signature("project.inspect", {"path": "F:/Work/asteroid/", "include_git": True})
+    other = _call_signature("project.inspect", {"path": "F:/Work/other", "include_git": True})
+
+    assert forward == backward
+    assert forward == trailing
+    assert forward != other, "genuinely different targets must stay distinguishable"
+
+
+def test_a_creation_request_is_not_a_repair_request():
+    """The read-saturation guard handed "make these base files" to the strict
+    REPAIR loop, which had nothing to repair, found no verifier for a markdown
+    spec, and ended the run UNCONFIRMED with no file written."""
+    from shamsu.agents.chat_loop import _request_is_verification_repair
+
+    assert not _request_is_verification_repair("yes please proceed and make these base files first")
+    assert not _request_is_verification_repair("create the project structure")
+
+
+def test_the_read_saturation_guard_only_hands_off_a_repair_request():
+    import inspect
+
+    from shamsu.agents.chat_loop import AgentChatLoop
+
+    source = inspect.getsource(AgentChatLoop)
+    guard = source.split("Skipped redundant read_file")[1][:1200]
+
+    assert "_request_is_verification_repair" in guard, (
+        "the creation path must fall through to the mutation instruction, "
+        "not into the repair loop"
+    )
+
+
+def test_an_approval_inside_the_agent_loop_does_not_orphan_a_coroutine():
+    """"RuntimeWarning: coroutine 'Application.run_async' was never awaited" fired
+    on every approval raised from the running agent loop."""
+    import asyncio
+    import warnings
+
+    from shamsu.safety.approval import _prompt_toolkit_answer
+
+    async def ask_while_a_loop_is_running():
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            answer = _prompt_toolkit_answer()
+        return answer, [str(w.message) for w in caught]
+
+    answer, messages = asyncio.run(ask_while_a_loop_is_running())
+
+    assert answer is None, "must decline, so the caller falls back to a usable reader"
+    assert not any("never awaited" in message for message in messages), messages
+
+
+# --- Context window and response limit raised ---------------------------------
+
+
+def test_the_real_context_window_is_read_from_the_model_not_a_hardcoded_table():
+    """The cookbook said qwen3:8b was 32768; the model itself declares 40960.
+    A table can only ever be stale, so ground truth wins when it is reachable."""
+    from shamsu.context import budget
+
+    probed: list[str] = []
+
+    def fake_probe(model_name: str) -> int:
+        probed.append(model_name)
+        return 262_144
+
+    original = budget._declared_ctx_window
+    budget._declared_ctx_window = fake_probe
+    try:
+        assert budget.ctx_window_for_model("qwen3.5:9b-q4_K_M") == 262_144
+        # ...even for a model the cookbook DOES list with a smaller number.
+        assert budget.ctx_window_for_model("qwen3:8b") == 262_144
+    finally:
+        budget._declared_ctx_window = original
+
+    assert probed, "the model must actually be asked"
+
+
+def test_an_unreachable_ollama_falls_back_to_the_static_table():
+    """The probe returns 0 offline; sizing must not collapse to the 8192 default
+    for a model the cookbook or a family pattern already covers."""
+    from shamsu.context import budget
+
+    original = budget._declared_ctx_window
+    budget._declared_ctx_window = lambda _name: 0
+    try:
+        assert budget.ctx_window_for_model("qwen3:8b") == 32_768
+        assert budget.ctx_window_for_model("qwen3.5:9b-q4_K_M") == 32_768
+        assert budget.ctx_window_for_model("nothing-known:1b") == 8_192
+    finally:
+        budget._declared_ctx_window = original
+
+
+def test_an_explicit_override_beats_everything():
+    from shamsu.context import budget
+
+    original = budget._declared_ctx_window
+    budget._declared_ctx_window = lambda _name: 262_144
+    try:
+        with_env = {"SHAMSU_MODEL_CTX_WINDOW": "12288"}
+        import os
+
+        os.environ.update(with_env)
+        try:
+            assert budget.ctx_window_for_model("qwen3:8b") == 12_288
+        finally:
+            os.environ.pop("SHAMSU_MODEL_CTX_WINDOW", None)
+    finally:
+        budget._declared_ctx_window = original
+
+
+def test_the_probe_is_disabled_in_tests_so_sizing_is_deterministic():
+    """Otherwise the suite's results depend on which models the machine has."""
+    from shamsu.runtime.ollama import declared_context_length
+
+    assert declared_context_length("qwen3:8b") == 0
+
+
+def test_the_window_and_response_reserve_were_actually_raised():
+    from shamsu.agents.chat_loop import _CHAT_MAX_CTX
+    from shamsu.context.budget import RESERVE_OUTPUT_TOKENS
+    from shamsu.llm.manager import STRUCTURED_MAX_CTX
+
+    assert _CHAT_MAX_CTX >= 32_768
+    assert STRUCTURED_MAX_CTX >= 32_768
+    # The response reserve IS the response limit for chat: no num_predict is set,
+    # so what the model may emit is whatever the prompt did not consume.
+    assert RESERVE_OUTPUT_TOKENS >= 8_192

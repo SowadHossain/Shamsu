@@ -95,7 +95,7 @@ _REPAIR_MODEL_TIMEOUT_SECONDS: int = int(
     _os.environ.get("SHAMSU_REPAIR_MODEL_TIMEOUT_SECONDS", "120")
 )
 _REPAIR_MODEL_MAX_OUTPUT_TOKENS: int = int(
-    _os.environ.get("SHAMSU_REPAIR_MODEL_MAX_OUTPUT_TOKENS", "2048")
+    _os.environ.get("SHAMSU_REPAIR_MODEL_MAX_OUTPUT_TOKENS", "4096")
 )
 
 # How often to emit a "still waiting for the model" heartbeat during a long model
@@ -121,6 +121,20 @@ def _env_int_at_least(name: str, default: int, minimum: int) -> int:
 # the conversation digest, more complete source for the file being edited, and
 # the project symbol index. Replaying transcript is what this replaced.
 # Override with SHAMSU_CHAT_MAX_CTX on machines that prefill more slowly.
+#
+# This is a VRAM cap, not a capability claim: the effective window is
+# min(what the model declares, this). Models now declare far more than a
+# consumer GPU can hold - qwen3.5:9b says 262144 - so this is what stops a
+# window the card cannot fit, which does not error, it silently offloads the KV
+# cache to system RAM and drops generation to a crawl.
+#
+# The arithmetic (measured 2026-08-17, reference box = RTX 4060 Laptop, 8GB):
+# KV bytes/token = attention_layers * kv_heads * (key_len + val_len) * 2 at f16.
+# For qwen3.5:9b that is 8 * 16 * 512 * 2 = 128 KiB/token, so 32k costs 4.0GB at
+# f16 and 2.0GB at q8_0, against ~2.7GB free once the weights are resident.
+# 32768 therefore fits comfortably with `OLLAMA_KV_CACHE_TYPE=q8_0`
+# (plus `OLLAMA_FLASH_ATTENTION=1`), and just barely does not at f16.
+# Lower this to 16384 on an 8GB card that is not using a quantized KV cache.
 _CHAT_MAX_CTX: int = _env_int_at_least("SHAMSU_CHAT_MAX_CTX", 32768, 6144)
 _CHAT_SUMMARY_BUDGET_TOKENS = 512
 _CHAT_PROMPT_TARGET_FRACTION = float(_os.environ.get("SHAMSU_CHAT_PROMPT_TARGET_FRACTION", "0.70"))
@@ -291,6 +305,25 @@ File tools:
 # Two identical calls, not three: with a 6-action step budget a third repeat
 # has already spent half the step on a call that produced nothing new.
 _MAX_REPEATED_CALLS = 2
+
+
+def _call_signature(name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+    """Identity of a tool call for repeat detection.
+
+    Path arguments are normalized first. The signature used to be the raw JSON,
+    so `F:/Work/asteroid` and `F:\\Work\\asteroid` were two different calls:
+    live 2026-08-17, the agent ran the SAME `project.inspect` twice - two
+    approval prompts, two identical results - and nothing caught it, because on
+    Windows a model flips separators freely. Against a 6-action budget that
+    duplicate cost a sixth of the step, and the run ended having written nothing.
+    """
+    normalized: dict[str, Any] = {}
+    for key, value in (arguments or {}).items():
+        if isinstance(value, str) and ("\\" in value or "/" in value):
+            normalized[key] = value.replace("\\", "/").rstrip("/").lower()
+        else:
+            normalized[key] = value
+    return (name, json.dumps(normalized, sort_keys=True, default=str))
 # Reasoning is flushed to the trace at a sentence/line break, or once this many
 # characters have accumulated without one.
 _THINKING_FLUSH_CHARS = 160
@@ -2754,7 +2787,7 @@ class AgentChatLoop:
                 self._inject_feedback(control)
                 name = _tool_call_name(call)
                 arguments = _tool_call_arguments(call)
-                signature = (name, json.dumps(arguments, sort_keys=True, default=str))
+                signature = _call_signature(name, arguments)
                 requested_read = str(arguments.get("filepath") or "").replace("\\", "/").lower()
                 if (
                     name in {"read_file", "file.read"}
@@ -2778,7 +2811,17 @@ class AgentChatLoop:
                         f"Skipped redundant read_file for {requested_read}; requiring mutation.",
                         {"category": "read_saturation", "filepath": requested_read},
                     )
-                    if not strict_repair_recovery_attempted:
+                    # Only a REPAIR request may be handed to the repair loop. The
+                    # other handoff site gates on this; this one did not, so
+                    # "create the base files" - a request with nothing to repair -
+                    # was routed into a verifier that found no verifier for a
+                    # markdown spec and ended the run UNCONFIRMED, having written
+                    # nothing. Worse, the handoff returned immediately after the
+                    # correction above was appended, so the model never got to act
+                    # on the instruction the loop had just given it.
+                    if not strict_repair_recovery_attempted and _request_is_verification_repair(
+                        original_input
+                    ):
                         strict_repair_recovery_attempted = True
                         handoff = await self._run_scoped_repair_handoff(
                             self.tools.allowed_write_paths(), round_index

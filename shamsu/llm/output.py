@@ -697,6 +697,44 @@ def _join_thinking(*parts: str) -> str:
     return "\n\n".join(part.strip() for part in parts if part and part.strip()).strip()
 
 
+def json_object_from_text(text: str) -> str:
+    """Return the JSON object embedded in *text*, or ``""`` when there is none.
+
+    Ollama streams a reasoning model on two channels, and a ``format`` schema
+    constrains only the answer one. Asked to both think and fill a schema, a 9B
+    will sometimes satisfy the request entirely in the FREE reasoning channel
+    and leave the constrained channel empty - so a complete, valid answer is
+    generated and then dropped, because nothing ever looks in the other
+    channel. Live 2026-08-17: a PRD plan came back as
+    ``{"plan_summary": "This plan builds a Browser-Based 3D Asteroid
+    Shooter...", ...}`` in `thinking`, and the run died on "planner did not
+    return a JSON object".
+
+    Recovering it costs one scan. Regenerating it costs another minute of a
+    small model's time and can fail exactly the same way.
+
+    The LARGEST balanced object wins: reasoning text routinely carries small
+    fragments (``{"id": "M-001"}``) alongside the real answer.
+    """
+    body = (text or "").strip()
+    if not body:
+        return ""
+    try:  # Strict first - never let a repair library invent an object from prose.
+        whole = json.loads(body)
+    except (ValueError, TypeError):
+        whole = None
+    if isinstance(whole, dict) and whole:
+        return body
+    best = ""
+    for span in _iter_json_objects(body):
+        if len(span) <= len(best):
+            continue
+        parsed = _load_json(span)
+        if isinstance(parsed, dict) and parsed:
+            best = span
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Low-level helpers
 # ---------------------------------------------------------------------------

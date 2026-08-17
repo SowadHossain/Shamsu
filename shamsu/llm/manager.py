@@ -33,8 +33,10 @@ from json_repair import repair_json
 
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.action_ledger.redaction import redact_text
+from shamsu.context.budget import count_tokens
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import ILLMManager
+from shamsu.llm.output import json_object_from_text
 from shamsu.memory.service import MemoryService
 from shamsu.runtime.models import (
     SPECIALIST_MODELS,
@@ -92,6 +94,33 @@ def _blocking_timeout() -> httpx.Timeout:
 # thinking mode). Remembered per-process so the retry-without-think costs at
 # most one 400 per model rather than one per call.
 _THINK_UNSUPPORTED: set[str] = set()
+
+# Ceiling for a structured call's context window. 8192 was the whole-file
+# default and predates 32k-capable local models. Kept in step with
+# `_CHAT_MAX_CTX`: both allocate against the same GPU, and a planning call that
+# spikes past what the card holds pays the same silent offload penalty.
+STRUCTURED_MAX_CTX = 32768
+
+
+def _structured_num_ctx(prompt_text: str, num_predict: int | None) -> int:
+    """Context window for one structured call, sized to the prompt it carries.
+
+    The 8192 default silently truncated big structured prompts - a PRD planning
+    payload carries the contract, every compiled milestone and a workspace file
+    inventory. Ollama drops the OLDEST tokens when a prompt exceeds num_ctx, so
+    the system prompt is the first casualty, which is exactly the instruction
+    telling the model to answer with the schema.
+
+    Sized per call rather than pinned at the ceiling: a small extraction prompt
+    on an 8GB box should not pay for a 32k KV cache.
+    """
+    try:
+        override = int(os.environ.get("SHAMSU_STRUCTURED_MAX_CTX", "").strip())
+    except ValueError:
+        override = 0
+    ceiling = max(8192, override if override > 0 else STRUCTURED_MAX_CTX)
+    needed = count_tokens(prompt_text) + int(num_predict or 0) + 512
+    return max(8192, min(ceiling, needed))
 
 
 class LLMStalledError(RuntimeError):
@@ -327,6 +356,7 @@ class LLMManager(ILLMManager):
         on_token: Callable[[str], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
         role: str = "",
+        force_no_think: bool = False,
     ) -> tuple[str, str, int]:
         """Stream a completion, asking reasoning models to separate their CoT.
 
@@ -345,9 +375,14 @@ class LLMManager(ILLMManager):
         # defence (send the router to a non-reasoning model) is gone, so a
         # mechanical role - routing, classification, extraction - must not pay for a
         # chain-of-thought pass just because the shared model is capable of one.
+        # `force_no_think` is the caller's second attempt after the model spent
+        # a whole schema-constrained call reasoning and left the answer channel
+        # empty. Thinking is what broke that call, so the retry must not repeat it.
         want_think = (
-            role_should_think(role, model) if role else model_is_reasoning(model)
-        ) and model not in _THINK_UNSUPPORTED
+            not force_no_think
+            and (role_should_think(role, model) if role else model_is_reasoning(model))
+            and model not in _THINK_UNSUPPORTED
+        )
         if not want_think:
             return await self._stream_once(model, payload, on_token, on_progress)
         try:
@@ -370,6 +405,8 @@ class LLMManager(ILLMManager):
         _role: str = "",
         _on_token: Callable[[str], None] | None = None,
         _on_progress: Callable[[str], None] | None = None,
+        _on_thinking: Callable[[str], None] | None = None,
+        _force_no_think: bool = False,
     ) -> str:
         payload = {
             "model": model,
@@ -389,10 +426,19 @@ class LLMManager(ILLMManager):
         if json_schema is not None:
             payload["format"] = json_schema   # Ollama-native structured output
         text, thinking, prompt_eval_count = await self._stream_completion(
-            model, payload, on_token=_on_token, on_progress=_on_progress, role=_role
+            model,
+            payload,
+            on_token=_on_token,
+            on_progress=_on_progress,
+            role=_role,
+            force_no_think=_force_no_think,
         )
         # Capture the reasoning trace (surfaced/logged, kept out of the text).
         self._log_thinking(model, thinking, _ledger_call_id, _role)
+        # ...and hand it to the caller, which may need to salvage an answer the
+        # model wrote there instead of in the constrained channel.
+        if _on_thinking is not None:
+            _on_thinking(thinking)
         # Calibrate future token estimates with Ollama's ground-truth count.
         if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
             self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
@@ -585,6 +631,7 @@ class LLMManager(ILLMManager):
             )
         started = time.perf_counter()
         progress_phase = "waiting for first token"
+        thinking_sink: list[str] = []
 
         def on_token(_token: str) -> None:
             nonlocal progress_phase
@@ -607,6 +654,7 @@ class LLMManager(ILLMManager):
         heartbeat = asyncio.create_task(
             self._structured_heartbeat(role, model, started, lambda: progress_phase)
         )
+        num_ctx = _structured_num_ctx(prompt_text, num_predict)
         try:
             raw = await self._generate(
                 model,
@@ -614,12 +662,42 @@ class LLMManager(ILLMManager):
                 prompt,
                 temperature=temperature,
                 json_schema=schema,
+                num_ctx=num_ctx,
                 num_predict=num_predict,
                 _ledger_call_id=ledger_call_id,
                 _role=role,
                 _on_token=on_token,
                 _on_progress=on_progress,
+                _on_thinking=thinking_sink.append,
             )
+            raw, usable = self._salvage_structured_answer(raw, thinking_sink, role)
+            if not usable and role_should_think(role, model) and model not in _THINK_UNSUPPORTED:
+                # The model spent the call in its reasoning channel and left the
+                # schema-constrained one empty or cut off mid-object, with nothing
+                # parseable in the reasoning either. Thinking is what starved the
+                # answer, so retry once without it rather than reporting that a
+                # working model "returned no JSON".
+                self._emit_activity(
+                    f"{role} model produced no usable JSON; retrying with reasoning off."
+                )
+                progress_phase = "waiting for first token"
+                thinking_sink.clear()
+                raw = await self._generate(
+                    model,
+                    system,
+                    prompt,
+                    temperature=temperature,
+                    json_schema=schema,
+                    num_ctx=num_ctx,
+                    num_predict=num_predict,
+                    _ledger_call_id=ledger_call_id,
+                    _role=role,
+                    _on_token=on_token,
+                    _on_progress=on_progress,
+                    _on_thinking=thinking_sink.append,
+                    _force_no_think=True,
+                )
+                raw, _ = self._salvage_structured_answer(raw, thinking_sink, role)
         except BaseException as exc:
             if self.action_ledger:
                 self.action_ledger.log_model_call_finished(
@@ -666,6 +744,41 @@ class LLMManager(ILLMManager):
                 call_id=ledger_call_id,
             )
         return raw
+
+    def _salvage_structured_answer(
+        self, raw: str, thinking_sink: list[str], role: str
+    ) -> tuple[str, bool]:
+        """Return the model's structured answer, recovering it from the reasoning
+        channel when the schema-constrained channel came back unusable.
+
+        A ``format`` schema constrains only Ollama's ``response`` stream. A
+        reasoning model handed both ``think: true`` and a schema sometimes
+        answers in ``thinking`` and emits an empty ``response`` - the answer is
+        produced in full, then discarded. Salvaging is strictly better than the
+        alternatives: the caller's retry costs another minute and can fail the
+        same way, and its error ("did not return a JSON object") describes the
+        model as having failed when it had not.
+
+        Returns ``(answer, usable)``. ``usable`` is False when NO channel held a
+        parseable object - which covers a truncated answer as well as an empty
+        one, since a chain of thought that eats the num_predict budget cuts the
+        JSON off mid-object just as often as it starves it entirely.
+        """
+        if json_object_from_text(raw):
+            return raw, True
+        salvaged = json_object_from_text("".join(thinking_sink))
+        if not salvaged:
+            return raw, False
+        self._emit_activity(
+            f"{role} model answered in its reasoning channel; recovered the JSON from there."
+        )
+        if self.session_logger:
+            self.session_logger.log(
+                "llm.salvaged_from_thinking",
+                {"specialist": role, "answer_chars": len(raw or ""), "salvaged_chars": len(salvaged)},
+                f"Recovered {role}'s structured answer from its reasoning channel",
+            )
+        return salvaged, True
 
     async def _structured_heartbeat(
         self,

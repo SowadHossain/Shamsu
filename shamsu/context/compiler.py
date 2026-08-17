@@ -294,8 +294,11 @@ _DEFINITION_RE = re.compile(
     r"(?m)^(?:export\s+)?(?:async\s+)?(?:class|def|function|interface|type|struct)\s+([A-Za-z_][A-Za-z0-9_]*)"
 )
 # Whole-file ceiling for RELEVANT SOURCE CODE. Large enough that an ordinary
-# source file arrives complete rather than cut mid-construct.
-_MAX_SOURCE_CHARS = 24000
+# source file arrives complete rather than cut mid-construct. Scaled with the
+# window: at 24000 a large module still arrived truncated, and a small model
+# edits what it can see - a file cut mid-construct is how settings.py ended up
+# using BASE_DIR without defining it.
+_MAX_SOURCE_CHARS = 48000
 _SYMBOL_SCAN_FILES = 40
 _SYMBOL_SCAN_LIMIT = 60
 

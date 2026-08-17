@@ -33,6 +33,28 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
 
 SAFE_FALLBACK_CTX_WINDOW = 8_192   # conservative fallback for unknown models
 
+# Families whose every published size carries at least a 32k window. An exact
+# MODEL_CONTEXT_WINDOWS entry always wins; this only rescues models the cookbook
+# has never heard of.
+#
+# Without this, pulling a NEWER model than the cookbook knows silently costs you
+# three quarters of your context: live 2026-08-17, `qwen3.5:9b-q4_K_M` matched no
+# entry, fell back to 8192, and the agent ran at "ctx chat 3.8k/8.2k 100%" - with
+# 4.6k reserved for output, the state frame had ~3.6k to hold the plan, the spec
+# and the conversation. It could not, so the model re-inspected and re-read
+# instead of writing, and the step budget was gone before a single file existed.
+_CTX_FAMILY_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("gemma3", 131_072),
+    ("mistral-nemo", 131_072),
+    ("llama3.1", 131_072),
+    ("llama3.2", 131_072),
+    ("qwen3", 32_768),
+    ("qwen2.5", 32_768),
+    ("deepseek-r1", 32_768),
+    ("qwq", 32_768),
+    ("phi4", 16_384),
+)
+
 
 def _reserve_output_tokens() -> int:
     """Headroom reserved for the model's response.
@@ -47,13 +69,18 @@ def _reserve_output_tokens() -> int:
     Note this is the right lever, not `num_predict`: an explicit output cap cannot
     make room, it can only stop generation sooner, so capping would CAUSE the
     truncation it is meant to prevent. Reserving space prevents it.
+
+    Raised to 8192 (roughly 800 lines) now that the window is large enough to
+    afford it. At 4096 a turn asked to write a whole module had ~400 lines of
+    room, and the overflow shape is the worst one available: the tool call is
+    cut off mid-payload and the write never lands.
     """
     import os
 
     raw = os.environ.get("SHAMSU_RESERVE_OUTPUT_TOKENS", "").strip()
     if raw.isdigit() and int(raw) >= 512:
         return int(raw)
-    return 4_096
+    return 8_192
 
 
 RESERVE_OUTPUT_TOKENS = _reserve_output_tokens()
@@ -61,8 +88,50 @@ SAFETY_MARGIN_TOKENS = 512         # extra buffer against off-by-one token count
 
 
 def ctx_window_for_model(model_name: str) -> int:
-    """Return the known context window for *model_name*, or the safe fallback."""
-    return MODEL_CONTEXT_WINDOWS.get(model_name, SAFE_FALLBACK_CTX_WINDOW)
+    """Return the context window for *model_name*, or the safe fallback.
+
+    In order: an explicit user override, what the model itself declares to
+    Ollama, the cookbook, the model's FAMILY, then the conservative default.
+
+    The declared value wins over the cookbook because it is ground truth and the
+    cookbook is a hardcoded table that any newer model silently falls out of -
+    which cost three quarters of the window without a word of warning. Family
+    matching then covers the offline case, and being wrong low there is the
+    expensive direction: it starves the state frame instead of failing visibly.
+    """
+    import os
+
+    try:
+        override = int(os.environ.get("SHAMSU_MODEL_CTX_WINDOW", "").strip())
+    except ValueError:
+        override = 0
+    if override > 0:
+        return override
+    declared = _declared_ctx_window(model_name)
+    if declared > 0:
+        return declared
+    exact = MODEL_CONTEXT_WINDOWS.get(model_name)
+    if exact is not None:
+        return exact
+    lowered = (model_name or "").strip().lower()
+    for family, window in _CTX_FAMILY_WINDOWS:
+        if lowered.startswith(family):
+            return window
+    return SAFE_FALLBACK_CTX_WINDOW
+
+
+def _declared_ctx_window(model_name: str) -> int:
+    """What Ollama says this model's window is, or 0 when it cannot be reached."""
+    if not (model_name or "").strip():
+        return 0
+    try:
+        # Local import: runtime.ollama -> llm.manager -> context.budget would
+        # cycle at module level.
+        from shamsu.runtime.ollama import declared_context_length
+
+        return declared_context_length(model_name)
+    except Exception:
+        return 0
 
 
 def count_tokens(text: str) -> int:
