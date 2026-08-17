@@ -279,6 +279,17 @@ def _strip_think_spans(content: str) -> str:
     return _DANGLING_THINK_RE.sub("", _THINK_RE.sub("", content))
 
 
+def strip_thinking(content: str) -> str:
+    """Public alias for :func:`_strip_think_spans`.
+
+    ``shamsu/transcript`` keeps the model's answer verbatim — code fences and all
+    — so it cannot use ``ModelTurn.text`` (which strips the fences it needs) and
+    must not keep the reasoning span (which is noise the next turn would re-read
+    and pay for). This is the exact middle it needs.
+    """
+    return _strip_think_spans(content)
+
+
 def _is_tool_call_envelope(obj: dict[str, Any], registered: set[str] | None) -> bool:
     """True when a ``{...}`` body is a leaked tool-call envelope, not file content.
 
