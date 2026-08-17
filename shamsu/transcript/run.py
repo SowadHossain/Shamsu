@@ -45,7 +45,7 @@ def _read_request(workspace: Path, request: str, prd: str | None) -> str:
         raise SystemExit(f"PRD not found: {source}")
     suffix = source.suffix.lower()
     if suffix in {".docx", ".pdf"}:
-        from shamsu.retriever.documents import extract_document_text
+        from shamsu.tools.workspace import extract_document_text
 
         text = extract_document_text(source)
     else:
