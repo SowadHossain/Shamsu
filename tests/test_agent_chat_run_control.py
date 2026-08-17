@@ -128,8 +128,14 @@ def test_long_running_timeout_config_uses_real_defaults(monkeypatch):
     normal = _timeout_config_for_mode(False)
     long_running = _timeout_config_for_mode(True)
 
-    assert normal.task_timeout == 300.0
+    # Interactive task budget covers one atomic task AND its verification. Once
+    # verification became per-file it can run a real test command, and at 300s a
+    # turn could write correctly then time out before proving it - reported as a
+    # failure, with the evidence lost.
+    assert normal.task_timeout == 600.0
     assert normal.first_token_timeout == 180.0
+    # Long-running keeps the opposite trade: a bigger task budget, but each
+    # individual call fails fast because there are many of them.
     assert long_running.task_timeout == 900.0
     assert long_running.first_token_timeout == 90.0
     assert long_running.min_model_call_seconds == 60.0

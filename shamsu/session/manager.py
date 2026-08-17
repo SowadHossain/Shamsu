@@ -89,11 +89,44 @@ class SessionManager:
         return SessionLogger(self, sessions[0])
 
     def get_or_create_latest(self) -> "SessionLogger":
+        """Resume the newest active session unconditionally.
+
+        No age or size bound: a session never leaves "active" on its own, so
+        this resumes the same one forever. Prefer :meth:`continue_or_create`,
+        which is the same idea with the bounds that make it safe. Kept for
+        callers that genuinely want "whatever was last open, however old".
+        """
         latest = self.latest_active()
         if latest is None:
             return self.create_session()
         latest.log("session.resumed", {"query": "latest-active"}, "Session resumed")
         return latest
+
+    def resume_or_start(
+        self,
+        *,
+        max_age_seconds: int,
+        max_messages: int,
+    ) -> tuple["SessionLogger", str]:
+        """Bounded resume that also reports WHY, so the choice is never silent.
+
+        Restarting SHAMSU and landing back in an old session is confusing on its
+        own; it is worse now that the compiled frame carries a digest of the
+        session transcript, because a stale session quietly feeds unrelated work
+        into every prompt. Returns the logger and a short reason to display.
+        """
+        latest = self.latest_active()
+        if latest is None:
+            return self.create_session(), "no previous session"
+        if self._safe_to_continue(latest.metadata, max_age_seconds, max_messages):
+            latest.log("session.resumed", {"query": "bounded-latest"}, "Session resumed")
+            return latest, "resumed"
+        reason = (
+            f"previous session had {latest.metadata.message_count} messages"
+            if max_messages and latest.metadata.message_count >= max_messages
+            else "previous session was stale"
+        )
+        return self.create_session(), reason
 
     def continue_or_create(
         self,

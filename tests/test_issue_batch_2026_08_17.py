@@ -279,3 +279,256 @@ def test_a_larger_window_delivers_whole_files_instead_of_truncated_ones(tmp_path
 
     assert "[truncated]" in small
     assert "[truncated]" not in large
+
+
+# --- a git mutation must never become a read --------------------------------
+
+
+def test_a_push_is_not_silently_turned_into_an_inspect(tmp_path):
+    """The git_* catch-all aliased every unmapped git tool to git.inspect, and
+    unknown modes default to "overview" - so a push ran a read and reported ok."""
+    from shamsu.tools.agent_tools import AgentToolRegistry
+    from shamsu.tools.logical import logical_target
+
+    registry = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    registry.use_logical_tools(True)
+
+    for mutation in ("git_push", "git_pull", "git_fetch", "git_checkout", "git_restore"):
+        assert registry._logical_tools.alias(mutation, {}) is None, mutation
+        assert logical_target(mutation) == "", mutation
+
+
+def test_git_reads_and_checkpoints_still_alias(tmp_path):
+    from shamsu.tools.agent_tools import AgentToolRegistry
+
+    registry = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    registry.use_logical_tools(True)
+
+    assert registry._logical_tools.alias("git_status", {})[0] == "git.inspect"
+    assert registry._logical_tools.alias("git_log", {})[0] == "git.inspect"
+    assert registry._logical_tools.alias("git_commit", {})[0] == "git.checkpoint"
+
+
+# --- #1: Ollama's own timings ------------------------------------------------
+
+
+def test_ollama_timings_are_captured_and_converted_from_nanoseconds():
+    from shamsu.agents.chat_loop import _format_ollama_timings, _ollama_timings
+
+    timings = _ollama_timings(
+        {
+            "done": True,
+            "total_duration": 5_200_000_000,
+            "load_duration": 1_100_000_000,
+            "prompt_eval_duration": 2_400_000_000,
+            "eval_duration": 1_600_000_000,
+            "prompt_eval_count": 3120,
+            "eval_count": 180,
+        }
+    )
+
+    assert timings["load_duration_ms"] == 1100.0
+    assert timings["prompt_eval_duration_ms"] == 2400.0
+    assert timings["eval_count"] == 180
+    # Separating load / prefill / generate is the whole point: it turns "slower
+    # than plain ollama" into a number, and prefill is what grows with context.
+    readout = _format_ollama_timings(timings)
+    assert "load 1100ms" in readout
+    assert "prefill 2400ms" in readout
+    assert "tok/s" in readout
+
+
+def test_a_chunk_without_timings_reports_nothing_rather_than_zeros():
+    from shamsu.agents.chat_loop import _ollama_timings
+
+    assert _ollama_timings({"done": True}) == {}
+
+
+# --- #3: a plan must build the thing that was asked for ----------------------
+
+
+def test_a_plan_that_drifts_to_another_stack_is_rejected():
+    from shamsu.cli.repl import _architecture_conformance_errors
+
+    drifted = {
+        "stack": ["python", "django"],
+        "milestones": [{"files": ["backend/core/forms.py", "backend/core/urls.py"]}],
+    }
+
+    errors = _architecture_conformance_errors(drifted, "build a python asteroid shooter")
+
+    assert errors
+    assert "forms.py" in errors[0]
+
+
+def test_a_plan_matching_the_request_passes():
+    from shamsu.cli.repl import _architecture_conformance_errors
+
+    game = {"stack": ["python", "pygame"], "milestones": [{"files": ["game.py", "sprites.py"]}]}
+
+    assert _architecture_conformance_errors(game, "build a python asteroid shooter") == []
+
+
+def test_a_web_request_may_legitimately_propose_web_files():
+    """The guard is about drift, not about banning Django."""
+    from shamsu.cli.repl import _architecture_conformance_errors
+
+    web = {
+        "stack": ["python", "django"],
+        "milestones": [{"files": ["backend/core/urls.py", "backend/core/forms.py"]}],
+    }
+
+    assert _architecture_conformance_errors(web, "build a django web app with an admin") == []
+
+
+def test_a_drifting_plan_fails_validation_outright():
+    from shamsu.cli.repl import _validate_prd_development_plan
+
+    candidate = {
+        "plan_summary": "Build it",
+        "stack": ["django"],
+        "milestones": [
+            {"id": "M-001", "title": "Forms", "goal": "Add forms", "files": ["app/forms.py"]}
+        ],
+    }
+
+    try:
+        _validate_prd_development_plan(candidate, "build a python asteroid shooter")
+    except ValueError as exc:
+        assert "never asks for that" in str(exc)
+    else:
+        raise AssertionError("a drifting plan must not validate")
+
+
+# --- the planner could not finish in the time it was given -------------------
+
+
+def test_a_reasoning_planner_gets_time_to_think(monkeypatch):
+    """30s predates reasoning planners and was only survivable while a timeout
+    fell back to compiled milestones. With the fallback correctly gone, the same
+    30s turns a slow-but-working planner into a hard failure."""
+    from shamsu.cli.repl import _prd_plan_num_predict, _prd_plan_timeout_seconds
+
+    monkeypatch.delenv("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("SHAMSU_PRD_PLAN_NUM_PREDICT", raising=False)
+
+    # A reasoning 9B can spend 15-20s reaching first token, then think.
+    assert _prd_plan_timeout_seconds(True) >= 300
+    assert _prd_plan_timeout_seconds(False) >= 120
+    # Thinking tokens are generated tokens: budget for the chain of thought AND
+    # the JSON, or the model runs out before it can emit the answer.
+    assert _prd_plan_num_predict(True) > _prd_plan_num_predict(False)
+
+
+def test_the_planner_timeout_is_still_tunable(monkeypatch):
+    from shamsu.cli.repl import _prd_plan_timeout_seconds
+
+    monkeypatch.setenv("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "45")
+    assert _prd_plan_timeout_seconds(True) == 45.0
+
+    monkeypatch.setenv("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "not a number")
+    assert _prd_plan_timeout_seconds(True) >= 300
+
+
+def test_planner_selection_matches_what_the_run_will_actually_do():
+    """The budget is chosen from whether the planner THINKS, so it has to agree
+    with the gate the model call itself uses."""
+    from shamsu.runtime.models import model_for_role, role_should_think
+
+    planner = model_for_role("planner")
+    assert isinstance(role_should_think("planner", planner), bool)
+
+
+# --- one session per workspace, forever ---------------------------------------
+
+
+def test_a_restart_resumes_a_recent_session(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    manager = SessionManager(tmp_path)
+    first, _ = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    again, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    assert again.session_id == first.session_id
+    assert reason == "resumed"
+
+
+def test_a_restart_does_not_resume_a_stale_session(tmp_path):
+    """`get_or_create_latest` had no age bound, so every restart landed back in
+    the same session forever - and the compiled frame now digests that
+    transcript, so a stale session feeds unrelated work into every prompt."""
+    from shamsu.session.manager import SessionManager
+
+    manager = SessionManager(tmp_path)
+    first, _ = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    # Age the session deterministically rather than racing a real clock.
+    first.metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    manager._write_metadata(first.metadata)
+    manager._upsert_index(first.metadata)
+
+    fresh, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    assert fresh.session_id != first.session_id
+    assert "stale" in reason
+
+
+def test_a_restart_does_not_resume_an_overlong_session(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    manager = SessionManager(tmp_path)
+    first, _ = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    for index in range(5):
+        first.log("chat.message", {"role": "user", "content": f"turn {index}"}, "turn")
+
+    fresh, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=3)
+
+    assert fresh.session_id != first.session_id
+    assert "messages" in reason
+
+
+def test_an_empty_session_is_not_treated_as_overlong(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    manager = SessionManager(tmp_path)
+    first, _ = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    again, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=1)
+
+    assert again.session_id == first.session_id
+    assert reason == "resumed"
+
+
+def test_a_new_session_can_start_without_ending_the_current_one(tmp_path):
+    """`close` was the only route to a fresh session from inside the REPL, so
+    starting new work meant ending work you wanted to keep."""
+    from shamsu.session.manager import SessionManager
+
+    manager = SessionManager(tmp_path)
+    current = manager.create_session("Asteroid build")
+    current.log("chat.message", {"role": "user", "content": "keep me"}, "turn")
+    console = Console(record=True, width=100)
+
+    fresh = repl._handle_sessions("/sessions new Refactor pass", manager, current, console)
+
+    assert fresh.session_id != current.session_id
+    assert fresh.metadata.title == "Refactor pass"
+    # The point: the previous session is still there and still open.
+    statuses = {item.session_id: item.status for item in manager.list_sessions()}
+    assert statuses[current.session_id] == "active"
+    assert len(statuses) == 2
+    # And the user is told how to get back to it.
+    assert current.session_id in console.export_text()
+
+
+def test_the_previous_session_can_be_resumed_after_starting_a_new_one(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    manager = SessionManager(tmp_path)
+    current = manager.create_session("First")
+    console = Console(record=True, width=100)
+
+    fresh = repl._handle_sessions("/sessions new Second", manager, current, console)
+    back = repl._handle_sessions(
+        f"/sessions resume {current.session_id}", manager, fresh, console
+    )
+
+    assert back.session_id == current.session_id

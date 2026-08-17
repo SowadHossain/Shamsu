@@ -176,6 +176,7 @@ from shamsu.runtime.models import (
     clear_model_override,
     initialize_model_tier,
     model_for_role,
+    role_should_think,
     set_model_override,
     set_model_tier,
     tier_ever_configured,
@@ -357,6 +358,7 @@ SYSTEM_COMMANDS = (
     "/django test ",
     "/django fix-tests ",
     "/sessions list",
+    "/sessions new",
     "/sessions current",
     "/sessions show ",
     "/sessions resume ",
@@ -592,6 +594,7 @@ def _print_help(console: Console) -> None:
                     "  /browse type <selector> <text>",
                     "  /browse screenshot        Save a browser screenshot",
                     "  /sessions list            List workspace sessions",
+                    "  /sessions new [title]     Start a fresh session, keeping the current one",
                     "  /sessions current         Show current session",
                     "  /sessions show <id>       Show session metadata",
                     "  /sessions resume <id>     Resume another session",
@@ -3865,15 +3868,31 @@ def _print_runtime_status(console: Console, status=None) -> None:
     console.print(table)
 
 
+# How stale or how long an interactive session may get before a restart starts a
+# fresh one. Deliberately looser than the headless bounds - picking work back up
+# after lunch is normal - but not unbounded, which is what left one session per
+# workspace running forever and feeding old work into every compiled frame.
+_SESSION_MAX_AGE_SECONDS = _env_int_at_least("SHAMSU_SESSION_MAX_AGE_SECONDS", 8 * 3600, 60)
+_SESSION_MAX_MESSAGES = _env_int_at_least("SHAMSU_SESSION_MAX_MESSAGES", 200, 10)
+
+
 def _start_session(args: argparse.Namespace, workspace: Path, console: Console) -> SessionLogger:
     manager = SessionManager(workspace)
+    reason = "new session"
     if args.new_session is not None:
         logger = manager.create_session(args.new_session)
     elif args.session:
         logger = manager.resume_session(args.session)
+        reason = "resumed"
     else:
-        logger = manager.get_or_create_latest()
-    console.print(f"[dim]Session: {logger.session_id} ({logger.metadata.title})[/dim]")
+        logger, reason = manager.resume_or_start(
+            max_age_seconds=_SESSION_MAX_AGE_SECONDS,
+            max_messages=_SESSION_MAX_MESSAGES,
+        )
+    console.print(
+        f"[dim]Session: {logger.session_id} ({logger.metadata.title}) - {reason}. "
+        "`/sessions list` to see others, `/sessions close` to end this one.[/dim]"
+    )
     return logger
 
 
@@ -3920,6 +3939,20 @@ def _handle_sessions(
             if renamed.session_id == current.session_id:
                 return SessionLogger(manager, renamed)
             return current
+        if command == "new":
+            # Start a fresh thread WITHOUT ending the current one. `close` was
+            # the only way to get a new session from inside the REPL, which
+            # forced you to end work you wanted to keep just to start something
+            # else in the same workspace. The old session stays active and
+            # resumable by id.
+            previous = current.session_id
+            title = argument.strip() or None
+            logger = manager.create_session(title)
+            console.print(
+                f"[green]Started session {logger.session_id} ({logger.metadata.title}).[/green]\n"
+                f"[dim]{previous} is still open - `/sessions resume {previous}` to go back.[/dim]"
+            )
+            return logger
         if command == "close":
             target = parts[2] if len(parts) >= 3 else current.session_id
             closed = manager.close_session(target)
@@ -8122,6 +8155,34 @@ def _save_development_plan(path: Path | None, plan: dict[str, Any]) -> None:
         swallowed.record("repl.development_plan_save", exc)
 
 
+def _prd_plan_timeout_seconds(planner_thinks: bool) -> float:
+    """Wall clock for one planning call.
+
+    The old 30s default predates reasoning planners and was survivable only
+    because a timeout silently fell back to compiled milestones. Now that the
+    fallback is (correctly) gone, that same 30s turns a slow-but-working planner
+    into a hard failure: a reasoning 9B can spend 15-20s reaching first token
+    and then needs to think before emitting any JSON at all.
+    """
+    raw = os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            return max(30.0, float(raw))
+        except ValueError:
+            pass
+    return 420.0 if planner_thinks else 180.0
+
+
+def _prd_plan_num_predict(planner_thinks: bool) -> int:
+    """Output budget for one planning call.
+
+    Thinking tokens are generated tokens: a reasoning model spends its budget
+    on the chain of thought first, so a cap sized for the JSON alone leaves
+    nothing to emit the JSON with.
+    """
+    return _env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 3072 if planner_thinks else 1400, 512)
+
+
 async def _prepare_prd_development_plan(
     parsed,
     relative_path: Path,
@@ -8173,6 +8234,8 @@ async def _prepare_prd_development_plan(
                 "Each milestone must include id, title, and goal.",
                 "Do not switch the tech stack or product type.",
             ]
+        planner_model = model_for_role("planner")
+        planner_thinks = role_should_think("planner", planner_model)
         try:
             raw = await asyncio.wait_for(
                 _make_llm_manager(session_logger, console, workspace).generate_structured(
@@ -8181,13 +8244,31 @@ async def _prepare_prd_development_plan(
                     json.dumps(planner_payload, indent=2, ensure_ascii=True),
                     PRD_DEVELOPMENT_PLAN_SCHEMA,
                     temperature=0.0,
-                    num_predict=_env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 1400, 512),
+                    num_predict=_prd_plan_num_predict(planner_thinks),
                 ),
-                timeout=float(os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "30")),
+                timeout=_prd_plan_timeout_seconds(planner_thinks),
             )
             candidate = _loads_freeform_json(raw or "")
-            plan = _validate_prd_development_plan(candidate)
+            plan = _validate_prd_development_plan(candidate, payload.get("user_request") or "")
             break
+        except (TimeoutError, asyncio.TimeoutError):
+            # asyncio.TimeoutError stringifies to "", so the panel used to read
+            # "Last error: TimeoutError:" - which names no cause and no remedy.
+            budget = _prd_plan_timeout_seconds(planner_thinks)
+            last_error = (
+                f"the planner model {planner_model} ran out of time after {budget:.0f}s"
+                + (" (it is a reasoning model, so it thinks before answering)" if planner_thinks else "")
+                + ". Raise SHAMSU_PRD_PLAN_TIMEOUT_SECONDS, or use a non-reasoning planner model."
+            )
+            if ledger:
+                ledger.log_event(
+                    "prd_development_plan_attempt_failed",
+                    attempt=attempt + 1,
+                    error=last_error,
+                    timeout_seconds=budget,
+                    planner_model=planner_model,
+                    planner_thinks=planner_thinks,
+                )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if ledger:
@@ -8305,7 +8386,7 @@ def _validate_prd_development_plan(candidate: Any, request: str = "") -> dict[st
         )
     if not milestones:
         raise ValueError("planner milestones were incomplete")
-    return {
+    plan = {
         "source": "model",
         "plan_summary": _safe_plan_text(candidate.get("plan_summary"), 500),
         "stack": _safe_plan_list(candidate.get("stack"), 10, 80),
@@ -8313,6 +8394,13 @@ def _validate_prd_development_plan(candidate: Any, request: str = "") -> dict[st
         "risks": _safe_plan_list(candidate.get("risks"), 8, 160),
         "first_actions": _safe_plan_list(candidate.get("first_actions"), 8, 160),
     }
+    drift = _architecture_conformance_errors(plan, request)
+    if drift:
+        # Raised, not warned: this joins the same retry-then-stop path a
+        # malformed plan takes, so a drifting architecture is never silently
+        # accepted as the thing to build.
+        raise ValueError("; ".join(drift))
+    return plan
 
 
 def _safe_plan_text(value: Any, limit: int) -> str:
