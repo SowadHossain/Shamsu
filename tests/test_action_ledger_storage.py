@@ -846,6 +846,49 @@ def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path, monke
     ) == "done" * 3000
 
 
+def test_friendly_model_transcript_writes_readable_table_and_csv(tmp_path: Path):
+    ledger = start_run(tmp_path, "add a healthcheck endpoint")
+    call_id = ledger.log_model_call_started(
+        "coder",
+        "m",
+        system="You are SHAMSU.",
+        messages=[{"role": "user", "content": "add a healthcheck endpoint"}],
+        tools=[{"name": "write_file"}],
+    )
+    ledger.log_context_preview(
+        {
+            "task_id": "agent-chat",
+            "step_id": 1,
+            "specialist": "agent-executor",
+            "token_estimate": 123,
+            "messages": [{"role": "user", "content": "add a healthcheck endpoint"}],
+            "snippets": [],
+        },
+        model_call_id=call_id,
+    )
+    ledger.log_model_call_finished(
+        "coder",
+        "m",
+        "I will call write_file.",
+        call_id=call_id,
+        meta={"thinking_chars": 42},
+    )
+
+    md = ledger.friendly_model_transcript_path.read_text(encoding="utf-8")
+    csv_text = ledger.friendly_model_transcript_csv_path.read_text(encoding="utf-8")
+
+    assert "SHAMSU Model Transcript" in md
+    assert "| timestamp | run | call | role | model | cot | context | prompt | model response |" in md
+    assert call_id in md
+    assert "captured (42 chars)" in md
+    assert "agent-executor, 1 message(s), ~123 token(s)" in md
+    assert (ledger.friendly_model_artifacts_dir / f"{call_id}.prompt.txt").is_file()
+    assert (ledger.friendly_model_artifacts_dir / f"{call_id}.context.txt").is_file()
+    assert (ledger.friendly_model_artifacts_dir / f"{call_id}.response.txt").is_file()
+    assert "model_response" in csv_text
+    assert call_id in csv_text
+
+
 def test_session_agent_development_log_is_single_prompt_and_verbose_evidence_file(
     tmp_path: Path, monkeypatch
 ):

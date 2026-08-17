@@ -369,7 +369,18 @@ class AgentToolRegistry:
 
     def model_tool_names(self) -> set[str]:
         if self._logical_tools_enabled:
-            return all_logical_tool_names()
+            return all_logical_tool_names() | {
+                "list_files",
+                "file_info",
+                "read_file",
+                "find_file",
+                "grep_files",
+                "search_index",
+                "write_file",
+                "edit_file",
+                "append_file",
+                "run_command",
+            }
         return {
             str((schema.get("function") or {}).get("name") or "")
             for schema in self.tool_schemas()

@@ -33,6 +33,7 @@ class TimeoutConfig:
     tool_timeout: float = 120.0
     step_timeout: float = 0.0
     task_timeout: float = 300.0
+    min_model_call_seconds: float = 60.0
 
     @classmethod
     def from_env(cls) -> "TimeoutConfig":
@@ -45,6 +46,7 @@ class TimeoutConfig:
             tool_timeout=_env_float("SHAMSU_TOOL_TIMEOUT_SECONDS", 120.0),
             step_timeout=_env_float("SHAMSU_STEP_TIMEOUT_SECONDS", 0.0),
             task_timeout=_env_float("SHAMSU_TASK_TIMEOUT_SECONDS", _env_float("SHAMSU_RUN_TIMEOUT_SECONDS", 300.0)),
+            min_model_call_seconds=_env_float("SHAMSU_MIN_MODEL_CALL_SECONDS", 60.0),
         )
 
     def diagnostics(self) -> dict[str, float]:
@@ -56,6 +58,7 @@ class TimeoutConfig:
             "tool_timeout": self.tool_timeout,
             "step_timeout": self.step_timeout,
             "task_timeout": self.task_timeout,
+            "min_model_call_seconds": self.min_model_call_seconds,
         }
 
 

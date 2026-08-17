@@ -36,6 +36,7 @@ pipeline, and nothing here is ever fed back into a model prompt.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import time
@@ -110,6 +111,7 @@ class ActionLedger:
         self.log_level = resolve_log_level(self.config)
         self.full_artifacts = wants_full_artifacts(self.config)
         self._max_inline = int(self.config.get("max_inline_event_size", DEFAULT_CONFIG["max_inline_event_size"]))
+        self.friendly_transcript = bool(self.config.get("friendly_model_transcript", True))
         self._event_seq = self._count_lines(self.events_path)
         self._decision_seq = self._count_lines(self.decisions_path)
         self._tool_call_seq = self._count_records(self.tool_calls_path, "phase", "called")
@@ -120,6 +122,8 @@ class ActionLedger:
         self._sequence = self._max_sequence()
         self._tool_started: dict[str, float] = {}
         self._model_started: dict[str, float] = {}
+        self._friendly_model_started: dict[str, dict[str, Any]] = {}
+        self._friendly_model_contexts: dict[str, dict[str, str]] = {}
 
     # -- paths ----------------------------------------------------------------
 
@@ -741,6 +745,14 @@ class ActionLedger:
         }
         if self.full_artifacts:
             record["prompt_path"] = self._write_artifact(self.prompts_dir, call_id, request_text)
+        friendly_prompt_path = self._write_friendly_model_artifact(call_id, "prompt", request_text)
+        self._friendly_model_started[call_id] = {
+            "timestamp": record["timestamp"],
+            "role": role,
+            "model": model,
+            "prompt_path": friendly_prompt_path,
+            "prompt_preview": _preview(request_text, 240),
+        }
         if self.config.get("log_model_prompts", True):
             record["prompt_preview"] = _preview(request_text)
         self._append_jsonl(self.model_calls_path, record)
@@ -791,10 +803,25 @@ class ActionLedger:
         }
         if self.full_artifacts and response:
             record["response_path"] = self._write_artifact(self.responses_dir, call_id, response)
+        friendly_response_path = self._write_friendly_model_artifact(
+            call_id,
+            "response",
+            response or error or "The model call ended without a response.",
+        )
         record["response_chars"] = len(response or "")
         if self.config.get("log_model_responses", True):
             record["response_preview"] = _preview(response or "")
         self._append_jsonl(self.model_calls_path, record)
+        self._append_friendly_model_transcript(
+            call_id=call_id,
+            role=role,
+            model=model,
+            response=response,
+            response_path=friendly_response_path,
+            error=error,
+            duration_ms=record["duration_ms"],
+            meta=meta or {},
+        )
         self._narrative(
             "append_model_result",
             call_id,
@@ -1220,6 +1247,16 @@ class ActionLedger:
         if self.full_artifacts:
             self._write_json(context_path, record)
             context_relative = str(context_path.relative_to(self.run_dir).as_posix())
+        if model_call_id:
+            friendly_context_path = self._write_friendly_model_artifact(
+                model_call_id,
+                "context",
+                json.dumps(record, indent=2, default=str),
+            )
+            self._friendly_model_contexts[model_call_id] = {
+                "path": friendly_context_path,
+                "preview": _context_summary(record),
+            }
         # Backward-compatible latest pointer for old readers and exports.
         self._write_json(self.context_preview_path, record)
         self._narrative("append_context", record)
@@ -1446,6 +1483,130 @@ class ActionLedger:
                 continue
         return texts
 
+    @property
+    def friendly_log_dir(self) -> Path:
+        return self.sandbox.validate(Path(".shamsu") / "logs" / self.session_id)
+
+    @property
+    def friendly_model_transcript_path(self) -> Path:
+        return self.friendly_log_dir / "model-transcript.md"
+
+    @property
+    def friendly_model_transcript_csv_path(self) -> Path:
+        return self.friendly_log_dir / "model-transcript.csv"
+
+    @property
+    def friendly_model_artifacts_dir(self) -> Path:
+        return self.friendly_log_dir / "model-transcript"
+
+    def _write_friendly_model_artifact(self, call_id: str, kind: str, text: str) -> str:
+        if not self.enabled or not self.friendly_transcript:
+            return ""
+        safe_call_id = "".join(char for char in (call_id or "model_unknown") if char.isalnum() or char in {"-", "_"})
+        safe_kind = "".join(char for char in kind if char.isalnum() or char in {"-", "_"})
+        path = self.friendly_model_artifacts_dir / f"{safe_call_id}.{safe_kind or 'artifact'}.txt"
+        try:
+            self._write_text(path, text or "")
+            return str(path.relative_to(self.friendly_log_dir).as_posix())
+        except OSError:
+            return ""
+
+    def _append_friendly_model_transcript(
+        self,
+        *,
+        call_id: str,
+        role: str,
+        model: str,
+        response: str,
+        response_path: str,
+        error: str,
+        duration_ms: float | None,
+        meta: dict[str, Any],
+    ) -> None:
+        if not self.enabled or not self.friendly_transcript:
+            return
+        started = self._friendly_model_started.get(call_id, {})
+        context = self._friendly_model_contexts.get(call_id, {})
+        thinking_chars = _int_from_meta(meta, "thinking_chars")
+        cot = f"captured ({thinking_chars} chars)" if thinking_chars > 0 else "not captured"
+        row = {
+            "timestamp": str(started.get("timestamp") or _now()),
+            "run_id": self.run_id,
+            "model_call_id": call_id,
+            "role": str(started.get("role") or role),
+            "model": str(started.get("model") or model),
+            "duration_ms": "" if duration_ms is None else str(duration_ms),
+            "cot": cot,
+            "context": _link_with_preview(str(context.get("path") or ""), str(context.get("preview") or "")),
+            "prompt": _link_with_preview(
+                str(started.get("prompt_path") or ""),
+                str(started.get("prompt_preview") or ""),
+            ),
+            "model_response": _link_with_preview(
+                response_path,
+                error or _preview(response or "", 240),
+            ),
+        }
+        try:
+            self._append_friendly_markdown_row(row)
+            self._append_friendly_csv_row(row)
+        except OSError:
+            return
+
+    def _append_friendly_markdown_row(self, row: dict[str, str]) -> None:
+        path = self.friendly_model_transcript_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(
+                "\n".join(
+                    [
+                        "# SHAMSU Model Transcript",
+                        "",
+                        "Readable index of model calls. Full prompt, context, and response text lives beside this file under `model-transcript/`.",
+                        "",
+                        "| timestamp | run | call | role | model | cot | context | prompt | model response |",
+                        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        cells = [
+            row["timestamp"],
+            row["run_id"],
+            row["model_call_id"],
+            row["role"],
+            row["model"],
+            row["cot"],
+            row["context"],
+            row["prompt"],
+            row["model_response"],
+        ]
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write("| " + " | ".join(_markdown_cell(cell) for cell in cells) + " |\n")
+
+    def _append_friendly_csv_row(self, row: dict[str, str]) -> None:
+        path = self.friendly_model_transcript_csv_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "timestamp",
+            "run_id",
+            "model_call_id",
+            "role",
+            "model",
+            "duration_ms",
+            "cot",
+            "context",
+            "prompt",
+            "model_response",
+        ]
+        exists = path.exists()
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if not exists:
+                writer.writeheader()
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
     def _write_json(self, path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         safe = redact_value(data) if self.config.get("redact_secrets", True) else data
@@ -1625,3 +1786,46 @@ def start_run(
             workflow_id=ledger.run_id,
         )
     return ledger
+
+
+def _context_summary(record: dict[str, Any]) -> str:
+    specialist = str(record.get("specialist") or "")
+    token_estimate = record.get("token_estimate")
+    messages = record.get("messages")
+    message_count = len(messages) if isinstance(messages, list) else int(record.get("message_count", 0) or 0)
+    snippets = record.get("snippets") or []
+    snippet_count = len(snippets) if isinstance(snippets, list) else 0
+    parts = []
+    if specialist:
+        parts.append(specialist)
+    if message_count:
+        parts.append(f"{message_count} message(s)")
+    if token_estimate:
+        parts.append(f"~{token_estimate} token(s)")
+    if snippet_count:
+        parts.append(f"{snippet_count} snippet(s)")
+    return ", ".join(parts) or "context captured"
+
+
+def _int_from_meta(meta: dict[str, Any], key: str) -> int:
+    try:
+        return int(meta.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _link_with_preview(path: str, preview: str) -> str:
+    preview = " ".join((preview or "").split())
+    preview = _preview(preview, 240)
+    if path:
+        label = path.rsplit("/", 1)[-1]
+        if preview:
+            return f"[{label}]({path})<br>{preview}"
+        return f"[{label}]({path})"
+    return preview or "-"
+
+
+def _markdown_cell(text: str) -> str:
+    clean = redact_text(str(text or ""))
+    clean = clean.replace("|", "\\|").replace("\r\n", "\n").replace("\r", "\n")
+    return clean.replace("\n", "<br>")

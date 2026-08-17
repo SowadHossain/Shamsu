@@ -34,6 +34,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "log_model_prompts": True,
     "log_model_responses": True,
     "log_context_preview": True,
+    "friendly_model_transcript": True,
     "max_inline_event_size": 4000,
     "retention_days": 30,
     "redact_secrets": True,

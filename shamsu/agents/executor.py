@@ -17,6 +17,10 @@ class StepExecutionLimits:
     max_consecutive_failures: int = 3
 
 
+DEFAULT_STEP_EXECUTION_LIMITS = StepExecutionLimits()
+LONG_RUNNING_STEP_EXECUTION_LIMITS = StepExecutionLimits(max_actions_per_step=12)
+
+
 class StepExecutionDecision(str, Enum):
     CONTINUE = "continue"
     VERIFY = "verify"

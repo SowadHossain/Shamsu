@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
@@ -33,6 +33,8 @@ from shamsu.agents.chat_state import ChatState
 from shamsu.agents.clarification import format_question
 from shamsu.agents.executor import (
     AgentExecutor,
+    DEFAULT_STEP_EXECUTION_LIMITS,
+    LONG_RUNNING_STEP_EXECUTION_LIMITS,
     StepExecutionController,
     StepExecutionDecision,
     StepExecutionLimits,
@@ -85,7 +87,7 @@ from shamsu.types import RunStatus
 # the normal stop condition (the repetition guard is what actually catches
 # a stuck loop; this just bounds worst-case cost on a local machine).
 DEFAULT_MAX_TOOL_ROUNDS = 8
-LONG_RUNNING_MAX_TOOL_ROUNDS = 50
+LONG_RUNNING_MAX_TOOL_ROUNDS = 20
 
 # Guard against a local model that never responds.  Local inference can stall
 # indefinitely when the model is swapping or the GPU is saturated; these caps
@@ -147,6 +149,22 @@ _AUTO_REPAIR_ENABLED = _os.environ.get("SHAMSU_AUTO_REPAIR", "1").strip().lower(
     "off",
     "no",
 }
+
+
+def _env_is_set(*names: str) -> bool:
+    return any(_os.environ.get(name, "").strip() for name in names)
+
+
+def _timeout_config_for_mode(long_running: bool) -> TimeoutConfig:
+    config = TimeoutConfig.from_env()
+    if not long_running:
+        return config
+    changes: dict[str, float] = {}
+    if not _env_is_set("SHAMSU_TASK_TIMEOUT_SECONDS", "SHAMSU_RUN_TIMEOUT_SECONDS"):
+        changes["task_timeout"] = max(config.task_timeout, 900.0)
+    if not _env_is_set("SHAMSU_FIRST_TOKEN_TIMEOUT_SECONDS", "SHAMSU_MODEL_TIMEOUT_SECONDS"):
+        changes["first_token_timeout"] = min(config.first_token_timeout, 90.0)
+    return replace(config, **changes) if changes else config
 
 # Repair iterations allowed per failed verify. `RepairLoop` stops as soon as no
 # actionable error remains, so a first-attempt fix still costs exactly one pass
@@ -544,6 +562,7 @@ class AgentChatLoop:
         use_model_compaction: bool = True,
         original_user_request: str = "",
         run_id: str | None = None,
+        runtime_task_id: str | None = None,
         max_runtime_seconds: float | None = None,
         runtime_state_store: RuntimeStateStore | None = None,
     ) -> None:
@@ -551,7 +570,7 @@ class AgentChatLoop:
         self.workspace_root = Path(workspace_root).resolve()
         self.session_logger = session_logger
         self.action_ledger = action_ledger
-        self.timeout_config = TimeoutConfig.from_env()
+        self.timeout_config = _timeout_config_for_mode(long_running)
         self.run_id = run_id or (
             action_ledger.run_id if action_ledger is not None else f"agentrun-{uuid.uuid4().hex[:12]}"
         )
@@ -561,7 +580,7 @@ class AgentChatLoop:
             else float(self.timeout_config.task_timeout)
         )
         self.runtime_state_store = runtime_state_store or RuntimeStateStore(self.workspace_root)
-        self.runtime_task_id = f"task-{self.run_id}"
+        self.runtime_task_id = runtime_task_id or f"task-{self.run_id}"
         self.model_name = model_name or model_for_role(_CHAT_EXECUTOR_ROLE)
         self.prompt_profile = prompt_profile_for_model(self.model_name)
         # Capability flags drive the model I/O boundary: whether to hand this
@@ -607,7 +626,9 @@ class AgentChatLoop:
             self.runtime_task_id,
             step_id_getter=self._current_failure_step_id,
         )
-        self.step_execution_limits = StepExecutionLimits()
+        self.step_execution_limits = (
+            LONG_RUNNING_STEP_EXECUTION_LIMITS if long_running else DEFAULT_STEP_EXECUTION_LIMITS
+        )
         self.executor = AgentExecutor(
             self._run_inner,
             step_runner=self.run_step,
@@ -719,6 +740,17 @@ class AgentChatLoop:
         except Exception:
             available_tools = ()
         return phase, current_step, available_tools
+
+    def _native_tool_schema_payload(self) -> str:
+        if not self._supports_native_tools:
+            return ""
+        try:
+            schemas = self.tools.tool_schemas()
+        except Exception:
+            return ""
+        if not schemas:
+            return ""
+        return json.dumps({"tools": schemas}, ensure_ascii=True, default=str)
 
     def _regrounding_block(self, mutated_paths: Sequence[str]) -> str:
         """Current on-disk contents of the files this run most recently changed.
@@ -1102,6 +1134,7 @@ class AgentChatLoop:
             if self.action_ledger:
                 message = _message_from_response(response)
                 visible = str(_get(message, "content", "") or "")
+                thinking = str(_get(message, "thinking", "") or "")
                 tool_calls = _get(message, "tool_calls", []) or []
                 response_preview = visible or json.dumps(
                     _compact_value(tool_calls, limit=6000),
@@ -1113,7 +1146,11 @@ class AgentChatLoop:
                     self.model_name,
                     response_preview,
                     call_id=ledger_call_id,
-                    meta={"round": round_index, "tool_call_count": len(tool_calls)},
+                    meta={
+                        "round": round_index,
+                        "tool_call_count": len(tool_calls),
+                        "thinking_chars": len(thinking),
+                    },
                 )
             return response
         except asyncio.CancelledError:
@@ -1307,7 +1344,14 @@ class AgentChatLoop:
         if control is not None:
             remaining = time_remaining(control)
             if remaining is not None:
-                candidates.append((TimeoutCategory.TASK_TIMEOUT, remaining))
+                if remaining <= 0:
+                    raise ShamsuTimeoutError(
+                        TimeoutCategory.TASK_TIMEOUT,
+                        0.0,
+                        self._timeout_message_for_category(TimeoutCategory.TASK_TIMEOUT, 0.0),
+                    )
+                if remaining >= self.timeout_config.min_model_call_seconds:
+                    candidates.append((TimeoutCategory.TASK_TIMEOUT, remaining))
         chosen_category, seconds = min(candidates, key=lambda item: item[1])
         if seconds <= 0:
             raise ShamsuTimeoutError(
@@ -1447,12 +1491,43 @@ class AgentChatLoop:
             status=RunStatus.RUNNING,
             deadline_at=control.deadline_at,
         )
-        state = self.runtime_state_store.create_task(
-            run_id=self.run_id,
-            task_id=self.runtime_task_id,
-            user_request=user_input,
-            project_id=self.workspace_root.name,
-        )
+        state = self.runtime_state_store.load_task(self.runtime_task_id, recover=False)
+        if state is None:
+            state = self.runtime_state_store.create_task(
+                run_id=self.run_id,
+                task_id=self.runtime_task_id,
+                user_request=user_input,
+                project_id=self.workspace_root.name,
+            )
+        elif state.status in {
+            RunStatus.CANCELLED,
+            RunStatus.TIMED_OUT,
+            RunStatus.FAILED,
+            RunStatus.COMPLETED,
+        }:
+            self.runtime_task_id = f"{self.runtime_task_id}-{uuid.uuid4().hex[:6]}"
+            self.failure_tracker = FailureTracker(
+                self.runtime_state_store,
+                self.runtime_task_id,
+                step_id_getter=self._current_failure_step_id,
+            )
+            self.repair_recorder = RepairRecorder(self.runtime_state_store, self.runtime_task_id)
+            self.agent_planner = AgentPlanner(
+                store=self.runtime_state_store,
+                tool_policy=self.tools,
+                registered_tool_names=self._registered_tool_names,
+                run_id=self.run_id,
+                task_id=self.runtime_task_id,
+            )
+            state = self.runtime_state_store.create_task(
+                run_id=self.run_id,
+                task_id=self.runtime_task_id,
+                user_request=user_input,
+                project_id=self.workspace_root.name,
+            )
+        else:
+            state.user_request = user_input
+            state.project_id = self.workspace_root.name
         state.status = RunStatus.RUNNING
         state.current_phase = ExecutionPhase.EXPLORE.value
         self.tools.set_phase(ExecutionPhase.EXPLORE, task_risk="low")
@@ -1799,6 +1874,19 @@ class AgentChatLoop:
         except Exception:
             pass
 
+    def _ensure_author_phase_for_mutation(self, user_input: str) -> None:
+        if not _request_requires_workspace_change(user_input):
+            return
+        try:
+            task = self.runtime_state_store.load_task(self.runtime_task_id)
+            current = normalize_phase(task.current_phase) if task is not None else ExecutionPhase.EXPLORE
+        except Exception:
+            current = ExecutionPhase.EXPLORE
+        if current not in {ExecutionPhase.EXPLORE, ExecutionPhase.PLAN}:
+            return
+        self.tools.set_phase(ExecutionPhase.AUTHOR, task_risk="medium")
+        self._checkpoint_task_status(RunStatus.RUNNING, ExecutionPhase.AUTHOR.value, "phase_selected")
+
     def _active_step_elapsed_seconds(self) -> float | None:
         if self.timeout_config.step_timeout <= 0:
             return None
@@ -1880,6 +1968,7 @@ class AgentChatLoop:
             user_input = await self._append_plan(user_input)
             self.runtime_state_store.record_plan_created(self.runtime_task_id)
             self._apply_active_step_phase()
+            self._ensure_author_phase_for_mutation(user_input)
             if self._active_step_timed_out():
                 self._mark_active_step_timed_out()
                 return self._timeout_result(
@@ -1966,10 +2055,15 @@ class AgentChatLoop:
             self._inject_feedback(control)
             num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
             self._refresh_system_prompt()
-            messages = await self.context_compiler.compile(num_ctx, written_files)
+            tool_schema_payload = self._native_tool_schema_payload()
+            tool_schema_tokens = count_tokens(tool_schema_payload) if tool_schema_payload else 0
+            message_ctx = max(2048, num_ctx - tool_schema_tokens)
+            messages = await self.context_compiler.compile(message_ctx, written_files)
             # Show context-window usage before each model call.
             if self.budget_manager:
                 _msg_text = "\n".join(str(m.get("content", "")) for m in messages)
+                if tool_schema_payload:
+                    _msg_text = f"{_msg_text}\n{tool_schema_payload}"
                 _budget = self.budget_manager.compute(self.model_name, "chat", _msg_text)
                 _budget.compacted = self._last_context_evicted
                 self.budget_manager.show_indicator(_budget)

@@ -12459,6 +12459,7 @@ async def _execute_plan(
             session_logger=session_logger,
             force_long_running=True,
             auto_approve=True,
+            use_planner=False,
         )
         return
 
@@ -12481,6 +12482,8 @@ async def _execute_plan(
                 session_logger=session_logger,
                 force_long_running=True,
                 auto_approve=True,
+                use_planner=False,
+                runtime_task_id=f"task-{task_obj.task_id}-{step.id}",
             )
         except Exception as exc:
             task_obj = mark_step_failed(task_obj, step.id, str(exc))
@@ -15600,6 +15603,7 @@ async def _run_agent_chat(
     hydrate_history: bool = True,
     verify_changes: bool = True,
     use_model_compaction: bool = True,
+    runtime_task_id: str | None = None,
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -15718,7 +15722,10 @@ async def _run_agent_chat(
         None if trace_mode == "quiet" else console,
         session_logger,
         title="Agent",
-        max_steps=50 if long_running else 20,
+        # Agent progress emits model calls, tool starts, and tool results. A
+        # generic max here pretends those are the same unit; the chat loop prints
+        # the real model-call denominator as "choosing action X/Y".
+        max_steps=None,
         verbose=trace_mode == "verbose",
     )
     progress.step("Waiting for model response")
@@ -15757,6 +15764,8 @@ async def _run_agent_chat(
         # A pending ask_user must resume from the clean user request, not an
         # internal wrapper (composite step / PRD repair contract).
         chat_kwargs["original_user_request"] = safety_input
+    if runtime_task_id and _call_accepts_keyword(AgentChatLoop, "runtime_task_id"):
+        chat_kwargs["runtime_task_id"] = runtime_task_id
     if _call_accepts_keyword(AgentChatLoop, "audit"):
         session_id = session_logger.session_id if session_logger is not None else None
         audit = SessionAuditLog(workspace, session_id)
