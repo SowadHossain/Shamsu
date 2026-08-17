@@ -111,14 +111,30 @@ async def test_an_identical_repeat_escalates_sampling(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_a_persistent_repeat_evicts_the_failed_attempt_from_the_prompt(tmp_path: Path):
+    """The eviction happens in the chat state, which is where the bloat lived.
+
+    This used to assert on the outgoing prompt. Prompts are now compiled from
+    runtime state rather than replayed conversation, so no assistant turn
+    reaches the model at all - asserting on the wire would pass for the wrong
+    reason (nothing is there) and stop protecting anything. The invariant that
+    matters is unchanged: a repeated unparseable attempt must not accumulate.
+    """
     client = RepeatingClient(TRUNCATED)
     loop = _loop(tmp_path, client)
 
     await loop.run(REQUEST)
 
-    last = client.messages_seen[-1]
-    assistant = [str(m.get("content", "")) for m in last if m.get("role") == "assistant"]
+    assistant = [
+        message.content
+        for message in loop.state.all_messages
+        if message.role == "assistant"
+    ]
     assert any("unparseable tool call omitted" in text for text in assistant)
+    # replace_last_assistant is what fires on a proven repeat, so the guarantee
+    # is about the most recent turn: whatever the model copies from next must
+    # not be the payload it already failed to parse. Earlier attempts stay as
+    # evidence.
+    assert TRUNCATED not in assistant[-1]
 
 
 @pytest.mark.asyncio

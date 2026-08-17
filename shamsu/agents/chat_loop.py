@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
 import json
@@ -114,11 +115,13 @@ def _env_int_at_least(name: str, default: int, minimum: int) -> int:
     return value if value >= minimum else default
 
 
-# Interactive-chat context window. Local Ollama latency is dominated by prompt
-# prefill; filling a 32k window before every edit made small models appear
-# frozen. Keep ordinary tool-loop turns tighter by default. Override with
-# SHAMSU_CHAT_MAX_CTX on machines that can comfortably prefill larger prompts.
-_CHAT_MAX_CTX: int = _env_int_at_least("SHAMSU_CHAT_MAX_CTX", 12288, 6144)
+# Interactive-chat context window. Prefill still dominates local latency, so the
+# window is not filled for its own sake: the frame stays structured and ordered,
+# and the extra room buys three specific things a small model cannot infer -
+# the conversation digest, more complete source for the file being edited, and
+# the project symbol index. Replaying transcript is what this replaced.
+# Override with SHAMSU_CHAT_MAX_CTX on machines that prefill more slowly.
+_CHAT_MAX_CTX: int = _env_int_at_least("SHAMSU_CHAT_MAX_CTX", 32768, 6144)
 _CHAT_SUMMARY_BUDGET_TOKENS = 512
 _CHAT_PROMPT_TARGET_FRACTION = float(_os.environ.get("SHAMSU_CHAT_PROMPT_TARGET_FRACTION", "0.70"))
 _CHAT_HARD_TRIM_MARKER = "\n\n[...context hard-trimmed by SHAMSU to keep the local model responsive...]\n\n"
@@ -285,7 +288,15 @@ File tools:
 """
 
 # How many times the exact same tool call may repeat before we stop the loop.
-_MAX_REPEATED_CALLS = 3
+# Two identical calls, not three: with a 6-action step budget a third repeat
+# has already spent half the step on a call that produced nothing new.
+_MAX_REPEATED_CALLS = 2
+# Reasoning is flushed to the trace at a sentence/line break, or once this many
+# characters have accumulated without one.
+_THINKING_FLUSH_CHARS = 160
+# Prior turns kept in the conversation digest. Enough to hold the thread across
+# a working session without turning the frame back into a transcript.
+_HISTORY_DIGEST_TURNS = 8
 
 # Read/discovery tools whose failures get an explicit recovery instruction so the
 # model reaches for a candidate/find_file/grep_files instead of stalling.
@@ -623,6 +634,7 @@ class AgentChatLoop:
             recent_messages_getter=lambda: [
                 message.to_ollama() for message in self.state.all_messages[-8:]
             ],
+            history_digest_getter=self._session_history_digest,
             trace=lambda event, message, data: self._emit_trace(
                 event,
                 message,
@@ -1259,12 +1271,6 @@ class AgentChatLoop:
         control: ControlledRun | None,
         round_index: int,
     ) -> dict[str, Any]:
-        chunks: list[str] = []
-        thinking_chunks: list[str] = []
-        tool_calls: list[Any] = []
-        started = False
-        first_token_elapsed: float | None = None
-        chunk_count = 0
         started_at = time.monotonic()
         total_deadline = (
             time.monotonic() + self.timeout_config.total_generation_timeout
@@ -1272,6 +1278,36 @@ class AgentChatLoop:
             else None
         )
         iterator = stream.__aiter__()
+        try:
+            return await self._drain_streaming_chat(
+                iterator, control, round_index, started_at, total_deadline
+            )
+        finally:
+            # The loop below breaks as soon as the model says `done`, leaving the
+            # generator suspended. Without an explicit close it is finalized by
+            # the garbage collector on some later event loop, which is where the
+            # async-generator errors during cleanup came from.
+            close = getattr(iterator, "aclose", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    await close()
+
+    async def _drain_streaming_chat(
+        self,
+        iterator: Any,
+        control: ControlledRun | None,
+        round_index: int,
+        started_at: float,
+        total_deadline: float | None,
+    ) -> dict[str, Any]:
+        chunks: list[str] = []
+        thinking_chunks: list[str] = []
+        tool_calls: list[Any] = []
+        started = False
+        first_token_elapsed: float | None = None
+        chunk_count = 0
+        pending_thinking = ""
+        ollama_timings: dict[str, float] = {}
         while True:
             category = TimeoutCategory.TOKEN_IDLE_TIMEOUT if started else TimeoutCategory.FIRST_TOKEN_TIMEOUT
             wait_category, seconds = self._timeout_for_generation_wait(category, control, total_deadline)
@@ -1315,6 +1351,13 @@ class AgentChatLoop:
                 chunks.append(content)
             if thinking:
                 thinking_chunks.append(thinking)
+                # Surfaced AS IT ARRIVES, not after the turn. The channel was
+                # already separated here and then buffered until the whole
+                # response landed, which is why a reasoning model looked silent
+                # for a minute and then explained itself all at once.
+                pending_thinking = self._emit_thinking_delta(
+                    pending_thinking + thinking, round_index
+                )
             if current_tool_calls:
                 tool_calls.extend(current_tool_calls)
             chunk_count += 1
@@ -1327,6 +1370,7 @@ class AgentChatLoop:
                     has_tool_calls=bool(current_tool_calls),
                 )
             if bool(_get(chunk, "done", False)):
+                ollama_timings = _ollama_timings(chunk)
                 break
         response: dict[str, Any] = {
             "message": {
@@ -1350,8 +1394,84 @@ class AgentChatLoop:
                 content_chars=sum(len(part) for part in chunks),
                 thinking_chars=sum(len(part) for part in thinking_chunks),
                 tool_call_count=len(tool_calls),
+                **ollama_timings,
             )
+        if ollama_timings:
+            # Ollama measures its OWN time better than a wall clock outside it
+            # can: this separates model load, prompt prefill and generation, so
+            # "SHAMSU is slower than plain ollama" becomes a number instead of a
+            # feeling. Prefill is the one that grows with the context window.
+            self._emit_trace(
+                "llm.timing",
+                _format_ollama_timings(ollama_timings),
+                {"round": round_index, "model": self.model_name, **ollama_timings},
+                level="verbose",
+            )
+            if self.session_logger:
+                try:
+                    self.session_logger.log(
+                        "llm.timing",
+                        {"model": self.model_name, "round": round_index, **ollama_timings},
+                        _format_ollama_timings(ollama_timings),
+                        workflow_id="agent-chat",
+                    )
+                except Exception:
+                    pass
         return response
+
+    def _session_history_digest(self) -> str:
+        """What the user has asked for across this session, and how it went.
+
+        The state frame is compiled per model call from runtime state, and the
+        runtime task is recreated every prompt - so without this, nothing
+        carried intent across turns and the agent lost the thread after a
+        handful of prompts. ChatState hydrates from messages.jsonl, which does
+        span prompts, so the raw material was already here and simply unused.
+
+        Deliberately deterministic: no model call. A digest a 9B can trust
+        beats a paraphrase it has to second-guess, and it costs nothing.
+        """
+        turns: list[str] = []
+        pending_request = ""
+        for message in self.state.all_messages:
+            content = " ".join(str(message.content or "").split())
+            if not content or content.lstrip().startswith("[PHASE]"):
+                continue
+            if message.role == "user":
+                if pending_request:
+                    turns.append(f"- asked: {pending_request}")
+                pending_request = content[:200]
+            elif message.role == "assistant" and pending_request:
+                turns.append(f"- asked: {pending_request}\n  result: {content[:160]}")
+                pending_request = ""
+        if pending_request:
+            turns.append(f"- asked: {pending_request}")
+        if len(turns) <= 1:
+            # Nothing has happened yet that the current request does not say.
+            return ""
+        return "\n".join(turns[-_HISTORY_DIGEST_TURNS:])
+
+    def _emit_thinking_delta(self, buffered: str, round_index: int) -> str:
+        """Flush reasoning on a natural boundary; return what is still pending.
+
+        Per-token emission would drown the trace, so this releases on a sentence
+        or line break, or once a chunk is long enough to be worth reading.
+        """
+        if not buffered:
+            return ""
+        boundary = max(buffered.rfind("\n"), buffered.rfind(". "))
+        if boundary < 0 and len(buffered) < _THINKING_FLUSH_CHARS:
+            return buffered
+        cut = boundary + 1 if boundary >= 0 else len(buffered)
+        ready, rest = buffered[:cut].strip(), buffered[cut:]
+        if ready:
+            self._emit_trace(
+                "assistant.thinking.delta",
+                ready,
+                {"round": round_index, "chars": len(ready)},
+                level="verbose",
+            )
+        return rest
 
     async def _await_generation_boundary(
         self,
@@ -1811,10 +1931,11 @@ class AgentChatLoop:
         written_files: list[str],
     ) -> AgentLoopResult:
         self._mark_active_step_blocked(outcome.reason)
-        final = (
-            "I stopped this step because it hit the bounded step executor limit. "
-            f"Reason: {outcome.reason or 'no progress'}."
-        )
+        # The specific cause leads and the budget frame follows, never the other
+        # way round: this sentence is both what the user reads and what a later
+        # turn is steered by, and "hit the bounded step executor limit" is not
+        # something a 7B - or a person - can act on.
+        final = _blocked_step_message(outcome.reason)
         self.state.append_assistant(final)
         control.record_event(
             "step_execution_blocked",
@@ -2638,13 +2759,11 @@ class AgentChatLoop:
                 if (
                     name in {"read_file", "file.read"}
                     and requested_read in successful_read_paths
-                    and (
-                        len(successful_read_paths) >= 2
-                        or (
-                            _request_is_verification_repair(original_input)
-                            and bool(self.tools.allowed_write_paths())
-                        )
-                    )
+                    # Re-reading ONE already-read file is enough to intervene.
+                    # The old rule waited for two distinct successful reads, so
+                    # against a 6-action budget a model could burn a third of
+                    # the step re-reading the same file before anything stopped
+                    # it - and then be blocked for making no progress.
                     and _request_requires_workspace_change(original_input)
                     and not successful_mutation
                 ):
@@ -2813,16 +2932,60 @@ class AgentChatLoop:
                             },
                             level="verbose",
                         )
+                if not result.ok and "denied by user" in result.message.lower():
+                    # Checked BEFORE the policy branch below. A denied approval is
+                    # terminal, but it is terminal for a REASON the user needs to
+                    # read; letting the generic step-budget message answer for it
+                    # replaced "approval was denied" with boilerplate.
+                    self._record_failure(
+                        FailureType.PERMISSION_DENIED,
+                        action=name,
+                        evidence=[result.message],
+                        detail={"arguments": arguments},
+                    )
+                    final = (
+                        f"{name} was not run because approval was denied. "
+                        "No action was taken."
+                    )
+                    self.state.append_assistant(final)
+                    self._emit_trace(
+                        "workflow.blocked",
+                        final,
+                        {"category": "approval_denied", "tool": name},
+                    )
+                    self._audit_final(final)
+                    return AgentLoopResult(
+                        final=final,
+                        tool_rounds=round_index,
+                        stopped=True,
+                        changed_files=tuple(written_files),
+                    )
                 if not result.ok:
+                    # A rejected ACTION is not a failed STEP. REJECT_ACTION means
+                    # "not that tool - here are the allowed ones", which a small
+                    # model can act on immediately; ending the step instead threw
+                    # away work already on disk and reported a finished edit as
+                    # FAILED. Only a policy that genuinely cannot continue (STOP)
+                    # or an authorization the user refused is terminal here. The
+                    # consecutive-failure budget still bounds a model that keeps
+                    # picking denied tools.
                     terminal_policy = bool(
                         tool_failure_policy is not None
                         and tool_failure_policy.max_retries <= 0
-                        and tool_failure_policy.action
-                        in {
-                            RecoveryAction.REJECT_ACTION,
-                            RecoveryAction.STOP,
-                        }
+                        and (
+                            tool_failure_policy.action == RecoveryAction.STOP
+                            or (
+                                tool_failure is not None
+                                and tool_failure.failure_type == FailureType.PERMISSION_DENIED
+                            )
+                        )
                     )
+                    if (
+                        not terminal_policy
+                        and tool_failure_policy is not None
+                        and tool_failure_policy.action == RecoveryAction.REJECT_ACTION
+                    ):
+                        self.state.append_user(_rejected_action_guidance(name, result))
                     if terminal_policy:
                         step_outcome = self._apply_step_outcome(
                             step_controller,
@@ -2876,30 +3039,6 @@ class AgentChatLoop:
                         "The user already authorized the requested operation. Choose the matching "
                         "registered mcp__ tool, correct its arguments, and continue. Do not replace "
                         "it with a shell command or ask for confirmation that was already given."
-                    )
-                if not result.ok and "denied by user" in result.message.lower():
-                    self._record_failure(
-                        FailureType.PERMISSION_DENIED,
-                        action=name,
-                        evidence=[result.message],
-                        detail={"arguments": arguments},
-                    )
-                    final = (
-                        f"{name} was not run because approval was denied. "
-                        "No action was taken."
-                    )
-                    self.state.append_assistant(final)
-                    self._emit_trace(
-                        "workflow.blocked",
-                        final,
-                        {"category": "approval_denied", "tool": name},
-                    )
-                    self._audit_final(final)
-                    return AgentLoopResult(
-                        final=final,
-                        tool_rounds=round_index,
-                        stopped=True,
-                        changed_files=tuple(written_files),
                     )
                 if name in {"write_file", "edit_file", "append_file", "file.patch"} and result.ok:
                     _data = result.data if isinstance(result.data, dict) else {}
@@ -4695,6 +4834,92 @@ urlpatterns = [path("orders/", views.my_orders, name="my_orders")]
   backticks instead of three. Markdown files always need four.
 - One block per file. Emit the blocks plus a one-line summary, nothing else.
 """
+
+
+# Step-executor reasons that read as a bare label rather than a sentence. The
+# stop is reported in the caller's words where they exist, so the reason a step
+# ended survives into the final answer instead of being replaced by the budget.
+_BLOCKED_REASON_SENTENCES = {
+    "empty model response": "The model returned an empty response and did not act.",
+    "model produced no executable action": (
+        "The model replied with prose instead of calling a tool."
+    ),
+}
+
+
+def _blocked_step_message(reason: str) -> str:
+    cleaned = (reason or "").strip().rstrip(".")
+    if not cleaned:
+        return "I stopped this step because it made no progress."
+    sentence = _BLOCKED_REASON_SENTENCES.get(cleaned.lower())
+    if sentence is None:
+        sentence = cleaned[0].upper() + cleaned[1:] + "."
+    return f"{sentence} I stopped this step here rather than burning more attempts on it."
+
+
+_OLLAMA_TIMING_FIELDS = (
+    "total_duration",
+    "load_duration",
+    "prompt_eval_duration",
+    "eval_duration",
+    "prompt_eval_count",
+    "eval_count",
+)
+
+
+def _ollama_timings(chunk: Any) -> dict[str, float]:
+    """Pull Ollama's own measurements off the final stream chunk.
+
+    Durations arrive in nanoseconds; they are converted to milliseconds here so
+    the numbers are comparable with everything else SHAMSU records.
+    """
+    timings: dict[str, float] = {}
+    for field in _OLLAMA_TIMING_FIELDS:
+        raw = _get(chunk, field, None)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if field.endswith("_duration"):
+            timings[f"{field}_ms"] = round(value / 1_000_000, 2)
+        else:
+            timings[field] = int(value)
+    return timings
+
+
+def _format_ollama_timings(timings: dict[str, float]) -> str:
+    load = timings.get("load_duration_ms", 0.0)
+    prefill = timings.get("prompt_eval_duration_ms", 0.0)
+    generate = timings.get("eval_duration_ms", 0.0)
+    prompt_tokens = timings.get("prompt_eval_count", 0)
+    output_tokens = timings.get("eval_count", 0)
+    rate = f", {output_tokens / (generate / 1000):.1f} tok/s" if generate else ""
+    return (
+        f"load {load:.0f}ms, prefill {prefill:.0f}ms ({prompt_tokens:.0f} tok), "
+        f"generate {generate:.0f}ms ({output_tokens:.0f} tok){rate}"
+    )
+
+
+def _rejected_action_guidance(name: str, result: Any) -> str:
+    """Turn a policy rejection into the one instruction a small model can act on.
+
+    The rejection payload already carries the allowed tool set. Without handing
+    it back, a 7B re-picks the tool that was just denied until the consecutive
+    failure budget ends the step - so the allowlist has to travel back into the
+    conversation, not just into the log.
+    """
+    data = result.data if isinstance(getattr(result, "data", None), dict) else {}
+    allowed = sorted({str(item) for item in (data.get("allowed_tools") or []) if str(item)})
+    reason = str(data.get("reason") or getattr(result, "message", "") or "").strip()
+    lines = [f"{name} was rejected and did NOT run."]
+    if reason:
+        lines.append(reason)
+    if allowed:
+        lines.append("Tools available for this step: " + ", ".join(allowed) + ".")
+    lines.append(f"Choose one of those and make the call now. Do not call {name} again.")
+    return " ".join(lines)
 
 
 def _thinking_preview(thinking: str, limit: int = 200) -> str:

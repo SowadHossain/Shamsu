@@ -259,7 +259,11 @@ async def test_repeated_successful_read_recovers_without_asking_user(tmp_path: P
         for message in round_messages
         if message.get("role") == "user"
     ]
-    assert any("DIFFERENT concrete action" in message for message in recovery_messages)
+    # The redundant-read guard now fires on the FIRST repeat rather than waiting
+    # for the generic repeated-call counter, so the correction names the actual
+    # problem ("you already read this") instead of "do something different".
+    # Against a 6-action budget the old threshold spent half the step first.
+    assert any("already been read successfully" in message for message in recovery_messages)
 
 
 @pytest.mark.asyncio

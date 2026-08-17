@@ -152,6 +152,16 @@ _NEGATED_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _DELETE_ONLY_RE = re.compile(r"\b(?:delete|remove)\s+only\b", re.IGNORECASE)
+# The user describing what THEY already did is not an instruction to do it
+# again. "i have add a prd to my working folder can you check that out?" was
+# read as a mutation because of the bare "add", which then overrode a correct
+# workspace.prds route and sent a read-only question into the agent loop.
+_REPORTED_ACTION_RE = re.compile(
+    r"\b(?:i|we)\s+(?:have\s+|'ve\s+|had\s+|just\s+|already\s+)*"
+    r"(?:add(?:ed)?|creat(?:e|ed)|wrote|written|made|make|built|build|put|drop(?:ped)?"
+    r"|install(?:ed)?|updat(?:e|ed)|chang(?:e|ed)|remov(?:e|ed)|delet(?:e|ed))\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -513,6 +523,7 @@ def _operation_kind(clause: str) -> str:
     text = " ".join(clause.lower().split())
     explicitly_read_only = read_only.applies(text)
     action_text = _NEGATED_ACTION_RE.sub(" ", read_only.strip(text))
+    action_text = _REPORTED_ACTION_RE.sub(" ", action_text)
     if not text:
         return ""
     if any(
@@ -570,7 +581,25 @@ def _operation_kind(clause: str) -> str:
     return "answer"
 
 
+# Deterministic handlers that answer a prompt without touching anything. The
+# kind heuristics below exist to stop a WRITE landing somewhere useless (web
+# search, weak QA); they must not also override a route that already answers
+# the question for free. Without this, "can you check that out?" classified as
+# workspace.prds and was then rerouted into the agent loop by the verify branch.
+_DETERMINISTIC_READ_ROUTES = frozenset(
+    {
+        "workspace.prds",
+        "workspace.files",
+        "workspace.location",
+        "prd_summary",
+        "prd.context_question",
+    }
+)
+
+
 def _route_for_kind(kind: str, classified: str, clause: str = "") -> str:
+    if classified in _DETERMINISTIC_READ_ROUTES and kind != "mutation":
+        return classified
     # A turn whose instruction is to write a file is never a web search,
     # whatever the model's classifier decided. Without this the fall-through at
     # the end returned the classifier's answer verbatim, and a prompt dictating

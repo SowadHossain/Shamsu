@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from shamsu.agents import chat_loop as chat_loop_module
+from shamsu.verification import verifier as verifier_module
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.verify.gate import (
@@ -524,7 +525,7 @@ def _loop(tmp_path: Path, *, long_running: bool) -> AgentChatLoop:
 @pytest.mark.asyncio
 async def test_maybe_verify_appends_failure_note(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(
             verified=False,
@@ -542,7 +543,7 @@ async def test_maybe_verify_appends_failure_note(tmp_path: Path, monkeypatch):
 @pytest.mark.asyncio
 async def test_maybe_verify_appends_verified_note(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(
             verified=True,
@@ -559,7 +560,7 @@ async def test_maybe_verify_appends_verified_note(tmp_path: Path, monkeypatch):
 @pytest.mark.asyncio
 async def test_maybe_verify_unverifiable_leaves_answer_untouched(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(verified=False, unverifiable=True, summary="UNVERIFIED"),
     )
@@ -573,7 +574,7 @@ async def test_maybe_verify_runs_lightweight_check_when_not_long_running(
     tmp_path: Path, monkeypatch
 ):
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(
             verified=True,
@@ -592,7 +593,7 @@ async def test_maybe_verify_skips_when_no_writes(tmp_path: Path, monkeypatch):
     def _boom(*a, **k):  # pragma: no cover - must not run
         raise AssertionError("verify must not run when nothing was written")
 
-    monkeypatch.setattr(chat_loop_module, "verify_only", _boom)
+    monkeypatch.setattr(verifier_module, "verify_only", _boom)
     loop = _loop(tmp_path, long_running=True)
     final = await loop._maybe_verify("Answer.", [])
     assert final == "Answer."

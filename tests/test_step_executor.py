@@ -104,7 +104,10 @@ async def test_failing_step_blocks_before_broad_loop_limit(tmp_path: Path):
     result = await loop.run("inspect missing files")
 
     assert result.status == RunStatus.FAILED
-    assert "bounded step executor limit" in result.final
+    # The message names the budget that actually fired, not the generic frame:
+    # this sentence is what the user reads and what a later turn is steered by.
+    assert "Consecutive failure budget exhausted (3)" in result.final
+    # The point of the test: the step's own budget stopped it, not max_tool_rounds=50.
     assert client.calls == 3
     store = RuntimeStateStore(tmp_path)
     task = store.require_task(result.task_id)

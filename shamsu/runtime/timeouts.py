@@ -26,13 +26,18 @@ class ShamsuTimeoutError(TimeoutError):
 
 @dataclass(frozen=True)
 class TimeoutConfig:
+    # Sized for a local 9B on a 32k window. Prefill dominates first-token time
+    # and grows with the prompt, so a 180s first-token bound started failing
+    # runs that were working, just slowly. The task budget has to cover the
+    # write AND its verification - a build that wrote correctly and then timed
+    # out before proving it reports as a failure and loses the evidence.
     connect_timeout: float = 15.0
-    first_token_timeout: float = 180.0
+    first_token_timeout: float = 240.0
     token_idle_timeout: float = 180.0
     total_generation_timeout: float = 0.0
     tool_timeout: float = 120.0
     step_timeout: float = 0.0
-    task_timeout: float = 300.0
+    task_timeout: float = 900.0
     min_model_call_seconds: float = 60.0
 
     @classmethod
@@ -40,12 +45,12 @@ class TimeoutConfig:
         old_model_timeout = _env_float("SHAMSU_MODEL_TIMEOUT_SECONDS", 0.0)
         return cls(
             connect_timeout=_env_float("SHAMSU_CONNECT_TIMEOUT_SECONDS", _env_float("SHAMSU_LLM_CONNECT_TIMEOUT", 15.0)),
-            first_token_timeout=_env_float("SHAMSU_FIRST_TOKEN_TIMEOUT_SECONDS", old_model_timeout or 180.0),
+            first_token_timeout=_env_float("SHAMSU_FIRST_TOKEN_TIMEOUT_SECONDS", old_model_timeout or 240.0),
             token_idle_timeout=_env_float("SHAMSU_TOKEN_IDLE_TIMEOUT_SECONDS", _env_float("SHAMSU_LLM_IDLE_TIMEOUT", 180.0)),
             total_generation_timeout=_env_float("SHAMSU_TOTAL_GENERATION_TIMEOUT_SECONDS", 0.0),
             tool_timeout=_env_float("SHAMSU_TOOL_TIMEOUT_SECONDS", 120.0),
             step_timeout=_env_float("SHAMSU_STEP_TIMEOUT_SECONDS", 0.0),
-            task_timeout=_env_float("SHAMSU_TASK_TIMEOUT_SECONDS", _env_float("SHAMSU_RUN_TIMEOUT_SECONDS", 300.0)),
+            task_timeout=_env_float("SHAMSU_TASK_TIMEOUT_SECONDS", _env_float("SHAMSU_RUN_TIMEOUT_SECONDS", 900.0)),
             min_model_call_seconds=_env_float("SHAMSU_MIN_MODEL_CALL_SECONDS", 60.0),
         )
 

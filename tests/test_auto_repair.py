@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import shamsu.agents.chat_loop as chat_loop_module
+from shamsu.verification import verifier as verifier_module
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.types import LLMResponse
@@ -75,7 +76,7 @@ async def test_failed_verify_triggers_one_repair_and_reports_success(tmp_path: P
 
     monkeypatch.setattr("shamsu.verify.gate.verify_and_repair", _fake_repair)
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(verified=False, exit_code=1, command="py_compile", summary="SyntaxError"),
     )
@@ -101,7 +102,7 @@ async def test_failed_repair_keeps_the_honest_unconfirmed_note(tmp_path: Path, m
         lambda *a, **k: VerifyOutcome(verified=False, exit_code=1, command="py_compile", summary="still broken"),
     )
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(verified=False, exit_code=1, command="py_compile", summary="SyntaxError"),
     )
@@ -122,7 +123,7 @@ async def test_repair_can_be_disabled(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("shamsu.verify.gate.verify_and_repair", _must_not_run)
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(verified=False, exit_code=1, command="c", summary="fail"),
     )
@@ -141,7 +142,7 @@ async def test_a_repair_error_degrades_to_unconfirmed(tmp_path: Path, monkeypatc
 
     monkeypatch.setattr("shamsu.verify.gate.verify_and_repair", _boom)
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(verified=False, exit_code=1, command="c", summary="fail"),
     )
@@ -159,7 +160,7 @@ async def test_a_passing_verify_never_runs_repair(tmp_path: Path, monkeypatch):
 
     monkeypatch.setattr("shamsu.verify.gate.verify_and_repair", _must_not_run)
     monkeypatch.setattr(
-        chat_loop_module,
+        verifier_module,
         "verify_only",
         lambda *a, **k: VerifyOutcome(verified=True, exit_code=0, command="c", summary="ok"),
     )

@@ -10,6 +10,7 @@ import argparse
 import ast
 import asyncio
 import atexit
+import contextlib
 import difflib
 import inspect
 import itertools
@@ -17,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -115,6 +117,7 @@ from shamsu.prd.execution import (
     mark_milestone_running,
     milestone_lines_from_state,
     model_preflight_schema,
+    prd_execution_root,
     record_milestone_preflight,
     record_milestone_repair,
     record_milestone_rollback,
@@ -138,7 +141,7 @@ from shamsu.plans.contracts import (
     validate_contract,
     write_plan_contracts,
 )
-from shamsu.plans.store import parse_plan_steps, read_plan
+from shamsu.plans.store import parse_plan_steps, plan_has_no_steps, read_plan
 from shamsu.routing.operations import (
     OperationPlan,
     OperationStep,
@@ -187,6 +190,7 @@ from shamsu.runtime.ollama import (
     status_text,
     wait_until_running,
 )
+from shamsu.runtime.run_control import active_run_ids, cancel_run
 from shamsu.runtime.session_registry import claim_ollama_ownership, register_session
 from shamsu.safety import dry_run, read_only
 from shamsu.safety.approval import ask_approval, ask_approval_menu, ask_tier_choice
@@ -201,7 +205,7 @@ from shamsu.patch.rollback import latest_undoable_transaction, rollback_transact
 from shamsu.patch.transactions import TransactionWorkspace
 from shamsu.audit import SessionAuditLog
 from shamsu.session.manager import SessionLogger, SessionManager
-from shamsu.session.memory import is_affirmative, is_negative
+from shamsu.session.memory import is_affirmative, is_negative, strip_filler_prefix
 from shamsu.templates.django.writer import DjangoProjectWriter
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.tools.browser import BrowserTool
@@ -1717,6 +1721,123 @@ def _resolve_pending_question(
     if created_from:
         return f'{created_from}\n\n(Answering the earlier question "{question}": {resolved_value})'
     return resolved_value
+
+
+# Two interrupts inside this window mean "I really want out", not "cancel again".
+_DOUBLE_INTERRUPT_SECONDS = 2.0
+
+
+class _RequestRunner:
+    """Runs one REPL request on a session-lifetime loop, cancellable with Ctrl+C.
+
+    Every request used to get its own ``asyncio.run``. Ctrl+C during one raised
+    KeyboardInterrupt straight through it, and because that is not an
+    ``Exception`` the loop's catch-all never saw it: the interrupt escaped
+    ``while True``, ended ``main()``, and took plan mode, pending actions, and
+    the in-flight run's state with it. A cancelled operation is not a cancelled
+    session.
+
+    The first Ctrl+C now asks the active run to stop and cancels the request
+    task; the run's own cancel path marks it CANCELLED and the prompt comes
+    back. A second Ctrl+C within :data:`_DOUBLE_INTERRUPT_SECONDS` exits, so
+    quitting is still two keystrokes away.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self.cancelled = False
+        self._loop = asyncio.new_event_loop()
+        self._task: asyncio.Task[Any] | None = None
+        self._last_interrupt = 0.0
+
+    def run(self, coro: Any) -> bool:
+        """Run ``coro`` to completion. Returns False when the user cancelled it."""
+        self.cancelled = False
+        try:
+            previous = signal.signal(signal.SIGINT, self._on_interrupt)
+        except ValueError:
+            # Not the main thread (embedded/test use): no signal handling here,
+            # but the request must still run.
+            previous = None
+        try:
+            self._loop.run_until_complete(self._guarded(coro))
+        finally:
+            if previous is not None:
+                signal.signal(signal.SIGINT, previous)
+        return not self.cancelled
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._loop.close()
+
+    async def _guarded(self, coro: Any) -> Any:
+        self._task = self._loop.create_task(coro)
+        # Windows' proactor loop can sit inside an IOCP wait that never returns
+        # to Python bytecode, and a signal handler only runs between bytecodes -
+        # so without a periodic wakeup Ctrl+C would not be seen until the wait
+        # ended on its own, which is exactly when it is least useful.
+        pump = self._loop.create_task(self._signal_pump())
+        try:
+            return await self._task
+        except asyncio.CancelledError:
+            self.cancelled = True
+            self.console.print(
+                "\n[yellow]Cancelled that operation.[/yellow] "
+                "[dim]The session is still here - your plan and pending actions are intact.[/dim]"
+            )
+            return None
+        finally:
+            pump.cancel()
+            # Await the cancelled children so their CancelledError is retrieved
+            # here rather than surfacing later as "Task exception was never
+            # retrieved" noise on an otherwise healthy session.
+            with contextlib.suppress(asyncio.CancelledError):
+                await pump
+            if self._task is not None and self._task.done() and not self._task.cancelled():
+                with contextlib.suppress(Exception):
+                    self._task.exception()
+            self._task = None
+
+    async def _signal_pump(self) -> None:
+        while True:
+            await asyncio.sleep(0.15)
+
+    def _on_interrupt(self, _signum: int, _frame: Any) -> None:
+        now = time.monotonic()
+        if now - self._last_interrupt < _DOUBLE_INTERRUPT_SECONDS:
+            raise KeyboardInterrupt
+        self._last_interrupt = now
+        # Ask the run to stop first. Setting its cancel_event before cancelling
+        # the task lets the agent loop take its own graceful exit - recording a
+        # CANCELLED status and returning partial work - instead of unwinding
+        # from whatever await it happened to be sitting on.
+        for run_id in active_run_ids():
+            with contextlib.suppress(Exception):
+                cancel_run(run_id)
+        task = self._task
+        if task is not None and not task.done():
+            self._loop.call_soon_threadsafe(task.cancel)
+        self.console.print(
+            "[dim]Stopping the current operation... (Ctrl+C again to leave SHAMSU)[/dim]"
+        )
+
+
+_REQUEST_RUNNER: _RequestRunner | None = None
+
+
+def _run_request(coro: Any, console: Console | None = None) -> bool:
+    """Run a REPL request under Ctrl+C cancellation. False when cancelled.
+
+    Falls back to a plain ``asyncio.run`` when no session runner exists, so
+    tests and non-REPL callers keep working unchanged.
+    """
+    runner = _REQUEST_RUNNER
+    if runner is None:
+        asyncio.run(coro)
+        return True
+    if console is not None:
+        runner.console = console
+    return runner.run(coro)
 
 
 def _report_request_error(
@@ -3308,7 +3429,7 @@ def _handle_web(
             argument,
             reason="User explicitly requested a sourced web search.",
         )
-        asyncio.run(_print_web_answer(argument, result, result.pages, console, llm))
+        _run_request(_print_web_answer(argument, result, result.pages, console, llm))
         return
     if command in {"open", "summarize"}:
         if not argument:
@@ -4210,7 +4331,7 @@ _ROUTE_RULES: tuple[tuple[str, Callable[[str, Path], bool]], ...] = (
     ("command.run", lambda text, ws: _command_for_existing_script_request(text, ws) != ""),
     # A self-contained coding question ("write python for the first 100 primes")
     # is answered directly by the model - no planner, no tool loop, no timeout.
-    ("direct_code", lambda text, ws: _looks_like_direct_code_request(text)),
+    ("direct_code", lambda text, ws: _looks_like_direct_code_request(text, ws)),
     ("workspace.prds", lambda text, ws: _looks_like_workspace_prd_request(text)),
     (
         "continue_game",
@@ -7114,7 +7235,44 @@ _DIRECT_CODE_WORKSPACE_SIGNALS = (
 )
 
 
-def _looks_like_direct_code_request(user_input: str) -> bool:
+# Capitalized words that are languages, frameworks or tools rather than the
+# user's own domain types, so "write a Python function" stays a self-contained
+# question while "implement Spaceship and Bullet classes" does not.
+_DIRECT_CODE_TECH_NOUNS = {
+    "python", "javascript", "typescript", "java", "kotlin", "swift", "go",
+    "golang", "rust", "ruby", "php", "perl", "scala", "haskell", "elixir",
+    "sql", "html", "css", "bash", "powershell", "react", "vue", "angular",
+    "svelte", "django", "flask", "fastapi", "express", "node", "nodejs",
+    "pygame", "numpy", "pandas", "pytorch", "tensorflow", "docker", "git",
+    "linux", "windows", "macos", "postgres", "postgresql", "mysql", "sqlite",
+    "redis", "mongodb", "api", "json", "yaml", "csv", "http", "https", "rest",
+    "i", "a", "the", "write", "implement", "create", "add", "build", "make",
+}
+_DOMAIN_TYPE_RE = re.compile(r"\b([A-Z][A-Za-z0-9_]{2,})\b")
+
+
+def _names_workspace_domain_types(user_input: str, workspace: Path) -> bool:
+    """True when the request names capitalized domain types in a live project.
+
+    "Implement Spaceship and Bullet classes" is a workspace edit, not a coding
+    quiz - but with no filename in it, it looked identical to "write python for
+    the first 100 primes" and was answered in chat while the project sat
+    untouched. Proper-noun types plus an existing codebase is the distinction.
+    """
+    candidates = [
+        word
+        for word in _DOMAIN_TYPE_RE.findall(user_input)
+        if word.lower() not in _DIRECT_CODE_TECH_NOUNS
+    ]
+    if not candidates:
+        return False
+    try:
+        return bool(_workspace_file_inventory_for_preflight(workspace, limit=5))
+    except Exception:
+        return False
+
+
+def _looks_like_direct_code_request(user_input: str, workspace: Path | None = None) -> bool:
     """A self-contained coding question ("write python to print the first 100
     primes") that should be answered directly by the model, without the planner
     or the file/tool loop. File-writing and workspace requests are excluded."""
@@ -7127,6 +7285,8 @@ def _looks_like_direct_code_request(user_input: str) -> bool:
     if _FILELIKE_RE.search(user_input):
         return False
     if any(signal in text for signal in _DIRECT_CODE_WORKSPACE_SIGNALS):
+        return False
+    if workspace is not None and _names_workspace_domain_types(user_input, workspace):
         return False
     produce = any(verb in text for verb in _DIRECT_CODE_PRODUCE_VERBS)
     code_noun = any(noun in text for noun in _DIRECT_CODE_NOUNS)
@@ -7422,7 +7582,7 @@ def _extract_dev_command(user_input: str, workspace: Path) -> str:
 
 
 def _looks_like_affirmative_continue(user_input: str) -> bool:
-    text = re.sub(r"[^\w\s]", " ", user_input.lower()).strip()
+    text = strip_filler_prefix(re.sub(r"[^\w\s]", " ", user_input.lower()).strip())
     if not text:
         return False
     return text in {
@@ -7909,6 +8069,59 @@ Do not claim files already exist unless the prompt says they do.
 Keep the plan concrete, ordered, and buildable by a local coding agent."""
 
 
+_REPLAN_RE = re.compile(
+    r"\b(?:re-?plan|replan|new plan|fresh plan|plan (?:it )?again|start (?:the )?plan over)\b",
+    re.IGNORECASE,
+)
+
+
+def _development_plan_cache_path(
+    workspace: Path,
+    project: Any,
+    project_root: str,
+) -> Path | None:
+    """Where this PRD's approved development plan lives, keyed by contract hash.
+
+    Beside the milestone ledger rather than in the pending action: the plan is
+    project state, not conversation state. Saying "okay lets start" used to
+    re-run the planner from scratch because only the plan's SOURCE string was
+    ever stored.
+    """
+    contract_obj = getattr(project, "prd_contract", None)
+    if contract_obj is None:
+        return None
+    try:
+        ledger = compile_requirement_ledger(contract_obj)
+        root = prd_execution_root(workspace, ledger.contract_hash, execution_key=project_root)
+    except Exception:
+        return None
+    return root / "development_plan.json"
+
+
+def _load_cached_development_plan(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not data.get("milestones"):
+        return None
+    if data.get("source") != "model":
+        return None
+    return data
+
+
+def _save_development_plan(path: Path | None, plan: dict[str, Any]) -> None:
+    if path is None or plan.get("source") != "model":
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(plan, indent=2, ensure_ascii=True), encoding="utf-8")
+    except OSError as exc:
+        swallowed.record("repl.development_plan_save", exc)
+
+
 async def _prepare_prd_development_plan(
     parsed,
     relative_path: Path,
@@ -7917,7 +8130,18 @@ async def _prepare_prd_development_plan(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None,
+    *,
+    cache_path: Path | None = None,
+    force_replan: bool = False,
 ) -> dict[str, Any]:
+    if not force_replan:
+        cached = _load_cached_development_plan(cache_path)
+        if cached is not None:
+            console.print(
+                "[dim]Reusing the saved development plan for this PRD. "
+                "Say `replan` to build a new one.[/dim]"
+            )
+            return cached
     contract = getattr(project, "prd_contract", None)
     contract_brief = contract.render_brief() if contract is not None else ""
     payload = {
@@ -7989,6 +8213,7 @@ async def _prepare_prd_development_plan(
             milestones=len(plan.get("milestones") or []),
             error=plan.get("error", ""),
         )
+    _save_development_plan(cache_path, plan)
     if plan.get("source") == "model":
         console.print("[dim]LLM development plan accepted from planner role.[/dim]")
     elif plan.get("source") == "planner_failed":
@@ -8000,7 +8225,62 @@ async def _prepare_prd_development_plan(
     return plan
 
 
-def _validate_prd_development_plan(candidate: Any) -> dict[str, Any]:
+# File extensions that betray a stack the request never asked for. Keyed by the
+# stack the plan would be drifting INTO, so the rejection can name it.
+_STACK_SIGNATURE_FILES = {
+    "django/web backend": ("settings.py", "urls.py", "wsgi.py", "asgi.py", "forms.py", "admin.py"),
+    "node/web frontend": ("package.json", "vite.config.js", "vite.config.ts", "tsconfig.json"),
+}
+# Words in the request that legitimately license each of those stacks.
+_STACK_LICENCE_WORDS = {
+    "django/web backend": (
+        "django", "web app", "webapp", "website", "backend", "api", "rest",
+        "server", "dashboard", "admin", "crud", "http", "browser",
+    ),
+    "node/web frontend": (
+        "react", "vue", "svelte", "vite", "node", "npm", "typescript",
+        "javascript", "frontend", "web app", "webapp", "website", "browser",
+    ),
+}
+
+
+def _architecture_conformance_errors(plan: dict[str, Any], request: str) -> list[str]:
+    """Reject a plan whose architecture does not match what was asked for.
+
+    A pygame request came back as a plan targeting `backend/core/forms.py` and
+    HTML templates, and nothing checked: the planner was validated for SHAPE
+    (ids, titles, goals present) and never for whether it was building the thing
+    the user described. Structure was well-formed; the product was wrong.
+    """
+    text = request.lower()
+    proposed = " ".join(
+        [
+            *(str(item) for item in plan.get("stack") or []),
+            *(
+                str(path)
+                for milestone in plan.get("milestones") or []
+                if isinstance(milestone, dict)
+                for path in milestone.get("files") or []
+            ),
+        ]
+    ).lower()
+    if not proposed:
+        return []
+    errors: list[str] = []
+    for stack, signatures in _STACK_SIGNATURE_FILES.items():
+        hits = sorted({name for name in signatures if name in proposed})
+        if not hits:
+            continue
+        if any(word in text for word in _STACK_LICENCE_WORDS[stack]):
+            continue
+        errors.append(
+            f"plan proposes {stack} files ({', '.join(hits)}) but the request "
+            f"never asks for that: {request.strip()[:120]}"
+        )
+    return errors
+
+
+def _validate_prd_development_plan(candidate: Any, request: str = "") -> dict[str, Any]:
     if not isinstance(candidate, dict):
         raise ValueError("planner did not return a JSON object")
     raw_milestones = candidate.get("milestones")
@@ -8349,6 +8629,160 @@ def _prd_skill_names_for_project(project: Any) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+def _prd_milestone_contracts(
+    preflight: dict[str, Any],
+    milestone: str,
+    milestone_id: str,
+    project_root: str,
+    workspace: Path,
+) -> list[TaskContract]:
+    """Turn one milestone into the atomic tasks that will actually be executed.
+
+    The decomposition already existed implicitly - expected-file passes and
+    behavioural file groups are one turn per file - but it lived only in the
+    call stack. Persisting it as TaskContracts makes the unit of work durable,
+    reviewable, and resumable, and gives each file its own locked write scope,
+    acceptance criteria, and verification requirement.
+    """
+    verifier = str(preflight.get("verifier") or "").strip()
+    requirement_refs = [str(item) for item in preflight.get("requirement_ids") or []]
+    targets: list[tuple[str, list[str]]] = []
+    for target in _preflight_expected_files(preflight):
+        targets.append((target, [f"{target} exists and satisfies its milestone requirements."]))
+    for target, requirements in _prd_behavioural_file_groups(preflight, project_root, workspace):
+        criteria = [
+            f"{item.get('id', '')}: {item.get('text', '')}".strip(": ")
+            for item in requirements
+            if isinstance(item, dict)
+        ]
+        targets.append((target, criteria or [f"{target} implements its behavioural requirements."]))
+
+    contracts: list[TaskContract] = []
+    previous_id = ""
+    seen: set[str] = set()
+    for index, (target, criteria) in enumerate(targets, 1):
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        task_id = f"{milestone_id}-task-{index:03d}"
+        contracts.append(
+            TaskContract(
+                task_id=task_id,
+                run_id=milestone_id,
+                objective=f"Implement {target} for milestone: {milestone}",
+                requirement_refs=requirement_refs,
+                dependencies=[previous_id] if previous_id else [],
+                allowed_write_paths=[target],
+                expected_write_paths=[target],
+                planner_proposed_files=[target],
+                acceptance_criteria=criteria,
+                verification_requirements=[verifier] if verifier else [],
+            )
+        )
+        previous_id = task_id
+    return contracts
+
+
+def _persist_prd_milestone_contracts(
+    preflight: dict[str, Any],
+    milestone: str,
+    milestone_id: str,
+    project_root: str,
+    workspace: Path,
+    session_logger: SessionLogger | None,
+) -> list[TaskContract]:
+    contracts = _prd_milestone_contracts(
+        preflight, milestone, milestone_id, project_root, workspace
+    )
+    if not contracts:
+        return []
+    validated: list[TaskContract] = []
+    for contract in contracts:
+        result = validate_contract(contract, workspace)
+        if result.ok:
+            validated.append(contract)
+        else:
+            _log_task_contract_event(
+                session_logger,
+                "task_contract.rejected",
+                {"task_id": contract.task_id, "errors": list(result.errors)},
+                "Milestone task contract failed validation",
+            )
+    if not validated:
+        return []
+    try:
+        write_plan_contracts(workspace, milestone_id, validated)
+    except OSError as exc:
+        swallowed.record("repl.prd_milestone_contracts", exc)
+    _log_task_contract_event(
+        session_logger,
+        "task_contract.milestone_decomposed",
+        {
+            "milestone_id": milestone_id,
+            "tasks": [contract.task_id for contract in validated],
+            "files": [path for contract in validated for path in contract.expected_write_paths],
+        },
+        f"Decomposed {milestone_id} into {len(validated)} atomic task(s)",
+    )
+    return validated
+
+
+def _pause_prd_milestone_between_files(
+    session_logger: SessionLogger | None,
+    *,
+    user_input: str,
+    relative_path: Path,
+    project_root: str,
+    milestone_id: str,
+    changed: list[str],
+    remaining: list[str],
+    console: Console,
+) -> None:
+    """Hand control back after one atomic file pass, naming what comes next.
+
+    `Autonomy: off` used to mean "one milestone per approval", which for a
+    scaffolding milestone was a dozen file writes the user never agreed to
+    individually. Off now means what it says: finish this file, report it, and
+    ask before starting the next one.
+    """
+    if session_logger is not None:
+        try:
+            session_logger.set_pending_action(
+                {
+                    "type": "prd_plan",
+                    "awaiting": "prd_plan_selection",
+                    "prd_path": relative_path.as_posix(),
+                    "project_root": project_root,
+                    "next_milestone_id": milestone_id,
+                    "created_from_prompt": user_input,
+                }
+            )
+        except Exception as exc:
+            swallowed.record("repl.prd_pause_between_files", exc)
+    console.print(
+        Panel(
+            f"Built {', '.join(changed)}.\n\n"
+            f"Next in {milestone_id}: {remaining[0]}\n"
+            f"{len(remaining)} file(s) left in this milestone.\n\n"
+            "Reply `continue` to build the next one, or `build all autonomously` "
+            "to finish the milestone without stopping.",
+            title="Paused After One File",
+            border_style="cyan",
+        )
+    )
+    _log_event(
+        session_logger,
+        "prd.milestone.file_pass_paused",
+        {
+            "milestone_id": milestone_id,
+            "changed": changed,
+            "remaining": remaining,
+        },
+        "Paused PRD milestone after one atomic file pass",
+        workflow_id="prd-build",
+    )
+
+
 def _pause_prd_build_after_slice(
     session_logger: SessionLogger | None,
     *,
@@ -8465,6 +8899,10 @@ async def _handle_prd_development_plan_request(
         workspace,
         console,
         session_logger,
+        cache_path=_development_plan_cache_path(
+            workspace, project, _prd_target_directory(user_input, project)
+        ),
+        force_replan=bool(_REPLAN_RE.search(user_input)),
     )
     if _prd_development_plan_failed(plan):
         _print_prd_development_plan_failure(plan, console)
@@ -9176,6 +9614,8 @@ async def _handle_prd_build_request(
         workspace,
         console,
         session_logger,
+        cache_path=_development_plan_cache_path(workspace, project, project_root),
+        force_replan=bool(_REPLAN_RE.search(user_input)),
     )
     if _prd_development_plan_failed(development_plan):
         _print_prd_development_plan_failure(development_plan, console)
@@ -9470,6 +9910,31 @@ async def _handle_prd_build_request(
         save_task(task, workspace)
         console.print(f"[dim]  -> Milestone {index + 1}/{len(milestones)}: {milestone}[/dim]")
         try:
+            # Decompose before implementing: the milestone's atomic tasks are
+            # written to .shamsu/plans/<milestone>.contracts.json first, so the
+            # unit of work is durable and reviewable rather than implicit in the
+            # call stack.
+            milestone_contracts = _persist_prd_milestone_contracts(
+                preflight,
+                milestone,
+                milestone_id,
+                project_root,
+                workspace,
+                session_logger,
+            )
+            # Keyed by target so each file pass can be handed ITS contract -
+            # locked write scope, acceptance criteria, verification. Building
+            # contracts and then not giving them to the model left every turn
+            # grounded only in the prompt text.
+            contracts_by_target = {
+                path: contract
+                for contract in milestone_contracts
+                for path in contract.expected_write_paths
+            }
+            # One approval buys one atomic file pass unless autonomy is on. The
+            # milestone stays the planning unit; the file is the execution unit.
+            pass_budget = None if is_long_running_enabled(workspace) else 1
+            remaining_targets: list[str] = []
             file_pass_changed = await _run_prd_expected_file_passes(
                 title=parsed.title,
                 relative_path=relative_path,
@@ -9480,6 +9945,9 @@ async def _handle_prd_build_request(
                 workspace=workspace,
                 console=console,
                 session_logger=session_logger,
+                max_passes=pass_budget,
+                remaining=remaining_targets,
+                contracts_by_target=contracts_by_target,
             )
             if not file_pass_changed and _prd_milestone_requires_mutation(preflight):
                 # The architecture pass only targets declared files that are
@@ -9496,7 +9964,43 @@ async def _handle_prd_build_request(
                     workspace=workspace,
                     console=console,
                     session_logger=session_logger,
+                    max_passes=pass_budget,
+                    remaining=remaining_targets,
+                    contracts_by_target=contracts_by_target,
                 )
+            if remaining_targets and file_pass_changed:
+                # Stop here rather than verifying a milestone that is knowingly
+                # half-built: the verifier would fail, the rollback would undo
+                # the work that just succeeded, and the user would be told the
+                # milestone broke when it was only unfinished.
+                _pause_prd_milestone_between_files(
+                    session_logger,
+                    user_input=user_input,
+                    relative_path=relative_path,
+                    project_root=project_root,
+                    milestone_id=milestone_id,
+                    changed=list(file_pass_changed),
+                    remaining=remaining_targets,
+                    console=console,
+                )
+                for path in file_pass_changed:
+                    if path not in changed_files:
+                        changed_files.append(path)
+                if prd_execution_root_path is not None:
+                    prd_execution_state = checkpoint_milestone(
+                        prd_execution_root_path,
+                        prd_execution_state,
+                        milestone_id,
+                        changed_files=list(file_pass_changed),
+                        evidence=[f"changed:{path}" for path in file_pass_changed],
+                        status="pending",
+                        message=(
+                            "Paused after one file pass; "
+                            f"{len(remaining_targets)} file(s) still to build."
+                        ),
+                    )
+                save_task(task, workspace)
+                return
             if file_pass_changed or resumed_milestone_changed:
                 accumulated = list(
                     dict.fromkeys([*resumed_milestone_changed, *file_pass_changed])
@@ -10967,11 +11471,24 @@ async def _run_prd_behavioural_file_passes(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None,
+    max_passes: int | None = None,
+    remaining: list[str] | None = None,
+    contracts_by_target: dict[str, TaskContract] | None = None,
 ) -> list[str]:
-    """Implement a milestone's behavioural requirements one file per turn."""
+    """Implement a milestone's behavioural requirements one file per turn.
+
+    ``max_passes`` bounds how many of those turns run before handing control
+    back; untouched targets are reported through ``remaining`` so the caller can
+    stop, say what is next, and wait. With autonomy off that bound is 1, which
+    is what makes one approval mean one file rather than one milestone.
+    """
     groups = _prd_behavioural_file_groups(preflight, project_root, workspace)
     if not groups:
         return []
+    if max_passes is not None and max_passes > 0 and len(groups) > max_passes:
+        if remaining is not None:
+            remaining.extend(target for target, _requirements in groups[max_passes:])
+        groups = groups[:max_passes]
 
     skill_context = _prd_milestone_skill_context(workspace, preflight)
     allowed = set(preflight.get("allowed_tools") or [])
@@ -11030,13 +11547,14 @@ description instead of a tool call.
             allowed_write_paths=[target],
             allowed_tools=turn_tools,
             required_tool_prefix="write_file" if "edit_file" not in turn_tools else "",
-            force_long_running=True,
+            force_long_running=is_long_running_enabled(workspace),
             auto_approve=True,
             use_long_term_memory=False,
             use_planner=False,
             user_request=_prd_agent_safety_request(project_root),
             hydrate_history=False,
-            verify_changes=False,
+            verify_changes=True,
+            task_contract=(contracts_by_target or {}).get(target),
         )
         for path in getattr(result, "changed_files", ()) or ():
             if path not in changed:
@@ -11056,12 +11574,18 @@ async def _run_prd_expected_file_passes(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None,
+    max_passes: int | None = None,
+    remaining: list[str] | None = None,
+    contracts_by_target: dict[str, TaskContract] | None = None,
 ) -> list[str]:
     """Materialize required architecture files through small, focused ReAct turns.
 
     A local 7B model is much more reliable when each turn has one mutation
     target. Valid files are retained, then the normal milestone pass integrates
     and verifies them as a unit.
+
+    ``max_passes`` bounds the turns per approval; anything not reached is
+    reported through ``remaining`` so the caller can stop and ask.
     """
     if not _prd_milestone_is_mandatory(preflight):
         return []
@@ -11076,6 +11600,10 @@ async def _run_prd_expected_file_passes(
     targets = list(dict.fromkeys([*missing, *invalid]))
     if not targets:
         return []
+    if max_passes is not None and max_passes > 0 and len(targets) > max_passes:
+        if remaining is not None:
+            remaining.extend(targets[max_passes:])
+        targets = targets[:max_passes]
 
     requirements = "\n".join(
         f"- {item.get('id', '')} [{item.get('kind', '')}]: {item.get('text', '')}"
@@ -11208,7 +11736,7 @@ Do not modify any other file.
                 workspace,
                 console,
                 session_logger=session_logger,
-                force_long_running=True,
+                force_long_running=is_long_running_enabled(workspace),
                 auto_approve=True,
                 allowed_write_paths=(target,),
                 allowed_read_paths=(project_root,),
@@ -11224,7 +11752,8 @@ Do not modify any other file.
                     else ""
                 ),
                 hydrate_history=False,
-                verify_changes=False,
+                verify_changes=True,
+                task_contract=(contracts_by_target or {}).get(target),
             )
             after_invalid = _invalid_expected_architecture_files(preflight, workspace)
             after_errors = _prd_target_validation_errors(target, after_invalid)
@@ -12433,7 +12962,7 @@ def _run_plan_with_ledger(
     set_current_run(ledger)
     try:
         with console.status(_thinking_status_for_input(user_input), spinner="dots"):
-            asyncio.run(_handle_plan(task, workspace, console, session_logger=session_logger))
+            _run_request(_handle_plan(task, workspace, console, session_logger=session_logger))
     except Exception as exc:
         ledger.fail(str(exc))
         clear_current_run()
@@ -12727,6 +13256,27 @@ async def _execute_plan(
 ) -> None:
     """Execute an approved plan. Each step runs as its own agent pass with the plan
     as authoritative context, tracked as a MilestoneTask (visible via `tasks`)."""
+    if plan_has_no_steps(plan_markdown):
+        # The planner produced nothing. Executing anyway used to hand the agent
+        # the placeholder sentence as if it were a task; a single pass over an
+        # empty plan is not a fallback, it is a guess with no instruction in it.
+        console.print(
+            Panel(
+                "This plan has no steps - the planner did not produce any.\n\n"
+                "Open the plan file and add the steps you want, then run `/proceed`. "
+                "Or re-run `plan <task>` with a more specific task.",
+                title="Nothing To Execute",
+                border_style="red",
+            )
+        )
+        _log_event(
+            session_logger,
+            "plan.execute.refused_empty",
+            {"task": task, "route": route},
+            "Refused to execute a plan with no steps",
+            workflow_id="plan",
+        )
+        return
     if not steps:
         contracts = contracts or contracts_from_markdown("ad-hoc-plan", task, [], plan_markdown)
         contract = run_file_preflight(contracts[0], workspace) if contracts else None
@@ -15188,7 +15738,7 @@ def _resolve_proceed(
     ledger = start_run(workspace, "proceed", session_logger=session_logger)
     set_current_run(ledger)
     try:
-        asyncio.run(
+        _run_request(
             _execute_pending_plan(
                 pending,
                 workspace,
@@ -17403,6 +17953,10 @@ def main(argv: list[str] | None = None) -> None:
     bottom_toolbar = CachedBottomToolbar(workspace)
     session = _make_prompt_session(workspace, bottom_toolbar)
     command_router = CommandRouter(SYSTEM_COMMANDS)
+    # One event loop for the whole session, so a cancelled request returns to
+    # this prompt instead of ending the process (see _RequestRunner).
+    global _REQUEST_RUNNER
+    _REQUEST_RUNNER = _RequestRunner(console)
     # Plan mode: `/plan` with no task arms this, and the NEXT natural prompt is
     # planned instead of executed. Deliberately per-session (not persisted): a
     # mode that silently survives a restart would plan when you meant to build.
@@ -17414,9 +17968,15 @@ def main(argv: list[str] | None = None) -> None:
                 raw_input_text = input("shamsu> ")
             else:
                 raw_input_text = session.prompt([("class:prompt", "shamsu> ")])
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             print("\nGoodbye.")
             break
+        except KeyboardInterrupt:
+            # Ctrl+C at an idle prompt clears the line; it does not quit. Ctrl+D
+            # (EOF) and /exit are how you leave, which is the convention every
+            # other shell the user is already in follows.
+            console.print("[dim]Use /exit or Ctrl+D to leave.[/dim]")
+            continue
 
         # Strip a stray leading BOM that piped stdin can prepend; it is
         # not whitespace, so .strip() alone leaves it and it would break slash
@@ -17457,7 +18017,7 @@ def main(argv: list[str] | None = None) -> None:
                     ledger = start_run(workspace, user_input, session_logger=session_logger)
                     set_current_run(ledger)
                     try:
-                        asyncio.run(
+                        _run_request(
                             _resume_paused_plan(
                                 paused_plan, rewritten, workspace, console, session_logger
                             )
@@ -17591,7 +18151,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             continue
         if lowered_input.startswith("generate-prd "):
-            asyncio.run(_handle_generate_prd(normalized_input, workspace, console, session_logger))
+            _run_request(_handle_generate_prd(normalized_input, workspace, console, session_logger))
             continue
         if lowered_input.startswith("models"):
             _handle_models(normalized_input, console, workspace)
@@ -17609,7 +18169,7 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("django"):
             if lowered_input.startswith("django fix-tests"):
-                asyncio.run(
+                _run_request(
                     _handle_django_fix_tests(normalized_input, workspace, console, session_logger)
                 )
             else:
@@ -17672,7 +18232,7 @@ def main(argv: list[str] | None = None) -> None:
                 ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
-                    asyncio.run(
+                    _run_request(
                         _handle_tasks_execute(
                             normalized_input,
                             workspace,
@@ -17755,7 +18315,7 @@ def main(argv: list[str] | None = None) -> None:
                 ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
-                    asyncio.run(
+                    _run_request(
                         _execute_pending_prd_plan(
                             pending_action,
                             user_input,
@@ -17784,7 +18344,7 @@ def main(argv: list[str] | None = None) -> None:
                 ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
-                    asyncio.run(
+                    _run_request(
                         _execute_pending_plan(
                             pending_action,
                             workspace,
@@ -17819,7 +18379,7 @@ def main(argv: list[str] | None = None) -> None:
                 ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
-                    asyncio.run(
+                    _run_request(
                         _execute_pending_plan(
                             pending_action,
                             workspace,
@@ -17857,7 +18417,7 @@ def main(argv: list[str] | None = None) -> None:
         set_current_run(ledger)
         try:
             with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
-                asyncio.run(
+                completed = _run_request(
                     _handle_request(
                         dispatch_input,
                         workspace,
@@ -17874,11 +18434,18 @@ def main(argv: list[str] | None = None) -> None:
             clear_current_run()
             _report_request_error(exc, console, session_logger)
             continue
+        if not completed:
+            # Record the interrupt on the run itself, so a cancelled turn reads
+            # as cancelled rather than as whatever partial evidence it left.
+            with contextlib.suppress(Exception):
+                ledger.log_run_cancelled()
         _finish_current_run(workspace, ledger)
         clear_current_run()
 
     flush_memory_queues()
     browser_tool.close()
+    if _REQUEST_RUNNER is not None:
+        _REQUEST_RUNNER.close()
 
 
 if __name__ == "__main__":

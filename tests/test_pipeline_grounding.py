@@ -396,6 +396,13 @@ def test_freeform_prd_build_uses_scoped_react_milestones(tmp_path, monkeypatch):
     monkeypatch.setattr(repl_mod, "_verify_completed_plan", fake_final_verify)
     monkeypatch.setattr(repl_mod, "_prepare_prd_development_plan", fake_development_plan)
 
+    # This test drives the whole product to completion, which is now what
+    # autonomy ON means. With it off the build deliberately stops after one
+    # file pass and asks - see test_autonomy_off_stops_after_one_file_pass.
+    from shamsu.safety.autonomy import set_long_running_enabled
+
+    set_long_running_enabled(tmp_path, True)
+
     output = StringIO()
     console = Console(file=output, force_terminal=False, width=120)
     asyncio.run(
@@ -585,3 +592,105 @@ def test_bugfix_request_requires_concrete_target_before_workflow():
     assert not _bugfix_request_has_actionable_target("fix a code for me")
     assert _bugfix_request_has_actionable_target("fix app.py")
     assert _bugfix_request_has_actionable_target("fix this traceback: TypeError: bad value")
+
+
+def test_autonomy_off_stops_after_one_file_pass(tmp_path, monkeypatch):
+    """`Autonomy: off` must mean one FILE per approval, not one milestone.
+
+    A scaffolding milestone is a dozen file writes. Approving the milestone
+    approved all of them, which is what made "Autonomy: off" in the toolbar a
+    lie while the executor ran the whole thing unattended.
+    """
+    from rich.console import Console
+    from shamsu.cli import repl as repl_mod
+
+    prd = tmp_path / "prd.md"
+    prd.write_text(
+        "# AtlasOps\n\n"
+        "## Overview\n"
+        "A full-stack web application with a browser UI and terminal CLI.\n\n"
+        "## Recommended Technical Stack\n"
+        "- TypeScript\n- React\n- Vite\n- Node.js\n- SQLite\n\n"
+        "### Entity: Incident\n\n"
+        "Fields:\n\n"
+        "- id: string, required, unique\n"
+        "- title: string, required\n"
+        "- status: enum, values: new, triaged, resolved\n\n"
+        "## Required CLI Commands\n"
+        "atlas init\natlas status\n",
+        encoding="utf-8",
+    )
+
+    calls: list[str] = []
+
+    async def fake_react(prompt, *_args, **kwargs):
+        calls.append(prompt)
+        target = "atlasops-scoped/src/current.ts"
+        (tmp_path / "atlasops-scoped" / "src").mkdir(parents=True, exist_ok=True)
+        (tmp_path / target).write_text("export const x = 1;\n", encoding="utf-8")
+        return SimpleNamespace(
+            changed_files=[target], stopped=False, awaiting_user=False, final="done"
+        )
+
+    async def fake_verify(*_args, **_kwargs):
+        raise AssertionError("a half-built milestone must not be verified or rolled back")
+
+    async def fake_development_plan(*_args, **_kwargs):
+        return {"source": "test", "plan_summary": "test", "milestones": []}
+
+    monkeypatch.setattr(repl_mod, "_run_agent_chat", fake_react)
+    monkeypatch.setattr(repl_mod, "_verify_prd_milestone", fake_verify)
+    monkeypatch.setattr(repl_mod, "_prepare_prd_development_plan", fake_development_plan)
+
+    output = StringIO()
+    console = Console(file=output, force_terminal=False, width=120)
+    asyncio.run(
+        repl_mod._handle_prd_build_request(
+            "build the product from prd.md in a new folder named atlasops-scoped",
+            tmp_path,
+            console,
+            execute_plan=True,
+        )
+    )
+
+    rendered = output.getvalue()
+    assert "Paused After One File" in rendered
+    assert "Reply `continue`" in rendered
+    assert "left in this milestone" in rendered
+    # At most one model turn per approval. Zero is legitimate here: framework
+    # scaffolding is written by deterministic substitution, and that still
+    # counts as the one file this approval bought.
+    assert len(calls) <= 1, f"expected at most one file pass, got {len(calls)}"
+
+
+def test_a_milestone_is_decomposed_into_persisted_task_contracts(tmp_path):
+    """Milestone -> atomic tasks, on disk, before any implementation runs.
+
+    The per-file decomposition already existed inside the call stack; nothing
+    recorded it, so no task could be reviewed, approved or resumed on its own.
+    """
+    from shamsu.cli import repl as repl_mod
+    from shamsu.plans.contracts import load_plan_contracts
+
+    preflight = {
+        "milestone_id": "M-001",
+        "requirement_ids": ["R-001", "R-002"],
+        "expected_files": ["app/models.py", "app/views.py"],
+        "verifier": "python -m compileall app",
+        "requirements": [],
+    }
+
+    contracts = repl_mod._persist_prd_milestone_contracts(
+        preflight, "M-001: Foundation", "M-001", "app", tmp_path, None
+    )
+
+    assert [c.task_id for c in contracts] == ["M-001-task-001", "M-001-task-002"]
+    assert [c.expected_write_paths for c in contracts] == [["app/models.py"], ["app/views.py"]]
+    # Each task is scoped to its own file and carries its own verification.
+    assert all(c.allowed_write_paths == c.expected_write_paths for c in contracts)
+    assert all(c.verification_requirements == ["python -m compileall app"] for c in contracts)
+    # Ordered: the second task depends on the first, so a resume knows where it is.
+    assert contracts[1].dependencies == ["M-001-task-001"]
+
+    reloaded = load_plan_contracts(tmp_path, "M-001")
+    assert [c.task_id for c in reloaded] == [c.task_id for c in contracts]

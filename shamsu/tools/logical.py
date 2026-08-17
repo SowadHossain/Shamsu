@@ -1,7 +1,7 @@
 """Small model-facing logical tools built on the existing low-level registry."""
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -106,6 +106,23 @@ class LogicalBackend(Protocol):
 
 ResultFactory = Callable[[bool, str, dict[str, Any]], Any]
 
+
+# Git mutations that git.checkpoint does not cover. There is no logical tool
+# for these, and inventing one by falling through to git.inspect turns a write
+# into a read that reports success.
+GIT_MUTATIONS_WITHOUT_LOGICAL_EQUIVALENT = frozenset(
+    {
+        "git_init",
+        "git_create_branch",
+        "git_checkout",
+        "git_restore",
+        "git_stash_push",
+        "git_stash_pop",
+        "git_fetch",
+        "git_pull",
+        "git_push",
+    }
+)
 
 READ_PHASES = frozenset(
     {
@@ -325,6 +342,13 @@ class LogicalToolLayer:
         if name.startswith("git_"):
             if name in {"git_add", "git_add_all", "git_commit"}:
                 return "git.checkpoint", _alias_git_checkpoint_args(name, arguments)
+            if name in GIT_MUTATIONS_WITHOUT_LOGICAL_EQUIVALENT:
+                # No alias. The old catch-all sent every unmapped git_* to
+                # git.inspect, and unknown modes default to "overview" - so a
+                # push ran a read and reported success. A mutation with no
+                # logical equivalent stays low-level, where the phase contract
+                # can allow or deny it honestly.
+                return None
             return "git.inspect", _alias_git_inspect_args(name, arguments)
         return None
 
@@ -577,6 +601,71 @@ def logical_tool_names_for_phase(phase: ExecutionPhase) -> set[str]:
 
 def all_logical_tool_names() -> set[str]:
     return set(LOGICAL_TOOL_SPECS)
+
+
+# Name-level mirror of ``LogicalToolLayer.alias``. That method needs the call's
+# arguments to reshape them, so it cannot answer "which capability is this?" for
+# an allowlist, which carries names and no arguments. Kept in sync by
+# test_logical_tools.py, which asserts the two agree for every registered tool.
+_LOW_LEVEL_TO_LOGICAL: dict[str, str] = {
+    "list_files": "project.inspect",
+    "file_info": "project.inspect",
+    "read_file": "file.read",
+    "find_file": "code.search",
+    "grep_files": "code.search",
+    "search_index": "code.search",
+    "write_file": "file.patch",
+    "edit_file": "file.patch",
+    "append_file": "file.patch",
+    "request_scope_expansion": "scope.expand",
+    "run_command": "test.run",
+    "git_add": "git.checkpoint",
+    "git_add_all": "git.checkpoint",
+    "git_commit": "git.checkpoint",
+}
+
+_LOGICAL_TO_LOW_LEVEL: dict[str, tuple[str, ...]] = {}
+for _low, _logical in _LOW_LEVEL_TO_LOGICAL.items():
+    _LOGICAL_TO_LOW_LEVEL[_logical] = (*_LOGICAL_TO_LOW_LEVEL.get(_logical, ()), _low)
+
+
+def logical_target(name: str) -> str:
+    """The logical tool a low-level call is rewritten into, or "" when none."""
+    mapped = _LOW_LEVEL_TO_LOGICAL.get(name)
+    if mapped:
+        return mapped
+    # Mirrors alias(): a git_* READ becomes git.inspect; a git mutation with no
+    # logical equivalent has no alias at all and must not be turned into one.
+    if name.startswith("git_") and name not in GIT_MUTATIONS_WITHOUT_LOGICAL_EQUIVALENT:
+        return "git.inspect"
+    return ""
+
+
+def expand_tool_aliases(names: Iterable[str]) -> set[str]:
+    """Admit both tool vocabularies for the same capability.
+
+    An allowlist is written in one vocabulary and enforced in the other: callers
+    list low-level names (``write_file``), while the model-facing layer rewrites
+    every call into a logical tool (``file.patch``) and checks THAT name against
+    the list. Unexpanded, a milestone allowing ``write_file`` exposed zero tool
+    schemas to the model and refused its own writes.
+
+    Forward expansion is required for that case. Reverse expansion covers the
+    mirror image - a logical-vocabulary allowlist that must still permit the raw
+    write fallback and the non-logical execution path - and is applied only to
+    logical names the caller actually listed, so allowing ``git_status`` cannot
+    quietly widen into every other git read.
+    """
+    original = {str(name) for name in names if str(name)}
+    expanded = set(original)
+    for name in original:
+        target = logical_target(name)
+        if target:
+            expanded.add(target)
+    for name in original:
+        if name in LOGICAL_TOOL_SPECS:
+            expanded.update(_LOGICAL_TO_LOW_LEVEL.get(name, ()))
+    return expanded
 
 
 def _compact_result(result: Any) -> dict[str, Any]:

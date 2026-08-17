@@ -1,6 +1,7 @@
 """State-frame context compiler for small local executor models."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
@@ -33,6 +34,8 @@ class ContextFrame:
     allowed_tools: tuple[str, ...] = ()
     artifact_context: str = ""
     project_snapshot: ProjectSnapshot | None = None
+    defined_symbols: str = ""
+    history_digest: str = ""
 
     def render(self, source_sections: list[str]) -> str:
         source = "\n\n".join(source_sections) or "No source snippets selected."
@@ -41,11 +44,17 @@ class ContextFrame:
             "PROJECT IDENTITY": _render_project_identity(self.project_snapshot),
             "TECH STACK": _render_tech_stack(self.project_snapshot),
             "PROJECT INVARIANTS": _render_project_invariants(self.project_snapshot),
+            "CONVERSATION SO FAR": (
+                self.history_digest or "This is the first request in this session."
+            ),
             "CURRENT TASK": _render_task(self.task),
             "CURRENT STEP": _render_step(self.current_step),
             "ACCEPTANCE CRITERIA": _render_acceptance(self.current_step, self.task),
             "PROJECT FACTS": _render_project_facts(self.task, self.plan, self.artifact_context),
             "RELEVANT ARTIFACTS": _render_artifacts(self.task, self.evidence),
+            "ALREADY DEFINED IN THIS PROJECT": (
+                self.defined_symbols or "No other project symbols detected."
+            ),
             "RELEVANT SOURCE CODE": source,
             "LATEST OBSERVATION": _render_observation(self.latest_observation),
             "COMPLETED STEP SUMMARY": _render_completed_steps(self.plan),
@@ -68,6 +77,7 @@ class ContextCompiler:
         system_prompt_getter: Callable[[], str] | None = None,
         allowed_tools_getter: Callable[[], list[dict[str, Any]]] | None = None,
         recent_messages_getter: Callable[[], list[dict[str, Any]]] | None = None,
+        history_digest_getter: Callable[[], str] | None = None,
         trace: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     ) -> None:
         self._compile_messages = compile_messages
@@ -77,6 +87,7 @@ class ContextCompiler:
         self.system_prompt_getter = system_prompt_getter
         self.allowed_tools_getter = allowed_tools_getter
         self.recent_messages_getter = recent_messages_getter
+        self.history_digest_getter = history_digest_getter
         self.trace = trace
 
     async def compile(
@@ -101,7 +112,12 @@ class ContextCompiler:
         allowed_tools = tuple(_tool_names(self.allowed_tools_getter() if self.allowed_tools_getter else []))
         phase = normalize_phase(task.current_phase).value
         relevant_files = _relevant_files(task, current_step, written_files)
-        source_sections = self._source_sections(relevant_files, token_budget)
+        # Off the event loop: this reads up to six files at whole-file size on
+        # every model call, and it sits directly between the loop and the model.
+        # Blocking here stalls heartbeats, cancellation and trace output.
+        source_sections = await asyncio.to_thread(
+            self._source_sections, relevant_files, token_budget
+        )
         artifact_context = ""
         project_snapshot = None
         if self.workspace_root is not None:
@@ -116,6 +132,17 @@ class ContextCompiler:
             task.last_tool_result,
             self.recent_messages_getter() if self.recent_messages_getter else [],
         )
+        defined_symbols = ""
+        if normalize_phase(phase) in {ExecutionPhase.AUTHOR, ExecutionPhase.REPAIR}:
+            defined_symbols = await asyncio.to_thread(
+                _defined_symbols, self.workspace_root, tuple(relevant_files)
+            )
+        history_digest = ""
+        if self.history_digest_getter is not None:
+            try:
+                history_digest = self.history_digest_getter() or ""
+            except Exception:
+                history_digest = ""
         frame = ContextFrame(
             phase=phase,
             task=task,
@@ -127,6 +154,8 @@ class ContextCompiler:
             allowed_tools=allowed_tools,
             artifact_context=artifact_context,
             project_snapshot=project_snapshot,
+            defined_symbols=defined_symbols,
+            history_digest=history_digest,
         )
         messages = [
             {"role": "system", "content": self.system_prompt_getter()},
@@ -153,7 +182,12 @@ class ContextCompiler:
         if self.workspace_root is None:
             return []
         usable = max(1200, token_budget - RESERVE_OUTPUT_TOKENS - SAFETY_MARGIN_TOKENS)
-        per_file_chars = max(1200, min(5000, (usable * 4) // max(1, min(len(files), 4))))
+        # The ceiling scales with the window instead of sitting at an 8k-era
+        # 5000 chars. A truncated file is worse than a smaller set of whole
+        # ones for a small model: it edits what it can see, and a file cut
+        # mid-construct is how settings.py ended up using BASE_DIR without
+        # defining it. Spend a larger window on completeness, not more files.
+        per_file_chars = max(1200, min(_MAX_SOURCE_CHARS, (usable * 4) // max(1, min(len(files), 4))))
         sections: list[str] = []
         for relative in files[:6]:
             try:
@@ -201,6 +235,7 @@ def _section_order_for_phase(phase: str) -> tuple[str, ...]:
         "PROJECT IDENTITY",
         "TECH STACK",
         "PROJECT INVARIANTS",
+        "CONVERSATION SO FAR",
         "CURRENT TASK",
         "CURRENT STEP",
         "ACCEPTANCE CRITERIA",
@@ -212,6 +247,7 @@ def _section_order_for_phase(phase: str) -> tuple[str, ...]:
     if normalized == ExecutionPhase.REPAIR:
         return (
             *common_front,
+            "ALREADY DEFINED IN THIS PROJECT",
             "RELEVANT ARTIFACTS",
             "LATEST OBSERVATION",
             "RELEVANT SOURCE CODE",
@@ -221,6 +257,7 @@ def _section_order_for_phase(phase: str) -> tuple[str, ...]:
         return (
             "PHASE",
             "PROJECT INVARIANTS",
+            "CONVERSATION SO FAR",
             "CURRENT TASK",
             "ACCEPTANCE CRITERIA",
             "RELEVANT ARTIFACTS",
@@ -231,6 +268,7 @@ def _section_order_for_phase(phase: str) -> tuple[str, ...]:
     if normalized == ExecutionPhase.AUTHOR:
         return (
             *common_front,
+            "ALREADY DEFINED IN THIS PROJECT",
             "RELEVANT SOURCE CODE",
             "LATEST OBSERVATION",
             "COMPLETED STEP SUMMARY",
@@ -250,6 +288,57 @@ def _section_order_for_phase(phase: str) -> tuple[str, ...]:
 def _phase_uses_artifact_context(phase: str) -> bool:
     normalized = normalize_phase(phase)
     return normalized not in {ExecutionPhase.AUTHOR, ExecutionPhase.REPAIR, ExecutionPhase.VERIFY}
+
+
+_DEFINITION_RE = re.compile(
+    r"(?m)^(?:export\s+)?(?:async\s+)?(?:class|def|function|interface|type|struct)\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
+# Whole-file ceiling for RELEVANT SOURCE CODE. Large enough that an ordinary
+# source file arrives complete rather than cut mid-construct.
+_MAX_SOURCE_CHARS = 24000
+_SYMBOL_SCAN_FILES = 40
+_SYMBOL_SCAN_LIMIT = 60
+
+
+def _defined_symbols(workspace: Path | None, exclude: tuple[str, ...] = ()) -> str:
+    """Symbols the project already defines, and where.
+
+    The full artifact brief is deliberately withheld while authoring - it is too
+    big - but withholding it entirely left the model with no idea what already
+    exists outside the handful of files in context. It would then declare a class
+    it wrote two turns ago to be missing and write it again. This is the cheap
+    half of that knowledge: names and their files, nothing else.
+    """
+    if workspace is None:
+        return ""
+    skip = {item.replace("\\", "/") for item in exclude}
+    found: list[str] = []
+    try:
+        from shamsu.indexer.policy import SOURCE_SUFFIXES, walk_workspace_files
+
+        paths = list(walk_workspace_files(workspace, suffixes=SOURCE_SUFFIXES, indexable_only=True))
+    except Exception:
+        return ""
+    for path in paths[:_SYMBOL_SCAN_FILES]:
+        try:
+            relative = path.relative_to(workspace).as_posix()
+        except ValueError:
+            continue
+        if relative in skip:
+            # Already present verbatim under RELEVANT SOURCE CODE.
+            continue
+        try:
+            body = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        names = list(dict.fromkeys(_DEFINITION_RE.findall(body)))[:8]
+        if names:
+            found.append(f"{relative}: {', '.join(names)}")
+        if len(found) >= _SYMBOL_SCAN_LIMIT:
+            break
+    if not found:
+        return ""
+    return "\n".join(found)
 
 
 def _render_task(task: TaskState | None) -> str:
@@ -359,18 +448,31 @@ def _latest_observation_with_hot_guidance(
     latest_observation: dict[str, Any],
     recent_messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """Carry the live conversation into a frame compiled from runtime state.
+
+    The frame deliberately replaces replayed history, but "no replay" is not the
+    same as "no continuity": an answer given on another route (QA, direct code)
+    is often exactly what the next turn needs, and dropping the assistant side
+    of it re-opened the cross-route amnesia gap A2 closed. Both sides are
+    carried, bounded, as a short recent exchange rather than a full transcript.
+    """
     payload = dict(latest_observation or {})
     guidance: list[str] = []
+    exchange: list[str] = []
     for message in recent_messages[-8:]:
         role = str(message.get("role") or "")
         content = str(message.get("content") or "").strip()
-        if role != "user" or not content:
+        if not content or _is_state_frame(content):
             continue
-        if _is_state_frame(content):
-            continue
-        guidance.append(content[-1800:])
+        if role == "user":
+            guidance.append(content[-1800:])
+            exchange.append(f"user: {content[-700:]}")
+        elif role == "assistant":
+            exchange.append(f"assistant: {content[-700:]}")
     if guidance:
         payload["recent_hot_guidance"] = guidance[-4:]
+    if exchange:
+        payload["recent_exchange"] = exchange[-4:]
     return payload
 
 
@@ -475,7 +577,9 @@ def _trim_state_frame(frame: str, char_budget: int) -> str:
     caps = {
         "PROJECT FACTS": 1400,
         "RELEVANT ARTIFACTS": 900,
-        "RELEVANT SOURCE CODE": 1800,
+        "CONVERSATION SO FAR": 1400,
+        "ALREADY DEFINED IN THIS PROJECT": 900,
+        "RELEVANT SOURCE CODE": 8000,
         "LATEST OBSERVATION": 1200,
         "COMPLETED STEP SUMMARY": 800,
     }

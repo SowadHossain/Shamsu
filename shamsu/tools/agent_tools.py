@@ -46,7 +46,7 @@ from shamsu.skills.ingest import (
 from shamsu.skills.loader import discover_skills
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitCommandResult, GitTool
-from shamsu.tools.logical import LogicalToolLayer, all_logical_tool_names
+from shamsu.tools.logical import LogicalToolLayer, all_logical_tool_names, expand_tool_aliases
 from shamsu.tools.path_resolve import (
     _find_files_by_query,
     _find_path_candidates,
@@ -364,11 +364,18 @@ class AgentToolRegistry:
         self._required_tool_prefix = str(prefix or "")
 
     def set_allowed_tools(self, names: Iterable[str] | None) -> None:
-        """Restrict model-visible and executable tools for an orchestrated step."""
+        """Restrict model-visible and executable tools for an orchestrated step.
+
+        The list is canonicalized across both tool vocabularies here, at the one
+        boundary every caller passes through, rather than in each caller's
+        constant: an allowlist naming ``write_file`` must also admit the
+        ``file.patch`` it is executed as, or the step runs with no usable tools
+        at all. See ``expand_tool_aliases``.
+        """
         if names is None:
             self._allowed_tool_names = None
             return
-        self._allowed_tool_names = {str(name) for name in names if str(name)}
+        self._allowed_tool_names = expand_tool_aliases(names)
 
     def use_logical_tools(self, enabled: bool = True) -> None:
         """Expose compact logical tools to the model while keeping low-level internals."""
@@ -543,7 +550,15 @@ class AgentToolRegistry:
 
     def tool_schemas(self) -> list[dict[str, Any]]:
         if self._logical_tools_enabled:
-            return self._logical_tools.schemas(allowed_names=self._allowed_tool_names)
+            # MCP tools are appended, not replaced. Returning only the logical
+            # set made every registered MCP tool invisible the moment logical
+            # tools were switched on - the same "registered but unreachable"
+            # failure as an allowlist naming the wrong vocabulary.
+            return self._logical_tools.schemas(allowed_names=self._allowed_tool_names) + [
+                schema
+                for schema in self._mcp.tool_schemas()
+                if self._tool_is_allowed(str((schema.get("function") or {}).get("name") or ""))
+            ]
         local_schemas = [
             _tool_schema(
                 "list_files",

@@ -133,6 +133,7 @@ EVENT_LABELS = {
     "plan.created": "Plan",
     "assistant.content": "Model",
     "assistant.thinking": "Reasoning",
+    "assistant.thinking.delta": "Thinking",
     "context.sent": "Context",
     "context.search": "Search",
     "verify.result": "Verify",
@@ -158,6 +159,7 @@ _EVENT_STYLES = {
     # Reasoning is surfaced but de-emphasized: the answer is what matters, the
     # trace just proves the model reasoned and gives a glimpse.
     "assistant.thinking": "dim",
+    "assistant.thinking.delta": "dim",
     "context.search": "cyan",
     "verify.result": "cyan",
     "tool.salvaged": "magenta",

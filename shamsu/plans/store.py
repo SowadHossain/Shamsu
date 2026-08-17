@@ -16,6 +16,17 @@ from shamsu.safety.sandbox import Sandbox
 
 PLANS_DIRNAME = "plans"
 
+# Written into a plan file whose planner produced nothing. Prose, not a list
+# item, so `parse_plan_steps` cannot mistake it for work to execute.
+PLAN_NO_STEPS_MARKER = (
+    "_No steps were produced._ Edit this file to add them, then run `/proceed`."
+)
+
+
+def plan_has_no_steps(markdown: str) -> bool:
+    """True when the planner produced nothing and the file says so."""
+    return PLAN_NO_STEPS_MARKER in (markdown or "")
+
 
 def plans_dir(workspace: Path) -> Path:
     directory = Sandbox(workspace).validate(Path(".shamsu") / PLANS_DIRNAME)

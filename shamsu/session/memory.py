@@ -35,16 +35,39 @@ FOLLOWUP_GENERIC = {
 AFFIRMATIVE_REPLIES = {
     "yes", "yep", "yeah", "yup", "sure", "ok", "okay", "k", "do it", "go ahead",
     "proceed", "continue", "confirm", "confirmed", "please do", "go for it",
-    "sounds good", "affirmative", "y",
+    "sounds good", "affirmative", "y", "next", "next one", "keep going",
+    "carry on", "go on",
 }
 NEGATIVE_REPLIES = {
     "no", "nope", "nah", "cancel", "stop", "don't", "dont", "do not",
     "abort", "never mind", "nevermind", "forget it", "n",
 }
 
+# Discourse markers people put in front of a one-word answer. "okay proceed" is
+# the same instruction as "proceed", but every affirmative check matched the
+# whole string, so a single filler word dropped the reply through to routing and
+# "okay proceed" was answered as a fresh question instead of continuing the task.
+_FILLER_PREFIXES = {
+    "okay", "ok", "alright", "allright", "right", "well", "so", "now", "then",
+    "please", "lets", "let's", "just", "and", "also", "um", "uh", "hmm",
+    "cool", "great", "nice", "fine", "perfect", "good",
+}
+
+
+def strip_filler_prefix(text: str) -> str:
+    """Drop leading discourse markers, but never reduce a reply to nothing.
+
+    "okay" on its own is an answer; "okay proceed" is the same answer with a
+    filler in front. Stripping stops as soon as one token is left.
+    """
+    tokens = text.split()
+    while len(tokens) > 1 and tokens[0] in _FILLER_PREFIXES:
+        tokens = tokens[1:]
+    return " ".join(tokens)
+
 
 def _normalize_reply(text: str) -> str:
-    return re.sub(r"[^a-z0-9' ]", "", text.lower()).strip()
+    return strip_filler_prefix(re.sub(r"[^a-z0-9' ]", "", text.lower()).strip())
 
 
 def is_affirmative(text: str) -> bool:

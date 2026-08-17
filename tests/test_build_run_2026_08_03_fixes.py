@@ -113,7 +113,14 @@ def test_rewrite_and_friends_count_as_mutations():
 
 
 def test_a_mutation_is_never_dispatched_to_web():
-    assert _route_for_kind("mutation", "web") == "file.write"
+    """The invariant is the negative: a write must never become a web search.
+
+    Which write route it takes depends on whether the clause names a file -
+    a named target goes straight to file.write, an unnamed one to the agent
+    loop that can find it. Both are writes; neither is web.
+    """
+    assert _route_for_kind("mutation", "web", "rewrite core/views.py") == "file.write"
+    assert _route_for_kind("mutation", "web") == "agent-chat"
 
 
 def test_a_question_can_still_be_dispatched_to_web():

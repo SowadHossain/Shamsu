@@ -69,9 +69,12 @@ def test_agent_loop_remembers_its_own_previous_turn(tmp_path: Path):
     second = _ScriptedClient([{"message": {"content": "Now blue", "tool_calls": []}}])
     asyncio.run(_loop(tmp_path, second, logger).run("now make the snake blue"))
 
-    seen = [(m["role"], m["content"]) for m in second.messages_seen[0]]
-    assert ("user", "build a snake game") in seen
-    assert any(role == "assistant" and "snake.js" in text for role, text in seen)
+    # Asserted against the compiled frame, not the message roles: prompts are
+    # built from runtime state now, so no prior turn arrives as its own message.
+    # The invariant is unchanged - the previous exchange must reach the model.
+    frame = "\n".join(str(m.get("content", "")) for m in second.messages_seen[0])
+    assert "build a snake game" in frame
+    assert "snake.js" in frame
 
 
 def test_non_loop_turn_is_visible_to_the_next_agent_run(tmp_path: Path):
@@ -85,9 +88,9 @@ def test_non_loop_turn_is_visible_to_the_next_agent_run(tmp_path: Path):
     client = _ScriptedClient([{"message": {"content": "Added.", "tool_calls": []}}])
     asyncio.run(_loop(tmp_path, client, logger).run("now add a pause button"))
 
-    seen = [(m["role"], m["content"]) for m in client.messages_seen[0]]
-    assert ("user", "what does game.js do?") in seen
-    assert any(role == "assistant" and "render loop" in text for role, text in seen)
+    frame = "\n".join(str(m.get("content", "")) for m in client.messages_seen[0])
+    assert "what does game.js do?" in frame
+    assert "render loop" in frame
 
 
 def test_simple_turn_records_both_sides_in_order(tmp_path: Path):

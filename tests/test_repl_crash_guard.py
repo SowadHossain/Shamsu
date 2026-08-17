@@ -3,19 +3,28 @@
 Every ledger-tracked handler used to re-raise after logging, and `main()` had
 no outer catch - a single Ollama stall or handler bug ended the entire session.
 These tests pin the new behavior: errors are reported in-band and the loop
-survives. Ctrl+C (KeyboardInterrupt) is NOT an `Exception`, so exiting still
-works exactly as before.
+survives.
+
+The same guarantee now covers Ctrl+C. Because KeyboardInterrupt is not an
+`Exception`, it used to slip past that catch-all, escape the per-request
+`asyncio.run`, and end `main()` - cancelling an operation cancelled the whole
+session. `_RequestRunner` keeps the loop alive and cancels only the active
+request; a second interrupt within two seconds still exits.
 """
 from __future__ import annotations
 
+import asyncio
 import io
+import signal
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 import shamsu.cli.repl as repl
 from shamsu.llm.manager import LLMStalledError
 from shamsu.session.manager import SessionManager
+from shamsu.types import RunStatus
 
 
 def _console() -> Console:
@@ -82,3 +91,91 @@ def test_resolve_proceed_survives_a_failing_plan(tmp_path: Path, monkeypatch):
     assert "Request failed" in out
     # The pending action was consumed - a retry won't ghost-execute it.
     assert logger.get_pending_action().get("awaiting") != "plan_approval"
+
+
+# --- Ctrl+C cancels the operation, not the session ----------------------------
+
+
+def _interrupting_request(runner: repl._RequestRunner):
+    """A request that raises the interrupt on itself, then would never finish."""
+
+    async def _never_finishes():
+        runner._on_interrupt(signal.SIGINT, None)
+        await asyncio.sleep(30)
+
+    return _never_finishes()
+
+
+def test_interrupt_cancels_the_request_and_the_session_survives():
+    runner = repl._RequestRunner(_console())
+    try:
+        assert runner.run(_interrupting_request(runner)) is False
+        assert runner.cancelled is True
+
+        # The whole point: the same runner still serves the next prompt.
+        async def _next_request():
+            return "served"
+
+        assert runner.run(_next_request()) is True
+        assert runner.cancelled is False
+    finally:
+        runner.close()
+
+
+def test_cancelled_request_leaves_no_orphaned_tasks():
+    """No 'Task exception was never retrieved' after an interrupt."""
+    runner = repl._RequestRunner(_console())
+    try:
+        runner.run(_interrupting_request(runner))
+        assert asyncio.all_tasks(runner._loop) == set()
+    finally:
+        runner.close()
+
+
+def test_interrupt_asks_the_active_run_to_stop_before_cancelling():
+    """The run's own cancel path is what records CANCELLED and returns partial work."""
+    from shamsu.runtime import run_control
+
+    run = run_control.register_run("run-interrupt-test")
+    runner = repl._RequestRunner(_console())
+    try:
+        runner._on_interrupt(signal.SIGINT, None)
+        assert run.cancel_event.is_set()
+        assert run.status is RunStatus.CANCELLING
+    finally:
+        runner.close()
+        run_control.complete_run("run-interrupt-test", RunStatus.CANCELLED)
+
+
+def test_second_interrupt_within_the_window_exits():
+    runner = repl._RequestRunner(_console())
+    try:
+        runner._on_interrupt(signal.SIGINT, None)
+        with pytest.raises(KeyboardInterrupt):
+            runner._on_interrupt(signal.SIGINT, None)
+    finally:
+        runner.close()
+
+
+def test_interrupt_tells_the_user_what_just_happened():
+    console = Console(record=True, width=100)
+    runner = repl._RequestRunner(console)
+    try:
+        runner.run(_interrupting_request(runner))
+    finally:
+        runner.close()
+    out = console.export_text()
+    assert "Cancelled that operation" in out
+    assert "Ctrl+C again" in out
+
+
+def test_run_request_without_a_session_runner_still_runs(monkeypatch):
+    """Non-REPL callers and tests keep the plain asyncio.run behaviour."""
+    monkeypatch.setattr(repl, "_REQUEST_RUNNER", None)
+    seen: list[str] = []
+
+    async def _work():
+        seen.append("ran")
+
+    assert repl._run_request(_work()) is True
+    assert seen == ["ran"]

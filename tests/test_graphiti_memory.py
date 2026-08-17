@@ -199,12 +199,22 @@ def test_relevant_memories_are_rendered_compactly(tmp_path):
 
 
 def test_no_fake_success_when_graphiti_tool_missing(tmp_path):
+    """Memory is local SQLite now, so a missing Graphiti no longer blocks work.
+
+    The honest-failure invariant moved rather than disappeared. The gate may
+    allow the turn, but nothing is allowed to claim a Graphiti backend that is
+    not there: storage reports as local, and the health check still says why.
+    """
     service = MemoryService(tmp_path, adapter=FakeGraphitiAdapter(available=False))
 
     gate = service.ensure_ready()
+    status = service.status()
 
-    assert gate.allowed is False
-    assert gate.reason == REQUIRED_MEMORY_MESSAGE
+    assert gate.allowed is True
+    assert status.storage_mode == "local"
+    assert status.local_available is True
+    assert status.health.ok is False
+    assert "missing" in status.health.message.lower()
 
 
 def test_ensure_local_backend_skips_non_default_uri(tmp_path):

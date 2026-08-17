@@ -22,7 +22,7 @@ from shamsu.indexer.policy import DEFAULT_EXCLUDED_DIRS, SOURCE_SUFFIXES, walk_w
 from shamsu.llm.manager import LLMManager
 from shamsu.memory.service import MemoryService
 from shamsu.plans.contracts import contracts_from_planner_data, write_plan_contracts
-from shamsu.plans.store import new_plan_id, parse_plan_steps, write_plan
+from shamsu.plans.store import PLAN_NO_STEPS_MARKER, new_plan_id, parse_plan_steps, write_plan
 
 _MAX_STEPS = 12
 
@@ -131,8 +131,11 @@ class PlanningWorkflow:
         raw = await self.llm.generate_structured(
             "planner", PLAN_SYSTEM, self._prompt(task, route, context_text), PLAN_SCHEMA
         )
-        data = _loads(raw) or {}
+        data, parse_error = _loads_with_reason(raw)
+        data = data or {}
         plan_steps = _steps_from_data(data)
+        if not plan_steps:
+            self._log_planner_lost(raw, parse_error, data)
         # Grounding gate: a plan naming files that don't exist is a
         # hallucination the coder inherits as trusted context. Give the model
         # one corrective round with the phantom names and the real listing
@@ -271,6 +274,30 @@ class PlanningWorkflow:
         except Exception:
             pass
 
+    def _log_planner_lost(self, raw: str, parse_error: str, data: dict) -> None:
+        """Record WHY a plan came out empty, with the response that caused it.
+
+        "No steps were produced" was the only evidence a lost plan ever left, so
+        a parse failure, a wrong schema key and an genuinely empty plan were
+        indistinguishable after the fact.
+        """
+        if not self.session_logger:
+            return
+        try:
+            self.session_logger.log(
+                "plan.planner_produced_no_steps",
+                {
+                    "parse_error": parse_error,
+                    "top_level_keys": sorted(str(key) for key in data)[:12],
+                    "response_chars": len(raw or ""),
+                    "response_preview": (raw or "")[:2000],
+                },
+                parse_error or "Planner returned JSON with no usable steps",
+                workflow_id="plan-mode",
+            )
+        except Exception:
+            pass
+
     def _log(self, plan_id: str, route: str, step_count: int) -> None:
         if not self.session_logger:
             return
@@ -285,9 +312,22 @@ class PlanningWorkflow:
             pass
 
 
+# Keys a small model reaches for when it does not follow `steps` exactly. The
+# plan was being discarded whole because the content was under the wrong name.
+_STEP_KEYS = ("steps", "plan", "tasks", "items", "actions", "plan_steps")
+
+
+def _raw_steps(data: dict) -> list:
+    for key in _STEP_KEYS:
+        value = data.get(key)
+        if isinstance(value, list) and value:
+            return value
+    return []
+
+
 def _steps_from_data(data: dict) -> list[PlanStep]:
     out: list[PlanStep] = []
-    for item in (data.get("steps") or [])[:_MAX_STEPS]:
+    for item in _raw_steps(data)[:_MAX_STEPS]:
         if isinstance(item, dict):
             description = str(item.get("description") or "").strip()
             if description:
@@ -334,7 +374,11 @@ def _render_markdown(
             suffix = f" (`{step.target_file}`)" if step.target_file else ""
             lines.append(f"{index}. {step.description}{suffix}")
     else:
-        lines.append("1. (no steps were produced - edit this file to add them, then proceed)")
+        # Deliberately NOT a numbered or bulleted line. The step parser collects
+        # every list item under this heading, so the old "1. (no steps were
+        # produced...)" placeholder was parsed straight back out as a step and
+        # handed to the agent as real work by `/proceed`.
+        lines.append(PLAN_NO_STEPS_MARKER)
     lines.append("")
     lines.append("## Verification")
     lines.append(
@@ -348,14 +392,37 @@ def _render_markdown(
 
 
 def _loads(text: str) -> dict | None:
+    return _loads_with_reason(text)[0]
+
+
+def _loads_with_reason(text: str) -> tuple[dict | None, str]:
+    """Parse the planner's JSON, and say why when it cannot.
+
+    This used to return a bare ``None`` that the caller turned into ``{}``, so a
+    schema mismatch, a truncated response and a genuinely empty plan all came
+    out as "no steps were produced" with nothing recorded to tell them apart.
+    """
     text = (text or "").strip()
     if not text:
-        return None
+        return None, "planner returned an empty response"
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         try:
             parsed = json.loads(repair_json(text))
         except Exception:
-            return None
-    return parsed if isinstance(parsed, dict) else None
+            return None, f"planner JSON could not be parsed or repaired: {exc}"
+    if isinstance(parsed, list):
+        # Some small models answer the schema with a bare array of steps. An
+        # EMPTY array is repair_json's usual output for unparseable junk, so it
+        # must not pass as a legitimately empty plan.
+        if not parsed:
+            return {"steps": []}, "planner response repaired to an empty list (not usable JSON)"
+        return {"steps": parsed}, ""
+    if not isinstance(parsed, dict):
+        return None, f"planner returned {type(parsed).__name__}, expected a JSON object"
+    if not parsed:
+        # repair_json turns unparseable prose into {} rather than raising, which
+        # otherwise looks identical to a model that answered with an empty plan.
+        return parsed, "planner response repaired to an empty object (not usable JSON)"
+    return parsed, ""

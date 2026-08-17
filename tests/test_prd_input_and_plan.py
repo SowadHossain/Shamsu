@@ -190,3 +190,107 @@ def test_plan_prd_approved_saves_generation_state(tmp_path):
     assert requests[0].action_type == "file_write"
     assert "approved and saved" in output.getvalue()
     assert Path(state_path(tmp_path)).exists()
+
+
+# --- the approved development plan is project state, not conversation state ---
+
+
+class _CountingPlanner:
+    """Stands in for the planner role; counts how often it is actually asked."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate_structured(self, role, system, prompt, schema, **kwargs):  # noqa: ANN001
+        import json as _json
+
+        self.calls += 1
+        return _json.dumps(
+            {
+                "plan_summary": "Build the todo app.",
+                "stack": ["python"],
+                "milestones": [
+                    {"id": "M-001", "title": "Data model", "goal": "Define the Task entity."}
+                ],
+                "risks": [],
+                "first_actions": [],
+            }
+        )
+
+
+async def _prepare(repl, parsed, project, workspace, console, cache_path, force_replan=False):
+    return await repl._prepare_prd_development_plan(
+        parsed,
+        Path("TODO_PRD.md"),
+        project,
+        ["M-001: Data model"],
+        workspace,
+        console,
+        None,
+        cache_path=cache_path,
+        force_replan=force_replan,
+    )
+
+
+def test_an_approved_development_plan_is_reused_instead_of_replanned(tmp_path, monkeypatch):
+    """"okay lets start from the beginning" must not re-run the planner.
+
+    Only the plan's `source` string was ever persisted, so every command that
+    touched the PRD paid for a fresh planning pass and could get a different
+    architecture back.
+    """
+    import asyncio
+
+    import shamsu.cli.repl as repl
+    from shamsu.prd.input import parse_prd_file
+    from shamsu.prd.project import build_project_spec
+
+    prd = tmp_path / "TODO_PRD.md"
+    prd.write_text("# Todo App\n\n## Entities\n- Task: title (text)\n", encoding="utf-8")
+    parsed = parse_prd_file(prd)
+    project = build_project_spec(parsed, request_text="build the todo app")
+
+    planner = _CountingPlanner()
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *a, **k: planner)
+    console = Console(file=StringIO(), force_terminal=False, width=100)
+    cache_path = repl._development_plan_cache_path(tmp_path, project, "todo-app")
+    assert cache_path is not None
+
+    first = asyncio.run(_prepare(repl, parsed, project, tmp_path, console, cache_path))
+    second = asyncio.run(_prepare(repl, parsed, project, tmp_path, console, cache_path))
+
+    assert first["source"] == "model"
+    assert second["milestones"] == first["milestones"]
+    assert planner.calls == 1, "the planner ran again for an already-approved plan"
+    assert cache_path.exists()
+
+
+def test_an_explicit_replan_still_regenerates(tmp_path, monkeypatch):
+    import asyncio
+
+    import shamsu.cli.repl as repl
+    from shamsu.prd.input import parse_prd_file
+    from shamsu.prd.project import build_project_spec
+
+    prd = tmp_path / "TODO_PRD.md"
+    prd.write_text("# Todo App\n\n## Entities\n- Task: title (text)\n", encoding="utf-8")
+    parsed = parse_prd_file(prd)
+    project = build_project_spec(parsed, request_text="build the todo app")
+
+    planner = _CountingPlanner()
+    monkeypatch.setattr(repl, "_make_llm_manager", lambda *a, **k: planner)
+    console = Console(file=StringIO(), force_terminal=False, width=100)
+    cache_path = repl._development_plan_cache_path(tmp_path, project, "todo-app")
+
+    asyncio.run(_prepare(repl, parsed, project, tmp_path, console, cache_path))
+    asyncio.run(_prepare(repl, parsed, project, tmp_path, console, cache_path, force_replan=True))
+
+    assert planner.calls == 2
+
+
+def test_replan_phrasing_is_recognised():
+    import shamsu.cli.repl as repl
+
+    for phrase in ("replan it", "re-plan the build", "give me a fresh plan", "plan it again"):
+        assert repl._REPLAN_RE.search(phrase), phrase
+    assert not repl._REPLAN_RE.search("build the product from the prd")
