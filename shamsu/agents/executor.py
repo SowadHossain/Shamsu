@@ -11,7 +11,7 @@ from shamsu.runtime.run_control import ControlledRun
 
 @dataclass(frozen=True)
 class StepExecutionLimits:
-    max_actions_per_step: int = 4
+    max_actions_per_step: int = 6
     max_repairs_per_step: int = 2
     max_replans_per_task: int = 2
     max_consecutive_failures: int = 3

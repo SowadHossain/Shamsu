@@ -10,7 +10,14 @@ from typing import Any
 
 from shamsu.artifacts.code import artifact_brief
 from shamsu.context.budget import RESERVE_OUTPUT_TOKENS, SAFETY_MARGIN_TOKENS, count_tokens
-from shamsu.runtime.phase_contracts import normalize_phase
+from shamsu.context.project_snapshot import (
+    ProjectSnapshot,
+    load_project_snapshot,
+    render_project_identity,
+    render_project_invariants,
+    render_tech_stack,
+)
+from shamsu.runtime.phase_contracts import ExecutionPhase, normalize_phase
 from shamsu.runtime.task_state import EvidenceRecord, ExecutionPlan, PlanStep, RuntimeStateStore, TaskState
 
 
@@ -25,22 +32,29 @@ class ContextFrame:
     latest_observation: dict[str, Any] = field(default_factory=dict)
     allowed_tools: tuple[str, ...] = ()
     artifact_context: str = ""
+    project_snapshot: ProjectSnapshot | None = None
 
     def render(self, source_sections: list[str]) -> str:
-        sections = [
-            ("PHASE", self.phase),
-            ("CURRENT TASK", _render_task(self.task)),
-            ("CURRENT STEP", _render_step(self.current_step)),
-            ("ACCEPTANCE CRITERIA", _render_acceptance(self.current_step, self.task)),
-            ("PROJECT FACTS", _render_project_facts(self.task, self.plan, self.artifact_context)),
-            ("RELEVANT ARTIFACTS", _render_artifacts(self.task, self.evidence)),
-            ("RELEVANT SOURCE CODE", "\n\n".join(source_sections) or "No source snippets selected."),
-            ("LATEST OBSERVATION", _render_observation(self.latest_observation)),
-            ("COMPLETED STEP SUMMARY", _render_completed_steps(self.plan)),
-            ("ALLOWED TOOLS", _render_allowed_tools(self.allowed_tools)),
-            ("OUTPUT CONTRACT", _output_contract(self.phase)),
-        ]
-        return "\n\n".join(f"[{title}]\n{body.strip()}" for title, body in sections)
+        source = "\n\n".join(source_sections) or "No source snippets selected."
+        sections = {
+            "PHASE": self.phase,
+            "PROJECT IDENTITY": _render_project_identity(self.project_snapshot),
+            "TECH STACK": _render_tech_stack(self.project_snapshot),
+            "PROJECT INVARIANTS": _render_project_invariants(self.project_snapshot),
+            "CURRENT TASK": _render_task(self.task),
+            "CURRENT STEP": _render_step(self.current_step),
+            "ACCEPTANCE CRITERIA": _render_acceptance(self.current_step, self.task),
+            "PROJECT FACTS": _render_project_facts(self.task, self.plan, self.artifact_context),
+            "RELEVANT ARTIFACTS": _render_artifacts(self.task, self.evidence),
+            "RELEVANT SOURCE CODE": source,
+            "LATEST OBSERVATION": _render_observation(self.latest_observation),
+            "COMPLETED STEP SUMMARY": _render_completed_steps(self.plan),
+            "ALLOWED TOOLS": _render_allowed_tools(self.allowed_tools),
+            "OUTPUT CONTRACT": _output_contract(self.phase),
+        }
+        return "\n\n".join(
+            f"[{title}]\n{sections[title].strip()}" for title in _section_order_for_phase(self.phase)
+        )
 
 
 class ContextCompiler:
@@ -85,21 +99,25 @@ class ContextCompiler:
         current_step = self.store.current_active_step(task.task_id)
         evidence = tuple(self.store.list_evidence(task.task_id)[-12:])
         allowed_tools = tuple(_tool_names(self.allowed_tools_getter() if self.allowed_tools_getter else []))
+        phase = normalize_phase(task.current_phase).value
         relevant_files = _relevant_files(task, current_step, written_files)
         source_sections = self._source_sections(relevant_files, token_budget)
         artifact_context = ""
+        project_snapshot = None
         if self.workspace_root is not None:
-            artifact_context = artifact_brief(
-                self.workspace_root,
-                query=f"{task.user_request} {current_step.goal if current_step else ''}",
-                files=relevant_files[:4],
-            )
+            project_snapshot = load_project_snapshot(self.workspace_root)
+            if _phase_uses_artifact_context(phase):
+                artifact_context = artifact_brief(
+                    self.workspace_root,
+                    query=f"{task.user_request} {current_step.goal if current_step else ''}",
+                    files=relevant_files[:4],
+                )
         latest_observation = _latest_observation_with_hot_guidance(
             task.last_tool_result,
             self.recent_messages_getter() if self.recent_messages_getter else [],
         )
         frame = ContextFrame(
-            phase=normalize_phase(task.current_phase).value,
+            phase=phase,
             task=task,
             plan=plan,
             current_step=current_step,
@@ -108,6 +126,7 @@ class ContextCompiler:
             latest_observation=latest_observation,
             allowed_tools=allowed_tools,
             artifact_context=artifact_context,
+            project_snapshot=project_snapshot,
         )
         messages = [
             {"role": "system", "content": self.system_prompt_getter()},
@@ -124,6 +143,7 @@ class ContextCompiler:
                     "files": list(relevant_files),
                     "evidence": len(evidence),
                     "allowed_tools": len(allowed_tools),
+                    "project_snapshot": bool(project_snapshot),
                     "trimmed": trimmed,
                 },
             )
@@ -162,11 +182,7 @@ class ContextCompiler:
         frame = str(trimmed[-1].get("content", ""))
         char_budget = max(2000, target * 4)
         if len(frame) > char_budget:
-            marker = "\n...[context frame truncated to fit model window]...\n"
-            keep = max(1000, char_budget - len(marker))
-            head = int(keep * 0.7)
-            tail = keep - head
-            trimmed[-1]["content"] = frame[:head].rstrip() + marker + frame[-tail:].lstrip()
+            trimmed[-1]["content"] = _trim_state_frame(frame, char_budget)
         return trimmed, True
 
 
@@ -176,6 +192,64 @@ def _tool_names(schemas: list[dict[str, Any]]) -> list[str]:
         for schema in schemas
         if str((schema.get("function") or {}).get("name") or "")
     ]
+
+
+def _section_order_for_phase(phase: str) -> tuple[str, ...]:
+    normalized = normalize_phase(phase)
+    common_front = (
+        "PHASE",
+        "PROJECT IDENTITY",
+        "TECH STACK",
+        "PROJECT INVARIANTS",
+        "CURRENT TASK",
+        "CURRENT STEP",
+        "ACCEPTANCE CRITERIA",
+    )
+    common_back = (
+        "ALLOWED TOOLS",
+        "OUTPUT CONTRACT",
+    )
+    if normalized == ExecutionPhase.REPAIR:
+        return (
+            *common_front,
+            "RELEVANT ARTIFACTS",
+            "LATEST OBSERVATION",
+            "RELEVANT SOURCE CODE",
+            *common_back,
+        )
+    if normalized == ExecutionPhase.VERIFY:
+        return (
+            "PHASE",
+            "PROJECT INVARIANTS",
+            "CURRENT TASK",
+            "ACCEPTANCE CRITERIA",
+            "RELEVANT ARTIFACTS",
+            "LATEST OBSERVATION",
+            "RELEVANT SOURCE CODE",
+            *common_back,
+        )
+    if normalized == ExecutionPhase.AUTHOR:
+        return (
+            *common_front,
+            "RELEVANT SOURCE CODE",
+            "LATEST OBSERVATION",
+            "COMPLETED STEP SUMMARY",
+            *common_back,
+        )
+    return (
+        *common_front,
+        "PROJECT FACTS",
+        "RELEVANT ARTIFACTS",
+        "RELEVANT SOURCE CODE",
+        "LATEST OBSERVATION",
+        "COMPLETED STEP SUMMARY",
+        *common_back,
+    )
+
+
+def _phase_uses_artifact_context(phase: str) -> bool:
+    normalized = normalize_phase(phase)
+    return normalized not in {ExecutionPhase.AUTHOR, ExecutionPhase.REPAIR, ExecutionPhase.VERIFY}
 
 
 def _render_task(task: TaskState | None) -> str:
@@ -193,6 +267,24 @@ def _render_task(task: TaskState | None) -> str:
             f"last_checkpoint: {task.last_checkpoint or 'none'}",
         ]
     )
+
+
+def _render_project_identity(snapshot: ProjectSnapshot | None) -> str:
+    if snapshot is None:
+        return "No project snapshot available."
+    return render_project_identity(snapshot)
+
+
+def _render_tech_stack(snapshot: ProjectSnapshot | None) -> str:
+    if snapshot is None:
+        return "No deterministic tech stack detected."
+    return render_tech_stack(snapshot)
+
+
+def _render_project_invariants(snapshot: ProjectSnapshot | None) -> str:
+    if snapshot is None:
+        return "No deterministic project invariants registered."
+    return render_project_invariants(snapshot)
 
 
 def _render_step(step: PlanStep | None) -> str:
@@ -369,3 +461,78 @@ def _json_budget(value: Any, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "\n...[truncated]"
+
+
+def _trim_state_frame(frame: str, char_budget: int) -> str:
+    sections = _split_state_frame(frame)
+    if not sections:
+        marker = "\n...[context frame truncated to fit model window]...\n"
+        keep = max(1000, char_budget - len(marker))
+        head = int(keep * 0.7)
+        tail = keep - head
+        return frame[:head].rstrip() + marker + frame[-tail:].lstrip()
+
+    caps = {
+        "PROJECT FACTS": 1400,
+        "RELEVANT ARTIFACTS": 900,
+        "RELEVANT SOURCE CODE": 1800,
+        "LATEST OBSERVATION": 1200,
+        "COMPLETED STEP SUMMARY": 800,
+    }
+    trimmed = [
+        (title, _clip_section(body, caps.get(title, len(body))))
+        for title, body in sections
+    ]
+    rendered = _render_sections(trimmed)
+    if len(rendered) <= char_budget:
+        return rendered
+
+    low_priority = [
+        "PROJECT FACTS",
+        "COMPLETED STEP SUMMARY",
+        "RELEVANT ARTIFACTS",
+        "LATEST OBSERVATION",
+        "RELEVANT SOURCE CODE",
+    ]
+    for title_to_trim in low_priority:
+        overflow = len(rendered) - char_budget
+        next_sections: list[tuple[str, str]] = []
+        for title, body in trimmed:
+            if title != title_to_trim:
+                next_sections.append((title, body))
+                continue
+            minimum = 500 if title == "RELEVANT SOURCE CODE" else 180
+            next_sections.append((title, _clip_section(body, max(minimum, len(body) - overflow - 120))))
+        trimmed = next_sections
+        rendered = _render_sections(trimmed)
+        if len(rendered) <= char_budget:
+            return rendered
+
+    marker = "\n...[context frame truncated to fit model window]...\n"
+    keep = max(1000, char_budget - len(marker))
+    head = int(keep * 0.75)
+    tail = keep - head
+    return rendered[:head].rstrip() + marker + rendered[-tail:].lstrip()
+
+
+def _split_state_frame(frame: str) -> list[tuple[str, str]]:
+    matches = list(re.finditer(r"(?m)^\[([A-Z][A-Z ]+)\]\n", frame))
+    sections: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        title = match.group(1)
+        body_start = match.end()
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(frame)
+        sections.append((title, frame[body_start:body_end].strip()))
+    return sections
+
+
+def _render_sections(sections: list[tuple[str, str]]) -> str:
+    return "\n\n".join(f"[{title}]\n{body.strip()}" for title, body in sections)
+
+
+def _clip_section(body: str, max_chars: int) -> str:
+    if len(body) <= max_chars:
+        return body
+    if max_chars <= 40:
+        return body[:max_chars].rstrip()
+    return body[: max_chars - 16].rstrip() + "\n...[truncated]"

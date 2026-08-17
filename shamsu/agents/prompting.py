@@ -171,6 +171,10 @@ def _tool_protocol(
     include_tool_protocol: bool,
     include_raw_write_protocol: bool,
 ) -> str:
+    available_tool_set = set(available_tools)
+    raw_write_tools = tuple(
+        name for name in ("write_file", "append_file", "edit_file") if name in available_tool_set
+    )
     lines = [
         "Call only one available tool, or answer only when no tool is needed.",
         "Do not describe a future tool call; make the call now.",
@@ -189,16 +193,18 @@ def _tool_protocol(
         )
     else:
         lines.append("Use the native tool-call interface when a tool is needed; do not emit tool JSON as prose.")
-    if include_raw_write_protocol:
+    if include_raw_write_protocol and raw_write_tools:
+        example_tool = raw_write_tools[0]
+        raw_write_headers = ", ".join(f"# {name}: path" for name in raw_write_tools)
         lines.extend(
             [
                 "Send file content as a RAW block, never as escaped JSON.",
                 "Raw fallback header example:",
                 "```html",
-                "# write_file: templates/my_orders.html",
+                f"# {example_tool}: templates/my_orders.html",
                 "<h1>Orders</h1>",
                 "```",
-                "Use # write_file: path, # append_file: path, or # edit_file: path.",
+                f"Use {raw_write_headers}.",
             ]
         )
     return "\n".join(f"- {line}" for line in lines)

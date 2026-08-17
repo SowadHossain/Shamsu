@@ -293,9 +293,15 @@ class FailureTracker:
         data = data if isinstance(data, dict) else {}
         message = str(getattr(result, "message", "") or "").lower()
         reason = str(data.get("reason") or "").lower()
-        if "denied by phase contract" in message or "phase" in data.get("current_phase", ""):
+        if data.get("phase_denied") or "denied by phase contract" in message:
             return FailureType.PHASE_VIOLATION
         if data.get("blocked_tool") or "not allowed for the current orchestrated step" in message:
+            if (
+                "active plan step" in reason
+                or "allowed tools" in reason
+                or "current orchestrated step" in message
+            ):
+                return FailureType.PERMISSION_DENIED
             return FailureType.WRONG_TOOL
         if "denied by user" in message or "permission denied" in message:
             return FailureType.PERMISSION_DENIED

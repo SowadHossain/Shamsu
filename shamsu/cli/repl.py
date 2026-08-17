@@ -19,6 +19,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 import traceback
 from dataclasses import replace
 from pathlib import Path
@@ -127,6 +128,16 @@ from shamsu.prd.requirements import (
     save_prd_execution_artifacts,
 )
 from shamsu.prd.state import create_generation_state, save_generation_state, state_path
+from shamsu.plans.contracts import (
+    TaskContract,
+    contract_prompt,
+    contracts_from_markdown,
+    load_plan_contracts,
+    request_scope_expansion,
+    run_file_preflight,
+    validate_contract,
+    write_plan_contracts,
+)
 from shamsu.plans.store import parse_plan_steps, read_plan
 from shamsu.routing.operations import (
     OperationPlan,
@@ -157,9 +168,12 @@ from shamsu.runtime.doctor import find_ancestor_workspace, format_report, run_do
 from shamsu.runtime.models import (
     DEFAULT_TIER,
     ModelTier,
+    active_model_override,
     active_tier,
+    clear_model_override,
     initialize_model_tier,
     model_for_role,
+    set_model_override,
     set_model_tier,
     tier_ever_configured,
     tier_model_specs,
@@ -320,6 +334,8 @@ SYSTEM_COMMANDS = (
     "/models tier light",
     "/models tier default",
     "/models tier heavy",
+    "/models use ",
+    "/models use tier",
     "/web search ",
     "/web setup",
     "/web status",
@@ -446,6 +462,8 @@ SYSTEM_COMMANDS = (
     "/exit",
 )
 
+_MODEL_COMPLETION_CACHE: tuple[float, tuple[str, ...]] = (0.0, ())
+
 
 class SlashCommandCompleter(Completer):
     def __init__(self, workspace: Path | None = None) -> None:
@@ -462,9 +480,35 @@ class SlashCommandCompleter(Completer):
         if not text.startswith("/"):
             return
         lowered = text.lower()
+        if lowered.startswith("/models use "):
+            fragment = text[len("/models use ") :]
+            candidates = ["tier", *_installed_model_completion_names()]
+            seen: set[str] = set()
+            for candidate in candidates:
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if candidate.lower().startswith(fragment.lower()):
+                    yield Completion(candidate, start_position=-len(fragment))
+            return
         for command in SYSTEM_COMMANDS:
             if command.startswith(lowered):
                 yield Completion(command, start_position=-len(text))
+
+
+def _installed_model_completion_names() -> tuple[str, ...]:
+    global _MODEL_COMPLETION_CACHE
+    now = time.monotonic()
+    cached_at, cached = _MODEL_COMPLETION_CACHE
+    if now - cached_at < 5.0:
+        return cached
+    try:
+        status = collect_status()
+    except Exception:
+        return cached
+    models = tuple(status.installed_models if status.server_running else ())
+    _MODEL_COMPLETION_CACHE = (now, models)
+    return models
 
 
 def resolve_workspace(workspace_arg: str | None) -> Path:
@@ -534,6 +578,7 @@ def _print_help(console: Console) -> None:
                     "  /models pull              Pull missing local models",
                     "  /models repair            Start Ollama and pull missing models",
                     "  /models tier [light|default|heavy]  Show or switch model tier",
+                    "  /models use <model>|tier   Pin an installed Ollama model or return to tiers",
                     "  /web search <query>       Search the web with approval",
                     "  /web open <url>           Fetch and summarize a web page",
                     "  /web summarize <url>      Alias for /web open",
@@ -3049,15 +3094,20 @@ def _handle_models(
     workspace: Path | None = None,
 ) -> None:
     parts = user_input.split(maxsplit=1)
-    command = parts[1].strip().lower() if len(parts) > 1 else "status"
-    if command == "status":
+    command_raw = parts[1].strip() if len(parts) > 1 else "status"
+    command_lower = command_raw.lower()
+    if command_lower == "status":
         _print_runtime_status(console)
         return
-    if command == "tier" or command.startswith("tier "):
-        tier_arg = command[len("tier") :].strip()
+    if command_lower == "tier" or command_lower.startswith("tier "):
+        tier_arg = command_raw[len("tier") :].strip()
         _handle_models_tier(tier_arg, console, workspace)
         return
-    if command == "pull":
+    if command_lower == "use" or command_lower.startswith("use "):
+        model_arg = command_raw[len("use") :].strip()
+        _handle_models_use(model_arg, console, workspace)
+        return
+    if command_lower == "pull":
         status = collect_status()
         if not status.ollama_found:
             console.print(
@@ -3086,7 +3136,7 @@ def _handle_models(
         _print_model_pull_results(results, console)
         _print_runtime_status(console)
         return
-    if command == "repair":
+    if command_lower == "repair":
         status = repair_runtime(pull_models=False)
         if status.ollama_found and not status.server_running:
             console.print("[yellow]Starting local Ollama...[/yellow]")
@@ -3108,7 +3158,7 @@ def _handle_models(
             status = collect_status(Path(status.ollama_path))
         _print_runtime_status(console, status=status)
         return
-    console.print("[red]Usage: models status|pull|repair|tier[/red]")
+    console.print("[red]Usage: models status|pull|repair|tier|use[/red]")
 
 
 def _handle_models_tier(tier_arg: str, console: Console, workspace: Path | None) -> None:
@@ -3123,7 +3173,7 @@ def _handle_models_tier(tier_arg: str, console: Console, workspace: Path | None)
         console.print("Usage: /models tier light|default|heavy")
         return
     try:
-        requested = ModelTier(tier_arg)
+        requested = ModelTier(tier_arg.strip().lower())
     except ValueError:
         console.print(
             f"[red]Unknown tier: {tier_arg}. Choose one of: "
@@ -3137,6 +3187,44 @@ def _handle_models_tier(tier_arg: str, console: Console, workspace: Path | None)
     set_model_tier(workspace, requested)
     console.print(f"[green]Switched to {requested.value} tier.[/green]")
     _pull_missing_models_for_active_tier(console)
+
+
+def _handle_models_use(model_arg: str, console: Console, workspace: Path | None) -> None:
+    if not model_arg:
+        current = active_model_override()
+        console.print(f"[cyan]Active model override:[/cyan] {current or 'none - using tier'}")
+        console.print(f"[cyan]Tier model for qa/coder:[/cyan] {model_for_role('qa')}")
+        status = collect_status()
+        if status.server_running and status.installed_models:
+            console.print("[cyan]Installed models:[/cyan] " + ", ".join(status.installed_models))
+        else:
+            console.print("[yellow]Ollama is not running; installed model suggestions are unavailable.[/yellow]")
+        console.print("Usage: /models use <installed-model>|tier")
+        return
+    if workspace is None:
+        console.print("[red]No workspace available to persist the model choice.[/red]")
+        return
+    if model_arg.strip().lower() in {"tier", "tiers", "default", "off", "reset", "clear"}:
+        clear_model_override(workspace)
+        console.print(f"[green]Using {active_tier().value} tier model selection.[/green]")
+        _print_runtime_status(console)
+        return
+    status = collect_status()
+    if not status.ollama_found:
+        console.print("[red]Ollama was not found. Install or repair Ollama before choosing a model.[/red]")
+        return
+    if not status.server_running:
+        console.print("[red]Ollama is not running. Run `/models repair`, then try `/models use`.[/red]")
+        return
+    installed = set(status.installed_models)
+    if model_arg not in installed:
+        console.print(f"[red]Model is not installed: {model_arg}[/red]")
+        if status.installed_models:
+            console.print("[cyan]Installed models:[/cyan] " + ", ".join(status.installed_models))
+        return
+    set_model_override(workspace, model_arg)
+    console.print(f"[green]Using installed model for all roles:[/green] {model_arg}")
+    _print_runtime_status(console)
 
 
 def _pull_missing_models_for_active_tier(console: Console) -> None:
@@ -3646,6 +3734,8 @@ def _print_runtime_status(console: Console, status=None) -> None:
     table.add_column("Value")
     table.add_row("Inference", "local-only Ollama")
     table.add_row("Tier", status.tier)
+    table.add_row("Model override", active_model_override() or "none")
+    table.add_row("Active model", model_for_role("qa"))
     table.add_row("Endpoint", status.base_url)
     table.add_row("Ollama", status.ollama_path or "not found")
     table.add_row("Server", "running" if status.server_running else "not running")
@@ -7848,27 +7938,47 @@ async def _prepare_prd_development_plan(
     ledger = get_current_run()
     if ledger:
         ledger.log_event("prd_development_plan_started", path=relative_path.as_posix())
-    try:
-        raw = await asyncio.wait_for(
-            _make_llm_manager(session_logger, console, workspace).generate_structured(
-                "planner",
-                PRD_DEVELOPMENT_PLAN_SYSTEM,
-                json.dumps(payload, indent=2, ensure_ascii=True),
-                PRD_DEVELOPMENT_PLAN_SCHEMA,
-                temperature=0.0,
-                num_predict=_env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 1400, 512),
-            ),
-            timeout=float(os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "30")),
-        )
-        candidate = _loads_freeform_json(raw or "")
-        plan = _validate_prd_development_plan(candidate)
-    except Exception as exc:
+    plan: dict[str, Any] | None = None
+    last_error = ""
+    for attempt in range(2):
+        planner_payload = dict(payload)
+        if attempt:
+            planner_payload["previous_validation_error"] = last_error
+            planner_payload["retry_rules"] = [
+                "Return a non-empty milestones array.",
+                "Each milestone must include id, title, and goal.",
+                "Do not switch the tech stack or product type.",
+            ]
+        try:
+            raw = await asyncio.wait_for(
+                _make_llm_manager(session_logger, console, workspace).generate_structured(
+                    "planner",
+                    PRD_DEVELOPMENT_PLAN_SYSTEM,
+                    json.dumps(planner_payload, indent=2, ensure_ascii=True),
+                    PRD_DEVELOPMENT_PLAN_SCHEMA,
+                    temperature=0.0,
+                    num_predict=_env_int_at_least("SHAMSU_PRD_PLAN_NUM_PREDICT", 1400, 512),
+                ),
+                timeout=float(os.environ.get("SHAMSU_PRD_PLAN_TIMEOUT_SECONDS", "30")),
+            )
+            candidate = _loads_freeform_json(raw or "")
+            plan = _validate_prd_development_plan(candidate)
+            break
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if ledger:
+                ledger.log_event(
+                    "prd_development_plan_attempt_failed",
+                    attempt=attempt + 1,
+                    error=last_error,
+                )
+    if plan is None:
         plan = {
-            "source": "deterministic_fallback",
-            "error": f"{type(exc).__name__}: {exc}",
-            "plan_summary": "Using the compiled requirement milestones as the development plan.",
+            "source": "planner_failed",
+            "error": last_error,
+            "plan_summary": "Planner output could not be validated. No fallback plan was executed.",
             "stack": [],
-            "milestones": _compiled_milestones_as_plan_items(milestones),
+            "milestones": [],
             "risks": [],
             "first_actions": [],
         }
@@ -7881,6 +7991,10 @@ async def _prepare_prd_development_plan(
         )
     if plan.get("source") == "model":
         console.print("[dim]LLM development plan accepted from planner role.[/dim]")
+    elif plan.get("source") == "planner_failed":
+        console.print(
+            "[yellow]LLM development plan failed validation; no fallback architecture will be used.[/yellow]"
+        )
     else:
         console.print("[dim]LLM development plan unavailable; using compiled fallback.[/dim]")
     return plan
@@ -7945,6 +8059,24 @@ def _compiled_milestones_as_plan_items(milestones: list[str]) -> list[dict[str, 
             }
         )
     return result
+
+
+def _prd_development_plan_failed(development_plan: dict[str, Any]) -> bool:
+    return development_plan.get("source") == "planner_failed"
+
+
+def _print_prd_development_plan_failure(
+    development_plan: dict[str, Any],
+    console: Console,
+) -> None:
+    error = str(development_plan.get("error") or "unknown planner validation error")
+    message = (
+        "The planner model did not return a valid executable milestone plan after a retry.\n\n"
+        "I stopped instead of using a compiled fallback, because that fallback can drift away "
+        "from the PRD's product type or tech stack.\n\n"
+        f"Last error: {error}"
+    )
+    console.print(Panel(message, title="PRD Planning Failed", border_style="red"))
 
 
 def _print_prd_development_plan(
@@ -8334,6 +8466,16 @@ async def _handle_prd_development_plan_request(
         console,
         session_logger,
     )
+    if _prd_development_plan_failed(plan):
+        _print_prd_development_plan_failure(plan, console)
+        _log_event(
+            session_logger,
+            "prd.plan.failed",
+            {"path": str(prd_path), "error": plan.get("error", "")},
+            "PRD development planner failed validation",
+            workflow_id="plan-prd",
+        )
+        return
     _print_prd_development_plan(
         parsed,
         relative_path,
@@ -9035,6 +9177,16 @@ async def _handle_prd_build_request(
         console,
         session_logger,
     )
+    if _prd_development_plan_failed(development_plan):
+        _print_prd_development_plan_failure(development_plan, console)
+        _log_event(
+            session_logger,
+            "prd.build.plan_failed",
+            {"path": str(prd_path), "error": development_plan.get("error", "")},
+            "PRD build stopped because development planner failed validation",
+            workflow_id="prd-build",
+        )
+        return
     milestone_execution_requested = _looks_like_prd_milestone_execution_request(user_input)
     autonomous_requested = _prd_autonomous_execution_requested(user_input)
     if milestone_execution_requested:
@@ -12193,6 +12345,21 @@ def _looks_like_follow_plan(text: str) -> bool:
     return any(phrase in lowered for phrase in _FOLLOW_PLAN_PHRASES)
 
 
+def _plan_autonomous_execution_requested(text: str) -> bool:
+    lowered = text.lower().strip()
+    return any(
+        phrase in lowered
+        for phrase in (
+            "build all autonomously",
+            "run all autonomously",
+            "execute all autonomously",
+            "finish all autonomously",
+            "run the rest autonomously",
+            "build the rest autonomously",
+        )
+    )
+
+
 async def _resolve_plan_route(task: str, workspace: Path, llm: LLMManager) -> str:
     """Classify the task the same way _handle_request routes it, so the plan (and
     later its execution) fit the kind of work: a PRD build, a code edit, a bugfix, etc."""
@@ -12337,20 +12504,82 @@ async def _execute_pending_plan(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None = None,
+    *,
+    run_all: bool | None = None,
 ) -> None:
     plan_id = str(pending_action.get("plan_id", ""))
     route = str(pending_action.get("route", "code_edit"))
-    task = str(pending_action.get("created_from_prompt", ""))
-    try:
-        markdown = read_plan(workspace, plan_id)
-    except Exception:
-        console.print(
-            "[red]Could not read the approved plan file - it may have been moved or deleted. "
-            "Make a new plan with `plan <task>`.[/red]"
+    task = str(pending_action.get("created_from_prompt") or pending_action.get("task") or "")
+    if pending_action.get("awaiting") == "plan_continue":
+        markdown = str(pending_action.get("plan_markdown") or "")
+        steps = [str(step) for step in (pending_action.get("steps") or [])]
+        contracts = contracts_from_markdown(plan_id or "continued-plan", task, steps, markdown)
+    else:
+        try:
+            markdown = read_plan(workspace, plan_id)
+        except Exception:
+            console.print(
+                "[red]Could not read the approved plan file - it may have been moved or deleted. "
+                "Make a new plan with `plan <task>`.[/red]"
+            )
+            return
+        steps = parse_plan_steps(markdown)
+        contracts = _load_or_create_plan_contracts(plan_id, task, steps, markdown, workspace, session_logger)
+    if run_all is None:
+        run_all = is_long_running_enabled(workspace)
+    max_steps = None if run_all else 1
+    await _execute_plan(
+        task,
+        route,
+        markdown,
+        steps,
+        workspace,
+        console,
+        session_logger,
+        contracts=contracts,
+        max_steps=max_steps,
+        force_long_running_steps=bool(run_all),
+    )
+
+
+def _load_or_create_plan_contracts(
+    plan_id: str,
+    task: str,
+    steps: list[str],
+    markdown: str,
+    workspace: Path,
+    session_logger: SessionLogger | None = None,
+) -> list[TaskContract]:
+    contracts = load_plan_contracts(workspace, plan_id)
+    if not contracts:
+        contracts = contracts_from_markdown(plan_id, task, steps, markdown)
+        write_plan_contracts(workspace, plan_id, contracts)
+        _log_task_contract_event(
+            session_logger,
+            "task_contract.compat_created",
+            {"plan_id": plan_id, "contracts": len(contracts)},
+            f"Created {len(contracts)} compatibility Task Contract(s) from markdown",
         )
-        return
-    steps = parse_plan_steps(markdown)
-    await _execute_plan(task, route, markdown, steps, workspace, console, session_logger)
+    return contracts
+
+
+def _log_task_contract_event(
+    session_logger: SessionLogger | None,
+    event_type: str,
+    payload: dict[str, Any],
+    summary: str,
+) -> None:
+    try:
+        if session_logger is not None:
+            session_logger.log(event_type, payload, summary, workflow_id="task-contract")
+    except Exception:
+        pass
+    ledger = get_current_run()
+    if ledger is not None:
+        try:
+            ledger.log_event(event_type, **payload)
+        except Exception:
+            pass
 
 
 def _pause_plan_for_question(
@@ -12385,6 +12614,51 @@ def _pause_plan_for_question(
         )
     except Exception:
         pass
+
+
+def _pause_plan_after_atomic_step(
+    task: str,
+    route: str,
+    plan_markdown: str,
+    remaining_steps: list[str],
+    changed_files: list[str],
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> None:
+    if not remaining_steps:
+        return
+    if session_logger is not None:
+        try:
+            session_logger.set_pending_action(
+                {
+                    "type": "plan",
+                    "awaiting": "plan_continue",
+                    "task": task,
+                    "route": route,
+                    "plan_markdown": plan_markdown,
+                    "steps": list(remaining_steps),
+                    "changed_files": list(changed_files),
+                }
+            )
+        except Exception:
+            pass
+    next_step = remaining_steps[0]
+    console.print(
+        Panel(
+            f"Finished one approved plan step.\n\nNext step: {next_step}\n\n"
+            "Reply `continue` or `proceed` to run the next step. "
+            "Reply `build all autonomously` to run the rest.",
+            title="Plan Paused",
+            border_style="cyan",
+        )
+    )
+    _log_event(
+        session_logger,
+        "plan.atomic_step_paused",
+        {"remaining_steps": len(remaining_steps), "changed_files": changed_files},
+        "Paused approved plan after one atomic step",
+        workflow_id="plan",
+    )
 
 
 def _take_paused_plan(session_logger: SessionLogger | None) -> dict[str, Any] | None:
@@ -12434,6 +12708,8 @@ async def _resume_paused_plan(
         workspace,
         console,
         session_logger=session_logger,
+        max_steps=None if is_long_running_enabled(workspace) else 1,
+        force_long_running_steps=is_long_running_enabled(workspace),
     )
 
 
@@ -12445,24 +12721,39 @@ async def _execute_plan(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None = None,
+    contracts: list[TaskContract] | None = None,
+    max_steps: int | None = None,
+    force_long_running_steps: bool = False,
 ) -> None:
     """Execute an approved plan. Each step runs as its own agent pass with the plan
     as authoritative context, tracked as a MilestoneTask (visible via `tasks`)."""
     if not steps:
+        contracts = contracts or contracts_from_markdown("ad-hoc-plan", task, [], plan_markdown)
+        contract = run_file_preflight(contracts[0], workspace) if contracts else None
+        if contract is not None:
+            validation = validate_contract(contract, workspace)
+            if not validation.ok:
+                console.print("[red]Task Contract validation failed: " + "; ".join(validation.errors) + "[/red]")
+                return
         console.print(
             "[cyan]No discrete steps found in the plan - executing it in a single pass.[/cyan]"
         )
         await _run_agent_chat(
-            _plan_single_request(task, plan_markdown),
+            _plan_single_request(task, plan_markdown)
+            + (f"\n\n{contract_prompt(contract)}" if contract is not None else ""),
             workspace,
             console,
             session_logger=session_logger,
-            force_long_running=True,
+            force_long_running=force_long_running_steps,
             auto_approve=True,
             use_planner=False,
+            allowed_write_paths=tuple(contract.allowed_write_paths) if contract and contract.allowed_write_paths else None,
+            task_contract=contract,
         )
         return
 
+    contracts = list(contracts or contracts_from_markdown("ad-hoc-plan", task, steps, plan_markdown))
+    step_limit = max_steps if max_steps is not None and max_steps > 0 else None
     task_obj = _create_plan_task(task, steps)
     save_task(task_obj, workspace)
     console.print(
@@ -12471,19 +12762,60 @@ async def _execute_plan(
     changed_files: list[str] = []
     for index, step_text in enumerate(steps):
         step = task_obj.steps[index]
+        contract = contracts[index] if index < len(contracts) else contracts_from_markdown(
+            "ad-hoc-plan", task, [step_text], plan_markdown
+        )[0]
+        _log_task_contract_event(
+            session_logger,
+            "task_contract.preflight_started",
+            {"task_id": contract.task_id, "objective": contract.objective},
+            f"Preflight started for {contract.task_id}",
+        )
+        contract = run_file_preflight(contract, workspace)
+        contracts[index] = contract
+        if contract.run_id and contract.run_id != "ad-hoc-plan":
+            write_plan_contracts(workspace, contract.run_id, contracts)
+        validation = validate_contract(contract, workspace)
+        if not validation.ok:
+            task_obj = mark_step_failed(task_obj, step.id, "; ".join(validation.errors))
+            save_task(task_obj, workspace)
+            console.print("[red]Task Contract validation failed: " + "; ".join(validation.errors) + "[/red]")
+            return
+        _log_task_contract_event(
+            session_logger,
+            "task_contract.scope_locked",
+            {
+                "task_id": contract.task_id,
+                "candidate_files": contract.candidate_files,
+                "allowed_write_paths": contract.allowed_write_paths,
+                "expected_write_paths": contract.expected_write_paths,
+            },
+            f"Locked write scope for {contract.task_id}",
+        )
+
+        def _persist_contract_update(updated: TaskContract, *, contract_index: int = index) -> None:
+            contracts[contract_index] = updated
+            if updated.run_id and updated.run_id != "ad-hoc-plan":
+                write_plan_contracts(workspace, updated.run_id, contracts)
+
         task_obj = mark_step_running(task_obj, step.id)
         save_task(task_obj, workspace)
         console.print(f"[cyan]  -> Step {index + 1}/{len(steps)}: {step_text}[/cyan]")
         try:
             result = await _run_agent_chat(
-                _plan_step_request(task, steps, index + 1, len(steps)),
+                _plan_step_request(task, steps, index + 1, len(steps))
+                + "\n\n"
+                + contract_prompt(contract),
                 workspace,
                 console,
                 session_logger=session_logger,
-                force_long_running=True,
+                force_long_running=force_long_running_steps,
                 auto_approve=True,
                 use_planner=False,
                 runtime_task_id=f"task-{task_obj.task_id}-{step.id}",
+                allowed_write_paths=tuple(contract.allowed_write_paths) if contract.allowed_write_paths else None,
+                task_contract=contract,
+                task_contract_persist=_persist_contract_update,
             )
         except Exception as exc:
             task_obj = mark_step_failed(task_obj, step.id, str(exc))
@@ -12509,6 +12841,19 @@ async def _execute_plan(
             return
         task_obj = mark_step_done(task_obj, step.id, "Agent completed this plan step.")
         save_task(task_obj, workspace)
+        if step_limit is not None and index + 1 >= step_limit:
+            remaining = steps[index + 1 :]
+            if remaining:
+                _pause_plan_after_atomic_step(
+                    task,
+                    route,
+                    plan_markdown,
+                    remaining,
+                    changed_files,
+                    console,
+                    session_logger,
+                )
+                return
     console.print(f"[green]Plan execution complete. Task: {task_obj.task_id}[/green]")
     # Integration check: a later step may have broken an earlier step's file, so
     # verify the whole changed set once at the end (never claim done unverified).
@@ -14837,13 +15182,21 @@ def _resolve_proceed(
     if session_logger is None:
         return False
     pending = session_logger.get_pending_action()
-    if pending.get("awaiting") != "plan_approval":
+    if pending.get("awaiting") not in {"plan_approval", "plan_continue"}:
         return False
     session_logger.clear_pending_action()
     ledger = start_run(workspace, "proceed", session_logger=session_logger)
     set_current_run(ledger)
     try:
-        asyncio.run(_execute_pending_plan(pending, workspace, console, session_logger))
+        asyncio.run(
+            _execute_pending_plan(
+                pending,
+                workspace,
+                console,
+                session_logger,
+                run_all=is_long_running_enabled(workspace),
+            )
+        )
     except Exception as exc:
         ledger.fail(str(exc))
         clear_current_run()
@@ -15604,6 +15957,8 @@ async def _run_agent_chat(
     verify_changes: bool = True,
     use_model_compaction: bool = True,
     runtime_task_id: str | None = None,
+    task_contract: TaskContract | None = None,
+    task_contract_persist: Callable[[TaskContract], None] | None = None,
 ) -> "AgentLoopResult | None":
     # auto_approve is used for an explicitly user-consented PRD build: the user
     # already approved building the whole product, so the agent's file writes
@@ -15631,6 +15986,54 @@ async def _run_agent_chat(
         allowed_write_paths=allowed_write_paths,
         allowed_read_paths=allowed_read_paths,
     )
+    if task_contract is not None:
+        tools.set_allowed_write_paths(task_contract.allowed_write_paths)
+
+        def _handle_scope_expansion(filepath: str, reason: str) -> ToolResult:
+            nonlocal task_contract
+            expanded = request_scope_expansion(task_contract, workspace, filepath, reason)
+            if expanded.ok:
+                task_contract = expanded.contract
+                tools.set_allowed_write_paths(expanded.contract.allowed_write_paths)
+                try:
+                    if task_contract_persist is not None:
+                        task_contract_persist(expanded.contract)
+                except Exception:
+                    pass
+                _log_task_contract_event(
+                    session_logger,
+                    "task_contract.scope_expansion_approved",
+                    {
+                        "task_id": expanded.contract.task_id,
+                        "filepath": expanded.path,
+                        "reason": reason,
+                        "allowed_write_paths": expanded.contract.allowed_write_paths,
+                    },
+                    expanded.message,
+                )
+                return ToolResult(
+                    True,
+                    expanded.message,
+                    {
+                        "scope_expansion": True,
+                        "approved": True,
+                        "filepath": expanded.path,
+                        "allowed": expanded.contract.allowed_write_paths,
+                    },
+                )
+            _log_task_contract_event(
+                session_logger,
+                "task_contract.scope_expansion_rejected",
+                {"task_id": task_contract.task_id, "filepath": filepath, "reason": reason},
+                expanded.message,
+            )
+            return ToolResult(
+                False,
+                expanded.message,
+                {"scope_expansion": True, "approved": False, "filepath": expanded.path or filepath},
+            )
+
+        tools.set_scope_expansion_handler(_handle_scope_expansion)
     if allowed_tools is not None:
         tools.set_allowed_tools(allowed_tools)
     if not hydrate_history and not use_long_term_memory and not use_planner:
@@ -15766,6 +16169,8 @@ async def _run_agent_chat(
         chat_kwargs["original_user_request"] = safety_input
     if runtime_task_id and _call_accepts_keyword(AgentChatLoop, "runtime_task_id"):
         chat_kwargs["runtime_task_id"] = runtime_task_id
+    if task_contract is not None and _call_accepts_keyword(AgentChatLoop, "task_contract"):
+        chat_kwargs["task_contract"] = task_contract
     if _call_accepts_keyword(AgentChatLoop, "audit"):
         session_id = session_logger.session_id if session_logger is not None else None
         audit = SessionAuditLog(workspace, session_id)
@@ -17369,6 +17774,37 @@ def main(argv: list[str] | None = None) -> None:
                 continue
             # The user may be asking a side question while a PRD plan is pending.
             # Leave it armed unless they explicitly start, continue, run all, or cancel.
+        if pending_action.get("awaiting") == "plan_continue":
+            if is_negative(user_input):
+                session_logger.clear_pending_action()
+                console.print("[yellow]Cancelled the remaining plan steps.[/yellow]")
+                continue
+            if is_affirmative(user_input) or _looks_like_follow_plan(user_input) or _plan_autonomous_execution_requested(user_input):
+                session_logger.clear_pending_action()
+                ledger = start_run(workspace, user_input, session_logger=session_logger)
+                set_current_run(ledger)
+                try:
+                    asyncio.run(
+                        _execute_pending_plan(
+                            pending_action,
+                            workspace,
+                            console,
+                            session_logger,
+                            run_all=(
+                                is_long_running_enabled(workspace)
+                                or _plan_autonomous_execution_requested(user_input)
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    ledger.fail(str(exc))
+                    clear_current_run()
+                    _report_request_error(exc, console, session_logger)
+                    continue
+                _finish_current_run(workspace, ledger)
+                clear_current_run()
+                continue
+            # The user may be asking a side question while plan steps remain.
         if pending_action.get("awaiting") == "plan_approval":
             # A plan is awaiting the user's go-ahead: "proceed"/"follow the plan"
             # executes it step by step; "no" discards it (the file is kept).
@@ -17378,13 +17814,22 @@ def main(argv: list[str] | None = None) -> None:
                     "[yellow]Discarded the pending plan. The plan file is kept under .shamsu/plans/.[/yellow]"
                 )
                 continue
-            if is_affirmative(user_input) or _looks_like_follow_plan(user_input):
+            if is_affirmative(user_input) or _looks_like_follow_plan(user_input) or _plan_autonomous_execution_requested(user_input):
                 session_logger.clear_pending_action()
                 ledger = start_run(workspace, user_input, session_logger=session_logger)
                 set_current_run(ledger)
                 try:
                     asyncio.run(
-                        _execute_pending_plan(pending_action, workspace, console, session_logger)
+                        _execute_pending_plan(
+                            pending_action,
+                            workspace,
+                            console,
+                            session_logger,
+                            run_all=(
+                                is_long_running_enabled(workspace)
+                                or _plan_autonomous_execution_requested(user_input)
+                            ),
+                        )
                     )
                 except Exception as exc:
                     ledger.fail(str(exc))

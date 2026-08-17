@@ -60,6 +60,8 @@ FILE_MUTATION_TOOLS = frozenset(
         "write_file",
         "move_file",
         "delete_file",
+        "request_scope_expansion",
+        "scope.expand",
     }
 )
 
@@ -110,6 +112,7 @@ AUTHOR_CHECK_COMMAND_PATTERNS = (
     r"\bpyright\b",
     r"\btsc\s+--noEmit\b",
     r"\bpython\s+-m\s+(?:pytest|compileall|mypy)\b",
+    r"\b(?:python|python\.exe|py)(?:\"|')?\s+-c\b",
     r"\bnpm\s+(?:test|run\s+(?:test|lint|typecheck))\b",
     r"\bpnpm\s+(?:test|run\s+(?:test|lint|typecheck))\b",
     r"\byarn\s+(?:test|run\s+(?:test|lint|typecheck))\b",
@@ -186,7 +189,17 @@ PHASE_CONTRACTS: dict[ExecutionPhase, PhaseContract] = {
     ExecutionPhase.AUTHOR: PhaseContract(
         phase=ExecutionPhase.AUTHOR,
         allowed_tools=READ_TOOLS
-        | {"file.patch", "test.run", "edit_file", "append_file", "write_file", "move_file", "run_command"},
+        | {
+            "file.patch",
+            "scope.expand",
+            "request_scope_expansion",
+            "test.run",
+            "edit_file",
+            "append_file",
+            "write_file",
+            "move_file",
+            "run_command",
+        },
         allowed_command_patterns=AUTHOR_CHECK_COMMAND_PATTERNS,
         reason="AUTHOR permits file patches and narrow code checks only.",
     ),
@@ -200,7 +213,17 @@ PHASE_CONTRACTS: dict[ExecutionPhase, PhaseContract] = {
     ExecutionPhase.REPAIR: PhaseContract(
         phase=ExecutionPhase.REPAIR,
         allowed_tools=READ_TOOLS
-        | {"file.patch", "test.run", "edit_file", "append_file", "write_file", "move_file", "run_command"},
+        | {
+            "file.patch",
+            "scope.expand",
+            "request_scope_expansion",
+            "test.run",
+            "edit_file",
+            "append_file",
+            "write_file",
+            "move_file",
+            "run_command",
+        },
         allowed_command_patterns=AUTHOR_CHECK_COMMAND_PATTERNS + VERIFY_COMMAND_PATTERNS,
         reason="REPAIR permits targeted edits and verification based on failure evidence.",
     ),

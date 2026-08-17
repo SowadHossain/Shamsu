@@ -92,6 +92,9 @@ class LogicalBackend(Protocol):
     def run_command(self, command: str, cwd: str = ".") -> Any:
         ...
 
+    def request_scope_expansion(self, filepath: str, reason: str) -> Any:
+        ...
+
     @property
     def git_tool(self) -> Any:
         ...
@@ -117,6 +120,7 @@ READ_PHASES = frozenset(
 PATCH_PHASES = frozenset({ExecutionPhase.AUTHOR, ExecutionPhase.REPAIR})
 TEST_PHASES = frozenset({ExecutionPhase.AUTHOR, ExecutionPhase.VERIFY, ExecutionPhase.REPAIR, ExecutionPhase.DEPLOY})
 CHECKPOINT_PHASES = frozenset({ExecutionPhase.VERIFY, ExecutionPhase.DEPLOY})
+SCOPE_PHASES = frozenset({ExecutionPhase.AUTHOR, ExecutionPhase.REPAIR})
 
 
 LOGICAL_TOOL_SPECS: dict[str, LogicalToolSpec] = {
@@ -189,6 +193,22 @@ LOGICAL_TOOL_SPECS: dict[str, LogicalToolSpec] = {
         evidence_produced=("file_changed",),
         reversible=True,
         reversibility="transaction backup",
+    ),
+    "scope.expand": LogicalToolSpec(
+        name="scope.expand",
+        description="Request explicit expansion of the current task's locked write scope before editing an unlisted file.",
+        input_schema={
+            "properties": {
+                "filepath": {"type": "string", "description": "Workspace-relative file path to add."},
+                "reason": {"type": "string", "description": "Concise reason this task requires the path."},
+            },
+            "required": ["filepath", "reason"],
+        },
+        output_schema={"type": "object", "properties": {"approved": {"type": "boolean"}, "allowed": {"type": "array"}}},
+        phases=SCOPE_PHASES,
+        risk="medium",
+        timeout_seconds=10,
+        output_budget_tokens=500,
     ),
     "test.run": LogicalToolSpec(
         name="test.run",
@@ -298,6 +318,8 @@ class LogicalToolLayer:
             return "code.search", _alias_search_args(name, arguments)
         if name in {"write_file", "edit_file", "append_file"}:
             return "file.patch", _alias_patch_args(name, arguments)
+        if name == "request_scope_expansion":
+            return "scope.expand", dict(arguments)
         if name == "run_command":
             return "test.run", dict(arguments)
         if name.startswith("git_"):
@@ -401,6 +423,12 @@ class LogicalToolLayer:
                 data = {**data, "touched_files": [touched], "resolved_filepath": touched}
                 return self._result(True, result.message, data)
         return result
+
+    def _execute_scope_expand(self, arguments: dict[str, Any]) -> Any:
+        return self.backend.request_scope_expansion(
+            str(arguments.get("filepath") or ""),
+            str(arguments.get("reason") or ""),
+        )
 
     def _execute_test_run(self, arguments: dict[str, Any]) -> Any:
         command = str(arguments.get("command") or "")

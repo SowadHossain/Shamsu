@@ -51,6 +51,7 @@ from shamsu.context.budget import (
 )
 from shamsu.context.builder import ContextBuilder
 from shamsu.context.manager import ContextBudgetManager
+from shamsu.plans.contracts import TaskContract
 from shamsu.safety import read_only
 from shamsu.interfaces import IContextBuilder, ILLMManager
 from shamsu.llm.manager import OLLAMA_BASE_URL, LLMManager, _validate_local_llm_url
@@ -89,12 +90,6 @@ from shamsu.types import RunStatus
 DEFAULT_MAX_TOOL_ROUNDS = 8
 LONG_RUNNING_MAX_TOOL_ROUNDS = 20
 
-# Guard against a local model that never responds.  Local inference can stall
-# indefinitely when the model is swapping or the GPU is saturated; these caps
-# bound the worst-case wall-clock cost on a developer machine.
-# Override with env var SHAMSU_MODEL_TIMEOUT_SECONDS (integer).
-_MODEL_CALL_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_MODEL_TIMEOUT_SECONDS", "120"))
-_RUN_TIMEOUT_SECONDS: int = int(_os.environ.get("SHAMSU_RUN_TIMEOUT_SECONDS", "300"))
 _REPAIR_MODEL_TIMEOUT_SECONDS: int = int(
     _os.environ.get("SHAMSU_REPAIR_MODEL_TIMEOUT_SECONDS", "120")
 )
@@ -105,6 +100,10 @@ _REPAIR_MODEL_MAX_OUTPUT_TOKENS: int = int(
 # How often to emit a "still waiting for the model" heartbeat during a long model
 # call, so a slow local model reads as working rather than a frozen prompt.
 _HEARTBEAT_INTERVAL_SECONDS: int = int(_os.environ.get("SHAMSU_HEARTBEAT_SECONDS", "15"))
+_CHAT_KEEP_ALIVE = _os.environ.get("SHAMSU_CHAT_KEEP_ALIVE", "10m").strip() or "10m"
+_LONG_RUNNING_CHAT_KEEP_ALIVE = (
+    _os.environ.get("SHAMSU_LONG_RUNNING_CHAT_KEEP_ALIVE", "30m").strip() or "30m"
+)
 
 def _env_int_at_least(name: str, default: int, minimum: int) -> int:
     raw = _os.environ.get(name, "").strip()
@@ -165,6 +164,18 @@ def _timeout_config_for_mode(long_running: bool) -> TimeoutConfig:
     if not _env_is_set("SHAMSU_FIRST_TOKEN_TIMEOUT_SECONDS", "SHAMSU_MODEL_TIMEOUT_SECONDS"):
         changes["first_token_timeout"] = min(config.first_token_timeout, 90.0)
     return replace(config, **changes) if changes else config
+
+
+def _chat_keep_alive_for_mode(long_running: bool) -> str:
+    return _LONG_RUNNING_CHAT_KEEP_ALIVE if long_running else _CHAT_KEEP_ALIVE
+
+
+def _drop_optional_chat_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(kwargs)
+    cleaned.pop("think", None)
+    cleaned.pop("keep_alive", None)
+    return cleaned
+
 
 # Repair iterations allowed per failed verify. `RepairLoop` stops as soon as no
 # actionable error remains, so a first-attempt fix still costs exactly one pass
@@ -483,7 +494,7 @@ _MUTATION_TOOL_NAMES = frozenset(
 )
 
 _WORKSPACE_CHANGE_RE = re.compile(
-    r"\b(create|write|build|implement|fix|edit|update|modify|change|add|remove|delete|rename|move|make)\b",
+    r"\b(create|write|append|build|implement|fix|edit|update|modify|change|add|remove|delete|rename|move|make)\b",
     re.IGNORECASE,
 )
 _INFORMATION_REQUEST_RE = re.compile(
@@ -563,6 +574,7 @@ class AgentChatLoop:
         original_user_request: str = "",
         run_id: str | None = None,
         runtime_task_id: str | None = None,
+        task_contract: TaskContract | None = None,
         max_runtime_seconds: float | None = None,
         runtime_state_store: RuntimeStateStore | None = None,
     ) -> None:
@@ -571,6 +583,7 @@ class AgentChatLoop:
         self.session_logger = session_logger
         self.action_ledger = action_ledger
         self.timeout_config = _timeout_config_for_mode(long_running)
+        self.chat_keep_alive = _chat_keep_alive_for_mode(long_running)
         self.run_id = run_id or (
             action_ledger.run_id if action_ledger is not None else f"agentrun-{uuid.uuid4().hex[:12]}"
         )
@@ -581,6 +594,7 @@ class AgentChatLoop:
         )
         self.runtime_state_store = runtime_state_store or RuntimeStateStore(self.workspace_root)
         self.runtime_task_id = runtime_task_id or f"task-{self.run_id}"
+        self.task_contract = task_contract
         self.model_name = model_name or model_for_role(_CHAT_EXECUTOR_ROLE)
         self.prompt_profile = prompt_profile_for_model(self.model_name)
         # Capability flags drive the model I/O boundary: whether to hand this
@@ -670,7 +684,7 @@ class AgentChatLoop:
             include_raw_write_protocol=not read_only,
             profile=self.prompt_profile,
             phase=ExecutionPhase.EXPLORE,
-            available_tools=(),
+            available_tools=tuple(sorted(self._registered_tool_names)),
         )
         self.state = state or ChatState(
             self._base_system_prompt + load_project_instructions(self.workspace_root),
@@ -1045,7 +1059,10 @@ class AgentChatLoop:
                         "num_ctx": min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX),
                     },
                 ),
-                timeout=_MODEL_CALL_TIMEOUT_SECONDS,
+                timeout=(
+                    self.timeout_config.total_generation_timeout
+                    or self.timeout_config.first_token_timeout
+                ),
             )
         except Exception:
             return prior_summary
@@ -1089,6 +1106,7 @@ class AgentChatLoop:
                 "num_ctx": num_ctx,
                 **(options_override or {}),
             },
+            "keep_alive": self.chat_keep_alive,
         }
         # Only hand a native tools schema to models that actually do native
         # tool-calling; for the rest the in-prompt protocol + output salvager
@@ -1121,16 +1139,27 @@ class AgentChatLoop:
             )
 
         beat = asyncio.ensure_future(_beat())
+        call_started = time.monotonic()
         model_task: asyncio.Task[Any] | None = None
         try:
             coro = self._chat_with_layered_timeouts(chat_kwargs, control, round_index)
             model_task = asyncio.create_task(coro)
             if control is not None:
                 control.current_model_task = model_task
-                control.record_event("model_call_started", round=round_index, model=self.model_name)
+                control.record_event(
+                    "model_call_started",
+                    round=round_index,
+                    model=self.model_name,
+                    timeout_config=self.timeout_config.diagnostics(),
+                )
             response = await model_task
             if control is not None:
-                control.record_event("model_call_finished", round=round_index, model=self.model_name)
+                control.record_event(
+                    "model_call_finished",
+                    round=round_index,
+                    model=self.model_name,
+                    elapsed_seconds=round(time.monotonic() - call_started, 3),
+                )
             if self.action_ledger:
                 message = _message_from_response(response)
                 visible = str(_get(message, "content", "") or "")
@@ -1187,7 +1216,7 @@ class AgentChatLoop:
         try:
             raw_stream = self.client.chat(**streaming_kwargs)
         except TypeError:
-            streaming_kwargs.pop("think", None)
+            streaming_kwargs = _drop_optional_chat_kwargs(streaming_kwargs)
             try:
                 raw_stream = self.client.chat(**streaming_kwargs)
             except TypeError:
@@ -1215,7 +1244,7 @@ class AgentChatLoop:
         try:
             raw_response = self.client.chat(**fallback_kwargs)
         except TypeError:
-            fallback_kwargs.pop("think", None)
+            fallback_kwargs = _drop_optional_chat_kwargs(fallback_kwargs)
             raw_response = self.client.chat(**fallback_kwargs)
         category = (
             TimeoutCategory.TOTAL_GENERATION_TIMEOUT
@@ -1234,6 +1263,9 @@ class AgentChatLoop:
         thinking_chunks: list[str] = []
         tool_calls: list[Any] = []
         started = False
+        first_token_elapsed: float | None = None
+        chunk_count = 0
+        started_at = time.monotonic()
         total_deadline = (
             time.monotonic() + self.timeout_config.total_generation_timeout
             if self.timeout_config.total_generation_timeout > 0
@@ -1258,6 +1290,26 @@ class AgentChatLoop:
             thinking = str(_get(message, "thinking", "") or "")
             current_tool_calls = _get(message, "tool_calls", []) or []
             if content or thinking or current_tool_calls:
+                if not started:
+                    first_token_elapsed = time.monotonic() - started_at
+                    if self.on_activity:
+                        self.on_activity(f"model started responding after {first_token_elapsed:.1f}s")
+                    if self.progress:
+                        self.progress.step(
+                            f"Model response started after {first_token_elapsed:.1f}s",
+                            round=round_index,
+                            model=self.model_name,
+                        )
+                    if control is not None:
+                        control.record_event(
+                            "model_first_token",
+                            round=round_index,
+                            model=self.model_name,
+                            elapsed_seconds=round(first_token_elapsed, 3),
+                            has_content=bool(content),
+                            has_thinking=bool(thinking),
+                            has_tool_calls=bool(current_tool_calls),
+                        )
                 started = True
             if content:
                 chunks.append(content)
@@ -1265,11 +1317,13 @@ class AgentChatLoop:
                 thinking_chunks.append(thinking)
             if current_tool_calls:
                 tool_calls.extend(current_tool_calls)
+            chunk_count += 1
             if control is not None:
                 control.record_event(
                     "model_stream_chunk",
                     round=round_index,
                     has_content=bool(content),
+                    has_thinking=bool(thinking),
                     has_tool_calls=bool(current_tool_calls),
                 )
             if bool(_get(chunk, "done", False)):
@@ -1283,6 +1337,20 @@ class AgentChatLoop:
         }
         if thinking_chunks:
             response["message"]["thinking"] = "".join(thinking_chunks)
+        if control is not None:
+            control.record_event(
+                "model_stream_finished",
+                round=round_index,
+                model=self.model_name,
+                elapsed_seconds=round(time.monotonic() - started_at, 3),
+                first_token_elapsed_seconds=(
+                    round(first_token_elapsed, 3) if first_token_elapsed is not None else None
+                ),
+                chunks=chunk_count,
+                content_chars=sum(len(part) for part in chunks),
+                thinking_chars=sum(len(part) for part in thinking_chunks),
+                tool_call_count=len(tool_calls),
+            )
         return response
 
     async def _await_generation_boundary(
@@ -1293,6 +1361,7 @@ class AgentChatLoop:
         round_index: int,
     ) -> Any:
         wait_category, seconds = self._timeout_for_generation_wait(category, control, None)
+        started_at = time.monotonic()
         try:
             if hasattr(value, "__await__"):
                 return await asyncio.wait_for(value, timeout=seconds)
@@ -1322,6 +1391,7 @@ class AgentChatLoop:
                     round=round_index,
                     category=wait_category.value,
                     seconds=seconds,
+                    elapsed_seconds=round(time.monotonic() - started_at, 3),
                 )
 
     def _timeout_for_generation_wait(
@@ -1531,7 +1601,23 @@ class AgentChatLoop:
         state.status = RunStatus.RUNNING
         state.current_phase = ExecutionPhase.EXPLORE.value
         self.tools.set_phase(ExecutionPhase.EXPLORE, task_risk="low")
-        return self.runtime_state_store.save_task(state, checkpoint_kind="task_started")
+        state = self.runtime_state_store.save_task(state, checkpoint_kind="task_started")
+        if self.task_contract is not None:
+            try:
+                plan = self.task_contract.to_runtime_plan(
+                    runtime_task_id=self.runtime_task_id,
+                    runtime_run_id=self.run_id,
+                    plan_id=f"runtime-contract-{self.runtime_task_id}",
+                )
+                self.runtime_state_store.save_execution_plan(plan)
+            except Exception as exc:
+                self._emit_trace(
+                    "task_contract.runtime_persist_failed",
+                    f"Could not persist Task Contract into runtime plan: {exc}",
+                    {"task_id": self.runtime_task_id},
+                    level="verbose",
+                )
+        return state
 
     def _checkpoint_task_status(
         self,
@@ -1968,7 +2054,7 @@ class AgentChatLoop:
             user_input = await self._append_plan(user_input)
             self.runtime_state_store.record_plan_created(self.runtime_task_id)
             self._apply_active_step_phase()
-            self._ensure_author_phase_for_mutation(user_input)
+            self._ensure_author_phase_for_mutation(f"{original_input}\n{user_input}")
             if self._active_step_timed_out():
                 self._mark_active_step_timed_out()
                 return self._timeout_result(
@@ -1980,7 +2066,7 @@ class AgentChatLoop:
         else:
             phase = (
                 ExecutionPhase.AUTHOR
-                if _request_requires_workspace_change(user_input)
+                if _request_requires_workspace_change(f"{original_input}\n{user_input}")
                 else ExecutionPhase.EXPLORE
             )
             risk = "medium" if phase == ExecutionPhase.AUTHOR else "low"
@@ -2133,7 +2219,12 @@ class AgentChatLoop:
                 if timed_out(control):
                     return self._timeout_result(control, round_index)
                 category = self._timeout_category(round_index, ran_any_tool)
-                final = _timeout_message(category, _MODEL_CALL_TIMEOUT_SECONDS)
+                timeout_seconds = (
+                    self.timeout_config.token_idle_timeout
+                    if ran_any_tool
+                    else self.timeout_config.first_token_timeout
+                )
+                final = _timeout_message(category, int(timeout_seconds))
                 self.state.append_assistant(final)
                 self._audit_final(final)
                 return AgentLoopResult(
@@ -2723,28 +2814,48 @@ class AgentChatLoop:
                             level="verbose",
                         )
                 if not result.ok:
-                    repairable = bool(
+                    terminal_policy = bool(
                         tool_failure_policy is not None
+                        and tool_failure_policy.max_retries <= 0
                         and tool_failure_policy.action
                         in {
-                            RecoveryAction.ENTER_REPAIR,
-                            RecoveryAction.SAFE_ARGUMENT_REPAIR,
-                            RecoveryAction.RETRY_WITH_TOOL_CONTRACT,
+                            RecoveryAction.REJECT_ACTION,
+                            RecoveryAction.STOP,
                         }
                     )
-                    replan_needed = bool(
-                        tool_failure_policy is not None
-                        and tool_failure_policy.action == RecoveryAction.REPLAN
-                    )
-                    step_outcome = self._apply_step_outcome(
-                        step_controller,
-                        step_controller.note_failure(
-                            repairable=repairable,
-                            replan_needed=replan_needed,
-                        ),
-                        round_index=round_index,
-                        failure_policy=tool_failure_policy,
-                    )
+                    if terminal_policy:
+                        step_outcome = self._apply_step_outcome(
+                            step_controller,
+                            StepExecutionOutcome(
+                                StepExecutionDecision.BLOCK,
+                                tool_failure_policy.message,
+                            ),
+                            round_index=round_index,
+                            failure_policy=tool_failure_policy,
+                        )
+                    else:
+                        repairable = bool(
+                            tool_failure_policy is not None
+                            and tool_failure_policy.action
+                            in {
+                                RecoveryAction.ENTER_REPAIR,
+                                RecoveryAction.SAFE_ARGUMENT_REPAIR,
+                                RecoveryAction.RETRY_WITH_TOOL_CONTRACT,
+                            }
+                        )
+                        replan_needed = bool(
+                            tool_failure_policy is not None
+                            and tool_failure_policy.action == RecoveryAction.REPLAN
+                        )
+                        step_outcome = self._apply_step_outcome(
+                            step_controller,
+                            step_controller.note_failure(
+                                repairable=repairable,
+                                replan_needed=replan_needed,
+                            ),
+                            round_index=round_index,
+                            failure_policy=tool_failure_policy,
+                        )
                     control.record_event(
                         "step_action_failed",
                         round=round_index,

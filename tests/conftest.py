@@ -87,6 +87,7 @@ def _model_tier_reset(monkeypatch):
     import shamsu.runtime.models as models_module
 
     monkeypatch.setattr(models_module, "_ACTIVE_TIER", models_module.DEFAULT_TIER)
+    monkeypatch.setattr(models_module, "_ACTIVE_MODEL_OVERRIDE", "")
 
 
 @pytest.fixture(autouse=True)

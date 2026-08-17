@@ -162,6 +162,7 @@ MODEL_COOKBOOK: dict[str, ModelSpec] = {spec.name: spec for spec in ALL_MODEL_SP
 
 TIER_FILENAME = "model_tier.json"
 _ACTIVE_TIER: ModelTier = DEFAULT_TIER
+_ACTIVE_MODEL_OVERRIDE = ""
 
 
 def _tier_config_path(workspace: Path) -> Path:
@@ -175,47 +176,93 @@ def tier_ever_configured(workspace: Path) -> bool:
     return _tier_config_path(workspace).exists()
 
 
-def _read_persisted_tier(workspace: Path) -> ModelTier | None:
+def _read_persisted_config(workspace: Path) -> dict[str, str]:
     path = _tier_config_path(workspace)
     if not path.exists():
-        return None
+        return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return None
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items() if isinstance(value, str)}
+
+
+def _read_persisted_tier(workspace: Path) -> ModelTier | None:
+    data = _read_persisted_config(workspace)
     try:
         return ModelTier(str(data.get("tier", "")).strip().lower())
     except ValueError:
         return None
 
 
+def _read_persisted_model_override(workspace: Path) -> str:
+    return _read_persisted_config(workspace).get("model", "").strip()
+
+
 def set_model_tier(workspace: Path, tier: ModelTier) -> None:
     """Persist `tier` for `workspace` and make it active immediately for the
     rest of this process - no restart needed."""
-    global _ACTIVE_TIER
+    global _ACTIVE_MODEL_OVERRIDE, _ACTIVE_TIER
     path = _tier_config_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"tier": tier.value}, indent=2), encoding="utf-8")
     _ACTIVE_TIER = tier
+    _ACTIVE_MODEL_OVERRIDE = ""
+
+
+def set_model_override(workspace: Path, model_name: str) -> None:
+    """Persist a workspace-local model pin and make it active immediately."""
+    global _ACTIVE_MODEL_OVERRIDE
+    model = str(model_name or "").strip()
+    if not model:
+        clear_model_override(workspace)
+        return
+    path = _tier_config_path(workspace)
+    data = _read_persisted_config(workspace)
+    data["tier"] = data.get("tier") or _ACTIVE_TIER.value
+    data["model"] = model
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _ACTIVE_MODEL_OVERRIDE = model
+
+
+def clear_model_override(workspace: Path) -> None:
+    """Return this workspace to tier-based model selection."""
+    global _ACTIVE_MODEL_OVERRIDE
+    path = _tier_config_path(workspace)
+    data = _read_persisted_config(workspace)
+    data.pop("model", None)
+    data["tier"] = data.get("tier") or _ACTIVE_TIER.value
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _ACTIVE_MODEL_OVERRIDE = ""
 
 
 def initialize_model_tier(workspace: Path) -> ModelTier:
     """Resolve the active tier once at process startup:
     SHAMSU_MODEL_TIER env var > persisted workspace choice > default."""
-    global _ACTIVE_TIER
+    global _ACTIVE_MODEL_OVERRIDE, _ACTIVE_TIER
     env_value = os.environ.get("SHAMSU_MODEL_TIER", "").strip().lower()
     if env_value:
         try:
             _ACTIVE_TIER = ModelTier(env_value)
+            _ACTIVE_MODEL_OVERRIDE = ""
             return _ACTIVE_TIER
         except ValueError:
             pass  # invalid env value - fall through to persisted/default
     _ACTIVE_TIER = _read_persisted_tier(workspace) or DEFAULT_TIER
+    _ACTIVE_MODEL_OVERRIDE = _read_persisted_model_override(workspace)
     return _ACTIVE_TIER
 
 
 def active_tier() -> ModelTier:
     return _ACTIVE_TIER
+
+
+def active_model_override() -> str:
+    return _ACTIVE_MODEL_OVERRIDE
 
 
 def tier_model_specs(tier: ModelTier | None = None) -> tuple[ModelSpec, ...]:
@@ -273,6 +320,8 @@ def model_for_role(role: str) -> str:
     pinned = configured_model()
     if pinned:
         return pinned
+    if _ACTIVE_MODEL_OVERRIDE:
+        return _ACTIVE_MODEL_OVERRIDE
     tier = active_tier()
     if single_model_mode_enabled():
         # The tier's thinking anchor, which is qwen3:8b on the default tier: it
@@ -366,6 +415,8 @@ def required_model_names(tier: ModelTier | None = None) -> list[str]:
     pinned = configured_model()
     if pinned:
         return [pinned]
+    if _ACTIVE_MODEL_OVERRIDE:
+        return [_ACTIVE_MODEL_OVERRIDE]
     if single_model_mode_enabled():
         return [_thinking_model_for_tier(resolved_tier)]
     return [spec.name for spec in TIER_MODEL_SPECS[resolved_tier] if spec.required]

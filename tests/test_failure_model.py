@@ -88,6 +88,20 @@ def test_tool_result_classifier_normalizes_denials_and_schema_errors(tmp_path):
         {"command": "pytest"},
         SimpleNamespace(ok=False, message="Command timed out.", data={"timeout": True}),
     )
+    blocked = tracker.record_tool_result(
+        "file.patch",
+        {"filepath": "app.py"},
+        SimpleNamespace(
+            ok=False,
+            message="Tool file.patch is not allowed for the current orchestrated step.",
+            data={
+                "blocked_tool": "file.patch",
+                "requested_tool": "file.patch",
+                "allowed_tools": ["read_file"],
+                "reason": "Tool is not in the active plan step's allowed tools.",
+            },
+        ),
+    )
 
     assert phase is not None
     assert phase.failure_type == FailureType.PHASE_VIOLATION
@@ -95,6 +109,9 @@ def test_tool_result_classifier_normalizes_denials_and_schema_errors(tmp_path):
     assert schema.failure_type == FailureType.TOOL_SCHEMA_ERROR
     assert timeout is not None
     assert timeout.failure_type == FailureType.TOOL_TIMEOUT
+    assert blocked is not None
+    assert blocked.failure_type == FailureType.PERMISSION_DENIED
+    assert recovery_policy(blocked.failure_type).max_retries == 0
 
 
 def test_premature_completion_failure_can_be_recorded_from_gate(tmp_path):

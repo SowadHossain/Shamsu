@@ -167,6 +167,38 @@ def test_no_empty_grep_query_corrects_model(tmp_path):
     assert result.final == "I could not search without a real query."
 
 
+def test_contract_denied_tool_call_blocks_without_retrying_model(tmp_path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
+    tools.set_allowed_tools({"read_file"})
+    client = ScriptedClient(
+        [
+            _message(
+                tool_calls=[
+                    _tool_call(
+                        "write_file",
+                        {"filepath": "app.py", "content": "print('hi')\n"},
+                    )
+                ]
+            ),
+            _message(content="I will try something else."),
+        ]
+    )
+    loop = AgentChatLoop(
+        tmp_path,
+        client=client,
+        tools=tools,
+        llm=NoPlanLLM(),
+        use_planner=False,
+        use_long_term_memory=False,
+    )
+
+    result = asyncio.run(loop.run("write app.py"))
+
+    assert result.stopped is True
+    assert len(client.messages_seen) == 1
+    assert "Do not retry denied actions" in result.final
+
+
 # --- D. a prose-only tool promise cannot end the loop -----------------------
 
 

@@ -12,6 +12,7 @@ Covers the failures described in pipeline.md / the problem statement:
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -205,6 +206,7 @@ async def test_winerror_32_stops_chat_loop(tmp_path):
 
     # Simulate one write_file tool call that returns WinError 32
     fake_tools = MagicMock(spec=AgentToolRegistry)
+    fake_tools.command_runner = None
     fake_tools.tool_schemas.return_value = []
     fake_tools.execute.return_value = ToolResult(
         ok=False,
@@ -213,14 +215,20 @@ async def test_winerror_32_stops_chat_loop(tmp_path):
     )
 
     fake_client = AsyncMock()
-    fake_client.chat.return_value = MagicMock(
-        message=MagicMock(
-            content="",
-            tool_calls=[
-                {"id": "1", "function": {"name": "write_file", "arguments": {"filepath": "game.ts", "content": "x"}}}
+    fake_client.chat.return_value = {
+        "message": {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": {"filepath": "game.ts", "content": "x"},
+                    },
+                }
             ],
-        )
-    )
+        }
+    }
 
     loop = AgentChatLoop(
         tmp_path,
@@ -246,17 +254,13 @@ async def test_winerror_32_stops_chat_loop(tmp_path):
 @pytest.mark.asyncio
 async def test_model_timeout_stops_loop(tmp_path, monkeypatch):
     """A stalled model call must time out and return a clear stop message."""
-    import shamsu.agents.chat_loop as chat_loop_mod
-    monkeypatch.setattr(chat_loop_mod, "_MODEL_CALL_TIMEOUT_SECONDS", 1)
-
     from shamsu.agents.chat_loop import AgentChatLoop
     from shamsu.tools.agent_tools import AgentToolRegistry
 
     async def slow_chat(**_kwargs):
         await asyncio.sleep(10)
 
-    fake_tools = MagicMock(spec=AgentToolRegistry)
-    fake_tools.tool_schemas.return_value = []
+    fake_tools = AgentToolRegistry(tmp_path, approval_func=lambda _request: True)
 
     fake_client = AsyncMock()
     fake_client.chat.side_effect = slow_chat
@@ -274,6 +278,7 @@ async def test_model_timeout_stops_loop(tmp_path, monkeypatch):
             return LLMResponse(raw="", model_used="fake")
 
     loop = AgentChatLoop(tmp_path, client=fake_client, tools=fake_tools, llm=_QuietPlanner())
+    loop.timeout_config = replace(loop.timeout_config, first_token_timeout=0.01)
     result = await loop.run("do something")
     assert result.stopped
     assert "timed out" in result.final.lower() or "not respond" in result.final.lower()

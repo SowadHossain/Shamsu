@@ -177,3 +177,88 @@ def test_models_tier_without_workspace_reports_error():
 
     assert "No workspace available" in output.getvalue()
     assert not repl._looks_like_runtime_error("ordinary validation issue")
+
+
+def test_models_use_switches_to_installed_model(monkeypatch, tmp_path):
+    console, output = _console_output()
+    monkeypatch.setattr(
+        repl,
+        "collect_status",
+        lambda *args, **kwargs: RuntimeStatus(
+            ollama_path=str(tmp_path / "ollama.exe"),
+            server_running=True,
+            installed_models=["llama3.1:8b"],
+            missing_models=[],
+        ),
+    )
+
+    repl._handle_models("models use llama3.1:8b", console, tmp_path)
+
+    rendered = output.getvalue()
+    assert "Using installed model for all roles" in rendered
+    from shamsu.runtime.models import active_model_override, model_for_role
+
+    assert active_model_override() == "llama3.1:8b"
+    assert model_for_role("coder") == "llama3.1:8b"
+
+
+def test_models_use_rejects_uninstalled_model(monkeypatch, tmp_path):
+    console, output = _console_output()
+    monkeypatch.setattr(
+        repl,
+        "collect_status",
+        lambda *args, **kwargs: RuntimeStatus(
+            ollama_path=str(tmp_path / "ollama.exe"),
+            server_running=True,
+            installed_models=["qwen3:8b"],
+            missing_models=[],
+        ),
+    )
+
+    repl._handle_models("models use llama3.1:8b", console, tmp_path)
+
+    rendered = output.getvalue()
+    assert "Model is not installed" in rendered
+    from shamsu.runtime.models import active_model_override
+
+    assert active_model_override() == ""
+
+
+def test_models_use_tier_clears_model_override(monkeypatch, tmp_path):
+    from shamsu.runtime.models import active_model_override, set_model_override
+
+    set_model_override(tmp_path, "llama3.1:8b")
+    console, output = _console_output()
+    monkeypatch.setattr(
+        repl,
+        "collect_status",
+        lambda *args, **kwargs: RuntimeStatus(
+            ollama_path=str(tmp_path / "ollama.exe"),
+            server_running=True,
+            installed_models=["qwen3:8b"],
+            missing_models=[],
+        ),
+    )
+
+    repl._handle_models("models use tier", console, tmp_path)
+
+    assert "Using default tier model selection" in output.getvalue()
+    assert active_model_override() == ""
+
+
+def test_models_use_completion_suggests_installed_models(monkeypatch):
+    monkeypatch.setattr(repl, "_MODEL_COMPLETION_CACHE", (0.0, ()))
+    monkeypatch.setattr(
+        repl,
+        "collect_status",
+        lambda *args, **kwargs: RuntimeStatus(
+            ollama_path="ollama",
+            server_running=True,
+            installed_models=["llama3.1:8b", "qwen3:8b"],
+        ),
+    )
+    from prompt_toolkit.document import Document
+
+    completions = list(repl.SlashCommandCompleter().get_completions(Document("/models use l"), None))
+
+    assert [item.text for item in completions] == ["llama3.1:8b"]

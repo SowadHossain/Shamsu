@@ -21,6 +21,7 @@ from json_repair import repair_json
 from shamsu.indexer.policy import DEFAULT_EXCLUDED_DIRS, SOURCE_SUFFIXES, walk_workspace_files
 from shamsu.llm.manager import LLMManager
 from shamsu.memory.service import MemoryService
+from shamsu.plans.contracts import contracts_from_planner_data, write_plan_contracts
 from shamsu.plans.store import new_plan_id, parse_plan_steps, write_plan
 
 _MAX_STEPS = 12
@@ -79,6 +80,8 @@ PLAN_SCHEMA: dict = {
                     "description": {"type": "string"},
                     "target_file": {"type": "string"},
                     "verify": {"type": "string"},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                    "constraints": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": ["description"],
             },
@@ -94,6 +97,8 @@ class PlanStep:
     description: str
     target_file: str = ""
     verify: str = ""
+    acceptance_criteria: list[str] = field(default_factory=list)
+    constraints: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -152,6 +157,9 @@ class PlanningWorkflow:
         markdown = _render_markdown(title, task, route, data, plan_steps)
         plan_id = new_plan_id()
         path = write_plan(self.workspace, plan_id, markdown)
+        contracts = contracts_from_planner_data(plan_id, data, plan_steps, task)
+        if contracts:
+            write_plan_contracts(self.workspace, plan_id, contracts)
         # Prefer the model's structured steps; fall back to re-parsing the rendered
         # markdown so a PlanDoc always agrees with what the file's `## Steps` says.
         steps = [step.description for step in plan_steps] or parse_plan_steps(markdown)
@@ -288,6 +296,16 @@ def _steps_from_data(data: dict) -> list[PlanStep]:
                         description=description,
                         target_file=str(item.get("target_file") or "").strip(),
                         verify=str(item.get("verify") or "").strip(),
+                        acceptance_criteria=[
+                            str(value).strip()
+                            for value in (item.get("acceptance_criteria") or [])
+                            if str(value).strip()
+                        ],
+                        constraints=[
+                            str(value).strip()
+                            for value in (item.get("constraints") or [])
+                            if str(value).strip()
+                        ],
                     )
                 )
         elif isinstance(item, str) and item.strip():

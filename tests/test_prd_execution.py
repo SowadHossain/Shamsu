@@ -2005,6 +2005,52 @@ def test_prepare_prd_development_plan_uses_planner_model(monkeypatch, tmp_path: 
     assert plan["milestones"][0]["files"] == ["docker-compose.yml", "backend/server.js"]
 
 
+def test_prepare_prd_development_plan_retries_then_fails_closed(monkeypatch, tmp_path: Path):
+    parsed = parse_prd_text(
+        "# Asteroids\n\n"
+        "## Tech Stack\n- Python\n- Pygame\n\n"
+        "## Features\n- Player ship shoots asteroids\n",
+        markdown=True,
+    )
+    project = SimpleNamespace(prd_contract=extract_contract(parsed))
+    project.user_request = "Build the Python Pygame asteroid shooter from the PRD."
+    prompts: list[str] = []
+
+    class FakeLLM:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def generate_structured(self, role, system, prompt, schema, **kwargs):
+            prompts.append(prompt)
+            return json.dumps(
+                {
+                    "plan_summary": "Invalid empty plan.",
+                    "stack": ["Python", "Pygame"],
+                    "milestones": [],
+                }
+            )
+
+    monkeypatch.setattr(repl, "LLMManager", FakeLLM)
+
+    plan = asyncio.run(
+        repl._prepare_prd_development_plan(
+            parsed,
+            Path("Asteroids_PRD.md"),
+            project,
+            ["M-001: Core gameplay [FEAT-001]"],
+            tmp_path,
+            _console(),
+            None,
+        )
+    )
+
+    assert len(prompts) == 2
+    assert "previous_validation_error" in prompts[1]
+    assert plan["source"] == "planner_failed"
+    assert plan["milestones"] == []
+    assert "no milestones" in plan["error"]
+
+
 def test_prepare_prd_milestone_preflight_defaults_to_deterministic(
     monkeypatch,
     tmp_path: Path,
@@ -2213,6 +2259,65 @@ def test_prd_build_defaults_to_plan_and_pending_selection(monkeypatch, tmp_path:
     assert pending["prd_path"] == "prd.md"
     assert pending["project_root"] == "demo"
     assert pending["next_milestone_id"] == "M-002"
+    assert not (tmp_path / "demo").exists()
+    assert not (tmp_path / ".git").exists()
+
+
+def test_prd_build_does_not_store_pending_plan_when_planner_fails(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from shamsu.session.manager import SessionManager
+
+    prd = tmp_path / "prd.md"
+    prd.write_text(
+        "# Demo\n\n## Features\n- Search tasks\n\n## Acceptance\n- `npm test` exits 0.\n",
+        encoding="utf-8",
+    )
+    project = SimpleNamespace(
+        project_name="demo",
+        generation_ready=True,
+        needs_input=False,
+        prd_contract=_contract(),
+        suitability=SimpleNamespace(strategy="generic"),
+        category="utility",
+        archetype=SimpleNamespace(value="utility"),
+    )
+
+    async def failed_development_plan(*_args, **_kwargs):
+        return {
+            "source": "planner_failed",
+            "error": "ValueError: planner returned no milestones",
+            "plan_summary": "Planner output could not be validated.",
+            "stack": [],
+            "milestones": [],
+            "risks": [],
+            "first_actions": [],
+        }
+
+    async def fail_agent_chat(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("failed PRD planning must not execute agent writes")
+
+    def fail_git_init(*_args, **_kwargs):  # pragma: no cover - must not run
+        raise AssertionError("failed PRD planning must not initialize git")
+
+    logger = SessionManager(tmp_path).create_session("PRD failed plan")
+    monkeypatch.setenv("SHAMSU_MILESTONE_EXECUTOR", "1")
+    monkeypatch.setattr(repl, "build_project_spec", lambda _parsed, **_kw: project)
+    monkeypatch.setattr(repl, "_prepare_prd_development_plan", failed_development_plan)
+    monkeypatch.setattr(repl, "_run_agent_chat", fail_agent_chat)
+    monkeypatch.setattr(repl, "_ensure_git_repo", fail_git_init)
+
+    asyncio.run(
+        repl._handle_prd_build_request(
+            "build the product from prd.md",
+            tmp_path,
+            _console(),
+            session_logger=logger,
+        )
+    )
+
+    assert not logger.get_pending_action()
     assert not (tmp_path / "demo").exists()
     assert not (tmp_path / ".git").exists()
 

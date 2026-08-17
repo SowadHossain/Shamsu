@@ -25,7 +25,11 @@ def test_the_tier_models_really_are_flagged_native():
 
 
 def test_the_raw_write_protocol_is_injected_even_for_native_tool_models():
-    prompt = _system_prompt(Path("/ws"), include_tool_protocol=False)
+    prompt = _system_prompt(
+        Path("/ws"),
+        include_tool_protocol=False,
+        available_tools=("read_file", "write_file"),
+    )
 
     assert "# write_file: templates/my_orders.html" in prompt
     assert "never as escaped JSON" in prompt
@@ -58,7 +62,11 @@ def test_a_read_only_loop_is_not_taught_to_write(tmp_path: Path):
 
 
 def test_the_json_protocol_still_warns_non_native_models_off_escaping():
-    prompt = _system_prompt(Path("/ws"), include_tool_protocol=True)
+    prompt = _system_prompt(
+        Path("/ws"),
+        include_tool_protocol=True,
+        available_tools=("read_file", "write_file"),
+    )
 
     assert "This model does not use native tool-calls" in prompt
     # The JSON dialect must carry the same exception, since it is the one that
@@ -67,6 +75,23 @@ def test_the_json_protocol_still_warns_non_native_models_off_escaping():
 
 
 def test_the_write_guidance_tells_the_model_not_to_escape():
-    prompt = _system_prompt(Path("/ws"))
+    prompt = _system_prompt(Path("/ws"), available_tools=("write_file",))
 
     assert "Send file content as a RAW block" in prompt
+
+
+def test_raw_write_guidance_is_omitted_when_raw_write_tools_are_unavailable():
+    prompt = _system_prompt(
+        Path("/ws"),
+        available_tools=("file.read", "file.patch", "run_command"),
+    )
+
+    assert "Send file content as a RAW block" not in prompt
+    assert "# write_file: templates/my_orders.html" not in prompt
+
+
+def test_raw_write_example_uses_an_available_raw_tool():
+    prompt = _system_prompt(Path("/ws"), available_tools=("append_file",))
+
+    assert "# append_file: templates/my_orders.html" in prompt
+    assert "# write_file: templates/my_orders.html" not in prompt

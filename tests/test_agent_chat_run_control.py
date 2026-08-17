@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from shamsu.agents.chat_loop import AgentChatLoop, TIMEOUT_STEP
+from shamsu.agents.chat_loop import (
+    AgentChatLoop,
+    TIMEOUT_STEP,
+    _chat_keep_alive_for_mode,
+    _timeout_config_for_mode,
+)
 from shamsu.runtime.run_control import (
     active_run_ids,
     add_feedback,
@@ -41,9 +46,11 @@ class ImmediateClient:
     def __init__(self, content: str = "done") -> None:
         self.content = content
         self.calls = 0
+        self.kwargs_seen: list[dict] = []
 
-    async def chat(self, **_kwargs):
+    async def chat(self, **kwargs):
         self.calls += 1
+        self.kwargs_seen.append(dict(kwargs))
         return _final_response(self.content)
 
 
@@ -106,6 +113,40 @@ def _loop(
         run_id=run_id,
         max_runtime_seconds=max_runtime_seconds,
     )
+
+
+def test_long_running_timeout_config_uses_real_defaults(monkeypatch):
+    for name in (
+        "SHAMSU_TASK_TIMEOUT_SECONDS",
+        "SHAMSU_RUN_TIMEOUT_SECONDS",
+        "SHAMSU_FIRST_TOKEN_TIMEOUT_SECONDS",
+        "SHAMSU_MODEL_TIMEOUT_SECONDS",
+        "SHAMSU_MIN_MODEL_CALL_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    normal = _timeout_config_for_mode(False)
+    long_running = _timeout_config_for_mode(True)
+
+    assert normal.task_timeout == 300.0
+    assert normal.first_token_timeout == 180.0
+    assert long_running.task_timeout == 900.0
+    assert long_running.first_token_timeout == 90.0
+    assert long_running.min_model_call_seconds == 60.0
+    assert _chat_keep_alive_for_mode(False) == "10m"
+    assert _chat_keep_alive_for_mode(True) == "30m"
+
+
+@pytest.mark.asyncio
+async def test_chat_calls_keep_model_loaded(tmp_path: Path):
+    client = ImmediateClient("ready")
+    loop = _loop(tmp_path, client, run_id="keep-alive")
+
+    result = await loop.run("answer")
+
+    assert result.final == "ready"
+    assert client.kwargs_seen
+    assert client.kwargs_seen[0]["keep_alive"] == "10m"
 
 
 @pytest.mark.asyncio
@@ -246,6 +287,17 @@ async def test_token_idle_timeout_records_specific_failure(tmp_path: Path):
     assert result.timeout_category == TimeoutCategory.TOKEN_IDLE_TIMEOUT.value
     failures = RuntimeStateStore(tmp_path).list_failures(result.task_id, FailureType.TOKEN_IDLE_TIMEOUT)
     assert failures
+    first_token_events = [
+        event for event in get_run_events("token-idle-timeout")
+        if event["type"] == "model_first_token"
+    ]
+    assert first_token_events
+    assert first_token_events[0]["elapsed_seconds"] >= 0
+    finished_events = [
+        event for event in get_run_events("token-idle-timeout")
+        if event["type"] == "model_stream_finished"
+    ]
+    assert not finished_events
 
 
 def test_active_plan_step_timeout_records_specific_failure(tmp_path: Path):

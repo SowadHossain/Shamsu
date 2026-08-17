@@ -8,7 +8,7 @@ import traceback
 import shutil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
@@ -208,6 +208,7 @@ class AgentToolRegistry:
         self._user_request = ""
         self._required_tool_prefix = ""
         self._allowed_tool_names: set[str] | None = None
+        self._scope_expansion_handler: Callable[[str, str], ToolResult] | None = None
         self._current_phase: ExecutionPhase | None = None
         self._task_risk = "medium"
         self._enabled_advanced_capabilities: frozenset[AdvancedCapability] = frozenset()
@@ -242,6 +243,12 @@ class AgentToolRegistry:
     def allowed_write_paths(self) -> list[str]:
         """Return the orchestrator-owned mutation scope for repair handoffs."""
         return sorted(self._allowed_write_paths or ())
+
+    def set_scope_expansion_handler(
+        self,
+        handler: Callable[[str, str], ToolResult] | None,
+    ) -> None:
+        self._scope_expansion_handler = handler
 
     def set_allowed_read_paths(self, paths: Iterable[str] | None) -> None:
         """Restrict local discovery and reads to project paths."""
@@ -380,6 +387,7 @@ class AgentToolRegistry:
                 "edit_file",
                 "append_file",
                 "run_command",
+                "request_scope_expansion",
             }
         return {
             str((schema.get("function") or {}).get("name") or "")
@@ -484,12 +492,27 @@ class AgentToolRegistry:
             return None
         if self._allowed_by_unique_basename_scope(normalized, allowed):
             return None
+        if self.action_ledger:
+            try:
+                self.action_ledger.log_event(
+                    "out_of_contract_write_rejected",
+                    filepath=path,
+                    allowed=sorted(allowed),
+                )
+            except Exception:
+                pass
         return ToolResult(
             False,
-            f"Refused to touch {path}: this request allowed changes only to "
+            f"Write rejected: {path} is outside this task's locked write scope. "
+            "This request allowed changes only to "
             + ", ".join(sorted(allowed))
             + ". No file was modified.",
-            {"scoped_read_only": True, "filepath": path, "allowed": sorted(allowed)},
+            {
+                "scoped_read_only": True,
+                "out_of_contract_write": True,
+                "filepath": path,
+                "allowed": sorted(allowed),
+            },
         )
 
     def _planned(self, action: str, path: str, detail: str, size_bytes: int = 0) -> ToolResult:
@@ -1036,6 +1059,21 @@ class AgentToolRegistry:
                 },
             ),
             _tool_schema(
+                "request_scope_expansion",
+                "Request explicit permission to add one workspace path to the current task's locked write scope.",
+                {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Workspace-relative file path to add.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Concise reason this task requires the path.",
+                    },
+                },
+                required=["filepath", "reason"],
+            ),
+            _tool_schema(
                 "ask_user",
                 "Ask the user a question when the answer is THEIRS to give: choosing between "
                 "valid approaches or designs, naming, scope, anything destructive or hard to "
@@ -1075,6 +1113,11 @@ class AgentToolRegistry:
 
     def execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         try:
+            if name == "request_scope_expansion":
+                return self.request_scope_expansion(
+                    str(arguments.get("filepath") or ""),
+                    str(arguments.get("reason") or ""),
+                )
             if self._logical_tools_enabled:
                 alias = None
                 if not self._logical_tools.is_logical_tool(name):
@@ -1180,6 +1223,11 @@ class AgentToolRegistry:
                 return self.run_command(
                     str(arguments.get("command") or ""),
                     str(arguments.get("cwd") or "."),
+                )
+            if name == "request_scope_expansion":
+                return self.request_scope_expansion(
+                    str(arguments.get("filepath") or ""),
+                    str(arguments.get("reason") or ""),
                 )
             if name == "search_index":
                 return self.search_index(str(arguments.get("query") or ""))
@@ -1387,6 +1435,15 @@ class AgentToolRegistry:
                     "traceback_path": traceback_path,
                 },
             )
+
+    def request_scope_expansion(self, filepath: str, reason: str) -> ToolResult:
+        if self._scope_expansion_handler is None:
+            return ToolResult(
+                False,
+                "Scope expansion is not available for this task.",
+                {"filepath": filepath, "reason": reason, "scope_expansion": False},
+            )
+        return self._scope_expansion_handler(filepath, reason)
 
     def _execute_mcp(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         tool = self._mcp.get_tool(name)

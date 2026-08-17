@@ -17,6 +17,10 @@ def _console() -> Console:
     return Console(file=io.StringIO(), force_terminal=False)
 
 
+async def _noop_verify(*args, **kwargs):  # noqa: ANN002, ANN003
+    return None
+
+
 # --- plan file parsing --------------------------------------------------------
 
 def test_parse_plan_steps_numbered_and_bulleted():
@@ -98,6 +102,7 @@ async def test_planning_workflow_survives_garbled_model_output(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_execute_pending_plan_runs_each_step_as_agent_pass(tmp_path: Path, monkeypatch):
     from shamsu.cli import repl
+    from shamsu.session.manager import SessionManager
     from shamsu.tasks.state import list_task_ids
 
     md = "# Plan: X\n\n## Steps\n1. build the entities\n2. wire the game loop\n\n## Verification\nnpm run build\n"
@@ -110,6 +115,45 @@ async def test_execute_pending_plan_runs_each_step_as_agent_pass(tmp_path: Path,
         calls.append(user_input)
 
     monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
+    logger = SessionManager(tmp_path).create_session("Plan")
+
+    pending = {
+        "type": "plan",
+        "awaiting": "plan_approval",
+        "plan_id": plan_id,
+        "route": "code_edit",
+        "created_from_prompt": "build the game",
+    }
+    await repl._execute_pending_plan(pending, tmp_path, _console(), session_logger=logger)
+
+    assert len(calls) == 1
+    assert "build the entities" in calls[0]
+    pending_continue = logger.get_pending_action()
+    assert pending_continue["awaiting"] == "plan_continue"
+    assert pending_continue["steps"] == ["wire the game loop"]
+    # Execution is tracked as a MilestoneTask for `/tasks` visibility.
+    assert list_task_ids(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_execute_pending_plan_runs_all_steps_when_autonomy_enabled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from shamsu.cli import repl
+    from shamsu.safety.autonomy import set_long_running_enabled
+
+    md = "# Plan: X\n\n## Steps\n1. build the entities\n2. wire the game loop\n\n"
+    plan_id = new_plan_id()
+    write_plan(tmp_path, plan_id, md)
+    calls: list[dict[str, object]] = []
+
+    async def fake_run_agent_chat(user_input, workspace, console, session_logger=None, **kwargs):
+        calls.append({"request": user_input, "force_long_running": kwargs.get("force_long_running")})
+
+    monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
+    monkeypatch.setattr(repl, "_verify_completed_plan", _noop_verify)
+    set_long_running_enabled(tmp_path, True)
 
     pending = {
         "type": "plan",
@@ -121,10 +165,37 @@ async def test_execute_pending_plan_runs_each_step_as_agent_pass(tmp_path: Path,
     await repl._execute_pending_plan(pending, tmp_path, _console(), session_logger=None)
 
     assert len(calls) == 2
-    assert "build the entities" in calls[0]
-    assert "wire the game loop" in calls[1]
-    # Execution is tracked as a MilestoneTask for `/tasks` visibility.
-    assert list_task_ids(tmp_path)
+    assert all(call["force_long_running"] is True for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_plan_continue_runs_next_atomic_step(tmp_path: Path, monkeypatch):
+    from shamsu.cli import repl
+    from shamsu.session.manager import SessionManager
+
+    calls: list[str] = []
+
+    async def fake_run_agent_chat(user_input, workspace, console, session_logger=None, **kwargs):
+        calls.append(user_input)
+
+    monkeypatch.setattr(repl, "_run_agent_chat", fake_run_agent_chat)
+    logger = SessionManager(tmp_path).create_session("Continue")
+    pending = {
+        "type": "plan",
+        "awaiting": "plan_continue",
+        "task": "build the game",
+        "route": "code_edit",
+        "plan_markdown": "## Steps\n1. wire the game loop\n2. add sounds\n",
+        "steps": ["wire the game loop", "add sounds"],
+    }
+
+    await repl._execute_pending_plan(pending, tmp_path, _console(), session_logger=logger)
+
+    assert len(calls) == 1
+    assert "wire the game loop" in calls[0]
+    pending_continue = logger.get_pending_action()
+    assert pending_continue["awaiting"] == "plan_continue"
+    assert pending_continue["steps"] == ["add sounds"]
 
 
 @pytest.mark.asyncio

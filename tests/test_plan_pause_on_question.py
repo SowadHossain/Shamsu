@@ -94,8 +94,11 @@ def test_paused_plan_resumes_from_the_asking_step(tmp_path: Path, monkeypatch):
     _run(repl._resume_paused_plan(paused, "use JWT", tmp_path, _console(), logger))
 
     # Resumes at step b: the two REMAINING steps run, not all three.
-    assert len(requests) == 2
+    assert len(requests) == 1
     assert any("use JWT" in request for request in requests)
+    pending = logger.get_pending_action()
+    assert pending["awaiting"] == "plan_continue"
+    assert pending["steps"] == ["step c"]
 
 
 def test_taking_a_paused_plan_pops_it_once(tmp_path: Path):

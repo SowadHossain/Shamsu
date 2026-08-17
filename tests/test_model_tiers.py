@@ -4,9 +4,12 @@ from shamsu.runtime.models import (
     DEFAULT_TIER,
     ModelTier,
     active_tier,
+    active_model_override,
+    clear_model_override,
     initialize_model_tier,
     model_for_role,
     required_model_names,
+    set_model_override,
     set_model_tier,
     tier_model_specs,
 )
@@ -43,6 +46,35 @@ def test_shamsu_model_pins_any_model_for_every_role(monkeypatch):
     for role in ("qa", "coder", "router", "planner"):
         assert model_for_role(role) == "qwen2.5-coder:7b-instruct", role
     assert required_model_names() == ["qwen2.5-coder:7b-instruct"]
+
+
+def test_persisted_model_override_pins_any_installed_model_for_every_role(tmp_path):
+    set_model_override(tmp_path, "llama3.1:8b")
+
+    assert active_model_override() == "llama3.1:8b"
+    for role in ("qa", "coder", "router", "planner"):
+        assert model_for_role(role) == "llama3.1:8b", role
+    assert required_model_names() == ["llama3.1:8b"]
+
+
+def test_initialize_model_tier_reads_persisted_model_override(tmp_path):
+    set_model_override(tmp_path, "mistral:7b")
+
+    from shamsu.runtime import models as models_module
+
+    models_module._ACTIVE_MODEL_OVERRIDE = ""
+    initialize_model_tier(tmp_path)
+
+    assert active_model_override() == "mistral:7b"
+    assert model_for_role("coder") == "mistral:7b"
+
+
+def test_clearing_model_override_returns_to_tier_selection(tmp_path):
+    set_model_override(tmp_path, "llama3.1:8b")
+    clear_model_override(tmp_path)
+
+    assert active_model_override() == ""
+    assert model_for_role("coder") == "qwen3:8b"
 
 
 def test_a_pin_outranks_multi_model_mode(monkeypatch):
