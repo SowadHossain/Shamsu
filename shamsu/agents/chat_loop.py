@@ -1982,6 +1982,8 @@ class AgentChatLoop:
                     {"messages": len(messages), "model": self.model_name, "round": round_index},
                     level="verbose",
                 )
+            if self.progress:
+                self.progress.step(f"Thinking... choosing action {round_index + 1}/{step_round_limit}")
             try:
                 response = await self._chat_with_heartbeat(
                     messages,

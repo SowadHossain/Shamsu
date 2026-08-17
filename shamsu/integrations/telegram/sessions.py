@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -14,6 +16,7 @@ from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
 from shamsu.cli.request_lifecycle import finish_current_run
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
 from shamsu.integrations.telegram.models import (
+    OutboundMessage,
     TelegramInboundMetadata,
     TelegramRuntimeStatus,
     TelegramSessionSummary,
@@ -28,6 +31,7 @@ from shamsu.runtime.run_control import (
 from shamsu.runtime.task_state import PlanStepStatus, RuntimeStateStore
 from shamsu.session.manager import SessionManager
 from shamsu.tools.agent_tools import AgentToolRegistry
+from shamsu.ui.progress import ProgressReporter
 
 
 @dataclass(frozen=True)
@@ -251,6 +255,13 @@ class LocalShamsuSessionGateway:
                 session_id=metadata.session_id,
                 run_id=ledger.run_id,
             )
+        notify = getattr(self.approval_broker, "notify", None)
+        progress = TelegramProgressReporter(
+            notify=notify,
+            telegram_chat_id=metadata.telegram_chat_id,
+            session_logger=logger,
+        )
+        progress.start_task("SHAMSU remote task")
         try:
             tools = AgentToolRegistry(
                 self.workspace,
@@ -265,10 +276,13 @@ class LocalShamsuSessionGateway:
                 action_ledger=ledger,
                 run_id=ledger.run_id,
                 original_user_request=text,
+                progress=progress,
+                max_runtime_seconds=_telegram_task_timeout_seconds(self.approval_broker),
             )
             result: AgentLoopResult = asyncio.run(loop.run(text))
             ledger.record_final_response(result.final)
             finish_current_run(self.workspace, ledger)
+            progress.done("SHAMSU finished the task.")
             summary = action_store.load_summary(self.workspace, ledger.run_id) or {}
             manifest = action_store.load_manifest(self.workspace, ledger.run_id) or {}
             return RoutedMessageResult(
@@ -277,6 +291,7 @@ class LocalShamsuSessionGateway:
                 status=str(summary.get("status") or manifest.get("status") or result.status.value),
             )
         except Exception as exc:
+            progress.failed("SHAMSU stopped with an error.")
             ledger.fail(str(exc))
             raise
         finally:
@@ -322,3 +337,67 @@ class LocalShamsuSessionGateway:
         except Exception:
             return ""
         return result.stdout.strip()
+
+
+class TelegramProgressReporter(ProgressReporter):
+    def __init__(
+        self,
+        *,
+        notify,
+        telegram_chat_id: int,
+        session_logger,
+        min_interval_seconds: float = 8.0,
+    ) -> None:
+        super().__init__(session_logger=session_logger, title="SHAMSU")
+        self.notify = notify
+        self.telegram_chat_id = telegram_chat_id
+        self.min_interval_seconds = min_interval_seconds
+        self._last_sent_at = 0.0
+        self._last_sent_message = ""
+
+    def _emit(self, kind: str, message: str, payload: dict) -> None:
+        super()._emit(kind, message, payload)
+        if self.notify is None or not self._should_notify(kind, message, payload):
+            return
+        self._last_sent_at = time.monotonic()
+        self._last_sent_message = message
+        self.notify(OutboundMessage(self.telegram_chat_id, _format_progress_message(kind, message, payload)))
+
+    def _should_notify(self, kind: str, message: str, payload: dict) -> bool:
+        if kind in {"progress.done", "progress.failed", "progress.warning", "progress.command_start"}:
+            return True
+        if kind == "progress.tool_start":
+            return True
+        if kind == "progress.tool_result":
+            return payload.get("ok") is False
+        now = time.monotonic()
+        if kind == "progress.step" and message != self._last_sent_message:
+            return now - self._last_sent_at >= self.min_interval_seconds
+        return False
+
+
+def _format_progress_message(kind: str, message: str, payload: dict) -> str:
+    if kind == "progress.tool_start":
+        return f"Working: {message}"
+    if kind == "progress.tool_result":
+        return f"Tool needs attention: {message}"
+    if kind == "progress.command_start":
+        return f"Running: {message}"
+    if kind == "progress.done":
+        return f"Done: {message}"
+    if kind == "progress.failed":
+        return f"Failed: {message}"
+    return f"Working: {message}"
+
+
+def _telegram_task_timeout_seconds(approval_broker: TelegramApprovalBroker | None) -> float:
+    raw = os.environ.get("SHAMSU_TELEGRAM_TASK_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    approval_timeout = float(getattr(approval_broker, "decision_timeout_seconds", 900.0) or 900.0)
+    return max(1800.0, approval_timeout + 300.0)

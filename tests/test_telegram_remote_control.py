@@ -398,6 +398,65 @@ def test_local_gateway_free_text_closes_action_ledger_without_false_failure(
     assert reloaded.last_user_prompt == "Hi"
 
 
+def test_local_gateway_sends_telegram_progress_notifications(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    logger = SessionManager(tmp_path).create_session("remote")
+    sent = []
+
+    class FakeApprovalBroker:
+        decision_timeout_seconds = 900.0
+
+        def notify(self, message):
+            sent.append(message)
+
+        def approval_func(self, **_kwargs):
+            return lambda _request: True
+
+    class FakeAgentChatLoop:
+        timeout_seen = 0.0
+
+        def __init__(self, *_args, progress=None, max_runtime_seconds=None, action_ledger=None, **_kwargs) -> None:
+            self.progress = progress
+            self.action_ledger = action_ledger
+            FakeAgentChatLoop.timeout_seen = float(max_runtime_seconds or 0)
+
+        async def run(self, text: str) -> AgentLoopResult:
+            self.progress.step("Thinking... choosing action 1/4")
+            self.progress.tool_start("file.patch", "file=primes.py")
+            return AgentLoopResult(
+                final=f"Echo: {text}",
+                run_id=self.action_ledger.run_id,
+                status=RunStatus.COMPLETED,
+            )
+
+    monkeypatch.setattr(telegram_sessions, "AgentChatLoop", FakeAgentChatLoop)
+    gateway = telegram_sessions.LocalShamsuSessionGateway(
+        tmp_path,
+        approval_broker=FakeApprovalBroker(),
+    )
+
+    result = asyncio.run(
+        gateway.route_user_message(
+            "Hi",
+            metadata=TelegramInboundMetadata(
+                source="telegram",
+                telegram_user_id=USER.user_id,
+                telegram_chat_id=CHAT.chat_id,
+                telegram_message_id=45,
+                session_id=logger.session_id,
+                timestamp=datetime.now(timezone.utc),
+            ),
+        )
+    )
+
+    assert result.text == "Echo: Hi"
+    assert FakeAgentChatLoop.timeout_seen == 1800.0
+    assert any("SHAMSU remote task started" in message.text for message in sent)
+    assert any("Using tool: file.patch" in message.text for message in sent)
+
+
 def test_message_formatting_and_pagination_redact_secrets() -> None:
     formatter = TelegramFormatter()
     pages = formatter.paginate("token=abc123\n" + ("x" * 5000), max_chars=1000)
@@ -569,6 +628,7 @@ def test_service_processes_status_while_task_is_running(tmp_path: Path) -> None:
         store.set_active_session(USER.user_id, "session-1")
 
         await service.process_update(TelegramUpdate(60, message=_message("Do slow work")))
+        assert transport.sent[0].text.startswith("Task received.")
         await asyncio.wait_for(gateway.started.wait(), timeout=1)
 
         await service.process_update(TelegramUpdate(61, message=_message("/status", message_id=2)))

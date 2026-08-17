@@ -163,20 +163,23 @@ class TelegramService:
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
         if self._should_process_in_background(update):
-            self._start_background_update(update)
+            self._mirror_inbound(update)
+            await self._send(self._background_ack(update))
+            self._start_background_update(update, mirror_inbound=False)
             return
         await self._handle_update_and_send(update)
 
-    async def _handle_update_and_send(self, update: TelegramUpdate) -> None:
+    async def _handle_update_and_send(self, update: TelegramUpdate, *, mirror_inbound: bool = True) -> None:
         messages = await self.controller.handle_update(update)
         if not messages:
             return
-        self._mirror_inbound(update)
+        if mirror_inbound:
+            self._mirror_inbound(update)
         for message in messages:
             await self._send(message)
 
-    def _start_background_update(self, update: TelegramUpdate) -> None:
-        task = asyncio.create_task(self._handle_update_and_send(update))
+    def _start_background_update(self, update: TelegramUpdate, *, mirror_inbound: bool = True) -> None:
+        task = asyncio.create_task(self._handle_update_and_send(update, mirror_inbound=mirror_inbound))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         task.add_done_callback(self._record_background_task_result)
@@ -204,6 +207,13 @@ class TelegramService:
         if parse_command(text) is not None:
             return False
         return self.authenticator.authorize(message.user, message.chat).ok
+
+    def _background_ack(self, update: TelegramUpdate) -> OutboundMessage:
+        assert update.message is not None
+        return OutboundMessage(
+            update.message.chat.chat_id,
+            "Task received. SHAMSU is starting now.\n\nUse /status anytime while it works.",
+        )
 
     async def _poll_loop(self) -> None:
         assert self.transport is not None
