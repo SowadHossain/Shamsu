@@ -1864,6 +1864,12 @@ def test_reading_a_file_in_pieces_still_allows_writing_it(tmp_path):
 
     loop._execute("read_file", {"filepath": "big.js", "start_line": 151, "end_line": 300})
 
+    # The partial-read guard has now released. A DIFFERENT guard takes over -
+    # big existing files are steered to patch_file - and that one has its own
+    # exit, so the deliberate second attempt lands.
+    released = loop._execute("write_file", {"filepath": "big.js", "content": "x"})
+    assert not released.data.get("partial_read"), "the partial-read guard never released"
+    assert released.data.get("prefer") == "patch_file"
     assert loop._execute("write_file", {"filepath": "big.js", "content": "x"}).ok
 
 
@@ -1989,6 +1995,12 @@ def test_a_huge_rewrite_does_not_replay_the_whole_file(tmp_path):
     (tmp_path / "big.js").write_text("\n".join(f"line {i}" for i in range(500)), encoding="utf-8")
     loop = _loop(tmp_path, [_text("ok")])
 
+    # First attempt is steered to patch_file; the deliberate retry is honoured
+    # and is the one that produces a diff.
+    loop._execute(
+        "write_file",
+        {"filepath": "big.js", "content": "unused"},
+    )
     result = loop._execute(
         "write_file",
         {"filepath": "big.js", "content": "\n".join(f"other {i}" for i in range(500))},
@@ -3120,3 +3132,64 @@ def test_an_old_client_that_rejects_a_keyword_still_gets_its_turn(tmp_path):
 
     assert result.final == "ok"
     assert "tools" in loop.client.calls[0], "tools were shed unnecessarily"
+
+
+# ---------------------------------------------------------------------------
+# Patch-first editing (SMALLCODE plan item C)
+#
+# Small models are unreliable at reproducing whole files - they truncate,
+# hallucinate imports and drift in indentation - and each attempt costs ~100s.
+# Live 2026-08-18, whole-file rewrites drove one turn to 18 minutes/18 rounds.
+# ---------------------------------------------------------------------------
+
+
+def _big_file(tmp_path: Path, name: str = "game.js", lines: int = 200) -> Path:
+    path = tmp_path / name
+    path.write_text("\n".join(f"const value{i} = {i};" for i in range(lines)), encoding="utf-8")
+    return path
+
+
+def test_rewriting_a_substantial_existing_file_is_steered_to_patch(tmp_path):
+    _big_file(tmp_path)
+    loop = _loop(tmp_path, [_tool("write_file", filepath="game.js", content="// oops")])
+
+    asyncio.run(loop.run("clean up game.js"))
+
+    assert _big_file  # keep the helper referenced for readers
+    assert (tmp_path / "game.js").read_text(encoding="utf-8") != "// oops"
+    told = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert any("patch_file" in c for c in told), "the error must name the next call"
+
+
+def test_a_deliberate_second_attempt_at_a_full_rewrite_is_honoured(tmp_path):
+    """Every guard needs an exit. A full rewrite is sometimes exactly right."""
+    _big_file(tmp_path)
+    rewrite = _tool("write_file", filepath="game.js", content="// intended full rewrite")
+    loop = _loop(tmp_path, [rewrite, rewrite, _text("rewritten")])
+
+    asyncio.run(loop.run("replace game.js entirely"))
+
+    assert (tmp_path / "game.js").read_text(encoding="utf-8") == "// intended full rewrite"
+
+
+def test_a_small_existing_file_is_still_rewritten_whole(tmp_path):
+    """The limit must not turn every tiny config edit into a patch round."""
+    (tmp_path / "config.json").write_text('{"port": 8080}', encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="config.json", content='{"port": 9090}'), _text("done")],
+    )
+
+    asyncio.run(loop.run("change the port"))
+
+    assert (tmp_path / "config.json").read_text(encoding="utf-8") == '{"port": 9090}'
+
+
+def test_a_brand_new_file_is_never_steered_to_patch(tmp_path):
+    """There is nothing to patch against."""
+    body = "\n".join(f"line {i}" for i in range(300))
+    loop = _loop(tmp_path, [_tool("write_file", filepath="new.py", content=body), _text("done")])
+
+    asyncio.run(loop.run("create new.py"))
+
+    assert (tmp_path / "new.py").read_text(encoding="utf-8") == body

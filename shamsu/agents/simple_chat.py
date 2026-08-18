@@ -107,6 +107,17 @@ REPEATED_READS_BEFORE_WARNING = 3
 
 # Diff lines fed back after an edit. Enough to see the change, not so many
 # that rewriting a file replays the whole file into the conversation.
+# An existing file bigger than this is patched, not rewritten whole. Small
+# models truncate, hallucinate imports and drift in indentation when asked to
+# reproduce a file; `patch_file` costs the same whatever the file size, and
+# cannot lose the parts nobody meant to touch. Measured 2026-08-19, the two
+# worst rewrite payloads in one session were 2,618 and 2,231 tokens - the
+# limit sits well below both, and well above a config file worth replacing.
+#
+# This is a PREFERENCE with an escape, unlike `_refuse_unwritable_rewrite`,
+# which is a physical limit and has none.
+WHOLE_REWRITE_LIMIT_TOKENS = 400
+
 MAX_DIFF_LINES = 40
 
 # How often the live status line reports that a model call is still running.
@@ -589,6 +600,11 @@ class SimpleChatLoop:
         # Lowered from what the GPU will actually accept, once it has refused.
         self._num_ctx_ceiling = 0
         self._evicted_others = False
+        # Paths already refused a whole-file rewrite once. The SECOND attempt
+        # is honoured: a full rewrite is sometimes genuinely right, and a guard
+        # with no exit is a deadlock waiting for a user. The partial-read guard
+        # once had none and blocked writes forever.
+        self._rewrite_refused: set[str] = set()
         # Files the model has seen only part of - writing them whole loses data.
         self._partial_reads: set[str] = set()
         # Line ranges seen per file, so reading a big file IN PIECES still
@@ -1353,6 +1369,11 @@ class SimpleChatLoop:
             blocked = self._refuse_blind_overwrite(arguments)
             if blocked is not None:
                 return blocked
+            blocked = self._prefer_patch_over_rewrite(
+                str(arguments.get("filepath") or "").strip()
+            )
+            if blocked is not None:
+                return blocked
             # A model asking to write a file means "make this the content",
             # whether or not it already exists. Refusing without overwrite=True
             # burns a round to teach a flag nobody wants to think about.
@@ -1434,6 +1455,8 @@ class SimpleChatLoop:
         path = str(data.get("resolved_filepath") or arguments.get("filepath") or "").strip()
         if not path:
             return
+        if not path:
+            return None
         key = path.lower()
         total = data.get("total_lines")
         start = data.get("start_line")
@@ -1487,6 +1510,44 @@ class SimpleChatLoop:
                 {"filepath": path, "partial_read": True},
             )
         return self._refuse_unwritable_rewrite(path)
+
+    def _prefer_patch_over_rewrite(self, path: str) -> ToolResult | None:
+        """Steer a whole-file rewrite of an existing file towards patch_file.
+
+        Not a physical limit like `_refuse_unwritable_rewrite` - a preference,
+        and the reasons are cost and safety rather than capacity. A small model
+        reproducing a file truncates it, invents imports and drifts in
+        indentation, and each attempt costs ~100s of generation; live
+        2026-08-18 whole-file rewrites drove one turn to 18 minutes over 18
+        rounds. `patch_file` costs the same whatever the file size.
+
+        The correction goes in the ERROR STRING, not the system prompt: a small
+        model acts on the message it just received, while a standing
+        prohibition only dilutes the prompt it sits in.
+
+        And it has an exit. A second attempt at the same path is honoured,
+        because a full rewrite is sometimes exactly right and a guard the model
+        cannot get past is a deadlock waiting for a user to notice.
+        """
+        key = path.lower()
+        if key in self._rewrite_refused:
+            self._activity(f"allowing the whole-file rewrite of {path} on the second attempt")
+            return None
+        try:
+            existing = (self.workspace / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None  # a new file - there is nothing to patch
+        if count_tokens(existing) <= WHOLE_REWRITE_LIMIT_TOKENS:
+            return None  # small enough that rewriting it whole is honest
+        self._rewrite_refused.add(key)
+        return ToolResult(
+            False,
+            f"{path} already exists and is {len(existing.splitlines())} lines. Use "
+            "patch_file to change just the part you mean - it is far faster and "
+            "cannot lose the rest of the file. Call patch_file with the exact "
+            "old_string you want replaced and the new_string to put there.",
+            {"filepath": path, "prefer": "patch_file", "retry_allowed": True},
+        )
 
     def _refuse_unwritable_rewrite(self, path: str) -> ToolResult | None:
         """Stop a whole-file rewrite that physically cannot fit in one reply.
