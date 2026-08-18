@@ -89,6 +89,7 @@ class ChatState:
         self._summarized_upto: int = 1
         if hydrate:
             self._hydrate_from_session()
+            self._restore_summary()
 
     def append_user(self, content: str, persisted_content: str | None = None) -> None:
         self._append(
@@ -181,6 +182,29 @@ class ChatState:
     def update_rolling_summary(self, summary: str, start_abs: int) -> None:
         self._rolling_summary = summary
         self._summarized_upto = max(self._summarized_upto, start_abs)
+        # Persist immediately. Held only in memory, this was rebuilt from
+        # whatever hydration loaded, so turns past the horizon were evicted,
+        # never summarised, and lost for good.
+        if self.session_logger is not None:
+            try:
+                self.session_logger.save_summary(self._rolling_summary, self._summarized_upto)
+            except Exception:
+                pass  # a failed save must never break the turn
+
+    def _restore_summary(self) -> None:
+        if self.session_logger is None:
+            return
+        try:
+            summary, upto = self.session_logger.load_summary()
+        except Exception:
+            return
+        if summary.strip():
+            self._rolling_summary = summary
+            # Hydration loads a WINDOW of the transcript, so the absolute index
+            # the summary was written against does not map onto this list. What
+            # matters is that the summary text survives and is shown; eviction
+            # accounting restarts from the hydrated messages.
+            self._summarized_upto = max(self._summarized_upto, 1)
 
     @property
     def rolling_summary(self) -> str:

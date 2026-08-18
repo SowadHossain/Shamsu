@@ -45,6 +45,14 @@ class SessionMetadata:
     auto_titled: bool = False
     message_count: int = 0
     summary_updated_at: str = ""
+    # The rolling compaction of turns that no longer fit the window. PERSISTED,
+    # because rebuilding it per turn only ever covered the messages hydration
+    # happened to load: past the 400-message horizon the earliest turns were
+    # evicted, never digested, and gone. Saved, it accumulates and keeps a trace
+    # of the whole thread however long it runs.
+    summary: str = ""
+    # Absolute index in the transcript up to which `summary` already accounts.
+    summarized_upto: int = 1
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionMetadata":
@@ -108,25 +116,60 @@ class SessionManager:
         max_age_seconds: int,
         max_messages: int,
     ) -> tuple["SessionLogger", str]:
-        """Bounded resume that also reports WHY, so the choice is never silent.
+        """Resume the newest unclaimed session, reporting WHY, never silently.
 
-        Restarting SHAMSU and landing back in an old session is confusing on its
-        own; it is worse now that the compiled frame carries a digest of the
-        session transcript, because a stale session quietly feeds unrelated work
-        into every prompt. Returns the logger and a short reason to display.
+        Age and message count no longer BLOCK a resume. They used to: 8 hours or
+        200 messages and SHAMSU silently started a new thread, so coming back the
+        next morning read as "everything I did yesterday is gone" even though the
+        transcript was intact on disk. Length is handled by compaction, which now
+        persists (`summary` in metadata), so a long thread stays affordable; and
+        staleness is handled by re-grounding, since the file listing is rebuilt
+        every round and `files_changed_since_last_activity` names what moved.
+
+        What DOES stop a resume is another live process already using the
+        session - interleaving two conversations into one transcript corrupts
+        both.
         """
-        latest = self.latest_active()
-        if latest is None:
-            return self.create_session(), "no previous session"
-        if self._safe_to_continue(latest.metadata, max_age_seconds, max_messages):
-            latest.log("session.resumed", {"query": "bounded-latest"}, "Session resumed")
-            return latest, "resumed"
-        reason = (
-            f"previous session had {latest.metadata.message_count} messages"
-            if max_messages and latest.metadata.message_count >= max_messages
-            else "previous session was stale"
-        )
-        return self.create_session(), reason
+        busy = 0
+        for candidate in self._active_loggers():
+            if candidate.claimed_by_other_live_process():
+                busy += 1
+                continue
+            # Read the age BEFORE anything touches the session: `log()` bumps
+            # `updated_at`, so measuring afterwards always reports "just now".
+            age = self._age_seconds(candidate.metadata)
+            candidate.resumed_from = candidate.metadata.updated_at
+            candidate.claim()
+            candidate.log("session.resumed", {"query": "latest-unclaimed"}, "Session resumed")
+            if age is not None and age > 86400:
+                return candidate, f"resumed - last active {age / 86400:.1f} days ago"
+            return candidate, "resumed"
+
+        fresh = self.create_session()
+        fresh.claim()
+        if busy == 1:
+            return fresh, "the previous session is open in another window"
+        if busy > 1:
+            return fresh, f"all {busy} previous sessions are open in other windows"
+        return fresh, "no previous session"
+
+    def _active_loggers(self) -> list["SessionLogger"]:
+        """Active sessions, newest first."""
+        return [
+            SessionLogger(self, item)
+            for item in self.list_sessions()
+            if item.status == "active"
+        ]
+
+    @staticmethod
+    def _age_seconds(metadata: SessionMetadata) -> float | None:
+        try:
+            updated = datetime.fromisoformat(metadata.updated_at.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return None
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - updated).total_seconds()
 
     def continue_or_create(
         self,
@@ -177,11 +220,17 @@ class SessionManager:
 
     def resume_session(self, query: str) -> "SessionLogger":
         metadata = self.resolve(query)
+        # Capture when the thread was last active before overwriting it, so
+        # `files_changed_since_last_activity` can still say what moved while it
+        # was away. Reading it afterwards only ever returns "now".
+        was_active_at = metadata.updated_at
         metadata.status = "active"
         metadata.updated_at = _now()
         self._write_metadata(metadata)
         self._upsert_index(metadata)
         logger = SessionLogger(self, metadata)
+        logger.resumed_from = was_active_at
+        logger.claim()
         logger.log("session.resumed", {"query": query}, "Session resumed")
         return logger
 
@@ -370,6 +419,13 @@ class SessionLogger:
         self.manager = manager
         self.metadata = metadata
         self.current_turn_id = ""
+        # When this thread was last active BEFORE we picked it up. Captured at
+        # resume, because resuming logs an event that bumps `updated_at`, and
+        # anything measuring staleness afterwards sees "now".
+        self.resumed_from: str = ""
+        # Set when `read_messages` had to rescue a transcript that was no longer
+        # JSONL. Non-zero means the file needs attention, not that reading failed.
+        self.recovered_message_count: int = 0
 
     @property
     def session_id(self) -> str:
@@ -392,6 +448,121 @@ class SessionLogger:
         return self.manager.sandbox.validate(
             Path(".shamsu") / "sessions" / self.session_id / "pending.json"
         )
+
+    # -- ownership -------------------------------------------------------
+    #
+    # `latest_active()` returns the newest active session with no notion of who
+    # is using it, so two REPLs in one workspace both attached to it, both
+    # appended to one transcript, and each one's hydration pulled in the other's
+    # turns. A claim file makes that visible so the second window can start its
+    # own thread instead of interleaving.
+
+    @property
+    def owner_path(self) -> Path:
+        return self.manager.session_dir(self.session_id) / "owner.json"
+
+    def claim(self) -> None:
+        """Mark this session as in use by this process."""
+        try:
+            self.owner_path.parent.mkdir(parents=True, exist_ok=True)
+            self.owner_path.write_text(
+                json.dumps({"pid": os.getpid(), "heartbeat": _now()}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass  # a session that cannot be claimed still has to work
+
+    def release(self) -> None:
+        try:
+            self.owner_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def claimed_by_other_live_process(self, stale_after_seconds: int = 300) -> bool:
+        """Is another RUNNING process using this session right now?
+
+        Two independent checks, because either alone is wrong: a pid can be
+        recycled by an unrelated program, and a heartbeat alone cannot tell a
+        crashed owner from a busy one. A claim counts only if the pid is alive
+        AND the heartbeat is recent, so a crash frees the session within
+        `stale_after_seconds` instead of locking it forever.
+        """
+        try:
+            raw = json.loads(self.owner_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        pid = raw.get("pid")
+        if not isinstance(pid, int) or pid == os.getpid():
+            return False
+        try:
+            beat = datetime.fromisoformat(str(raw.get("heartbeat", "")))
+            if beat.tzinfo is None:
+                beat = beat.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - beat).total_seconds() > stale_after_seconds:
+                return False
+        except (ValueError, AttributeError):
+            return False
+        try:
+            import psutil
+
+            return psutil.pid_exists(pid)
+        except Exception:
+            # No psutil: trust the heartbeat alone rather than guess.
+            return True
+
+    def save_summary(self, summary: str, summarized_upto: int) -> None:
+        """Persist the rolling compaction so it survives the process.
+
+        Without this the digest was rebuilt from whatever hydration loaded, so
+        anything past the 400-message horizon was evicted, never summarised, and
+        lost. Saved, the summary accumulates and a thread stays resumable
+        however long it grows.
+        """
+        metadata = self.metadata
+        metadata.summary = summary
+        metadata.summarized_upto = max(int(summarized_upto), 1)
+        metadata.summary_updated_at = datetime.now(timezone.utc).isoformat()
+        self.manager._write_metadata(metadata)
+        self.manager._upsert_index(metadata)
+
+    def load_summary(self) -> tuple[str, int]:
+        metadata = self.metadata
+        return metadata.summary or "", max(int(metadata.summarized_upto or 1), 1)
+
+    def files_changed_since_last_activity(self, limit: int = 20) -> list[str]:
+        """Workspace files modified since this session was last active.
+
+        A resumed thread quotes file CONTENT from old `read_file` results, and
+        that content may be stale even though the file LISTING is rebuilt every
+        round. This names exactly which memories to distrust.
+
+        Measures from `resumed_from`, captured BEFORE the resume touched
+        anything. Reading `metadata.updated_at` here returns "now", because
+        resuming logs an event that bumps it - so the answer was always an empty
+        list, which reads exactly like "nothing changed".
+        """
+        stamp = self.resumed_from or self.metadata.updated_at
+        try:
+            updated = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return []
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=timezone.utc)
+        cutoff = updated.timestamp()
+        root = Path(self.manager.workspace)
+        changed: list[str] = []
+        skip = {".shamsu", ".git", ".venv", "venv", "node_modules", "__pycache__", "dist", "build"}
+        for path in root.rglob("*"):
+            if len(changed) >= limit:
+                break
+            if not path.is_file() or skip & set(path.parts):
+                continue
+            try:
+                if path.stat().st_mtime > cutoff:
+                    changed.append(path.relative_to(root).as_posix())
+            except OSError:
+                continue
+        return changed
 
     def set_pending_question(self, question: dict[str, Any]) -> None:
         """Persist a clarification question SHAMSU is waiting on. The next user
@@ -542,13 +713,17 @@ class SessionLogger:
         """Append one clean transcript turn. Kept separate from the richer
         `chat.message` event so hydration can prefer a compact, redacted
         transcript and moving fully off events.jsonl later is trivial."""
+        # LOSSLESS on purpose - see `redact_payload`. This file is the archive
+        # the whole conversation is read back from; clipping here silently
+        # shrank what a resumed session could see, and what "show me the full
+        # history" could ever print. Budgets belong at READ time.
         record = {
             "timestamp": _now(),
             "role": role,
-            "content": _clip(redact(str(content)), MESSAGE_PREVIEW_CHARS),
+            "content": redact(str(content)),
             "tool_call_id": tool_call_id,
             "name": name,
-            "tool_calls": sanitize_payload(tool_calls or []),
+            "tool_calls": redact_payload(tool_calls or []),
         }
         path = self.messages_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -558,19 +733,43 @@ class SessionLogger:
         return record
 
     def read_messages(self, count: int | None = None) -> list[dict[str, Any]]:
+        """The conversation, recovered even if the file is no longer JSONL.
+
+        This used to skip unparseable lines silently. Live 2026-08-18 a 99 KB
+        transcript had been reformatted into indented JSON - an editor opening a
+        `.jsonl` will do that - and 655 of 657 lines failed to parse. The
+        session hydrated ONE message, the agent worked with almost no history,
+        and nothing anywhere said so. Fifteen minutes were lost to it.
+
+        Losing history silently is the worst failure this class of code has, so:
+        parse line-by-line first (the fast, normal path), and if that clearly
+        did not work, re-read the whole file as a stream of JSON objects, which
+        recovers pretty-printed records. `recovered_message_count` reports what
+        the fallback had to rescue, so a caller can warn.
+        """
         path = self.messages_path
         if not path.exists():
             return []
-        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if count is not None:
-            lines = lines[-count:]
+        text = path.read_text(encoding="utf-8")
+        lines = [line for line in text.splitlines() if line.strip()]
+
         records: list[dict[str, Any]] = []
+        failures = 0
         for line in lines:
             try:
                 records.append(json.loads(line))
             except json.JSONDecodeError:
-                continue
-        return records
+                failures += 1
+
+        # More lines failed than parsed: this is not JSONL any more. Recover the
+        # objects rather than return a near-empty conversation.
+        if failures > len(records):
+            recovered = _decode_json_stream(text)
+            if len(recovered) > len(records):
+                self.recovered_message_count = len(recovered)
+                records = recovered
+
+        return records[-count:] if count is not None else records
 
     # -- Session state / pending action (state.json) ------------------------
 
@@ -947,6 +1146,83 @@ def sanitize_payload(value: Any) -> Any:
         return sanitize_payload(asdict(value))
     except TypeError:
         return _truncate(redact(str(value)))
+
+
+SECRET_KEYS = frozenset(
+    {
+        "access_token", "api_key", "apikey", "authorization", "client_secret",
+        "credential", "credentials", "password", "private_key", "refresh_token",
+        "secret", "secret_key", "token",
+    }
+)
+
+
+def _decode_json_stream(text: str) -> list[dict[str, Any]]:
+    """Every JSON object in *text*, however it happens to be laid out.
+
+    Rescues a transcript that is no longer one-object-per-line - most often
+    because something reformatted it with an indent. `raw_decode` reads one
+    object and reports where it stopped, so this walks the file without caring
+    about newlines.
+    """
+    decoder = json.JSONDecoder()
+    out: list[dict[str, Any]] = []
+    index, length = 0, len(text)
+    while index < length:
+        while index < length and text[index] in " \t\r\n":
+            index += 1
+        if index >= length:
+            break
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except ValueError:
+            # Skip to the next plausible object start rather than give up.
+            nxt = text.find("{", index + 1)
+            if nxt == -1:
+                break
+            index = nxt
+            continue
+        if isinstance(value, dict):
+            out.append(value)
+    return out
+
+
+def redact_payload(value: Any) -> Any:
+    """`sanitize_payload` without the truncation - redaction only.
+
+    The transcript is the ARCHIVE, and an archive that clips is not one. Live
+    2026-08-18 `tool_calls` went through `sanitize_payload`, which truncates
+    every string at MAX_STRING_CHARS (4000), so a `write_file` of a 10k-char
+    file was recorded as a fragment: on resume the model could not trust its own
+    history. Meanwhile `_budgeted` had just been raised to ~32k chars, so the
+    same read was FULL in memory and clipped on disk.
+
+    The rule this exists to enforce: **truncate at READ, never at WRITE.** A
+    complete record can always be narrowed for a prompt; a truncated one can
+    never be widened. Disk growth is a retention problem - a whole project's
+    sessions measured 684 KB - not a reason to mutilate a live conversation.
+
+    Secrets are still removed: redaction is not truncation.
+    """
+    if isinstance(value, ContextPack):
+        return redact_payload(value.to_dict())
+    if isinstance(value, dict):
+        return {
+            str(key): "[REDACTED]"
+            if str(key).lower().replace("-", "_") in SECRET_KEYS
+            else redact_payload(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_payload(item) for item in value]
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    try:
+        return redact_payload(asdict(value))
+    except TypeError:
+        return redact(str(value))
 
 
 def _sanitize_scalar(value: Any) -> Any:

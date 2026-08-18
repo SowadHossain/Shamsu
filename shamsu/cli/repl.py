@@ -358,6 +358,8 @@ SYSTEM_COMMANDS = (
     "/django setup ",
     "/django test ",
     "/django fix-tests ",
+    "/compact",
+    "/compact clear",
     "/sessions list",
     "/sessions new",
     "/sessions current",
@@ -3894,7 +3896,77 @@ def _start_session(args: argparse.Namespace, workspace: Path, console: Console) 
         f"[dim]Session: {logger.session_id} ({logger.metadata.title}) - {reason}. "
         "`/sessions list` to see others, `/sessions close` to end this one.[/dim]"
     )
+    _announce_other_threads(manager, logger, console)
+    _announce_stale_files(logger, console)
+    _announce_recovered_transcript(logger, console)
     return logger
+
+
+def _announce_recovered_transcript(logger: Any, console: Any) -> None:
+    """Say so when the transcript had to be rescued.
+
+    A reformatted `messages.jsonl` used to hydrate as ONE message with no
+    warning - the agent worked with almost no history and nobody could tell.
+    Recovery is good; recovering silently is how the original bug hid.
+    """
+    try:
+        logger.read_messages(1)
+        rescued = getattr(logger, "recovered_message_count", 0)
+    except Exception:
+        return
+    if rescued:
+        console.print(
+            f"[yellow]Note: this session's transcript is no longer line-delimited "
+            f"JSON - recovered {rescued} messages from it. Something reformatted "
+            f"{logger.messages_path.name}; history is intact but the file should "
+            "not be edited by hand.[/yellow]"
+        )
+
+
+def _announce_other_threads(manager: Any, current: Any, console: Any, limit: int = 5) -> None:
+    """Name the other threads, so resuming one is discoverable.
+
+    Persistence was never the problem - a conversation survives a reboot and a
+    full model eviction. Finding it was: the old sessions sat on disk behind a
+    command you had to already know, so starting a new thread read as "yesterday
+    is gone". This is the sidebar every chat app has, in one line.
+    """
+    try:
+        others = [
+            item for item in manager.list_sessions()
+            if item.session_id != current.session_id and item.status == "active"
+        ][:limit]
+    except Exception:
+        return
+    if not others:
+        return
+    console.print("[dim]Other threads you can resume:[/dim]")
+    for item in others:
+        console.print(
+            f"[dim]  /sessions resume {item.session_id}   "
+            f"{item.title} ({item.message_count} messages)[/dim]"
+        )
+
+
+def _announce_stale_files(logger: Any, console: Any, limit: int = 8) -> None:
+    """Name files that changed while this thread was away.
+
+    The workspace LISTING is rebuilt every round, so layout is never stale. What
+    goes stale is file CONTENT quoted in old `read_file` results - the model
+    will happily act on a week-old copy. This says which memories to distrust.
+    """
+    try:
+        changed = logger.files_changed_since_last_activity(limit=limit + 1)
+    except Exception:
+        return
+    if not changed:
+        return
+    shown = ", ".join(changed[:limit])
+    more = f" (+{len(changed) - limit} more)" if len(changed) > limit else ""
+    console.print(
+        f"[dim]Changed since this thread was last active: {shown}{more}. "
+        "Re-read those before editing them.[/dim]"
+    )
 
 
 def _handle_sessions(
@@ -17878,6 +17950,14 @@ def _normalize_command_input(user_input: str) -> str:
 
 
 def _thinking_status_for_input(user_input: str) -> str:
+    # These labels describe LEGACY routing steps - "checking workspace PRD
+    # files", "checking whether web lookup is needed" - and simple mode does
+    # none of them. Live 2026-08-18 a prompt that merely contained the word
+    # "prd" sat under "Checking workspace PRD files..." for ten minutes while
+    # the model was in fact answering an ordinary chat turn, and the user
+    # reasonably read the label as the thing that was stuck.
+    if not _legacy_routing_enabled():
+        return "[dim]Working...[/dim]"
     normalized = _normalize_command_input(user_input).lower()
     if _looks_like_capabilities_question(user_input):
         return "[dim]Checking which tools I actually have...[/dim]"
@@ -18025,6 +18105,57 @@ def _make_prompt_session(
         return None
 
 
+def _handle_compact(user_input: str, session_logger: Any, console: Any) -> None:
+    """`/compact` shows the running summary; `/compact clear` forgets it.
+
+    Compaction is otherwise invisible: it decides what the model still knows
+    about earlier work, and until now there was no way to read it or correct it.
+    """
+    argument = user_input.split(None, 1)[1].strip().lower() if " " in user_input else ""
+    try:
+        summary, upto = session_logger.load_summary()
+    except Exception as exc:  # noqa: BLE001 - a broken read is worth showing
+        console.print(f"[red]Could not read the summary: {exc}[/red]")
+        return
+
+    if argument == "clear":
+        try:
+            session_logger.save_summary("", 1)
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[red]Could not clear it: {exc}[/red]")
+            return
+        console.print("[dim]Summary cleared. Earlier turns still exist in the transcript.[/dim]")
+        return
+
+    if not summary.strip():
+        console.print(
+            "[dim]Nothing compacted yet - the whole conversation still fits in the "
+            "window. This fills in once older turns stop fitting.[/dim]"
+        )
+        return
+
+    console.print(f"[dim]What the model is told about earlier work (through message {upto}):[/dim]")
+    console.print(summary)
+    console.print("[dim]`/compact clear` to forget it and rebuild from the transcript.[/dim]")
+
+
+def _session_prompt_label(session_logger: Any, max_chars: int = 24) -> str:
+    """`shamsu (asteroids)> ` - which thread you are talking to.
+
+    Falls back to a bare `shamsu> ` if anything is missing: a decorative label
+    must never be able to stop the REPL from accepting input.
+    """
+    try:
+        title = str(getattr(getattr(session_logger, "metadata", None), "title", "") or "").strip()
+    except Exception:
+        title = ""
+    if not title or title.lower() in {"shamsu session", "session", "untitled"}:
+        return "shamsu> "
+    if len(title) > max_chars:
+        title = title[:max_chars].rstrip() + "..."
+    return f"shamsu ({title})> "
+
+
 def _force_utf8_stdio() -> None:
     """Best-effort: make stdout/stderr UTF-8 so non-ASCII output (arrow/box glyphs)
     never crashes on a Windows console, even if PYTHONUTF8 wasn't set by the
@@ -18133,10 +18264,15 @@ def main(argv: list[str] | None = None) -> None:
 
     while True:
         try:
+            # Name the thread in the prompt. `/sessions current` existed, but
+            # nobody runs it every turn, so which conversation you were in was
+            # invisible - and after a restart silently forked a new session it
+            # was the difference between "resumed" and "everything is gone".
+            prompt_label = _session_prompt_label(session_logger)
             if session is None:
-                raw_input_text = input("shamsu> ")
+                raw_input_text = input(prompt_label)
             else:
-                raw_input_text = session.prompt([("class:prompt", "shamsu> ")])
+                raw_input_text = session.prompt([("class:prompt", prompt_label)])
         except EOFError:
             print("\nGoodbye.")
             break
@@ -18343,6 +18479,9 @@ def main(argv: list[str] | None = None) -> None:
                 )
             else:
                 _handle_django(normalized_input, workspace, console, session_logger=session_logger)
+            continue
+        if lowered_input.startswith("compact"):
+            _handle_compact(normalized_input, session_logger, console)
             continue
         if lowered_input.startswith("sessions"):
             with console.status(_thinking_status_for_input(user_input), spinner="dots"):

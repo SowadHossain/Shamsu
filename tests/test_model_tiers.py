@@ -14,6 +14,14 @@ from shamsu.runtime.models import (
     tier_model_specs,
 )
 
+# The DEFAULT tier's thinking anchor, read from the cookbook rather than
+# hardcoded: swapping the anchor (qwen3:8b -> qwen3.5:9b-q4_K_M, 2026-08-18)
+# broke 20 tests that had the old name baked in. The behaviour under test is
+# "every role resolves to the ONE anchor", never "it is called qwen3:8b".
+from shamsu.runtime.models import ModelTier, TIER_MODEL_SPECS
+
+ANCHOR = TIER_MODEL_SPECS[ModelTier.DEFAULT][0].name
+
 
 def test_default_tier_serves_every_role_from_one_model():
     """One model is now the default, not opt-in.
@@ -25,15 +33,15 @@ def test_default_tier_serves_every_role_from_one_model():
     """
     assert active_tier() is DEFAULT_TIER
     for role in ("qa", "coder", "router", "planner", "bugfix"):
-        assert model_for_role(role) == "qwen3:8b", role
-    assert required_model_names() == ["qwen3:8b"]
+        assert model_for_role(role) == ANCHOR, role
+    assert required_model_names() == [ANCHOR]
 
 
 def test_multi_model_mode_restores_the_two_anchor_layout(monkeypatch):
     """The escape hatch, kept working so the default is reversible."""
     monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
 
-    assert model_for_role("qa") == "qwen3:8b"
+    assert model_for_role("qa") == ANCHOR
     assert model_for_role("coder") == "qwen2.5-coder:7b-instruct"
     # In this mode the router still dodges the reasoning anchor by model choice.
     assert model_for_role("router") == "qwen2.5-coder:7b-instruct"
@@ -74,21 +82,21 @@ def test_clearing_model_override_returns_to_tier_selection(tmp_path):
     clear_model_override(tmp_path)
 
     assert active_model_override() == ""
-    assert model_for_role("coder") == "qwen3:8b"
+    assert model_for_role("coder") == ANCHOR
 
 
 def test_a_pin_outranks_multi_model_mode(monkeypatch):
     monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
-    monkeypatch.setenv("SHAMSU_MODEL", "qwen3:8b")
+    monkeypatch.setenv("SHAMSU_MODEL", ANCHOR)
 
-    assert model_for_role("coder") == "qwen3:8b"
+    assert model_for_role("coder") == ANCHOR
 
 
 def test_default_thinking_anchor_does_native_tools_and_reasoning():
     from shamsu.runtime.models import model_is_reasoning, model_supports_native_tools
 
-    assert model_supports_native_tools("qwen3:8b") is True
-    assert model_is_reasoning("qwen3:8b") is True
+    assert model_supports_native_tools(ANCHOR) is True
+    assert model_is_reasoning(ANCHOR) is True
 
 
 def test_light_tier_uses_small_cpu_friendly_models(tmp_path):
@@ -195,9 +203,9 @@ def test_mechanical_roles_do_not_think_but_real_work_does():
     from shamsu.runtime.models import role_should_think
 
     for role in ("router", "classifier", "prd_headings", "prd_entities"):
-        assert role_should_think(role, "qwen3:8b") is False, role
+        assert role_should_think(role, ANCHOR) is False, role
     for role in ("planner", "coder", "reviewer", "qa"):
-        assert role_should_think(role, "qwen3:8b") is True, role
+        assert role_should_think(role, ANCHOR) is True, role
 
 
 def test_a_non_reasoning_model_never_thinks_whatever_the_role():

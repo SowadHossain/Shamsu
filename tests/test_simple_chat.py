@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -249,14 +250,26 @@ def test_a_dangerous_command_still_asks():
 # --- context sizing -----------------------------------------------------
 
 
-def test_a_short_conversation_does_not_allocate_the_whole_window(tmp_path):
-    """Ollama reserves KV for the whole num_ctx; asking 32k for an 8k prompt is
-    what spilled the cache to system RAM and made first token take 83s."""
-    loop = _loop(tmp_path, [_text("hi")])
+def test_every_call_in_a_session_uses_one_window(tmp_path):
+    """Superseded 2026-08-18. Sizing num_ctx to the prompt was right at f16,
+    where asking 32k for an 8k prompt spilled the cache to RAM and made first
+    token take 83s. With a quantized KV cache the whole range costs 385 MiB
+    (8192 -> 6506, 16384 -> 6702, 32768 -> 6891), so the saving is gone while
+    the costs are not: changing num_ctx RELOADS the model, and the smaller
+    bucket halves `output_reserve`, which starves a reasoning model into empty
+    replies. Live, that combination produced 290s rounds and a failed turn.
+
+    Prefill is charged on the actual prompt, not the window, so a big window is
+    free in time. `_shrink_for_oom` still steps down if the GPU refuses.
+    """
+    loop = _loop(tmp_path, [_tool("list_files", path="."), _text("hi")])
 
     asyncio.run(loop.run("hello"))
+    asyncio.run(loop.run("and again"))
 
-    assert loop.client.calls[0]["options"]["num_ctx"] == CTX_BUCKETS[0]
+    windows = {call["options"]["num_ctx"] for call in loop.client.calls}
+    assert len(windows) == 1, f"one window per session, saw {sorted(windows)}"
+    assert windows == {32768}
 
 
 def test_the_window_grows_with_the_conversation_and_never_shrinks(tmp_path):
@@ -725,11 +738,22 @@ def test_an_unavailable_code_graph_does_not_break_the_turn(tmp_path, monkeypatch
 # message cap had been accidentally protecting the VRAM ceiling.
 
 
-def test_the_default_context_fits_an_8gb_card(tmp_path):
-    """~5GB of weights + 144 KiB/token of KV: 16k costs ~2.25GB, 32k ~4.5GB."""
+def test_the_default_context_is_the_full_32k(tmp_path):
+    """32k fits at 100% GPU once the KV cache is q8_0 - measured 2026-08-18:
+    f16 made 16k spill to CPU (47.5s); q8_0 put 32k on the GPU at 7.5s."""
     from shamsu.agents.simple_chat import max_ctx
 
-    assert max_ctx() == 16384
+    assert max_ctx() == 32768
+
+
+def test_the_reply_reserve_scales_with_the_window(tmp_path):
+    """A fixed 4096 reserve at 32k left the prompt 28160 and the reply the same
+    4096 it got at 8k - the model spent it thinking and returned nothing."""
+    from shamsu.agents.simple_chat import output_reserve
+
+    assert output_reserve(8192) == 4096
+    assert output_reserve(32768) == 8192
+    assert output_reserve(65536) == 16384
 
 
 def test_an_out_of_memory_reply_is_recognised():
@@ -912,3 +936,1045 @@ def test_logging_failure_never_breaks_the_turn(tmp_path):
     log.open_turn("hi")          # must not raise
     log.log_response({"message": {"content": "x"}}, 0.1)
     log.close_turn("done", 1, stopped=False)
+
+
+
+def test_an_empty_reply_cannot_spin_forever(tmp_path):
+    """Unbounded, this branch ran all 24 rounds - half an hour of "Thinking..."
+    with three consecutive `user` messages and no reply."""
+    always_empty = [_text("") for _ in range(30)]
+    loop = _loop(tmp_path, always_empty, max_rounds=24)
+
+    result = asyncio.run(loop.run("okay proceed"))
+
+    assert result.stopped
+    assert len(loop.client.calls) <= 4, f"must give up early, made {len(loop.client.calls)} calls"
+    assert "empty reply" in result.final
+
+
+def test_the_transcript_never_stacks_user_messages(tmp_path):
+    """Consecutive user turns with no assistant between them is a malformed
+    conversation - the model stops seeing its own output."""
+    loop = _loop(tmp_path, [_text(""), _text(""), _text("here you go")])
+
+    asyncio.run(loop.run("okay proceed"))
+
+    roles = [m["role"] for m in loop.client.calls[-1]["messages"]]
+    for first, second in zip(roles, roles[1:]):
+        assert not (first == "user" and second == "user"), f"stacked user turns: {roles}"
+
+
+def test_a_reply_that_only_reasoned_is_used_not_discarded(tmp_path):
+    """A model that thinks past its budget emits no visible content. That is a
+    reply, not silence - re-asking just burns another 30s."""
+    reasoned = {"message": {"content": "", "thinking": "The fix is to set speed = 2.", "tool_calls": []}}
+    loop = _loop(tmp_path, [reasoned] * 6)
+
+    result = asyncio.run(loop.run("how do I slow the ship?"))
+
+    assert not result.stopped
+    assert "speed = 2" in result.final
+
+
+def test_an_empty_first_turn_is_retried_before_being_salvaged(tmp_path):
+    """Salvaging on the FIRST empty turn ended the turn and did no work - the
+    live probe lost turns 8-10 that way, main.py was never written."""
+    reasoned = {"message": {"content": "", "thinking": "Let me think about this.", "tool_calls": []}}
+    loop = _loop(
+        tmp_path,
+        [reasoned, _tool("write_file", filepath="main.py", content="print(1)"), _text("Wrote main.py.")],
+    )
+
+    result = asyncio.run(loop.run("write main.py"))
+
+    assert (tmp_path / "main.py").exists(), "it must get another chance to call the tool"
+    assert result.final == "Wrote main.py."
+
+
+# --- truncated reads (live 2026-08-18) ----------------------------------
+#
+# `_compact_value` split its 6000-char budget EQUALLY across a dict's keys.
+# read_file returns six, so content got 6000//6 = 1000 chars: a 4170-char file
+# reached the model as 24% of itself under `"truncated": false`. The model said
+# "the file read is being truncated in the response", re-read five times, and
+# had no way to ask for the rest.
+
+
+def test_a_normal_source_file_reaches_the_model_whole(tmp_path):
+    from shamsu.tools.agent_tools import AgentToolRegistry
+
+    source = "\n".join(f"const value{i} = {i};" for i in range(200))
+    (tmp_path / "app.js").write_text(source, encoding="utf-8")
+    reg = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+
+    payload = json.loads(reg.read_file("app.js").to_json())
+
+    assert payload["data"]["content"] == source, "the serializer must not silently clip it"
+    assert "[truncated" not in payload["data"]["content"]
+
+
+def test_one_big_field_is_not_starved_by_its_small_siblings(tmp_path):
+    """The bug exactly: five tiny keys each reserved an equal share."""
+    from shamsu.tools.agent_tools import _compact_value, COMPACT_VALUE_LIMIT
+
+    data = {
+        "filepath": "a.js", "resolved_filepath": "a.js", "total_lines": 156,
+        "candidates": [], "truncated": False, "content": "x" * 9000,
+    }
+    out = _compact_value(data, COMPACT_VALUE_LIMIT)
+
+    assert out["content"] == data["content"], "content must not pay for the metadata"
+
+
+def test_an_oversized_result_stays_parseable(tmp_path):
+    """Slicing raw JSON left an unterminated string - unreadable to the model."""
+    from shamsu.agents.simple_chat import _budgeted
+
+    payload = json.dumps({"ok": True, "message": "Read file.",
+                          "data": {"filepath": "big.js", "content": "y" * 400000}})
+    out = _budgeted(payload)
+
+    parsed = json.loads(out)  # must not raise
+    assert parsed["data"]["content_truncated"] is True
+    assert "start_line" in parsed["data"]["content"], "say how to get the rest"
+
+
+def test_the_model_can_ask_for_a_line_range(tmp_path):
+    """Without this, a truncated read is a dead end - the only move left is to
+    re-read and get the identical result, which is what it did five times."""
+    read = next(t for t in SIMPLE_TOOL_SCHEMAS if t["function"]["name"] == "read_file")
+
+    assert set(read["function"]["parameters"]["properties"]) >= {"start_line", "end_line"}
+    assert read["function"]["parameters"]["required"] == ["filepath"]
+
+
+def test_a_partly_read_file_cannot_be_overwritten_whole(tmp_path):
+    """The data-loss path: rewrite from a fragment and the unseen tail is gone.
+    The gutting guard misses it - that needs a 75% shrink AND zero declarations."""
+    original = "\n".join(f"function f{i}() {{ return {i}; }}" for i in range(400))
+    (tmp_path / "big.js").write_text(original, encoding="utf-8")
+
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._partial_reads.add("big.js")
+
+    result = loop._execute("write_file", {"filepath": "big.js", "content": "function f0() {}"})
+
+    assert not result.ok
+    assert "only seen part" in result.message
+    assert "patch_file" in result.message, "tell it what to do instead"
+    assert (tmp_path / "big.js").read_text(encoding="utf-8") == original, "file untouched"
+
+
+def test_a_full_read_clears_the_block(tmp_path):
+    (tmp_path / "small.js").write_text("const a = 1;\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._partial_reads.add("small.js")
+
+    loop._execute("read_file", {"filepath": "small.js"})
+
+    assert loop._execute(
+        "write_file", {"filepath": "small.js", "content": "const a = 2;\n"}
+    ).ok, "once it has seen the whole file, writing must be allowed again"
+
+
+# --- compaction that survives the process (2026-08-18) ------------------
+#
+# The rolling summary was held only in memory and rebuilt each turn from
+# whatever hydration loaded, so a thread past the 400-message horizon lost its
+# earliest turns entirely - evicted, never summarised, gone.
+
+
+def test_the_summary_survives_a_restart(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="long thread")
+    state = ChatState(simple_system_prompt(tmp_path), session_logger=logger, hydrate=False)
+    state.update_rolling_summary("- you asked: build an asteroids game\n- window is 900x700", 12)
+
+    # a brand new process would build a fresh ChatState from the same session
+    revived = ChatState(
+        simple_system_prompt(tmp_path),
+        session_logger=mgr.resume_session(logger.session_id),
+        hydrate=True,
+    )
+
+    assert "900x700" in revived.rolling_summary, "compaction must outlive the process"
+
+
+def test_a_session_written_before_this_feature_still_loads(tmp_path):
+    """from_dict filters to known fields, so old session.json must not crash."""
+    from shamsu.session.manager import SessionMetadata
+
+    meta = SessionMetadata.from_dict(
+        {"session_id": "s", "title": "t", "workspace": "w",
+         "created_at": "c", "updated_at": "u"}
+    )
+
+    assert meta.summary == ""
+    assert meta.summarized_upto == 1
+
+
+def test_the_summary_cannot_grow_until_it_eats_the_window(tmp_path):
+    from shamsu.agents.simple_chat import _bounded_summary, summary_budget
+    from shamsu.context.budget import count_tokens
+
+    budget = summary_budget(32768)
+    lines = [f"- you asked: step {i}" for i in range(2000)]
+
+    out = _bounded_summary(lines, budget)
+
+    assert count_tokens(out) <= budget
+
+
+def test_compaction_keeps_the_founding_decision_not_just_recent_chatter(tmp_path):
+    """`lines[-14:]` kept the newest fourteen and threw away exactly the early
+    decisions ('the window is 900x700') a long thread depends on."""
+    from shamsu.agents.simple_chat import _bounded_summary, summary_budget
+
+    lines = ["- you asked: the window is 900x700 and max speed is 4.5"]
+    lines += [f"- you asked: tweak number {i}" for i in range(500)]
+
+    out = _bounded_summary(lines, summary_budget(32768))
+
+    assert "900x700" in out, "the founding decision must survive"
+    assert "tweak number 499" in out, "and so must the most recent work"
+
+
+def test_resuming_names_the_files_that_changed_while_away(tmp_path):
+    """A resumed thread quotes file CONTENT from old reads; this says which of
+    those memories to distrust."""
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="stale")
+    (tmp_path / "changed.js").write_text("// edited after the session paused\n", encoding="utf-8")
+
+    changed = logger.files_changed_since_last_activity()
+
+    assert "changed.js" in changed
+
+
+# --- P6: the archive is complete, the prompt is budgeted ----------------
+#
+# `messages.jsonl` clipped content at 16000 and tool_calls at 4000, so a
+# `write_file` of a 10k file was recorded as a fragment and a resumed session
+# saw less than the original. Raising the in-memory budget to ~32k chars the
+# same day made the gap wider. Rule: truncate at READ, never at WRITE.
+
+
+def test_a_big_tool_call_is_archived_whole(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="archive")
+    body = "x = 1\n" * 4000                      # ~24k chars, over every old cap
+    logger.append_message(
+        "assistant", "",
+        tool_calls=[{"function": {"name": "write_file",
+                                  "arguments": {"filepath": "big.py", "content": body}}}],
+    )
+
+    stored = logger.read_messages()[-1]
+    written = stored["tool_calls"][0]["function"]["arguments"]["content"]
+
+    assert written == body, f"archive lost {len(body) - len(written)} chars"
+    assert "[truncated" not in json.dumps(stored)
+
+
+def test_a_big_message_content_is_archived_whole(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="archive")
+    body = "line of a very large file\n" * 2000   # ~50k chars
+
+    logger.append_message("tool", body, name="read_file")
+
+    assert logger.read_messages()[-1]["content"] == body
+
+
+def test_on_disk_fidelity_is_never_less_than_in_memory(tmp_path):
+    """The invariant. Whatever the model was allowed to SEE must be at least
+    what the transcript keeps, or resuming silently degrades the conversation."""
+    from shamsu.agents.simple_chat import MAX_TOOL_RESULT_TOKENS
+    from shamsu.session.manager import SessionManager
+
+    in_memory_chars = MAX_TOOL_RESULT_TOKENS * 4
+    payload = "y" * in_memory_chars
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="invariant")
+    logger.append_message("tool", payload, name="read_file")
+
+    assert len(logger.read_messages()[-1]["content"]) >= in_memory_chars
+
+
+def test_secrets_are_still_removed_from_the_archive(tmp_path):
+    """Lossless must not mean unredacted - redaction is not truncation."""
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="secrets")
+    logger.append_message(
+        "assistant", "",
+        tool_calls=[{"function": {"name": "run_command",
+                                  "arguments": {"command": "deploy", "api_key": "sk-abc123"}}}],
+    )
+
+    blob = json.dumps(logger.read_messages()[-1])
+    assert "sk-abc123" not in blob
+    assert "[REDACTED]" in blob
+
+
+def test_the_markdown_log_keeps_whole_tool_results(tmp_path):
+    from shamsu.agents.simple_log import SimpleTurnLog
+
+    log = SimpleTurnLog(tmp_path, 1, "m")
+    body = "const value = 1;\n" * 1000            # ~17k chars
+
+    log.log_tool_result("read_file", {"filepath": "a.js"}, True, body)
+
+    text = log.path.read_text(encoding="utf-8")
+    assert "more chars]" not in text
+    assert text.count("const value = 1;") == 1000
+
+
+# --- P1: one log file per THREAD, not per turn --------------------------
+#
+# The counter was `number of files in the directory`, so numbering was
+# workspace-global, carried no session id, and two threads interleaved as
+# turn-001..turn-011 with no way to tell them apart.
+
+
+def test_a_thread_is_one_log_file_across_many_turns(tmp_path):
+    from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
+
+    for message in ("first thing", "second thing", "third thing"):
+        log = SimpleTurnLog(
+            tmp_path, next_turn_number(tmp_path, "sess-A"), "m",
+            session_id="sess-A", session_title="Asteroids Game",
+        )
+        log.open_turn(message)
+        log.close_turn("ok", 1, stopped=False)
+
+    files = sorted(p.name for p in (tmp_path / ".shamsu/chat-logs").glob("*.md"))
+    assert files == ["latest.md", "sess-A--asteroids-game.md"], files
+    text = (tmp_path / ".shamsu/chat-logs/sess-A--asteroids-game.md").read_text(encoding="utf-8")
+    assert text.count("# Turn ") == 3
+    for message in ("first thing", "second thing", "third thing"):
+        assert message in text
+
+
+def test_two_sessions_do_not_share_a_file_or_a_counter(tmp_path):
+    from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
+
+    for sid, title, message in (("sess-A", "Game", "game work"), ("sess-B", "Api", "api work")):
+        log = SimpleTurnLog(tmp_path, next_turn_number(tmp_path, sid), "m",
+                            session_id=sid, session_title=title)
+        log.open_turn(message)
+        log.close_turn("ok", 1, stopped=False)
+
+    root = tmp_path / ".shamsu/chat-logs"
+    a = (root / "sess-A--game.md").read_text(encoding="utf-8")
+    b = (root / "sess-B--api.md").read_text(encoding="utf-8")
+
+    assert "game work" in a and "api work" not in a
+    assert "api work" in b and "game work" not in b
+    # each thread starts its own numbering
+    assert "# Turn 1 " in a and "# Turn 1 " in b
+
+
+def test_turn_numbers_survive_a_restart(tmp_path):
+    """The number must come from the thread's own file, not process state."""
+    from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
+
+    log = SimpleTurnLog(tmp_path, next_turn_number(tmp_path, "s"), "m", session_id="s")
+    log.open_turn("one")
+    log.close_turn("ok", 1, stopped=False)
+
+    # a brand new process would call next_turn_number again
+    assert next_turn_number(tmp_path, "s") == 2
+
+
+def test_latest_points_at_the_thread_rather_than_copying_it(tmp_path):
+    """The session log is lossless and can reach megabytes - copying it every
+    turn would double writes and disk for nothing."""
+    from shamsu.agents.simple_log import SimpleTurnLog
+
+    log = SimpleTurnLog(tmp_path, 1, "m", session_id="sess-A", session_title="Game")
+    log.open_turn("hello")
+    log.log_tool_result("read_file", {"filepath": "a.js"}, True, "x" * 50000)
+    log.close_turn("done", 1, stopped=False)
+
+    latest = (tmp_path / ".shamsu/chat-logs/latest.md").read_text(encoding="utf-8")
+    assert "sess-A--game.md" in latest
+    assert len(latest) < 500, "latest.md must be a pointer, not a copy"
+
+
+# --- P2/P3b: ownership, unlimited length, re-grounding ------------------
+
+
+def test_the_same_process_reattaches_to_its_own_session(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    first, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    second, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    assert second.session_id == first.session_id
+
+
+def test_a_second_window_gets_its_own_session(tmp_path, monkeypatch):
+    """`latest_active()` had no notion of who was using a session, so two REPLs
+    both attached to it, both appended to one transcript, and each one's
+    hydration pulled in the other's turns."""
+    import json as _json
+    import psutil
+    from datetime import datetime, timezone
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    first, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    # Another LIVE process holds it: a foreign pid with a fresh heartbeat.
+    foreign_pid = os.getpid() + 1
+    monkeypatch.setattr(psutil, "pid_exists", lambda pid: pid == foreign_pid)
+    first.owner_path.write_text(
+        _json.dumps({"pid": foreign_pid,
+                     "heartbeat": datetime.now(timezone.utc).isoformat()}),
+        encoding="utf-8",
+    )
+
+    assert first.claimed_by_other_live_process()
+
+    second, reason = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    assert second.session_id != first.session_id, "must not interleave two threads"
+    assert "another window" in reason
+
+
+def test_a_crashed_owner_does_not_lock_the_session_forever(tmp_path):
+    """Heartbeat AND pid are both checked: a stale claim must expire, or a crash
+    would strand the thread permanently."""
+    import json as _json
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    logger.owner_path.write_text(
+        _json.dumps({"pid": 999999, "heartbeat": "2020-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+
+    assert not logger.claimed_by_other_live_process()
+
+
+def test_our_own_claim_never_blocks_us(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    logger.claim()
+
+    assert not logger.claimed_by_other_live_process()
+
+
+def test_coming_back_days_later_still_resumes(tmp_path):
+    """8 hours used to fork a new thread silently - overnight always broke."""
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    first, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    first.metadata.updated_at = "2020-01-01T00:00:00+00:00"
+    mgr._write_metadata(first.metadata)
+    mgr._upsert_index(first.metadata)
+
+    again, reason = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    assert again.session_id == first.session_id
+    assert "days ago" in reason
+
+
+# --- P4: a rewrite that cannot fit must not be attempted ----------------
+
+
+def test_a_file_too_big_to_rewrite_is_refused_with_the_alternative(tmp_path):
+    """The reply reserve caps what one turn can emit, so rewriting a larger
+    file is cut off partway and the tail is lost. patch_file costs the same at
+    any file size."""
+    from shamsu.agents.simple_chat import max_ctx, output_reserve
+
+    writable = output_reserve(max_ctx()) * 4
+    big = tmp_path / "huge.js"
+    big.write_text("x" * (writable + 5000), encoding="utf-8")
+    original = big.read_text(encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("write_file", {"filepath": "huge.js", "content": "tiny"})
+
+    assert not result.ok
+    assert "patch_file" in result.message
+    assert big.read_text(encoding="utf-8") == original, "file must be untouched"
+
+
+def test_an_ordinary_file_is_still_rewritable(tmp_path):
+    (tmp_path / "small.js").write_text("const a = 1;\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    assert loop._execute(
+        "write_file", {"filepath": "small.js", "content": "const a = 2;\n"}
+    ).ok
+
+
+def test_creating_a_new_file_is_never_blocked(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+
+    assert loop._execute("write_file", {"filepath": "brand_new.js", "content": "x"}).ok
+
+
+def test_write_file_points_at_patch_file_for_existing_files(tmp_path):
+    write = next(t for t in SIMPLE_TOOL_SCHEMAS if t["function"]["name"] == "write_file")
+
+    assert "patch_file" in write["function"]["description"]
+
+
+def test_resuming_reports_files_changed_while_the_thread_was_away(tmp_path):
+    """Measured from BEFORE the resume. Reading `updated_at` afterwards returns
+    "now" - resuming logs an event that bumps it - so the answer was always an
+    empty list, which reads exactly like "nothing changed". Caught live."""
+    import time as _time
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    first, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    first.release()
+
+    _time.sleep(1.1)                       # mtime resolution
+    (tmp_path / "edited_while_away.js").write_text("// changed\n", encoding="utf-8")
+
+    again, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+
+    assert "edited_while_away.js" in again.files_changed_since_last_activity()
+
+
+def test_the_explicit_resume_command_reports_them_too(tmp_path):
+    import time as _time
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    first = mgr.create_session(title="thread")
+    first.release()
+
+    _time.sleep(1.1)
+    (tmp_path / "touched.js").write_text("// changed\n", encoding="utf-8")
+
+    again = mgr.resume_session(first.session_id)
+
+    assert "touched.js" in again.files_changed_since_last_activity()
+
+
+def test_a_long_turn_does_not_let_another_window_steal_the_thread(tmp_path):
+    """Claiming only at resume left the heartbeat stale after 5 minutes, so a
+    second window would decide the session was free mid-conversation."""
+    import json as _json
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger, _ = mgr.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    # Age the claim past the staleness window.
+    logger.owner_path.write_text(
+        _json.dumps({"pid": os.getpid(), "heartbeat": "2020-01-01T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+
+    loop = _loop(tmp_path, [_text("ok")], session_logger=logger)
+    asyncio.run(loop.run("keep working"))
+
+    beat = _json.loads(logger.owner_path.read_text(encoding="utf-8"))["heartbeat"]
+    assert beat.startswith("20"), beat
+    assert "2020-01-01" not in beat, "each turn must refresh the claim"
+
+
+def test_a_budget_clipped_read_also_blocks_a_whole_file_rewrite(tmp_path):
+    """`_budgeted` trims AFTER `_execute`, so the guard's own inspection saw a
+    complete result. Without this the model gets a clipped file and is still
+    allowed to rewrite it whole - losing everything it never saw."""
+    from shamsu.agents.simple_chat import MAX_TOOL_RESULT_TOKENS
+
+    # Bigger than one tool result may occupy, so _budgeted must clip it.
+    huge = "const line = 1;\n" * (MAX_TOOL_RESULT_TOKENS)
+    (tmp_path / "huge.js").write_text(huge, encoding="utf-8")
+
+    loop = _loop(tmp_path, [_tool("read_file", filepath="huge.js"), _text("done")])
+    asyncio.run(loop.run("read huge.js"))
+
+    assert "huge.js" in loop._partial_reads, "a clipped read must mark the file partial"
+    blocked = loop._execute("write_file", {"filepath": "huge.js", "content": "tiny"})
+    assert not blocked.ok
+    assert (tmp_path / "huge.js").read_text(encoding="utf-8") == huge
+
+
+def test_a_truncated_read_names_the_exact_next_call(tmp_path):
+    """"Read the rest with start_line" was too vague to act on: live
+    2026-08-18 the model re-read the same file twice, got the same head both
+    times, and gave up without ever trying a range or patch_file."""
+    from shamsu.agents.simple_chat import _budgeted
+
+    body = "\n".join(f"line {i}" for i in range(6000))
+    payload = json.dumps({"ok": True, "message": "Read file.",
+                          "data": {"filepath": "big.js", "total_lines": 6000,
+                                   "content": body}})
+
+    data = json.loads(_budgeted(payload))["data"]
+
+    shown = data["shown_lines"]
+    assert data["content_truncated"] is True
+    assert f"lines 1-{shown} of 6000" in data["content"], "say what you DID show"
+    assert f"start_line={shown + 1}" in data["content"], "name the exact next call"
+    assert "patch_file" in data["content"], "and how to change it"
+
+
+# --- P3.2: the digest carries DECISIONS, not just questions -------------
+
+
+def test_compaction_records_what_was_decided_not_just_what_was_asked(tmp_path):
+    """The deterministic digest says "you asked to slow the ship" and never
+    "we set maxSpeed to 4.5" - the half a later turn actually needs."""
+    class Narrating:
+        def __init__(self):
+            self.asks = []
+
+        async def chat(self, **kwargs):
+            body = kwargs["messages"][-1]["content"]
+            self.asks.append(body)
+            if "DECISIONS" in body:
+                return {"message": {"content": "- maxSpeed is 4.5\n- window is 900x700"}}
+            return {"message": {"content": "ok", "tool_calls": []}}
+
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    loop = SimpleChatLoop(
+        tmp_path, client=Narrating(), tools=tools, state=state, model_name="qwen3:8b",
+    )
+    # Enough history that the budget must evict some of it.
+    for i in range(60):
+        state.append_user(f"turn {i}: " + ("filler text " * 200))
+        state.append_assistant("noted " + ("more filler " * 200))
+
+    asyncio.run(loop.run("carry on"))
+
+    assert "maxSpeed is 4.5" in state.rolling_summary
+    assert any("DECISIONS" in ask for ask in loop.client.asks), "must ask for decisions"
+
+
+def test_a_failed_summary_call_leaves_the_deterministic_digest_standing(tmp_path):
+    """The model call only ever ADDS - if it fails, compaction must not."""
+    class Failing:
+        async def chat(self, **kwargs):
+            if "DECISIONS" in kwargs["messages"][-1]["content"]:
+                raise RuntimeError("model unavailable")
+            return {"message": {"content": "ok", "tool_calls": []}}
+
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    loop = SimpleChatLoop(
+        tmp_path, client=Failing(), tools=tools, state=state, model_name="qwen3:8b",
+    )
+    for i in range(60):
+        state.append_user(f"turn {i}: " + ("filler text " * 200))
+        state.append_assistant("noted " + ("more filler " * 200))
+
+    result = asyncio.run(loop.run("carry on"))
+
+    assert not result.stopped, "a failed summary must not break the turn"
+    assert state.rolling_summary.strip(), "the deterministic digest still stands"
+
+
+# --- P3.4: /compact makes an invisible mechanism inspectable ------------
+
+
+class _Recorder:
+    def __init__(self): self.lines = []
+    def print(self, text=""): self.lines.append(str(text))
+    @property
+    def text(self): return "\n".join(self.lines)
+
+
+def test_compact_shows_what_the_model_is_told_about_earlier_work(tmp_path):
+    from shamsu.cli.repl import _handle_compact
+    from shamsu.session.manager import SessionManager
+
+    logger = SessionManager(tmp_path).create_session(title="t")
+    logger.save_summary("- maxSpeed is 4.5\n- window is 900x700", 12)
+    out = _Recorder()
+
+    _handle_compact("compact", logger, out)
+
+    assert "maxSpeed is 4.5" in out.text
+    assert "message 12" in out.text
+
+
+def test_compact_says_so_when_nothing_has_been_compacted(tmp_path):
+    from shamsu.cli.repl import _handle_compact
+    from shamsu.session.manager import SessionManager
+
+    logger = SessionManager(tmp_path).create_session(title="t")
+    out = _Recorder()
+
+    _handle_compact("compact", logger, out)
+
+    assert "Nothing compacted yet" in out.text
+
+
+def test_compact_clear_forgets_the_summary_but_not_the_transcript(tmp_path):
+    from shamsu.cli.repl import _handle_compact
+    from shamsu.session.manager import SessionManager
+
+    logger = SessionManager(tmp_path).create_session(title="t")
+    logger.append_message("user", "the port is 8080")
+    logger.save_summary("- something stale", 5)
+    out = _Recorder()
+
+    _handle_compact("compact clear", logger, out)
+
+    assert logger.load_summary()[0] == ""
+    assert "the port is 8080" in json.dumps(logger.read_messages()), "transcript survives"
+
+
+def test_decisions_outrank_routine_asks_in_the_summary(tmp_path):
+    """Live 2026-08-18: eight lines of "you asked: step 45: filler..." nearly
+    buried the two lines naming the actual decisions. Decisions go first, so
+    the head of a bounded summary keeps them."""
+    class Narrating:
+        async def chat(self, **kwargs):
+            if "DECISIONS" in kwargs["messages"][-1]["content"]:
+                return {"message": {"content": "- token TTL is 900s\n- Redis on 6380"}}
+            return {"message": {"content": "ok", "tool_calls": []}}
+
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    loop = SimpleChatLoop(
+        tmp_path, client=Narrating(), tools=tools, state=state, model_name="qwen3:8b",
+    )
+    for i in range(60):
+        state.append_user(f"step {i}: " + ("filler " * 250))
+        state.append_assistant("done " + ("filler " * 250))
+
+    asyncio.run(loop.run("carry on"))
+
+    lines = [l for l in state.rolling_summary.splitlines() if l.strip()]
+    assert "TTL is 900s" in lines[0], f"decisions must lead, got {lines[0]!r}"
+    # Protected by ORDER, not by trimming the asks - `_bounded_summary` keeps
+    # both ends, so leading with decisions guarantees they outlive the middle.
+    assert "Redis on 6380" in state.rolling_summary
+
+
+def test_compaction_does_not_change_the_context_window(tmp_path):
+    """A different num_ctx makes Ollama RELOAD the model (~5s measured), and
+    compaction would pay it twice - down then back up - every time it fires."""
+    seen = []
+
+    class Watching:
+        async def chat(self, **kwargs):
+            seen.append(kwargs["options"]["num_ctx"])
+            if "DECISIONS" in kwargs["messages"][-1]["content"]:
+                return {"message": {"content": "- a decision"}}
+            return {"message": {"content": "ok", "tool_calls": []}}
+
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    loop = SimpleChatLoop(
+        tmp_path, client=Watching(), tools=tools, state=state, model_name="qwen3:8b",
+    )
+    for i in range(60):
+        state.append_user(f"step {i}: " + ("filler " * 250))
+        state.append_assistant("done " + ("filler " * 250))
+    asyncio.run(loop.run("carry on"))
+
+    assert len(set(seen)) == 1, (
+        f"one window for the whole turn, saw {sorted(set(seen))} - each change "
+        "reloads the model"
+    )
+
+
+# --- a transcript that is no longer JSONL (live 2026-08-18) -------------
+#
+# A 99 KB transcript had been reformatted into indented JSON - an editor
+# opening a `.jsonl` does that - and 655 of 657 lines failed to parse.
+# `read_messages` skipped them SILENTLY and returned one message. The session
+# hydrated almost no history, the agent floundered for 15 minutes, and nothing
+# anywhere said why.
+
+
+def test_a_reformatted_transcript_is_recovered_not_silently_lost(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="reformatted")
+    for i in range(20):
+        logger.append_message("user", f"message {i}")
+
+    # Reformat it the way an editor would: indented, one object over many lines.
+    records = logger.read_messages()
+    logger.messages_path.write_text(
+        "\n".join(json.dumps(r, indent=4) for r in records), encoding="utf-8"
+    )
+
+    revived = mgr.logger_for(logger.session_id)
+    recovered = revived.read_messages()
+
+    assert len(recovered) == 20, f"history must survive, got {len(recovered)}"
+    assert recovered[0]["content"] == "message 0"
+    assert revived.recovered_message_count == 20, "and it must be REPORTED, not silent"
+
+
+def test_a_healthy_transcript_does_not_take_the_recovery_path(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="healthy")
+    for i in range(5):
+        logger.append_message("user", f"message {i}")
+
+    revived = mgr.logger_for(logger.session_id)
+    assert len(revived.read_messages()) == 5
+    assert revived.recovered_message_count == 0, "normal files must not look rescued"
+
+
+def test_recovery_keeps_working_with_a_count_limit(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="limited")
+    for i in range(30):
+        logger.append_message("user", f"message {i}")
+    records = logger.read_messages()
+    logger.messages_path.write_text(
+        "\n".join(json.dumps(r, indent=2) for r in records), encoding="utf-8"
+    )
+
+    tail = mgr.logger_for(logger.session_id).read_messages(5)
+
+    assert len(tail) == 5
+    assert tail[-1]["content"] == "message 29", "must still be the NEWEST five"
+
+
+def test_a_partly_mangled_transcript_recovers_what_it_can(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="mangled")
+    for i in range(10):
+        logger.append_message("user", f"message {i}")
+    logger.messages_path.write_text(
+        "\n".join(json.dumps(r, indent=2) for r in logger.read_messages())
+        + "\n{ this is not json at all\n",
+        encoding="utf-8",
+    )
+
+    recovered = mgr.logger_for(logger.session_id).read_messages()
+
+    assert len(recovered) == 10, "garbage at the end must not cost the whole file"
+
+
+# --- no-progress detection (live 2026-08-18) ----------------------------
+#
+# One turn ran 12 no-op patches ("old_string and new_string are identical")
+# and 5 failed ones across 24 rounds and ~25 minutes, changing nothing. Only
+# max_rounds stopped it, and the user was told "I stopped after 24 steps"
+# rather than what had actually gone wrong.
+
+
+def test_repeated_edits_that_change_nothing_stop_the_turn(tmp_path):
+    (tmp_path / "a.js").write_text("const a = 1;\n", encoding="utf-8")
+    # Every patch matches text that is not there.
+    turns = [_tool("patch_file", filepath="a.js", old_string="NOT PRESENT",
+                   new_string="x") for _ in range(12)]
+    loop = _loop(tmp_path, turns, max_rounds=24)
+
+    result = asyncio.run(loop.run("fix it"))
+
+    assert result.stopped
+    assert result.rounds < 12, f"must give up early, ran {result.rounds} rounds"
+    assert "changed nothing" in result.final
+    assert "exact text" in result.final, "and say what would help"
+
+
+def test_a_no_op_patch_counts_as_no_progress(tmp_path):
+    """old_string == new_string 'succeeds' while leaving the file untouched -
+    12 of those in one live turn."""
+    from shamsu.agents.simple_chat import _changed_nothing
+    from shamsu.types import ToolResult
+
+    assert _changed_nothing(
+        ToolResult(True, "old_string and new_string are identical; nothing to change.", {})
+    )
+    assert _changed_nothing(ToolResult(False, "old_string not found in a.js.", {}))
+    assert not _changed_nothing(ToolResult(True, "Edited a.js (1 replacement).", {}))
+
+
+def test_a_successful_edit_resets_the_counter(tmp_path):
+    """Progress must clear the count, or a long legitimate session trips it."""
+    (tmp_path / "a.js").write_text("const a = 1;\n", encoding="utf-8")
+    turns = [
+        _tool("patch_file", filepath="a.js", old_string="MISSING", new_string="x"),
+        _tool("patch_file", filepath="a.js", old_string="MISSING", new_string="x"),
+        _tool("patch_file", filepath="a.js", old_string="const a = 1;", new_string="const a = 2;"),
+        _tool("patch_file", filepath="a.js", old_string="MISSING", new_string="x"),
+        _text("done"),
+    ]
+    loop = _loop(tmp_path, turns, max_rounds=24)
+
+    result = asyncio.run(loop.run("fix it"))
+
+    assert not result.stopped, "a real edit in the middle must reset the count"
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == "const a = 2;\n"
+
+
+def test_reading_a_file_in_pieces_still_allows_writing_it(tmp_path):
+    """Told to read a large file with start_line/end_line, the model would read
+    ALL of it in ranges and still be refused a write - forever."""
+    body = "\n".join(f"line {i}" for i in range(300))
+    (tmp_path / "big.js").write_text(body, encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    loop._execute("read_file", {"filepath": "big.js", "start_line": 1, "end_line": 150})
+    assert not loop._execute("write_file", {"filepath": "big.js", "content": "x"}).ok
+
+    loop._execute("read_file", {"filepath": "big.js", "start_line": 151, "end_line": 300})
+
+    assert loop._execute("write_file", {"filepath": "big.js", "content": "x"}).ok
+
+
+def test_a_gap_in_the_ranges_still_counts_as_partial(tmp_path):
+    body = "\n".join(f"line {i}" for i in range(300))
+    (tmp_path / "big.js").write_text(body, encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    loop._execute("read_file", {"filepath": "big.js", "start_line": 1, "end_line": 100})
+    loop._execute("read_file", {"filepath": "big.js", "start_line": 200, "end_line": 300})
+
+    assert not loop._execute("write_file", {"filepath": "big.js", "content": "x"}).ok
+
+
+# --- repeated blind fixes (live 2026-08-18) -----------------------------
+#
+# 7 successful patches to one file in a single turn, chasing an error that had
+# ALREADY been fixed - the console message was a stale browser cache. Each edit
+# changed the file, so the no-change counter never saw them, and the model never
+# once said it could not verify any of it.
+
+
+def _edit(n: int) -> dict:
+    return _tool("patch_file", filepath="game.js",
+                 old_string=f"const v = {n};", new_string=f"const v = {n + 1};")
+
+
+def test_repeatedly_editing_one_file_without_confirming_stops(tmp_path):
+    (tmp_path / "game.js").write_text(
+        "\n".join(f"const v = {i};" for i in range(10)), encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_edit(i) for i in range(9)], max_rounds=24, verify_changes=False)
+
+    result = asyncio.run(loop.run("fix the error"))
+
+    assert result.stopped
+    assert result.rounds < 9, f"must stop early, ran {result.rounds}"
+    assert "without being able to confirm" in result.final
+    assert "git diff" in result.final, "warn that blind edits can undo good code"
+
+
+def test_it_is_warned_before_it_is_stopped(tmp_path):
+    (tmp_path / "game.js").write_text(
+        "\n".join(f"const v = {i};" for i in range(10)), encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_edit(i) for i in range(9)], max_rounds=24, verify_changes=False)
+
+    asyncio.run(loop.run("fix the error"))
+
+    nudges = [
+        m.content for m in loop.state.all_messages
+        if m.role == "user" and "cannot confirm" in m.content
+    ]
+    assert nudges, "it must be told before it is cut off"
+    assert "ask for the exact error" in nudges[0]
+
+
+def test_editing_several_different_files_is_not_penalised(tmp_path):
+    """The signal is repetition on ONE file, not activity in general."""
+    for name in ("a.js", "b.js", "c.js", "d.js", "e.js"):
+        (tmp_path / name).write_text("const v = 0;\n", encoding="utf-8")
+    turns = [
+        _tool("patch_file", filepath=n, old_string="const v = 0;", new_string="const v = 1;")
+        for n in ("a.js", "b.js", "c.js", "d.js", "e.js")
+    ] + [_text("all done")]
+    loop = _loop(tmp_path, turns, max_rounds=24, verify_changes=False)
+
+    result = asyncio.run(loop.run("update them all"))
+
+    assert not result.stopped
+    assert result.final == "all done"
+
+
+# --- the model must SEE what its edit did -------------------------------
+#
+# A mutation reported "Edited game.js: +3 -1 lines" - a count, not a change. So
+# the model could not tell a fix from an edit that removed the wrong thing, and
+# live 2026-08-18 it patched one file seven times without seeing any result.
+# The harness was already writing a real diff per edit to .shamsu/mutations/
+# and never showing it.
+
+
+def test_an_edit_shows_the_model_the_actual_diff(tmp_path):
+    (tmp_path / "a.js").write_text("const a = 1;\nconst b = 2;\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "patch_file",
+        {"filepath": "a.js", "old_string": "const b = 2;", "new_string": "const b = 99;"},
+    )
+
+    assert "What changed:" in result.message
+    assert "-const b = 2;" in result.message
+    assert "+const b = 99;" in result.message
+
+
+def test_the_diff_reaches_the_conversation_not_just_the_console(tmp_path):
+    (tmp_path / "a.js").write_text("x = 1\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("patch_file", filepath="a.js", old_string="x = 1", new_string="x = 2"),
+         _text("done")],
+    )
+
+    asyncio.run(loop.run("change it"))
+
+    tool_messages = [m for m in loop.client.calls[1]["messages"] if m["role"] == "tool"]
+    assert any("+x = 2" in m["content"] for m in tool_messages), "the model must see it"
+
+
+def test_a_new_file_does_not_produce_a_confusing_diff(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("write_file", {"filepath": "new.js", "content": "const a = 1;\n"})
+
+    assert result.ok
+    assert "+const a = 1;" in result.message, "creating a file still shows what landed"
+
+
+def test_a_huge_rewrite_does_not_replay_the_whole_file(tmp_path):
+    from shamsu.agents.simple_chat import MAX_DIFF_LINES
+
+    (tmp_path / "big.js").write_text("\n".join(f"line {i}" for i in range(500)), encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "write_file",
+        {"filepath": "big.js", "content": "\n".join(f"other {i}" for i in range(500))},
+    )
+
+    body = result.message.split("What changed:", 1)[1]
+    assert len(body.splitlines()) <= MAX_DIFF_LINES + 3
+    assert "more diff lines" in result.message

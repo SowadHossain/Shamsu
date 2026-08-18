@@ -98,7 +98,16 @@ _READABLE_TEXT_EXTENSIONS = frozenset(
 _READABLE_FILENAMES = frozenset({"Dockerfile", "Makefile", ".gitignore", ".env", ".dockerignore"})
 
 # Max characters returned for a whole-file read before truncation kicks in.
-MAX_READ_CHARS = 6000
+MAX_READ_CHARS = 24000
+
+# Total characters one serialized tool result may spend on its string fields.
+# Raised from an effective 6000 because the window is now 32k with a ~24k prompt
+# budget - a source file the model must EDIT is worth ~6k tokens of it, and the
+# old ceiling silently cut ordinary files. `_share_budget` decides who gets what.
+COMPACT_VALUE_LIMIT = 24000
+
+# No field is squeezed below this, so metadata stays readable.
+MIN_FIELD_CHARS = 500
 
 _MCP_PATH_ARGUMENTS = frozenset(
     {
@@ -1824,7 +1833,11 @@ class AgentToolRegistry:
             if len(content) > MAX_READ_CHARS:
                 content = f"{content[:MAX_READ_CHARS]}\n... [truncated {len(content) - MAX_READ_CHARS} chars]"
                 data["truncated"] = True
-                data["hint"] = "File is large; pass start_line/end_line to read a specific range."
+                data["hint"] = (
+                    "File is large; pass start_line/end_line to read a specific range. "
+                    "To change it, use patch_file - rewriting a file this size with "
+                    "write_file is slow and may not fit in one reply."
+                )
             else:
                 data["truncated"] = False
         data["content"] = content
@@ -3562,7 +3575,7 @@ def _tool_schema(
     }
 
 
-def _compact_value(value: Any, limit: int = 6000) -> Any:
+def _compact_value(value: Any, limit: int = COMPACT_VALUE_LIMIT) -> Any:
     if isinstance(value, str):
         return _truncate_text(value, limit)
 
@@ -3574,16 +3587,55 @@ def _compact_value(value: Any, limit: int = 6000) -> Any:
 
     if isinstance(value, dict):
         items = list(value.items())[:40]
-        per_item_limit = max(limit // max(len(items), 1), 500)
         compacted = {
-            str(key): _compact_value(item, per_item_limit)
-            for key, item in items
+            str(key): _compact_value(item, budget)
+            for (key, item), budget in zip(items, _share_budget(items, limit))
         }
         if len(value) > len(items):
             compacted["..."] = f"truncated {len(value) - len(items)} key(s)"
         return compacted
 
     return value
+
+
+def _share_budget(items: list[tuple[Any, Any]], limit: int) -> list[int]:
+    """Split *limit* across a dict's values by what each actually needs.
+
+    An EQUAL split is what broke `read_file` live on 2026-08-18. Its result has
+    six keys - filepath, resolved_filepath, total_lines, candidates, truncated,
+    content - so `6000 // 6` gave the file content **1000 chars** while a bool
+    and an empty list reserved 1000 each. A 4170-char file reached the model as
+    24% of itself, under `"truncated": false` (honest: the READER did not
+    truncate, the serializer did). The model correctly reported "the file read
+    is being truncated in the response", re-read five times, and had no way out.
+
+    Equal shares also degrade silently as keys are added: exposing start_line
+    and end_line would have cut content to ~666 chars.
+
+    So: anything that already fits keeps its full size, and only the oversized
+    values divide what is left. One big field among small ones - the usual shape
+    of a tool result - now gets nearly the whole budget.
+    """
+    sizes = [len(item) if isinstance(item, str) else 0 for _key, item in items]
+    budgets = [0] * len(items)
+    remaining = limit
+    unsatisfied = list(range(len(items)))
+
+    # Repeatedly hand out an equal share; anything needing less than its share
+    # takes only what it needs and returns the rest to the pool.
+    while unsatisfied:
+        share = max(remaining // len(unsatisfied), MIN_FIELD_CHARS)
+        settled = [i for i in unsatisfied if sizes[i] <= share]
+        if not settled:
+            for i in unsatisfied:
+                budgets[i] = share
+            break
+        for i in settled:
+            budgets[i] = max(sizes[i], MIN_FIELD_CHARS)
+            remaining -= sizes[i]
+            unsatisfied.remove(i)
+        remaining = max(remaining, 0)
+    return budgets
 
 
 def _truncate_text(text: str, limit: int) -> str:

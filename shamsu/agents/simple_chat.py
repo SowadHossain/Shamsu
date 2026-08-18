@@ -23,6 +23,7 @@ how this codebase ended up with two orchestrators in the first place.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -60,8 +61,11 @@ DEFAULT_MAX_ROUNDS = 24
 # model whenever num_ctx changes.
 CTX_BUCKETS = (8192, 16384, 32768, 49152, 65536)
 
-# A single tool result must not be able to crowd out the conversation.
-MAX_TOOL_RESULT_TOKENS = 2000
+# A single tool result must not be able to crowd out the conversation. 8000
+# tokens (~32k chars) against a ~24k-token prompt budget: a source file the
+# model has to EDIT is worth a large share of it, and 2000 silently cut
+# ordinary files down to a fragment.
+MAX_TOOL_RESULT_TOKENS = 8000
 
 # Files named in the always-fresh workspace listing, and the noise excluded from
 # it. Small enough to be nearly free; the point is grounding, not a project dump.
@@ -72,6 +76,36 @@ _IGNORED_DIRS = frozenset(
 
 # How many times one run may tell the model "you described it, now do it".
 MAX_PROSE_NUDGES = 2
+
+# How many empty replies one run tolerates before stopping and saying so.
+# Unbounded, this was a 24-round hang.
+MAX_EMPTY_NUDGES = 2
+
+# Consecutive mutations that change nothing before the run gives up. Failed
+# patches and no-op patches both count: either way the file is untouched and
+# repeating is not going to help.
+MAX_UNPRODUCTIVE_EDITS = 4
+
+# Successful edits to ONE file in a single turn before the loop says so, and
+# before it gives up. These edits DO change the file, so the no-change counter
+# never sees them - but a fix that needs a seventh attempt is not a fix, it is
+# guessing. Live 2026-08-18: 7 successful patches to one file in one turn, and
+# not once did the model say it could not verify any of them.
+EDITS_PER_FILE_BEFORE_WARNING = 3
+EDITS_PER_FILE_BEFORE_STOPPING = 5
+
+# Identical read-only calls in one turn before the loop points it out. Reads
+# never change anything, so the no-change counter above cannot see them
+# spinning: live 2026-08-18 a turn issued `list_files {path: "."}` three times
+# in a row, each returning the same listing it already had.
+REPEATED_READS_BEFORE_WARNING = 3
+
+# Diff lines fed back after an edit. Enough to see the change, not so many
+# that rewriting a file replays the whole file into the conversation.
+MAX_DIFF_LINES = 40
+
+# How often the live status line reports that a model call is still running.
+HEARTBEAT_SECONDS = 5.0
 
 _FENCE_RE = re.compile(r"```[^\n]*\n(?P<body>.*?)```", re.DOTALL)
 
@@ -90,19 +124,46 @@ def simple_mode_enabled() -> bool:
 def max_ctx() -> int:
     """Ceiling for a chat call's context window.
 
-    16384, not 32768, because this is a VRAM budget and not a capability claim.
-    A 7-9B q4 model is ~5GB resident and its KV cache is ~144 KiB/token, so on
-    an 8GB card 16k costs ~2.25GB (fits) and 32k costs ~4.5GB (does not). Live
-    2026-08-17 the 32k bucket produced `cudaMalloc failed: out of memory` the
-    moment anything else shared the GPU - and something usually does.
+    32768. The window is a VRAM cost, not a free capability - Ollama reserves
+    the KV cache for the WHOLE num_ctx up front - but the cost is set by the
+    cache's precision, not by the window alone. Measured on an 8GB card with
+    qwen3.5:9b, 2026-08-18:
 
-    Raise it with SHAMSU_CHAT_MAX_CTX on a bigger card; `_shrink_for_oom` will
-    walk it back down automatically if the hardware disagrees.
+        f16 KV (default):  16384 -> 47.5s, spilled to CPU; 32768 -> OOM
+        q8_0 KV + flash :   8192 -> 10.3s | 16384 -> 7.4s | 32768 -> 7.5s
+                            and 32768 sits at 6891 MiB, 100% on GPU
+
+    So 32k is only ~385 MiB more than 8k with a quantized cache, and free in
+    time. That needs, on the Ollama SERVER (not per request):
+
+        OLLAMA_FLASH_ATTENTION=1
+        OLLAMA_KV_CACHE_TYPE=q8_0
+
+    Without them a 32k request spills to CPU or fails outright - which is what
+    "the harness got extremely slow" was. `_shrink_for_oom` walks the window
+    back down if the GPU refuses, so an unconfigured server degrades instead of
+    hanging, but it degrades to SLOW. Check those two vars first.
+
+    SHAMSU_CHAT_MAX_CTX overrides.
     """
     raw = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
     if raw.isdigit() and int(raw) >= 4096:
         return int(raw)
-    return 16384
+    return 32768
+
+
+def output_reserve(ceiling: int) -> int:
+    """Tokens held back for the model's reply, as a SHARE of the window.
+
+    A fixed 4096 reserve is what starved simple mode: at num_ctx 32768 the
+    prompt was allowed to grow to 28160 and the reply - thinking AND answer
+    together - got the same 4096 it would have had at 8k. A reasoning model
+    spends that thinking and emits nothing, which the loop then read as an
+    empty reply and nudged, forever.
+
+    A quarter of the window scales with it: 8k -> 4096, 32k -> 8192.
+    """
+    return max(RESERVE_OUTPUT_TOKENS, ceiling // 4)
 
 
 # Substrings Ollama/llama.cpp use when the GPU cannot fit what was asked for.
@@ -140,11 +201,22 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file from the workspace.",
+            "description": (
+                "Read a file from the workspace. Omit start_line/end_line to read "
+                "the whole file; pass them to read one part of a large file."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filepath": {"type": "string", "description": "Path relative to the workspace."}
+                    "filepath": {"type": "string", "description": "Path relative to the workspace."},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "First line to read (1-based). Optional.",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Last line to read, inclusive. Optional.",
+                    },
                 },
                 "required": ["filepath"],
             },
@@ -182,7 +254,11 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Create a file, or replace one completely, with the given content.",
+            "description": (
+                "Create a NEW file, or replace a small one completely. To change part "
+                "of an existing file, prefer patch_file: it is far faster and cannot "
+                "lose the parts you did not mean to touch."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -227,6 +303,51 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
 
+# Legacy LOGICAL tool names, mapped to the six simple ones.
+#
+# Simple mode never offers these, so `_execute` used to refuse them outright -
+# correct, but it costs a round each time and the model rarely takes the hint.
+# Two things put them in front of the model anyway:
+#
+#   1. A legacy-routed SHAMSU (`SHAMSU_LEGACY_ROUTING=1`, or an older build)
+#      sharing the workspace appends ITS calls to the same session transcript.
+#      Live 2026-08-18 that happened: `project.inspect`, `file.read`,
+#      `code.search` and `test.run` landed in the history of a simple-mode
+#      session, and the model - reasonably - kept calling what it could see
+#      itself having called.
+#   2. The names are close enough to other agents' conventions to be guessed.
+#
+# Accepting them is strictly better than refusing: same sandbox, same ledger,
+# same six implementations - just a name the model already believes in.
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    "file.read": "read_file",
+    "file.write": "write_file",
+    "file.patch": "patch_file",
+    "file.edit": "patch_file",
+    "code.search": "search_files",
+    "file.search": "search_files",
+    "project.inspect": "list_files",
+    "file.list": "list_files",
+    "shell.run": "run_command",
+    "test.run": "run_command",
+    "command.run": "run_command",
+}
+
+
+def canonical_tool_name(name: str) -> str:
+    """The simple-mode tool *name* refers to, accepting legacy/near-miss spellings."""
+    raw = (name or "").strip()
+    if raw in SIMPLE_TOOLS:
+        return raw
+    lowered = raw.lower()
+    if lowered in _TOOL_NAME_ALIASES:
+        return _TOOL_NAME_ALIASES[lowered]
+    # `functions.read_file`, `tools.read_file` - a prefix some models emit.
+    tail = lowered.rsplit(".", 1)[-1]
+    if tail in SIMPLE_TOOLS:
+        return tail
+    return raw
+
 # Argument aliases a small model reaches for. Accepting them costs nothing and
 # saves a whole failed round each time, which on a 6-round budget is expensive.
 _ARG_ALIASES = {
@@ -234,27 +355,45 @@ _ARG_ALIASES = {
     "file": "filepath",
     "file_path": "filepath",
     "filename": "filepath",
-    "query": "pattern",
     "text": "content",
     "old": "old_string",
     "new": "new_string",
     "cmd": "command",
 }
 
+# Tools whose real implementation names an argument differently from the schema
+# the model is shown. `search_files` is `grep_files`, which reads `query` - so
+# the schema's own `pattern` normalised to nothing and EVERY search failed with
+# "Missing or placeholder query" (measured 2026-08-18, 100% of calls). A rename
+# in one table is the whole fix; per-tool entries win over the global aliases.
+_TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "list_files": {"path": "path", "dir": "path", "directory": "path", "folder": "path"},
+    "search_files": {
+        "pattern": "query",
+        "query": "query",
+        "text": "query",
+        "search": "query",
+        "regex": "query",
+        "string": "query",
+        "path": "path",
+        "dir": "path",
+        "directory": "path",
+    },
+}
+
 
 def normalize_arguments(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Accept the near-miss argument names small models produce.
 
-    `list_files` genuinely takes `path`, so it is exempt from the path->filepath
-    rewrite; everything else means the file it is about to touch.
+    Two layers: a per-tool table for tools whose implementation genuinely names
+    an argument differently (`list_files`/`search_files` take a `path`, not a
+    `filepath`; `search_files` takes a `query`, not a `pattern`), then the
+    global near-miss aliases for everything else.
     """
+    per_tool = _TOOL_ARG_ALIASES.get(tool, {})
     normalized: dict[str, Any] = {}
     for key, value in (arguments or {}).items():
-        target = _ARG_ALIASES.get(key, key)
-        if tool == "list_files" and key == "path":
-            target = "path"
-        if tool == "search_files" and key == "path":
-            target = "path"
+        target = per_tool.get(key) or _ARG_ALIASES.get(key, key)
         normalized.setdefault(target, value)
     return normalized
 
@@ -339,6 +478,9 @@ class SimpleChatResult:
 class _Round:
     tool_names: list[str] = field(default_factory=list)
     written: list[str] = field(default_factory=list)
+    repeated_edit: int = 0
+    repeated_path: str = ""
+    repeated_read: str = ""
 
 
 class SimpleChatLoop:
@@ -356,6 +498,7 @@ class SimpleChatLoop:
         model_name: str | None = None,
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         on_activity: Any | None = None,
+        on_status: Any | None = None,
         on_trace: Any | None = None,
         verify_changes: bool = True,
         temperature: float = 0.2,
@@ -370,6 +513,11 @@ class SimpleChatLoop:
         self.model_name = model_name or model_for_role("agent-chat")
         self.max_rounds = max(1, int(max_rounds))
         self.on_activity = on_activity
+        # Replaces a LIVE status line rather than printing a new one. Without
+        # it a model call is completely silent for as long as it takes, and at
+        # a 600s timeout that is ten minutes indistinguishable from a hang -
+        # which is exactly how it was reported.
+        self.on_status = on_status
         self.on_trace = on_trace
         self.verify_changes = verify_changes
         self.temperature = temperature
@@ -391,6 +539,17 @@ class SimpleChatLoop:
         # Lowered from what the GPU will actually accept, once it has refused.
         self._num_ctx_ceiling = 0
         self._evicted_others = False
+        # Files the model has seen only part of - writing them whole loses data.
+        self._partial_reads: set[str] = set()
+        # Line ranges seen per file, so reading a big file IN PIECES still
+        # adds up to having seen it.
+        self._seen_ranges: dict[str, list[tuple[int, int]]] = {}
+        # Consecutive mutations that changed nothing.
+        self._unproductive = 0
+        # Successful edits per file this turn - repeated blind fixes.
+        self._edits_per_file: dict[str, int] = {}
+        # How many times each identical read-only call has been made this turn.
+        self._read_signatures: dict[str, int] = {}
         # Readable per-turn transcript of prompt + raw response.
         self.turn_log: SimpleTurnLog | None = None
         self._files: list[str] = []
@@ -404,11 +563,30 @@ class SimpleChatLoop:
     # -- public ----------------------------------------------------------
 
     async def run(self, user_input: str) -> SimpleChatResult:
+        # Refresh the ownership heartbeat every turn. Claiming only at resume
+        # left it stale after 5 minutes, so a second window would decide the
+        # thread was free and attach to it - the interleaving this is meant to
+        # prevent, just delayed by one long turn.
+        claim = getattr(self.session_logger, "claim", None)
+        if callable(claim):
+            try:
+                claim()
+            except Exception:
+                pass
         self.state.append_user(user_input)
+        await self._compact_if_needed()
         if self.log_turns:
             try:
+                # Scope the log to the SESSION, so a thread is one readable file
+                # instead of a pile of turn-NNN files nobody can tell apart.
+                session_id = getattr(self.session_logger, "session_id", "") or ""
+                title = getattr(getattr(self.session_logger, "metadata", None), "title", "") or ""
                 self.turn_log = SimpleTurnLog(
-                    self.workspace, next_turn_number(self.workspace), self.model_name
+                    self.workspace,
+                    next_turn_number(self.workspace, session_id),
+                    self.model_name,
+                    session_id=session_id,
+                    session_title=title,
                 )
                 self.turn_log.open_turn(user_input)
             except OSError:
@@ -419,6 +597,7 @@ class SimpleChatLoop:
         changed: list[str] = []
         tool_calls = 0
         prose_nudges = 0
+        empty_nudges = 0
         for round_index in range(self.max_rounds):
             self._files = await asyncio.to_thread(workspace_files, self.workspace)
             try:
@@ -446,13 +625,45 @@ class SimpleChatLoop:
             if not turn.tool_calls:
                 text = (turn.text or "").strip()
                 if not text:
-                    # An empty turn is not an answer. Nudge once rather than
-                    # ending on nothing, which is what "No response returned."
-                    # used to be.
-                    self.state.append_user(
-                        "That reply was empty. Answer the question, or call one tool."
+                    # An empty turn is not an answer - but nudging forever is
+                    # worse. Live 2026-08-18 this branch had no counter and did
+                    # not append the assistant turn, so a starved model produced
+                    # a run of consecutive `user` messages and the loop span all
+                    # 24 rounds: half an hour of "Thinking..." and no reply.
+                    if empty_nudges < MAX_EMPTY_NUDGES:
+                        empty_nudges += 1
+                        # Keep the transcript alternating: an assistant turn,
+                        # then the nudge. Stacking user messages is what broke
+                        # it. And nudge BEFORE salvaging - a reasoning model's
+                        # first empty turn usually means it is about to call a
+                        # tool, so ending the turn here does no work at all.
+                        # (Salvaging first cost the probe turns 8-10: 0 tools,
+                        # main.py never written.)
+                        self.state.append_assistant("")
+                        self.state.append_user(
+                            "That reply was empty. Answer the question, or call one tool."
+                        )
+                        continue
+                    if turn.thinking:
+                        # Out of retries but it did reason - that beats an error.
+                        self._activity("model only reasoned; using its thinking as the answer")
+                        self.state.append_assistant(turn.thinking)
+                        if self.turn_log:
+                            self.turn_log.close_turn(turn.thinking, round_index + 1, stopped=False)
+                        return SimpleChatResult(
+                            final=turn.thinking,
+                            rounds=round_index + 1,
+                            tool_calls=tool_calls,
+                            changed_files=tuple(dict.fromkeys(changed)),
+                        )
+                    return self._stop(
+                        f"The model returned an empty reply {empty_nudges + 1} times. "
+                        "It is most likely out of room to answer in - try a shorter "
+                        "request, or `/new` to start a fresh conversation.",
+                        round_index,
+                        tool_calls,
+                        changed,
                     )
-                    continue
                 described = describes_an_unmade_edit(text, self._files)
                 if described and prose_nudges < MAX_PROSE_NUDGES:
                     # It showed the code instead of writing it. Say so once,
@@ -484,6 +695,65 @@ class SimpleChatLoop:
             outcome = await self._run_tools(turn.tool_calls)
             tool_calls += len(turn.tool_calls)
             changed.extend(outcome.written)
+            if self._unproductive >= MAX_UNPRODUCTIVE_EDITS:
+                # Spinning. Live 2026-08-18 a turn ran 12 no-op patches and 5
+                # failed ones across 24 rounds and ~25 minutes, changing nothing
+                # - and the only thing that stopped it was max_rounds. Say what
+                # happened instead of burning the rest of the budget.
+                return self._stop(
+                    f"I tried {self._unproductive} edits in a row that changed nothing - "
+                    "either the snippet I was matching is not in the file, or my "
+                    "replacement was identical to what is already there. I have stopped "
+                    "rather than keep guessing.\n\n"
+                    "It would help to tell me the exact text to look for, or to paste "
+                    "the few lines around the problem.",
+                    round_index,
+                    tool_calls,
+                    changed,
+                )
+            if outcome.repeated_read:
+                # A read that repeats verbatim is the model having lost track of
+                # what it already has, not new information. Say so once and name
+                # the result it is re-fetching, rather than letting it spend the
+                # round budget re-reading the same listing.
+                self.state.append_user(
+                    f"You have already called {outcome.repeated_read} this turn and the "
+                    "result has not changed. Use the result you already have, and either "
+                    "answer now or make a DIFFERENT call."
+                )
+                self._read_signatures[outcome.repeated_read] = 0
+                self._activity(f"repeated {outcome.repeated_read}; asked it to move on")
+            if outcome.repeated_edit >= EDITS_PER_FILE_BEFORE_STOPPING:
+                # Repeatedly "fixing" one file without ever confirming a fix is
+                # guessing, and each guess can damage what was already right.
+                # Live 2026-08-18: 7 successful patches to one file in a single
+                # turn, chasing an error that had already been fixed - the
+                # console message was a stale browser cache.
+                return self._stop(
+                    f"I have now changed {outcome.repeated_path} "
+                    f"{outcome.repeated_edit} times in this turn without being able to "
+                    "confirm any of them worked, so I have stopped rather than keep "
+                    "guessing.\n\n"
+                    "Check `git diff` on that file - repeated blind edits can undo "
+                    "things that were already correct. To go further I need either "
+                    "permission to run something that reproduces the problem, or the "
+                    "exact current error after a hard refresh.",
+                    round_index,
+                    tool_calls,
+                    changed,
+                )
+            if outcome.repeated_edit == EDITS_PER_FILE_BEFORE_WARNING:
+                self._activity(
+                    f"changed {outcome.repeated_path} {outcome.repeated_edit} times "
+                    "this turn without confirming a fix"
+                )
+                self.state.append_user(
+                    f"You have changed {outcome.repeated_path} "
+                    f"{outcome.repeated_edit} times this turn and cannot confirm any of "
+                    "them worked. Do not edit it again on a guess. Either say precisely "
+                    "what you changed and what the user should check, or ask for the "
+                    "exact error or the lines around the problem."
+                )
             if outcome.written and self.verify_changes:
                 await self._append_verification(outcome.written)
 
@@ -516,6 +786,7 @@ class SimpleChatLoop:
             approx = sum(count_tokens(str(m.get("content") or "")) for m in messages)
             self.turn_log.log_call(messages, num_ctx, approx)
         started = time.perf_counter()
+        beat = asyncio.ensure_future(self._heartbeat("thinking..."))
         try:
             try:
                 raw = await asyncio.wait_for(
@@ -532,10 +803,98 @@ class SimpleChatLoop:
                 self.turn_log.log_error(f"{type(exc).__name__}: {exc}")
             raise
         finally:
+            beat.cancel()
             self._activity(f"model responded in {time.perf_counter() - started:.0f}s")
         if self.turn_log:
             self.turn_log.log_response(raw, time.perf_counter() - started)
         return raw
+
+    async def _compact_if_needed(self) -> None:
+        """Once per user turn, ask the model to summarise what no longer fits.
+
+        The deterministic digest records what was ASKED and which files were
+        TOUCHED - exact, free, and it cannot record a DECISION. It remembers
+        "you asked to slow the ship" and never "we set maxSpeed to 4.5", which
+        is the half a later turn actually needs.
+
+        So: facts stay deterministic, and a model call adds the reasoning. Done
+        here rather than inside `_messages` because that is sync and runs per
+        round; compaction belongs once per turn, and at a 32k window it fires
+        rarely enough that the round-trip is cheap. If the call fails the
+        deterministic digest still stands - this only ever adds.
+        """
+        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
+        if self._num_ctx_ceiling:
+            ceiling = min(ceiling, self._num_ctx_ceiling)
+        usable = max(1024, ceiling - output_reserve(ceiling) - SAFETY_MARGIN_TOKENS)
+        _tail, start_abs = self.state.select_for_budget(usable, count_tokens)
+        if start_abs <= 1:
+            return
+        evicted = self.state.newly_evicted(start_abs)
+        if not evicted:
+            return
+
+        facts = _digest(self.state.rolling_summary, evicted)
+        # Use the bucket the REAL call is about to use. `self._num_ctx_floor` is
+        # 0 here - a fresh loop is built per user turn - so reading it fell back
+        # to the smallest bucket and every compaction cost a model reload.
+        kept_tokens = sum(count_tokens(str(getattr(m, "content", "") or "")) for m in _tail)
+        narrative = await self._narrate(
+            evicted, self._bucket_for(kept_tokens + count_tokens(self.state.system_prompt))
+        )
+        # Decisions FIRST: `_bounded_summary` keeps both ends, so putting them
+        # at the head guarantees they outlive the raw "you asked" lines. Live
+        # 2026-08-18 eight lines of routine asks nearly buried the two lines
+        # that actually mattered.
+        combined = f"{narrative}\n{facts}".strip() if narrative else facts
+        if combined:
+            self.state.update_rolling_summary(
+                _bounded_summary(
+                    [line for line in combined.splitlines() if line.strip()],
+                    summary_budget(ceiling),
+                ),
+                start_abs,
+            )
+
+    async def _narrate(self, evicted: list[Any], num_ctx: int | None = None) -> str:
+        """One short model call: what was DECIDED in the turns being dropped."""
+        transcript = "\n".join(
+            f"{getattr(m, 'role', '?')}: {str(getattr(m, 'content', '') or '')[:600]}"
+            for m in evicted
+            if str(getattr(m, "content", "") or "").strip()
+        )
+        if not transcript.strip():
+            return ""
+        ask = (
+            "Below is part of a conversation that no longer fits in context. "
+            "List only the DECISIONS and facts a later turn would need - names, "
+            "numbers, file paths, choices made. Up to 6 lines, each starting "
+            "'- '. No preamble, no commentary.\n\n" + transcript[:12000]
+        )
+        try:
+            raw = await asyncio.wait_for(
+                self.client.chat(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": ask}],
+                    stream=False,
+                    options={
+                        "temperature": 0.0,
+                        "num_ctx": num_ctx or self._num_ctx([]),
+                    },
+                ),
+                timeout=min(self.request_timeout, 120.0),
+            )
+        except Exception:
+            return ""  # the deterministic digest still stands
+        turn = parse_model_turn(raw, set())
+        lines = [
+            line.strip()
+            for line in (turn.text or "").splitlines()
+            if line.strip().startswith("-")
+        ]
+        if lines:
+            self._activity(f"compacted {len(evicted)} older messages")
+        return "\n".join(lines[:6])
 
     def _messages(self) -> list[dict[str, Any]]:
         """System prompt + workspace listing + older summary + the conversation.
@@ -547,7 +906,9 @@ class SimpleChatLoop:
         the rolling summary.
         """
         ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
-        usable = max(1024, ceiling - RESERVE_OUTPUT_TOKENS - SAFETY_MARGIN_TOKENS)
+        if self._num_ctx_ceiling:
+            ceiling = min(ceiling, self._num_ctx_ceiling)
+        usable = max(1024, ceiling - output_reserve(ceiling) - SAFETY_MARGIN_TOKENS)
         tail, start_abs = self.state.select_for_budget(usable, count_tokens)
         if start_abs > 1:
             # Fold what no longer fits into a digest instead of dropping it.
@@ -620,26 +981,42 @@ class SimpleChatLoop:
             return False
 
     def _num_ctx(self, messages: list[dict[str, Any]]) -> int:
+        prompt = count_tokens("\n".join(str(m.get("content", "")) for m in messages))
+        chosen = self._bucket_for(prompt)
+        self._num_ctx_floor = chosen
+        return chosen
+
+    def _bucket_for(self, prompt_tokens: int) -> int:
+        """One window for the whole session: the ceiling. No side effects.
+
+        Sizing num_ctx to the prompt was a false economy once the KV cache was
+        quantized. Measured on an 8GB card 2026-08-18:
+
+            8192 -> 6506 MiB | 16384 -> 6702 MiB | 32768 -> 6891 MiB
+
+        The ENTIRE range costs 385 MiB, while changing num_ctx makes Ollama
+        reload the model - live, a compaction call at 8192 followed by chat at
+        16384 produced 290s and 282s rounds. Worse, the smaller bucket halves
+        the reply reserve (`output_reserve`): 4096 at 16k against 8192 at 32k,
+        and a reasoning model that runs out of room returns EMPTY, which is what
+        ended that turn after 15 minutes.
+
+        So: pay the 385 MiB once and never reload. `_shrink_for_oom` still steps
+        down if the GPU refuses, which is the case this used to be guessing at.
+        Prefill is charged on the actual prompt, not the window, so a big window
+        costs nothing in time.
+        """
         ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
         if self._num_ctx_ceiling:
             ceiling = min(ceiling, self._num_ctx_ceiling)
-        prompt = count_tokens("\n".join(str(m.get("content", "")) for m in messages))
-        needed = prompt + RESERVE_OUTPUT_TOKENS + SAFETY_MARGIN_TOKENS
-        chosen = ceiling
-        for bucket in CTX_BUCKETS:
-            if bucket >= needed:
-                chosen = min(bucket, ceiling)
-                break
-        chosen = max(chosen, self._num_ctx_floor)
-        self._num_ctx_floor = chosen
-        return chosen
+        return max(ceiling, self._num_ctx_floor) if self._num_ctx_floor else ceiling
 
     # -- tools -----------------------------------------------------------
 
     async def _run_tools(self, calls: list[Any]) -> _Round:
         outcome = _Round()
         for call in calls:
-            name = _call_name(call)
+            name = canonical_tool_name(_call_name(call))
             arguments = normalize_arguments(name, _call_arguments(call))
             outcome.tool_names.append(name)
             self._activity(f"{name} {_argument_summary(arguments)}")
@@ -647,16 +1024,43 @@ class SimpleChatLoop:
             result = await asyncio.to_thread(self._execute, name, arguments)
             if self.turn_log:
                 self.turn_log.log_tool_result(name, arguments, result.ok, result.message)
-            self.state.append_tool(
-                _call_id(call), name, _budgeted(result.to_json())
-            )
+            payload = _budgeted(result.to_json())
+            if name == "read_file" and '"content_truncated": true' in payload.lower():
+                # `_budgeted` trims AFTER `_execute` has run, so the ToolResult
+                # the partial-read guard inspected looked complete. Without this
+                # the model could be handed a clipped file and still be allowed
+                # to rewrite it whole - losing everything it never saw.
+                target = str(
+                    (result.data or {}).get("resolved_filepath")
+                    or arguments.get("filepath")
+                    or ""
+                ).strip()
+                if target:
+                    self._partial_reads.add(target.lower())
+            self.state.append_tool(_call_id(call), name, payload)
+            if name in MUTATING_TOOLS:
+                if _changed_nothing(result):
+                    self._unproductive += 1
+                else:
+                    self._unproductive = 0
+            else:
+                signature = f"{name}({_argument_summary(arguments)})"
+                seen = self._read_signatures.get(signature, 0) + 1
+                self._read_signatures[signature] = seen
+                if seen >= REPEATED_READS_BEFORE_WARNING:
+                    outcome.repeated_read = signature
             if result.ok and name in MUTATING_TOOLS:
                 path = str(arguments.get("filepath") or "").strip()
                 if path:
                     outcome.written.append(path)
+                    count = self._edits_per_file.get(path.lower(), 0) + 1
+                    self._edits_per_file[path.lower()] = count
+                    outcome.repeated_edit = max(outcome.repeated_edit, count)
+                    outcome.repeated_path = path if count >= EDITS_PER_FILE_BEFORE_WARNING else outcome.repeated_path
         return outcome
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        name = canonical_tool_name(name)
         target = SIMPLE_TOOLS.get(name)
         if target is None:
             return ToolResult(
@@ -666,15 +1070,174 @@ class SimpleChatLoop:
                 {"unknown_tool": name},
             )
         if name == "write_file":
+            blocked = self._refuse_blind_overwrite(arguments)
+            if blocked is not None:
+                return blocked
             # A model asking to write a file means "make this the content",
             # whether or not it already exists. Refusing without overwrite=True
             # burns a round to teach a flag nobody wants to think about.
             arguments = {**arguments, "overwrite": True}
+        before = self._snapshot(arguments) if name in MUTATING_TOOLS else None
         try:
-            return self.tools.execute(target, arguments)
+            result = self.tools.execute(target, arguments)
         except Exception as exc:  # noqa: BLE001 - the model can act on the message
             return ToolResult(False, f"{type(exc).__name__}: {exc}", {"tool": name})
+        if name == "read_file":
+            self._note_partial_read(arguments, result)
+        if before is not None and result.ok:
+            return self._with_diff(arguments, before, result)
+        return result
 
+    def _snapshot(self, arguments: dict[str, Any]) -> str:
+        path = str(arguments.get("filepath") or "").strip()
+        if not path:
+            return ""
+        try:
+            return (self.workspace / path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _with_diff(
+        self, arguments: dict[str, Any], before: str, result: ToolResult
+    ) -> ToolResult:
+        """Show the model what its edit ACTUALLY did.
+
+        A mutation used to report "Edited game.js: +3 -1 lines" - a count, not a
+        change. So the model could not tell a fix from a no-op from an edit that
+        removed the wrong thing, and live 2026-08-18 it patched one file seven
+        times in a turn without ever seeing the result of any of them.
+
+        Deliberately NOT git. `git diff` shows everything since the last commit
+        - the user's work mixed with the agent's - and says nothing at all in a
+        workspace that is not a repo, which is the common case. Diffing the file
+        against its own state one call ago is exact, always available, and
+        scoped to precisely this edit.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        if not path:
+            return result
+        after = self._snapshot(arguments)
+        if after == before:
+            return result
+        diff = list(
+            difflib.unified_diff(
+                before.splitlines(), after.splitlines(),
+                fromfile=f"{path} (before)", tofile=f"{path} (after)",
+                lineterm="", n=2,
+            )
+        )
+        if not diff:
+            return result
+        shown = diff[:MAX_DIFF_LINES]
+        if len(diff) > MAX_DIFF_LINES:
+            shown.append(f"... [{len(diff) - MAX_DIFF_LINES} more diff lines]")
+        data = dict(result.data) if isinstance(result.data, dict) else {}
+        data["diff_lines"] = len(diff)
+        return ToolResult(
+            result.ok,
+            f"{result.message}\n\nWhat changed:\n" + "\n".join(shown),
+            data,
+        )
+
+    def _note_partial_read(self, arguments: dict[str, Any], result: ToolResult) -> None:
+        """Track how much of each file the model has actually seen.
+
+        Ranges have to ACCUMULATE. Marking a file partial on any range read and
+        only clearing it on a whole-file read made the guard a dead end: told to
+        read a large file with start_line/end_line, the model would read it all
+        in pieces and still be refused a write, forever. Live 2026-08-18 that
+        left one turn alternating read and patch for 24 rounds.
+        """
+        data = result.data if isinstance(result.data, dict) else {}
+        if not result.ok:
+            return
+        path = str(data.get("resolved_filepath") or arguments.get("filepath") or "").strip()
+        if not path:
+            return
+        key = path.lower()
+        total = data.get("total_lines")
+        start = data.get("start_line")
+        end = data.get("end_line")
+        ranged = isinstance(start, int) and isinstance(end, int)
+        # Three different things can shorten a read, and they mean different
+        # things. `content_truncated` is the conversation budget clipping it.
+        # `truncated` means "you did not get every line" - but on a RANGE read
+        # that is just the range doing its job, so it only signals clipping when
+        # no range was asked for. Conflating them cleared the flag on a file the
+        # model had only seen the head of.
+        clipped = bool(data.get("content_truncated")) or (
+            not ranged and bool(data.get("truncated"))
+        )
+
+        if not clipped and not ranged:
+            # A complete, unclipped read: the model has seen all of it.
+            self._seen_ranges.pop(key, None)
+            self._partial_reads.discard(key)
+            return
+
+        if ranged and not clipped:
+            seen = self._seen_ranges.setdefault(key, [])
+            seen.append((start, end))
+            if isinstance(total, int) and _covers(seen, total):
+                # Read in pieces, but all of it - that is not a partial read.
+                self._seen_ranges.pop(key, None)
+                self._partial_reads.discard(key)
+                return
+        self._partial_reads.add(key)
+
+    def _refuse_blind_overwrite(self, arguments: dict[str, Any]) -> ToolResult | None:
+        """Stop a whole-file write of a file the model has only partly read.
+
+        The failure this prevents: a truncated read leaves the model holding a
+        fragment, it "rewrites" the file from that fragment, and everything it
+        never saw is gone. The existing gutting guard does not catch it - that
+        one needs a shrink to under 25% AND the loss of every declaration, built
+        for a file replaced by the three bytes `}`. Losing the last third of a
+        file passes it cleanly.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        if not path:
+            return None
+        if path.lower() in self._partial_reads:
+            return ToolResult(
+                False,
+                f"You have only seen part of {path}, so writing it whole would delete "
+                "the rest. Either call patch_file to change just the part you need, or "
+                "read the remainder first with read_file(start_line=..., end_line=...).",
+                {"filepath": path, "partial_read": True},
+            )
+        return self._refuse_unwritable_rewrite(path)
+
+    def _refuse_unwritable_rewrite(self, path: str) -> ToolResult | None:
+        """Stop a whole-file rewrite that physically cannot fit in one reply.
+
+        Not a style preference - a hard limit. The reply reserve is
+        `output_reserve(num_ctx)` tokens, so a file larger than that cannot be
+        emitted whole however well the model reads it: generation simply stops
+        mid-file and the tail is lost. `patch_file` costs the same regardless of
+        file size, which is why it is the answer rather than a bigger window.
+
+        Measured 2026-08-18: whole-file rewrites drove one turn to 18 minutes
+        over 18 rounds at ~100s per write.
+        """
+        try:
+            existing = (self.workspace / path).stat().st_size
+        except OSError:
+            return None  # new file - nothing to lose, and nothing to compare
+        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
+        if self._num_ctx_ceiling:
+            ceiling = min(ceiling, self._num_ctx_ceiling)
+        writable_chars = output_reserve(ceiling) * 4
+        if existing <= writable_chars:
+            return None
+        return ToolResult(
+            False,
+            f"{path} is {existing:,} bytes and one reply can hold about "
+            f"{writable_chars:,}, so rewriting it whole would be cut off partway "
+            "and lose the rest. Use patch_file for the change you actually want - "
+            "its cost does not grow with the file.",
+            {"filepath": path, "size": existing, "writable_chars": writable_chars},
+        )
     # -- verification ----------------------------------------------------
 
     async def _append_verification(self, written: list[str]) -> None:
@@ -751,6 +1314,23 @@ class SimpleChatLoop:
                 self.on_activity(message)
             except Exception:
                 pass
+
+    def _status(self, message: str) -> None:
+        if self.on_status:
+            try:
+                self.on_status(message)
+            except Exception:
+                pass
+
+    async def _heartbeat(self, label: str) -> None:
+        """Tick a live status while a model call is in flight, until cancelled."""
+        started = time.perf_counter()
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_SECONDS)
+                self._status(f"{label} {time.perf_counter() - started:.0f}s")
+        except asyncio.CancelledError:
+            pass
 
     def _trace(self, event: str, message: str, data: dict[str, Any]) -> None:
         if self.on_trace:
@@ -880,13 +1460,80 @@ def _digest(previous: str, evicted: list[Any]) -> str:
             if path and function.get("name") in MUTATING_TOOLS:
                 touched.append(path)
     lines = [line for line in (previous or "").splitlines() if line.strip()]
+    # Eight. Trimming these to make room for the model-written decisions looked
+    # tempting after a synthetic run where they were all filler, but in a real
+    # conversation they carry facts nothing else records - dropping to four lost
+    # "the port is 8080" from an early turn. Decisions are protected by ORDER
+    # instead: they lead, so the head of a bounded summary always keeps them.
     lines.extend(f"- you asked: {item}" for item in asked[-8:])
     if touched:
         lines.append("- files changed earlier: " + ", ".join(dict.fromkeys(touched))[:300])
     if not lines:
         return ""
-    return "\n".join(lines[-14:])
+    return _bounded_summary(lines, summary_budget(max_ctx()))
 
+
+
+
+def _changed_nothing(result: ToolResult) -> bool:
+    """Did this mutation leave the file exactly as it was?
+
+    Both shapes count, because both are the model spinning: a patch that FAILED
+    (old_string not found) and a patch that "succeeded" with old_string ==
+    new_string. Live 2026-08-18 one turn ran 12 no-op patches and 5 failed ones
+    - 17 mutations that changed nothing - and the harness ran every one without
+    noticing.
+    """
+    if not result.ok:
+        return True
+    message = (result.message or "").lower()
+    return "nothing to change" in message or "identical" in message
+
+
+def _covers(ranges: list[tuple[int, int]], total_lines: int) -> bool:
+    """Do these (start, end) line ranges together cover 1..total_lines?"""
+    if total_lines <= 0:
+        return False
+    reach = 0
+    for start, end in sorted(ranges):
+        if start > reach + 1:
+            return False          # a gap the model has not read
+        reach = max(reach, end)
+    return reach >= total_lines
+
+
+def summary_budget(ceiling: int) -> int:
+    """Tokens the rolling summary may occupy: ~6% of the window.
+
+    It has to be bounded, or the thing protecting the window eventually eats it
+    - the summary now PERSISTS and accumulates across every turn of a thread
+    that may run for weeks.
+    """
+    return max(256, ceiling // 16)
+
+
+def _bounded_summary(lines: list[str], budget_tokens: int) -> str:
+    """Fit the summary to *budget_tokens*, dropping the MIDDLE.
+
+    The old rule was `lines[-14:]` - keep the newest fourteen - which discarded
+    exactly the founding decisions a long thread depends on ("the window is
+    900x700", "max speed is 4.5") while keeping incidental recent chatter. Both
+    ends are what matter: what the project IS, and what just happened.
+    """
+    joined = chr(10).join(lines)
+    if count_tokens(joined) <= budget_tokens:
+        return joined
+    head, tail = 4, 10
+    while head + tail > 2:
+        kept = lines[:head] + ["- (older detail compacted)"] + lines[-tail:]
+        text = chr(10).join(kept)
+        if count_tokens(text) <= budget_tokens:
+            return text
+        if tail > head:
+            tail -= 1
+        else:
+            head -= 1
+    return chr(10).join(lines[:1] + ["- (older detail compacted)"] + lines[-1:])
 
 def workspace_files(workspace: Path, limit: int = MAX_LISTED_FILES) -> list[str]:
     """Every file in the workspace right now, as posix-relative paths.
@@ -947,10 +1594,47 @@ def describes_an_unmade_edit(text: str, files: list[str]) -> str:
 
 
 def _budgeted(payload: str) -> str:
-    """Cap one tool result so it cannot crowd the conversation out of the window."""
+    """Cap one tool result so it cannot crowd the conversation out of the window.
+
+    Truncates the CONTENT field, not the JSON string. Slicing raw JSON left an
+    unterminated string and unclosed braces - a payload the model can only read
+    as garbage. Whatever survives the cap must still be shaped like a result.
+    """
     if count_tokens(payload) <= MAX_TOOL_RESULT_TOKENS:
         return payload
     keep = MAX_TOOL_RESULT_TOKENS * 4
+    try:
+        parsed = json.loads(payload)
+        data = parsed.get("data")
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            body = data["content"]
+            overflow = len(payload) - keep
+            if 0 < overflow < len(body):
+                kept = body[: len(body) - overflow]
+                shown = kept.count("\n") + 1
+                total = data.get("total_lines")
+                # Name the exact next call. "Read the rest with start_line" was
+                # too vague to act on: live 2026-08-18 the model re-read the
+                # same file twice, got the same head both times, and gave up
+                # without ever trying a range or patch_file.
+                if isinstance(total, int) and total > shown:
+                    guidance = (
+                        f"... [showing lines 1-{shown} of {total}. "
+                        f"For the rest call read_file(start_line={shown + 1}, "
+                        f"end_line={total}). To CHANGE this file use patch_file - "
+                        "it is too large to rewrite whole.]"
+                    )
+                else:
+                    guidance = (
+                        f"... [truncated {overflow} chars - call read_file with "
+                        "start_line/end_line for the rest, and patch_file to change it]"
+                    )
+                data["content"] = kept + "\n" + guidance
+                data["content_truncated"] = True
+                data["shown_lines"] = shown
+                return json.dumps(parsed, ensure_ascii=True)
+    except (ValueError, AttributeError, TypeError):
+        pass
     return payload[:keep] + "\n...[result truncated by SHAMSU]"
 
 
@@ -972,8 +1656,11 @@ def build_simple_tools(
 
 __all__ = [
     "CTX_BUCKETS",
+    "canonical_tool_name",
     "DEFAULT_MAX_ROUNDS",
+    "MAX_EMPTY_NUDGES",
     "MAX_PROSE_NUDGES",
+    "REPEATED_READS_BEFORE_WARNING",
     "SIMPLE_TOOLS",
     "SIMPLE_TOOL_SCHEMAS",
     "SimpleChatLoop",

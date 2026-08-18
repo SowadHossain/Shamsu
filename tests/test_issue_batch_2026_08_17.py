@@ -453,10 +453,18 @@ def test_a_restart_resumes_a_recent_session(tmp_path):
     assert reason == "resumed"
 
 
-def test_a_restart_does_not_resume_a_stale_session(tmp_path):
-    """`get_or_create_latest` had no age bound, so every restart landed back in
-    the same session forever - and the compiled frame now digests that
-    transcript, so a stale session feeds unrelated work into every prompt."""
+def test_an_old_session_is_resumed_but_its_age_is_announced(tmp_path):
+    """Superseded 2026-08-18. The original rule forked a NEW session past 8
+    hours, because "a stale session feeds unrelated work into every prompt".
+    That concern is real but the cure was worse: coming back the next morning
+    read as "everything I did yesterday is gone", though the transcript was
+    intact on disk the whole time.
+
+    It is now answered differently - resume, and SAY how old it is, so the
+    choice to carry on is the user's and never silent. Staleness of file
+    CONTENT is handled by re-grounding (`files_changed_since_last_activity`),
+    and length by compaction, which now persists.
+    """
     from shamsu.session.manager import SessionManager
 
     manager = SessionManager(tmp_path)
@@ -466,13 +474,14 @@ def test_a_restart_does_not_resume_a_stale_session(tmp_path):
     manager._write_metadata(first.metadata)
     manager._upsert_index(first.metadata)
 
-    fresh, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
+    again, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=200)
 
-    assert fresh.session_id != first.session_id
-    assert "stale" in reason
+    assert again.session_id == first.session_id, "an old thread must still be resumable"
+    assert "days ago" in reason, f"its age must be announced, got {reason!r}"
 
 
-def test_a_restart_does_not_resume_an_overlong_session(tmp_path):
+def test_a_long_session_is_not_cut_off(tmp_path):
+    """Length is handled by compaction, not by abandoning the thread."""
     from shamsu.session.manager import SessionManager
 
     manager = SessionManager(tmp_path)
@@ -480,10 +489,10 @@ def test_a_restart_does_not_resume_an_overlong_session(tmp_path):
     for index in range(5):
         first.log("chat.message", {"role": "user", "content": f"turn {index}"}, "turn")
 
-    fresh, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=3)
+    again, reason = manager.resume_or_start(max_age_seconds=8 * 3600, max_messages=3)
 
-    assert fresh.session_id != first.session_id
-    assert "messages" in reason
+    assert again.session_id == first.session_id
+    assert reason == "resumed"
 
 
 def test_an_empty_session_is_not_treated_as_overlong(tmp_path):
