@@ -24,6 +24,7 @@ from shamsu.agents.simple_chat import (
     command_needs_approval,
     make_approval_func,
     normalize_arguments,
+    workspace_files,
     simple_mode_enabled,
 )
 from shamsu.agents.simple_prompt import build_instruction, simple_system_prompt
@@ -3193,3 +3194,208 @@ def test_a_brand_new_file_is_never_steered_to_patch(tmp_path):
     asyncio.run(loop.run("create new.py"))
 
     assert (tmp_path / "new.py").read_text(encoding="utf-8") == body
+
+
+# ---------------------------------------------------------------------------
+# Eliding tool payloads (SMALLCODE plan item D)
+#
+# Code enters the conversation twice - as the write_file content inside
+# tool_calls, and as the body of a read_file result - and both have served
+# their purpose the moment the call returns. Measured on a 130-message
+# session: 44,833 tokens verbatim vs 10,476 elided, ~13 turns vs ~57.
+# ---------------------------------------------------------------------------
+
+
+def _write_call_body(path: str, body: str) -> list[dict]:
+    return [{"function": {"name": "write_file", "arguments": {"filepath": path, "content": body}}}]
+
+
+def _session(tmp_path):
+    from shamsu.session.manager import SessionManager
+
+    return SessionManager(tmp_path).create_session("elide")
+
+
+def test_an_old_write_payload_is_dropped_but_the_call_is_still_legible(tmp_path):
+    from shamsu.agents.simple_chat import KEEP_VERBATIM_MESSAGES
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_user("build it")
+    state.append_assistant("", tool_calls=_write_call_body("game.js", "x=1;\n" * 500))
+    for i in range(KEEP_VERBATIM_MESSAGES + 2):
+        state.append_user(f"later {i}")
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    payload = state.all_messages[2]
+    arguments = payload.tool_calls[0]["function"]["arguments"]
+    assert "game.js" == arguments["filepath"], "the model must still see WHICH file"
+    assert len(arguments["content"]) < 150, "the file body should be gone"
+    assert "elided" in arguments["content"]
+
+
+def test_elision_survives_the_turn_boundary(tmp_path):
+    """A fresh ChatState is built per user message and rehydrates from disk.
+
+    Eliding only in memory for the current turn saves nothing across turns -
+    which is exactly the case the 44,833 -> 10,476 measurement was taken on.
+    """
+    from shamsu.context.budget import messages_tokens
+
+    logger = _session(tmp_path)
+    state = ChatState(simple_system_prompt(tmp_path), session_logger=logger, hydrate=False)
+    body = "const x = 1;\n" * 400
+    for i in range(40):   # ~120 messages, the scale the reclaim was measured at
+        state.append_user(f"step {i}")
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", body))
+        state.append_tool("", "write_file", json.dumps({"ok": True, "message": "wrote it",
+                                                        "data": {"content": body}}))
+
+    # A NEW loop for the next user message, hydrating everything back off disk.
+    fresh = SimpleChatLoop(
+        tmp_path,
+        client=FakeClient([_text("ok")]),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        session_logger=logger,
+        model_name="qwen3:8b",
+    )
+    before = messages_tokens(m.to_ollama() for m in fresh.state.all_messages)
+    fresh._elide_payloads()
+    after = messages_tokens(m.to_ollama() for m in fresh.state.all_messages)
+
+    assert after < before * 0.5, f"expected a large reclaim, got {before} -> {after}"
+
+
+def test_the_most_recent_payloads_are_kept_verbatim(tmp_path):
+    """Inside a turn the model MUST see what it just did, or it repeats it."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    body = "y=2;\n" * 400
+    state.append_user("go")
+    state.append_assistant("", tool_calls=_write_call_body("recent.js", body))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    arguments = state.all_messages[2].tool_calls[0]["function"]["arguments"]
+    assert arguments["content"] == body, "the current edit was elided out from under it"
+
+
+def test_shell_output_is_compacted_not_discarded(tmp_path):
+    """A stack trace cannot be fetched back by calling anything."""
+    from shamsu.agents.simple_chat import elide_tool_result
+
+    trace = json.dumps({
+        "ok": False,
+        "message": "FAILED\n" + "\n".join(f"  frame {i}" for i in range(200)) + "\nAssertionError: boom",
+    })
+    kept = elide_tool_result("run_command", trace)
+
+    assert "FAILED" in kept
+    assert "AssertionError: boom" in kept, "the end of a trace is where the answer is"
+    assert "elided" in kept
+    assert len(kept) < len(trace) / 2
+
+
+def test_a_file_result_says_how_to_get_it_back(tmp_path):
+    from shamsu.agents.simple_chat import elide_tool_result
+
+    payload = json.dumps({"ok": True, "message": "Read game.js",
+                          "data": {"content": "z=3;\n" * 500, "total_lines": 500}})
+    kept = elide_tool_result("read_file", payload)
+
+    assert "read_file" in kept, "the model must be told how to recover it"
+    assert "z=3" not in kept
+    assert json.loads(kept)["data"]["total_lines"] == 500
+
+
+def test_elision_never_orphans_a_tool_result_from_its_call(tmp_path):
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(30):
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", "q=1;\n" * 300))
+        state.append_tool(f"call-{i}", "write_file", json.dumps({"ok": True, "message": "wrote"}))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    messages = state.all_messages
+    owners = sum(1 for m in messages if m.role == "assistant" and m.tool_calls)
+    results = sum(1 for m in messages if m.role == "tool")
+    assert owners == results == 30, "elision must rewrite content, never remove messages"
+
+
+def test_a_long_edit_turn_elides_before_it_reaches_the_user(tmp_path):
+    """Waiting for the next user message is too late - the turn fills the window."""
+    body = chr(10).join(f"const line{i} = {i};" for i in range(400))
+    (tmp_path / "big.js").write_text(body, encoding="utf-8")
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(30):   # a turn already well into the window
+        state.append_user(f"step {i}")
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", body))
+    loop = _loop(tmp_path, [_tool("read_file", filepath="big.js")] * 4 + [_text("done")])
+    loop.state = state
+
+    asyncio.run(loop.run("study big.js"))
+
+    assert loop.evictions > 0, "no mid-turn sweep ever elided anything"
+    assert any(m.elided for m in loop.state.all_messages)
+
+
+def test_a_short_turn_does_not_elide_what_it_is_working_on(tmp_path):
+    """Under no pressure, the sweep must leave the current edit alone."""
+    (tmp_path / "small.js").write_text("const a = 1;", encoding="utf-8")
+    loop = _loop(tmp_path, [_tool("read_file", filepath="small.js")] * 4 + [_text("done")])
+
+    asyncio.run(loop.run("read small.js"))
+
+    assert loop.evictions == 0
+
+def test_the_reply_reserve_is_actually_available_after_budgeting(tmp_path):
+    """Item A's own acceptance test, measured on a REAL assembled prompt.
+
+    The reserve promises ~8,192 tokens at a 32k window. Charging `tool_calls`
+    alone still leaves the tool schemas, the grounding block and the rolling
+    summary uncounted - about 3,900 tokens - so headroom would come back as
+    ~5,300 while every internal number claimed it was fixed. This builds the
+    prompt the way `_call_model` does and measures what is actually left.
+    """
+    from shamsu.agents.simple_chat import output_reserve
+    from shamsu.context.budget import messages_tokens, tool_schema_tokens
+
+    for i in range(40):
+        (tmp_path / f"file{i}.py").write_text("x = 1" + chr(10) * 2, encoding="utf-8")
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    body = "const value = 1;" + chr(10)
+    for i in range(60):
+        state.append_user(f"step {i} " + "padding " * 80)
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", body * 200))
+    state.update_rolling_summary("- an earlier decision worth keeping" * 40, start_abs=1)
+
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+    loop._files = workspace_files(tmp_path)
+
+    prompt = loop._messages()
+    ceiling = loop._num_ctx(prompt)
+    sent = messages_tokens(prompt) + tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+    headroom = ceiling - sent
+
+    assert headroom >= output_reserve(ceiling), (
+        f"prompt is {sent} of a {ceiling} window, leaving {headroom} to answer "
+        f"in; the reserve promises {output_reserve(ceiling)}"
+    )
+
+
+def test_the_tool_schemas_sent_on_every_call_are_charged(tmp_path):
+    """~630 tokens, on every single request, counted nowhere."""
+    from shamsu.agents.simple_chat import SIMPLE_TOOL_SCHEMAS
+    from shamsu.context.budget import tool_schema_tokens
+
+    loop = _loop(tmp_path, [_text("ok")])
+
+    assert tool_schema_tokens(SIMPLE_TOOL_SCHEMAS) > 300
+    assert loop._fixed_overhead() >= tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)

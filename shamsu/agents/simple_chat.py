@@ -116,6 +116,49 @@ REPEATED_READS_BEFORE_WARNING = 3
 #
 # This is a PREFERENCE with an escape, unlike `_refuse_unwritable_rewrite`,
 # which is a physical limit and has none.
+# Messages kept byte-for-byte at the end of history. Inside one turn the model
+# MUST see what it just did - when it cannot, it repeats itself, which is the
+# 12 no-op patches and the 3 identical `list_files` calls found live. Across
+# turns it needs the gist, not the bytes. Measured on a 130-message session:
+#
+#     keep verbatim | prompt tokens | turns before a 24k budget fills
+#         everything |        44,833 | ~13   <- before
+#            last 20 |        10,476 | ~57   <- here
+#            nothing |         7,569 | ~79
+#
+# Twenty is the knee: nearly all of the reclaim, and the model still holds the
+# whole of the edit it is in the middle of.
+KEEP_VERBATIM_MESSAGES = 20
+
+# A tool_call argument longer than this is shortened in OLD messages. Keys are
+# always kept, so the model still reads `write_file(filepath=game.js)` rather
+# than a hole where a call used to be.
+MAX_OLD_ARGUMENT_CHARS = 100
+OLD_ARGUMENT_KEEP_CHARS = 80
+
+# Tools whose result can be fetched again exactly. Eliding these is lossless:
+# the file is still on disk, the listing can be re-listed, the search re-run.
+# `run_command` is deliberately ABSENT - a test failure or a stack trace cannot
+# be recovered by calling anything, so it is compacted head-and-tail instead of
+# being thrown away.
+RECOVERABLE_TOOLS = frozenset({"read_file", "list_files", "search_files", "write_file", "patch_file"})
+
+# Lines kept at each end of an unrecoverable result (shell output).
+COMMAND_OUTPUT_HEAD_LINES = 8
+COMMAND_OUTPUT_TAIL_LINES = 12
+
+# Tool calls between mid-turn elision sweeps. A long edit turn fills the window
+# WITHIN the turn, and waiting for the next user message is too late.
+ELIDE_EVERY_N_TOOL_CALLS = 3
+
+# Fraction of the history budget above which a mid-turn sweep gets aggressive.
+# SmallCode uses 0.6 of the detected window for the same decision. Below this
+# the sweep keeps the normal verbatim tail; above it, the turn is on course to
+# fill the window before it ever reaches the user, so it keeps only what the
+# edit in progress needs.
+ELIDE_PRESSURE_FRACTION = 0.6
+KEEP_VERBATIM_UNDER_PRESSURE = 8
+
 WHOLE_REWRITE_LIMIT_TOKENS = 400
 
 MAX_DIFF_LINES = 40
@@ -604,6 +647,10 @@ class SimpleChatLoop:
         # is honoured: a full rewrite is sometimes genuinely right, and a guard
         # with no exit is a deadlock waiting for a user. The partial-read guard
         # once had none and blocked writes forever.
+        # Tool calls since the last mid-turn elision sweep.
+        self._calls_since_elide = 0
+        # How many sweeps and how many messages they shrank, for `/status`.
+        self.evictions = 0
         self._rewrite_refused: set[str] = set()
         # Files the model has seen only part of - writing them whole loses data.
         self._partial_reads: set[str] = set()
@@ -656,6 +703,11 @@ class SimpleChatLoop:
                 claim()
             except Exception:
                 pass
+        # Before the budget is computed, and before compaction: hydration has
+        # just reloaded the transcript from disk with every payload intact, and
+        # eliding after budgeting would mean budgeting against bytes that are
+        # about to be thrown away.
+        self._elide_payloads()
         self.state.append_user(user_input)
         # Before compaction, not after: `_fixed_overhead` charges the grounding
         # block against the budget, and compaction decides what to evict from
@@ -1192,6 +1244,57 @@ class SimpleChatLoop:
         except Exception:
             return False
 
+    def _elide_payloads(self, keep_recent: int = KEEP_VERBATIM_MESSAGES) -> int:
+        """Shrink tool payloads older than the last *keep_recent* messages.
+
+        Called at the START of a turn as well as during one. A fresh
+        `SimpleChatLoop` - and so a fresh `ChatState` - is built per user
+        message, and hydration reloads the transcript from disk with every
+        `write_file` payload intact. Eliding only what this turn produced would
+        therefore save nothing at all across turns, which is precisely the case
+        the 44,833 -> 10,476 measurement was taken on.
+        """
+
+        def elide(message: Any) -> tuple[str, list[dict[str, Any]]] | None:
+            if message.role == "assistant" and message.tool_calls:
+                return message.content, _shorten_arguments(message.tool_calls)
+            if message.role == "tool":
+                name = canonical_tool_name(message.name or "")
+                return elide_tool_result(name, message.content), message.tool_calls
+            return None
+
+        changed = self.state.elide_old_payloads(keep_recent, elide)
+        if changed:
+            self._trace(
+                "simple.elide",
+                f"elided {changed} older tool payloads",
+                {"messages": changed},
+            )
+        return changed
+
+    def _history_pressure(self) -> float:
+        """How full the conversation already is, as a fraction of its budget."""
+        budget = self._history_budget()
+        if budget <= 0:
+            return 1.0
+        used = messages_tokens(m.to_ollama() for m in self.state.all_messages)
+        return used / budget
+
+    def _elide_under_pressure(self) -> int:
+        """A mid-turn sweep, keeping less verbatim the fuller the window is.
+
+        Cadence alone is not a trigger: sweeping every three calls in a short
+        turn finds nothing older than the verbatim tail and does no work. What
+        matters is whether this turn is on course to fill the window BEFORE it
+        reaches the user, which is what happened live over 24 rounds and 18
+        whole-file writes.
+        """
+        keep = KEEP_VERBATIM_MESSAGES
+        if self._history_pressure() > ELIDE_PRESSURE_FRACTION:
+            keep = KEEP_VERBATIM_UNDER_PRESSURE
+            self._activity("context is filling; eliding older tool payloads")
+        return self._elide_payloads(keep)
+
     def _ceiling(self) -> int:
         """The context window this session asks Ollama for.
 
@@ -1334,6 +1437,14 @@ class SimpleChatLoop:
                 if target:
                     self._partial_reads.add(target.lower())
             self.state.append_tool(_call_id(call), name, payload)
+            self._calls_since_elide += 1
+            if self._calls_since_elide >= ELIDE_EVERY_N_TOOL_CALLS:
+                # Mid-turn, not only between turns. A single edit turn can fill
+                # the window on its own - live 2026-08-18 one ran 24 rounds and
+                # 18 whole-file writes - and by the time the user speaks again
+                # the truncation has already happened.
+                self._calls_since_elide = 0
+                self.evictions += self._elide_under_pressure()
             if name in MUTATING_TOOLS:
                 if _changed_nothing(result):
                     self._unproductive += 1
@@ -1948,6 +2059,96 @@ def describes_an_unmade_edit(text: str, files: list[str]) -> str:
     if body_lines < 4:
         return ""
     return names_a_workspace_file(text, files)
+
+
+def _shorten_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Shrink long argument VALUES in an old tool call, keeping every key.
+
+    Once the result has come back the model does not need the whole file it
+    asked to write - but it does still need to see that it wrote that file.
+    Keeping the keys means the call still reads as
+    `write_file(filepath=frontend/game.js)` instead of a hole in the history.
+    """
+    shortened: list[dict[str, Any]] = []
+    for call in tool_calls:
+        function = dict(call.get("function") or {}) if isinstance(call, dict) else {}
+        arguments = function.get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (ValueError, TypeError):
+                arguments = {}
+        if isinstance(arguments, dict):
+            function["arguments"] = {
+                key: (
+                    value[:OLD_ARGUMENT_KEEP_CHARS] + " ...[elided]"
+                    if isinstance(value, str) and len(value) > MAX_OLD_ARGUMENT_CHARS
+                    else value
+                )
+                for key, value in arguments.items()
+            }
+        updated = dict(call) if isinstance(call, dict) else {}
+        updated["function"] = function
+        shortened.append(updated)
+    return shortened
+
+
+def _middle_out(text: str, head: int, tail: int) -> str:
+    """Keep both ends of an unrecoverable result, name what went missing.
+
+    Shell output is the one payload `read_file` cannot fetch back, and the two
+    ends are where the answer is: the command that ran, and how it failed.
+    """
+    body = text.splitlines()
+    if len(body) <= head + tail + 1:
+        return text
+    omitted = len(body) - head - tail
+    kept = body[:head] + [f"... [{omitted} lines elided - re-run to see them] ..."] + body[-tail:]
+    return chr(10).join(kept)
+
+
+def elide_tool_result(name: str, payload: str) -> str:
+    """What an old tool result is worth keeping as.
+
+    A `read_file` body and a `write_file` echo have both served their purpose
+    the moment the call returns, and the file is still on disk. What survives
+    is the fact of the call and its outcome - including, for a mutation, the
+    diff `_with_diff` already computed, which is the part the model reasons
+    from next.
+    """
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, TypeError):
+        return _middle_out(payload, COMMAND_OUTPUT_HEAD_LINES, COMMAND_OUTPUT_TAIL_LINES)
+    if not isinstance(parsed, dict):
+        return payload
+    if name not in RECOVERABLE_TOOLS:
+        # Not recoverable by any call - compact it, never drop it.
+        message = str(parsed.get("message") or "")
+        parsed["message"] = _middle_out(
+            message, COMMAND_OUTPUT_HEAD_LINES, COMMAND_OUTPUT_TAIL_LINES
+        )
+        data = parsed.get("data")
+        if isinstance(data, dict):
+            for key in ("stdout", "stderr", "output", "content"):
+                if isinstance(data.get(key), str):
+                    data[key] = _middle_out(
+                        data[key], COMMAND_OUTPUT_HEAD_LINES, COMMAND_OUTPUT_TAIL_LINES
+                    )
+        return json.dumps(parsed, ensure_ascii=True)
+    # Recoverable. Keep the verdict and the diff; drop the bytes.
+    message = str(parsed.get("message") or "")
+    kept: dict[str, Any] = {"ok": parsed.get("ok", True), "message": message}
+    data = parsed.get("data")
+    if isinstance(data, dict):
+        summary = {
+            key: data[key]
+            for key in ("resolved_filepath", "total_lines", "diff_lines", "matches")
+            if key in data
+        }
+        summary["elided"] = "call read_file for the current contents"
+        kept["data"] = summary
+    return json.dumps(kept, ensure_ascii=True)
 
 
 def _budgeted(payload: str) -> str:
