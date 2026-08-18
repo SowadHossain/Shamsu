@@ -19,6 +19,10 @@ _ACTION_LABELS = {
 
 _MAX_EMPTY_TTY_READS = 3
 
+# Live displays stopped for a prompt, keyed by console, so the same prompt can
+# hand them back afterwards.
+_PAUSED: dict[int, list] = {}
+
 
 def _action_label(action_type: str) -> str:
     return _ACTION_LABELS.get(action_type, action_type)
@@ -43,7 +47,21 @@ def _render_request(request: ApprovalRequest, console: Console) -> None:
     console.print(Panel(body, title="Approval Required", border_style="yellow"))
 
 
-def _pause_console_live(console: Console) -> None:
+def _resume_console_live(paused: list) -> None:
+    """Restart what `_pause_console_live` stopped.
+
+    Without this the spinner never comes back after an approval, so the rest of
+    a turn runs with no sign of life - the same "is it stuck?" the pause was
+    added to fix, just moved later.
+    """
+    for target in paused:
+        try:
+            target.start()
+        except Exception:
+            pass
+
+
+def _pause_console_live(console: Console) -> list:
     """Stop Rich's active Live/status before blocking on stdin.
 
     Rich Live/status rendering and Python's built-in input() can fight over a
@@ -58,11 +76,15 @@ def _pause_console_live(console: Console) -> None:
     if live is not None:
         targets.append(live)
     targets.extend(getattr(console, "_shamsu_active_statuses", []))
+    stopped = []
     for target in reversed(targets):
         try:
-            target.stop()
+            if getattr(target, "is_started", True):
+                target.stop()
+                stopped.append(target)
         except Exception:
             pass
+    return stopped
 
 
 def ask_approval_menu(
@@ -91,6 +113,7 @@ def ask_approval_menu(
     console.print("  [n] Deny", markup=False)
 
     answer = _read_approval_answer(console)
+    _resume_console_live(_PAUSED.pop(id(console), []))
     if answer is None:
         return False, "none"
     if offer_remember and answer in {"a", "always"}:
@@ -216,7 +239,7 @@ def _read_approval_answer(console: Console) -> str | None:
     to ``input()`` for non-interactive/piped test contexts where an empty string
     means "No".
     """
-    _pause_console_live(console)
+    _PAUSED[id(console)] = _pause_console_live(console)
     if console.is_terminal:
         answer = _prompt_toolkit_answer()
         if answer is not None:
@@ -225,7 +248,10 @@ def _read_approval_answer(console: Console) -> str | None:
         if fallback is not None:
             return fallback
 
-    _pause_console_live(console)
+    # A second pass, because the branch above may have started something back
+    # up. Accumulate rather than overwrite - dropping the first list would
+    # leave the spinner stopped for the rest of the turn.
+    _PAUSED.setdefault(id(console), []).extend(_pause_console_live(console))
     try:
         return input("> ").strip().lower()
     except EOFError:

@@ -303,6 +303,13 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
 
+# Every `name` simple mode itself writes into a transcript. This is the set
+# history is filtered against on rehydration, so it must include names the loop
+# APPENDS as well as the ones the model calls - `verify` is written by
+# `_append_verification`, and filtering it out would silently drop "your file
+# failed to compile" from the conversation the next turn sees.
+SIMPLE_TRANSCRIPT_TOOLS = frozenset(SIMPLE_TOOLS) | {"verify"}
+
 # Legacy LOGICAL tool names, mapped to the six simple ones.
 #
 # Simple mode never offers these, so `_execute` used to refuse them outright -
@@ -534,6 +541,10 @@ class SimpleChatLoop:
             # horizon: ~5 messages per turn meant a 32k window remembered five
             # turns, and the agent started guessing at a project it had built.
             hydrate_max_messages=HYDRATE_MAX_MESSAGES,
+            # Replay only calls this loop could have made. The legacy router
+            # shares the same transcript and speaks a different vocabulary; a
+            # model shown `project.inspect` in its own history will call it.
+            known_tools=SIMPLE_TRANSCRIPT_TOOLS,
         )
         self._num_ctx_floor = 0
         # Lowered from what the GPU will actually accept, once it has refused.
@@ -1021,7 +1032,15 @@ class SimpleChatLoop:
             outcome.tool_names.append(name)
             self._activity(f"{name} {_argument_summary(arguments)}")
             self._trace("simple.tool", f"{name} {_argument_summary(arguments)}", {"tool": name})
-            result = await asyncio.to_thread(self._execute, name, arguments)
+            # A tool can block for as long as its timeout allows - `run_command`
+            # defaults to 120s, and a server started in the foreground will use
+            # every second of it. Without a tick that is two minutes of silence
+            # immediately AFTER an approval prompt, which reads as a hang.
+            beat = asyncio.ensure_future(self._heartbeat(f"running {name}..."))
+            try:
+                result = await asyncio.to_thread(self._execute, name, arguments)
+            finally:
+                beat.cancel()
             if self.turn_log:
                 self.turn_log.log_tool_result(name, arguments, result.ok, result.message)
             payload = _budgeted(result.to_json())
@@ -1663,6 +1682,7 @@ __all__ = [
     "REPEATED_READS_BEFORE_WARNING",
     "SIMPLE_TOOLS",
     "SIMPLE_TOOL_SCHEMAS",
+    "SIMPLE_TRANSCRIPT_TOOLS",
     "SimpleChatLoop",
     "SimpleChatResult",
     "build_simple_tools",

@@ -13,6 +13,7 @@ from shamsu.action_ledger import store as action_store
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import start_run
 from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
+from shamsu.agents.simple_chat import simple_mode_enabled
 from shamsu.cli.request_lifecycle import finish_current_run
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
 from shamsu.integrations.telegram.models import (
@@ -269,26 +270,38 @@ class LocalShamsuSessionGateway:
                 session_logger=logger,
                 action_ledger=ledger,
             )
-            loop = AgentChatLoop(
-                self.workspace,
-                session_logger=logger,
-                tools=tools,
-                action_ledger=ledger,
-                run_id=ledger.run_id,
-                original_user_request=text,
-                progress=progress,
-                max_runtime_seconds=_telegram_task_timeout_seconds(self.approval_broker),
-            )
-            result: AgentLoopResult = asyncio.run(loop.run(text))
-            ledger.record_final_response(result.final)
+            if simple_mode_enabled():
+                # Telegram resumes the LATEST session in the workspace, which is
+                # normally the one the desktop REPL is in. Running the legacy
+                # loop here therefore wrote ITS tool vocabulary -
+                # `project.inspect`, `file.read`, `code.search`, and a `test.run`
+                # denied by an AUTHOR phase contract - straight into a
+                # simple-mode transcript, where the model then imitated calls it
+                # could not make. Observed live 2026-08-18; the desktop side
+                # showed no turn for it, because Telegram writes no chat log.
+                final = self._run_simple(text, logger, tools, ledger, progress)
+            else:
+                loop = AgentChatLoop(
+                    self.workspace,
+                    session_logger=logger,
+                    tools=tools,
+                    action_ledger=ledger,
+                    run_id=ledger.run_id,
+                    original_user_request=text,
+                    progress=progress,
+                    max_runtime_seconds=_telegram_task_timeout_seconds(self.approval_broker),
+                )
+                result: AgentLoopResult = asyncio.run(loop.run(text))
+                final = result.final
+            ledger.record_final_response(final)
             finish_current_run(self.workspace, ledger)
             progress.done("SHAMSU finished the task.")
             summary = action_store.load_summary(self.workspace, ledger.run_id) or {}
             manifest = action_store.load_manifest(self.workspace, ledger.run_id) or {}
             return RoutedMessageResult(
-                result.final,
-                run_id=result.run_id or ledger.run_id,
-                status=str(summary.get("status") or manifest.get("status") or result.status.value),
+                final,
+                run_id=ledger.run_id,
+                status=str(summary.get("status") or manifest.get("status") or "completed"),
             )
         except Exception as exc:
             progress.failed("SHAMSU stopped with an error.")
@@ -296,6 +309,24 @@ class LocalShamsuSessionGateway:
             raise
         finally:
             clear_current_run()
+
+    def _run_simple(self, text, logger, tools, ledger, progress) -> str:
+        """The same loop the desktop uses, on the same session, same six tools."""
+        from shamsu.agents.chat_loop import _default_ollama_client
+        from shamsu.agents.simple_chat import SimpleChatLoop
+        from shamsu.llm.manager import OLLAMA_BASE_URL
+        from shamsu.runtime.timeouts import TimeoutConfig
+
+        loop = SimpleChatLoop(
+            self.workspace,
+            client=_default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig()),
+            tools=tools,
+            session_logger=logger,
+            action_ledger=ledger,
+            on_activity=lambda message: progress.step(str(message)),
+        )
+        result = asyncio.run(loop.run(text))
+        return result.final
 
     def _summary_for_metadata(self, metadata) -> TelegramSessionSummary:
         active = active_runs_for_session(metadata.session_id)

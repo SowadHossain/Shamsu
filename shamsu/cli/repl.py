@@ -4588,6 +4588,7 @@ async def _run_simple_chat(
     workspace: Path,
     console: Console,
     session_logger: SessionLogger | None = None,
+    thinking_status: Any = None,
 ) -> None:
     """The default path: one conversation, six tools, no routing.
 
@@ -4609,7 +4610,11 @@ async def _run_simple_chat(
     timeouts = TimeoutConfig()
     tools = build_simple_tools(
         workspace,
-        console_approval=ask_approval,
+        # Bind THIS console. Called bare, `ask_approval` builds a fresh
+        # Console(), which knows nothing about the live spinner - so
+        # `_pause_console_live` had nothing to stop and the status kept
+        # repainting over the prompt ("Working> y"), and over the answer.
+        console_approval=lambda request: ask_approval(request, console=console),
         session_logger=session_logger,
         action_ledger=action_ledger,
     )
@@ -4620,11 +4625,69 @@ async def _run_simple_chat(
         session_logger=session_logger,
         action_ledger=action_ledger,
         on_activity=lambda message: console.print(f"[dim]{message}[/dim]"),
+        # A model call is silent for as long as it runs, and at the 600s
+        # timeout that is ten minutes that look exactly like a hang. Ticking
+        # the spinner's own text says "alive, still thinking, N seconds" and
+        # costs a line nobody has to scroll past.
+        on_status=_status_updater(thinking_status),
     )
     result = await loop.run(user_input)
     body = result.final.strip() or "No response returned."
     console.print(Markdown(body))
     _log_assistant_message(session_logger, body, workflow_id="simple-chat")
+
+
+async def _simple_pending_run(
+    instruction: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None,
+) -> None:
+    """Run a stored pending action through SIMPLE mode.
+
+    Slash commands and pending-action replies are dispatched inside `main()`
+    BEFORE `_handle_request`, so the simple-mode guard there never sees them.
+    That left four live routes into the legacy orchestrator - `proceed`, a bare
+    "yes", a resumed plan, and a pending PRD plan - and a one-word reply was
+    enough to take them. Live 2026-08-18 that is how `project.inspect`,
+    `file.read`, `code.search` and a `test.run` denied by an AUTHOR phase
+    contract ended up in a simple-mode transcript, where the model then
+    imitated them.
+    """
+    text = (instruction or "").strip()
+    if not text:
+        console.print("[yellow]There is nothing pending to continue.[/yellow]")
+        return
+    await _run_simple_chat(text, workspace, console, session_logger)
+
+
+def _pending_plan_instruction(pending_action: dict[str, Any], *, skip: int = 0) -> str:
+    """The stored plan, as the one instruction that restarts it."""
+    task = str(
+        pending_action.get("created_from_prompt") or pending_action.get("task") or ""
+    ).strip()
+    steps = [str(step).strip() for step in (pending_action.get("steps") or []) if str(step).strip()]
+    steps = steps[skip:]
+    if not steps:
+        return task
+    listed = chr(10).join(f"{index}. {step}" for index, step in enumerate(steps, 1))
+    lead = task or "Continue the plan we agreed."
+    return (
+        f"{lead}\n\nWork through these steps in order, one at a time. After each "
+        f"one, check it works and say what you finished:\n{listed}"
+    )
+
+
+def _status_updater(thinking_status: Any) -> Any:
+    """A callback that REPLACES the live status line, or None if there is none."""
+    if thinking_status is None or not hasattr(thinking_status, "update"):
+        return None
+
+    def update(message: str) -> None:
+        with contextlib.suppress(Exception):
+            thinking_status.update(f"[dim]{message}[/dim]")
+
+    return update
 
 
 def _legacy_routing_enabled() -> bool:
@@ -4645,7 +4708,9 @@ async def _handle_request(
     thinking_status: Any = None,
 ) -> None:
     if not _legacy_routing_enabled():
-        await _run_simple_chat(user_input, workspace, console, session_logger)
+        await _run_simple_chat(
+            user_input, workspace, console, session_logger, thinking_status=thinking_status
+        )
         return
     agent_result = AgentOrchestrator(workspace, session_logger=session_logger).run(user_input)
     effective_input = agent_result.effective_input or user_input
@@ -9076,6 +9141,9 @@ async def _execute_pending_prd_plan(
     prd_path = str(pending_action.get("prd_path") or "").strip()
     if not origin:
         origin = f"build the product from {prd_path}" if prd_path else "build the product from the PRD"
+    if not _legacy_routing_enabled():
+        await _simple_pending_run(origin, workspace, console, session_logger)
+        return
     run_all = _prd_autonomous_execution_requested(reply)
     if run_all:
         console.print("[dim]Executing the full PRD plan because you asked for all milestones.[/dim]")
@@ -13277,6 +13345,11 @@ async def _execute_pending_plan(
     *,
     run_all: bool | None = None,
 ) -> None:
+    if not _legacy_routing_enabled():
+        await _simple_pending_run(
+            _pending_plan_instruction(pending_action), workspace, console, session_logger
+        )
+        return
     plan_id = str(pending_action.get("plan_id", ""))
     route = str(pending_action.get("route", "code_edit"))
     task = str(pending_action.get("created_from_prompt") or pending_action.get("task") or "")
@@ -13463,6 +13536,16 @@ async def _resume_paused_plan(
     """
     steps = [str(step) for step in (paused.get("steps") or [])]
     resume_index = int(paused.get("resume_index", 0) or 0)
+    if not _legacy_routing_enabled():
+        instruction = _pending_plan_instruction(paused, skip=resume_index)
+        answer = (answer_prompt or "").strip()
+        await _simple_pending_run(
+            f"{answer}\n\n{instruction}".strip() if answer else instruction,
+            workspace,
+            console,
+            session_logger,
+        )
+        return
     remaining = steps[resume_index:]
     if not remaining:
         return

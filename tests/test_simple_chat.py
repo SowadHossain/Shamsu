@@ -6,6 +6,9 @@ refactor that quietly reintroduces the ceremony fails here.
 from __future__ import annotations
 
 import asyncio
+import time
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -1978,3 +1981,748 @@ def test_a_huge_rewrite_does_not_replay_the_whole_file(tmp_path):
     body = result.message.split("What changed:", 1)[1]
     assert len(body.splitlines()) <= MAX_DIFF_LINES + 3
     assert "more diff lines" in result.message
+
+
+# --- the six tools must actually be callable ----------------------------
+# Every one of these is a bug that shipped: a schema whose argument name the
+# implementation does not read is indistinguishable, from the model's side,
+# from a tool that does not work.
+
+
+def test_every_tool_schema_argument_survives_normalisation(tmp_path):
+    """The name the model is SHOWN must reach the implementation.
+
+    `search_files` shipped with schema `pattern` against an implementation
+    reading `query`, so 100% of searches failed with "Missing or placeholder
+    query" - one of six tools dead, silently, for as long as it existed.
+    """
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    (tmp_path / "hello.py").write_text("value = 1\n", encoding="utf-8")
+
+    for schema in SIMPLE_TOOL_SCHEMAS:
+        function = schema.get("function", schema)
+        name = function["name"]
+        required = (function.get("parameters") or {}).get("required", [])
+        if name in {"write_file", "patch_file", "run_command"}:
+            continue  # mutating/shell: covered by their own tests
+        arguments = {key: "hello.py" if "file" in key else "value" for key in required}
+        normalized = normalize_arguments(name, arguments)
+        result = tools.execute(SIMPLE_TOOLS[name], normalized)
+        assert result.ok, f"{name}({arguments}) -> {result.message}"
+
+
+def test_search_files_reaches_grep_whatever_the_model_calls_the_argument(tmp_path):
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    (tmp_path / "game.js").write_text("const bulletSpeed = 7;\n", encoding="utf-8")
+
+    for spelling in ("pattern", "query", "text", "search", "regex"):
+        normalized = normalize_arguments("search_files", {spelling: "bulletSpeed"})
+        assert normalized == {"query": "bulletSpeed"}
+        result = tools.execute(SIMPLE_TOOLS["search_files"], normalized)
+        assert result.ok, f"{spelling}: {result.message}"
+
+
+def test_search_files_keeps_its_directory_argument_as_a_path(tmp_path):
+    """`path` means a directory here, not the `filepath` the global alias maps it to."""
+    assert normalize_arguments("search_files", {"pattern": "x", "path": "backend"}) == {
+        "query": "x",
+        "path": "backend",
+    }
+    assert normalize_arguments("list_files", {"path": "backend"}) == {"path": "backend"}
+    # ...while a file-shaped tool still gets filepath.
+    assert normalize_arguments("read_file", {"path": "a.py"}) == {"filepath": "a.py"}
+
+
+# --- legacy tool names in a shared transcript ---------------------------
+
+
+def test_legacy_logical_tool_names_run_the_simple_equivalent(tmp_path):
+    """A legacy-routed SHAMSU sharing the workspace poisons the history.
+
+    Live 2026-08-18 `project.inspect`, `file.read`, `code.search` and `test.run`
+    were appended to a simple-mode session by a second process, and the model
+    then called what it could see itself having called. Refusing costs a round
+    each time; the names map cleanly onto the six tools.
+    """
+    from shamsu.agents.simple_chat import canonical_tool_name
+
+    assert canonical_tool_name("file.read") == "read_file"
+    assert canonical_tool_name("code.search") == "search_files"
+    assert canonical_tool_name("project.inspect") == "list_files"
+    assert canonical_tool_name("test.run") == "run_command"
+    assert canonical_tool_name("file.write") == "write_file"
+    assert canonical_tool_name("file.patch") == "patch_file"
+    # A prefix some models emit, and the plain names, are untouched.
+    assert canonical_tool_name("functions.read_file") == "read_file"
+    assert canonical_tool_name("read_file") == "read_file"
+    # Something genuinely unknown still reports itself, not a wrong guess.
+    assert canonical_tool_name("deploy.rocket") == "deploy.rocket"
+
+
+def test_a_legacy_named_call_actually_reads_the_file(tmp_path):
+    (tmp_path / "main.py").write_text("value = 42\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_tool("file.read", filepath="main.py"), _text("It sets 42.")])
+
+    result = asyncio.run(loop.run("what does main.py do?"))
+
+    assert result.final == "It sets 42."
+    tool_messages = [m for m in loop.state.messages(500) if m["role"] == "tool"]
+    assert tool_messages, "the legacy-named call produced no tool result"
+    assert "value = 42" in str(tool_messages[-1]["content"])
+
+
+def test_an_unknown_tool_still_names_what_is_available(tmp_path):
+    loop = _loop(tmp_path, [_tool("deploy.rocket", target="mars"), _text("Cannot.")])
+
+    asyncio.run(loop.run("deploy it"))
+
+    tool_messages = [m for m in loop.state.messages(500) if m["role"] == "tool"]
+    assert "no tool called deploy.rocket" in str(tool_messages[-1]["content"])
+
+
+# --- reads that spin -----------------------------------------------------
+
+
+def test_repeating_one_read_is_pointed_out_rather_than_left_to_loop(tmp_path):
+    """Reads change nothing, so the no-change counter cannot see them spin.
+
+    Live 2026-08-18: `list_files {path: "."}` three times in a row, each
+    returning the listing the model already had.
+    """
+    turns = [_tool("list_files", path=".") for _ in range(3)] + [_text("Done.")]
+    loop = _loop(tmp_path, turns)
+
+    result = asyncio.run(loop.run("what is here?"))
+
+    nudges = [
+        str(m["content"])
+        for m in loop.state.messages(500)
+        if m["role"] == "user" and "already called" in str(m["content"])
+    ]
+    assert nudges, "a verbatim-repeated read was never pointed out"
+    assert "list_files" in nudges[0]
+    assert result.final == "Done."
+
+
+def test_different_reads_are_never_treated_as_repetition(tmp_path):
+    (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("b = 2\n", encoding="utf-8")
+    turns = [
+        _tool("read_file", filepath="a.py"),
+        _tool("read_file", filepath="b.py"),
+        _tool("list_files", path="."),
+        _text("Two files."),
+    ]
+    loop = _loop(tmp_path, turns)
+
+    asyncio.run(loop.run("look around"))
+
+    assert not [
+        m
+        for m in loop.state.messages(500)
+        if m["role"] == "user" and "already called" in str(m["content"])
+    ]
+
+
+# --- a long call must not look like a hang -------------------------------
+
+
+def test_a_slow_model_call_reports_that_it_is_still_running(tmp_path):
+    """Ten minutes of silence is how "it is stuck" gets reported."""
+    import shamsu.agents.simple_chat as simple_chat
+
+    seen: list[str] = []
+    original = simple_chat.HEARTBEAT_SECONDS
+    simple_chat.HEARTBEAT_SECONDS = 0.01
+    try:
+
+        class SlowClient(FakeClient):
+            async def chat(self, **kwargs):
+                await asyncio.sleep(0.08)
+                return await super().chat(**kwargs)
+
+        tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+        state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+        loop = SimpleChatLoop(
+            tmp_path,
+            client=SlowClient([_text("Finally.")]),
+            tools=tools,
+            state=state,
+            model_name="qwen3:8b",
+            on_status=seen.append,
+        )
+        result = asyncio.run(loop.run("hello?"))
+    finally:
+        simple_chat.HEARTBEAT_SECONDS = original
+
+    assert result.final == "Finally."
+    assert seen, "a slow call reported nothing while it ran"
+    assert all("thinking" in message for message in seen)
+
+
+def test_the_heartbeat_stops_when_the_call_returns(tmp_path):
+    """A ticker left running would keep claiming work after the turn ended."""
+    import shamsu.agents.simple_chat as simple_chat
+
+    seen: list[str] = []
+    original = simple_chat.HEARTBEAT_SECONDS
+    simple_chat.HEARTBEAT_SECONDS = 0.01
+    try:
+        loop = _loop(tmp_path, [_text("Quick.")], on_status=seen.append)
+        asyncio.run(loop.run("hi"))
+        settled = len(seen)
+
+        async def _wait():
+            await asyncio.sleep(0.1)
+
+        asyncio.run(_wait())
+    finally:
+        simple_chat.HEARTBEAT_SECONDS = original
+
+    assert len(seen) == settled
+
+
+# --- history written by another agent ------------------------------------
+# A workspace transcript is shared by every SHAMSU that opens it, and the
+# legacy router speaks a different tool vocabulary. A model imitates its own
+# history, so foreign calls in the transcript are not untidiness - they are
+# instructions to call tools this loop cannot execute.
+
+
+def _legacy_records():
+    return [
+        {"role": "user", "content": "run the game"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "function": {"name": "project.inspect", "arguments": {}}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "project.inspect", "content": "{}"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c2", "function": {"name": "read_file", "arguments": {"filepath": "a.py"}}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c2", "name": "read_file", "content": "a = 1"},
+        {"role": "tool", "tool_call_id": "", "name": "verify", "content": "a.py: ok"},
+        {"role": "assistant", "content": "Done."},
+    ]
+
+
+def _tool_names(state):
+    names = set()
+    for message in state._messages:
+        for call in getattr(message, "tool_calls", []) or []:
+            function = call.get("function")
+            source = function if isinstance(function, dict) else call
+            names.add(str(source.get("name") or ""))
+        if getattr(message, "name", ""):
+            names.add(message.name)
+    return {name for name in names if name}
+
+
+def test_a_foreign_agents_tool_calls_never_reach_the_model():
+    from shamsu.agents.simple_chat import SIMPLE_TRANSCRIPT_TOOLS
+
+    state = ChatState("sys", hydrate=False, known_tools=SIMPLE_TRANSCRIPT_TOOLS)
+    state._hydrate_records(_legacy_records(), "content")
+
+    names = _tool_names(state)
+    assert "project.inspect" not in names
+    assert "read_file" in names, "the legitimate history was thrown away too"
+
+
+def test_the_result_of_a_dropped_call_is_dropped_with_it():
+    """An orphaned tool result is a reply to a question the model never asked."""
+    from shamsu.agents.simple_chat import SIMPLE_TRANSCRIPT_TOOLS
+
+    state = ChatState("sys", hydrate=False, known_tools=SIMPLE_TRANSCRIPT_TOOLS)
+    state._hydrate_records(_legacy_records(), "content")
+
+    assert not [
+        m
+        for m in state._messages
+        if getattr(m, "role", "") == "tool"
+        and getattr(m, "name", "") not in SIMPLE_TRANSCRIPT_TOOLS
+    ]
+
+
+def test_verification_results_survive_the_filter():
+    """`verify` is written by the loop itself, not called by the model.
+
+    Filtering on the six CALLABLE tools alone would silently drop "your file
+    failed to compile" from the history the next turn reads.
+    """
+    from shamsu.agents.simple_chat import SIMPLE_TOOLS, SIMPLE_TRANSCRIPT_TOOLS
+
+    assert "verify" not in SIMPLE_TOOLS
+    assert "verify" in SIMPLE_TRANSCRIPT_TOOLS
+
+    state = ChatState("sys", hydrate=False, known_tools=SIMPLE_TRANSCRIPT_TOOLS)
+    state._hydrate_records(_legacy_records(), "content")
+
+    assert "verify" in _tool_names(state)
+
+
+def test_an_assistant_turn_that_said_something_keeps_its_words():
+    """Only the foreign CALL is dropped - prose the user may refer back to stays."""
+    from shamsu.agents.simple_chat import SIMPLE_TRANSCRIPT_TOOLS
+
+    records = [
+        {
+            "role": "assistant",
+            "content": "Let me inspect the project.",
+            "tool_calls": [{"id": "c1", "function": {"name": "project.inspect"}}],
+        },
+    ]
+    state = ChatState("sys", hydrate=False, known_tools=SIMPLE_TRANSCRIPT_TOOLS)
+    state._hydrate_records(records, "content")
+
+    kept = [m for m in state._messages if getattr(m, "role", "") == "assistant"]
+    assert len(kept) == 1
+    assert "inspect the project" in kept[0].content
+    assert kept[0].tool_calls == []
+
+
+def test_without_a_declared_vocabulary_nothing_is_filtered():
+    """Legacy callers share this class and must be completely unaffected."""
+    state = ChatState("sys", hydrate=False)
+    state._hydrate_records(_legacy_records(), "content")
+
+    assert "project.inspect" in _tool_names(state)
+
+
+# --- the harness's own words are not the model's -------------------------
+
+
+def test_the_harnesss_stop_messages_are_not_replayed_as_the_models_answers():
+    """Replaying them teaches the model that stopping is how a turn ends.
+
+    Live 2026-08-18 a session carried "The model did not respond within 600s."
+    forward into every later turn as an assistant message.
+    """
+    from shamsu.agents.chat_state import _should_hydrate_chat_message
+
+    for stop in (
+        "The model did not respond within 600s.",
+        "The model returned an empty reply 3 times.",
+        "I stopped after 24 steps without finishing. Say `continue` to keep going.",
+        "I tried 4 edits in a row that changed nothing - either the snippet is missing.",
+        "I have now changed frontend/game.js 5 times in this turn without confirming.",
+    ):
+        assert not _should_hydrate_chat_message("assistant", stop), stop
+
+
+def test_ordinary_prose_that_merely_starts_the_same_way_is_kept():
+    """"I tried..." and "I stopped..." are perfectly normal things to say."""
+    from shamsu.agents.chat_state import _should_hydrate_chat_message
+
+    for kept in (
+        "I tried a different approach and it worked.",
+        "I stopped the server because the port was busy.",
+        "I have now changed the approach entirely.",
+        "Done! Changed bulletSpeed from 7 to 9 in frontend/game.js.",
+    ):
+        assert _should_hydrate_chat_message("assistant", kept), kept
+
+
+def test_a_stopped_turn_does_not_teach_the_next_one_to_stop(tmp_path):
+    """End to end: the stop is persisted for the user, but not replayed."""
+    from shamsu.agents.chat_state import ChatState
+
+    records = [
+        {"role": "user", "content": "review the prd"},
+        {"role": "assistant", "content": "The model did not respond within 600s."},
+        {"role": "user", "content": "try again"},
+    ]
+    state = ChatState("sys", hydrate=False)
+    state._hydrate_records(records, "content")
+
+    replayed = [m.content for m in state._messages if getattr(m, "role", "") == "assistant"]
+    assert not replayed, f"a harness stop was replayed: {replayed}"
+    # ...while the user's own turns are untouched.
+    asked = [m.content for m in state._messages if getattr(m, "role", "") == "user"]
+    assert asked == ["review the prd", "try again"]
+
+
+# --- pending actions must not reopen the legacy orchestrator -------------
+# Slash commands and pending-action replies are dispatched inside main()
+# BEFORE _handle_request, so the simple-mode guard there never saw them. A bare
+# "yes" was enough to drop the whole conversation into the old loop, which
+# speaks a different tool vocabulary and writes it into the shared transcript.
+
+
+def _route_probe(monkeypatch):
+    """Record which loop a dispatch reaches, without running either."""
+    import shamsu.cli.repl as repl
+
+    taken: list[tuple[str, str]] = []
+
+    async def fake_simple(user_input, workspace, console, session_logger=None, **kwargs):
+        taken.append(("simple", str(user_input)))
+
+    async def fake_legacy(*args, **kwargs):
+        taken.append(("legacy", str(args[0]) if args else ""))
+        return None
+
+    monkeypatch.setattr(repl, "_run_simple_chat", fake_simple)
+    monkeypatch.setattr(repl, "_run_agent_chat", fake_legacy)
+    return repl, taken
+
+
+def test_proceeding_with_a_plan_stays_in_simple_mode(tmp_path, monkeypatch):
+    monkeypatch.delenv("SHAMSU_LEGACY_ROUTING", raising=False)
+    repl, taken = _route_probe(monkeypatch)
+
+    pending = {
+        "awaiting": "plan_approval",
+        "created_from_prompt": "add a scoreboard",
+        "steps": ["create score.js", "wire it into index.html"],
+    }
+    asyncio.run(repl._execute_pending_plan(pending, tmp_path, repl.Console(), None))
+
+    assert [where for where, _ in taken] == ["simple"]
+    instruction = taken[0][1]
+    assert "add a scoreboard" in instruction
+    assert "create score.js" in instruction, "the agreed steps were dropped"
+
+
+def test_a_pending_prd_plan_stays_in_simple_mode(tmp_path, monkeypatch):
+    """This is the exact route that poisoned a live session."""
+    monkeypatch.delenv("SHAMSU_LEGACY_ROUTING", raising=False)
+    repl, taken = _route_probe(monkeypatch)
+
+    pending = {"created_from_prompt": "build the product from SPEC.md", "prd_path": "SPEC.md"}
+    asyncio.run(
+        repl._execute_pending_prd_plan(pending, "yes", tmp_path, repl.Console(), None)
+    )
+
+    assert [where for where, _ in taken] == ["simple"]
+    assert "SPEC.md" in taken[0][1]
+
+
+def test_resuming_a_paused_plan_stays_in_simple_mode(tmp_path, monkeypatch):
+    monkeypatch.delenv("SHAMSU_LEGACY_ROUTING", raising=False)
+    repl, taken = _route_probe(monkeypatch)
+
+    paused = {
+        "steps": ["step one", "step two", "step three"],
+        "resume_index": 1,
+        "created_from_prompt": "build the menu",
+    }
+    asyncio.run(
+        repl._resume_paused_plan(paused, "use port 8080", tmp_path, repl.Console(), None)
+    )
+
+    assert [where for where, _ in taken] == ["simple"]
+    instruction = taken[0][1]
+    assert "use port 8080" in instruction, "the answer that unblocked it was lost"
+    assert "step two" in instruction
+    assert "step one" not in instruction, "already-done steps were replayed"
+
+
+def test_legacy_routing_still_reaches_the_old_loop(tmp_path, monkeypatch):
+    """The escape hatch must keep working, or the pinned suite is testing nothing."""
+    monkeypatch.setenv("SHAMSU_LEGACY_ROUTING", "1")
+    repl, taken = _route_probe(monkeypatch)
+
+    pending = {"created_from_prompt": "build it", "prd_path": "SPEC.md"}
+    try:
+        asyncio.run(
+            repl._execute_pending_prd_plan(pending, "yes", tmp_path, repl.Console(), None)
+        )
+    except Exception:
+        pass  # the legacy path needs far more scaffolding; reaching it is the point
+
+    assert "simple" not in [where for where, _ in taken]
+
+
+def test_no_slash_command_can_reach_the_legacy_loop_unguarded():
+    """A structural check, so a new handler cannot quietly reopen the hole.
+
+    Walks repl.py's call graph from every handler main() dispatches and fails if
+    one reaches `_run_agent_chat` without a `_legacy_routing_enabled` guard on
+    the way.
+    """
+    import ast
+    import collections
+    from pathlib import Path as _Path
+
+    import shamsu.cli.repl as repl
+
+    source = _Path(repl.__file__).read_text(encoding="utf-8", errors="replace")
+    tree = ast.parse(source)
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    def calls(node):
+        found = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                target = child.func
+                name = (
+                    target.id
+                    if isinstance(target, ast.Name)
+                    else target.attr if isinstance(target, ast.Attribute) else None
+                )
+                if name in functions:
+                    found.add(name)
+        return found
+
+    guarded = {
+        name
+        for name, node in functions.items()
+        if "_legacy_routing_enabled" in calls(node)
+    }
+    edges = {name: calls(node) for name, node in functions.items()}
+
+    unguarded = []
+    for handler in sorted(calls(functions["main"])):
+        if handler in guarded:
+            continue
+        queue = collections.deque([(handler, [handler])])
+        seen = {handler}
+        while queue:
+            current, path = queue.popleft()
+            for target in sorted(edges.get(current, ())):
+                if target == "_run_agent_chat":
+                    unguarded.append(" -> ".join(path + [target]))
+                    queue.clear()
+                    break
+                if target not in seen and target not in guarded:
+                    seen.add(target)
+                    queue.append((target, path + [target]))
+
+    assert not unguarded, "unguarded routes into the legacy loop:\n" + "\n".join(unguarded)
+
+
+# --- remote control must speak the same vocabulary -----------------------
+# Telegram resumes the LATEST session in the workspace - normally the one the
+# desktop REPL is sitting in - and it wrote no chat log of its own, so a legacy
+# run there was invisible from the desktop side while poisoning its transcript.
+
+
+def test_a_telegram_message_runs_the_same_loop_as_the_desktop(tmp_path, monkeypatch):
+    monkeypatch.delenv("SHAMSU_LEGACY_ROUTING", raising=False)
+    import shamsu.integrations.telegram.sessions as telegram_sessions
+
+    used: list[str] = []
+
+    class _Loop:
+        def __init__(self, *args, **kwargs):
+            used.append("simple")
+
+        async def run(self, text):
+            from shamsu.agents.simple_chat import SimpleChatResult
+
+            return SimpleChatResult(final="done via simple mode")
+
+    def _legacy(*args, **kwargs):
+        used.append("legacy")
+        raise AssertionError("Telegram reached the legacy loop in simple mode")
+
+    monkeypatch.setattr("shamsu.agents.simple_chat.SimpleChatLoop", _Loop)
+    monkeypatch.setattr("shamsu.agents.chat_loop._default_ollama_client", lambda *a, **k: object())
+    monkeypatch.setattr(telegram_sessions, "AgentChatLoop", _legacy)
+
+    class _Progress:
+        def step(self, *args, **kwargs):
+            pass
+
+    service = telegram_sessions.LocalShamsuSessionGateway.__new__(
+        telegram_sessions.LocalShamsuSessionGateway
+    )
+    service.workspace = tmp_path
+    final = service._run_simple("hello", None, None, None, _Progress())
+
+    assert final == "done via simple mode"
+    assert used == ["simple"]
+
+
+def test_only_guarded_places_build_the_legacy_loop():
+    """A structural check: nothing may construct AgentChatLoop unguarded.
+
+    Two entry points existed - the REPL's own `_run_agent_chat`, and Telegram,
+    which had no guard at all. Any third one is the same bug again.
+    """
+    import ast
+    from pathlib import Path as _Path
+
+    import shamsu
+
+    root = _Path(shamsu.__file__).parent
+    offenders = []
+    for path in root.rglob("*.py"):
+        if "__pycache__" in path.parts or "legacy-code" in path.parts:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = node.func
+            name = getattr(target, "id", None) or getattr(target, "attr", None)
+            if name != "AgentChatLoop":
+                continue
+            # The enclosing function must consult simple mode somewhere.
+            enclosing = None
+            for candidate in ast.walk(tree):
+                if isinstance(candidate, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if candidate.lineno <= node.lineno <= (candidate.end_lineno or 0):
+                        if enclosing is None or candidate.lineno > enclosing.lineno:
+                            enclosing = candidate
+            if enclosing is not None and enclosing.name == "_run_agent_chat":
+                # THE legacy runner. It is reached only through guarded callers,
+                # which `test_no_slash_command_can_reach_the_legacy_loop_unguarded`
+                # verifies by walking the call graph.
+                continue
+            body = ast.dump(enclosing) if enclosing is not None else ""
+            if "simple_mode_enabled" not in body and "_legacy_routing_enabled" not in body:
+                offenders.append(f"{path.name}:{node.lineno}")
+
+    assert not offenders, (
+        "AgentChatLoop is built without checking simple mode at: " + ", ".join(offenders)
+    )
+
+
+# --- approval must not fight the spinner ---------------------------------
+# Reported live 2026-08-18: the prompt rendered, then the status kept
+# repainting over it - "Working> y" - and the turn sometimes hung. The prompt
+# was building its OWN Console, so it had nothing to pause.
+
+
+class _FakeStatus:
+    """Stands in for a Rich status: records start/stop like the real one."""
+
+    def __init__(self):
+        self.is_started = True
+        self.events: list[str] = []
+
+    def stop(self):
+        self.is_started = False
+        self.events.append("stop")
+
+    def start(self):
+        self.is_started = True
+        self.events.append("start")
+
+
+def test_the_live_spinner_is_stopped_before_approval_reads_input(monkeypatch):
+    from rich.console import Console as _Console
+
+    from shamsu.safety import approval as approval_module
+    from shamsu.types import ApprovalRequest
+
+    console = _Console(file=io.StringIO(), force_terminal=False)
+    status = _FakeStatus()
+    setattr(console, "_shamsu_active_statuses", [status])
+
+    running_when_read: list[bool] = []
+
+    def fake_input(_prompt=""):
+        running_when_read.append(status.is_started)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+
+    request = ApprovalRequest(
+        action_type="run_command",
+        risk_level="medium",
+        description="python -m http.server 8000",
+    )
+    assert approval_module.ask_approval(request, console=console) is True
+
+    assert running_when_read == [False], "the spinner was still painting while input was read"
+    assert status.events[0] == "stop"
+
+
+def test_the_spinner_comes_back_after_the_answer(monkeypatch):
+    """Otherwise the rest of the turn runs with no sign of life."""
+    from rich.console import Console as _Console
+
+    from shamsu.safety import approval as approval_module
+    from shamsu.types import ApprovalRequest
+
+    console = _Console(file=io.StringIO(), force_terminal=False)
+    status = _FakeStatus()
+    setattr(console, "_shamsu_active_statuses", [status])
+    monkeypatch.setattr("builtins.input", lambda _p="": "n")
+
+    approval_module.ask_approval(
+        ApprovalRequest(action_type="run_command", risk_level="medium", description="rm -rf /"),
+        console=console,
+    )
+
+    assert status.is_started, "the spinner was never restarted"
+    assert status.events == ["stop", "start"]
+
+
+def test_simple_mode_hands_the_real_console_to_the_prompt(tmp_path, monkeypatch):
+    """The whole bug in one line: called bare, the prompt makes its own Console."""
+    import shamsu.cli.repl as repl
+
+    seen: dict = {}
+
+    def fake_ask(request, console=None):
+        seen["console"] = console
+        return True
+
+    monkeypatch.setattr(repl, "ask_approval", fake_ask)
+
+    captured: dict = {}
+
+    def fake_build(workspace, *, console_approval, **kwargs):
+        captured["approve"] = console_approval
+        raise RuntimeError("stop here - the wiring is what matters")
+
+    monkeypatch.setattr("shamsu.agents.simple_chat.build_simple_tools", fake_build)
+
+    console = repl.Console(file=io.StringIO())
+    with contextlib.suppress(RuntimeError):
+        asyncio.run(repl._run_simple_chat("hi", tmp_path, console, None))
+
+    assert "approve" in captured, "build_simple_tools was never reached"
+    captured["approve"](object())
+    assert seen.get("console") is console, "the prompt was given a different console"
+
+
+def test_a_slow_tool_call_reports_that_it_is_still_running(tmp_path):
+    """After an approval, a blocking command was 120s of total silence."""
+    import shamsu.agents.simple_chat as simple_chat
+
+    seen: list[str] = []
+    original = simple_chat.HEARTBEAT_SECONDS
+    simple_chat.HEARTBEAT_SECONDS = 0.01
+
+    class SlowTools(AgentToolRegistry):
+        def execute(self, name, arguments):
+            time.sleep(0.08)
+            return super().execute(name, arguments)
+
+    try:
+        (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+        tools = SlowTools(tmp_path, approval_func=lambda _r: True)
+        state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+        loop = SimpleChatLoop(
+            tmp_path,
+            client=FakeClient([_tool("read_file", filepath="a.py"), _text("Read it.")]),
+            tools=tools,
+            state=state,
+            model_name="qwen3:8b",
+            on_status=seen.append,
+        )
+        result = asyncio.run(loop.run("read a.py"))
+    finally:
+        simple_chat.HEARTBEAT_SECONDS = original
+
+    assert result.final == "Read it."
+    assert any("running read_file" in message for message in seen), seen

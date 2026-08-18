@@ -1,6 +1,8 @@
 """Stateful chat message history for SHAMSU's ReAct loop."""
 from __future__ import annotations
 
+import re
+
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +28,20 @@ _HARNESS_STATUS_PREFIXES = (
     # Placeholder left by replace_last_assistant. Replaying it would teach the
     # model that emitting an unparseable call is a normal way to end a turn.
     "(unparseable tool call omitted",
+    # Simple mode's own stops. These are the HARNESS speaking, not the model,
+    # and replaying them as assistant turns teaches the model that "I stopped
+    # after 24 steps" is a normal way to end one. Live 2026-08-18 a session
+    # carried "The model did not respond within 600s." into every later turn.
+    "the model did not respond within",
+    "the model returned an empty reply",
+)
+
+# The same thing, where a leading number or path makes a prefix unsafe - "I
+# tried..." is perfectly ordinary model prose, so these must match precisely.
+_HARNESS_STATUS_PATTERNS = (
+    re.compile(r"^i stopped after \d+ steps? without finishing"),
+    re.compile(r"^i tried \d+ edits? in a row that changed nothing"),
+    re.compile(r"^i have now changed .+ \d+ times in this turn"),
 )
 
 # How many times the same assistant answer may be replayed before the rest are
@@ -71,9 +87,18 @@ class ChatState:
         session_logger: SessionLogger | None = None,
         hydrate: bool = True,
         hydrate_max_messages: int = HYDRATE_MAX_MESSAGES,
+        known_tools: frozenset[str] | None = None,
     ) -> None:
         self.system_prompt = system_prompt
         self.session_logger = session_logger
+        # Tool names this caller can actually execute. A transcript is shared by
+        # every SHAMSU that opens the workspace, and the legacy router speaks a
+        # DIFFERENT vocabulary - `project.inspect`, `file.read`, `code.search`,
+        # `test.run`. Live 2026-08-18 those landed in a simple-mode session, and
+        # the model, seeing calls it appeared to have made itself, kept making
+        # them. A model imitates its own transcript, so history written by
+        # another agent is not merely untidy: it is instructions.
+        self.known_tools = frozenset(known_tools) if known_tools else None
         # How far back to rehydrate. The 24 default is an 8k-era number and is a
         # HARD horizon, applied before any token budgeting: a caller that builds
         # a fresh ChatState per user message can never see further back than
@@ -280,11 +305,34 @@ class ChatState:
 
     def _hydrate_records(self, records: list[dict[str, Any]], key_content: str) -> None:
         seen_assistant: dict[str, int] = {}
+        foreign_call_ids: set[str] = set()
         for payload in records:
             role = str(payload.get("role", "")).strip()
             content = str(payload.get(key_content, ""))
             if role == "user":
                 content = _clean_user_content_for_persistence(content)
+            tool_calls = _list_of_dicts(payload.get("tool_calls", []))
+            if self.known_tools is not None:
+                if role == "assistant" and tool_calls:
+                    kept = [c for c in tool_calls if _call_tool_name(c) in self.known_tools]
+                    if len(kept) != len(tool_calls):
+                        foreign_call_ids.update(
+                            str(c.get("id") or "")
+                            for c in tool_calls
+                            if _call_tool_name(c) not in self.known_tools
+                        )
+                        tool_calls = kept
+                        # An assistant turn that was ONLY a foreign call carries
+                        # nothing else worth replaying.
+                        if not kept and not content.strip():
+                            continue
+                if role == "tool":
+                    name = str(payload.get("name", "")).strip()
+                    call_id = str(payload.get("tool_call_id", "")).strip()
+                    if (name and name not in self.known_tools) or (
+                        call_id and call_id in foreign_call_ids
+                    ):
+                        continue
             if role == "assistant":
                 # Drop repeats of an identical answer. A model that stalled the
                 # same way five times must not be shown five examples of it.
@@ -300,10 +348,18 @@ class ChatState:
                         content=content,
                         tool_call_id=str(payload.get("tool_call_id", "")),
                         name=str(payload.get("name", "")),
-                        tool_calls=_list_of_dicts(payload.get("tool_calls", [])),
+                        tool_calls=tool_calls,
                     ),
                     persist=False,
                 )
+
+def _call_tool_name(call: dict[str, Any]) -> str:
+    """The tool a persisted tool_call names, whichever shape it was stored in."""
+    function = call.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "").strip()
+    return str(call.get("name") or "").strip()
+
 
 def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list):
@@ -319,7 +375,9 @@ def _should_hydrate_chat_message(role: str, content: str) -> bool:
     normalized = " ".join(content.strip().lower().split())
     if not normalized:
         return True
-    return not normalized.startswith(_HARNESS_STATUS_PREFIXES)
+    if normalized.startswith(_HARNESS_STATUS_PREFIXES):
+        return False
+    return not any(pattern.match(normalized) for pattern in _HARNESS_STATUS_PATTERNS)
 
 
 def _clean_user_content_for_persistence(content: str | None) -> str:
