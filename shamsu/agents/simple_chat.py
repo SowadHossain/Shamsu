@@ -38,10 +38,14 @@ from shamsu.agents.chat_state import ChatState
 from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
 from shamsu.agents.simple_prompt import simple_system_prompt
 from shamsu.context.budget import (
+    PER_MESSAGE_OVERHEAD,
     RESERVE_OUTPUT_TOKENS,
     SAFETY_MARGIN_TOKENS,
+    clamp_calibration,
     count_tokens,
     ctx_window_for_model,
+    messages_tokens,
+    tool_schema_tokens,
 )
 from shamsu.llm.manager import OLLAMA_BASE_URL
 from shamsu.llm.output import parse_model_turn
@@ -600,6 +604,23 @@ class SimpleChatLoop:
         self.turn_log: SimpleTurnLog | None = None
         self._files: list[str] = []
         self._brief = ""
+        # Ground truth from the last response, and the estimate that predicted
+        # it. `prompt_eval_count` is the only number in this file that is not a
+        # guess; everything else is calibrated against it.
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_estimate = 0
+        self.last_done_reason = ""
+        # Per-model correction factor, persisted in `.shamsu/`. Already built
+        # and already used by `llm/manager.py`; simple mode talks to Ollama
+        # directly, so it was the one caller estimating without ever checking.
+        self._budget: Any = None
+        try:
+            from shamsu.context.manager import ContextBudgetManager
+
+            self._budget = ContextBudgetManager(workspace=self.workspace)
+        except Exception:  # noqa: BLE001 - budgeting must never break a turn
+            self._budget = None
         # Simple mode owns the whole toolbox: no phase policy, no per-step
         # allowlist, no logical-alias indirection between the model and the tool.
         self.tools.clear_phase()
@@ -620,6 +641,14 @@ class SimpleChatLoop:
             except Exception:
                 pass
         self.state.append_user(user_input)
+        # Before compaction, not after: `_fixed_overhead` charges the grounding
+        # block against the budget, and compaction decides what to evict from
+        # that same budget. Computed after, compaction saw a workspace listing
+        # of nothing and believed it had hundreds of tokens more than it did.
+        self._files = await asyncio.to_thread(workspace_files, self.workspace)
+        # Once per user message, not per round: the graph lookup costs ~2s and
+        # what a file exports does not change between rounds of the same turn.
+        self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
         await self._compact_if_needed()
         if self.log_turns:
             try:
@@ -637,9 +666,6 @@ class SimpleChatLoop:
                 self.turn_log.open_turn(user_input)
             except OSError:
                 self.turn_log = None
-        # Once per user message, not per round: the graph lookup costs ~2s and
-        # what a file exports does not change between rounds of the same turn.
-        self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
         changed: list[str] = []
         tool_calls = 0
         prose_nudges = 0
@@ -690,8 +716,10 @@ class SimpleChatLoop:
                             "That reply was empty. Answer the question, or call one tool."
                         )
                         continue
-                    if turn.thinking:
-                        # Out of retries but it did reason - that beats an error.
+                    if turn.thinking and not self._hit_the_length_limit():
+                        # A COMPLETE thought with no visible content. Reasoning
+                        # models really do end turns this way, and re-asking
+                        # just burns another 30s - so it is used as the answer.
                         self._activity("model only reasoned; using its thinking as the answer")
                         self.state.append_assistant(turn.thinking)
                         if self.turn_log:
@@ -701,6 +729,27 @@ class SimpleChatLoop:
                             rounds=round_index + 1,
                             tool_calls=tool_calls,
                             changed_files=tuple(dict.fromkeys(changed)),
+                        )
+                    if turn.thinking:
+                        # Thinking that was CUT OFF. This is the case that put a
+                        # sentence ending mid-word - "...means `window.asteroid"
+                        # - in front of a user as a finished answer, and then
+                        # into the transcript as permanent conversation. It is
+                        # an incomplete turn, and it is not an answer. The
+                        # thought stays in the turn log and on screen; it never
+                        # becomes history.
+                        self._activity("model ran out of room mid-thought")
+                        return self._stop(
+                            self._out_of_room_message(),
+                            round_index,
+                            tool_calls,
+                            changed,
+                        )
+                        return self._stop(
+                            self._out_of_room_message(),
+                            round_index,
+                            tool_calls,
+                            changed,
                         )
                     return self._stop(
                         f"The model returned an empty reply {empty_nudges + 1} times. "
@@ -724,6 +773,12 @@ class SimpleChatLoop:
                     )
                     self._activity(f"described a change to {described} without making it; asked it to apply")
                     continue
+                if self._hit_the_length_limit():
+                    # The model was still speaking when the window ran out.
+                    # Keep what it managed to say, but never present it as a
+                    # finished answer - `done_reason` told us it was not.
+                    text = self._out_of_room_message(text)
+                    self._activity("reply hit the context limit; labelled it partial")
                 self.state.append_assistant(text)
                 if self.turn_log:
                     self.turn_log.close_turn(text, round_index + 1, stopped=False)
@@ -813,6 +868,62 @@ class SimpleChatLoop:
 
     # -- model -----------------------------------------------------------
 
+    def _hit_the_length_limit(self) -> bool:
+        """Did the last generation stop because it ran out of room?
+
+        Ollama says so in `done_reason`, and the harness used to ignore it -
+        so a reply cut off mid-word was displayed as a finished answer.
+        """
+        return self.last_done_reason.strip().lower() == "length"
+
+    def _out_of_room_message(self, partial: str = "") -> str:
+        """Say plainly that the answer was cut, and what to do about it.
+
+        The window holds the prompt and the reply in one buffer, so a long
+        conversation genuinely leaves less room to speak in. Saying that costs
+        two sentences and is the difference between a tool that looks broken
+        and one the user can work with.
+        """
+        used = self.last_prompt_tokens or self.last_estimate
+        ceiling = self._ceiling()
+        where = f" The prompt was {used:,} tokens of a {ceiling:,} window." if used else ""
+        text = (
+            "I ran out of room to answer in." + where + " The window holds the "
+            "conversation and the reply together, so a long conversation leaves "
+            "less space to speak in." + chr(10) + chr(10) +
+            "`/new` starts a fresh conversation, or ask for a smaller piece of this one."
+        )
+        if partial.strip():
+            cut = "**This answer was cut off.** "
+            return partial.rstrip() + chr(10) * 2 + "---" + chr(10) * 2 + cut + text
+        return text
+
+    async def _client_chat(self, kwargs: dict[str, Any], timeout: float | None = None) -> Any:
+        """One chat call, degrading past keywords the client does not know.
+
+        Simpler clients - and the fakes in the tests - accept only the basics.
+        Dropping an unsupported keyword and retrying keeps the turn alive; the
+        old code did this for `tools` alone, which meant adding `think` would
+        have turned an old client into a silent hard failure instead.
+
+        Optional keys are shed one at a time, cheapest first, so a client that
+        rejects `think` does not also lose its tools.
+        """
+        optional = ("think", "tools")
+        attempt = dict(kwargs)
+        for _ in range(len(optional) + 1):
+            try:
+                return await asyncio.wait_for(
+                    self.client.chat(**attempt),
+                    timeout=timeout or self.request_timeout,
+                )
+            except TypeError:
+                shed = next((key for key in optional if key in attempt), None)
+                if shed is None:
+                    raise
+                attempt.pop(shed, None)
+        raise TypeError("the model client rejected every supported keyword")
+
     async def _call_model(self) -> Any:
         messages = self._messages()
         num_ctx = self._num_ctx(messages)
@@ -821,7 +932,15 @@ class SimpleChatLoop:
             "messages": messages,
             "tools": SIMPLE_TOOL_SCHEMAS,
             "stream": False,
-            "options": {"temperature": self.temperature, "num_ctx": num_ctx},
+            "options": {
+                "temperature": self.temperature,
+                "num_ctx": num_ctx,
+                # Pinned to the reserve the budget already held back, never
+                # below it: a cap smaller than the reserve would cause the
+                # truncation it exists to prevent. At this value it only stops
+                # a runaway from eating the window the prompt still occupies.
+                "num_predict": output_reserve(num_ctx),
+            },
         }
         self._trace(
             "simple.model_call",
@@ -829,21 +948,12 @@ class SimpleChatLoop:
             {"messages": len(messages), "num_ctx": num_ctx},
         )
         if self.turn_log:
-            approx = sum(count_tokens(str(m.get("content") or "")) for m in messages)
+            approx = self._estimate_prompt(messages)
             self.turn_log.log_call(messages, num_ctx, approx)
         started = time.perf_counter()
         beat = asyncio.ensure_future(self._heartbeat("thinking..."))
         try:
-            try:
-                raw = await asyncio.wait_for(
-                    self.client.chat(**kwargs), timeout=self.request_timeout
-                )
-            except TypeError:
-                # Older/simpler clients may not accept every keyword.
-                kwargs.pop("tools", None)
-                raw = await asyncio.wait_for(
-                    self.client.chat(**kwargs), timeout=self.request_timeout
-                )
+            raw = await self._client_chat(kwargs)
         except Exception as exc:
             if self.turn_log:
                 self.turn_log.log_error(f"{type(exc).__name__}: {exc}")
@@ -851,9 +961,31 @@ class SimpleChatLoop:
         finally:
             beat.cancel()
             self._activity(f"model responded in {time.perf_counter() - started:.0f}s")
+        self._record_usage(raw, self._estimate_prompt(messages))
         if self.turn_log:
             self.turn_log.log_response(raw, time.perf_counter() - started)
         return raw
+
+    def _record_usage(self, raw: Any, estimate: int) -> None:
+        """Take the real prompt size off the response and learn from it.
+
+        `prompt_eval_count` is ground truth - the only number here Ollama
+        measured rather than we guessed. Recording it does two things: it feeds
+        the per-model correction factor, and it gives the context meter a real
+        number to show instead of the estimate that was wrong by 30%.
+        """
+        self.last_prompt_tokens = int(_response_field(raw, "prompt_eval_count") or 0)
+        self.last_completion_tokens = int(_response_field(raw, "eval_count") or 0)
+        self.last_done_reason = str(_response_field(raw, "done_reason") or "")
+        self.last_estimate = estimate
+        if self._budget is None or estimate <= 0 or self.last_prompt_tokens <= 0:
+            return
+        try:
+            self._budget.calibrate_from_response(
+                self.model_name, self.last_prompt_tokens, estimate
+            )
+        except Exception:  # noqa: BLE001 - a failed save must never break a turn
+            pass
 
     async def _compact_if_needed(self) -> None:
         """Once per user turn, ask the model to summarise what no longer fits.
@@ -869,11 +1001,8 @@ class SimpleChatLoop:
         rarely enough that the round-trip is cheap. If the call fails the
         deterministic digest still stands - this only ever adds.
         """
-        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
-        if self._num_ctx_ceiling:
-            ceiling = min(ceiling, self._num_ctx_ceiling)
-        usable = max(1024, ceiling - output_reserve(ceiling) - SAFETY_MARGIN_TOKENS)
-        _tail, start_abs = self.state.select_for_budget(usable, count_tokens)
+        ceiling = self._ceiling()
+        _tail, start_abs = self.state.select_for_budget(self._history_budget(), count_tokens)
         if start_abs <= 1:
             return
         evicted = self.state.newly_evicted(start_abs)
@@ -918,17 +1047,26 @@ class SimpleChatLoop:
             "'- '. No preamble, no commentary.\n\n" + transcript[:12000]
         )
         try:
-            raw = await asyncio.wait_for(
-                self.client.chat(
-                    model=self.model_name,
-                    messages=[{"role": "user", "content": ask}],
-                    stream=False,
-                    options={
+            raw = await self._client_chat(
+                {
+                    "model": self.model_name,
+                    "messages": [{"role": "user", "content": ask}],
+                    "stream": False,
+                    "options": {
                         "temperature": 0.0,
                         "num_ctx": num_ctx or self._num_ctx([]),
+                        # Six lines. Left unbounded, this call could spend the
+                        # whole reply budget summarising.
+                        "num_predict": 512,
                     },
-                ),
-                timeout=min(self.request_timeout, 120.0),
+                    # Mechanical pass: a digest of what was said needs no
+                    # reasoning trace, and a reasoning model will happily spend
+                    # every token it is given producing one. `_client_chat`
+                    # sheds the keyword for clients that do not know it, so a
+                    # narration is never lost to an unsupported argument.
+                    "think": False,
+                },
+                min(self.request_timeout, 120.0),
             )
         except Exception:
             return ""  # the deterministic digest still stands
@@ -951,11 +1089,7 @@ class SimpleChatLoop:
         uses - keep the largest recent suffix that fits, older turns survive as
         the rolling summary.
         """
-        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
-        if self._num_ctx_ceiling:
-            ceiling = min(ceiling, self._num_ctx_ceiling)
-        usable = max(1024, ceiling - output_reserve(ceiling) - SAFETY_MARGIN_TOKENS)
-        tail, start_abs = self.state.select_for_budget(usable, count_tokens)
+        tail, start_abs = self.state.select_for_budget(self._history_budget(), count_tokens)
         if start_abs > 1:
             # Fold what no longer fits into a digest instead of dropping it.
             # Without this the evicted turns simply vanished and `include_summary`
@@ -1042,11 +1176,89 @@ class SimpleChatLoop:
         except Exception:
             return False
 
+    def _ceiling(self) -> int:
+        """The context window this session asks Ollama for.
+
+        The model's own window, capped by `max_ctx()`, and lowered again if the
+        GPU has already refused something larger this run.
+        """
+        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
+        if self._num_ctx_ceiling:
+            ceiling = min(ceiling, self._num_ctx_ceiling)
+        return ceiling
+
+    def _calibration_factor(self) -> float:
+        """How much bigger the real prompt tends to be than our estimate.
+
+        Measured per model against `prompt_eval_count` and persisted. An
+        estimate nobody checks against reality drifts, and drifts silently -
+        which is how a prompt believed to be 21,381 tokens was really ~31,400.
+        """
+        if self._budget is None:
+            return 1.0
+        try:
+            return clamp_calibration(self._budget.calibration_factor(self.model_name))
+        except Exception:  # noqa: BLE001 - budgeting must never break a turn
+            return 1.0
+
+    def _fixed_overhead(self) -> int:
+        """Tokens every request carries that `select_for_budget` cannot see.
+
+        Three of them, and none was charged to any budget before:
+
+          * the six tool schemas, ~630 tokens on EVERY call;
+          * the grounding block, which `_messages` inserts AFTER the budget has
+            already been spent - up to 80 file paths plus the codebase brief;
+          * the rolling summary, prepended by `build_ollama_messages`, bounded
+            at `summary_budget()` - a further 2,048 tokens at a 32k window.
+
+        Counting only `tool_calls` and leaving these three out still overshoots
+        by ~3,900 tokens, which is the difference between the ~8,192 of headroom
+        the reply reserve promises and the ~5,300 it would actually deliver.
+        """
+        total = tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+        grounding = render_workspace_files(self._files)
+        if self._brief:
+            grounding = grounding + chr(10) + chr(10) + self._brief
+        total += count_tokens(grounding) + PER_MESSAGE_OVERHEAD
+        summary = self.state.rolling_summary
+        if summary.strip():
+            total += count_tokens(summary) + PER_MESSAGE_OVERHEAD
+        return total
+
+    def _history_budget(self) -> int:
+        """Tokens the conversation itself may occupy.
+
+        window - reply reserve - safety margin - everything else the request
+        carries, then divided by the calibration factor so the budget is stated
+        in the same units the estimator speaks. Dividing the budget once is the
+        same as multiplying every estimate, and it keeps the correction in one
+        readable place.
+        """
+        ceiling = self._ceiling()
+        usable = (
+            ceiling
+            - output_reserve(ceiling)
+            - SAFETY_MARGIN_TOKENS
+            - self._fixed_overhead()
+        )
+        return max(1024, int(usable / self._calibration_factor()))
+
     def _num_ctx(self, messages: list[dict[str, Any]]) -> int:
-        prompt = count_tokens("\n".join(str(m.get("content", "")) for m in messages))
-        chosen = self._bucket_for(prompt)
+        chosen = self._bucket_for(self._estimate_prompt(messages))
         self._num_ctx_floor = chosen
         return chosen
+
+    def _estimate_prompt(self, messages: list[dict[str, Any]]) -> int:
+        """Our best guess at what Ollama will report as `prompt_eval_count`.
+
+        Content, `tool_calls`, the per-message envelope, and the tool schemas -
+        everything that actually goes over the wire. Deliberately UNcalibrated:
+        this is the raw estimate the correction factor is measured against, so
+        applying the factor here would feed the correction back into its own
+        input and converge on the square root of the truth instead of the truth.
+        """
+        return messages_tokens(messages) + tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
 
     def _bucket_for(self, prompt_tokens: int) -> int:
         """One window for the whole session: the ceiling. No side effects.
@@ -1068,9 +1280,7 @@ class SimpleChatLoop:
         Prefill is charged on the actual prompt, not the window, so a big window
         costs nothing in time.
         """
-        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
-        if self._num_ctx_ceiling:
-            ceiling = min(ceiling, self._num_ctx_ceiling)
+        ceiling = self._ceiling()
         return max(ceiling, self._num_ctx_floor) if self._num_ctx_floor else ceiling
 
     # -- tools -----------------------------------------------------------
@@ -1294,10 +1504,7 @@ class SimpleChatLoop:
             existing = (self.workspace / path).stat().st_size
         except OSError:
             return None  # new file - nothing to lose, and nothing to compare
-        ceiling = min(ctx_window_for_model(self.model_name), max_ctx())
-        if self._num_ctx_ceiling:
-            ceiling = min(ceiling, self._num_ctx_ceiling)
-        writable_chars = output_reserve(ceiling) * 4
+        writable_chars = output_reserve(self._ceiling()) * 4
         if existing <= writable_chars:
             return None
         return ToolResult(
@@ -1419,6 +1626,19 @@ class SimpleChatLoop:
 # --------------------------------------------------------------------------
 # Tool-call shape helpers (native dicts and salvaged ToolCall objects both)
 # --------------------------------------------------------------------------
+
+
+def _response_field(response: Any, key: str) -> Any:
+    """Read a top-level field off a chat response, dict or model object.
+
+    Live, the ollama SDK returns a pydantic `ChatResponse`; the tests script
+    plain dicts. Both carry `prompt_eval_count`, `eval_count` and
+    `done_reason`, and a reader that understands only one of them reports zero
+    for the other - which would make the calibration silently do nothing.
+    """
+    if isinstance(response, dict):
+        return response.get(key)
+    return getattr(response, key, None)
 
 
 def _call_name(call: Any) -> str:

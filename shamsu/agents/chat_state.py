@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from shamsu.context.budget import PER_MESSAGE_OVERHEAD, message_tokens
 from shamsu.session.manager import SessionLogger
 
 # Compaction: hydrate only the most recent N transcript turns. The session
@@ -167,25 +168,42 @@ class ChatState:
         return [system.to_ollama(), *[message.to_ollama() for message in tail]]
 
     def select_for_budget(
-        self, max_tokens: int, token_counter: Callable[[str], int]
+        self,
+        max_tokens: int,
+        token_counter: Callable[[str], int],
+        *,
+        per_message_overhead: int = PER_MESSAGE_OVERHEAD,
     ) -> tuple[list[ChatMessage], int]:
-        """Pick the largest recent suffix of history whose content fits in
-        *max_tokens*, always keeping at least the most recent message. Returns
+        """Pick the largest recent suffix of history that fits in *max_tokens*,
+        always keeping at least the most recent message. Returns
         ``(tail, start_abs)`` where ``start_abs`` is the absolute index in
         ``_messages`` at which the kept suffix begins (1 == nothing evicted).
         The start is snapped forward to a user-message boundary when that still
         leaves a non-empty tail, so assistant/tool-call sequences stay intact.
-        This is the token-aware replacement for the flat ``messages(30)`` cap."""
+        This is the token-aware replacement for the flat ``messages(30)`` cap.
+
+        Each message is charged for its `tool_calls` and its chat-template
+        envelope as well as its text - see `message_tokens`. Charging content
+        alone is what let a prompt reach ~31,400 tokens of a 32,768 window while
+        this method believed it had built one of 21,381.
+
+        ``per_message_overhead`` is exposed so a test can isolate the selection
+        logic from the envelope constant."""
         history = self._messages[1:]
         if not history:
             return [], 1
         # ``max_tokens`` is the budget for the complete message list, not just
-        # conversation history. Charge the always-present system prompt first.
-        history_budget = max(0, max_tokens - token_counter(self.system_prompt))
+        # conversation history. Charge the always-present system prompt first -
+        # envelope included, since it is a message like any other.
+        history_budget = max(
+            0, max_tokens - token_counter(self.system_prompt) - per_message_overhead
+        )
         used = 0
         start_rel = len(history)
         for i in range(len(history) - 1, -1, -1):
-            cost = token_counter(history[i].content)
+            cost = message_tokens(
+                history[i], token_counter, overhead=per_message_overhead
+            )
             if start_rel != len(history) and used + cost > history_budget:
                 break
             used += cost

@@ -6,9 +6,12 @@ minimal installs.
 """
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 # Effective budget = num_ctx * safety margin (leave room for response + tool
 # metadata). v2.2 targets 8GB machines, so prompts stay tighter by default.
@@ -48,9 +51,13 @@ def _reserve_output_tokens() -> int:
     the model's tool call is cut off mid-payload - the `json_truncated` failure in
     llm/output.py.
 
-    Note this is the right lever, not `num_predict`: an explicit output cap cannot
-    make room, it can only stop generation sooner, so capping would CAUSE the
-    truncation it is meant to prevent. Reserving space prevents it.
+    Reserving space is the lever that MAKES room; `num_predict` cannot, and for
+    a long time this docstring said therefore not to send one at all. That was
+    half right. Sent at exactly this value it can never shrink the reply - it is
+    the same number - while it does stop a runaway generation from eating into
+    the window the prompt still needs. Sent SMALLER it would indeed cause the
+    truncation it is meant to prevent, so `simple_chat._call_model` derives it
+    from `output_reserve()` and never from anything else.
     """
     import os
 
@@ -99,6 +106,92 @@ def count_tokens(text: str) -> int:
     if tokenizer is not None:
         return len(tokenizer.encode(text).ids)
     return max(len(text) // CHARS_PER_TOKEN_ESTIMATE, 0)
+
+
+# What the chat template adds per message on top of its content: role markers
+# and the special tokens that open and close a turn. Measured against Ollama's
+# `prompt_eval_count` 2026-08-19, qwen3:8b:
+#
+#     1 message : ours  50   ollama  60    (+10)
+#     3 messages: ours 152   ollama 170    (+6/msg)
+#     6 messages: ours 305   ollama 332    (+4.5/msg)
+#
+# Eight is the middle of that range. It matters at scale, not per message: a
+# 130-message session carries ~1,000 tokens of pure envelope that used to be
+# counted as zero.
+PER_MESSAGE_OVERHEAD = 8
+
+# How far the calibration factor may move the budget. The factor corrects a
+# structural estimate against ground truth, so a value far from 1.0 means
+# something else is wrong - and trusting it blindly would either overflow the
+# window (too low) or throw away most of the conversation (too high).
+CALIBRATION_MIN = 0.8
+CALIBRATION_MAX = 1.6
+
+
+def _message_field(message: Any, key: str) -> Any:
+    """Read *key* off a message, whether it is a mapping or an object.
+
+    Both shapes are live: `ChatState` holds `ChatMessage` objects, `_call_model`
+    builds plain dicts, and the tests script dicts. A counter that understands
+    only one of them silently returns zero for the other, which is the exact
+    class of bug this module exists to end.
+    """
+    if isinstance(message, dict):
+        return message.get(key)
+    return getattr(message, key, None)
+
+
+def message_tokens(
+    message: Any,
+    token_counter: Callable[[str], int] | None = None,
+    *,
+    overhead: int = PER_MESSAGE_OVERHEAD,
+) -> int:
+    """Everything one message costs in the prompt - not just its text.
+
+    `tool_calls` used to cost ZERO. An assistant turn whose content is empty but
+    whose `write_file` payload carries a whole source file was counted as
+    nothing at all; measured against Ollama, one such message was 341 tokens,
+    and the two worst in a live session were 2,618 and 2,231. Across a
+    130-message session that hid 9,795 tokens - 22% of the prompt - so the
+    budget never trimmed, the window filled, and 19 generations were cut off
+    mid-word with the harness reporting nothing was wrong.
+    """
+    counter = token_counter or count_tokens
+    total = counter(str(_message_field(message, "content") or ""))
+    tool_calls = _message_field(message, "tool_calls")
+    if tool_calls:
+        total += counter(json.dumps(tool_calls, default=str))
+    return total + overhead
+
+
+def messages_tokens(
+    messages: Any,
+    token_counter: Callable[[str], int] | None = None,
+) -> int:
+    """What a whole message list costs, envelope included."""
+    return sum(message_tokens(message, token_counter) for message in messages)
+
+
+def tool_schema_tokens(schemas: Any) -> int:
+    """What the tool definitions cost. They ship on EVERY request.
+
+    Counted nowhere before: the six simple-mode schemas are ~630 tokens that
+    were spent on every single call and charged to no budget.
+    """
+    if not schemas:
+        return 0
+    return count_tokens(json.dumps(schemas, default=str))
+
+
+def clamp_calibration(factor: float) -> float:
+    """Keep a measured correction factor inside a range worth trusting."""
+    try:
+        value = float(factor)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(CALIBRATION_MAX, max(CALIBRATION_MIN, value))
 
 
 @lru_cache(maxsize=1)

@@ -814,7 +814,9 @@ class LLMManager(ILLMManager):
                 budget = self.budget_manager.compute(model_name, specialist, prompt)
                 budget = replace(budget, compacted=True)
             self.budget_manager.show_indicator(budget)
-            estimated_tokens = budget.estimated_tokens
+            # RAW, not calibrated: this feeds calibrate_from_response, and
+            # the factor must not be measured against its own output.
+            estimated_tokens = budget.raw_estimated_tokens or budget.estimated_tokens
 
         started = time.perf_counter()
         if self.session_logger:
@@ -941,7 +943,9 @@ class LLMManager(ILLMManager):
                 budget = self.budget_manager.compute(model_name, specialist, prompt)
                 budget = replace(budget, compacted=True)
             self.budget_manager.show_indicator(budget)
-            estimated_tokens = budget.estimated_tokens
+            # RAW, not calibrated: this feeds calibrate_from_response, and
+            # the factor must not be measured against its own output.
+            estimated_tokens = budget.raw_estimated_tokens or budget.estimated_tokens
 
         started = time.perf_counter()
         if self.session_logger:

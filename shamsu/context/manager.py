@@ -43,6 +43,11 @@ class BudgetResult:
     context_window: int
     reserve_tokens: int
     compacted: bool = False
+    # The estimate BEFORE the calibration factor was applied. Calibration is
+    # defined as actual/raw, so feeding it the calibrated number makes the
+    # factor its own input: the EMA then settles on sqrt(true ratio) instead
+    # of the true ratio, leaving over half of a measured undercount in place.
+    raw_estimated_tokens: int = 0
 
     @property
     def usable_tokens(self) -> int:
@@ -82,7 +87,7 @@ class ContextBudgetManager:
             result = replace(result, compacted=True)
         mgr.show_indicator(result)
         # … call model …
-        mgr.calibrate_from_response(model_name, prompt_eval_count, result.estimated_tokens)
+        mgr.calibrate_from_response(model_name, prompt_eval_count, result.raw_estimated_tokens)
     """
 
     def __init__(
@@ -112,6 +117,7 @@ class ContextBudgetManager:
             model_name=model_name,
             specialist=specialist,
             estimated_tokens=estimated,
+            raw_estimated_tokens=raw_est,
             context_window=window,
             reserve_tokens=reserve,
         )
@@ -180,6 +186,9 @@ class ContextBudgetManager:
         estimated_tokens: int,
     ) -> None:
         """Improve future estimates using Ollama's actual prompt_eval_count.
+
+        *estimated_tokens* must be the RAW, uncalibrated estimate. Passing the
+        already-corrected number feeds the factor back into itself.
 
         Uses an exponential moving average (α=0.2) so a single outlier
         doesn't destabilise the calibration.

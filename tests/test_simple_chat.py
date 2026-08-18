@@ -3004,3 +3004,119 @@ def test_the_users_request_is_still_the_last_thing_the_model_reads(tmp_path):
     sent = loop.client.calls[0]["messages"]
     assert sent[-1] == {"role": "user", "content": "change the bullet speed"}
     assert _grounding_of(loop.client.calls[0]), "the grounding block went missing"
+
+
+# ---------------------------------------------------------------------------
+# Output room and honest truncation (SMALLCODE plan item B)
+#
+# A live session produced 19 generations that Ollama cut off at the window, and
+# the harness reported none of them. One was displayed as a finished answer
+# while ending mid-word, and then became permanent conversation.
+# ---------------------------------------------------------------------------
+
+
+def _cut(content: str = "", thinking: str = "") -> dict:
+    """A turn Ollama stopped because the window filled."""
+    return {
+        "message": {"content": content, "thinking": thinking, "tool_calls": []},
+        "done_reason": "length",
+        "prompt_eval_count": 31_400,
+        "eval_count": 95,
+    }
+
+
+def test_generation_is_capped_at_the_reserve_the_budget_held_back(tmp_path):
+    """Without num_predict, generation was bounded only by leftover window."""
+    from shamsu.agents.simple_chat import output_reserve
+
+    loop = _loop(tmp_path, [_text("done")])
+    asyncio.run(loop.run("hi"))
+
+    options = loop.client.calls[0]["options"]
+    assert options["num_predict"] == output_reserve(options["num_ctx"])
+
+
+def test_a_cut_off_answer_is_never_presented_as_a_finished_one(tmp_path):
+    """`done_reason == "length"` means the model was still speaking."""
+    loop = _loop(tmp_path, [_cut(content="The fix is to set window.asteroid")])
+
+    result = asyncio.run(loop.run("why is it broken?"))
+
+    assert "cut off" in result.final.lower()
+    assert "The fix is to set window.asteroid" in result.final  # partial kept
+    assert "/new" in result.final                               # and a way out
+
+
+def test_a_truncated_thought_never_becomes_the_answer_or_the_history(tmp_path):
+    """The exact live failure: a thought ending mid-word, shown as an answer."""
+    loop = _loop(tmp_path, [_cut(thinking="means `window.asteroid")] * 6)
+
+    result = asyncio.run(loop.run("why is it broken?"))
+
+    assert "means `window.asteroid" not in result.final
+    assert "ran out of room" in result.final.lower()
+    hydrated = [m.content for m in loop.state.all_messages if m.role == "assistant"]
+    assert not any("means `window.asteroid" in c for c in hydrated)
+
+
+def test_a_COMPLETE_thought_with_no_content_is_still_used_as_the_answer(tmp_path):
+    """Reasoning models end turns this way; claiming it ran out of room lies."""
+    finished = {
+        "message": {"content": "", "thinking": "Set speed = 2.", "tool_calls": []},
+        "done_reason": "stop",
+    }
+    loop = _loop(tmp_path, [finished] * 6)
+
+    result = asyncio.run(loop.run("how do I slow the ship?"))
+
+    assert result.final == "Set speed = 2."
+    assert not result.stopped
+    assert "ran out of room" not in result.final.lower()
+
+
+def test_the_compaction_pass_does_not_spend_its_budget_thinking(tmp_path):
+    """A mechanical summary needs no reasoning trace."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(40):
+        state.append_user(f"turn {i} " + "padding " * 300)
+        state.append_assistant(f"reply {i} " + "padding " * 300)
+    loop = _loop(tmp_path, [_text("done")])
+    loop.state = state
+
+    asyncio.run(loop.run("carry on"))
+
+    narrations = [c for c in loop.client.calls if c.get("think") is False]
+    assert narrations, "the narration pass should disable thinking"
+
+
+def test_ground_truth_prompt_size_is_read_off_the_response(tmp_path):
+    """prompt_eval_count is the only number here that is not a guess."""
+    loop = _loop(tmp_path, [{"message": {"content": "hi", "tool_calls": []},
+                             "prompt_eval_count": 4242, "eval_count": 7}])
+
+    asyncio.run(loop.run("hello"))
+
+    assert loop.last_prompt_tokens == 4242
+    assert loop.last_completion_tokens == 7
+    assert loop.last_estimate > 0
+
+
+def test_an_old_client_that_rejects_a_keyword_still_gets_its_turn(tmp_path):
+    """Shedding `think` must not also cost the model its tools."""
+    class PickyClient:
+        def __init__(self):
+            self.calls = []
+
+        async def chat(self, **kwargs):
+            if "think" in kwargs:
+                raise TypeError("unexpected keyword argument 'think'")
+            self.calls.append(kwargs)
+            return {"message": {"content": "ok", "tool_calls": []}}
+
+    loop = _loop(tmp_path, [])
+    loop.client = PickyClient()
+
+    result = asyncio.run(loop.run("hi"))
+
+    assert result.final == "ok"
+    assert "tools" in loop.client.calls[0], "tools were shed unnecessarily"
