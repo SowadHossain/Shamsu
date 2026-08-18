@@ -8,7 +8,7 @@ Implements ILLMManager. Encodes the harness defaults directly:
     this is the PRIMARY mechanism, not a library. json_repair is the
     fallback when schema enforcement still produces something invalid
     (rare, but happens under quantization-induced glitches).
-  - num_ctx=8192 default â€” drop to 4096 if you observe swapping
+  - num_ctx now comes from `shared_num_ctx(model)` so every call agrees
     (see harness Â§8, "num_ctx tradeoffs").
 
 This file does NOT manage model loading/unloading lifecycle yet â€”
@@ -33,6 +33,7 @@ from json_repair import repair_json
 
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.action_ledger.redaction import redact_text
+from shamsu.context.budget import shared_num_ctx
 from shamsu.context.manager import ContextBudgetManager
 from shamsu.interfaces import ILLMManager
 from shamsu.memory.service import MemoryService
@@ -363,7 +364,7 @@ class LLMManager(ILLMManager):
     async def _generate(
         self, model: str, system: str, prompt: str,
         temperature: float = 0.1, json_schema: dict | None = None,
-        keep_alive: str = "10m", num_ctx: int = 8192,
+        keep_alive: str = "10m", num_ctx: int | None = None,
         num_predict: int | None = None,
         _estimated_tokens: int = 0,
         _ledger_call_id: str = "",
@@ -378,7 +379,7 @@ class LLMManager(ILLMManager):
             "stream": True,
             "options": {
                 "temperature": temperature,
-                "num_ctx": num_ctx,
+                "num_ctx": num_ctx or shared_num_ctx(model),
                 "top_p": 0.9,
                 "repeat_penalty": 1.0,
             },
@@ -450,7 +451,7 @@ class LLMManager(ILLMManager):
         tools: list[dict] | None = None,
         temperature: float = 0.1,
         keep_alive: str = "10m",
-        num_ctx: int = 8192,
+        num_ctx: int | None = None,
         role: str = "agent-chat-tools",
         workflow_id: str = "agent-chat-tools",
     ) -> dict:
@@ -461,7 +462,7 @@ class LLMManager(ILLMManager):
             "stream": False,
             "options": {
                 "temperature": temperature,
-                "num_ctx": num_ctx,
+                "num_ctx": num_ctx or shared_num_ctx(model),
                 "top_p": 0.9,
                 "repeat_penalty": 1.0,
             },
@@ -882,7 +883,7 @@ class LLMManager(ILLMManager):
     async def _generate_stream(
         self, model: str, system: str, prompt: str,
         on_token: Callable[[str], None],
-        temperature: float = 0.1, keep_alive: str = "10m", num_ctx: int = 8192,
+        temperature: float = 0.1, keep_alive: str = "10m", num_ctx: int | None = None,
         _estimated_tokens: int = 0,
         _ledger_call_id: str = "",
         _role: str = "",
@@ -894,7 +895,7 @@ class LLMManager(ILLMManager):
             "stream": True,
             "options": {
                 "temperature": temperature,
-                "num_ctx": num_ctx,
+                "num_ctx": num_ctx or shared_num_ctx(model),
                 "top_p": 0.9,
                 "repeat_penalty": 1.0,
             },

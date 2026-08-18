@@ -27,6 +27,7 @@ import difflib
 import json
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,6 +115,16 @@ _FENCE_RE = re.compile(r"```[^\n]*\n(?P<body>.*?)```", re.DOTALL)
 # conversation to choose from. A small cap here is invisible and unrecoverable -
 # it silently truncates history BEFORE anything gets to weigh it.
 HYDRATE_MAX_MESSAGES = 400
+
+
+def _prompt_is_active() -> bool:
+    """Whether something is currently waiting on a typed answer."""
+    try:
+        from shamsu.safety.approval import prompt_is_active
+
+        return prompt_is_active()
+    except Exception:
+        return False
 
 
 def simple_mode_enabled() -> bool:
@@ -444,13 +455,37 @@ def command_needs_approval(command: str) -> bool:
         return True
 
 
-def make_approval_func(console_approval: Any) -> Any:
+def make_approval_func(console_approval: Any, *, main_loop: Any = None) -> Any:
     """Approval policy for simple mode.
 
     Only shell commands can reach a prompt. File writes are already constrained
     to the workspace by the sandbox, which refuses an escape outright rather than
     asking about it, so a second question adds friction without adding safety.
+
+    `main_loop` is the event loop the REPL runs on. Tools execute via
+    `asyncio.to_thread`, so without it the prompt would read the console from a
+    WORKER thread - and on Windows the entire input stack (prompt_toolkit's
+    console session, `msvcrt`, Rich's Live) is owned by the main thread. That is
+    the classic run_in_executor+stdin trap, and it is why a turn could sit at
+    "Approval Required" forever. With it, the question is handed back to the
+    main thread, which is idle inside `await` and free to run it.
     """
+
+    def ask(request: Any) -> bool:
+        if main_loop is not None and threading.current_thread() is not threading.main_thread():
+            try:
+                future = asyncio.run_coroutine_threadsafe(_ask_on_main(request), main_loop)
+                return bool(future.result())
+            except Exception:
+                # The loop is gone or refused the callback; a prompt that runs
+                # in the wrong place still beats an action taken unasked.
+                return bool(console_approval(request))
+        return bool(console_approval(request))
+
+    async def _ask_on_main(request: Any) -> bool:
+        # Deliberately blocking. Nothing else should run while a human is being
+        # asked a question, and the heartbeat is suppressed for the same reason.
+        return bool(console_approval(request))
 
     def approve(request: Any) -> bool:
         action = str(getattr(request, "action_type", "") or getattr(request, "action", "") or "")
@@ -460,8 +495,8 @@ def make_approval_func(console_approval: Any) -> Any:
         if action == "run_command" or command:
             if not command_needs_approval(command):
                 return True
-            return bool(console_approval(request))
-        return bool(console_approval(request))
+            return ask(request)
+        return ask(request)
 
     return approve
 
@@ -939,7 +974,23 @@ class SimpleChatLoop:
         grounding = render_workspace_files(self._files)
         if self._brief:
             grounding = f"{grounding}\n\n{self._brief}"
-        messages.insert(1, {"role": "system", "content": grounding})
+        # LAST, not at position 1. llama.cpp reuses the KV cache for the
+        # longest common PREFIX of the token sequence, and this block changes
+        # whenever a file changes or the turn is about a different file.
+        # Sitting second, one edit invalidated everything after ~150 tokens
+        # and forced a full re-prefill of the whole conversation - measured
+        # live: 46 sends, 6 distinct versions, against a 23,000-token prompt.
+        # Appended, the cached prefix covers the system prompt AND every
+        # earlier turn, and it lands next to the request it describes.
+        # Just BEFORE the final user turn: the cache benefit is identical (the
+        # prefix up to here is the system prompt plus every earlier turn, all
+        # stable), while the request the model must act on stays last, where a
+        # small model actually reads it.
+        block = {"role": "system", "content": grounding}
+        if len(messages) > 1 and messages[-1].get("role") == "user":
+            messages.insert(len(messages) - 1, block)
+        else:
+            messages.append(block)
         return messages
 
     def _shrink_for_oom(self) -> bool:
@@ -1347,6 +1398,12 @@ class SimpleChatLoop:
         try:
             while True:
                 await asyncio.sleep(HEARTBEAT_SECONDS)
+                if _prompt_is_active():
+                    # A tool is blocked on an approval prompt. Ticking here
+                    # redraws over the question and the half-typed answer -
+                    # which is why answering within 5s worked and waiting did
+                    # not.
+                    continue
                 self._status(f"{label} {time.perf_counter() - started:.0f}s")
         except asyncio.CancelledError:
             pass
@@ -1663,11 +1720,12 @@ def build_simple_tools(
     console_approval: Any,
     session_logger: SessionLogger | None = None,
     action_ledger: ActionLedger | None = None,
+    main_loop: Any = None,
 ) -> AgentToolRegistry:
     """An AgentToolRegistry wired for simple mode's approval policy."""
     return AgentToolRegistry(
         workspace,
-        approval_func=make_approval_func(console_approval),
+        approval_func=make_approval_func(console_approval, main_loop=main_loop),
         session_logger=session_logger,
         action_ledger=action_ledger,
     )

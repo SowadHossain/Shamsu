@@ -194,7 +194,12 @@ from shamsu.runtime.ollama import (
 from shamsu.runtime.run_control import active_run_ids, cancel_run
 from shamsu.runtime.session_registry import claim_ollama_ownership, register_session
 from shamsu.safety import dry_run, read_only
-from shamsu.safety.approval import ask_approval, ask_approval_menu, ask_tier_choice
+from shamsu.safety.approval import (
+    ask_approval,
+    ask_approval_menu,
+    ask_tier_choice,
+    prompt_is_active,
+)
 from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
 from shamsu.safety.sandbox import Sandbox, SecurityError
 from shamsu.patch import git_apply as patch_git_apply
@@ -4610,6 +4615,9 @@ async def _run_simple_chat(
     timeouts = TimeoutConfig()
     tools = build_simple_tools(
         workspace,
+        # Tools run on a worker thread; the approval prompt must not. See
+        # `make_approval_func`.
+        main_loop=asyncio.get_running_loop(),
         # Bind THIS console. Called bare, `ask_approval` builds a fresh
         # Console(), which knows nothing about the live spinner - so
         # `_pause_console_live` had nothing to stop and the status kept
@@ -4684,6 +4692,12 @@ def _status_updater(thinking_status: Any) -> Any:
         return None
 
     def update(message: str) -> None:
+        # Never paint while a prompt is waiting on the user. Rich renders a
+        # status update even when the Live is stopped, so a heartbeat tick
+        # lands straight on top of the approval question and whatever has been
+        # typed so far.
+        if prompt_is_active():
+            return
         with contextlib.suppress(Exception):
             thinking_status.update(f"[dim]{message}[/dim]")
 

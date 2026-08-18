@@ -3,8 +3,10 @@ Internal command execution helpers for workspace-bound SHAMSU tools.
 """
 from __future__ import annotations
 
+import contextlib
 import re
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import Callable
@@ -43,6 +45,82 @@ def _platform_command(command: str) -> str:
         command,
     )
 
+
+
+def _kill_process_tree(process: "subprocess.Popen") -> None:
+    """Kill the command AND everything it started.
+
+    `subprocess.run(..., capture_output=True, timeout=N)` cannot enforce N when
+    the command leaves a survivor. It kills the direct child - the shell - then
+    calls `communicate()` again to drain the pipes; a grandchild that inherited
+    those handles keeps them open, so `communicate()` waits for an EOF that
+    never comes and `TimeoutExpired` is never raised.
+
+    Live 2026-08-18: `cd frontend && python -m http.server 8000 &` hung a turn
+    for 28 minutes against a 120s timeout, with no tool result written at all.
+    """
+    if sys.platform == "win32":
+        # taskkill walks the tree; the shell's children are not in our group.
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+    else:
+        with contextlib.suppress(Exception):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        process.kill()
+
+
+def _run_command_bounded(
+    command: str,
+    cwd: "Path",
+    timeout_seconds: float,
+    creationflags: int,
+) -> "subprocess.CompletedProcess":
+    """Run *command*, and actually come back within *timeout_seconds*.
+
+    Raises `subprocess.TimeoutExpired` on timeout, like `subprocess.run` was
+    supposed to - but only after killing the whole tree, and never blocking on
+    output a survivor is still holding.
+    """
+    popen_kwargs: dict = {
+        "shell": True,
+        "cwd": str(cwd),
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "creationflags": creationflags,
+    }
+    if sys.platform != "win32":
+        # Own process group, so the whole tree can be signalled at once.
+        popen_kwargs["start_new_session"] = True
+
+    process = subprocess.Popen(command, **popen_kwargs)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(process)
+        try:
+            # The tree is dead, so the pipes should close promptly. If something
+            # STILL holds them, abandon the output rather than hang - a partial
+            # result the model can act on beats a turn that never returns.
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Something survived the tree kill and still holds the pipes -
+            # `start /b` detaches a child out of the shell's tree entirely.
+            # ABANDON the output; do not close the pipes. `communicate` reads
+            # them on daemon threads, and closing a file object whose reader is
+            # blocked inside read() waits on that thread's lock, which is the
+            # very hang being escaped (measured: 120s instead of 7.5s).
+            stdout, stderr = "", ""
+        raise subprocess.TimeoutExpired(command, timeout_seconds, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 class CommandRunner(ICommandRunner):
     def __init__(
@@ -200,16 +278,11 @@ class CommandRunner(ICommandRunner):
             )
 
         try:
-            completed = subprocess.run(
+            completed = _run_command_bounded(
                 command,
-                shell=True,
-                cwd=validated_cwd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout_seconds,
-                creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0),
+                validated_cwd,
+                self.timeout_seconds,
+                subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except subprocess.TimeoutExpired as exc:
             stdout = redact(_as_text(exc.stdout))

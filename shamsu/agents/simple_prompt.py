@@ -11,6 +11,13 @@ Corrections do not belong here. The tool layer already returns a specific error
 at the moment a call goes wrong, which is where a small model can actually act
 on it; repeating those errors as standing prohibitions only dilutes the
 instruction that says what to do.
+
+One instruction here WAS unconditional and cost real work: "Work in small
+steps: make one change, check it" presumes the task is a change. Asked to
+"review the PRD and plan the next steps" the model wrote five backend files,
+ran pip and pytest, hit the 24-round cap at 577s and delivered no plan (live
+2026-08-18). It is now conditional, and answering is named as work in its own
+right - still a statement of what to do, not a prohibition.
 """
 from __future__ import annotations
 
@@ -23,8 +30,12 @@ You can read, search and change files in that folder, and run commands there.
 Use a tool when you need real information or need to change something. If the
 question does not need one, just answer normally.
 
-When you change code, check it works - run it, run its tests, or run the build.
-Work in small steps: make one change, check it, then move to the next.
+When someone asks you to review, explain, or plan, the answer IS the work: say
+what you found and what you would do next. Change files when you are asked to
+change something.
+
+When you are changing code, check it works - run it, run its tests, or run the
+build - and work in small steps: make one change, check it, then move on.
 
 You are talking to one person over time. Earlier messages in this conversation
 are real: refer back to them, and when they say "continue" or "next", carry on

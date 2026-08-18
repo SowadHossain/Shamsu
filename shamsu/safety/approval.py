@@ -3,6 +3,7 @@ User approval prompt for risky actions.
 """
 from __future__ import annotations
 
+import contextlib
 import sys
 
 from rich.console import Console
@@ -22,6 +23,28 @@ _MAX_EMPTY_TTY_READS = 3
 # Live displays stopped for a prompt, keyed by console, so the same prompt can
 # hand them back afterwards.
 _PAUSED: dict[int, list] = {}
+
+# Non-zero while a prompt is waiting on a human. Anything that PAINTS - the
+# thinking spinner, the tool heartbeat - must hold off, or it redraws over the
+# question and over the half-typed answer. Live 2026-08-18 the 5s heartbeat did
+# exactly that: answering inside 5s worked, waiting did not.
+_PROMPT_DEPTH = 0
+
+
+def prompt_is_active() -> bool:
+    """True while SHAMSU is blocked waiting for a typed answer."""
+    return _PROMPT_DEPTH > 0
+
+
+@contextlib.contextmanager
+def reading_input():
+    """Mark the window in which nothing else may write to the terminal."""
+    global _PROMPT_DEPTH
+    _PROMPT_DEPTH += 1
+    try:
+        yield
+    finally:
+        _PROMPT_DEPTH = max(0, _PROMPT_DEPTH - 1)
 
 
 def _action_label(action_type: str) -> str:
@@ -240,26 +263,27 @@ def _read_approval_answer(console: Console) -> str | None:
     means "No".
     """
     _PAUSED[id(console)] = _pause_console_live(console)
-    if console.is_terminal:
-        answer = _prompt_toolkit_answer()
-        if answer is not None:
-            return answer
-        fallback = _read_windows_console_answer(console)
-        if fallback is not None:
-            return fallback
+    with reading_input():
+        if console.is_terminal:
+            answer = _prompt_toolkit_answer()
+            if answer is not None:
+                return answer
+            fallback = _read_windows_console_answer(console)
+            if fallback is not None:
+                return fallback
 
-    # A second pass, because the branch above may have started something back
-    # up. Accumulate rather than overwrite - dropping the first list would
-    # leave the spinner stopped for the rest of the turn.
-    _PAUSED.setdefault(id(console), []).extend(_pause_console_live(console))
-    try:
-        return input("> ").strip().lower()
-    except EOFError:
-        fallback = _read_windows_console_answer(console)
-        if fallback is not None:
-            return fallback
-        console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
-        return None
+        # A second pass, because the branch above may have started something
+        # back up. Accumulate rather than overwrite - dropping the first list
+        # would leave the spinner stopped for the rest of the turn.
+        _PAUSED.setdefault(id(console), []).extend(_pause_console_live(console))
+        try:
+            return input("> ").strip().lower()
+        except EOFError:
+            fallback = _read_windows_console_answer(console)
+            if fallback is not None:
+                return fallback
+            console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
+            return None
 
 
 def _read_windows_console_answer(console: Console) -> str | None:
@@ -297,3 +321,10 @@ def _read_windows_console_answer(console: Console) -> str | None:
         if lowered in {"y", "a", "n"}:
             console.print(char)
             return lowered
+        # Anything else used to loop here in total silence - Enter, a stray
+        # arrow key, a paste - and a prompt that ignores you without a word is
+        # indistinguishable from a hung one. Say so, and keep waiting.
+        if char.isprintable() and char.strip():
+            console.print(f"[dim]'{char}' is not an option - press y, a, or n.[/dim]")
+        else:
+            console.print("[dim]Press y, a, or n (no Enter needed).[/dim]")

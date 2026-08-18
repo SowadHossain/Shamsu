@@ -6,6 +6,7 @@ minimal installs.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 from pathlib import Path
 
@@ -63,9 +64,33 @@ RESERVE_OUTPUT_TOKENS = _reserve_output_tokens()
 SAFETY_MARGIN_TOKENS = 512         # extra buffer against off-by-one token counts
 
 
+# The window a chat session asks for when the model allows it. Kept here rather
+# than in simple_chat so the LLM manager can agree with it without importing an
+# agent module.
+DEFAULT_CHAT_CTX = 32768
+
+
 def ctx_window_for_model(model_name: str) -> int:
     """Return the known context window for *model_name*, or the safe fallback."""
     return MODEL_CONTEXT_WINDOWS.get(model_name, SAFE_FALLBACK_CTX_WINDOW)
+
+
+def shared_num_ctx(model_name: str) -> int:
+    """The ONE context window every SHAMSU call should ask for, per model.
+
+    Ollama reloads a model whenever `num_ctx` changes. Three call sites in
+    `llm/manager.py` defaulted to 8192 while simple mode asked for 32768, so any
+    background call - memory, summaries, a health check - evicted the chat
+    model and vice versa. Measured 2026-08-18, the Ollama server log alternated
+    `n_ctx = 8192 -> 32768 -> 8192 ...` on EVERY call: a ~6GB reload each time,
+    turning 5-15s replies into 74-107s.
+
+    Capped per model, so a small model is never asked for more than it has.
+    `SHAMSU_CHAT_MAX_CTX` overrides the ceiling.
+    """
+    raw = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
+    ceiling = int(raw) if raw.isdigit() and int(raw) >= 4096 else DEFAULT_CHAT_CTX
+    return min(ctx_window_for_model(model_name), ceiling)
 
 
 def count_tokens(text: str) -> int:

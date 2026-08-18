@@ -57,6 +57,22 @@ def _tool(name: str, **arguments) -> dict:
     }
 
 
+
+def _grounding_of(call: dict) -> str:
+    """The workspace-grounding system block, wherever the loop chose to put it.
+
+    Deliberately found by CONTENT: its position is a cache decision, not a
+    behaviour, and a test that pins the index fails for the wrong reason.
+    """
+    for message in call["messages"]:
+        content = str(message.get("content", ""))
+        if message.get("role") == "system" and (
+            "Files in the workspace" in content or "workspace is empty" in content
+        ):
+            return content
+    return ""
+
+
 def _loop(tmp_path: Path, turns, **kwargs) -> SimpleChatLoop:
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
     state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
@@ -452,11 +468,11 @@ def test_the_listing_is_rebuilt_every_call_so_it_cannot_go_stale(tmp_path):
 
     asyncio.run(loop.run("create new.py"))
 
-    first = loop.client.calls[0]["messages"][1]["content"]
+    first = _grounding_of(loop.client.calls[0])
     assert "new.py" not in first
     # The loop refreshes the listing at the top of each round.
     asyncio.run(loop.run("what files exist?"))
-    latest = loop.client.calls[-1]["messages"][1]["content"]
+    latest = _grounding_of(loop.client.calls[-1])
     assert "new.py" in latest
 
 
@@ -652,7 +668,7 @@ def test_the_grounding_block_carries_both_the_tree_and_the_code_facts(tmp_path, 
 
     asyncio.run(loop.run("fix game.js"))
 
-    grounding = loop.client.calls[0]["messages"][1]["content"]
+    grounding = _grounding_of(loop.client.calls[0])
     assert "Files in the workspace right now" in grounding
     assert "game.js" in grounding
     assert "exports: update" in grounding
@@ -2726,3 +2742,265 @@ def test_a_slow_tool_call_reports_that_it_is_still_running(tmp_path):
 
     assert result.final == "Read it."
     assert any("running read_file" in message for message in seen), seen
+
+
+# --- a slow human must not be punished -----------------------------------
+# Reported live: "if i wait for a bit it gets stuck". The tool heartbeat ticks
+# every 5s and the approval prompt lives INSIDE tool execution, so answering
+# within 5s worked and thinking about it did not.
+
+
+def test_nothing_paints_while_an_approval_prompt_is_waiting(tmp_path):
+    """The heartbeat must hold off, however long the human takes."""
+    import shamsu.agents.simple_chat as simple_chat
+    from shamsu.safety.approval import prompt_is_active, reading_input
+
+    painted_while_waiting: list[str] = []
+    original = simple_chat.HEARTBEAT_SECONDS
+    simple_chat.HEARTBEAT_SECONDS = 0.01
+
+    class PromptingTools(AgentToolRegistry):
+        def execute(self, name, arguments):
+            # Stand in for a human staring at the prompt for a while.
+            with reading_input():
+                time.sleep(0.15)
+            return super().execute(name, arguments)
+
+    def record(message: str) -> None:
+        if prompt_is_active():
+            painted_while_waiting.append(message)
+
+    try:
+        (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+        tools = PromptingTools(tmp_path, approval_func=lambda _r: True)
+        state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+        loop = SimpleChatLoop(
+            tmp_path,
+            client=FakeClient([_tool("read_file", filepath="a.py"), _text("Done.")]),
+            tools=tools,
+            state=state,
+            model_name="qwen3:8b",
+            on_status=record,
+        )
+        result = asyncio.run(loop.run("read it"))
+    finally:
+        simple_chat.HEARTBEAT_SECONDS = original
+
+    assert result.final == "Done."
+    assert not painted_while_waiting, (
+        "the spinner painted over a waiting prompt: " + repr(painted_while_waiting)
+    )
+
+
+def test_the_flag_clears_even_when_the_prompt_raises():
+    """A stuck flag would silence the spinner for the rest of the session."""
+    from shamsu.safety.approval import prompt_is_active, reading_input
+
+    assert not prompt_is_active()
+    with contextlib.suppress(RuntimeError):
+        with reading_input():
+            assert prompt_is_active()
+            raise RuntimeError("user hit ctrl-c")
+    assert not prompt_is_active(), "the prompt flag was left set"
+
+
+def test_nested_prompts_do_not_unmask_early():
+    from shamsu.safety.approval import prompt_is_active, reading_input
+
+    with reading_input():
+        with reading_input():
+            assert prompt_is_active()
+        assert prompt_is_active(), "an inner prompt cleared the outer one"
+    assert not prompt_is_active()
+
+
+def test_the_repl_status_updater_holds_off_during_a_prompt():
+    """The REPL's own painter, not just the loop's."""
+    import shamsu.cli.repl as repl
+    from shamsu.safety.approval import reading_input
+
+    class _Status:
+        def __init__(self):
+            self.painted = []
+
+        def update(self, message):
+            self.painted.append(message)
+
+    status = _Status()
+    update = repl._status_updater(status)
+
+    update("thinking... 5s")
+    assert len(status.painted) == 1, "normal updates must still paint"
+
+    with reading_input():
+        update("thinking... 10s")
+    assert len(status.painted) == 1, "it painted over a waiting prompt"
+
+    update("thinking... 15s")
+    assert len(status.painted) == 2, "painting never resumed after the prompt"
+
+
+# --- the prompt must run where the console lives -------------------------
+# Tools execute via `asyncio.to_thread`, so the approval prompt was reading the
+# console from a WORKER thread. On Windows the whole input stack -
+# prompt_toolkit's console session, msvcrt, Rich's Live - belongs to the main
+# thread. That is the run_in_executor+stdin trap, and it is why a turn could
+# sit at "Approval Required" forever.
+
+
+def test_the_approval_prompt_runs_on_the_main_thread(tmp_path):
+    import threading
+
+    from shamsu.agents.simple_chat import build_simple_tools
+
+    seen: dict = {}
+
+    def spy(_request):
+        seen["is_main"] = threading.current_thread() is threading.main_thread()
+        return False
+
+    async def drive():
+        tools = build_simple_tools(
+            tmp_path,
+            console_approval=spy,
+            main_loop=asyncio.get_running_loop(),
+        )
+        # Exactly what SimpleChatLoop._run_tools does.
+        await asyncio.to_thread(
+            tools.execute, "run_command", {"command": 'python -c "pass"'}
+        )
+
+    asyncio.run(drive())
+
+    assert seen.get("is_main") is True, "the prompt read the console off the main thread"
+
+
+def test_without_a_loop_it_still_asks_rather_than_assuming(tmp_path):
+    """No loop to marshal onto must never become an unasked action."""
+    import threading
+
+    from shamsu.agents.simple_chat import build_simple_tools
+
+    asked: list[bool] = []
+
+    def spy(_request):
+        asked.append(threading.current_thread() is threading.main_thread())
+        return False
+
+    async def drive():
+        tools = build_simple_tools(tmp_path, console_approval=spy)  # no main_loop
+        await asyncio.to_thread(
+            tools.execute, "run_command", {"command": 'python -c "pass"'}
+        )
+
+    asyncio.run(drive())
+    assert asked, "the command ran without anyone being asked"
+
+
+def test_a_slow_answer_does_not_hang_the_turn(tmp_path):
+    """The reported symptom: answer fast and it works, wait and it sticks."""
+    from shamsu.agents.simple_chat import build_simple_tools
+    from shamsu.safety.approval import reading_input
+
+    def slow_human(_request):
+        with reading_input():
+            time.sleep(0.4)
+        return True
+
+    async def drive():
+        tools = build_simple_tools(
+            tmp_path,
+            console_approval=slow_human,
+            main_loop=asyncio.get_running_loop(),
+        )
+        state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+        loop = SimpleChatLoop(
+            tmp_path,
+            client=FakeClient(
+                [_tool("run_command", command='python -c "print(1)"'), _text("Ran it.")]
+            ),
+            tools=tools,
+            state=state,
+            model_name="qwen3:8b",
+        )
+        return await asyncio.wait_for(loop.run("run it"), timeout=60)
+
+    started = time.perf_counter()
+    result = asyncio.run(drive())
+    elapsed = time.perf_counter() - started
+
+    assert result.final == "Ran it."
+    assert elapsed < 45, f"the turn took {elapsed:.1f}s"
+
+
+def test_an_unrecognised_key_is_answered_not_swallowed(monkeypatch):
+    """Silence on a keypress is indistinguishable from a hang."""
+    import io as _io
+    import sys as _sys
+
+    from rich.console import Console as _Console
+
+    from shamsu.safety import approval as approval_module
+
+    if _sys.platform != "win32":
+        pytest.skip("msvcrt reader is Windows-only")
+
+    keys = iter(["q", "\r", "y"])
+    monkeypatch.setattr(approval_module.sys, "platform", "win32")
+    fake_msvcrt = type("M", (), {"getwch": staticmethod(lambda: next(keys))})
+    monkeypatch.setitem(__import__("sys").modules, "msvcrt", fake_msvcrt)
+
+    buffer = _io.StringIO()
+    console = _Console(file=buffer, force_terminal=True)
+    answer = approval_module._read_windows_console_answer(console)
+
+    assert answer == "y"
+    printed = buffer.getvalue()
+    assert "not an option" in printed or "Press y" in printed, printed
+
+
+def test_the_changing_block_never_sits_in_front_of_the_conversation(tmp_path):
+    """llama.cpp caches the longest common PREFIX of the token sequence.
+
+    The workspace listing changes whenever a file does. At position 1 - which is
+    where it used to be - one edit invalidated everything after ~150 tokens and
+    forced a full re-prefill of the entire conversation. Measured on a live
+    session: 46 sends, 6 distinct versions, against a 23,000-token prompt.
+
+    So the rule is positional: the volatile block goes at the END of the
+    conversation, never in front of it.
+    """
+    (tmp_path / "a.py").write_text("a = 1\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_text("one"), _tool("write_file", filepath="b.py", content="b = 2\n"), _text("two")],
+    )
+
+    asyncio.run(loop.run("first question"))
+    asyncio.run(loop.run("now create b.py"))
+
+    # It really does change between calls - otherwise this proves nothing.
+    assert "b.py" not in _grounding_of(loop.client.calls[0])
+    assert "b.py" in _grounding_of(loop.client.calls[-1])
+
+    for call in loop.client.calls:
+        messages = call["messages"]
+        index = next(
+            i for i, m in enumerate(messages)
+            if str(m.get("content", "")) == _grounding_of(call)
+        )
+        assert index >= len(messages) - 2, (
+            f"the volatile block is at {index} of {len(messages)} - it belongs at "
+            "the end, or every earlier turn gets re-prefilled"
+        )
+
+
+def test_the_users_request_is_still_the_last_thing_the_model_reads(tmp_path):
+    """Grounding must not be appended AFTER the question it is grounding."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    asyncio.run(loop.run("change the bullet speed"))
+
+    sent = loop.client.calls[0]["messages"]
+    assert sent[-1] == {"role": "user", "content": "change the bullet speed"}
+    assert _grounding_of(loop.client.calls[0]), "the grounding block went missing"

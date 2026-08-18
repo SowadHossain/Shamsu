@@ -42,3 +42,6 @@ dogfood-*/
 tmp/
 ASE2_PRD_EVAL_ARTIFACTS/
 Shamsu\agent context\PHASE2_PRD_EVAL_ARTIFACTS
+# Third-party sources kept locally for reference only. Never ours to publish:
+# separate projects, separate licences. Read them here, do not vendor them in.
+reference/
