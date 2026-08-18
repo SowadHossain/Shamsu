@@ -14,6 +14,26 @@ def _memory_queue_cleanup():
     reset_memory_queues(timeout=0.2)
 
 
+@pytest.fixture(autouse=True)
+def _pin_legacy_routing(monkeypatch, request):
+    """Existing tests drive `_handle_request` to assert ROUTER behaviour.
+
+    Simple mode is now the production default and short-circuits that router
+    before it runs, so without this those tests would silently stop testing what
+    they were written for - and worse, they would reach a real Ollama and hang,
+    because the simple loop builds a live client.
+
+    The router still ships behind SHAMSU_LEGACY_ROUTING, so pinning it here is
+    what those tests actually mean. `tests/test_simple_chat.py` owns the new
+    default and opts out.
+    """
+    if request.node.fspath.basename == "test_simple_chat.py":
+        yield
+        return
+    monkeypatch.setenv("SHAMSU_LEGACY_ROUTING", "1")
+    yield
+
+
 class _AlwaysOpenAbstractService:
     """Stand-in used only for AgentOrchestrator's default (no explicit
     abstract_service passed). Tests that construct their own AbstractService

@@ -330,6 +330,7 @@ SYSTEM_COMMANDS = (
     "/plan off",
     "/proceed",
     "/plan-prd ",
+    "/build ",
     "/generate-django ",
     "/generate-prd ",
     "/models status",
@@ -4484,6 +4485,83 @@ def _classify_route_label(effective_input: str, workspace: Path) -> str:
     return "composite" if plan.is_composite else plan.primary_route
 
 
+def _simple_build_seed(user_input: str, workspace: Path) -> str:
+    """Turn `/build <prd>` into the one instruction that starts a build.
+
+    The slash is already stripped by the command router, so "build the login
+    page" and "/build SPEC.md" arrive identically. Only treat it as the command
+    when the argument names a file that exists - otherwise ordinary prose
+    beginning with "build" would be hijacked into a PRD run.
+    """
+    from shamsu.agents.simple_prompt import build_instruction
+
+    text = (user_input or "").strip()
+    if not text.lower().startswith("build "):
+        return ""
+    argument = text[len("build "):].strip().strip('"').strip("'")
+    if not argument:
+        return ""
+    try:
+        candidate = (workspace / argument).resolve()
+        if not candidate.is_file():
+            return ""
+        candidate.relative_to(Path(workspace).resolve())
+    except (OSError, ValueError):
+        return ""
+    return build_instruction(argument)
+
+
+async def _run_simple_chat(
+    user_input: str,
+    workspace: Path,
+    console: Console,
+    session_logger: SessionLogger | None = None,
+) -> None:
+    """The default path: one conversation, six tools, no routing.
+
+    Everything the legacy path does before the model sees a word - orchestrator,
+    PRD-plan detection, the 27-branch router, the planner, phases, task objects,
+    the synthetic state frame - is skipped. What remains is what the user
+    actually wants: talk to the model, and let it reach for a tool when it needs
+    one.
+    """
+    from rich.markdown import Markdown
+
+    from shamsu.agents.chat_loop import _default_ollama_client
+    from shamsu.agents.simple_chat import SimpleChatLoop, build_simple_tools
+    from shamsu.llm.manager import OLLAMA_BASE_URL
+    from shamsu.runtime.timeouts import TimeoutConfig
+
+    user_input = _simple_build_seed(user_input, workspace) or user_input
+    action_ledger = get_current_run()
+    timeouts = TimeoutConfig()
+    tools = build_simple_tools(
+        workspace,
+        console_approval=ask_approval,
+        session_logger=session_logger,
+        action_ledger=action_ledger,
+    )
+    loop = SimpleChatLoop(
+        workspace,
+        client=_default_ollama_client(OLLAMA_BASE_URL, timeouts),
+        tools=tools,
+        session_logger=session_logger,
+        action_ledger=action_ledger,
+        on_activity=lambda message: console.print(f"[dim]{message}[/dim]"),
+    )
+    result = await loop.run(user_input)
+    body = result.final.strip() or "No response returned."
+    console.print(Markdown(body))
+    _log_assistant_message(session_logger, body, workflow_id="simple-chat")
+
+
+def _legacy_routing_enabled() -> bool:
+    """Whether to use the pre-simple-mode router. Opt-in via SHAMSU_LEGACY_ROUTING."""
+    from shamsu.agents.simple_chat import simple_mode_enabled
+
+    return not simple_mode_enabled()
+
+
 async def _handle_request(
     user_input: str,
     workspace: Path,
@@ -4494,6 +4572,9 @@ async def _handle_request(
     session_logger: SessionLogger | None = None,
     thinking_status: Any = None,
 ) -> None:
+    if not _legacy_routing_enabled():
+        await _run_simple_chat(user_input, workspace, console, session_logger)
+        return
     agent_result = AgentOrchestrator(workspace, session_logger=session_logger).run(user_input)
     effective_input = agent_result.effective_input or user_input
     if session_logger is None:

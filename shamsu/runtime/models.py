@@ -5,7 +5,7 @@ Three hardware tiers, same role contract (router/qa/planner/... -> a
 "thinking" model; coder/bugfix/tests/... -> a "coding" model):
 
   light   - 8GB RAM, no GPU. Tiny models, CPU-friendly.
-  default - the 8GB cookbook (qwen3:8b + qwen2.5-coder:7b-instruct).
+  default - the 8GB cookbook (qwen3.5:9b-q4_K_M + qwen2.5-coder:7b-instruct).
   heavy   - 16GB+ RAM machines. Coder is allowed to 14B since there is no
             dedicated ~12B code model; the thinking anchor stays at 12B.
 
@@ -90,13 +90,14 @@ TIER_MODEL_SPECS: dict[ModelTier, tuple[ModelSpec, ...]] = {
     ),
     ModelTier.DEFAULT: (
         ModelSpec(
-            "qwen3:8b",
+            "qwen3.5:9b-q4_K_M",
             _THINKING_ROLES,
             max_vram_gb=8.0,
             notes="Thinking/text anchor for routing, planning, review, docs, and chat. "
-            "Replaces deepseek-r1:7b: Qwen3 does native tool calling, so planner and "
-            "router calls no longer depend on the output salvager, and it keeps a "
-            "separate thinking channel. The coder anchor stays a qwen2.5-coder.",
+            "Replaces qwen3:8b, measured head-to-head on an 8GB card 2026-08-18: both "
+            "3/3 on a write-then-run task with 2 tool calls, median 24.0s vs 37.7s. "
+            "Fits at num_ctx 16384 (~6.2GB resident, see simple_chat.max_ctx). Keeps "
+            "native tool calling and a separate thinking channel.",
             supports_native_tools=True,
             is_reasoning=True,
         ),
@@ -324,7 +325,7 @@ def model_for_role(role: str) -> str:
         return _ACTIVE_MODEL_OVERRIDE
     tier = active_tier()
     if single_model_mode_enabled():
-        # The tier's thinking anchor, which is qwen3:8b on the default tier: it
+        # The tier's thinking anchor, qwen3.5:9b-q4_K_M on the default tier: it
         # does native tool-calling AND has a separate thinking channel, so one
         # model can serve planning and coding without a swap. Roles that must not
         # pay for chain-of-thought are handled per CALL by role_should_think(),

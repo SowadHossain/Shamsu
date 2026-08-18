@@ -3,6 +3,14 @@ from __future__ import annotations
 import shamsu.runtime.ollama as ollama
 import shamsu.runtime.session_registry as registry
 
+# The DEFAULT tier's thinking anchor, read from the cookbook rather than
+# hardcoded: swapping the anchor (qwen3:8b -> qwen3.5:9b-q4_K_M, 2026-08-18)
+# broke 17 tests that had the old name baked in. The behaviour under test is
+# "the anchor is required/allowed/routed to", never "it is called qwen3:8b".
+from shamsu.runtime.models import ModelTier, TIER_MODEL_SPECS
+
+ANCHOR = TIER_MODEL_SPECS[ModelTier.DEFAULT][0].name
+
 
 def _use_tmp(monkeypatch, tmp_path):
     monkeypatch.setattr(registry, "_base_dir", lambda: tmp_path)
@@ -90,7 +98,7 @@ def test_shutdown_unloads_models_when_server_not_owned(monkeypatch, tmp_path):
     result = ollama.shutdown_if_last_session(
         111,
         server_stopper=lambda pid: (_ for _ in ()).throw(AssertionError("should not stop")),
-        model_unloader=lambda url: unloaded_from.append(url) or ["qwen3:8b"],
+        model_unloader=lambda url: unloaded_from.append(url) or [ANCHOR],
     )
 
     assert result == "unloaded"
@@ -106,7 +114,7 @@ def test_shutdown_clears_stale_owner_then_unloads(monkeypatch, tmp_path):
     result = ollama.shutdown_if_last_session(
         111,
         server_stopper=lambda pid: (_ for _ in ()).throw(AssertionError("dead pid must not be stopped")),
-        model_unloader=lambda url: ["qwen3:8b"],
+        model_unloader=lambda url: [ANCHOR],
     )
 
     assert result == "unloaded"
@@ -114,14 +122,14 @@ def test_shutdown_clears_stale_owner_then_unloads(monkeypatch, tmp_path):
 
 
 def test_unload_shamsu_models_only_touches_known_models(monkeypatch):
-    monkeypatch.setattr(ollama, "list_loaded_models", lambda base_url="x": ["qwen3:8b", "randomapp:1b"])
+    monkeypatch.setattr(ollama, "list_loaded_models", lambda base_url="x": [ANCHOR, "randomapp:1b"])
     unloaded = []
     monkeypatch.setattr(ollama, "unload_model", lambda name, base_url="x": unloaded.append(name) or True)
 
     result = ollama.unload_shamsu_models("http://localhost:11434")
 
-    assert result == ["qwen3:8b"]
-    assert unloaded == ["qwen3:8b"]  # the unrelated model was left alone
+    assert result == [ANCHOR]
+    assert unloaded == [ANCHOR]  # the unrelated model was left alone
 
 
 def test_shutdown_never_stops_falkordb_on_last_exit(monkeypatch, tmp_path):
@@ -136,7 +144,7 @@ def test_shutdown_never_stops_falkordb_on_last_exit(monkeypatch, tmp_path):
     result = ollama.shutdown_if_last_session(
         111,
         server_stopper=lambda pid: True,
-        model_unloader=lambda url: ["qwen3:8b"],
+        model_unloader=lambda url: [ANCHOR],
     )
 
     assert result == "unloaded"

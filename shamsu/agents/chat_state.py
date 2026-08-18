@@ -70,9 +70,17 @@ class ChatState:
         system_prompt: str,
         session_logger: SessionLogger | None = None,
         hydrate: bool = True,
+        hydrate_max_messages: int = HYDRATE_MAX_MESSAGES,
     ) -> None:
         self.system_prompt = system_prompt
         self.session_logger = session_logger
+        # How far back to rehydrate. The 24 default is an 8k-era number and is a
+        # HARD horizon, applied before any token budgeting: a caller that builds
+        # a fresh ChatState per user message can never see further back than
+        # this, however large its context window. Live 2026-08-17, simple mode
+        # emits ~5 messages per turn, so 24 meant the agent remembered five
+        # turns of a twenty-turn session and started guessing at the project.
+        self.hydrate_max_messages = max(1, int(hydrate_max_messages))
         self._messages: list[ChatMessage] = [ChatMessage("system", system_prompt)]
         # Rolling summary of turns evicted by budget-aware trimming, and the
         # absolute index in _messages up to which history has been folded in
@@ -236,12 +244,12 @@ class ChatState:
         # Prefer the clean transcript; only fall back to scanning events.jsonl
         # for chat.message when no transcript exists (older sessions).
         if self.session_logger.messages_path.exists():
-            records = self.session_logger.read_messages(HYDRATE_MAX_MESSAGES)
+            records = self.session_logger.read_messages(self.hydrate_max_messages)
             self._hydrate_records(records, key_content="content")
             return
         events = [
             event.get("payload", {})
-            for event in self.session_logger.tail(HYDRATE_MAX_MESSAGES)
+            for event in self.session_logger.tail(self.hydrate_max_messages)
             if event.get("event_type") == "chat.message"
         ]
         self._hydrate_records(events, key_content="content")

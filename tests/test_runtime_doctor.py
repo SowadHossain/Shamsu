@@ -33,6 +33,14 @@ from shamsu.memory.service import MemoryService
 from tests.test_graphiti_memory import FakeGraphitiAdapter
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 
+# The DEFAULT tier's thinking anchor, read from the cookbook rather than
+# hardcoded: swapping the anchor (qwen3:8b -> qwen3.5:9b-q4_K_M, 2026-08-18)
+# broke 17 tests that had the old name baked in. The behaviour under test is
+# "the anchor is required/allowed/routed to", never "it is called qwen3:8b".
+from shamsu.runtime.models import ModelTier, TIER_MODEL_SPECS
+
+ANCHOR = TIER_MODEL_SPECS[ModelTier.DEFAULT][0].name
+
 
 def test_check_editable_install_ok_when_package_is_inside_repo_root():
     import shamsu
@@ -55,7 +63,7 @@ def test_check_ollama_ok_when_ready():
     status = RuntimeStatus(
         ollama_path="/usr/bin/ollama",
         server_running=True,
-        installed_models=["qwen3:8b"],
+        installed_models=[ANCHOR],
         missing_models=[],
     )
 
@@ -65,7 +73,7 @@ def test_check_ollama_ok_when_ready():
 
 
 def test_check_ollama_warns_when_not_ready():
-    status = RuntimeStatus(missing_models=["qwen3:8b"])
+    status = RuntimeStatus(missing_models=[ANCHOR])
 
     check = check_ollama(status)
 
@@ -77,7 +85,7 @@ def test_check_cookbook_ok_when_only_allowed_models_are_installed():
     status = RuntimeStatus(
         ollama_path="/usr/bin/ollama",
         server_running=True,
-        installed_models=["qwen3:8b", "qwen2.5-coder:7b-instruct"],
+        installed_models=[ANCHOR, "qwen2.5-coder:7b-instruct"],
     )
 
     check = check_cookbook(status)
@@ -89,7 +97,7 @@ def test_check_cookbook_warns_for_off_cookbook_models():
     status = RuntimeStatus(
         ollama_path="/usr/bin/ollama",
         server_running=True,
-        installed_models=["qwen3:8b", "mistral:7b-instruct-q4_K_M"],
+        installed_models=[ANCHOR, "mistral:7b-instruct-q4_K_M"],
     )
 
     check = check_cookbook(status)
@@ -251,7 +259,7 @@ def test_run_doctor_combines_all_checks(tmp_path):
     ready_status = RuntimeStatus(
         ollama_path="/usr/bin/ollama",
         server_running=True,
-        installed_models=["qwen3:8b"],
+        installed_models=[ANCHOR],
         missing_models=[],
     )
     cbm_service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=True))
@@ -276,7 +284,7 @@ def test_first_run_checks_cover_productive_capabilities(tmp_path, monkeypatch):
     ready_status = RuntimeStatus(
         ollama_path="/usr/bin/ollama",
         server_running=True,
-        installed_models=["qwen3:8b"],
+        installed_models=[ANCHOR],
     )
     cbm_service = AbstractService(tmp_path, adapter=FakeCodebaseMemoryAdapter(available=True))
     cbm_service.ensure_ready()
@@ -372,7 +380,7 @@ def test_check_workspace_state_reports_contradictory_index_generations(tmp_path)
 def test_run_doctor_flags_problems_when_present(tmp_path):
     nested = tmp_path / "scripts" / ".shamsu"
     nested.mkdir(parents=True)
-    not_ready = RuntimeStatus(missing_models=["qwen3:8b"])
+    not_ready = RuntimeStatus(missing_models=[ANCHOR])
 
     report = run_doctor(
         workspace=tmp_path,

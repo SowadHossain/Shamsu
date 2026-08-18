@@ -24,6 +24,9 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gemma3:4b":                 131_072,
     "deepseek-r1:7b":             32_768,
     "qwen3:8b":                   32_768,
+    # Native window is 262144; the real limit is VRAM, not the model - see
+    # simple_chat.max_ctx(), which caps a call at 16384 (~6.2GB on an 8GB card).
+    "qwen3.5:9b-q4_K_M":         262_144,
     "qwen2.5:3b-instruct":        32_768,
     "qwen2.5-coder:7b-instruct":  32_768,
     "qwen2.5-coder:3b-instruct":  32_768,

@@ -24,6 +24,14 @@ from shamsu.runtime.ollama import (
     write_runtime_config,
 )
 
+# The DEFAULT tier's thinking anchor, read from the cookbook rather than
+# hardcoded: swapping the anchor (qwen3:8b -> qwen3.5:9b-q4_K_M, 2026-08-18)
+# broke 17 tests that had the old name baked in. The behaviour under test is
+# "the anchor is required/allowed/routed to", never "it is called qwen3:8b".
+from shamsu.runtime.models import ModelTier, TIER_MODEL_SPECS
+
+ANCHOR = TIER_MODEL_SPECS[ModelTier.DEFAULT][0].name
+
 
 def test_llm_manager_accepts_local_urls():
     assert LLMManager("http://localhost:11434").base_url == "http://localhost:11434"
@@ -38,14 +46,14 @@ def test_llm_manager_rejects_remote_urls():
 
 def test_only_one_model_is_required_by_default():
     """The point of the single-model default: one model to pull and keep resident."""
-    assert required_model_names() == ["qwen3:8b"]
+    assert required_model_names() == [ANCHOR]
 
 
 def test_multi_model_mode_requires_both_anchors(monkeypatch):
     monkeypatch.setenv("SHAMSU_MULTI_MODEL_MODE", "1")
     required = required_model_names()
 
-    assert required == ["qwen3:8b", "qwen2.5-coder:7b-instruct"]
+    assert required == [ANCHOR, "qwen2.5-coder:7b-instruct"]
     # SPECIALIST_MODELS is the back-compat static snapshot of the two-anchor
     # default-tier layout, so it is only meaningful in this mode.
     assert SPECIALIST_MODELS["coder"] in required
@@ -58,9 +66,9 @@ def test_single_model_mode_routes_all_roles_to_thinking_anchor(monkeypatch):
 
     # Single-model mode collapses every role onto the tier's thinking anchor,
     # which is Qwen3 8B on the default tier.
-    assert required_model_names() == ["qwen3:8b"]
-    assert model_for_role("coder") == "qwen3:8b"
-    assert model_for_role("bugfix") == "qwen3:8b"
+    assert required_model_names() == [ANCHOR]
+    assert model_for_role("coder") == ANCHOR
+    assert model_for_role("bugfix") == ANCHOR
 
 
 def test_model_cookbook_allows_anchor_models_across_all_tiers():
@@ -70,7 +78,7 @@ def test_model_cookbook_allows_anchor_models_across_all_tiers():
     # pulled under a different tier.
     allowed = allowed_model_names()
     assert "deepseek-r1:7b" in allowed
-    assert "qwen3:8b" in allowed
+    assert ANCHOR in allowed
     assert "gemma3:4b" in allowed
     assert "qwen2.5-coder:7b-instruct" in allowed
     assert "qwen2.5:3b-instruct" in allowed
@@ -78,7 +86,7 @@ def test_model_cookbook_allows_anchor_models_across_all_tiers():
     assert "mistral-nemo:12b" in allowed
     assert "qwen2.5-coder:14b" in allowed
     assert is_allowed_model("deepseek-r1:7b") is True
-    assert is_allowed_model("qwen3:8b") is True
+    assert is_allowed_model(ANCHOR) is True
     assert is_allowed_model("mistral:7b-instruct-q4_K_M") is False
 
 
@@ -127,7 +135,7 @@ def test_ollama_pull_uses_utf8_replacement_decoding(monkeypatch, tmp_path):
 
     monkeypatch.setattr("shamsu.runtime.ollama.subprocess.run", fake_run)
 
-    code, stdout, stderr = pull_model(tmp_path / "ollama.exe", "qwen3:8b")
+    code, stdout, stderr = pull_model(tmp_path / "ollama.exe", ANCHOR)
 
     assert code == 0
     assert stdout == "pulled ✓"
@@ -168,7 +176,7 @@ def test_streaming_pull_reports_progress_chunks(monkeypatch, tmp_path):
     chunks = []
     monkeypatch.setattr("shamsu.runtime.ollama.subprocess.Popen", fake_popen)
 
-    assert pull_model_streaming(tmp_path / "ollama.exe", "qwen3:8b", chunks.append) == 0
+    assert pull_model_streaming(tmp_path / "ollama.exe", ANCHOR, chunks.append) == 0
     assert chunks == ["a", "b"]
     kwargs = calls[0][1]
     assert kwargs["encoding"] == "utf-8"
@@ -188,14 +196,14 @@ def test_streaming_pull_refuses_off_cookbook_model(tmp_path):
 def test_ensure_model_available_skips_pull_when_already_installed(monkeypatch, tmp_path):
     pull_calls = []
     monkeypatch.setattr(
-        "shamsu.runtime.ollama.list_installed_models", lambda _path: ["qwen3:8b"]
+        "shamsu.runtime.ollama.list_installed_models", lambda _path: [ANCHOR]
     )
     monkeypatch.setattr(
         "shamsu.runtime.ollama.pull_model_streaming",
         lambda *args, **kwargs: pull_calls.append(args) or 0,
     )
 
-    assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is True
+    assert ensure_model_available(tmp_path / "ollama.exe", ANCHOR) is True
     assert pull_calls == []
 
 
@@ -203,7 +211,7 @@ def test_ensure_model_available_pulls_when_missing(monkeypatch, tmp_path):
     pull_calls = []
 
     def fake_list(_path):
-        return ["qwen3:8b"] if pull_calls else []
+        return [ANCHOR] if pull_calls else []
 
     def fake_pull(_path, model_name, _progress_callback=None):
         pull_calls.append(model_name)
@@ -212,8 +220,8 @@ def test_ensure_model_available_pulls_when_missing(monkeypatch, tmp_path):
     monkeypatch.setattr("shamsu.runtime.ollama.list_installed_models", fake_list)
     monkeypatch.setattr("shamsu.runtime.ollama.pull_model_streaming", fake_pull)
 
-    assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is True
-    assert pull_calls == ["qwen3:8b"]
+    assert ensure_model_available(tmp_path / "ollama.exe", ANCHOR) is True
+    assert pull_calls == [ANCHOR]
 
 
 def test_ensure_model_available_returns_false_when_pull_fails(monkeypatch, tmp_path):
@@ -222,7 +230,7 @@ def test_ensure_model_available_returns_false_when_pull_fails(monkeypatch, tmp_p
         "shamsu.runtime.ollama.pull_model_streaming", lambda *args, **kwargs: 1
     )
 
-    assert ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b") is False
+    assert ensure_model_available(tmp_path / "ollama.exe", ANCHOR) is False
 
 
 def test_ensure_model_available_refuses_off_cookbook_model(tmp_path):
@@ -247,7 +255,7 @@ def test_ensure_model_available_forwards_progress_chunks(monkeypatch, tmp_path):
     monkeypatch.setattr("shamsu.runtime.ollama.list_installed_models", lambda _path: [])
     monkeypatch.setattr("shamsu.runtime.ollama.pull_model_streaming", fake_pull)
 
-    ensure_model_available(tmp_path / "ollama.exe", "qwen3:8b", chunks.append)
+    ensure_model_available(tmp_path / "ollama.exe", ANCHOR, chunks.append)
 
     assert chunks == ["chunk"]
 
@@ -307,7 +315,7 @@ def test_streaming_pull_hides_console_window(monkeypatch, tmp_path):
 
     monkeypatch.setattr("shamsu.runtime.ollama.subprocess.Popen", fake_popen)
 
-    pull_model_streaming(tmp_path / "ollama.exe", "qwen3:8b")
+    pull_model_streaming(tmp_path / "ollama.exe", ANCHOR)
 
     assert calls[0]["creationflags"] == ollama._no_window_flags()
 

@@ -123,6 +123,9 @@ def _env_int_at_least(name: str, default: int, minimum: int) -> int:
 # Override with SHAMSU_CHAT_MAX_CTX on machines that prefill more slowly.
 _CHAT_MAX_CTX: int = _env_int_at_least("SHAMSU_CHAT_MAX_CTX", 32768, 6144)
 _CHAT_SUMMARY_BUDGET_TOKENS = 512
+# Sizes a call may request. Few and coarse on purpose: Ollama reloads the model
+# whenever num_ctx changes, so every extra bucket is another potential reload.
+_CTX_BUCKETS = (8192, 16384, 32768, 49152, 65536)
 _CHAT_PROMPT_TARGET_FRACTION = float(_os.environ.get("SHAMSU_CHAT_PROMPT_TARGET_FRACTION", "0.70"))
 _CHAT_HARD_TRIM_MARKER = "\n\n[...context hard-trimmed by SHAMSU to keep the local model responsive...]\n\n"
 
@@ -714,6 +717,9 @@ class AgentChatLoop:
         self.verify_changes = verify_changes
         self.use_model_compaction = use_model_compaction
         self._last_context_evicted = False
+        # Smallest num_ctx this session may request. Never shrinks: every change
+        # makes Ollama reload the model.
+        self._num_ctx_floor = 0
         # The clean CURRENT user request, when the caller wraps it in an
         # internal contract (composite step, PRD repair). A pending ask_user
         # must resume from this - resuming from the internal wrapper re-routes
@@ -884,6 +890,29 @@ class AgentChatLoop:
         messages, hard_trimmed = self._hard_trim_messages(messages, num_ctx)
         self._last_context_evicted = evicted_anything or hard_trimmed
         return messages
+
+    def _allocated_num_ctx(
+        self, messages: list[dict[str, Any]], tool_schema_tokens: int, ceiling: int
+    ) -> int:
+        """The num_ctx to actually request for this call.
+
+        Bucketed rather than exact: Ollama keys its loaded instance on num_ctx,
+        so a value that drifts every turn would reload the model every turn.
+        Monotonic for the same reason - once a session has grown into a bucket it
+        stays there, so the cost is at most one reload per bucket per session.
+        """
+        prompt_tokens = count_tokens(
+            "\n".join(str(message.get("content", "")) for message in messages)
+        )
+        needed = prompt_tokens + tool_schema_tokens + RESERVE_OUTPUT_TOKENS + SAFETY_MARGIN_TOKENS
+        chosen = ceiling
+        for bucket in _CTX_BUCKETS:
+            if bucket >= needed:
+                chosen = min(bucket, ceiling)
+                break
+        chosen = max(chosen, self._num_ctx_floor)
+        self._num_ctx_floor = chosen
+        return chosen
 
     def _hard_trim_messages(
         self, messages: list[dict[str, Any]], num_ctx: int
@@ -2260,12 +2289,23 @@ class AgentChatLoop:
                     seconds=self.timeout_config.step_timeout,
                 )
             self._inject_feedback(control)
-            num_ctx = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
+            ctx_ceiling = min(ctx_window_for_model(self.model_name), _CHAT_MAX_CTX)
             self._refresh_system_prompt()
             tool_schema_payload = self._native_tool_schema_payload()
             tool_schema_tokens = count_tokens(tool_schema_payload) if tool_schema_payload else 0
-            message_ctx = max(2048, num_ctx - tool_schema_tokens)
+            message_ctx = max(2048, ctx_ceiling - tool_schema_tokens)
             messages = await self.context_compiler.compile(message_ctx, written_files)
+            # Allocate for the prompt we actually built, not for the ceiling.
+            #
+            # Ollama reserves the KV cache for the WHOLE num_ctx up front, so
+            # asking for 32k costs 32k of VRAM even when the frame is 8k. Live
+            # 2026-08-17: an 8.3k frame requested 32768, the cache no longer fit
+            # beside the weights on an 8GB card, prefill fell back to system RAM
+            # and first token took 83s - which tripped the 90s timeout and killed
+            # the milestone. The window is a ceiling to grow INTO, not a floor.
+            num_ctx = self._allocated_num_ctx(
+                messages, tool_schema_tokens, ctx_ceiling
+            )
             # Show context-window usage before each model call.
             if self.budget_manager:
                 _msg_text = "\n".join(str(m.get("content", "")) for m in messages)
