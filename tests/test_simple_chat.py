@@ -3524,3 +3524,84 @@ def test_a_huge_mention_cannot_swallow_the_window(tmp_path):
     sent = loop.client.calls[0]["messages"][-1]["content"]
     assert count_tokens(sent) < MAX_MENTION_TOKENS * 1.5
     assert "read_file" in sent, "it must say how to get the rest"
+
+
+# ---------------------------------------------------------------------------
+# Per-category budget buckets (SMALLCODE plan item F)
+#
+# One total tells you the window is full and never what filled it, so the only
+# available response is to drop the OLDEST messages - which on a real session
+# evicts a user's early decisions while leaving a 2,618-token write_file
+# payload untouched.
+# ---------------------------------------------------------------------------
+
+
+def test_tool_results_are_the_majority_bucket_on_an_edit_session(tmp_path):
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    body = "const value = 1;" + chr(10)
+    for i in range(20):
+        state.append_user(f"change thing {i}")
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", body * 200))
+        state.append_tool("", "write_file", json.dumps(
+            {"ok": True, "message": "wrote", "data": {"content": body * 200}}))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    allocation = loop.token_allocation()
+
+    assert allocation.fattest() == "tool results"
+    assert allocation.tool_results > allocation.conversation
+
+
+def test_a_write_payload_is_charged_to_tools_not_to_conversation(tmp_path):
+    """Lumping the two hid the biggest items behind a label that looked like chat."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_assistant("I will write it", tool_calls=_write_call_body("a.js", "x" * 20_000))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    allocation = loop.token_allocation()
+
+    assert allocation.tool_results > 1000
+    assert allocation.conversation < 100, "the payload was counted as conversation"
+
+
+def test_a_plain_conversation_is_not_attacked_by_payload_elision(tmp_path):
+    """Eliding harder reclaims nothing when the fat bucket is the chat itself."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(60):
+        state.append_user(f"question {i} " + "words " * 200)
+        state.append_assistant(f"answer {i} " + "words " * 200)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+    said: list[str] = []
+    loop.on_activity = said.append
+
+    allocation = loop.token_allocation()
+    loop._elide_under_pressure()
+
+    assert allocation.fattest() == "conversation"
+    assert any("will not help much" in m for m in said)
+
+
+def test_the_buckets_add_up_to_what_the_budget_counts(tmp_path):
+    """The breakdown and the trimmer must never disagree about the same prompt."""
+    from shamsu.context.budget import messages_tokens, tool_schema_tokens
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(10):
+        state.append_user(f"u{i}")
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", "y" * 5000))
+        state.append_tool("", "write_file", json.dumps({"ok": True, "message": "wrote"}))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+    loop._files = workspace_files(tmp_path)
+
+    allocation = loop.token_allocation()
+    counted = (
+        messages_tokens(m.to_ollama() for m in state.all_messages)
+        + tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+        + allocation.grounding
+    )
+
+    assert abs(allocation.total - counted) <= 2, f"{allocation.total} vs {counted}"

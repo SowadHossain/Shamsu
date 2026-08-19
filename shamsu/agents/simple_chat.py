@@ -39,6 +39,7 @@ from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
 from shamsu.agents.simple_prompt import simple_system_prompt
 from shamsu.context.budget import (
     PER_MESSAGE_OVERHEAD,
+    message_tokens,
     RESERVE_OUTPUT_TOKENS,
     SAFETY_MARGIN_TOKENS,
     clamp_calibration,
@@ -565,6 +566,48 @@ def make_approval_func(console_approval: Any, *, main_loop: Any = None) -> Any:
 
 
 @dataclass
+class TokenAllocation:
+    """Where the prompt actually goes, by category rather than as one number.
+
+    One total tells you the window is full; it does not tell you what filled
+    it, so the only available response is to drop the OLDEST messages. That is
+    usually the wrong thing: measured on a real session the majority bucket was
+    tool results, not conversation, and dropping oldest evicts a user's early
+    decisions while leaving a 2,618-token `write_file` payload untouched.
+    """
+
+    system_prompt: int = 0
+    tool_schemas: int = 0
+    grounding: int = 0
+    conversation: int = 0
+    tool_results: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.system_prompt
+            + self.tool_schemas
+            + self.grounding
+            + self.conversation
+            + self.tool_results
+        )
+
+    @property
+    def buckets(self) -> dict[str, int]:
+        return {
+            "system prompt": self.system_prompt,
+            "tool schemas": self.tool_schemas,
+            "grounding": self.grounding,
+            "conversation": self.conversation,
+            "tool results": self.tool_results,
+        }
+
+    def fattest(self) -> str:
+        """The bucket eviction should attack first."""
+        return max(self.buckets.items(), key=lambda item: item[1])[0]
+
+
+@dataclass
 class ContextCounters:
     """What the context machinery actually did, per session.
 
@@ -602,6 +645,10 @@ class ContextCounters:
 # Process-wide, because a fresh SimpleChatLoop is built per user message while
 # the REPL that reports these numbers lives for the whole session.
 SESSION_COUNTERS = ContextCounters()
+
+# The most recent per-category split, for `/context meter`. A dict rather than
+# a bare global so the REPL reads whatever the last loop actually built.
+LAST_ALLOCATION: dict[str, Any] = {"value": None}
 
 
 # Warn once per session on the way UP, rather than at the wall, where the only
@@ -1277,6 +1324,7 @@ class SimpleChatLoop:
             messages.insert(len(messages) - 1, block)
         else:
             messages.append(block)
+        LAST_ALLOCATION["value"] = self.token_allocation()
         return messages
 
     def _shrink_for_oom(self) -> bool:
@@ -1357,6 +1405,39 @@ class SimpleChatLoop:
             )
         return changed
 
+    def token_allocation(self) -> TokenAllocation:
+        """Split the current prompt into the buckets that make it up.
+
+        Costed with the same `message_tokens` the budget uses, so the numbers
+        here and the numbers the trimmer acts on can never disagree - which
+        they did for as long as `tool_calls` cost nothing.
+        """
+        allocation = TokenAllocation(
+            system_prompt=count_tokens(self.state.system_prompt) + PER_MESSAGE_OVERHEAD,
+            tool_schemas=tool_schema_tokens(SIMPLE_TOOL_SCHEMAS),
+        )
+        grounding = render_workspace_files(self._files)
+        if self._brief:
+            grounding = grounding + chr(10) * 2 + self._brief
+        allocation.grounding = count_tokens(grounding) + PER_MESSAGE_OVERHEAD
+        summary = self.state.rolling_summary
+        if summary.strip():
+            allocation.grounding += count_tokens(summary) + PER_MESSAGE_OVERHEAD
+        for message in self.state.all_messages[1:]:
+            cost = message_tokens(message)
+            if message.role == "tool":
+                allocation.tool_results += cost
+            elif message.role == "assistant" and message.tool_calls:
+                # The CALL is conversation; the payload inside it is a tool
+                # cost, and lumping the two hid the biggest items in the
+                # prompt behind a label that looked like ordinary chat.
+                text_only = count_tokens(message.content) + PER_MESSAGE_OVERHEAD
+                allocation.conversation += text_only
+                allocation.tool_results += max(0, cost - text_only)
+            else:
+                allocation.conversation += cost
+        return allocation
+
     def _history_pressure(self) -> float:
         """How full the conversation already is, as a fraction of its budget."""
         budget = self._history_budget()
@@ -1373,12 +1454,25 @@ class SimpleChatLoop:
         matters is whether this turn is on course to fill the window BEFORE it
         reaches the user, which is what happened live over 24 rounds and 18
         whole-file writes.
+
+        Which bucket is fat decides how hard to sweep. Tool results are the
+        majority on any edit-heavy session and are lossless to elide, so a fat
+        one is worth attacking hard. When the conversation itself is the fat
+        bucket, eliding harder reclaims almost nothing and costs the model the
+        edit it is in the middle of - compaction is the right tool there, and
+        it runs at the turn boundary.
         """
-        keep = KEEP_VERBATIM_MESSAGES
-        if self._history_pressure() > ELIDE_PRESSURE_FRACTION:
-            keep = KEEP_VERBATIM_UNDER_PRESSURE
-            self._activity("context is filling; eliding older tool payloads")
-        return self._elide_payloads(keep)
+        if self._history_pressure() <= ELIDE_PRESSURE_FRACTION:
+            return self._elide_payloads()
+        allocation = self.token_allocation()
+        if allocation.fattest() != "tool results":
+            self._activity(
+                f"context is filling and the largest part is {allocation.fattest()}; "
+                "eliding payloads will not help much here"
+            )
+            return self._elide_payloads()
+        self._activity("context is filling; eliding older tool payloads")
+        return self._elide_payloads(KEEP_VERBATIM_UNDER_PRESSURE)
 
     def _ceiling(self) -> int:
         """The context window this session asks Ollama for.
@@ -2358,6 +2452,7 @@ __all__ = [
     "SIMPLE_TRANSCRIPT_TOOLS",
     "SimpleChatLoop",
     "SimpleChatResult",
+    "TokenAllocation",
     "build_simple_tools",
     "codebase_brief",
     "command_needs_approval",

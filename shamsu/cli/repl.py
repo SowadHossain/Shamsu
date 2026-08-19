@@ -3603,6 +3603,22 @@ def _get_budget_manager(workspace: Path, console: Console) -> ContextBudgetManag
     return mgr
 
 
+def _context_bucket_rows() -> list[str]:
+    """The per-category split of the last simple-mode prompt, if there was one."""
+    from shamsu.agents.simple_chat import LAST_ALLOCATION
+
+    allocation = LAST_ALLOCATION.get("value")
+    if allocation is None:
+        return ["  (no simple-mode prompt built yet)"]
+    total = max(1, allocation.total)
+    rows = []
+    for name, cost in sorted(allocation.buckets.items(), key=lambda kv: -kv[1]):
+        bar = "#" * round(20 * cost / total)
+        rows.append(f"  {name:<14} {cost:>7,}  {100 * cost // total:>3}%  {bar}")
+    rows.append("  fattest        " + allocation.fattest())
+    return rows
+
+
 def _handle_context(
     normalized_input: str,
     workspace: Path,
@@ -3655,6 +3671,10 @@ def _handle_context(
             f"  compactions        : {counters.compactions}",
             f"  payload elisions   : {counters.evictions}",
             f"  truncated replies  : {counters.truncations}",
+            "",
+            "[dim]Where the last prompt went (one total tells you the window is",
+            "full, never what filled it):[/dim]",
+            *_context_bucket_rows(),
             "",
             "[dim]Compactions should be RARE. A count that climbs once per turn is",
             "the same-messages-every-turn bug, not healthy behaviour. Truncated",
