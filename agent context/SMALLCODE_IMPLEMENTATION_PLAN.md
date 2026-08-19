@@ -512,3 +512,76 @@ Also worth noting for anyone reading §D's verification list: "the model can sti
 name every file it touched" cannot be tested through the prompt alone — the
 always-fresh workspace listing names every file whether history remembers it or
 not. It has to be probed with a fact only the conversation carries.
+
+---
+
+## Round two — read from smallcode's source, not from this plan's summary of it
+
+Everything above was built from §A–H, which describe smallcode. Reading
+`reference/smallcode` directly turned up four methods worth taking properly and
+one weakness in theirs worth fixing. Commit `b675488`.
+
+### 1. Hybrid search — the biggest gap this plan never mentioned
+
+`src/tools/hybrid_search.js` + `src/rag/index_store.js`. Their framing: "grep on
+steroids" — one call that fuses exact regex matching with meaning-based ranking
+over symbol-aware chunks.
+
+SHAMSU's `search_files` → `grep_files` matched with `query in line`. **A literal
+substring — not even a regex.** Measured on this repo:
+
+```
+QUERY: "the function that decides how many tokens a message costs"
+  BEFORE  0 match(es)
+  AFTER  10, top hits: token_allocation, messages_tokens, message_tokens
+
+QUERY: def _refuse_\w+   (regex)
+  BEFORE  0 match(es)
+  AFTER   2, both exact: _refuse_blind_overwrite, _refuse_unwritable_rewrite
+```
+
+The insight worth stealing is that their "embedding" is **feature hashing** —
+tokens hashed into 1024 buckets, normalised. No model, no service, pure stdlib.
+That matters here specifically: `retriever/semantic.py` needs a 274MB
+`nomic-embed-text` in Ollama and `retriever/search.py` needs the MCP server up,
+and both degrade to "no hits" when the dependency is missing — which on a fresh
+machine is always. This *meets* the "no embedding model, no vector DB"
+constraint rather than working around it.
+
+**Improved on theirs: a light stemmer.** Their tokenizer has none, so "validates
+tokens" and `validateAuthToken` are different words scoring zero — precisely the
+gap the hybrid exists to close. Guarded so `class` does not become `clas`.
+
+### 2. `shouldDisableThinking` — `src/model/thinking_budget.js`
+
+Their reasoning, which matches what was measured here: on a retry the model
+"already overthought the original solution. A fast, low-creativity retry is
+better." Thinking is now off once a turn is repairing rather than progressing.
+Note their `applyThinkingBudget` is mostly provider-detection that deliberately
+sends *nothing* to Ollama; SHAMSU's native `think=` parameter is the better
+lever and needs none of it.
+
+### 3. Evict to a TARGET, not past a cutoff — `bin/smallcode.js`
+
+They stop at `maxBudget * 0.7`. My first pass elided everything older than a
+fixed 20-message tail whether or not that was necessary. Re-measured after
+changing it: the 30-turn retention benefit is **unchanged** (71 messages against
+35) while short sessions now elide **nothing at all**. Strictly better.
+
+### 4. Efficiency ratio — `bin/token_monitor.js`
+
+Completion tokens per 100 prompt tokens. The single number that says whether the
+context work is paying off: a session whose efficiency falls as it runs is one
+filling its window with things the model is not using. `/context meter` shows it
+alongside cumulative totals.
+
+### Deliberately still not taken
+
+- **Cloud escalation** (`bin/escalation.js`) — against the prime directive.
+- **Two-stage tool routing** — a real saving at 18 tools; SHAMSU sends 7 small
+  schemas, so the payoff is small and the indirection is the routing complexity
+  simple mode exists to remove.
+- **Curated external repos** (`src/rag/curated_repos.json`) — their RAG indexes
+  Flask, Django, Express and so on as *examples*. Interesting, but it is a
+  different feature from searching the user's own project, and it wants a
+  deliberate decision rather than being smuggled in with a search fix.
