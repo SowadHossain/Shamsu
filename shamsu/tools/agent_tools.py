@@ -3279,6 +3279,32 @@ class AgentToolRegistry:
             except (OSError, UnicodeDecodeError):
                 old_content = ""
 
+        if exists and old_content == content:
+            # A write that changes nothing used to report "Overwrote main.js
+            # (+0 -0 lines, 30 total)" and `ok: true`. Live 2026-08-19 the model
+            # read that as "my fix landed", was then told by the verifier that
+            # the file was still broken, concluded something ELSE must be wrong,
+            # and sent the identical bytes again - five times, all reported as
+            # successful overwrites.
+            #
+            # `patch_file` already refuses its own version of this ("old_string
+            # and new_string are identical; nothing to change"), and this is the
+            # same event. Refusing also lets `_changed_nothing` see it: the
+            # no-op counter could not detect a no-op WRITE at all, so
+            # MAX_UNPRODUCTIVE_EDITS never moved through any of those five.
+            #
+            # Nothing is written and no transaction is opened - there is no
+            # mutation to record, and a journal full of no-ops is a journal
+            # nobody can read.
+            return ToolResult(
+                False,
+                f"No change: what you sent is byte-for-byte identical to what "
+                f"{normalized} already contains, so nothing was written. If the file "
+                "is still wrong, the fix you have in mind is not the one you sent - "
+                "read it again and change the part that is actually different.",
+                {"filepath": normalized, "identical": True, "line_count": len(content.splitlines())},
+            )
+
         request = ApprovalRequest(
             action_type="file_edit" if exists else "file_write",
             description=f"{'Overwrite' if exists else 'Create'} file: {normalized}",

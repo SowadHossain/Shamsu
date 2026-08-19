@@ -439,3 +439,72 @@ def test_nothing_resembling_the_text_says_so_plainly(tmp_path: Path):
     assert result.ok is False
     assert "Nothing in the file resembles" in result.message
     assert "read_file" in result.message
+
+
+# --- a write that changes nothing is not a success (N1) -----------------
+#
+# Live 2026-08-19, qwen2.5:3b-instruct. Five write_file calls, all byte-identical
+# to what was already on disk, every one reported "Overwrote js/main.js
+# (+0 -0 lines, 30 total)" with ok=true. The model read that as "my fix landed",
+# was told by the verifier the file was still broken, concluded something ELSE
+# was wrong, and sent the same bytes again.
+
+
+def test_writing_identical_content_is_refused(tmp_path: Path):
+    registry = _registry(tmp_path)
+    body = "function f() {" + chr(10)
+    (tmp_path / "main.js").write_text(body, encoding="utf-8")
+
+    result = registry.write_file("main.js", body, overwrite=True)
+
+    assert result.ok is False
+    assert "identical" in result.message
+    assert result.data["identical"] is True
+
+
+def test_the_refusal_says_the_fix_is_not_the_one_that_was_sent(tmp_path: Path):
+    """The model needs to know its idea was wrong, not its typing."""
+    registry = _registry(tmp_path)
+    (tmp_path / "a.js").write_text("x" + chr(10), encoding="utf-8")
+
+    result = registry.write_file("a.js", "x" + chr(10), overwrite=True)
+
+    assert "read it again" in result.message
+
+
+def test_a_no_op_write_leaves_the_file_and_writes_no_transaction(tmp_path: Path):
+    """A journal full of no-ops is a journal nobody can read."""
+    registry = _registry(tmp_path)
+    body = "const a = 1;" + chr(10)
+    (tmp_path / "a.js").write_text(body, encoding="utf-8")
+    before = sorted(p.name for p in (tmp_path / ".shamsu" / "mutations").glob("*")) if (
+        tmp_path / ".shamsu" / "mutations"
+    ).exists() else []
+
+    registry.write_file("a.js", body, overwrite=True)
+
+    after = sorted(p.name for p in (tmp_path / ".shamsu" / "mutations").glob("*")) if (
+        tmp_path / ".shamsu" / "mutations"
+    ).exists() else []
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == body
+    assert before == after
+
+
+def test_a_real_change_still_writes(tmp_path: Path):
+    """The guard must not touch the ordinary path."""
+    registry = _registry(tmp_path)
+    (tmp_path / "a.js").write_text("const a = 1;" + chr(10), encoding="utf-8")
+
+    result = registry.write_file("a.js", "const a = 2;" + chr(10), overwrite=True)
+
+    assert result.ok is True
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == "const a = 2;" + chr(10)
+
+
+def test_creating_a_new_file_is_never_a_no_op(tmp_path: Path):
+    registry = _registry(tmp_path)
+
+    result = registry.write_file("new.js", "const a = 1;" + chr(10))
+
+    assert result.ok is True
+    assert (tmp_path / "new.js").exists()
