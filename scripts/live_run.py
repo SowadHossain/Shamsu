@@ -59,6 +59,59 @@ TURNS = [
 ]
 
 
+class RecordingClient:
+    """Wraps the Ollama client to keep every prompt sent and thought received.
+
+    Item B says a truncated thought must never become permanent conversation.
+    That can only be checked against a model that thinks, and only by looking
+    at what actually went over the wire on a LATER turn.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.sent: list[list[dict]] = []
+        self.thoughts: list[str] = []
+
+    async def chat(self, **kwargs):
+        self.sent.append(kwargs.get("messages") or [])
+        raw = await self._inner.chat(**kwargs)
+        message = getattr(raw, "message", None) or (
+            raw.get("message") if isinstance(raw, dict) else None
+        )
+        thinking = ""
+        if message is not None:
+            thinking = str(
+                getattr(message, "thinking", None)
+                or (message.get("thinking") if isinstance(message, dict) else "")
+                or ""
+            )
+        if thinking.strip():
+            self.thoughts.append(thinking.strip())
+        return raw
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def thinking_leaked_into_a_prompt(self) -> list[str]:
+        """Thoughts that later came back as conversation content.
+
+        Only counts a thought seen BEFORE the prompt that carries it - a model
+        quoting itself inside one turn is not the bug. Compared on a long
+        prefix so trivial overlaps ("Let me") do not register.
+        """
+        leaks = []
+        for index, messages in enumerate(self.sent):
+            earlier = self.thoughts[: max(0, index)]
+            for thought in earlier:
+                probe = thought[:200].strip()
+                if len(probe) < 60:
+                    continue
+                for message in messages:
+                    content = str(message.get("content") or "")
+                    if probe and probe in content:
+                        leaks.append(probe[:120])
+        return leaks
+
 def build(workspace: Path, client, tools):
     from shamsu.agents.simple_chat import SimpleChatLoop
 
@@ -86,7 +139,7 @@ async def main() -> int:
         shutil.rmtree(WS, ignore_errors=True)
     WS.mkdir(parents=True, exist_ok=True)
 
-    client = _default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig())
+    client = RecordingClient(_default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig()))
     # --approval allow: every mutating tool is auto-approved, so nothing blocks
     # on stdin. This is the documented headless posture.
     tools = build_simple_tools(WS, console_approval=lambda request: True)
@@ -183,12 +236,28 @@ async def main() -> int:
     ok["RECALL: the port survived 4 turns"] = "8731" in str(last.get("final", ""))
     ok["no turn stopped on a guard"] = all(not r["stopped"] for r in turns)
     ok["all 5 turns completed"] = len(turns) == len(TURNS)
+    # Only meaningful against a model that thinks; vacuously true otherwise,
+    # and reported as such so nobody reads a blank as a pass.
+    leaks = client.thinking_leaked_into_a_prompt()
+    label = (
+        "B thinking never replayed as conversation"
+        if client.thoughts
+        else "B thinking never replayed (VACUOUS - model produced no thinking)"
+    )
+    ok[label] = not leaks
+    if leaks:
+        print("  LEAKED THOUGHTS:")
+        for leak in leaks[:3]:
+            print(f"    {leak!r}")
+    print(f"\n  thinking blocks seen: {len(client.thoughts)}")
 
     for name, passed in ok.items():
         print(f"  {'PASS' if passed else 'FAIL'}  {name}")
 
     out = WS / "live_report.json"
-    out.write_text(json.dumps({"model": MODEL, "turns": report, "verdicts": ok}, indent=2, default=str), encoding="utf-8")
+    ok_report = {"model": MODEL, "turns": report, "verdicts": ok,
+                 "thinking_blocks": len(client.thoughts)}
+    out.write_text(json.dumps(ok_report, indent=2, default=str), encoding="utf-8")
     print(f"\nreport: {out}")
     print(f"score: {sum(1 for v in ok.values() if v)}/{len(ok)}")
     return 0
