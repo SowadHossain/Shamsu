@@ -31,6 +31,9 @@ Companion docs: `SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
 | [G2](#g2) | Graph indexes `reference/`, `other peoples work/`, `legacy-code/` and answers out of them | **high** | graph |
 | [L3](#l3) | Tool schemas are **57–81% of every prompt**; two-stage routing is off at 32k | **high** | context |
 | [W1](#w1) | `.shamsu/` records the same turn four times; `paths.py` governs 7 of its 13 entries | medium | structure |
+| [W2](#w2) | **No session retention** — 127 sessions / 9.9 MB in one workspace, never pruned | medium | structure |
+| [W3](#w3) | Session files carry conversation content with default permissions | low | security |
+| [W0](#w0) | Global workspace tracking: neither project does it — answered, not a defect | info | structure |
 | [G3](#g3) | Graph answers are truncated in arrival order, not ranked by relevance | medium | graph |
 | [L2](#l2) | Token estimate runs **~15% heavy** on qwen2.5 | medium | context |
 | [L4](#l4) | Small model thrashes — 8 rounds / 292s to write a one-line file | medium | agent loop |
@@ -387,6 +390,107 @@ documented an intent and never got the enforcement that would hold it.
 
 Do **not** follow smallcode into three root directories. One `.shamsu/` is the
 better call and is already ours.
+
+---
+
+<a name="w0"></a>
+## W0 — neither project tracks workspaces globally · ANSWERED, NOT AN ISSUE
+
+Checked because it was assumed the other way round: *"smallcode tracks all the
+workspaces and their sessions at the home directory it was installed to."*
+
+**It does not, and neither do we.**
+
+| | smallcode | SHAMSU |
+|---|---|---|
+| sessions | `.smallcode/sessions/` **per project** | `.shamsu/sessions/` **per project** |
+| home directory holds | config, skills, plugins, `mcp.json` | config, `bin/`, `cache/`, `tools/`, `runtime/` |
+| global session registry | none | none |
+
+`~/.smallcode` **does not exist on this machine at all** — their home usage is
+`~/.config/smallcode/` for configuration and plugins, nothing per-session.
+
+SHAMSU's `~/.shamsu/runtime/sessions/` looks like a registry and is not one: it
+holds `<pid>.pid` files whose only job is deciding whether the exiting REPL is
+the last one running, so Ollama can be unloaded. Dead entries are pruned by a
+liveness check on read.
+
+### The one thing that *is* global is ours, and it is the problem
+
+The code graph. `codebase-memory-mcp` keeps a **single global store keyed by
+mangled absolute path**, which is how it came to hold 239 projects including
+every temp directory a test ever ran in — see [G1](#g1). smallcode's engine
+writes `.code-graph/graph.db` inside the project, so it structurally cannot
+accumulate that way.
+
+So the intuition was right that something tracks every workspace from one place.
+It is SHAMSU, it is only the graph, and it is unbounded.
+
+### Also checked, and safe
+
+`~/.shamsu/runtime/ollama-owner.json` holds `serve_pid 14152` from 2026-08-04
+and **that process is dead**. The marker is what authorises SHAMSU to stop an
+Ollama server it started, so a stale one pointing at a PID since reused would be
+a real hazard. It is not: `runtime/ollama.py:237` checks `pid_alive(serve_pid)`
+before acting. The file is never cleaned up when the PID dies — cosmetic only.
+
+---
+
+<a name="w2"></a>
+## W2 — sessions accumulate forever · MEDIUM
+
+Measured across the test workspaces:
+
+```
+sessions   workspace
+     127   openbazaar-build      9.9 MB of sessions, 27 MB of .shamsu
+       2   test1
+       2   openbazaar-telegram-smoke
+```
+
+Oldest surviving session in that workspace is `20260802-213327-7f01` — **17 days
+old and still on disk**. Nothing prunes.
+
+smallcode caps it, in nine characters:
+
+```js
+const MAX_SESSIONS = 50;          // src/session/persistence.js
+```
+
+`shamsu/session/manager.py:1225` acknowledges the problem in a comment —
+*"Disk growth is a retention problem"* — and there is no policy anywhere that
+acts on it.
+
+This compounds W1: a workspace already writes the same turn into four stores,
+and then keeps every one of them indefinitely.
+
+**Fix:** a session cap with pruning, the way theirs works. Prune oldest-first,
+never touch the session currently open, and keep the append-only archive
+guarantee intact for whatever survives — the archive is the thing
+`history_search` reaches across, so the cap has to be a deliberate number rather
+than a side effect.
+
+---
+
+<a name="w3"></a>
+## W3 — session files are written with default permissions · LOW
+
+smallcode sets mode `0o600` on its session directory and files, with the reason
+in the line above it:
+
+```js
+// File mode 0o600: owner read/write only — sessions contain conversation
+```
+
+SHAMSU's session code contains no `chmod` and no mode argument. Its sessions
+hold the same thing: full conversation content, file contents the model read,
+and command output.
+
+**Honest scope:** on Windows, where this was measured, POSIX modes are largely
+inert and NTFS ACLs do the real work — so this is close to a no-op on the
+machine in question. It matters on a shared POSIX host, and on any machine where
+a workspace lives somewhere world-readable. Low severity, cheap fix, worth doing
+when W2 is done since both live in the same module.
 
 ---
 
