@@ -22,6 +22,9 @@ node_modules/
 site-packages/
 target/
 venv/
+other peoples work/little-coder/
+other peoples work/SmallCTL/
+reference/smallcode/
 .DS_Store
 .cbmignore
 .codebase-memory.json
@@ -52,3 +55,9 @@ venv/
 *.woff2
 *.zip
 # END SHAMSU MANAGED EXCLUSIONS
+
+# --- this repo's own rules, outside the managed block ---
+# SHAMSU's archived v1 tree. Not third-party, so the nested-repository rule
+# cannot see it, and not a name worth hardcoding into every workspace - it is
+# simply dead code that must not answer questions about live code.
+legacy-code/

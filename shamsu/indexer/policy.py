@@ -229,16 +229,81 @@ def workspace_manifest(workspace_root: Path) -> dict[str, int | str]:
     }
 
 
-def cbm_ignore_rules() -> list[str]:
-    """Rules for Codebase-Memory's supported project-local `.cbmignore`."""
+# How deep to look for a repository nested inside the workspace. Vendored code
+# lives one or two levels down (`reference/smallcode`, `other peoples work/
+# SmallCTL`); deeper than that and the scan costs more than it saves.
+NESTED_REPO_SCAN_DEPTH = 3
+
+
+def nested_repository_dirs(workspace_root: Path) -> list[str]:
+    """Directories inside the workspace that are their own repository.
+
+    A git repository inside your repository is somebody else's code - a clone,
+    a vendored dependency, a reference copy - and indexing it means the graph
+    answers questions about it as though it were yours.
+
+    Live on this repo:
+
+        graph_search("message_tokens")
+        -> _estimate_emitted_message_tokens
+           other peoples work/SmallCTL/src/smallctl/context/assembler.py
+
+    Wrong function, wrong project; the real `message_tokens` in
+    `shamsu/context/budget.py` was missed entirely. All three offending trees -
+    `reference/smallcode`, `other peoples work/SmallCTL` and `.../little-coder` -
+    turned out to be clones carrying their own `.git`.
+
+    Detected rather than named, on purpose. The obvious fix is to add
+    `reference/` to `DEFAULT_EXCLUDED_DIRS`, but that set is matched against
+    EVERY path part, so it would silently drop a directory called `reference`
+    from every other workspace SHAMSU is ever pointed at. "Is its own
+    repository" is a fact about the tree, and it is true wherever it is found.
+    """
+    root = Path(workspace_root).resolve()
+    found: list[str] = []
+
+    def walk(directory: Path, depth: int) -> None:
+        if depth > NESTED_REPO_SCAN_DEPTH:
+            return
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir():
+                continue
+            if entry.name in DEFAULT_EXCLUDED_DIRS:
+                continue
+            if (entry / ".git").exists():
+                found.append(entry.relative_to(root).as_posix() + "/")
+                continue          # its contents go with it
+            walk(entry, depth + 1)
+
+    walk(root, 1)
+    return found
+
+
+def cbm_ignore_rules(workspace_root: Path | None = None) -> list[str]:
+    """Rules for Codebase-Memory's supported project-local `.cbmignore`.
+
+    Given a workspace, nested repositories are excluded too - see
+    `nested_repository_dirs`. Without one the static rules come back unchanged,
+    so every existing caller keeps the behaviour it had.
+    """
     directory_rules = [f"{name}/" for name in sorted(DEFAULT_EXCLUDED_DIRS)]
-    return [*directory_rules, *sorted(DEFAULT_EXCLUDED_FILES), *sorted(DEFAULT_EXCLUDED_PATTERNS)]
+    nested = nested_repository_dirs(workspace_root) if workspace_root is not None else []
+    return [
+        *directory_rules,
+        *nested,
+        *sorted(DEFAULT_EXCLUDED_FILES),
+        *sorted(DEFAULT_EXCLUDED_PATTERNS),
+    ]
 
 
 def ensure_cbm_ignore(workspace_root: Path) -> dict[str, object]:
     """Install/update SHAMSU's block while preserving user-authored rules."""
     path = Path(workspace_root).resolve() / ".cbmignore"
-    managed = "\n".join([_CBM_BEGIN, *cbm_ignore_rules(), _CBM_END])
+    managed = "\n".join([_CBM_BEGIN, *cbm_ignore_rules(path.parent), _CBM_END])
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""
         if _CBM_BEGIN in existing and _CBM_END in existing:

@@ -78,3 +78,94 @@ def test_context_preview_records_the_code_memory_index_version(tmp_path: Path):
     assert preview["code_memory_index"]["stale"] is False
     assert preview["code_memory_index"]["manifest_hash"]
     assert preview["code_memory_index"]["policy_version"] == 1
+
+
+# --- vendored clones must not answer for this project (G2) --------------
+#
+# Reproduced live on this repo before the fix:
+#   graph_search("message_tokens")
+#     -> _estimate_emitted_message_tokens
+#        other peoples work/SmallCTL/src/smallctl/context/assembler.py
+# Wrong function, wrong project; the real one in shamsu/context/budget.py was
+# missed entirely.
+
+
+def _repo(root: Path, relative: str) -> Path:
+    directory = root / relative
+    (directory / ".git").mkdir(parents=True)
+    (directory / "assembler.py").write_text("def message_tokens():\n    ...\n", encoding="utf-8")
+    return directory
+
+
+def test_a_clone_inside_the_workspace_is_not_indexed(tmp_path: Path):
+    from shamsu.indexer.policy import nested_repository_dirs
+
+    _repo(tmp_path, "reference/smallcode")
+    _repo(tmp_path, "other peoples work/SmallCTL")
+    (tmp_path / "shamsu").mkdir()
+    (tmp_path / "shamsu" / "budget.py").write_text("def message_tokens():\n    ...\n", encoding="utf-8")
+
+    found = nested_repository_dirs(tmp_path)
+
+    assert "reference/smallcode/" in found
+    assert "other peoples work/SmallCTL/" in found
+    assert not any(f.startswith("shamsu/") for f in found), "this project's own code stays"
+
+
+def test_a_directory_called_reference_is_not_excluded_by_its_name(tmp_path: Path):
+    """The obvious fix - adding `reference/` to DEFAULT_EXCLUDED_DIRS - would
+    silently drop a directory of that name from every other workspace, because
+    that set is matched against every path part."""
+    from shamsu.indexer.policy import nested_repository_dirs
+
+    (tmp_path / "reference").mkdir()
+    (tmp_path / "reference" / "tables.py").write_text("RATES = {}\n", encoding="utf-8")
+
+    assert nested_repository_dirs(tmp_path) == []
+
+
+def test_the_workspaces_own_git_is_not_mistaken_for_a_nested_one(tmp_path: Path):
+    from shamsu.indexer.policy import nested_repository_dirs
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "src").mkdir()
+
+    assert nested_repository_dirs(tmp_path) == []
+
+
+def test_nested_repositories_reach_the_generated_cbmignore(tmp_path: Path):
+    from shamsu.indexer.policy import ensure_cbm_ignore
+
+    _repo(tmp_path, "reference/smallcode")
+
+    ensure_cbm_ignore(tmp_path)
+
+    assert "reference/smallcode/" in (tmp_path / ".cbmignore").read_text(encoding="utf-8")
+
+
+def test_a_user_rule_outside_the_managed_block_survives_regeneration(tmp_path: Path):
+    """`legacy-code/` is this repo's own archived tree - no `.git`, so the
+    nested-repository rule cannot see it, and not a name worth hardcoding into
+    every workspace either."""
+    from shamsu.indexer.policy import ensure_cbm_ignore
+
+    ensure_cbm_ignore(tmp_path)
+    path = tmp_path / ".cbmignore"
+    path.write_text(path.read_text(encoding="utf-8") + "\nlegacy-code/\n", encoding="utf-8")
+
+    _repo(tmp_path, "reference/smallcode")
+    ensure_cbm_ignore(tmp_path)
+
+    body = path.read_text(encoding="utf-8")
+    assert "legacy-code/" in body
+    assert "reference/smallcode/" in body
+
+
+def test_the_scan_is_bounded(tmp_path: Path):
+    """A deep tree must not turn ignore-file generation into a full walk."""
+    from shamsu.indexer.policy import NESTED_REPO_SCAN_DEPTH, nested_repository_dirs
+
+    deep = tmp_path.joinpath(*[f"level{i}" for i in range(NESTED_REPO_SCAN_DEPTH + 3)])
+    (deep / ".git").mkdir(parents=True)
+
+    assert nested_repository_dirs(tmp_path) == []

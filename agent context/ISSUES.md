@@ -31,7 +31,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [C9](TRUNCATED_FILES_REPORT.md) | Harness nudges recorded as "you asked" in the compaction digest | medium | context |
 | [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
-| [G2](#g2) | Graph indexes `reference/`, `other peoples work/`, `legacy-code/` and answers out of them | **high** | graph |
 | [W1](#w1) | `.shamsu/` records the same turn four times; `paths.py` governs 7 of its 13 entries | medium | structure |
 | [W2](#w2) | **No session retention** — 127 sessions / 9.9 MB in one workspace, never pruned | medium | structure |
 | [W3](#w3) | Session files carry conversation content with default permissions | low | security |
@@ -59,6 +58,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `4e70775` |
 | [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `9cbdde9` |
 | [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `d1ba009` |
+| [G2](#g2) | Graph indexed `reference/`, `other peoples work/`, `legacy-code/` and answered out of them | `b1f81bf`+1 |
 | [M1](#m1) | **Memory was only written if the model volunteered** — a real 2-turn run produced none | `7284641`+1 |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail was 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | `8bc7f6c`+1 |
 | [L3](#l3) | Tool schemas were a flat **2,111 tokens on every call** — 85% of a fresh 3B prompt. Measured, then gated by relevance | `ac256c1`+1 |
@@ -521,9 +521,30 @@ To its credit it *declared* the staleness (`"the code graph is out of date...
 honest wrong answer is still wrong, and this is the tool whose entire purpose is
 to stop the model reading files and guessing.
 
-**Fix:** add those three directories to `cbm_ignore_rules()` at
+**Fix as proposed:** add those three directories to `cbm_ignore_rules()` at
 `shamsu/indexer/policy.py:232`; `ensure_cbm_ignore()` (line 238) regenerates
 `.cbmignore` from it automatically. Then re-index.
+
+**Fix as built,** because the proposal does not survive contact with other
+workspaces: `DEFAULT_EXCLUDED_DIRS` is matched against EVERY path part, so
+adding `reference/` would silently drop a directory of that name from every
+workspace SHAMSU is ever pointed at - and `reference/` is an ordinary name.
+
+All three offending trees turned out to be clones carrying their own `.git`:
+
+```
+reference/smallcode/.git
+other peoples work/SmallCTL/.git
+other peoples work/little-coder/.git
+```
+
+So the rule is **"is its own repository"**, detected per workspace rather than
+named - a fact about the tree, true wherever it is found, and safe everywhere.
+`legacy-code/` has no `.git` because it is SHAMSU's own archived v1 tree; it
+goes in `.cbmignore`'s user section, which `ensure_cbm_ignore` preserves across
+regeneration, and there is a test for that.
+
+Still to do: **re-index**, which is G1.
 
 ---
 
