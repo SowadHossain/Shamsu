@@ -276,7 +276,14 @@ SIMPLE_TOOLS: dict[str, str] = {
     # Handled inside `_execute`, not by the registry: it writes a scratchpad,
     # not a workspace file, and routing it through `write_file` would put it
     # behind the patch-first guard and the sandbox path rules for no reason.
-    "remember": "remember",
+    # Handled inside `_execute`, not by the registry. Names and shapes follow
+    # smallcode `bin/tools.js` so the vocabulary is one a model has likely met.
+    "memory_remember": "memory_remember",
+    "memory_load": "memory_load",
+    "memory_list": "memory_list",
+    "memory_forget": "memory_forget",
+    "graph_search": "graph_search",
+    "explain_symbol": "explain_symbol",
 }
 
 SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -392,31 +399,107 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "remember",
+            "name": "memory_remember",
             "description": (
-                "Keep one durable fact about this project for later turns. Use it when you decide something, discover a trap, or learn how this project is built - not for things only this turn cares about."
+                "Save durable knowledge about this project: a decision, a workflow, a "
+                "gotcha, a convention. Only things that should outlive this conversation "
+                "- not a summary of what you just did."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "type": {
-                        "type": "string",
-                        "enum": list(MEMORY_TYPES),
-                        "description": (
-                            "decision (a choice to respect), workflow (how to build/run/test), "
-                            "gotcha (a trap and its workaround), convention (naming, layout, style), "
-                            "context (what the project is)."
-                        ),
-                    },
+                    "type": {"type": "string", "enum": list(MEMORY_TYPES),
+                             "description": "Which kind of knowledge this is."},
                     "title": {"type": "string", "description": "A few words naming the fact."},
                     "content": {"type": "string", "description": "The fact itself, one or two sentences."},
-                    "tags": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional words that should bring this back later.",
-                    },
+                    "tags": {"type": "array", "items": {"type": "string"},
+                             "description": "Optional words that should bring this back later."},
                 },
                 "required": ["type", "title", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_load",
+            "description": (
+                "Load what was remembered about this project that bears on a task - past "
+                "decisions, workflows, conventions and gotchas. Worth calling before "
+                "starting anything substantial."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "What you are about to do."}
+                },
+                "required": ["task"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_list",
+            "description": (
+                "List everything remembered about this project."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "Optional: only this kind."}
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_forget",
+            "description": (
+                "Delete one remembered note by its id, once it has become wrong."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "The note id."}
+                },
+                "required": ["id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_search",
+            "description": (
+                "Search the code graph for a symbol, function or class and get back where "
+                "it lives. Answers where-is-the-auth-logic without reading files. Needs "
+                "the workspace to have been indexed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Symbol name or concept."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explain_symbol",
+            "description": (
+                "Where a symbol is defined and WHO CALLS IT. The callers cannot be got "
+                "from a text search - that finds the string, this finds the call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "description": "The symbol to explain."}
+                },
+                "required": ["symbol"],
             },
         },
     },
@@ -448,6 +531,8 @@ SIMPLE_TRANSCRIPT_TOOLS = frozenset(SIMPLE_TOOLS) | {"verify"}
 # Accepting them is strictly better than refusing: same sandbox, same ledger,
 # same six implementations - just a name the model already believes in.
 _TOOL_NAME_ALIASES: dict[str, str] = {
+    # The one-word spelling shipped first and a model will keep reaching for it.
+    "remember": "memory_remember",
     "file.read": "read_file",
     "file.write": "write_file",
     "file.patch": "patch_file",
@@ -1781,21 +1866,10 @@ class SimpleChatLoop:
             if hybrid is not None:
                 return hybrid
 
-        if name == "remember":
-            from shamsu.agents.simple_memory import remember
-
-            tags = arguments.get("tags")
-            ok, message = remember(
-                self.workspace,
-                str(arguments.get("type") or "context"),
-                str(arguments.get("title") or ""),
-                # `note` is the old single-field spelling and the one a model
-                # reaches for anyway; accepting it costs nothing and saves a
-                # failed round.
-                str(arguments.get("content") or arguments.get("note") or ""),
-                [str(t) for t in tags] if isinstance(tags, list) else None,
-            )
-            return ToolResult(ok, message, {"tool": "remember"})
+        if name.startswith("memory_"):
+            return self._memory_tool(name, arguments)
+        if name in {"graph_search", "explain_symbol"}:
+            return self._graph_tool(name, arguments)
         target = SIMPLE_TOOLS.get(name)
         if target is None:
             return ToolResult(
@@ -1827,6 +1901,73 @@ class SimpleChatLoop:
         if before is not None and result.ok:
             return self._with_diff(arguments, before, result)
         return result
+
+    def _memory_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """The four memory tools, shaped as smallcode shapes them.
+
+        Writing was the only half that existed. A model could record a
+        decision and then had no way to ask what it had recorded, or to
+        correct one that had gone stale - so memory was write-only, which is
+        not memory.
+        """
+        from shamsu.agents.simple_graph import format_notes
+        from shamsu.agents.simple_memory import MemoryStore, render_memory
+
+        if name == "memory_remember":
+            from shamsu.agents.simple_memory import remember
+
+            tags = arguments.get("tags")
+            ok, message = remember(
+                self.workspace,
+                str(arguments.get("type") or "context"),
+                str(arguments.get("title") or ""),
+                # `note` is the one-word spelling that shipped first and the
+                # one a model reaches for anyway.
+                str(arguments.get("content") or arguments.get("note") or ""),
+                [str(t) for t in tags] if isinstance(tags, list) else None,
+            )
+            return ToolResult(ok, message, {"tool": name})
+
+        if name == "memory_load":
+            task = str(arguments.get("task") or arguments.get("query") or "")
+            block = render_memory(self.workspace, task)
+            return ToolResult(
+                True,
+                block or "Nothing remembered about this project bears on that.",
+                {"tool": name},
+            )
+
+        if name == "memory_list":
+            wanted = str(arguments.get("type") or "").strip().lower()
+            notes = MemoryStore(self.workspace).all_notes()
+            if wanted:
+                notes = [note for note in notes if note.type == wanted]
+            return ToolResult(True, format_notes(notes), {"tool": name, "count": len(notes)})
+
+        if name == "memory_forget":
+            ok, message = MemoryStore(self.workspace).forget(str(arguments.get("id") or ""))
+            return ToolResult(ok, message, {"tool": name})
+
+        return ToolResult(False, f"There is no tool called {name}.", {"tool": name})
+
+    def _graph_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """Let the model ask the code graph SHAMSU already maintains.
+
+        It indexes a workspace into a graph and then never gave the model a way
+        to query it, so the model read files and guessed at what calls what -
+        which is the thing the graph exists to prevent.
+        """
+        from shamsu.agents.simple_graph import explain_symbol, graph_search
+
+        if name == "graph_search":
+            ok, message = graph_search(
+                self.workspace, str(arguments.get("query") or arguments.get("pattern") or "")
+            )
+        else:
+            ok, message = explain_symbol(
+                self.workspace, str(arguments.get("symbol") or arguments.get("query") or "")
+            )
+        return ToolResult(ok, message, {"tool": name})
 
     def _hybrid_search(self, arguments: dict[str, Any]) -> ToolResult | None:
         """Search by meaning and by pattern in one call.

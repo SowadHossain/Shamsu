@@ -189,16 +189,20 @@ def test_an_unknown_tool_is_answered_with_the_names_that_exist(tmp_path):
     assert "write_file" in tool_messages[0]["content"]
 
 
-def test_only_the_seven_tools_are_offered(tmp_path):
+def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
     loop = _loop(tmp_path, [_text("ok")])
     asyncio.run(loop.run("hi"))
 
     offered = {t["function"]["name"] for t in loop.client.calls[0]["tools"]}
     assert offered == {
         "read_file", "list_files", "search_files", "write_file", "patch_file",
-        "run_command", "remember",
+        "run_command",
+        # memory and code graph, named as smallcode names them
+        "memory_remember", "memory_load", "memory_list", "memory_forget",
+        "graph_search", "explain_symbol",
     }
-    assert offered == set(SIMPLE_TOOLS)
+    # `remember` is an accepted alias, not an offered tool.
+    assert offered == {n for n in SIMPLE_TOOLS if n != "remember"}
 
 
 # --- verification -------------------------------------------------------
@@ -2035,15 +2039,22 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
         required = (function.get("parameters") or {}).get("required", [])
         if name in {"write_file", "patch_file", "run_command"}:
             continue  # mutating/shell: covered by their own tests
-        if name == "remember":
-            # Not a registry tool: it writes typed project notes, not a
-            # workspace file. Same contract though - the schema names must
+        if name.startswith("memory_") or name in {"graph_search", "explain_symbol"}:
+            # Not registry tools: they reach project memory and the code graph,
+            # not the workspace. Same contract though - the schema names must
             # reach the implementation.
             loop = _loop(tmp_path, [_text("ok")])
-            assert loop._execute(
-                "remember",
-                {"type": "decision", "title": "a title", "content": "a fact"},
-            ).ok
+            probe = {
+                "memory_remember": {"type": "decision", "title": "t", "content": "c"},
+                "memory_load": {"task": "anything"},
+                "memory_list": {},
+                "memory_forget": {"id": "nope"},
+                "graph_search": {"query": "anything"},
+                "explain_symbol": {"symbol": "anything"},
+            }[name]
+            result = loop._execute(name, probe)
+            # memory_forget on a missing id is a legitimate no.
+            assert result.ok or name == "memory_forget", f"{name} -> {result.message}"
             continue
         arguments = {key: "hello.py" if "file" in key else "value" for key in required}
         normalized = normalize_arguments(name, arguments)
@@ -3913,3 +3924,96 @@ def test_a_corrupt_memory_index_is_kept_not_overwritten(tmp_path):
     assert "not json" in spoiled.read_text(encoding="utf-8")
     # And the store keeps working rather than refusing every turn from here on.
     assert any(n.title == "a later note" for n in MemoryStore(tmp_path).all_notes())
+
+
+# ---------------------------------------------------------------------------
+# The same tool roster smallcode exposes: 4 memory tools + 2 code-graph tools
+# ---------------------------------------------------------------------------
+
+
+def test_memory_is_no_longer_write_only(tmp_path):
+    """Writing was the only half that existed, which is not memory."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    loop._execute("memory_remember", {"type": "workflow", "title": "tests",
+                                      "content": "Run pytest from the repo root."})
+    loaded = loop._execute("memory_load", {"task": "how do I run the tests?"})
+    listed = loop._execute("memory_list", {})
+
+    assert "pytest" in loaded.message
+    assert "[workflow]" in loaded.message
+    assert "tests" in listed.message
+
+
+def test_a_note_that_went_wrong_can_be_deleted(tmp_path):
+    from shamsu.agents.simple_memory import MemoryStore
+
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._execute("memory_remember", {"type": "decision", "title": "old port",
+                                      "content": "The port is 3000."})
+    note_id = MemoryStore(tmp_path).all_notes()[0].id
+
+    result = loop._execute("memory_forget", {"id": note_id})
+
+    assert result.ok
+    assert MemoryStore(tmp_path).all_notes() == []
+
+
+def test_memory_list_can_be_filtered_by_type(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._execute("memory_remember", {"type": "gotcha", "title": "g", "content": "A trap."})
+    loop._execute("memory_remember", {"type": "decision", "title": "d", "content": "A choice."})
+
+    only = loop._execute("memory_list", {"type": "gotcha"})
+
+    assert "A trap." in only.message
+    assert "A choice." not in only.message
+
+
+def test_the_one_word_remember_spelling_still_works(tmp_path):
+    """It shipped first and a model will keep reaching for it."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("remember", {"type": "context", "title": "t", "content": "A fact."})
+
+    assert result.ok
+
+
+def test_graph_tools_say_so_plainly_when_there_is_no_index(tmp_path):
+    """Most workspaces are never indexed; raising there would be useless."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    search = loop._execute("graph_search", {"query": "anything"})
+    explain = loop._execute("explain_symbol", {"symbol": "anything"})
+
+    assert search.ok and explain.ok
+    for result in (search, explain):
+        assert "search_files" in result.message, "it must name what to use instead"
+
+
+def test_a_stale_graph_answer_is_labelled_stale(tmp_path, monkeypatch):
+    """A stale index gives confidently wrong answers that look authoritative."""
+    from shamsu.agents import simple_graph
+
+    monkeypatch.setattr(simple_graph, "_adapter", lambda: _FakeGraph())
+    ok, message = simple_graph.graph_search(tmp_path, "handler")
+
+    assert ok
+    assert "handler" in message
+    assert "out of date" in message, "nothing warned that the graph predates the code"
+
+
+class _FakeGraph:
+    def is_available(self, workspace):
+        return True
+
+    def query(self, workspace, query, limit=15):
+        return {"ok": True, "data": {"results": [
+            {"name": "handler", "file_path": "app/views.py", "start_line": 12}
+        ]}}
+
+    def get_symbols(self, workspace, name):
+        return self.query(workspace, name)
+
+    def get_references(self, workspace, name):
+        return {"ok": True, "data": {"results": []}}
