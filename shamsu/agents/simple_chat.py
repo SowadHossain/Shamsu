@@ -284,6 +284,13 @@ SIMPLE_TOOLS: dict[str, str] = {
     "memory_forget": "memory_forget",
     "graph_search": "graph_search",
     "explain_symbol": "explain_symbol",
+    # The archive is lossless on disk; this is what makes it reachable.
+    "history_search": "history_search",
+    # From smallcode `bin/tools.js`. `append_file` is the one that matters:
+    # it gives the model a way to BUILD a large file (skeleton, then sections)
+    # rather than only being told it may not rewrite one.
+    "append_file": "append_file",
+    "find_files": "find_files",
 }
 
 SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -500,6 +507,59 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "symbol": {"type": "string", "description": "The symbol to explain."}
                 },
                 "required": ["symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "history_search",
+            "description": (
+                "Search everything ever said in this conversation, including turns long "
+                "since dropped from the window and sessions this one was forked from. Use "
+                "it when the user refers to something decided earlier that you cannot see."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What was being discussed."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "append_file",
+            "description": (
+                "Add content to the END of an existing file. This is how you build a large "
+                "file: write_file the first section, then append_file each one after. Far "
+                "safer than rewriting a whole file, and it cannot be cut off partway."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "description": "Path relative to the workspace."},
+                    "content": {"type": "string", "description": "The text to add at the end."},
+                },
+                "required": ["filepath", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": (
+                "Find files by glob pattern, e.g. **/*.py or src/**/test_*.js."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern."}
+                },
+                "required": ["pattern"],
             },
         },
     },
@@ -1870,6 +1930,12 @@ class SimpleChatLoop:
             return self._memory_tool(name, arguments)
         if name in {"graph_search", "explain_symbol"}:
             return self._graph_tool(name, arguments)
+        if name == "history_search":
+            return self._history_search(arguments)
+        if name == "append_file":
+            return self._append_file(arguments)
+        if name == "find_files":
+            return self._find_files(arguments)
         target = SIMPLE_TOOLS.get(name)
         if target is None:
             return ToolResult(
@@ -1901,6 +1967,114 @@ class SimpleChatLoop:
         if before is not None and result.ok:
             return self._with_diff(arguments, before, result)
         return result
+
+    def _history_search(self, arguments: dict[str, Any]) -> ToolResult:
+        """Search everything ever said, not just what still fits.
+
+        The transcript has always been lossless on disk and completely out of
+        reach: older turns survive as a few summary lines, so a decision from
+        turn three was gone the moment the window moved past it. Nothing was
+        lost - it just could not be got back. This gets it back, at the cost
+        of the handful of lines that answer the question.
+        """
+        query = str(arguments.get("query") or arguments.get("task") or "").strip()
+        if not query:
+            return ToolResult(False, "Say what to look for in the history.", {})
+        if self.session_logger is None:
+            return ToolResult(
+                True,
+                "This conversation is not being recorded, so there is no history to search.",
+                {"matches": []},
+            )
+        try:
+            from shamsu.session.history import render_hits, search_history
+
+            hits = search_history(
+                self.session_logger.manager,
+                self.session_logger.session_id,
+                query,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False, f"Could not search the history: {exc}", {})
+        return ToolResult(
+            True,
+            render_hits(hits, query),
+            {"query": query, "matches": len(hits)},
+        )
+
+    def _append_file(self, arguments: dict[str, Any]) -> ToolResult:
+        """Add to the end of a file, so a big one can be built in pieces.
+
+        SHAMSU could refuse a whole-file rewrite and could patch an existing
+        snippet, and between those two there was no way to GROW a file. A model
+        told "that file is too large to rewrite" had no next move except a
+        patch against text it had to guess at. smallcode gives the obvious
+        third option and says so in the tool description: write the first
+        section, append each one after.
+
+        Costs the same whatever the file already holds, and cannot be cut off
+        partway, because what is generated is only the new part.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        content = arguments.get("content")
+        if not path or not isinstance(content, str) or not content:
+            return ToolResult(False, "append_file needs a filepath and content.", {})
+        try:
+            target = self.tools.sandbox.validate(path)
+        except Exception as exc:  # noqa: BLE001 - the sandbox owns this refusal
+            return ToolResult(False, str(exc), {"filepath": path})
+        existed = target.exists()
+        before = ""
+        if existed:
+            try:
+                before = target.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return ToolResult(False, f"Could not read {path}: {exc}", {"filepath": path})
+        joiner = "" if (not before or before.endswith(chr(10))) else chr(10)
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(before + joiner + content, encoding="utf-8", newline="")
+        except OSError as exc:
+            return ToolResult(False, f"Could not write {path}: {exc}", {"filepath": path})
+        added = content.count(chr(10)) + 1
+        total = (before + joiner + content).count(chr(10)) + 1
+        return ToolResult(
+            True,
+            f"Appended {added} line(s) to {path}; it is now {total} lines."
+            + ("" if existed else " (the file did not exist and was created)"),
+            {"filepath": path, "added_lines": added, "total_lines": total},
+        )
+
+    def _find_files(self, arguments: dict[str, Any]) -> ToolResult:
+        """Files matching a glob. `list_files` shows one directory; this hunts."""
+        pattern = str(arguments.get("pattern") or arguments.get("query") or "").strip()
+        if not pattern:
+            return ToolResult(False, "Pass a glob pattern, e.g. **/*.py.", {})
+        try:
+            found = sorted(
+                path.relative_to(self.workspace).as_posix()
+                for path in self.workspace.glob(pattern)
+                if path.is_file()
+                and not any(part in _IGNORED_DIRS for part in path.parts)
+            )
+        except (OSError, ValueError) as exc:
+            return ToolResult(False, f"Bad pattern {pattern!r}: {exc}", {"pattern": pattern})
+        if not found:
+            return ToolResult(
+                True,
+                f"No files match {pattern!r}. Note ** matches directories: use "
+                "**/*.py rather than *.py to search below the root.",
+                {"pattern": pattern, "files": []},
+            )
+        shown = found[:MAX_LISTED_FILES]
+        body = chr(10).join(f"  {path}" for path in shown)
+        if len(found) > len(shown):
+            body += chr(10) + f"  ... [{len(found) - len(shown)} more]"
+        return ToolResult(
+            True,
+            f"{len(found)} file(s) match {pattern!r}:" + chr(10) + body,
+            {"pattern": pattern, "files": shown, "count": len(found)},
+        )
 
     def _memory_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """The four memory tools, shaped as smallcode shapes them.

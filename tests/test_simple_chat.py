@@ -74,6 +74,16 @@ def _grounding_of(call: dict) -> str:
     return ""
 
 
+# Tools handled inside `_execute` rather than by the registry: they reach
+# project memory, the code graph, the conversation archive, or the filesystem
+# directly.
+_NON_REGISTRY_TOOLS = frozenset({
+    "memory_remember", "memory_load", "memory_list", "memory_forget",
+    "graph_search", "explain_symbol", "history_search", "append_file",
+    "find_files",
+})
+
+
 def _loop(tmp_path: Path, turns, **kwargs) -> SimpleChatLoop:
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
     state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
@@ -200,6 +210,8 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
         # memory and code graph, named as smallcode names them
         "memory_remember", "memory_load", "memory_list", "memory_forget",
         "graph_search", "explain_symbol",
+        # the whole conversation, and building files in pieces
+        "history_search", "append_file", "find_files",
     }
     # `remember` is an accepted alias, not an offered tool.
     assert offered == {n for n in SIMPLE_TOOLS if n != "remember"}
@@ -2039,7 +2051,7 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
         required = (function.get("parameters") or {}).get("required", [])
         if name in {"write_file", "patch_file", "run_command"}:
             continue  # mutating/shell: covered by their own tests
-        if name.startswith("memory_") or name in {"graph_search", "explain_symbol"}:
+        if name in _NON_REGISTRY_TOOLS:
             # Not registry tools: they reach project memory and the code graph,
             # not the workspace. Same contract though - the schema names must
             # reach the implementation.
@@ -2051,6 +2063,9 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 "memory_forget": {"id": "nope"},
                 "graph_search": {"query": "anything"},
                 "explain_symbol": {"symbol": "anything"},
+                "history_search": {"query": "anything"},
+                "append_file": {"filepath": "grown.py", "content": "# section"},
+                "find_files": {"pattern": "**/*.py"},
             }[name]
             result = loop._execute(name, probe)
             # memory_forget on a missing id is a legitimate no.
@@ -4017,3 +4032,81 @@ class _FakeGraph:
 
     def get_references(self, workspace, name):
         return {"ok": True, "data": {"results": []}}
+
+
+def test_a_large_file_can_be_built_in_sections(tmp_path):
+    """The move SHAMSU had no tool for.
+
+    It could refuse a whole-file rewrite and it could patch an existing
+    snippet; between those there was no way to GROW a file. A model told "too
+    large to rewrite" had no next move but a patch against text it was
+    guessing at. smallcode's answer: write the first section, append the rest.
+    """
+    loop = _loop(tmp_path, [_text("ok")])
+
+    loop._execute("write_file", {"filepath": "app.py", "content": "# app\n"})
+    for i in range(3):
+        result = loop._execute(
+            "append_file", {"filepath": "app.py", "content": f"def s{i}():\n    return {i}\n"}
+        )
+        assert result.ok
+
+    body = (tmp_path / "app.py").read_text(encoding="utf-8")
+    assert body.startswith("# app")
+    assert all(f"def s{i}()" in body for i in range(3))
+    assert body.count("# app") == 1, "appending overwrote instead of adding"
+
+
+def test_appending_does_not_glue_lines_together(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+    (tmp_path / "a.txt").write_text("first", encoding="utf-8")
+
+    loop._execute("append_file", {"filepath": "a.txt", "content": "second"})
+
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8").splitlines() == ["first", "second"]
+
+
+def test_find_files_hunts_where_list_files_only_shows_one_directory(tmp_path):
+    (tmp_path / "src" / "deep").mkdir(parents=True)
+    (tmp_path / "src" / "deep" / "target.py").write_text("x = 1", encoding="utf-8")
+    (tmp_path / "readme.md").write_text("hi", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("find_files", {"pattern": "**/*.py"})
+
+    assert "src/deep/target.py" in result.message
+    assert "readme.md" not in result.message
+
+
+def test_a_glob_that_matches_nothing_explains_the_usual_mistake(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("find_files", {"pattern": "*.py"})
+
+    assert result.ok
+    assert "**/*.py" in result.message, "it should name the fix, not just say no"
+
+
+def test_the_model_can_search_the_whole_conversation(tmp_path):
+    """Including turns long since evicted from the window."""
+    from shamsu.session.manager import SessionManager
+
+    logger = SessionManager(tmp_path).create_session("long one")
+    logger.append_message("user", "we settled on port 8080 for the dev server")
+    for i in range(80):
+        logger.append_message("user", f"filler {i}")
+        logger.append_message("assistant", f"ok {i}")
+    loop = SimpleChatLoop(
+        tmp_path,
+        client=FakeClient([_text("ok")]),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        session_logger=logger,
+        model_name="qwen3:8b",
+    )
+
+    result = loop._execute("history_search", {"query": "what port did we pick?"})
+
+    assert result.ok
+    assert "8080" in result.message

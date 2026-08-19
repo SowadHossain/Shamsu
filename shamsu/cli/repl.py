@@ -377,6 +377,10 @@ SYSTEM_COMMANDS = (
     "/sessions summary",
     "/sessions memory",
     "/sessions search ",
+    "/sessions fork",
+    "/sessions fork ",
+    "/sessions history ",
+    "/sessions tree",
     "/permissions list",
     "/permissions clear",
     "/skills",
@@ -4057,6 +4061,38 @@ def _handle_sessions(
             return current
         if command == "current":
             _print_session(current.metadata, console)
+            return current
+        if command == "fork":
+            # A fresh window that still remembers where it came from. The
+            # parent keeps every byte and the link is recorded, so `history`
+            # still reaches across it - forking costs nothing in recall.
+            forked = manager.fork(current.session_id, argument or None)
+            console.print(
+                f"[green]Forked[/green] {current.metadata.title} -> "
+                f"{forked.metadata.title} ({forked.session_id})"
+            )
+            console.print(
+                "[dim]The earlier conversation is kept in full and stays "
+                "searchable with `/sessions history <query>`.[/dim]"
+            )
+            return forked
+        if command == "history":
+            if not argument:
+                console.print("[yellow]Say what to look for: /sessions history <query>[/yellow]")
+                return current
+            from shamsu.session.history import render_hits, search_history
+
+            hits = search_history(manager, current.session_id, argument)
+            console.print(render_hits(hits, argument))
+            return current
+        if command == "tree":
+            chain = manager.ancestry(current.session_id)
+            if len(chain) == 1:
+                console.print("[dim]This conversation has not been forked.[/dim]")
+                return current
+            for depth, item in enumerate(reversed(chain)):
+                marker = "  " * depth + ("* " if item.session_id == current.session_id else "- ")
+                console.print(f"{marker}{item.title}  [dim]{item.session_id}[/dim]")
             return current
         if command == "show" and len(parts) >= 3:
             _print_session(manager.resolve(parts[2]), console)

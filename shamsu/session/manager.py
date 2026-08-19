@@ -90,6 +90,29 @@ class SessionManager:
         logger.log("session.started", {"title": metadata.title}, "Session started")
         return logger
 
+    def fork(self, session_id: str, title: str | None = None) -> "SessionLogger":
+        """Start a fresh window that still remembers where it came from.
+
+        The alternative shapes both lose something. OpenCode compacts by
+        starting a new session seeded with a summary and no link back, so the
+        old conversation exists but nothing finds it. Compacting in place, the
+        route SHAMSU took, avoids the fragmentation by overwriting detail
+        instead.
+
+        A recorded parent avoids both: the child starts clean, the parent keeps
+        every byte, and `shamsu.session.history` walks the link - so a search
+        crosses forks and the user still has one conversation.
+        """
+        from shamsu.session.history import fork_session
+
+        return fork_session(self, session_id, title)
+
+    def ancestry(self, session_id: str) -> list[SessionMetadata]:
+        """This session and every one it was forked from, newest first."""
+        from shamsu.session.history import ancestry
+
+        return ancestry(self, session_id)
+
     def latest_active(self) -> "SessionLogger | None":
         sessions = [item for item in self.list_sessions() if item.status == "active"]
         if not sessions:
