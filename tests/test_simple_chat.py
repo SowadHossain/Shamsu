@@ -5942,3 +5942,110 @@ def test_the_estimate_still_matches_what_is_sent_when_gated(tmp_path):
         loop._estimate_prompt(built)
         - (messages_tokens(built) + tool_schema_tokens(loop._sent_schemas()))
     ) <= 1
+
+
+# --- the verbatim tail is bounded by tokens, not messages (C5) -----------
+#
+# RC5, measured over 77 prompts of a real file-writing session:
+#     older (elidable)   4,655 msgs  2,352,729 chars    505 chars/msg
+#     last-20 verbatim   1,475 msgs  2,485,838 chars  1,685 chars/msg
+# The protected tail was 24% of the messages and 51% of the CONTENT - 87% in
+# the worst prompt, where one assistant message was 25,473 characters.
+
+
+def _file_writing_session(tmp_path, modules: int = 15):
+    """The shape RC5 measured: every recent message is a whole file."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    body = ("// a line of a real javascript file" + chr(10)) * 700
+    for i in range(modules):
+        state.append_user(f"now write module {i}")
+        state.append_assistant("", tool_calls=[{"function": {"name": "write_file",
+            "arguments": {"filepath": f"js/mod{i}.js", "content": body}}}])
+        state.append_tool(f"c{i}", "write_file", json.dumps(
+            {"ok": True, "message": f"Created js/mod{i}.js (+700 lines, 700 total).",
+             "data": {"filepath": f"js/mod{i}.js", "resolved_filepath": f"js/mod{i}.js"}}))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+    return loop, state
+
+
+def test_whole_file_payloads_shrink_the_verbatim_tail(tmp_path):
+    from shamsu.agents.simple_chat import KEEP_VERBATIM_MESSAGES
+
+    loop, _ = _file_writing_session(tmp_path)
+
+    assert loop._verbatim_tail() < KEEP_VERBATIM_MESSAGES
+
+
+def test_short_turns_keep_the_whole_tail(tmp_path):
+    """Twenty conversational turns cost almost nothing and all stay whole - the
+    original measurement was right about conversation, and must not regress."""
+    from shamsu.agents.simple_chat import KEEP_VERBATIM_MESSAGES
+
+    loop = _loop(tmp_path, [_text("ok")])
+    for i in range(40):
+        loop.state.append_user(f"what about step {i}?")
+        loop.state.append_assistant(f"Step {i} is fine.")
+
+    assert loop._verbatim_tail() == KEEP_VERBATIM_MESSAGES
+
+
+def test_the_old_constant_could_not_reach_the_target_and_the_new_one_can(tmp_path):
+    """The point of RC5: elision worked perfectly and was not allowed to touch
+    the half of the prompt that mattered."""
+    from shamsu.agents.simple_chat import KEEP_VERBATIM_MESSAGES
+    from shamsu.context.budget import messages_tokens
+
+    loop, state = _file_writing_session(tmp_path)
+    budget = loop._history_budget()
+
+    import copy
+    old_state = copy.deepcopy(state)
+    loop.state = old_state
+    loop._elide_payloads(KEEP_VERBATIM_MESSAGES)
+    kept_by_count = messages_tokens(m.to_ollama() for m in old_state.all_messages)
+
+    loop.state = state
+    loop._elide_payloads()
+    kept_by_tokens = messages_tokens(m.to_ollama() for m in state.all_messages)
+
+    assert kept_by_count > budget, "the old tail could not get under budget at all"
+    assert kept_by_tokens < kept_by_count
+    assert kept_by_tokens < budget
+
+
+def test_the_current_exchange_always_survives(tmp_path):
+    """A model that cannot see the edit it is in the middle of is worse off than
+    one paying for it."""
+    from shamsu.agents.simple_chat import MIN_VERBATIM_MESSAGES
+
+    loop, _ = _file_writing_session(tmp_path, modules=40)
+
+    assert loop._verbatim_tail() >= MIN_VERBATIM_MESSAGES
+
+
+def test_the_tail_can_only_shrink_never_grow(tmp_path):
+    """Bounded above by the old constant, so this can never make a prompt bigger
+    than it was before."""
+    from shamsu.agents.simple_chat import KEEP_VERBATIM_MESSAGES
+
+    for modules in (1, 3, 8, 20):
+        loop, _ = _file_writing_session(tmp_path, modules=modules)
+        assert loop._verbatim_tail() <= KEEP_VERBATIM_MESSAGES
+
+
+def test_pressure_shrinks_the_tail_further(tmp_path):
+    from shamsu.agents.simple_chat import (
+        VERBATIM_TAIL_FRACTION,
+        VERBATIM_TAIL_FRACTION_UNDER_PRESSURE,
+    )
+
+    loop = _loop(tmp_path, [_text("ok")])
+    body = "padding " * 300
+    for i in range(30):
+        loop.state.append_user(f"turn {i} {body}")
+        loop.state.append_assistant(f"ok {i}")
+
+    assert loop._verbatim_tail(VERBATIM_TAIL_FRACTION_UNDER_PRESSURE) <= loop._verbatim_tail(
+        VERBATIM_TAIL_FRACTION
+    )

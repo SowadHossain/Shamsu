@@ -142,6 +142,27 @@ REPEATED_READS_BEFORE_WARNING = 3
 # whole of the edit it is in the middle of.
 KEEP_VERBATIM_MESSAGES = 20
 
+# ...and twenty is the knee for CONVERSATION. It is the wrong unit for this.
+#
+# The measurement above assumed conversational messages. Measured again over 77
+# prompts of a real file-writing session, where a message can be an entire file:
+#
+#     older (elidable)   4,655 messages   2,352,729 chars    505 chars/msg
+#     last-20 verbatim   1,475 messages   2,485,838 chars  1,685 chars/msg
+#
+# The protected tail was 24% of the messages and 51% of the CONTENT - 87% in the
+# worst prompt, where one single assistant message was 25,473 characters. Elision
+# was working perfectly and was simply not allowed to touch any of it.
+#
+# So the tail is bounded by tokens instead: twenty small turns still stay whole,
+# and three whole-file writes do not. Bounded above by KEEP_VERBATIM_MESSAGES so
+# this can only ever shrink the tail, never grow it, and below by the current
+# exchange - a model that cannot see the edit it is in the middle of is worse
+# off than one paying for it.
+VERBATIM_TAIL_FRACTION = 0.35
+VERBATIM_TAIL_FRACTION_UNDER_PRESSURE = 0.15
+MIN_VERBATIM_MESSAGES = 4
+
 # Thresholds and approach adapted from smallcode `bin/smallcode.js` (~L1000),
 # MIT, (c) 2026 Doorman11991 - see reference/smallcode/LICENSE.
 # A tool_call argument longer than this is shortened in OLD messages. Keys are
@@ -2168,7 +2189,31 @@ class SimpleChatLoop:
         except Exception:
             return False
 
-    def _elide_payloads(self, keep_recent: int = KEEP_VERBATIM_MESSAGES) -> int:
+    def _verbatim_tail(self, fraction: float = VERBATIM_TAIL_FRACTION) -> int:
+        """How many recent messages to keep whole, measured in TOKENS.
+
+        Walks back from the newest message spending a share of the history
+        budget. Twenty short turns cost almost nothing and all stay; three
+        whole-file payloads spend it immediately and only the newest survives.
+
+        Never more than `KEEP_VERBATIM_MESSAGES`, so this cannot make a prompt
+        bigger than it was before. Never fewer than `MIN_VERBATIM_MESSAGES`,
+        because the current exchange is what the model is working on.
+        """
+        budget = int(self._history_budget() * fraction)
+        history = self.state.all_messages[1:]
+        kept = 0
+        spent = 0
+        for message in reversed(history):
+            spent += message_tokens(message.to_ollama())
+            if spent > budget and kept >= MIN_VERBATIM_MESSAGES:
+                break
+            kept += 1
+            if kept >= KEEP_VERBATIM_MESSAGES:
+                break
+        return max(MIN_VERBATIM_MESSAGES, min(kept, KEEP_VERBATIM_MESSAGES))
+
+    def _elide_payloads(self, keep_recent: int | None = None) -> int:
         """Shrink tool payloads older than the last *keep_recent* messages.
 
         Called at the START of a turn as well as during one. A fresh
@@ -2179,6 +2224,8 @@ class SimpleChatLoop:
         the 44,833 -> 10,476 measurement was taken on.
         """
 
+        if keep_recent is None:
+            keep_recent = self._verbatim_tail()
         protected = self._current_file_reads()
 
         def make_elide(spare: set[int]):
@@ -2329,7 +2376,9 @@ class SimpleChatLoop:
             )
             return self._elide_payloads()
         self._activity("context is filling; eliding older tool payloads")
-        return self._elide_payloads(KEEP_VERBATIM_UNDER_PRESSURE)
+        return self._elide_payloads(
+            self._verbatim_tail(VERBATIM_TAIL_FRACTION_UNDER_PRESSURE)
+        )
 
     def _take_feedback(self) -> bool:
         """Fold anything the user typed mid-turn into the conversation.
