@@ -565,6 +565,51 @@ def make_approval_func(console_approval: Any, *, main_loop: Any = None) -> Any:
 
 
 @dataclass
+class ContextCounters:
+    """What the context machinery actually did, per session.
+
+    A whole session once re-compacted the same 23 messages every single turn
+    and nobody noticed, because the only evidence was a line in the scrollback.
+    A counter turns that class of bug from invisible into obvious: compactions
+    should be rare, and a number that climbs once per turn is a bug on sight.
+    """
+
+    compactions: int = 0
+    evictions: int = 0
+    truncations: int = 0
+    calls: int = 0
+    # Ground truth from the most recent response, for the meter.
+    last_prompt_tokens: int = 0
+    last_window: int = 0
+    last_estimate: int = 0
+
+    @property
+    def pct(self) -> int:
+        if not self.last_window:
+            return 0
+        return round(100 * self.last_prompt_tokens / self.last_window)
+
+    def meter(self) -> str:
+        """`ctx 68% (22.3k/32.8k)` - driven by prompt_eval_count, not a guess."""
+        if not self.last_window or not self.last_prompt_tokens:
+            return "ctx --"
+        return (
+            f"ctx {self.pct}% "
+            f"({self.last_prompt_tokens / 1000:.1f}k/{self.last_window / 1000:.1f}k)"
+        )
+
+
+# Process-wide, because a fresh SimpleChatLoop is built per user message while
+# the REPL that reports these numbers lives for the whole session.
+SESSION_COUNTERS = ContextCounters()
+
+
+# Warn once per session on the way UP, rather than at the wall, where the only
+# thing left to say is that the answer was already cut.
+CONTEXT_WARN_FRACTION = 0.8
+
+
+@dataclass
 class SimpleChatResult:
     final: str = ""
     rounds: int = 0
@@ -649,6 +694,8 @@ class SimpleChatLoop:
         # once had none and blocked writes forever.
         # Tool calls since the last mid-turn elision sweep.
         self._calls_since_elide = 0
+        # Said once per loop, not once per round.
+        self._warned_filling = False
         # How many sweeps and how many messages they shrank, for `/status`.
         self.evictions = 0
         self._rewrite_refused: set[str] = set()
@@ -936,6 +983,22 @@ class SimpleChatLoop:
 
     # -- model -----------------------------------------------------------
 
+    def _warn_if_filling(self) -> None:
+        """Say the window is filling on the way UP, once.
+
+        At the wall the only thing left to say is that the answer was already
+        cut. Said at 80% there is still room to act on it.
+        """
+        if self._warned_filling or not SESSION_COUNTERS.last_window:
+            return
+        if SESSION_COUNTERS.pct < CONTEXT_WARN_FRACTION * 100:
+            return
+        self._warned_filling = True
+        self._activity(
+            f"{SESSION_COUNTERS.meter()} - the conversation is filling the window. "
+            "`/new` starts a fresh one; older file payloads are already elided."
+        )
+
     def _hit_the_length_limit(self) -> bool:
         """Did the last generation stop because it ran out of room?
 
@@ -1046,6 +1109,17 @@ class SimpleChatLoop:
         self.last_completion_tokens = int(_response_field(raw, "eval_count") or 0)
         self.last_done_reason = str(_response_field(raw, "done_reason") or "")
         self.last_estimate = estimate
+        SESSION_COUNTERS.calls += 1
+        SESSION_COUNTERS.last_window = self._ceiling()
+        if self.last_prompt_tokens:
+            # Only when the server actually reported one. A response without a
+            # count must not blank the meter - the window did not empty, we
+            # just were not told about it.
+            SESSION_COUNTERS.last_prompt_tokens = self.last_prompt_tokens
+            SESSION_COUNTERS.last_estimate = estimate
+        if self._hit_the_length_limit():
+            SESSION_COUNTERS.truncations += 1
+        self._warn_if_filling()
         if self._budget is None or estimate <= 0 or self.last_prompt_tokens <= 0:
             return
         try:
@@ -1091,6 +1165,7 @@ class SimpleChatLoop:
         # that actually mattered.
         combined = f"{narrative}\n{facts}".strip() if narrative else facts
         if combined:
+            SESSION_COUNTERS.compactions += 1
             self.state.update_rolling_summary(
                 _bounded_summary(
                     [line for line in combined.splitlines() if line.strip()],
@@ -1265,6 +1340,7 @@ class SimpleChatLoop:
 
         changed = self.state.elide_old_payloads(keep_recent, elide)
         if changed:
+            SESSION_COUNTERS.evictions += changed
             self._trace(
                 "simple.elide",
                 f"elided {changed} older tool payloads",

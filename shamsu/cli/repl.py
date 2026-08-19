@@ -465,6 +465,7 @@ SYSTEM_COMMANDS = (
     "/run clean",
     "/context status",
     "/context budget",
+    "/context meter",
     "/context inspect",
     "/context compact",
     "/context show",
@@ -3631,6 +3632,35 @@ def _handle_context(
         else:
             rows.append("No calibration data yet (accumulates after first model call).")
         console.print(Panel("\n".join(rows), title="Context Status", border_style="cyan"))
+
+    elif sub == "meter":
+        from shamsu.agents.simple_chat import SESSION_COUNTERS as counters
+
+        if not counters.calls:
+            console.print("[dim]No model calls yet this session.[/dim]")
+            return
+        drift = (
+            f"{counters.last_prompt_tokens / counters.last_estimate:.2f}x"
+            if counters.last_estimate
+            else "n/a"
+        )
+        lines_out = [
+            counters.meter(),
+            "",
+            f"  model calls        : {counters.calls}",
+            f"  last prompt (real) : {counters.last_prompt_tokens:,} tokens"
+            "   <- Ollama prompt_eval_count",
+            f"  our estimate was   : {counters.last_estimate:,} tokens  (off by {drift})",
+            "",
+            f"  compactions        : {counters.compactions}",
+            f"  payload elisions   : {counters.evictions}",
+            f"  truncated replies  : {counters.truncations}",
+            "",
+            "[dim]Compactions should be RARE. A count that climbs once per turn is",
+            "the same-messages-every-turn bug, not healthy behaviour. Truncated",
+            "replies should be zero.[/dim]",
+        ]
+        console.print(Panel(chr(10).join(lines_out), title="Context Meter", border_style="cyan"))
 
     elif sub in ("budget", "inspect"):
         result = mgr.last_result

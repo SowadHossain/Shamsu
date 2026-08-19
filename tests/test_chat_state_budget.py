@@ -208,3 +208,88 @@ def test_system_prompt_is_charged_before_history():
     # turn only - so the older one must fall out. If the system prompt were
     # not charged, both would fit and nothing would be evicted.
     _tail, start_abs = state.select_for_budget(11, _wc, per_message_overhead=0)
+
+
+# ---------------------------------------------------------------------------
+# The summary watermark must survive rehydration
+#
+# A fresh ChatState is built per user turn. `_restore_summary` used to reset
+# the watermark to 1 every time, so `newly_evicted()` returned the whole
+# history every turn and each one spent a model call re-summarising the same
+# messages. Measured live 2026-08-19: session.json held 24, the loop used 1,
+# and the same 23 messages were compacted for a whole session.
+# ---------------------------------------------------------------------------
+
+
+def test_a_restored_summary_does_not_re_evict_what_it_already_covers(tmp_path):
+    logger = SessionManager(tmp_path).create_session("watermark")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+    for i in range(10):
+        state.append_user(f"u{i}")
+        state.append_assistant(f"a{i}")
+    state.update_rolling_summary("- decided the port is 8080", start_abs=13)
+
+    # The next user message builds a completely new ChatState off the session.
+    resumed = ChatState("sys", session_logger=logger, hydrate=True)
+
+    assert resumed.rolling_summary == "- decided the port is 8080"
+    assert resumed.newly_evicted(start_abs=13) == [], (
+        "the same messages are being handed to the summariser again"
+    )
+
+
+def test_only_the_genuinely_new_messages_are_handed_to_the_summariser(tmp_path):
+    logger = SessionManager(tmp_path).create_session("watermark2")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+    for i in range(6):
+        state.append_user(f"u{i}")
+        state.append_assistant(f"a{i}")
+    state.update_rolling_summary("- earlier decisions", start_abs=7)  # covers 6
+
+    resumed = ChatState("sys", session_logger=logger, hydrate=True)
+    fresh = resumed.newly_evicted(start_abs=11)
+
+    assert [m.content for m in fresh] == ["u3", "a3", "u4", "a4"], (
+        f"expected only the un-summarised slice, got {[m.content for m in fresh]}"
+    )
+
+
+def test_a_narrow_hydration_window_still_translates_the_watermark(tmp_path):
+    """Hydration loads a TAIL of the transcript; the watermark counts the whole.
+
+    Here the summary covers everything BEFORE the window, so each hydrated
+    message is genuinely new - and must be offered to the summariser exactly
+    once, not on every turn forever.
+    """
+    logger = SessionManager(tmp_path).create_session("watermark3")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+    for i in range(20):
+        state.append_user(f"u{i}")
+        state.append_assistant(f"a{i}")
+    state.update_rolling_summary("- old decisions", start_abs=31)  # 30 records
+
+    # Only the last 10 records are hydrated; the other 30 are already covered.
+    resumed = ChatState("sys", session_logger=logger, hydrate=True, hydrate_max_messages=10)
+    hydrated = [m.content for m in resumed.all_messages if m.role in {"user", "assistant"}]
+
+    assert hydrated == ["u15", "a15", "u16", "a16", "u17", "a17",
+                        "u18", "a18", "u19", "a19"]
+    # Every hydrated message is new, and none of the 30 older ones comes back.
+    fresh = [m.content for m in resumed.newly_evicted(start_abs=len(hydrated) + 1)]
+    assert fresh == hydrated
+
+
+def test_the_watermark_persisted_is_a_whole_transcript_number(tmp_path):
+    """An index into one hydrated window means nothing to the next process."""
+    logger = SessionManager(tmp_path).create_session("watermark4")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+    for i in range(20):
+        state.append_user(f"u{i}")
+        state.append_assistant(f"a{i}")
+
+    narrow = ChatState("sys", session_logger=logger, hydrate=True, hydrate_max_messages=10)
+    narrow.update_rolling_summary("- from a narrow window", start_abs=5)
+
+    _summary, upto = logger.load_summary()
+    # 30 records skipped by hydration + 4 covered inside the window.
+    assert upto == 34, f"a window-local index was persisted verbatim: {upto}"

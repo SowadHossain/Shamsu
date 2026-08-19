@@ -3399,3 +3399,68 @@ def test_the_tool_schemas_sent_on_every_call_are_charged(tmp_path):
 
     assert tool_schema_tokens(SIMPLE_TOOL_SCHEMAS) > 300
     assert loop._fixed_overhead() >= tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+
+
+# ---------------------------------------------------------------------------
+# Context meter and counters (SMALLCODE plan item E)
+#
+# A whole session re-compacted the same 23 messages every turn and it was
+# found by reading scrollback. A counter makes that class of bug obvious.
+# ---------------------------------------------------------------------------
+
+
+def _reset_counters():
+    from shamsu.agents.simple_chat import SESSION_COUNTERS
+
+    for field_name in ("compactions", "evictions", "truncations", "calls",
+                       "last_prompt_tokens", "last_window", "last_estimate"):
+        setattr(SESSION_COUNTERS, field_name, 0)
+    return SESSION_COUNTERS
+
+
+def test_the_meter_reports_the_real_prompt_size_not_the_estimate(tmp_path):
+    counters = _reset_counters()
+    loop = _loop(tmp_path, [{"message": {"content": "hi", "tool_calls": []},
+                             "prompt_eval_count": 22_300}])
+
+    asyncio.run(loop.run("hello"))
+
+    assert counters.last_prompt_tokens == 22_300
+    assert "22.3k" in counters.meter()
+    assert f"{counters.pct}%" in counters.meter()
+
+
+def test_a_truncated_reply_is_counted(tmp_path):
+    counters = _reset_counters()
+    loop = _loop(tmp_path, [_cut(content="half an ans")])
+
+    asyncio.run(loop.run("explain"))
+
+    assert counters.truncations == 1
+
+
+def test_the_user_is_warned_on_the_way_up_and_only_once(tmp_path):
+    """At the wall the only thing left to say is that it was already cut."""
+    counters = _reset_counters()
+    said: list[str] = []
+    full = {"message": {"content": "", "tool_calls": [
+        {"function": {"name": "list_files", "arguments": {"path": "."}}}]},
+        "prompt_eval_count": 30_000}
+    loop = _loop(tmp_path, [full, full, _text("done")], on_activity=said.append)
+
+    asyncio.run(loop.run("go"))
+
+    warnings = [m for m in said if "filling the window" in m]
+    assert len(warnings) == 1, f"expected exactly one warning, got {warnings}"
+    assert counters.pct >= 80
+
+
+def test_a_quiet_session_warns_about_nothing(tmp_path):
+    _reset_counters()
+    said: list[str] = []
+    loop = _loop(tmp_path, [{"message": {"content": "hi", "tool_calls": []},
+                             "prompt_eval_count": 900}], on_activity=said.append)
+
+    asyncio.run(loop.run("hello"))
+
+    assert not [m for m in said if "filling the window" in m]

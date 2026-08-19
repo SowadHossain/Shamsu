@@ -117,6 +117,10 @@ class ChatState:
         # (1 == nothing summarized yet; index 0 is the system prompt).
         self._rolling_summary: str = ""
         self._summarized_upto: int = 1
+        # Transcript records that hydration did NOT load. Needed to translate
+        # the persisted watermark, which counts records in the whole
+        # transcript, into an index in this hydrated window.
+        self._hydration_offset: int = 0
         if hydrate:
             self._hydrate_from_session()
             self._restore_summary()
@@ -279,9 +283,22 @@ class ChatState:
         # never summarised, and lost for good.
         if self.session_logger is not None:
             try:
-                self.session_logger.save_summary(self._rolling_summary, self._summarized_upto)
+                self.session_logger.save_summary(
+                    self._rolling_summary, self._transcript_watermark()
+                )
             except Exception:
                 pass  # a failed save must never break the turn
+
+    def _transcript_watermark(self) -> int:
+        """`_summarized_upto`, expressed in whole-transcript terms.
+
+        The in-memory index is meaningless to the next process: it counts
+        positions in THIS hydrated window. Persisting it directly is what made
+        the watermark untranslatable and forced the reset that re-summarised
+        everything every turn. Adding back what hydration skipped makes it a
+        number the next session can actually use.
+        """
+        return self._hydration_offset + max(0, self._summarized_upto - 1)
 
     def _restore_summary(self) -> None:
         if self.session_logger is None:
@@ -292,11 +309,20 @@ class ChatState:
             return
         if summary.strip():
             self._rolling_summary = summary
-            # Hydration loads a WINDOW of the transcript, so the absolute index
-            # the summary was written against does not map onto this list. What
-            # matters is that the summary text survives and is shown; eviction
-            # accounting restarts from the hydrated messages.
-            self._summarized_upto = max(self._summarized_upto, 1)
+            # `upto` counts records in the WHOLE transcript that the summary
+            # already covers. Hydration loaded only the tail, so translate it
+            # into this window rather than giving up and starting from 1.
+            #
+            # Giving up is what shipped: a fresh ChatState is built per user
+            # turn, so `newly_evicted()` returned the entire history every
+            # turn and each one spent a model call re-summarising the same
+            # messages. Measured live 2026-08-19: session.json held 24, the
+            # loop used 1, and the same 23 messages were compacted every turn
+            # for a whole session.
+            already_summarised = max(0, int(upto) - self._hydration_offset)
+            self._summarized_upto = max(
+                1, min(1 + already_summarised, len(self._messages))
+            )
 
     @property
     def rolling_summary(self) -> str:
@@ -360,7 +386,12 @@ class ChatState:
         # Prefer the clean transcript; only fall back to scanning events.jsonl
         # for chat.message when no transcript exists (older sessions).
         if self.session_logger.messages_path.exists():
-            records = self.session_logger.read_messages(self.hydrate_max_messages)
+            # Read all, then window it here: `read_messages` reads the whole
+            # file either way, and the count of what was SKIPPED is what makes
+            # the summary watermark translatable.
+            every = self.session_logger.read_messages(None)
+            records = every[-self.hydrate_max_messages:] if self.hydrate_max_messages else every
+            self._hydration_offset = max(0, len(every) - len(records))
             self._hydrate_records(records, key_content="content")
             return
         events = [
