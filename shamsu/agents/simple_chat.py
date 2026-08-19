@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import hashlib
 import json
 import os
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1043,6 +1045,69 @@ SESSION_COUNTERS = ContextCounters()
 LAST_ALLOCATION: dict[str, Any] = {"value": None}
 
 
+@dataclass
+class SessionStalls:
+    """What has already failed in THIS conversation, and how often.
+
+    Everything here used to live on `SimpleChatLoop`, and `repl.py` builds a
+    fresh one per user message - so every stall counter reset the moment the
+    user typed. `MAX_UNPRODUCTIVE_EDITS = 4` existed the whole time and would
+    have caught the live failure; it never fired because the model failed four
+    times, was prompted, and started again from zero. Live 2026-08-19 that was
+    29 patch calls, 11 distinct payloads, one of them sent NINE times
+    byte-for-byte, and the run only ended when `max_rounds` did.
+
+    Keyed by session id, so `/new` gives a clean slate without the `/new`
+    handler having to know this exists.
+    """
+
+    # signature -> how many times that exact call has failed
+    failures: dict[str, int] = field(default_factory=dict)
+    # signature -> the error it failed with, so a repeat can quote it
+    errors: dict[str, str] = field(default_factory=dict)
+    # Consecutive mutations that changed nothing, ACROSS user turns.
+    unproductive: int = 0
+
+    def record_failure(self, signature: str, error: str) -> int:
+        seen = self.failures.get(signature, 0) + 1
+        self.failures[signature] = seen
+        self.errors[signature] = error
+        return seen
+
+    def forget(self, predicate: Callable[[str], bool]) -> None:
+        """Drop remembered failures the world has moved past.
+
+        The escape. A patch that could not match yesterday may match once the
+        file it targets has actually changed, and a memory with no way out
+        would make the first success in a file the last one.
+        """
+        for signature in [s for s in self.failures if predicate(s)]:
+            self.failures.pop(signature, None)
+            self.errors.pop(signature, None)
+
+
+_SESSION_STALLS: dict[str, SessionStalls] = {}
+
+
+def session_stalls(key: str) -> SessionStalls:
+    """The stall record for one conversation, created on first use."""
+    return _SESSION_STALLS.setdefault(key or "default", SessionStalls())
+
+
+def reset_session_stalls(key: str = "") -> None:
+    """Forget one conversation's stalls, or all of them. Tests and `/new`."""
+    if key:
+        _SESSION_STALLS.pop(key, None)
+    else:
+        _SESSION_STALLS.clear()
+
+
+# Identical failing calls tolerated before the tool stops being run at all.
+# The third attempt is refused: two is a retry, three is a loop. Live the same
+# payload went out nine times and failed nine times identically.
+IDENTICAL_FAILURES_BEFORE_REFUSING = 2
+
+
 # Warn once per session on the way UP, rather than at the wall, where the only
 # thing left to say is that the answer was already cut.
 CONTEXT_WARN_FRACTION = 0.8
@@ -1158,8 +1223,13 @@ class SimpleChatLoop:
         # Line ranges seen per file, so reading a big file IN PIECES still
         # adds up to having seen it.
         self._seen_ranges: dict[str, list[tuple[int, int]]] = {}
-        # Consecutive mutations that changed nothing.
-        self._unproductive = 0
+        # Stalls that must OUTLIVE this object. A fresh SimpleChatLoop is built
+        # per user message, so anything tracking "the model is repeating itself"
+        # has to be keyed by the conversation or it resets whenever the user
+        # types - which is exactly how one payload was sent nine times.
+        self._stalls = session_stalls(
+            getattr(session_logger, "session_id", "") or str(self.workspace)
+        )
         # Consecutive writes refused for arriving truncated, and the file the
         # last one was aimed at - so the second refusal can say something the
         # first did not.
@@ -1454,13 +1524,18 @@ class SimpleChatLoop:
                     tool_calls,
                     changed,
                 )
-            if self._unproductive >= MAX_UNPRODUCTIVE_EDITS:
+            if self._stalls.unproductive >= MAX_UNPRODUCTIVE_EDITS:
                 # Spinning. Live 2026-08-18 a turn ran 12 no-op patches and 5
                 # failed ones across 24 rounds and ~25 minutes, changing nothing
                 # - and the only thing that stopped it was max_rounds. Say what
                 # happened instead of burning the rest of the budget.
+                tried = self._stalls.unproductive
+                # Reset now the user has been TOLD. The defect was a counter
+                # that reset silently without ever tripping; one that stays hot
+                # after it fires would stop the next turn before it started.
+                self._stalls.unproductive = 0
                 return self._stop(
-                    f"I tried {self._unproductive} edits in a row that changed nothing - "
+                    f"I tried {tried} edits in a row that changed nothing - "
                     "either the snippet I was matching is not in the file, or my "
                     "replacement was identical to what is already there. I have stopped "
                     "rather than keep guessing.\n\n"
@@ -2264,6 +2339,14 @@ class SimpleChatLoop:
             if cut_off and index == last and name in WRITING_TOOLS:
                 self._refuse_truncated_write(call, name, arguments, outcome)
                 continue
+            signature = _call_signature(name, arguments)
+            if (
+                name in WRITING_TOOLS
+                and self._stalls.failures.get(signature, 0)
+                >= IDENTICAL_FAILURES_BEFORE_REFUSING
+            ):
+                self._refuse_repeated_failure(call, name, arguments, signature)
+                continue
             self._activity(f"{name} {_argument_summary(arguments)}")
             self._trace("simple.tool", f"{name} {_argument_summary(arguments)}", {"tool": name})
             # A tool can block for as long as its timeout allows - `run_command`
@@ -2299,18 +2382,29 @@ class SimpleChatLoop:
                 # the truncation has already happened.
                 self._calls_since_elide = 0
                 self.evictions += self._elide_under_pressure()
+            if name in WRITING_TOOLS:
+                if result.ok:
+                    # The world moved. A patch that could not match before may
+                    # match now that this file has actually changed, so its
+                    # remembered failures stop being true.
+                    changed_path = _signature_path(signature)
+                    self._stalls.forget(
+                        lambda sig, p=changed_path: _signature_path(sig) == p
+                    )
+                else:
+                    self._stalls.record_failure(signature, result.message)
             if name in MUTATING_TOOLS:
                 if _changed_nothing(result):
-                    self._unproductive += 1
+                    self._stalls.unproductive += 1
                     self._repair_attempts += 1
                 else:
-                    self._unproductive = 0
+                    self._stalls.unproductive = 0
             else:
-                signature = f"{name}({_argument_summary(arguments)})"
-                seen = self._read_signatures.get(signature, 0) + 1
-                self._read_signatures[signature] = seen
+                read_signature = f"{name}({_argument_summary(arguments)})"
+                seen = self._read_signatures.get(read_signature, 0) + 1
+                self._read_signatures[read_signature] = seen
                 if seen >= REPEATED_READS_BEFORE_WARNING:
-                    outcome.repeated_read = signature
+                    outcome.repeated_read = read_signature
             if result.ok and name in MUTATING_TOOLS:
                 path = str(arguments.get("filepath") or "").strip()
                 if path:
@@ -2324,6 +2418,53 @@ class SimpleChatLoop:
                 self._truncated_refusals = 0
                 self._truncated_target = ""
         return outcome
+
+    def _refuse_repeated_failure(
+        self,
+        call: Any,
+        name: str,
+        arguments: dict[str, Any],
+        signature: str,
+    ) -> None:
+        """Do not run a call that has already failed identically.
+
+        `MAX_UNPRODUCTIVE_EDITS = 4` would have caught this and never fired,
+        because the counter lived on an object rebuilt per user message: the
+        model failed four times, the user typed, and it started again from zero.
+        Live 2026-08-19, 29 patch calls, 11 distinct payloads, one sent NINE
+        times byte-for-byte with an identical failure each time.
+
+        Running it a tenth time cannot produce a different answer - the file has
+        not changed and neither have the arguments - so it is not run. What the
+        model gets back instead is the fact of the repetition and the error it
+        already had, which is the one thing it apparently could not see.
+        """
+        seen = self._stalls.failures.get(signature, 0)
+        previous = (self._stalls.errors.get(signature) or "").strip()
+        path = str(arguments.get("filepath") or arguments.get("path") or "").strip()
+        named = path or "that file"
+        message = (
+            f"NOT RUN. This exact {name} call has already failed {seen} times in this "
+            f"conversation with the same arguments, and {named} is unchanged.\n\n"
+            f"What it said every time:\n{previous}\n\n"
+            f"The same call will fail again. Call read_file on {named} and copy the "
+            "text you want to replace out of the result, character for character, "
+            "rather than writing it from memory."
+        )
+        result = ToolResult(
+            False, message, {"refused": "identical_call_already_failed", "attempts": seen}
+        )
+        # Counted, so a model that keeps finding new ways to fail still reaches
+        # the session-scoped stop rather than spending every round here.
+        self._stalls.unproductive += 1
+        self._repair_attempts += 1
+        self._activity(f"{name} on {named} already failed {seen} times identically; not run")
+        self._trace(
+            "simple.refused_repeat", f"{name} {named}", {"tool": name, "attempts": seen}
+        )
+        if self.turn_log:
+            self.turn_log.log_tool_result(name, arguments, False, message)
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
 
     def _refuse_truncated_write(
         self,
@@ -3560,6 +3701,32 @@ def _middle_out(text: str, head: int, tail: int) -> str:
     omitted = len(body) - head - tail
     kept = body[:head] + [f"... [{omitted} lines elided - re-run to see them] ..."] + body[-tail:]
     return chr(10).join(kept)
+
+
+def _call_signature(name: str, arguments: dict[str, Any]) -> str:
+    """A stable identity for one tool call, arguments and all.
+
+    `_argument_summary` truncates, which is right for a status line and wrong
+    here: two 4,000-character patches differing only at the end would share a
+    summary and be mistaken for the same call. The digest is over the whole
+    argument set.
+
+    The path is kept readable in front of the digest so a successful edit can
+    find and forget every failure recorded against that file.
+    """
+    path = str(arguments.get("filepath") or arguments.get("path") or "").strip().lower()
+    try:
+        body = json.dumps(arguments, sort_keys=True, ensure_ascii=True, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        body = repr(sorted(arguments.items(), key=lambda item: str(item[0])))
+    digest = hashlib.sha1(body.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{name}|{path}|{digest}"
+
+
+def _signature_path(signature: str) -> str:
+    """The file a signature was recorded against, or ``""``."""
+    parts = signature.split("|")
+    return parts[1] if len(parts) >= 3 else ""
 
 
 def _read_result_path(payload: str) -> str:

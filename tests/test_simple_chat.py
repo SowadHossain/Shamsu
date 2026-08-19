@@ -5259,3 +5259,182 @@ def test_a_reply_the_output_cap_severed_is_not_treated_as_a_promise(tmp_path):
 
     assert "cut off" in result.final.lower()
     assert "called no tool" not in result.final
+
+
+# --- stall counters that survive the user typing (C6) --------------------
+#
+# RC6. 29 patch calls, 11 distinct payloads, one sent NINE times byte-for-byte.
+# `MAX_UNPRODUCTIVE_EDITS = 4` existed the whole time and never fired, because
+# `_unproductive` lived on SimpleChatLoop and repl.py builds a fresh one per
+# user message. The model failed four times, the user typed, and it started
+# again from zero.
+
+
+class _NamedSession:
+    """Just enough SessionLogger to carry an id, which is what binds stalls."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        self.metadata = None
+        self.claim = None
+
+
+def _stall_loop(tmp_path, turns, session: str, **kwargs):
+    """A loop bound to a named conversation exactly the way repl.py binds one:
+    through the constructor, so the binding itself is under test and not just
+    the store behind it."""
+    from shamsu.agents.simple_chat import SimpleChatLoop
+
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    return SimpleChatLoop(
+        tmp_path,
+        client=FakeClient(turns),
+        tools=tools,
+        state=state,
+        session_logger=_NamedSession(session),
+        model_name="qwen3:8b",
+        **kwargs,
+    )
+
+
+def test_the_no_op_counter_is_not_reset_by_the_user_typing(tmp_path):
+    """The whole of RC6 in one assertion."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    reset_session_stalls("s1")
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    miss = _tool("patch_file", filepath="a.js", old_string="not in the file", new_string="x")
+
+    first = _stall_loop(tmp_path, [miss, miss, _text("hm")], "s1", max_rounds=3, verify_changes=False)
+    asyncio.run(first.run("fix a.js"))
+    carried = first._stalls.unproductive
+
+    second = _stall_loop(tmp_path, [_text("ok")], "s1", max_rounds=1, verify_changes=False)
+
+    assert carried >= 2
+    assert second._stalls.unproductive == carried, "a new turn wiped the count"
+
+
+def test_a_different_conversation_starts_clean(tmp_path):
+    """Session-scoped, not global. `/new` must be a real fresh start."""
+    from shamsu.agents.simple_chat import reset_session_stalls, session_stalls
+
+    reset_session_stalls()
+    session_stalls("s1").unproductive = 3
+
+    assert session_stalls("s2").unproductive == 0
+
+
+def test_an_identical_failing_call_is_not_run_a_third_time(tmp_path):
+    """One payload went out nine times and failed nine times identically."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    reset_session_stalls("s3")
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    miss = _tool("patch_file", filepath="a.js", old_string="not in the file", new_string="x")
+    loop = _stall_loop(tmp_path, [miss] * 6, "s3", max_rounds=6, verify_changes=False)
+
+    asyncio.run(loop.run("fix a.js"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    refused = [c for c in said if "NOT RUN" in c]
+    assert refused, "the identical call was run every time"
+    assert "already failed" in refused[0]
+
+
+def test_the_refusal_hands_back_the_error_it_already_had(tmp_path):
+    """The model has no new information to reason from, so give it the old one
+    plus the fact that it is repeating itself."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    reset_session_stalls("s4")
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    miss = _tool("patch_file", filepath="a.js", old_string="not in the file", new_string="x")
+    loop = _stall_loop(tmp_path, [miss] * 4, "s4", max_rounds=4, verify_changes=False)
+
+    asyncio.run(loop.run("fix a.js"))
+
+    refused = [m.content for m in loop.state.all_messages if "NOT RUN" in m.content]
+    assert "old_string not found" in refused[0], "the previous error was not carried"
+    assert "read_file" in refused[0], "and it must say what to do instead"
+
+
+def test_a_repeat_carries_across_the_user_typing_too(tmp_path):
+    """The counter and the memory are both session-scoped, or neither is."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    reset_session_stalls("s5")
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    miss = _tool("patch_file", filepath="a.js", old_string="not in the file", new_string="x")
+
+    first = _stall_loop(tmp_path, [miss, miss, _text("hm")], "s5", max_rounds=3, verify_changes=False)
+    asyncio.run(first.run("fix a.js"))
+
+    second = _stall_loop(tmp_path, [miss, _text("ok")], "s5", max_rounds=2, verify_changes=False)
+    asyncio.run(second.run("try again"))
+
+    said = [m.content for m in second.state.all_messages if m.role == "tool"]
+    assert any("NOT RUN" in c for c in said), "the new turn forgot what already failed"
+
+
+def test_a_successful_edit_forgets_that_file_s_failures(tmp_path):
+    """The escape. A patch that could not match before may match once the file
+    has actually changed, and a memory with no way out would make the first
+    success in a file the last one."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    reset_session_stalls("s6")
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    miss = _tool("patch_file", filepath="a.js", old_string="not in the file", new_string="x")
+    good = _tool("write_file", filepath="a.js", content="not in the file\n")
+
+    loop = _stall_loop(tmp_path, [miss, miss, good, _text("ok")], "s6", max_rounds=4, verify_changes=False)
+    asyncio.run(loop.run("fix a.js"))
+
+    assert loop._stalls.failures == {}, "the write should have cleared that file's record"
+
+
+def test_a_failure_on_one_file_does_not_forget_another(tmp_path):
+    from shamsu.agents.simple_chat import _call_signature, _signature_path
+
+    a = _call_signature("patch_file", {"filepath": "a.js", "old_string": "x", "new_string": "y"})
+    b = _call_signature("patch_file", {"filepath": "b.js", "old_string": "x", "new_string": "y"})
+
+    assert _signature_path(a) == "a.js"
+    assert _signature_path(b) == "b.js"
+    assert a != b
+
+
+def test_two_long_patches_differing_only_at_the_end_are_different_calls():
+    """`_argument_summary` truncates, which would have made these one call."""
+    from shamsu.agents.simple_chat import _call_signature
+
+    body = "x" * 4000
+    one = _call_signature("patch_file", {"filepath": "a.js", "old_string": body + "A", "new_string": "z"})
+    two = _call_signature("patch_file", {"filepath": "a.js", "old_string": body + "B", "new_string": "z"})
+
+    assert one != two
+
+
+def test_the_no_op_stop_does_not_stop_the_next_turn_before_it_starts(tmp_path):
+    """A counter that stays hot after firing is a guard with no escape."""
+    from shamsu.agents.simple_chat import MAX_UNPRODUCTIVE_EDITS, reset_session_stalls
+
+    reset_session_stalls("s7")
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    misses = [
+        _tool("patch_file", filepath="a.js", old_string=f"missing {i}", new_string="x")
+        for i in range(MAX_UNPRODUCTIVE_EDITS + 2)
+    ]
+    first = _stall_loop(tmp_path, misses, "s7", max_rounds=8, verify_changes=False)
+    result = asyncio.run(first.run("fix a.js"))
+
+    assert result.stopped
+    assert "changed nothing" in result.final
+
+    second = _stall_loop(tmp_path, [_text("here you go")], "s7", max_rounds=2, verify_changes=False)
+    again = asyncio.run(second.run("the text is: real contents"))
+
+    assert not again.stopped
+    assert again.final == "here you go"
