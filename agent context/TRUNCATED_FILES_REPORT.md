@@ -236,3 +236,153 @@ foreach ($f in Get-ChildItem js\*.js) {
 # the false verdicts
 Select-String -Path .shamsu\chat-logs\*.md -Pattern 'no syntax errors' | Measure-Object
 ```
+
+---
+---
+
+# Part 2 — why the repair loop never terminates
+
+Same session, later. Asked to fix a syntax error in `main.js`, SHAMSU spent
+**eight user turns** re-announcing a fix it never made, re-diagnosing a bug the
+user had already disproved four times.
+
+```
+29 patch_file calls    0 succeeded
+21 read_file calls     all succeeded
+```
+
+Reading is not the failure. Four separate defects keep the loop alive.
+
+---
+
+## RC6 — the same failing patch is retried byte-for-byte
+
+29 patch calls, **11 distinct payloads**. The top three:
+
+```
+x9   {"filepath": "js/main.js", "old_string": "// Start the application when DOM is ready\\nd…
+x6   (same shape)
+x4   (same shape)
+```
+
+One payload was sent **nine times**, identical, and failed identically nine
+times. Nothing detects that the exact call already failed.
+
+`MAX_UNPRODUCTIVE_EDITS = 4` exists and would catch this — but `self._unproductive`
+is initialised in `__init__` (`simple_chat.py:1103`), and **a fresh
+`SimpleChatLoop` is built per user message**. So the counter resets to zero every
+time the user types. A model that fails four times, gets prompted, and fails four
+more times never trips it. That is exactly this session.
+
+**Fix:** remember failed `(tool, arguments)` pairs for the session, not the turn.
+On an exact repeat, do not call the tool — return "this identical call already
+failed N times, here is the error; try something different" and count it toward
+a session-scoped stop.
+
+---
+
+## RC7 — the turn ends on a promise, and the harness accepts it
+
+**14 assistant turns ended with prose announcing an edit and no tool call:**
+
+```
+"...I'll use patch_file to replace just those two lines:"
+"...with proper code structure. I'll read lines 420-435 to see exactly what needs to be replaced:"
+"...let me create a simple test to verify everything works and provide you with instructions:"
+```
+
+Every one ends in a colon. The next thing should be a tool call; there is none.
+The turn is accepted as a finished answer and handed back to the user.
+
+`describes_an_unmade_edit` is meant to catch this, and cannot:
+
+```python
+if body_lines < 4:        # requires a fenced code block of 4+ lines
+    return ""
+```
+
+It only fires when the model **shows the code instead of writing it**. Here the
+model shows nothing at all — it just promises. No fence, no nudge, turn over.
+
+This is the single defect the user actually experienced: *"I told it to read
+files but nothing happened, the agent remained dumb."* It was not dumb; it was
+cut off at the exact moment it was about to act, every time, and told that was a
+complete answer.
+
+**Fix:** treat a turn that ends on an unfulfilled intent as incomplete. A reply
+whose last non-empty line ends in `:` and announces an action (`let me`, `I'll`,
+`I will`) with zero tool calls should get one continuation nudge, the same way an
+empty reply does.
+
+---
+
+## RC8 — the same error message is returned 29 times, unchanged
+
+Every failure returned:
+
+```
+old_string not found in js/main.js. The file was NOT changed.
+Nearest similar line is line 424: "// Start the application when DOM is ready"
+```
+
+Accurate, and useless on repeat. It never escalates, never widens, never offers
+the actual text. The model has no new information to reason from, so it produces
+the same call again.
+
+`read_and_patch` already carries the right rule — *a half-failure returns the
+half that worked*, handing back the file contents so the next attempt is computed
+from real text. Plain `patch_file` does not.
+
+**Fix:** on a failed match, return the real lines around the nearest hit. On a
+**repeated** failed match, say so explicitly and refuse to accept the same
+`old_string` again.
+
+---
+
+## RC9 — harness messages are recorded as things the user asked
+
+From the user's own `/compact` output:
+
+```
+- you asked: can you make me a 3d asteroid game...
+- you asked: That reply was empty. Answer the question, or call one tool.   <-- not the user
+- you asked: That reply was empty. Answer the question, or call one tool.   <-- not the user
+- you asked: okay read from the plan and do the next task please
+```
+
+`_digest` (`simple_chat.py:2981`) records every `role == "user"` message as
+something the user asked:
+
+```python
+if role == "user" and content:
+    asked.append(...)
+```
+
+But the harness injects its own corrections through `append_user()` — the
+empty-reply nudge, the prose nudge. They are `role: user` on the wire because
+that is how a correction reaches the model, and the digest cannot tell them
+apart.
+
+The digest is what **survives compaction**, so the permanent record of a long
+session fills with instructions the user never gave. It also feeds the model back
+its own scolding as if it were a request.
+
+**Fix:** tag harness-injected turns at write time and skip them in `_digest`.
+This is the same class as RC3's replayed cut-off notice: harness speech is
+becoming conversation.
+
+---
+
+## What the user experienced, in order
+
+1. Model reads `main.js` — succeeds (RC4 note: reads were never the problem)
+2. Emits a patch with a literal `\n` that can never match — **RC4**
+3. Gets the same unhelpful error — **RC8**
+4. Retries it verbatim, up to nine times — **RC6**
+5. Eventually stops calling tools and just promises a fix — **RC7**
+6. Harness accepts the promise as a finished answer — **RC7**
+7. User prompts again; counters reset — **RC6**
+8. Repeat, with the digest quietly filling with fake user requests — **RC9**
+
+Fix order for Part 2: **RC7** (the loop-breaker — without it the agent stops
+mid-intent forever), then **RC6**, then **RC8**, then **RC9**.
