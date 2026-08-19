@@ -30,8 +30,8 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ` in `old_string` can never match | **high** | tools |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
-| [C10](TRUNCATED_FILES_REPORT.md) | **Elision deletes the file it read and keeps the wrong conclusion** — 15 stubs vs 8 surviving false claims | **critical** | context |
 | [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call is accepted as done** (14x) | **critical** | agent loop |
+| [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
 | [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | **high** | agent loop |
 | [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalates | medium | tools |
 | [C9](TRUNCATED_FILES_REPORT.md) | Harness nudges recorded as "you asked" in the compaction digest | medium | context |
@@ -61,6 +61,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Fixed by |
 |---|---|---|
 | [L1](#l1) | `think=` sent to models that cannot think → HTTP 400, **every turn dead** | `c5486ef` |
+| [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `09f29ee` |
 | [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `b08d298` |
 | [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reported "no syntax errors" for files it never opened** (572x in one session) | `dbbaaa1` |
 | [F1](#f1) | Rolling summary dropped when hydration skipped what it described | `8b338d5` |
@@ -74,6 +75,30 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ---
 
 # OPEN
+
+<a name="c12"></a>
+## C12 — the other two thirds of RC10's fix · MEDIUM
+
+`09f29ee` landed RC10 fix 1, the one the report calls sufficient on its own:
+the current contents of a file survive elision. Fixes 2 and 3 did not, and
+saying "C10 is fixed" without recording that would overstate it.
+
+**Fix 2 — elide stale assistant claims too.** A conclusion is not more durable
+than the observation it rests on. Assistant prose is currently not elidable at
+any pressure, which is why eight restatements of one wrong diagnosis survived
+while every read that contradicted them was dropped. If the read behind a claim
+is gone, the claim should be summarised or dropped with it.
+
+**Fix 3 — mark a read that follows a user correction.** *"Re-read after the user
+said the previous diagnosis was wrong"* is one line, and it is exactly the
+context a small model needs to override its own earlier statement. The user
+saying *"the first error does not exist"* carried no more weight than any other
+sentence in the transcript.
+
+Both are lower severity than C10 was, because fix 1 breaks the loop: the model
+can now see the file it read. These make it less likely to argue with it.
+
+---
 
 <a name="c11"></a>
 ## C11 — the checker roster stops short of "every major language" · MEDIUM

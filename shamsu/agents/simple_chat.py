@@ -170,6 +170,36 @@ ELIDE_PRESSURE_FRACTION = 0.6
 ELIDE_TARGET_FRACTION = 0.7
 KEEP_VERBATIM_UNDER_PRESSURE = 8
 
+# How many files keep their most recent read verbatim, however old it is.
+#
+# `RECOVERABLE_TOOLS` asks "can this be fetched again?". That is true of a file
+# read and it is the wrong question - the right one is "what is this result
+# still doing in the reasoning?". A read taken to check a claim is the evidence
+# for that claim and stays load-bearing while the claim is live.
+#
+# The asymmetry is what made it self-reinforcing: the harness elided what it
+# COULD re-fetch and kept what it could not, and the un-refetchable thing is the
+# model's own speculation. Live 2026-08-19 the final prompt held 15 reads of
+# main.js reduced to stubs and 8 surviving assistant sentences all asserting the
+# same wrong diagnosis, so the model re-derived it - that was the only evidence
+# left in the room.
+#
+# Bounded at four paths because this is the one thing elision may not reclaim,
+# and superseded reads of the SAME path are still elided: fifteen stubs for one
+# file is pure loss either way.
+MAX_PROTECTED_READ_PATHS = 4
+
+# And bounded by size as well as by count. The most recent read is always kept -
+# it is the file the model is working on, and dropping it is the whole defect -
+# but further paths are only added while the protected total stays under this
+# fraction of the history budget.
+#
+# The bound is not the escape, though. Protection only stops a payload being
+# SHRUNK; `select_for_budget` still evicts whole messages to fit the window, so
+# a protected read that genuinely cannot fit falls out of the prompt entirely
+# and no amount of protection can deadlock a turn.
+PROTECTED_READS_MAX_FRACTION = 0.35
+
 WHOLE_REWRITE_LIMIT_TOKENS = 400
 
 MAX_DIFF_LINES = 40
@@ -1853,26 +1883,38 @@ class SimpleChatLoop:
         the 44,833 -> 10,476 measurement was taken on.
         """
 
-        def elide(message: Any) -> tuple[str, list[dict[str, Any]]] | None:
-            if message.role == "assistant" and message.tool_calls:
-                return message.content, _shorten_arguments(message.tool_calls)
-            if message.role == "tool":
-                name = canonical_tool_name(message.name or "")
-                return elide_tool_result(name, message.content), message.tool_calls
-            return None
+        protected = self._current_file_reads()
+
+        def make_elide(spare: set[int]):
+            def elide(message: Any) -> tuple[str, list[dict[str, Any]]] | None:
+                if id(message) in spare:
+                    # The current contents of a file still under discussion.
+                    # Dropping this is what left the model with nothing but its
+                    # own wrong conclusions to reason from.
+                    return None
+                if message.role == "assistant" and message.tool_calls:
+                    return message.content, _shorten_arguments(message.tool_calls)
+                if message.role == "tool":
+                    name = canonical_tool_name(message.name or "")
+                    return elide_tool_result(name, message.content), message.tool_calls
+                return None
+
+            return elide
 
         # Stop as soon as the history is under target rather than eliding
         # everything past the cutoff. smallcode evicts to `maxBudget * 0.7`
         # for the same reason: a session only just over budget should keep
         # almost all of its detail.
         target = int(self._history_budget() * ELIDE_TARGET_FRACTION)
+
+        def cost() -> int:
+            return messages_tokens(m.to_ollama() for m in self.state.all_messages)
+
         changed = self.state.elide_old_payloads(
             keep_recent,
-            elide,
+            make_elide(protected),
             target=target,
-            cost_of=lambda: messages_tokens(
-                m.to_ollama() for m in self.state.all_messages
-            ),
+            cost_of=cost,
         )
         if changed:
             SESSION_COUNTERS.evictions += changed
@@ -1882,6 +1924,40 @@ class SimpleChatLoop:
                 {"messages": changed},
             )
         return changed
+
+    def _current_file_reads(self) -> set[int]:
+        """The messages holding what each file ACTUALLY says right now.
+
+        One per path, newest first, capped. Everything older for the same path
+        is superseded and elides normally - fifteen stubs of one file carry no
+        information, and neither did the fifteen full copies.
+
+        Identity rather than index: `elide_old_payloads` walks its own slice of
+        the history, and an index computed here would silently point at the
+        wrong message the moment that slice changed.
+        """
+        protected: set[int] = set()
+        seen: set[str] = set()
+        allowance = int(self._history_budget() * PROTECTED_READS_MAX_FRACTION)
+        spent = 0
+        for message in reversed(self.state.all_messages):
+            if len(seen) >= MAX_PROTECTED_READ_PATHS:
+                break
+            if message.role != "tool" or message.elided:
+                continue
+            path = _read_result_path(message.content)
+            if not path or path in seen:
+                continue
+            cost = message_tokens(message.to_ollama())
+            if protected and spent + cost > allowance:
+                # The most recent read is kept whatever it costs - it is the
+                # file being worked on. Everything after it is a nice-to-have
+                # and stops at the allowance.
+                break
+            seen.add(path)
+            spent += cost
+            protected.add(id(message))
+        return protected
 
     def token_allocation(
         self, messages: list[dict[str, Any]] | None = None
@@ -3374,6 +3450,32 @@ def _middle_out(text: str, head: int, tail: int) -> str:
     omitted = len(body) - head - tail
     kept = body[:head] + [f"... [{omitted} lines elided - re-run to see them] ..."] + body[-tail:]
     return chr(10).join(kept)
+
+
+def _read_result_path(payload: str) -> str:
+    """The file whose CONTENTS this tool result carries, or ``""``.
+
+    Keyed on the payload rather than the tool name so the composites count too:
+    `find_and_read` and `search_and_read` spread the `read_file` data into their
+    own result, so they hand the model a file body under a different name.
+
+    A result that has already been elided down to a stub is not evidence of
+    anything - it says so itself - so it is not a candidate to protect.
+    """
+    if '"resolved_filepath"' not in payload:
+        return ""
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, TypeError):
+        return ""
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict) or "elided" in data:
+        return ""
+    if "content" not in data and "lines" not in data and "text" not in data:
+        # A write echo also carries `resolved_filepath`, and it is not a read.
+        # What distinguishes a read is that the body came back with it.
+        return ""
+    return str(data.get("resolved_filepath") or "").strip().lower()
 
 
 def elide_tool_result(name: str, payload: str) -> str:

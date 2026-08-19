@@ -4978,3 +4978,166 @@ def test_a_write_that_lands_intact_clears_the_refusal_streak(tmp_path):
     asyncio.run(loop.run("write the game loop"))
 
     assert loop._truncated_refusals == 1
+
+
+# --- elision keeps the evidence, not just the conclusion (C10) -----------
+#
+# RC10. The final prompt of the 2026-08-19 session held 15 reads of main.js
+# reduced to `{"elided": "call read_file for the current contents"}` and 8
+# surviving assistant sentences all asserting the same wrong diagnosis. The
+# model re-derived line 426 every round because that was the only evidence left
+# in the room.
+
+
+def _read_payload(path: str, body: str) -> str:
+    return json.dumps({
+        "ok": True,
+        "message": "Read file.",
+        "data": {
+            "filepath": path,
+            "resolved_filepath": path,
+            "total_lines": len(body.splitlines()),
+            "content": body,
+        },
+    })
+
+
+def _crowded(state, rounds: int = 60) -> None:
+    """Enough weight to push the session well past the elision target."""
+    for i in range(rounds):
+        state.append_user(f"later {i} " + "padding " * 400)
+
+
+def test_the_current_contents_of_a_file_survive_elision(tmp_path):
+    """Fix 1, the one the report says would alone have ended the loop."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_user("why is main.js broken?")
+    state.append_assistant("", tool_calls=[{"function": {"name": "read_file", "arguments": {"filepath": "main.js"}}}])
+    state.append_tool("c1", "read_file", _read_payload("main.js", "the real contents of main.js\n"))
+    _crowded(state)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    kept = state.all_messages[3]
+    assert "the real contents of main.js" in kept.content
+    assert "call read_file for the current contents" not in kept.content
+
+
+def test_a_superseded_read_of_the_same_file_is_still_elided(tmp_path):
+    """Fifteen stubs of one file is pure loss; so were fifteen full copies."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(3):
+        state.append_user(f"read it {i}")
+        state.append_assistant("", tool_calls=[{"function": {"name": "read_file", "arguments": {"filepath": "main.js"}}}])
+        state.append_tool(f"c{i}", "read_file", _read_payload("main.js", f"revision {i} of main.js\n"))
+    _crowded(state)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    reads = [m for m in state.all_messages if m.role == "tool"]
+    assert "revision 2 of main.js" in reads[-1].content, "the current one must survive"
+    assert "revision 0 of main.js" not in reads[0].content, "superseded, should be a stub"
+    assert "revision 1 of main.js" not in reads[1].content
+
+
+def test_a_write_echo_is_not_mistaken_for_the_file_contents(tmp_path):
+    """A write result carries `resolved_filepath` too, and is not evidence."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_user("write it")
+    state.append_assistant("", tool_calls=_write_call_body("main.js", "x=1;" + chr(10)))
+    state.append_tool("c1", "write_file", json.dumps({
+        "ok": True, "message": "Created main.js.",
+        "data": {"filepath": "main.js", "resolved_filepath": "main.js", "line_count": 1},
+    }))
+    _crowded(state)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    assert state.all_messages[3].elided
+
+
+def test_only_a_bounded_number_of_files_keep_their_contents(tmp_path):
+    """Protection is the one thing elision may not reclaim, so it is capped."""
+    from shamsu.agents.simple_chat import MAX_PROTECTED_READ_PATHS
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(MAX_PROTECTED_READ_PATHS + 3):
+        state.append_user(f"read f{i}")
+        state.append_assistant("", tool_calls=[{"function": {"name": "read_file", "arguments": {"filepath": f"f{i}.js"}}}])
+        state.append_tool(f"c{i}", "read_file", _read_payload(f"f{i}.js", f"contents of f{i}\n"))
+    _crowded(state)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    survived = [m for m in state.all_messages if m.role == "tool" and "contents of f" in m.content]
+    assert len(survived) <= MAX_PROTECTED_READ_PATHS
+    assert "contents of f0" not in "".join(m.content for m in state.all_messages)
+
+
+def test_protection_stops_at_an_allowance_so_it_cannot_pin_the_window(tmp_path):
+    """The bound. Only the most recent read is kept whatever it costs; further
+    files are added while the protected total stays under the allowance."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    huge = "a line of a very large file " * 60 + chr(10)
+    for i in range(4):
+        state.append_user(f"read big{i}")
+        state.append_assistant("", tool_calls=[{"function": {"name": "read_file", "arguments": {"filepath": f"big{i}.js"}}}])
+        state.append_tool(f"c{i}", "read_file", _read_payload(f"big{i}.js", huge * 40))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    protected = loop._current_file_reads()
+
+    assert len(protected) == 1, "four oversized reads must not all be kept"
+    assert id(state.all_messages[-1]) in protected, "and the one kept is the newest"
+
+
+def test_protection_can_never_deadlock_the_prompt(tmp_path):
+    """The real escape is eviction, one layer down: protection stops a payload
+    being SHRUNK, it does not stop a message being dropped to fit the window."""
+    from shamsu.agents.simple_chat import output_reserve
+    from shamsu.context.budget import messages_tokens, tool_schema_tokens
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    huge = "a line of a very large file " * 60 + chr(10)
+    for i in range(6):
+        state.append_user(f"read big{i}")
+        state.append_assistant("", tool_calls=[{"function": {"name": "read_file", "arguments": {"filepath": f"big{i}.js"}}}])
+        state.append_tool(f"c{i}", "read_file", _read_payload(f"big{i}.js", huge * 40))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+    loop._request = "fix it"
+
+    loop._elide_payloads()
+    built = loop._messages()
+    ceiling = loop._ceiling()
+    sent = messages_tokens(built) + tool_schema_tokens(loop._sent_schemas())
+
+    assert sent < ceiling
+    assert ceiling - sent >= output_reserve(ceiling)
+
+
+def test_the_read_that_survives_is_the_one_the_model_reasons_from(tmp_path):
+    """End to end, the shape of the live failure: the model's wrong claim and
+    the read that disproves it, both old. The read must not be the casualty."""
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_assistant("I found it! The issue is on line 426 - a stray comment.")
+    state.append_assistant("", tool_calls=[{"function": {"name": "read_file", "arguments": {"filepath": "main.js"}}}])
+    state.append_tool("c1", "read_file", _read_payload("main.js", "426: // a perfectly ordinary comment\n"))
+    _crowded(state)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    loop._elide_payloads()
+
+    prompt = "".join(m.content for m in state.all_messages)
+    assert "line 426 - a stray comment" in prompt          # the claim survives
+    assert "a perfectly ordinary comment" in prompt        # so does what disproves it
