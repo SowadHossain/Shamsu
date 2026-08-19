@@ -261,3 +261,108 @@ def test_tool_schemas_expose_clarification_and_discovery_tools(tmp_path: Path):
     names = {schema["function"]["name"] for schema in registry.tool_schemas()}
 
     assert {"find_file", "grep_files", "append_file", "ask_user"}.issubset(names)
+
+
+# --- a literal backslash-n in old_string (C3) ---------------------------
+#
+# RC4. Live 2026-08-19: 24 patch attempts, 0 successes, then 29 more in the
+# next session with one payload sent nine times. The model emits `\n` as two
+# characters where a newline belongs, mixed with real newlines in the same
+# string. That text is in no file, so it can never match, and the harness's
+# error was accurate and useless because it compared the mangled string as
+# given.
+
+BACKSLASH = chr(92)
+
+
+def _mangled(text: str) -> str:
+    """A model's edit block with its newlines emitted as two characters."""
+    return text.replace(chr(10), BACKSLASH + "n")
+
+
+def test_a_patch_whose_newlines_arrived_as_two_characters_still_applies(tmp_path: Path):
+    """The exact payload shape from the log."""
+    registry = _registry(tmp_path)
+    (tmp_path / "main.js").write_text(
+        "// Start the application when DOM is ready\n"
+        "document.addEventListener('DOMContentLoaded', init);\n",
+        encoding="utf-8",
+    )
+
+    result = registry.edit_file(
+        "main.js",
+        _mangled("// Start the application when DOM is ready\ndocument.addEventListener('DOMContentLoaded', init);"),
+        "// fixed",
+    )
+
+    assert result.ok is True
+    assert (tmp_path / "main.js").read_text(encoding="utf-8") == "// fixed\n"
+
+
+def test_the_replacement_is_unescaped_too_or_the_backslash_lands_in_the_file(tmp_path: Path):
+    """Decoding only old_string would trade one corruption for another."""
+    registry = _registry(tmp_path)
+    (tmp_path / "a.js").write_text("one\ntwo\n", encoding="utf-8")
+
+    result = registry.edit_file("a.js", _mangled("one\ntwo"), _mangled("uno\ndos"))
+
+    assert result.ok is True
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == "uno\ndos\n"
+
+
+def test_the_salvage_is_reported_so_the_model_can_stop_doing_it(tmp_path: Path):
+    """A salvage the model never hears about is one it makes every turn."""
+    registry = _registry(tmp_path)
+    (tmp_path / "a.js").write_text("one\ntwo\n", encoding="utf-8")
+
+    result = registry.edit_file("a.js", _mangled("one\ntwo"), "1")
+
+    assert "literal backslash-n" in result.message
+    assert result.data["unescaped_literal_newlines"] is True
+
+
+def test_a_real_backslash_n_in_source_is_left_alone(tmp_path: Path):
+    """`"\n"` in JavaScript is content, not a mangled newline. Decoding it
+    would corrupt the very edit being made."""
+    registry = _registry(tmp_path)
+    body = 'const nl = "' + BACKSLASH + BACKSLASH + 'n";' + chr(10)
+    (tmp_path / "a.js").write_text(body, encoding="utf-8")
+
+    result = registry.edit_file("a.js", 'const nl = "' + BACKSLASH + BACKSLASH + 'n";', "const nl = NEWLINE;")
+
+    assert result.ok is True
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == "const nl = NEWLINE;\n"
+
+
+def test_regex_escapes_are_not_decoded(tmp_path: Path):
+    r"""Only n, r and t. `\d` and `\s` are ordinary content."""
+    from shamsu.tools.agent_tools import _decode_literal_escapes
+
+    pattern = BACKSLASH + "d+" + BACKSLASH + "s*"
+
+    assert _decode_literal_escapes(pattern) == pattern
+
+
+def test_an_ordinary_patch_is_untouched_by_the_salvage(tmp_path: Path):
+    """The decode is only ever tried after an exact match has already missed."""
+    registry = _registry(tmp_path)
+    (tmp_path / "a.js").write_text("one\ntwo\n", encoding="utf-8")
+
+    result = registry.edit_file("a.js", "one\ntwo", "uno")
+
+    assert result.ok is True
+    assert "literal backslash-n" not in result.message
+    assert result.data["unescaped_literal_newlines"] is False
+
+
+def test_a_mangled_patch_that_still_does_not_match_names_the_format_mistake(tmp_path: Path):
+    """The model cannot see that its own newlines went out as two characters,
+    and it repeated the same payload nine times without ever being told."""
+    registry = _registry(tmp_path)
+    (tmp_path / "a.js").write_text("one\ntwo\n", encoding="utf-8")
+
+    result = registry.edit_file("a.js", _mangled("nine\nten"), "x")
+
+    assert result.ok is False
+    assert "literal backslash-n" in result.message
+    assert "The file was NOT changed" in result.message

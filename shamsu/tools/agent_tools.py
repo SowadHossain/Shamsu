@@ -2075,6 +2075,26 @@ class AgentToolRegistry:
             return ToolResult(False, f"Could not read {normalized}: {exc}", {"filepath": normalized})
 
         count = content.count(old_string)
+        unescaped_escapes = False
+        if count == 0:
+            # The model wrote a LITERAL backslash-n where a newline belongs.
+            # That text is in no file, so it can never match: live 2026-08-19
+            # this was 24 patch attempts and 0 successes in one session, then 29
+            # more in the next, with the same payload sent nine times. The
+            # harness's error was accurate and useless because it compared the
+            # mangled string as given.
+            #
+            # Tried before the whitespace fuzz because it is the more specific
+            # failure, and only ever after an exact match has already missed -
+            # nothing that already worked changes path. `new_string` is
+            # unescaped with it or the replacement would put the literal
+            # backslash INTO the file, trading one corruption for another.
+            decoded = _decode_literal_escapes(old_string)
+            if decoded != old_string and content.count(decoded) > 0:
+                old_string = decoded
+                new_string = _decode_literal_escapes(new_string)
+                count = content.count(old_string)
+                unescaped_escapes = True
         if count == 0:
             # Exact match missed - retry tolerating trailing-whitespace / line-
             # ending drift (the most common reason a local model's edit block
@@ -2087,6 +2107,16 @@ class AgentToolRegistry:
                 count = content.count(old_string)
         if count == 0:
             hint = _nearby_edit_hint(content, old_string)
+            if _mentions_literal_escapes(old_string):
+                # Unescaping was tried above and still did not match, so the
+                # text is wrong for a second reason too. Name the format
+                # mistake anyway - the model cannot see that its own newlines
+                # went out as two characters, and it repeated the same payload
+                # nine times without ever being told.
+                hint = (
+                    "Your old_string contains a literal backslash-n where a newline "
+                    "belongs. Send real line breaks, not the two characters. " + hint
+                )
             return ToolResult(
                 False,
                 f"old_string not found in {normalized}. The file was NOT changed. {hint}",
@@ -2199,10 +2229,21 @@ class AgentToolRegistry:
         first_index = content.find(old_string)
         start_line = content.count("\n", 0, first_index) + 1
         end_line = start_line + old_string.count("\n")
+        message = (
+            f"Edited {normalized}: +{added} -{removed} lines "
+            f"(lines {start_line}-{end_line}, {replacements} replacement(s))."
+        )
+        if unescaped_escapes:
+            # Say it even on success. A salvage the model never hears about is
+            # one it makes again every turn, and the next one may not be
+            # salvageable.
+            message += (
+                " Note: your old_string had a literal backslash-n where a newline "
+                "belongs; it was decoded to match. Send real line breaks next time."
+            )
         return ToolResult(
             True,
-            f"Edited {normalized}: +{added} -{removed} lines "
-            f"(lines {start_line}-{end_line}, {replacements} replacement(s)).",
+            message,
             {
                 "filepath": normalized,
                 "resolved_filepath": normalized,
@@ -2214,6 +2255,7 @@ class AgentToolRegistry:
                 "start_line": start_line,
                 "end_line": end_line,
                 "auto_disambiguated": auto_disambiguated,
+                "unescaped_literal_newlines": unescaped_escapes,
             },
         )
 
@@ -3800,6 +3842,33 @@ def _coerce_optional_int(value: Any) -> int | None:
         return int(str(value).strip())
     except (ValueError, TypeError):
         return None
+
+
+# A backslash followed by n, r or t - but not one that is itself escaped, so
+# `"\\n"` in real JavaScript source is left exactly as the file has it.
+_LITERAL_ESCAPE_RE = re.compile(r"(?<!\\)\\([nrt])")
+_LITERAL_ESCAPE_CHARS = {"n": "\n", "r": "\r", "t": "\t"}
+
+
+def _decode_literal_escapes(text: str) -> str:
+    """Turn a literal backslash-n into a newline. Whitespace escapes only.
+
+    Small models routinely emit `\\n` as two characters where a newline belongs,
+    mixed with real newlines in the same string - live 2026-08-19 that string
+    matched nothing in 24 attempts, and the same payload was sent nine times.
+
+    Deliberately narrow. `\\d`, `\\s`, `\\\\` and every other escape are left
+    alone, because they are ordinary content in a regex or a Windows path and
+    "helpfully" decoding them would corrupt the very edit being made. The caller
+    adopts the result only when it actually matches the file, so an over-eager
+    decode here cannot reach disk on its own.
+    """
+    return _LITERAL_ESCAPE_RE.sub(lambda m: _LITERAL_ESCAPE_CHARS[m.group(1)], text)
+
+
+def _mentions_literal_escapes(text: str) -> bool:
+    """Whether a failed `old_string` looks mangled in the way the log showed."""
+    return bool(_LITERAL_ESCAPE_RE.search(text or ""))
 
 
 def _fuzzy_match_block(content: str, old_string: str) -> str | None:
