@@ -30,7 +30,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
 | [C9](TRUNCATED_FILES_REPORT.md) | Harness nudges recorded as "you asked" in the compaction digest | medium | context |
 | [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
-| [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
 | [W1](#w1) | `.shamsu/` records the same turn four times; `paths.py` governs 7 of its 13 entries | medium | structure |
 | [W2](#w2) | **No session retention** — 127 sessions / 9.9 MB in one workspace, never pruned | medium | structure |
 | [W3](#w3) | Session files carry conversation content with default permissions | low | security |
@@ -58,6 +57,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `4e70775` |
 | [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `9cbdde9` |
 | [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `d1ba009` |
+| [G1](#g1) | Code graph held **243 projects**, 129 of them dead scratch dirs — and this repo indexed **twice** | `3fede9e`+1 |
 | [G2](#g2) | Graph indexed `reference/`, `other peoples work/`, `legacy-code/` and answered out of them | `b1f81bf`+1 |
 | [M1](#m1) | **Memory was only written if the model volunteered** — a real 2-turn run produced none | `7284641`+1 |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail was 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | `8bc7f6c`+1 |
@@ -486,9 +486,58 @@ and nothing ever cleans up. Contrast smallcode's engine, which writes
 `.code-graph/graph.db` **inside the project** — delete the folder, the index
 goes with it, and cross-project contamination is structurally impossible.
 
-**Fix:** purge the eval-scratch projects (`delete_project`), re-index this repo,
-and add a cleanup path so temp-dir indexes cannot accumulate. Until then, treat
-every graph answer as suspect.
+### Re-measured 2026-08-19, and two of the claims above have changed
+
+```
+total projects        243
+  under system temp   129
+  eval-artifact dirs    30   (inside this repo, indexed as separate projects)
+this repo indexed      YES - TWICE
+```
+
+**"This repo is not indexed" is no longer true**, and what replaced it is worse:
+it is indexed **twice, under two names for the identical root path**.
+
+```
+F-Work-PROJECTS-shamsu-shamsu   22,730 nodes  154,613 edges
+shamsu-windows                  23,707 nodes  163,484 edges
+```
+
+A `graph_search` answer therefore depends on which project name the caller
+passes, and the two disagree by roughly a thousand nodes. `shamsu-windows` is
+the one this repo's notes tell agents to use.
+
+**What the 129 temp entries actually are** matters too. They are not only July's
+eval scratchpads:
+
+```
+.../pytest-of-so_what_/pytest-320/test_workspace_qa_workflow_fal0
+.../scratchpad/livetest, verify-a, verify-b, small-a2
+```
+
+SHAMSU's **own test suite** has been filling the global store, and four more
+entries were created by the live runs that verified this session's fixes.
+
+### Fixed
+
+The recurrence: `index_workspace` now declines a workspace that is disposable -
+under the system temp directory, or named as eval output - because a graph that
+outlives the directory it describes can never answer anything. `force=True` is
+the escape.
+
+The guard sits on the ADAPTER, not on `AbstractService`, and the first attempt
+put it in the wrong place: every test that exercises indexing goes through a
+fake adapter and never touches the real store, so guarding the service made nine
+tests opt out of a hazard they never posed. The only code that writes to the
+global store is the only code that needs to refuse.
+
+### Still to do, and deliberately not done here
+
+* **Purge** the 129 + 30 dead entries and one of the two duplicate SHAMSU
+  indexes. That is `delete_project` against a store shared with unrelated real
+  projects (`F:/Work/pewdiepie/odysseus`, `F:/Work/pong-test` and others), it is
+  irreversible, and it is not something to do without being asked.
+* **Re-index** this repo after G2, so the vendored trees drop out.
 
 ---
 

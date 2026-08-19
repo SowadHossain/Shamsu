@@ -19,6 +19,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -61,6 +62,49 @@ def _no_window_flags() -> int:
     if sys.platform != "win32":
         return 0
     return subprocess.CREATE_NO_WINDOW
+
+
+# Directory names that mean "this tree is not a project". Matched on the PATH,
+# not on a single name, so a real project simply called `tmp` is untouched.
+_DISPOSABLE_MARKERS = (
+    "/eval_",
+    "/baseline_artifacts/",
+    "/prd_eval",
+    "/universal-prd-eval",
+    "/phase2_prd_eval_artifacts/",
+)
+
+
+def disposable_workspace(workspace: Path) -> str:
+    """Why this directory is throwaway, or ``""`` if it is a real project.
+
+    Two independent signals, both taken from what actually filled the store:
+
+    * it lives under the system temp directory - true of 129 of the 243 indexed
+      projects, all of them eval scratchpads from a single day in July;
+    * its path names it as eval output - true of 30 more, which sit INSIDE this
+      repository and are indexed as separate projects alongside it.
+
+    Returns a reason rather than a bool so the refusal can say which one.
+    """
+    try:
+        resolved = Path(workspace).resolve()
+    except OSError:
+        return ""
+    lowered = resolved.as_posix().lower()
+    for root in (tempfile.gettempdir(), os.environ.get("TMPDIR", "")):
+        if not root:
+            continue
+        try:
+            root_posix = Path(root).resolve().as_posix().lower()
+        except OSError:
+            continue
+        if lowered == root_posix or lowered.startswith(root_posix.rstrip("/") + "/"):
+            return "inside the system temporary directory"
+    for marker in _DISPOSABLE_MARKERS:
+        if marker in lowered:
+            return f"an evaluation artifact directory ({marker.strip('/')})"
+    return ""
 
 
 class CodebaseMemoryAdapter:
@@ -261,7 +305,39 @@ class CodebaseMemoryAdapter:
 
     # -- indexing -----------------------------------------------------------------
 
-    def index_workspace(self, workspace: Path) -> dict[str, Any]:
+    def index_workspace(self, workspace: Path, force: bool = False) -> dict[str, Any]:
+        throwaway = "" if force else disposable_workspace(workspace)
+        if throwaway:
+            # The store is GLOBAL and keyed by a mangled absolute path, so every
+            # throwaway directory anything ever ran in accumulates forever and
+            # nothing cleans up. Measured 2026-08-19: 243 indexed projects, of
+            # which 129 lived under a temp directory and 30 more were
+            # eval-artifact folders inside this repo, indexed as separate
+            # projects beside it. Among the 129 were `pytest-of-.../pytest-320/
+            # test_workspace_qa_workflow_fal0` - SHAMSU's own test suite had
+            # been filling the store for weeks - and four workspaces created
+            # while testing these very fixes.
+            #
+            # A graph that outlives the directory it describes can never answer
+            # anything, so building it was pure cost.
+            #
+            # The guard sits HERE, at the only place that writes to the global
+            # store, rather than in `AbstractService`: every test that exercises
+            # indexing does so through a fake adapter and never touches the real
+            # store, so guarding the service would have made nine tests opt out
+            # of a hazard they never posed.
+            #
+            # `force` is the escape - somebody who explicitly asks to index a
+            # scratch directory has a reason.
+            return {
+                "ok": False,
+                "skipped": "disposable_workspace",
+                "error": (
+                    f"Not indexing {workspace}: it is {throwaway}, so the index would "
+                    "outlive the directory it describes and stay in the global store "
+                    "forever. Pass force=True if that is really what you want."
+                ),
+            }
         ignore_policy = ensure_cbm_ignore(workspace)
         if not ignore_policy.get("ok"):
             return {

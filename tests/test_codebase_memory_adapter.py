@@ -99,9 +99,12 @@ def test_index_workspace_installs_cbmignore_without_replacing_user_rules(monkeyp
         lambda workspace, tool, args: AdapterResult(ok=True, data={"status": "indexed"}),
     )
 
-    result = adapter.index_workspace(tmp_path)
+    # A pytest tmp_path is a disposable workspace and is refused by default, so
+    # this test - which is about the ignore file, not about the policy - says
+    # explicitly that it means to index one.
+    result = adapter.index_workspace(tmp_path, force=True)
     first = ignore.read_text(encoding="utf-8")
-    adapter.index_workspace(tmp_path)
+    adapter.index_workspace(tmp_path, force=True)
 
     assert result["ok"] is True
     assert "private-notes/" in first
@@ -128,3 +131,82 @@ def test_refresh_rebuilds_an_existing_index_that_contains_internal_paths(monkeyp
     assert result["rebuilt_for_policy"] is True
     assert result["removed_internal_paths"] == [".shamsu/runs/old.json"]
     assert len(index_calls) == 2
+
+
+# --- throwaway directories must not enter a global store (G1) -----------
+#
+# Measured 2026-08-19: 243 indexed projects. 129 lived under the system temp
+# directory - eval scratchpads from a single day in July that had not existed
+# for weeks - and 30 more were eval-artifact folders inside this repository,
+# indexed as separate projects alongside it. The store is global and keyed by a
+# mangled absolute path, so nothing ever cleaned up.
+
+
+def test_a_temp_directory_is_recognised_as_throwaway(tmp_path):
+    from shamsu.tools.codebase_memory import disposable_workspace
+
+    # pytest's tmp_path IS under the system temp directory, which is the point.
+    assert disposable_workspace(tmp_path)
+
+
+def test_an_eval_artifact_directory_is_recognised():
+    """The 30 that sit INSIDE this repository, indexed as separate projects
+    alongside it. Checked on a real project path so the temp-dir signal cannot
+    answer for it."""
+    from pathlib import Path
+
+    from shamsu.tools.codebase_memory import disposable_workspace
+
+    target = Path("F:/Work/PROJECTS/shamsu/Shamsu/tmp/universal-prd-eval/eval_20260801_0109")
+
+    assert "evaluation artifact" in disposable_workspace(target)
+
+
+def test_a_real_project_is_not_refused(tmp_path):
+    """The repo this runs in is a real project and must stay indexable."""
+    from pathlib import Path
+
+    from shamsu.tools.codebase_memory import disposable_workspace
+
+    assert disposable_workspace(Path(__file__).resolve().parent.parent) == ""
+
+
+def test_a_project_merely_called_tmp_is_not_refused():
+    """Matched on the PATH, not on a single name - a real project called `tmp`
+    is somebody's actual work."""
+    from pathlib import Path
+
+    from shamsu.tools.codebase_memory import disposable_workspace
+
+    assert disposable_workspace(Path("F:/Work/tmp")) == ""
+
+
+def test_indexing_a_throwaway_workspace_is_refused_and_says_why(tmp_path):
+    """Refused rather than skipped silently: a caller that asked for an index
+    deserves to know it did not get one."""
+    adapter = CodebaseMemoryAdapter()
+
+    result = adapter.index_workspace(tmp_path)
+
+    assert result["ok"] is False
+    assert result["skipped"] == "disposable_workspace"
+    assert "temporary directory" in result["error"]
+
+
+def test_a_refused_index_leaves_the_directory_untouched(tmp_path):
+    """The refusal comes first, so a throwaway directory is left as found."""
+    adapter = CodebaseMemoryAdapter()
+
+    adapter.index_workspace(tmp_path)
+
+    assert not (tmp_path / ".cbmignore").exists()
+
+
+def test_force_is_the_escape(tmp_path):
+    """A guard with no way past it is a deadlock. `force=True` gets as far as
+    installing the ignore file, which is proof it went past the refusal."""
+    adapter = CodebaseMemoryAdapter()
+
+    adapter.index_workspace(tmp_path, force=True)
+
+    assert (tmp_path / ".cbmignore").exists()
