@@ -1684,7 +1684,9 @@ class SimpleChatLoop:
                 digest = _digest(self.state.rolling_summary, evicted)
                 if digest:
                     self.state.update_rolling_summary(digest, start_abs)
-        messages = self.state.build_ollama_messages(tail, include_summary=start_abs > 1)
+        messages = self.state.build_ollama_messages(
+            tail, include_summary=self.state.should_include_summary(start_abs)
+        )
         # Placed AFTER the system prompt and before the conversation, and rebuilt
         # every call, so it can never be the stale thing the model reasons from.
         # Two halves of one question: the listing says which files exist, the
@@ -1712,7 +1714,7 @@ class SimpleChatLoop:
             messages.insert(len(messages) - 1, block)
         else:
             messages.append(block)
-        LAST_ALLOCATION["value"] = self.token_allocation()
+        LAST_ALLOCATION["value"] = self.token_allocation(messages)
         return messages
 
     def _shrink_for_oom(self) -> bool:
@@ -1805,36 +1807,40 @@ class SimpleChatLoop:
             )
         return changed
 
-    def token_allocation(self) -> TokenAllocation:
-        """Split the current prompt into the buckets that make it up.
+    def token_allocation(
+        self, messages: list[dict[str, Any]] | None = None
+    ) -> TokenAllocation:
+        """Split the prompt that was actually SENT into the buckets making it up.
 
-        Costed with the same `message_tokens` the budget uses, so the numbers
-        here and the numbers the trimmer acts on can never disagree - which
-        they did for as long as `tool_calls` cost nothing.
+        Classifies the assembled message list rather than re-deriving it, and
+        that is the whole point. Walking every stored message reported 42,440
+        tokens of tool results inside a 23,595-token prompt. Re-running the
+        selection instead was closer but still wrong by ~900, because
+        `_messages` UPDATES the rolling summary while it builds - so the second
+        run sees a different state from the one that was sent.
+
+        Measure what you built. A meter that overstates is worse than none,
+        because it gets believed.
         """
-        allocation = TokenAllocation(
-            system_prompt=count_tokens(self.state.system_prompt) + PER_MESSAGE_OVERHEAD,
-            tool_schemas=tool_schema_tokens(self._sent_schemas()),
-        )
-        grounding = render_workspace_files(self._files)
-        remembered = render_memory(self.workspace, self._request)
-        if remembered:
-            grounding = remembered + chr(10) * 2 + grounding
-        if self._brief:
-            grounding = grounding + chr(10) * 2 + self._brief
-        allocation.grounding = count_tokens(grounding) + PER_MESSAGE_OVERHEAD
-        summary = self.state.rolling_summary
-        if summary.strip():
-            allocation.grounding += count_tokens(summary) + PER_MESSAGE_OVERHEAD
-        for message in self.state.all_messages[1:]:
+        built = self._messages() if messages is None else messages
+        allocation = TokenAllocation(tool_schemas=tool_schema_tokens(self._sent_schemas()))
+        for index, message in enumerate(built):
             cost = message_tokens(message)
-            if message.role == "tool":
+            role = str(message.get("role") or "")
+            if role == "system":
+                # Position 0 is the standing prompt; any later system message
+                # is injected context - the summary and the grounding block.
+                if index == 0:
+                    allocation.system_prompt += cost
+                else:
+                    allocation.grounding += cost
+            elif role == "tool":
                 allocation.tool_results += cost
-            elif message.role == "assistant" and message.tool_calls:
+            elif role == "assistant" and message.get("tool_calls"):
                 # The CALL is conversation; the payload inside it is a tool
-                # cost, and lumping the two hid the biggest items in the
-                # prompt behind a label that looked like ordinary chat.
-                text_only = count_tokens(message.content) + PER_MESSAGE_OVERHEAD
+                # cost. Lumping the two hid the biggest items in the prompt
+                # behind a label that looked like ordinary chat.
+                text_only = count_tokens(str(message.get("content") or "")) + PER_MESSAGE_OVERHEAD
                 allocation.conversation += text_only
                 allocation.tool_results += max(0, cost - text_only)
             else:

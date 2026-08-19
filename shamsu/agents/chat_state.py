@@ -336,6 +336,27 @@ class ChatState:
     def rolling_summary(self) -> str:
         return self._rolling_summary
 
+    def should_include_summary(self, start_abs: int) -> bool:
+        """Whether the rolling summary describes anything not in the prompt.
+
+        The caller used to decide this with `start_abs > 1` - "did we evict
+        anything THIS turn" - and that is the wrong question. It misses the
+        case the summary exists for.
+
+        A long thread resumed: hydration loads the last 400 records and skips
+        the rest, those 400 fit the budget, so nothing is evicted this turn and
+        `start_abs` is 1. The summary is then dropped - and it was the only
+        trace of everything hydration skipped. Reproduced directly: 101
+        messages left unloaded, the founding decision recorded in the summary,
+        and neither the decision nor the summary anywhere in the prompt.
+
+        The right question is whether the summary covers anything the prompt
+        does not: something evicted now, or something never loaded at all.
+        """
+        if not self._rolling_summary.strip():
+            return False
+        return start_abs > 1 or self._hydration_offset > 0
+
     def build_ollama_messages(
         self, tail: list[ChatMessage], include_summary: bool
     ) -> list[dict[str, Any]]:

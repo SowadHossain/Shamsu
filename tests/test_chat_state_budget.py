@@ -293,3 +293,67 @@ def test_the_watermark_persisted_is_a_whole_transcript_number(tmp_path):
     _summary, upto = logger.load_summary()
     # 30 records skipped by hydration + 4 covered inside the window.
     assert upto == 34, f"a window-local index was persisted verbatim: {upto}"
+
+# ---------------------------------------------------------------------------
+# The rolling summary must reach the prompt when it is the only trace left
+# ---------------------------------------------------------------------------
+
+
+def _long_thread(tmp_path, turns: int = 60):
+    logger = SessionManager(tmp_path).create_session("long")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+    state.append_user("THE FOUNDING DECISION: the window is 900x700")
+    for i in range(turns):
+        state.append_user(f"turn {i}")
+        state.append_assistant(f"reply {i}")
+    state.update_rolling_summary("- the window is 900x700", 40)
+    return logger
+
+
+def test_a_resumed_thread_still_carries_its_summary(tmp_path):
+    """The case the summary exists for, and the one it used to be dropped in.
+
+    Hydration loads the tail and skips the rest; the tail fits, so nothing is
+    evicted this turn and `start_abs` is 1. Deciding on `start_abs > 1` then
+    discarded the only surviving trace of everything hydration skipped.
+    """
+    logger = _long_thread(tmp_path)
+    resumed = ChatState("sys", session_logger=logger, hydrate=True, hydrate_max_messages=20)
+
+    tail, start_abs = resumed.select_for_budget(100_000, _wc)
+    built = resumed.build_ollama_messages(
+        tail, include_summary=resumed.should_include_summary(start_abs)
+    )
+
+    assert start_abs == 1, "precondition: nothing evicted this turn"
+    assert resumed._hydration_offset > 0, "precondition: hydration skipped messages"
+    assert any("900x700" in str(m.get("content")) for m in built), (
+        "the summary was dropped, and it was the only trace of the skipped turns"
+    )
+
+
+def test_a_short_thread_does_not_repeat_itself(tmp_path):
+    """Everything the summary covers is still in the prompt; sending both is waste."""
+    logger = SessionManager(tmp_path).create_session("short")
+    state = ChatState("sys", session_logger=logger, hydrate=False)
+    state.append_user("hello")
+    state.update_rolling_summary("- something", 1)
+
+    _tail, start_abs = state.select_for_budget(100_000, _wc)
+
+    assert state.should_include_summary(start_abs) is False
+
+
+def test_an_empty_summary_is_never_inserted(tmp_path):
+    state = ChatState("sys", session_logger=None, hydrate=False)
+    state.append_user("hi")
+
+    assert state.should_include_summary(5) is False
+
+
+def test_a_summary_is_included_when_this_turn_evicted_something(tmp_path):
+    state = ChatState("sys", session_logger=None, hydrate=False)
+    state.append_user("hi")
+    state.update_rolling_summary("- older detail", 2)
+
+    assert state.should_include_summary(3) is True

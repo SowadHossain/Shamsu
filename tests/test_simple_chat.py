@@ -3669,27 +3669,48 @@ def test_a_plain_conversation_is_not_attacked_by_payload_elision(tmp_path):
     assert any("will not help much" in m for m in said)
 
 
-def test_the_buckets_add_up_to_what_the_budget_counts(tmp_path):
-    """The breakdown and the trimmer must never disagree about the same prompt."""
+def test_the_buckets_add_up_to_the_prompt_exactly(tmp_path):
+    """The meter says "where the last prompt went", so it must mean the PROMPT.
+
+    Reading every stored message instead reported 42,440 tokens of tool results
+    inside a 23,595-token prompt - true about the wrong thing. Re-running the
+    selection was closer and still wrong by ~900, because `_messages` updates
+    the rolling summary as it builds. Classifying the assembled list is the
+    only version that cannot drift.
+    """
     from shamsu.context.budget import messages_tokens, tool_schema_tokens
 
     state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
-    for i in range(10):
-        state.append_user(f"u{i}")
+    for i in range(30):
+        state.append_user(f"u{i} " + "pad " * 50)
         state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", "y" * 5000))
-        state.append_tool("", "write_file", json.dumps({"ok": True, "message": "wrote"}))
+        state.append_tool(f"c{i}", "write_file", json.dumps({"ok": True, "message": "wrote"}))
     loop = _loop(tmp_path, [_text("ok")])
     loop.state = state
     loop._files = workspace_files(tmp_path)
 
-    allocation = loop.token_allocation()
-    counted = (
-        messages_tokens(m.to_ollama() for m in state.all_messages)
-        + tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
-        + allocation.grounding
-    )
+    built = loop._messages()
+    sent = messages_tokens(built) + tool_schema_tokens(loop._sent_schemas())
 
-    assert abs(allocation.total - counted) <= 2, f"{allocation.total} vs {counted}"
+    assert loop.token_allocation(built).total == sent
+
+
+def test_the_buckets_describe_the_prompt_not_the_whole_conversation(tmp_path):
+    """A meter that overstates by 2x is worse than none: it gets believed."""
+    from shamsu.context.budget import messages_tokens
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(60):
+        state.append_user(f"u{i}")
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", "y" * 6000))
+        state.append_tool(f"c{i}", "write_file", json.dumps({"ok": True, "message": "wrote"}))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    whole = messages_tokens(m.to_ollama() for m in state.all_messages)
+    reported = loop.token_allocation().total
+
+    assert reported < whole / 2, "the meter is reporting the archive, not the prompt"
 
 
 # ---------------------------------------------------------------------------
@@ -4425,3 +4446,89 @@ def test_a_turn_with_nobody_listening_behaves_exactly_as_before(tmp_path):
 
     assert result.final == "ok"
     assert loop.feedback is None
+
+
+# ---------------------------------------------------------------------------
+# The assembled prompt: structure, ordering, and pairing
+#
+# Every part of this changed in this branch - budget, elision, grounding,
+# memory, capability lines, routing. These pin the shape they must add up to.
+# ---------------------------------------------------------------------------
+
+
+def _assembled(tmp_path, turns: int = 40):
+    from shamsu.agents.simple_memory import remember
+
+    for i in range(20):
+        (tmp_path / f"m{i}.py").write_text("x = 1\n", encoding="utf-8")
+    remember(tmp_path, "decision", "dev server port", "The dev server runs on port 8080.")
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._request = "what port does the dev server use?"
+    loop._files = workspace_files(tmp_path)
+    for i in range(turns):
+        loop.state.append_user(f"turn {i} " + "pad " * 40)
+        loop.state.append_assistant(
+            "", tool_calls=_write_call_body(f"m{i}.py", "y\n" * 300)
+        )
+        loop.state.append_tool(f"c{i}", "write_file", json.dumps({"ok": True, "message": "wrote"}))
+    loop.state.append_user("what port does the dev server use?")
+    return loop, loop._messages()
+
+
+def test_the_standing_prompt_leads_and_the_request_ends(tmp_path):
+    """A small model reads the end. The request has to be there."""
+    _loop_, built = _assembled(tmp_path)
+
+    assert built[0]["role"] == "system"
+    assert built[-1]["role"] == "user"
+    assert "what port" in built[-1]["content"]
+
+
+def test_grounding_sits_immediately_before_the_request(tmp_path):
+    """Not at position 1: it changes whenever a file does, and sitting early it
+    invalidated the KV prefix and forced a full re-prefill every turn."""
+    _loop_, built = _assembled(tmp_path)
+
+    grounding = [
+        i for i, m in enumerate(built) if "Files in the workspace" in str(m.get("content"))
+    ]
+
+    assert grounding == [len(built) - 2]
+
+
+def test_recalled_memory_rides_along_with_the_grounding(tmp_path):
+    _loop_, built = _assembled(tmp_path)
+
+    assert any("8080" in str(m.get("content")) for m in built)
+
+
+def test_no_tool_result_is_orphaned_from_its_call(tmp_path):
+    """Trimming to a budget must never cut between a call and its result."""
+    _loop_, built = _assembled(tmp_path)
+
+    roles = [m["role"] for m in built]
+    for index, role in enumerate(roles):
+        if role == "tool":
+            assert index > 0 and roles[index - 1] in {"assistant", "tool"}
+
+
+def test_the_assembled_prompt_leaves_the_reply_its_reserve(tmp_path):
+    from shamsu.agents.simple_chat import output_reserve
+    from shamsu.context.budget import messages_tokens, tool_schema_tokens
+
+    loop, built = _assembled(tmp_path, turns=60)
+    ceiling = loop._ceiling()
+    sent = messages_tokens(built) + tool_schema_tokens(loop._sent_schemas())
+
+    assert sent < ceiling
+    assert ceiling - sent >= output_reserve(ceiling)
+
+
+def test_the_estimate_matches_the_assembled_prompt(tmp_path):
+    """Item A, end to end: the number budgeted and the number sent are one."""
+    from shamsu.context.budget import messages_tokens, tool_schema_tokens
+
+    loop, built = _assembled(tmp_path)
+    sent = messages_tokens(built) + tool_schema_tokens(loop._sent_schemas())
+
+    assert abs(loop._estimate_prompt(built) - sent) <= 1
