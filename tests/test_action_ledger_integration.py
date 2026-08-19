@@ -527,3 +527,56 @@ def test_evidence_outcome_fails_when_a_different_files_patch_never_recovers(tmp_
     ledger.log_event("patch_apply_succeeded", files=["a.py"])
 
     assert ledger.evidence_outcome() == "failed"
+
+
+# -- a denial the agent worked around must not fail the whole run -------------
+
+
+def test_evidence_outcome_recovers_when_the_agent_works_around_a_denial(tmp_path: Path):
+    """Live repro 2026-08-19: a headless run repaired a truncated js/main.js in
+    one turn - one patch, braces 8/3 to 26/26, `node --check` clean - and
+    reported `denied`, exit 1. The model had earlier tried
+    `cat js/main.js | wc -l`, been refused, and simply used read_file instead.
+
+    Every other failure kind here already asks whether the agent recovered.
+    Approval denial never did."""
+    ledger = start_run(tmp_path, "fix the syntax error")
+    ledger.log_event("approval_denied", command="cat js/main.js | wc -l")
+    ledger.log_event("patch_apply_succeeded", files=["js/main.js"])
+    ledger.log_verification_result(True, "parses", command="node --check", required=True)
+
+    assert ledger.evidence_outcome() == "success"
+
+
+def test_a_denial_that_ends_the_run_is_still_denied(tmp_path: Path):
+    """Regression guard: `denied` must still mean the run could not proceed."""
+    ledger = start_run(tmp_path, "delete the database")
+    ledger.log_event("approval_denied", command="rm -rf data")
+
+    assert ledger.evidence_outcome() == "denied"
+
+
+def test_work_before_a_denial_does_not_excuse_it(tmp_path: Path):
+    """Positional. A denial that stops the run has nothing after it, whatever
+    happened earlier."""
+    ledger = start_run(tmp_path, "two steps")
+    ledger.log_event("patch_apply_succeeded", files=["a.py"])
+    ledger.log_event("approval_denied", command="rm -rf data")
+
+    assert ledger.evidence_outcome() == "denied"
+
+
+def test_a_successful_command_after_a_denial_also_counts_as_recovery(tmp_path: Path):
+    ledger = start_run(tmp_path, "run the tests")
+    ledger.log_event("approval_denied", command="curl example.com")
+    ledger.log_event("command_finished", command="pytest -q", exit_code=0)
+
+    assert ledger.evidence_outcome() != "denied"
+
+
+def test_a_failing_command_after_a_denial_is_not_recovery(tmp_path: Path):
+    ledger = start_run(tmp_path, "run the tests")
+    ledger.log_event("approval_denied", command="curl example.com")
+    ledger.log_event("command_finished", command="pytest -q", exit_code=1)
+
+    assert ledger.evidence_outcome() == "denied"

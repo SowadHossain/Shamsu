@@ -12,7 +12,7 @@ Suites: `tests/test_simple_chat.py` 254 -> 337 passed; `tests/test_agent_tools.p
 
 ---
 
-## C2 — the verifier certified files it never opened · `dbbaaa1`
+## C2 — the verifier certified files it never opened · `fea1d06`
 
 **Files**
 * `shamsu/agents/simple_verify.py` — new
@@ -58,7 +58,7 @@ syntax errors"*, pointed the other way.
 
 ---
 
-## C1 — truncated generations committed their writes · `b08d298`
+## C1 — truncated generations committed their writes · `42c5d62`
 
 **Files** `shamsu/agents/simple_chat.py` — `_run_tools`, new
 `_refuse_truncated_write`, new `WRITING_TOOLS`
@@ -99,7 +99,7 @@ two sets stay separate.
 
 ---
 
-## C10 — elision deleted the read and kept the wrong conclusion · `09f29ee`
+## C10 — elision deleted the read and kept the wrong conclusion · `22880a9`
 
 **Files** `shamsu/agents/simple_chat.py` — `_elide_payloads`, new
 `_current_file_reads`, new `_read_result_path`
@@ -151,7 +151,7 @@ stub `{"elided": "call read_file for the current contents"}`.
 
 ---
 
-## C7 — a turn ending on a promise was accepted as done · `a7a5631`
+## C7 — a turn ending on a promise was accepted as done · `4690991`
 
 **Files** `shamsu/agents/simple_chat.py` — new `ends_on_an_unmade_promise`, one
 branch in the round loop
@@ -201,12 +201,12 @@ how a turn ends.
 | # | Why it was logged rather than absorbed |
 |---|---|
 | C11 | C2 made the verifier honest about what it skips. 14 common extensions (`.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs`) still have no checker. Scheduled after the patch cluster. |
-| C12 | `09f29ee` landed RC10 fix 1 only. Fixes 2 (elide stale claims with the read behind them) and 3 (mark a re-read that follows a user correction) are not done, and closing C10 without saying so would overstate it. |
+| C12 | `22880a9` landed RC10 fix 1 only. Fixes 2 (elide stale claims with the read behind them) and 3 (mark a re-read that follows a user correction) are not done, and closing C10 without saying so would overstate it. |
 
 ---
 
 ## C3 — a literal `
-` in `old_string` could never match · `66fc252`
+` in `old_string` could never match · `60e0449`
 
 **File** `shamsu/tools/agent_tools.py` — `edit_file`, new `_decode_literal_escapes`
 
@@ -250,7 +250,7 @@ the log's own `main.js` payload.
 
 ---
 
-## C6 — stall counters reset every time the user typed · `4dfc17b`
+## C6 — stall counters reset every time the user typed · `4853a55`
 
 **File** `shamsu/agents/simple_chat.py` — new `SessionStalls`, `_run_tools`
 
@@ -295,7 +295,7 @@ does.
 
 ---
 
-## C8 — the same patch error returned 29x, unchanged · `a342fd1`
+## C8 — the same patch error returned 29x, unchanged · `f58ceb4`
 
 **File** `shamsu/tools/agent_tools.py` — `_nearby_edit_hint`
 
@@ -341,7 +341,7 @@ unit tests could not have produced any of them.
 
 ---
 
-## C13 — the promise detector only understood colons · `82e05d5`
+## C13 — the promise detector only understood colons · `e25da63`
 
 **File** `shamsu/agents/simple_chat.py` — `ends_on_an_unmade_promise`
 
@@ -371,7 +371,7 @@ produced.
 
 ---
 
-## V2 — the reply cap ignored the window that was free · `0beb31f`
+## V2 — the reply cap ignored the window that was free · `9cbdde9`
 
 **File** `shamsu/agents/simple_chat.py` — new `_reply_cap`
 
@@ -398,7 +398,7 @@ floor and a ceiling.
 
 ---
 
-## C4 — the cut-off message blamed the wrong thing · `f9ebd07`
+## C4 — the cut-off message blamed the wrong thing · `d1ba009`
 
 **Files** `shamsu/agents/simple_chat.py` — `_out_of_room_message`;
 `shamsu/agents/chat_state.py` — the harness-status filter
@@ -426,7 +426,7 @@ verbatim, *"filled the window - 2,270 tokens of 32,768"*.
 
 ---
 
-## V1 — a failing verify never reached the run outcome · `987079a`
+## V1 — a failing verify never reached the run outcome · `4e70775`
 
 **File** `shamsu/agents/simple_chat.py` — `_append_verification`
 

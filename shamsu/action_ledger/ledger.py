@@ -442,7 +442,7 @@ class ActionLedger:
             outcome = "timed_out"
         elif "run_needs_input" in event_types:
             outcome = "needs_input"
-        elif "approval_denied" in event_types:
+        elif self._has_unrecovered_denial(events):
             outcome = "denied"
         elif "composite_failed" in event_types:
             outcome = "failed"
@@ -535,6 +535,49 @@ class ActionLedger:
             key = str(event.get("verifier_id") or event.get("command") or "__general__")
             latest[key] = event_type == "verification_passed"
         return any(not passed for passed in latest.values())
+
+    @staticmethod
+    def _has_unrecovered_denial(events: list[dict[str, Any]]) -> bool:
+        """A denial the agent worked AROUND is not a failed run.
+
+        Any `approval_denied` used to end the run as `denied`, forever, whatever
+        happened next. Live 2026-08-19 a headless run repaired a truncated file
+        in one turn - one patch, braces 8/3 to 26/26, `node --check` clean - and
+        reported `denied`, exit 1, because the model had earlier tried
+        `cat js/main.js | wc -l`, been refused, and simply used read_file
+        instead.
+
+        Every other failure kind in this method already asks whether the agent
+        recovered; approval denial never did. It does now, on the same rule: a
+        denial counts only if NOTHING succeeded after it. `denied` should mean
+        the run could not proceed, not that something was refused once.
+
+        Deliberately positional. A denial early in a run that then does its work
+        is recovered; a denial that ends the run - the shape of a genuinely
+        blocked one - has nothing after it and still reports `denied`.
+        """
+        last_denial = -1
+        for index, event in enumerate(events):
+            if str(event.get("type", "")) == "approval_denied":
+                last_denial = index
+        if last_denial < 0:
+            return False
+        recovered_by = {
+            "patch_apply_succeeded",
+            "verification_passed",
+            "mutation_finished",
+        }
+        for event in events[last_denial + 1:]:
+            event_type = str(event.get("type", ""))
+            if event_type in recovered_by:
+                return False
+            if event_type == "command_finished":
+                try:
+                    if int(event.get("exit_code", 1)) == 0:
+                        return False
+                except (TypeError, ValueError):
+                    continue
+        return True
 
     @staticmethod
     def _has_unrecovered_patch_failure(events: list[dict[str, Any]]) -> bool:

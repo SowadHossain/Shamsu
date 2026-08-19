@@ -26,7 +26,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 
 | # | Issue | Severity | Area |
 |---|---|---|---|
-| [H1](#h1) | **A denied command marks a fully successful run `denied` and exits 1** — found by the first live run of the fixes | **high** | headless |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
@@ -57,17 +56,19 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 |---|---|---|
 | [L1](#l1) | `think=` sent to models that cannot think → HTTP 400, **every turn dead** | `c5486ef` |
 | [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
-` in `old_string` could never match | `66fc252` |
-| [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | `4dfc17b` |
-| [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalated | `a342fd1` |
-| [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `987079a` |
-| [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `0beb31f` |
-| [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `f9ebd07` |
-| [C13](#c13) | C7 missed a promise ending in a full stop — found live on a 3B | `82e05d5` |
-| [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call was accepted as done** (14x) | `a7a5631` |
-| [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `09f29ee` |
-| [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `b08d298` |
-| [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reported "no syntax errors" for files it never opened** (572x in one session) | `dbbaaa1` |
+` in `old_string` could never match | `60e0449` |
+| [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | `4853a55` |
+| [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalated | `f58ceb4` |
+| [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `4e70775` |
+| [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `9cbdde9` |
+| [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `d1ba009` |
+| [H1](#h1) | **A denied command marked a fully successful run `denied`** — found by the first live run of the fixes | `1d93b76`+1 |
+| [N1](#n1) | **A byte-identical write reported `ok: true`** — five no-op writes read as successes, and the no-op counter could not see any of them | `1d93b76` |
+| [C13](#c13) | C7 missed a promise ending in a full stop — found live on a 3B | `e25da63` |
+| [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call was accepted as done** (14x) | `4690991` |
+| [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `22880a9` |
+| [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `42c5d62` |
+| [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reported "no syntax errors" for files it never opened** (572x in one session) | `fea1d06` |
 | [F1](#f1) | Rolling summary dropped when hydration skipped what it described | `8b338d5` |
 | [F2](#f2) | Context meter reported 42,440 tokens of tool results inside a 23,595-token prompt | `8b338d5` |
 | [F3](#f3) | 11 ruff errors while docs claimed "Lint: passes" | `152fbb0` |
@@ -156,6 +157,33 @@ per-reply cap.
 
 ---
 
+<a name="n1"></a>
+## N1 — a write that changed nothing reported success · **HIGH** · FIXED
+
+Live 2026-08-19, `qwen2.5:3b-instruct`, asked to repair the truncated
+`js/main.js`. Five `write_file` calls, every one byte-identical to what was
+already on disk, every one reported:
+
+```
+Overwrote js/main.js (+0 -0 lines, 30 total)     ok: true
+```
+
+So the model read "my fix landed", was told by the verifier that the file was
+still broken, concluded something ELSE must be wrong, and sent the same bytes
+again. That is the loop, and this is what kept it alive.
+
+Two defects in one. `patch_file` already refuses its own version of this
+("old_string and new_string are identical; nothing to change") and `write_file`
+did not — and because `_changed_nothing` looks for exactly those words in the
+message, **the no-op counter could not see a no-op WRITE at all.** None of those
+five moved `MAX_UNPRODUCTIVE_EDITS`; only the per-file edit ceiling stopped the
+turn, two edits later than it should have.
+
+Fixed by refusing, which corrects the model where it is looking and makes the
+counter work for free.
+
+---
+
 <a name="h1"></a>
 ## H1 — one denied command marks the whole run failed · **HIGH**
 
@@ -224,7 +252,7 @@ once*.
 <a name="c12"></a>
 ## C12 — the other two thirds of RC10's fix · MEDIUM
 
-`09f29ee` landed RC10 fix 1, the one the report calls sufficient on its own:
+`22880a9` landed RC10 fix 1, the one the report calls sufficient on its own:
 the current contents of a file survive elision. Fixes 2 and 3 did not, and
 saying "C10 is fixed" without recording that would overstate it.
 
@@ -248,13 +276,13 @@ can now see the file it read. These make it less likely to argue with it.
 <a name="c11"></a>
 ## C11 — the checker roster stops short of "every major language" · MEDIUM
 
-Opened out of C2. `dbbaaa1` made the verifier honest — it now says `skipped
+Opened out of C2. `fea1d06` made the verifier honest — it now says `skipped
 (no checker for .html)` instead of certifying a file it never opened — but
 honest is not the same as covered.
 
 ### What is checked today
 
-`shamsu/agents/simple_verify.py`, after `dbbaaa1`:
+`shamsu/agents/simple_verify.py`, after `fea1d06`:
 
 | checker | extensions | needs |
 |---|---|---|
