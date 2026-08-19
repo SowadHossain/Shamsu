@@ -25,6 +25,8 @@ Companion docs: `SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
 
 | # | Issue | Severity | Area |
 |---|---|---|---|
+| [M1](#m1) | **Memory is only written if the model volunteers** — a real 2-turn run produced none | **high** | memory |
+| [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
 | [G2](#g2) | Graph indexes `reference/`, `other peoples work/`, `legacy-code/` and answers out of them | **high** | graph |
 | [L3](#l3) | Tool schemas are **57–81% of every prompt**; two-stage routing is off at 32k | **high** | context |
@@ -55,6 +57,128 @@ Companion docs: `SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
 ---
 
 # OPEN
+
+<a name="m1"></a>
+## M1 — memory only exists if the model volunteers, and it usually does not · **HIGH**
+
+Reported from a real session: *"I am running the harness on this workspace but
+it didn't create any memory.db files."*
+
+### The measurement
+
+`test-shamsu/test1`, prompt *"make me 3d asteroid game"*, model
+**qwen3.5:9b-q4_K_M** (the out-of-box default), 2 turns:
+
+```
+REAL tool invocations          .shamsu/memory/ contents
+  6  write_file                  status.json          <- and nothing else
+  1  run_command                 (no notes/)
+  1  read_file                   (no memory.db)
+```
+
+`memory_remember` was **never called.** The system prompt advertises it on every
+turn (*"You remember this project: memory_remember keeps a decision or a
+gotcha..."*), the schema is sent on every call, and the model still never
+reached for it. So the session ended with no memory at all.
+
+### smallcode, same shape of session, same machine
+
+`F:\Work\smallcode\project\.memory\` — **six notes**, and not one of them
+was written by the model:
+
+```
+# hi did it get stuck? have you finsihed mielstone 0??
+**Type:** context
+**Tags:** evidence, success
+Task: hi did it get stuck? have you finsihed mielstone 0??
+Files: backend/main.py
+Successful steps:
+- write_file backend/main.py
+Duration: 122.3s
+```
+
+The title is the user's raw prompt — typos preserved (`mielstone`, `expained`,
+`ruid`) across all six. The body is a structured record of what the turn *did*.
+These are **harness output**, not model output.
+
+### The mechanism, from their source
+
+`src/memory/evidence.js`:
+
+> *"Automated capture of 'what was tried, what worked, what failed' per task.
+> **Distinct from manual memory (decisions/conventions): evidence is
+> auto-derived from the trace recorder at task end.**"*
+
+It extracts failed commands and their error tail, successful commands of value,
+files created or edited, validation outcomes, and net duration — deliberately
+**not** full traces ("those are 5-50KB each"; evidence is a 1-3KB digest).
+
+**So smallcode has two writers and SHAMSU has one:**
+
+| writer | smallcode | SHAMSU |
+|---|---|---|
+| model calls a memory tool (decisions, conventions) | yes | yes — `memory_remember` |
+| **harness records evidence at task end** | **yes** | **no** |
+
+`shamsu/agents/simple_chat.py:2451` is the *only* caller of `remember()` in
+simple mode, and it sits inside the `memory_remember` tool handler.
+
+### Why this is high severity
+
+Item H was justified on the grounds that a scratchpad *"compensates for small
+models' limited internal reasoning."* The models that most need it are exactly
+the ones least likely to spend a tool call on it. A memory system that fires
+only when the model volunteers is one that is empty when it matters — which is
+what the run above shows.
+
+It also means every finding in `SMALL_MODEL_LIVE_RUNS.md` about recall rests on
+a run where **I explicitly prompted** *"remember this for later"*. That proved
+the store works. It did not prove memory accumulates on its own, and it does not.
+
+### Fix
+
+**The raw material already exists.** Every turn already writes
+`.shamsu/runs/<id>/`, `.shamsu/mutations/<id>/` and a turn log — the same facts
+smallcode distils. Nothing needs to be captured; something needs to *summarise*.
+
+Write an evidence note at turn end from data already on disk: the task, files
+touched, tool calls that succeeded, tool calls that failed with their error
+tail, duration. Type `context`, tag `evidence`, so `render_memory`'s existing
+scoring loads it only when it bears on the request and it never becomes a
+standing tax on the window.
+
+Keep `memory_remember` as-is. Deliberate notes and automatic evidence are
+different things, and their file says so.
+
+---
+
+<a name="m2"></a>
+## M2 — `memory.db` is not the file to look for in simple mode · INFORMATIONAL
+
+Recorded because it wasted time twice, once mine and once in the report that
+opened M1.
+
+SHAMSU has **two** memory subsystems, and simple mode uses only one:
+
+| | store | written by | used by |
+|---|---|---|---|
+| typed notes | `.shamsu/memory/notes/*.md` + `index.json` | `simple_memory.py` | **simple mode** |
+| SQLite service | `.shamsu/memory/memory.db` | `shamsu/memory/service.py` | legacy path only |
+
+`grep` confirms simple mode never touches SQLite: no reference to
+`MemoryService`, `SQLiteMemoryStore` or `memory.db` exists in `simple_chat.py`
+or `simple_memory.py`. A `memory.db` in a workspace is a fossil of a legacy run,
+and its **absence in a simple-mode workspace is correct, not a fault**.
+
+So "no memory.db was created" is expected. The real symptom is the missing
+`notes/` directory — see M1.
+
+`status.json` is written regardless (memory service initialisation) and says
+`"Graphiti disabled; local SQLite memory is authoritative"`, which is misleading
+in a simple-mode workspace: the SQLite store is not authoritative there because
+nothing in simple mode reads or writes it. Worth rewording.
+
+---
 
 <a name="g1"></a>
 ## G1 — the code graph holds 239 projects, and not this one · **HIGH**
