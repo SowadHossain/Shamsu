@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 from shamsu.abstract.types import AdapterResult, CodebaseMemoryHealth
 from shamsu.indexer.policy import ensure_cbm_ignore
+from shamsu.paths import code_graph_dir
 
 CLI_TIMEOUT_SECONDS = 60
 VERSION_TIMEOUT_SECONDS = 5
@@ -305,6 +306,37 @@ class CodebaseMemoryAdapter:
 
     # -- indexing -----------------------------------------------------------------
 
+    def _cli_env(self, workspace: Path) -> dict[str, str]:
+        """The environment every Codebase-Memory call runs under.
+
+        `CBM_CACHE_DIR` moves the graph store INTO the workspace. Without it the
+        tool writes to one global cache keyed by a mangled absolute path, and
+        nothing ever cleans up: 243 projects and 619 MB on 2026-08-19, 129 of
+        them temp directories that had not existed for weeks, including
+        SHAMSU's own pytest runs.
+
+        smallcode keeps its graph at `.code-graph/graph.db` inside the project,
+        which makes that whole class of problem impossible - the index cannot
+        outlive what it describes, and two projects cannot contaminate each
+        other because they do not share a store.
+
+        Not discoverable from `--help` or `config list`; found in the binary's
+        own strings. `SHAMSU_CBM_GLOBAL_CACHE=1` restores the old shared store
+        for anyone who wants one graph across several checkouts.
+        """
+        env = dict(os.environ)
+        if env.get("SHAMSU_CBM_GLOBAL_CACHE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return env
+        store = code_graph_dir(workspace)
+        try:
+            store.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # A workspace that cannot hold its own index falls back to the
+            # global one rather than losing the graph entirely.
+            return env
+        env["CBM_CACHE_DIR"] = str(store)
+        return env
+
     def index_workspace(self, workspace: Path, force: bool = False) -> dict[str, Any]:
         throwaway = "" if force else disposable_workspace(workspace)
         if throwaway:
@@ -520,6 +552,7 @@ class CodebaseMemoryAdapter:
                 capture_output=True,
                 text=True,
                 cwd=str(workspace),
+                env=self._cli_env(workspace),
                 timeout=CLI_TIMEOUT_SECONDS,
                 creationflags=_no_window_flags(),
             )

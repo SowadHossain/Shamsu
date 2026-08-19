@@ -565,13 +565,42 @@ fake adapter and never touches the real store, so guarding the service made nine
 tests opt out of a hazard they never posed. The only code that writes to the
 global store is the only code that needs to refuse.
 
+### Fixed at the root, 2026-08-19 — the store is now project-local
+
+The guard above stops throwaway directories ENTERING a global store. This
+removes the global store from the picture instead, which is the actual
+difference between SHAMSU and smallcode.
+
+`CBM_CACHE_DIR` relocates Codebase-Memory's graph. It appears in neither
+`--help` nor `config list` - it was found in the binary's own strings, after I
+had already told the user twice that relocation was impossible. Verified live:
+
+```
+CBM_CACHE_DIR=<ws>/.shamsu/code-graph  ->  <ws>/.shamsu/code-graph/<name>.db
+global ~/.cache/codebase-memory-mcp    ->  unchanged, 86 entries
+```
+
+So a workspace now carries its own graph, exactly as smallcode carries
+`.code-graph/graph.db`. Delete the project and the index goes with it; two
+projects cannot contaminate each other because they no longer share a store.
+`SHAMSU_CBM_GLOBAL_CACHE=1` restores the shared one.
+
+Under `.shamsu/` rather than a second top-level dotfolder: already git-ignored,
+already excluded from indexing, and one dotfolder per tool beats smallcode's
+three. Locality is the property that matters, not the name.
+
 ### Still to do, and deliberately not done here
 
-* **Purge** the 129 + 30 dead entries and one of the two duplicate SHAMSU
-  indexes. That is `delete_project` against a store shared with unrelated real
-  projects (`F:/Work/pewdiepie/odysseus`, `F:/Work/pong-test` and others), it is
-  irreversible, and it is not something to do without being asked.
-* **Re-index** this repo after G2, so the vendored trees drop out.
+* ~~Purge the dead entries~~ **done 2026-08-19**: 160 deleted (129 temp, 30
+  eval-artifact, 1 duplicate), 243 -> 83 projects. All 66 `test-shamsu/` entries
+  were left untouched deliberately.
+* ~~Re-index this repo after G2~~ **done**: 163,194 nodes / 258,808 edges, and
+  `search_graph("message_tokens")` now returns `shamsu.context.budget.message_tokens`
+  instead of SmallCTL's. The stale `shamsu-windows` duplicate was deleted, so
+  the project name is now `F-Work-PROJECTS-shamsu-Shamsu`.
+* The 619 MB global cache still holds 83 other projects' graphs. It stops
+  GROWING from SHAMSU, but nothing migrates what is already there - those
+  workspaces re-index locally on next use.
 
 ---
 

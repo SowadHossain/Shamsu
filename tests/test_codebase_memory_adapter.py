@@ -210,3 +210,61 @@ def test_force_is_the_escape(tmp_path):
     adapter.index_workspace(tmp_path, force=True)
 
     assert (tmp_path / ".cbmignore").exists()
+
+
+# --- the graph lives in the workspace, like smallcode's (G1) -------------
+#
+# Codebase-Memory defaults to ONE global cache keyed by a mangled absolute path:
+# 243 projects and 619 MB on 2026-08-19, of which 129 were temp directories that
+# had not existed for weeks. smallcode keeps its graph at `.code-graph/graph.db`
+# inside the project, and that one decision makes the whole class of problem
+# impossible. `CBM_CACHE_DIR` - not in `--help` or `config list`, found in the
+# binary's strings - lets SHAMSU do the same.
+
+
+def test_the_graph_store_is_inside_the_workspace(tmp_path):
+    from shamsu.paths import code_graph_dir
+
+    adapter = CodebaseMemoryAdapter()
+
+    env = adapter._cli_env(tmp_path)
+
+    assert env["CBM_CACHE_DIR"] == str(code_graph_dir(tmp_path))
+    assert str(tmp_path) in env["CBM_CACHE_DIR"], "the index must not outlive the project"
+
+
+def test_the_store_directory_is_created(tmp_path):
+    from shamsu.paths import code_graph_dir
+
+    CodebaseMemoryAdapter()._cli_env(tmp_path)
+
+    assert code_graph_dir(tmp_path).is_dir()
+
+
+def test_two_workspaces_never_share_a_store(tmp_path):
+    """Cross-project contamination is what put SmallCTL's `message_tokens` in
+    an answer about SHAMSU. Separate stores make it structurally impossible."""
+    adapter = CodebaseMemoryAdapter()
+    one, two = tmp_path / "one", tmp_path / "two"
+    one.mkdir()
+    two.mkdir()
+
+    assert adapter._cli_env(one)["CBM_CACHE_DIR"] != adapter._cli_env(two)["CBM_CACHE_DIR"]
+
+
+def test_the_global_cache_can_be_restored(tmp_path, monkeypatch):
+    """The escape, for anyone who wants one graph across several checkouts."""
+    monkeypatch.setenv("SHAMSU_CBM_GLOBAL_CACHE", "1")
+
+    assert "CBM_CACHE_DIR" not in CodebaseMemoryAdapter()._cli_env(tmp_path)
+
+
+def test_an_unwritable_workspace_falls_back_rather_than_losing_the_graph(tmp_path, monkeypatch):
+    from shamsu import paths
+
+    def boom(*_args, **_kwargs):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(paths.Path, "mkdir", boom)
+
+    assert "CBM_CACHE_DIR" not in CodebaseMemoryAdapter()._cli_env(tmp_path)

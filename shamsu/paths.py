@@ -159,3 +159,22 @@ def memory_dir(workspace: Path) -> Path:
 def memory_notes_dir(workspace: Path) -> Path:
     """Typed notes the model writes for itself, beside the SQLite store."""
     return memory_dir(workspace) / "notes"
+
+
+def code_graph_dir(workspace: Path) -> Path:
+    """Where this workspace's code graph lives, INSIDE the workspace.
+
+    Codebase-Memory defaults to one global cache (`~/.cache/codebase-memory-mcp`)
+    keyed by a mangled absolute path, so every directory anything was ever
+    pointed at accumulates forever: 243 projects and 619 MB on 2026-08-19, of
+    which 129 were temp directories that had not existed for weeks.
+
+    smallcode keeps its graph at `.code-graph/graph.db` inside the project, and
+    that one decision makes the whole class of problem impossible - delete the
+    project and the index goes with it. `CBM_CACHE_DIR` lets SHAMSU do the same.
+
+    Under `.shamsu/` rather than a second top-level dotfolder: it is already
+    git-ignored, already excluded from indexing, and one dotfolder per tool is
+    tidier than smallcode's three. The locality is what matters, not the name.
+    """
+    return shamsu_dir(workspace) / "code-graph"
