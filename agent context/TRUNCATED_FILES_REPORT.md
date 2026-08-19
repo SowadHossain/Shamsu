@@ -3,8 +3,11 @@
 **Session:** `test-shamsu/test1` · `20260819-074923-10d7` · qwen3.5:9b-q4_K_M · 9 turns
 **Reported:** files cut off mid-code; "read and complete" could not recover.
 
-Four independent defects. Each is sufficient on its own; together they make
+Five independent defects. Each is sufficient on its own; together they make
 truncation invisible and unrecoverable.
+
+**The window was never full.** Prompts peaked at 21,472 tokens of 32,768 and the
+reply was stopped by our own 8,192 `num_predict` cap — see RC3 and RC5.
 
 ---
 
@@ -95,24 +98,84 @@ fallback, which would have caught all three files here.
 
 ---
 
-## RC3 — the cut-off message blames the wrong thing
+## RC3 — the window was never full, and the message says it was
+
+**The 32k window was never reached.** Measured across all 77 logged prompts:
+
+```
+largest prompt        21,472 tokens   of a 32,768 window   (66%)
+typical               20,200-20,900
+reply cap             8,192           num_predict = output_reserve(32768)
+21,472 + 8,192      = 29,664          still 3,104 under the window
+```
+
+At the largest prompt, **11,296 tokens of window were free** and the reply was
+stopped at 8,192 by SHAMSU's own per-reply cap. The window was not the
+constraint at any point in this session.
+
+What the model was told instead:
 
 ```
 This answer was cut off. I ran out of room to answer in. The prompt was
-16,965 tokens of a 32,768 window... /new starts a fresh conversation.
+16,965 tokens of a 32,768 window. The window holds the conversation and the
+reply together, so a long conversation leaves less space to speak in.
+
+/new starts a fresh conversation, or ask for a smaller piece of this one.
 ```
 
-Arithmetic: `32,768 − 16,965 = 15,803` tokens of window were **free**. The
-generation stopped at `num_predict = output_reserve(32768) = 8,192` — SHAMSU's
-own cap, with 7,611 tokens of window still unused.
+Three things wrong with it:
 
-So the diagnosis is wrong and the advice is wrong: `/new` shortens the
-conversation, which was never the constraint. The user is sent to fix something
-that is not broken while the real limit stays put.
+1. **The diagnosis.** The reply hit `num_predict`, not the window.
+2. **The advice.** `/new` shortens the conversation, which was never the limit.
+3. **The number is frozen.** `16,965` appears **54 times, identical**, across a
+   session whose prompt ranged 20,200–21,472. It was generated **once** as a
+   real answer and then replayed 53 times inside later prompts — the harness's
+   own error message became conversation, was fed back every turn, and taught
+   the model that "I ran out of room" is how a turn ends.
 
-**Fix:** distinguish the two cases. Report the window only when the window is
-actually the binding constraint; otherwise say the reply hit the per-reply cap
-and raise `num_predict` toward the free space when a large write is in flight.
+**Fix:** report the window only when the window is actually binding; otherwise
+say the reply hit the per-reply cap. Raise `num_predict` toward the free space
+when a write is in flight. And do not append this message to history — it is a
+harness notice, not something the model said.
+
+---
+
+## RC5 — the verbatim tail is the prompt
+
+Why a small project produces a 21,000-token prompt, and the direct answer to
+"did we really use the window?".
+
+`KEEP_VERBATIM_MESSAGES = 20` keeps the last twenty messages at full size;
+elision may only touch what is older. Measured over all 77 prompts:
+
+```
+                  messages     chars    avg chars/msg
+older (elided)       4,655   2,352,729            505
+last-20 verbatim     1,475   2,485,838          1,685
+```
+
+**Elision works.** Old messages are shrunk to a third the size. The problem is
+that the protected tail is **24% of the messages and 51% of the content** — and
+in the worst prompt, 87%:
+
+```
+msgs   older(elidable)   last-20 verbatim   total
+  31            11,056             74,835   85,891 chars
+```
+
+In a file-writing session the last twenty messages are whole-file payloads. One
+single assistant message in that prompt was **25,473 characters** — an entire
+file, kept verbatim, correctly, by design.
+
+The constant came from a 130-message measurement where "twenty is the knee".
+That measurement assumed conversational messages. It does not hold when one
+message can be 25,000 characters, and this is the case simple mode is for.
+
+**Fix:** cap the verbatim tail by **tokens, not message count** — keep the most
+recent messages until a token budget is spent, so twenty small turns stay whole
+and three whole-file writes do not. This is the single change that would most
+reduce prompt size here, and unlike raising the window it does not scale the
+problem up with the files.
 
 ---
 
@@ -155,8 +218,10 @@ rather than memory. `read_and_patch` already carries that rule; plain
 1. **RC2** — smallest change, largest effect. It converts a silent failure into
    a visible one, and it is what lets any of the others be observed.
 2. **RC1** — stops the corruption at its source.
-3. **RC4** — makes the files already on disk repairable.
-4. **RC3** — accuracy of the message; no behaviour depends on it.
+3. **RC5** — halves the prompt, which is what gives the model room to finish a
+   file in the first place.
+4. **RC4** — makes the files already on disk repairable.
+5. **RC3** — message accuracy, plus not replaying the notice into history.
 
 ## Reproduce
 
