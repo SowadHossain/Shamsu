@@ -568,6 +568,78 @@ def test_an_ordinary_answer_with_a_snippet_is_not_nagged(tmp_path):
     assert result.rounds == 1, "no extra round should be spent"
 
 
+def test_a_plan_that_shows_code_is_not_nudged_into_writing_it(tmp_path):
+    """Asked to plan, planning is the deliverable - not a skipped job.
+
+    The nudge assumes prose plus a fence means the model answered instead of
+    working. When the request was "review and plan", that is backwards: it
+    told the model to abandon the plan and start writing, which is the same
+    presumption that cost 24 rounds and 577s live on 2026-08-18.
+    """
+    (tmp_path / "game.js").write_text("// old\n", encoding="utf-8")
+    plan = (
+        "Here is what I would do to game.js:\n\n```javascript\n"
+        "// step 1: hoist the canvas lookup\n"
+        "// step 2: guard the empty asteroid array\n"
+        "// step 3: cap the frame rate\n"
+        "// step 4: add a restart handler\n```\n"
+    )
+    loop = _loop(tmp_path, [_text(plan)])
+
+    result = asyncio.run(loop.run("review game.js and plan the next steps"))
+
+    assert result.rounds == 1, "planning must not cost a correction round"
+    nudges = [
+        m for m in loop.state.all_messages
+        if m.role == "user" and "did not change the file" in m.content
+    ]
+    assert not nudges, "a plan is the answer; it must not be told to write it"
+    assert (tmp_path / "game.js").read_text(encoding="utf-8") == "// old\n"
+
+
+def test_a_review_that_also_asks_for_a_fix_still_nudges(tmp_path):
+    """The asymmetry, deliberately: a change-verb wins over a words-verb.
+
+    Skipping the nudge wrongly means the work silently never happens. Nudging
+    wrongly costs one round. So a request naming both must still nudge.
+    """
+    (tmp_path / "game.js").write_text("// old\n", encoding="utf-8")
+    shown = "```js\na\nb\nc\nd\ne\n```\nThat is the new game.js."
+    loop = _loop(
+        tmp_path,
+        [
+            _text(shown),
+            _tool("write_file", filepath="game.js", content="// new\n"),
+            _text("Applied."),
+        ],
+    )
+
+    asyncio.run(loop.run("review game.js and fix the bug"))
+
+    assert (tmp_path / "game.js").read_text(encoding="utf-8") == "// new\n"
+
+
+def test_asks_only_for_words_matches_on_word_boundaries(tmp_path):
+    """`plan` must not fire on `planet`, and `add` must not fire on `address`.
+
+    A raw substring is how `_PRD_BUILD_NOUNS` came to hold "it" and made almost
+    any sentence name a product.
+    """
+    from shamsu.agents.simple_chat import asks_only_for_words
+
+    assert asks_only_for_words("plan the next steps")
+    assert asks_only_for_words("explain what this does")
+    assert asks_only_for_words("what would you do about the retry loop?")
+    # A change-verb present anywhere wins.
+    assert not asks_only_for_words("review it and fix the bug")
+    assert not asks_only_for_words("plan and then implement it")
+    # No words-verb at all.
+    assert not asks_only_for_words("make the tests pass")
+    # Word boundaries, both directions.
+    assert not asks_only_for_words("render the planet texture")
+    assert asks_only_for_words("explain the address parser")
+
+
 def test_the_nudge_gives_up_rather_than_looping_forever(tmp_path):
     """A model that only ever describes must still hand back."""
     from shamsu.agents.simple_chat import MAX_PROSE_NUDGES

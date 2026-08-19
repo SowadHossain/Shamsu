@@ -1290,6 +1290,10 @@ class SimpleChatLoop:
                         changed,
                     )
                 described = describes_an_unmade_edit(text, self._files)
+                if described and asks_only_for_words(self._request):
+                    # Asked for a plan or a review, it planned. Nudging here
+                    # tells it to abandon the deliverable and start writing.
+                    described = ""
                 if described and prose_nudges < MAX_PROSE_NUDGES:
                     # It showed the code instead of writing it. Say so once,
                     # naming the file, and let it act - the alternative is what
@@ -3118,6 +3122,74 @@ def describes_an_unmade_edit(text: str, files: list[str]) -> str:
     return names_a_workspace_file(text, files)
 
 
+# Verbs that ask for WORDS, and verbs that ask for a CHANGE. Matched on word
+# boundaries: `_PRD_BUILD_NOUNS` once held "it" as a raw substring, which made
+# almost any English sentence "name a product". The same mistake here would
+# silently switch off the one guard that makes the model act.
+_WORDS_VERBS = (
+    "plan",
+    "review",
+    "explain",
+    "describe",
+    "outline",
+    "summarize",
+    "summarise",
+    "analyse",
+    "analyze",
+    "assess",
+    "compare",
+    "suggest",
+    "recommend",
+    "propose",
+    "what would you",
+    "how would you",
+)
+_CHANGE_VERBS = (
+    "implement",
+    "apply",
+    "fix",
+    "write",
+    "create",
+    "add",
+    "change",
+    "update",
+    "edit",
+    "patch",
+    "refactor",
+    "rename",
+    "delete",
+    "remove",
+    "build",
+    "make",
+)
+
+
+def asks_only_for_words(request: str) -> bool:
+    """True when the deliverable is prose, so showing code is not a failure.
+
+    `describes_an_unmade_edit` assumes prose plus a code block means the model
+    answered and skipped the job. Asked to "review the PRD and plan the next
+    steps" that is exactly backwards: describing the change IS the deliverable,
+    and the nudge told the model to stop planning and start writing - the same
+    presumption that cost 24 rounds and 577s before the system prompt was made
+    conditional (live 2026-08-18).
+
+    Deliberately asymmetric. A words-verb only counts when NO change-verb is
+    present, so "review the code and fix the bug" still nudges. Skipping the
+    nudge wrongly means the work silently does not happen; nudging wrongly
+    costs one round. The cheap error is the one to prefer.
+    """
+    lowered = f" {(request or '').lower()} "
+
+    def names(vocabulary: tuple[str, ...]) -> bool:
+        return any(
+            re.search(rf"(?<![a-z]){re.escape(word)}(?![a-z])", lowered)
+            for word in vocabulary
+        )
+
+    return names(_WORDS_VERBS) and not names(_CHANGE_VERBS)
+
+
 def _shorten_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Shrink long argument VALUES in an old tool call, keeping every key.
 
@@ -3335,6 +3407,7 @@ __all__ = [
     "build_simple_tools",
     "codebase_brief",
     "command_needs_approval",
+    "asks_only_for_words",
     "describes_an_unmade_edit",
     "expand_mentions",
     "render_memory",
