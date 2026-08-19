@@ -5654,3 +5654,137 @@ def test_a_partial_answer_with_real_content_is_still_kept(tmp_path):
 
     assert "Here is the first half of the file." in message
     assert _should_hydrate_chat_message("assistant", message)
+
+
+# --- a failing verify reaches the run outcome (V1) -----------------------
+#
+# Live 2026-08-19 the verifier caught a no-op write that left js/main.js
+# unparseable and said so to the model. The run exited 0, because the verdict
+# lived only in the chat transcript.
+
+
+class _RecordingLedger:
+    """Just enough ActionLedger to see what was logged."""
+
+    def __init__(self):
+        self.events: list[dict] = []
+
+    def log_event(self, event_type: str, **fields):
+        self.events.append({"type": event_type, **fields})
+        return {}
+
+
+def _verified(tmp_path, turns, ledger, **kwargs):
+    from shamsu.agents.simple_chat import SimpleChatLoop
+
+    return SimpleChatLoop(
+        tmp_path,
+        client=FakeClient(turns),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
+        action_ledger=ledger,
+        model_name="qwen3:8b",
+        **kwargs,
+    )
+
+
+def test_a_broken_written_file_records_a_verification_failure(tmp_path, monkeypatch):
+    """The exact live shape: the model writes back something that will not parse."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [_tool("write_file", filepath="main.js", content="function f() {\n"), _text("done")],
+        ledger,
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("write main.js"))
+
+    failures = [e for e in ledger.events if e["type"] == "verification_failed"]
+    assert failures, "the run outcome could not see the broken file"
+    assert failures[0]["verifier_id"] == "syntax:main.js"
+
+
+def test_a_good_written_file_records_a_pass(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [_tool("write_file", filepath="main.js", content="const a = 1;\n"), _text("done")],
+        ledger,
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("write main.js"))
+
+    assert [e for e in ledger.events if e["type"] == "verification_passed"]
+
+
+def test_fixing_the_file_later_clears_the_earlier_failure(tmp_path, monkeypatch):
+    """Keyed per file so the ledger's supersede rule can do its job: only a file
+    whose LAST verdict failed counts against the run."""
+    from shamsu.action_ledger.ledger import ActionLedger
+
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [
+            _tool("write_file", filepath="main.js", content="function f() {\n"),
+            _tool("write_file", filepath="main.js", content="function f() {}\n"),
+            _text("done"),
+        ],
+        ledger,
+        max_rounds=3,
+    )
+
+    asyncio.run(loop.run("write main.js"))
+
+    assert not ActionLedger._has_unrecovered_verification_failure(ledger.events)
+
+
+def test_a_file_left_broken_still_counts_against_the_run(tmp_path, monkeypatch):
+    from shamsu.action_ledger.ledger import ActionLedger
+
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [_tool("write_file", filepath="main.js", content="function f() {\n"), _text("done")],
+        ledger,
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("write main.js"))
+
+    assert ActionLedger._has_unrecovered_verification_failure(ledger.events)
+
+
+def test_a_skipped_file_is_neither_a_pass_nor_a_failure(tmp_path):
+    """`skipped` is the escape. It must not fail a run, and it must not claim a
+    verification that never happened."""
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [_tool("write_file", filepath="notes.md", content="# hi\n"), _text("done")],
+        ledger,
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("write notes.md"))
+
+    assert not [e for e in ledger.events if e["type"].startswith("verification_")]
+
+
+def test_a_missing_ledger_never_breaks_a_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="main.js", content="function f() {\n"), _text("done")],
+        max_rounds=2,
+    )
+
+    result = asyncio.run(loop.run("write main.js"))
+
+    assert result.final == "done"

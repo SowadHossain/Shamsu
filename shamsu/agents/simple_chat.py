@@ -3216,6 +3216,51 @@ class SimpleChatLoop:
             return
         self.state.append_tool("", "verify", report)
         self._trace("simple.verify", report.splitlines()[0] if report else "", {})
+        self._record_verification(report)
+
+    def _record_verification(self, report: str) -> None:
+        """Put the verdict where the RUN OUTCOME can see it, not only the model.
+
+        Live 2026-08-19 the verifier did its job perfectly - it caught a no-op
+        write that left `js/main.js` unparseable, and said so in the tool result
+        the model could read. The run then exited 0, because that verdict
+        existed only in the chat transcript: `evidence_outcome()` saw a mutation
+        applied and no verification event, so it reported success on a file that
+        does not parse.
+
+        The events and their supersede rule already exist for the legacy path.
+        Keyed per FILE so `_has_unrecovered_verification_failure` can do what it
+        was written for - a later good write of the same file clears the earlier
+        failure, and only a file whose LAST verdict failed counts against the
+        run.
+        """
+        if self.action_ledger is None:
+            return
+        try:
+            parsed = json.loads(report)
+            data = parsed.get("data") or {}
+        except (ValueError, TypeError):  # pragma: no cover - defensive
+            return
+        for relative in data.get("checked") or []:
+            self._log_verdict(True, str(relative), "")
+        for problem in data.get("problems") or []:
+            # "path: detail" - the path is what the verdict is keyed on, and a
+            # problem without one still has to fail the run, so it gets the
+            # whole string as its key rather than being dropped.
+            text = str(problem)
+            relative = text.split(":", 1)[0].strip() if ":" in text else text
+            self._log_verdict(False, relative, text)
+
+    def _log_verdict(self, passed: bool, relative: str, detail: str) -> None:
+        try:
+            self.action_ledger.log_event(
+                "verification_passed" if passed else "verification_failed",
+                verifier_id=f"syntax:{relative.lower()}",
+                path=relative,
+                detail=detail,
+            )
+        except Exception:  # noqa: BLE001 - a ledger write must never end a turn
+            pass
 
     def _verify(self, written: list[str]) -> str:
         """Parse what was just written, and claim only what was parsed.

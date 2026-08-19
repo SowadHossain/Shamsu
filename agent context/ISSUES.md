@@ -27,13 +27,10 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Severity | Area |
 |---|---|---|---|
 | [H1](#h1) | **A denied command marks a fully successful run `denied` and exits 1** — found by the first live run of the fixes | **high** | headless |
-| [V1](#v1) | **A failing `verify` never reaches the run outcome** — file left broken, run exited 0 | **high** | verify |
-| [V2](#v2) | `num_predict` is a fixed share of the window, so a reply is capped at 8k with 30k free | **high** | context |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
 | [C9](TRUNCATED_FILES_REPORT.md) | Harness nudges recorded as "you asked" in the compaction digest | medium | context |
-| [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blames the window, is replayed 53x into later prompts | medium | context |
 | [M1](#m1) | **Memory is only written if the model volunteers** — a real 2-turn run produced none | **high** | memory |
 | [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
@@ -63,6 +60,9 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ` in `old_string` could never match | `66fc252` |
 | [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | `4dfc17b` |
 | [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalated | `a342fd1` |
+| [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `987079a` |
+| [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `0beb31f` |
+| [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `f9ebd07` |
 | [C13](#c13) | C7 missed a promise ending in a full stop — found live on a 3B | `82e05d5` |
 | [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call was accepted as done** (14x) | `a7a5631` |
 | [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `09f29ee` |

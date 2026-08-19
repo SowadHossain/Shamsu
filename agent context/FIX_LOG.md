@@ -7,8 +7,8 @@ in `ISSUES.md`. This file is the summary you read first.
 Every guard below was proved by **removing it** and watching the named test fail
 with the named message. A commit is not proof.
 
-Suites: `tests/test_simple_chat.py` 254 -> 297 passed; `tests/test_agent_tools.py`
-17 -> 34 passed. 0 failures. Ruff clean. 433 passed across every suite touched.
+Suites: `tests/test_simple_chat.py` 254 -> 337 passed; `tests/test_agent_tools.py`
+17 -> 34 passed. 0 failures. Ruff clean. 406 passed across every suite touched.
 
 ---
 
@@ -324,6 +324,132 @@ old_string not found
 
 **Proof** Restore the one-line hint → three tests fail, quoting the 29x sentence
 back verbatim.
+
+---
+
+---
+
+# Round 2 — what live testing found
+
+The seven fixes above were proved by unit test. None had met a real model. Run
+on `qwen2.5:3b-instruct` — a 3B, because that is the model class SHAMSU exists
+for and the harder case; the 9B from the report was used only to reproduce the
+original failure.
+
+**It found four defects in one afternoon, one of them in my own C7 fix.** The
+unit tests could not have produced any of them.
+
+---
+
+## C13 — the promise detector only understood colons · `82e05d5`
+
+**File** `shamsu/agents/simple_chat.py` — `ends_on_an_unmade_promise`
+
+**Why** C7 was built from the report's fourteen examples, and the report says
+"Every one ends in a colon." True of that 9B session. Live on a 3B, handed an
+honest verify failure, the model answered *"...I will ensure this is fixed."* —
+promise, no tool call, turn over, file still broken, guard silent.
+
+**Decision**
+
+```
+last line of a reply with no tool call
+├─ heading / table / fence ............... not a promise
+├─ no future-intent opener ............... not a promise  ("I fixed it by...")
+└─ says "I will" / "let me" / "I'll" ...
+   ├─ ends in ":" ........................ PROMISE
+   ├─ names a change verb ................ PROMISE   ("...this is fixed.")
+   └─ neither ............................ not a promise  ("I will need more info")
+```
+
+The action arm separates *"I am about to edit a file"* from *"I will need more
+information"* — the second is a question to the user, a legitimate way to end a
+turn.
+
+**Proof** Drop the action arm → the test fails on the exact sentence the 3B
+produced.
+
+---
+
+## V2 — the reply cap ignored the window that was free · `0beb31f`
+
+**File** `shamsu/agents/simple_chat.py` — new `_reply_cap`
+
+**Why** `num_predict` was `output_reserve(num_ctx)`, a fixed quarter. Live, the
+model was cut off mid-file and told: *"The prompt was 2,270 tokens of a 32,768
+window."* The window was **7% full**. 30,498 tokens free, reply stopped at
+8,192, run wrote nothing.
+
+**Approach** `output_reserve` is right as the amount the prompt assembler holds
+BACK. Using it as the generation CAP throws away what the prompt did not spend.
+
+```
+reply cap = clamp(num_ctx - prompt - margin,
+                  floor   = output_reserve(num_ctx),   <- can only ever increase
+                  ceiling = MAX_REPLY_TOKENS)          <- one reply cannot eat the window
+```
+
+On the failing prompt that computes **16,384** — double the room it had.
+
+**A test had pinned the old contract.** `test_generation_is_capped_at_the_reserve_the_budget_held_back`
+asserted equality with the reserve. Rewritten, not deleted: the bug it was
+written for — generation bounded only by leftover window — still holds, now as a
+floor and a ceiling.
+
+---
+
+## C4 — the cut-off message blamed the wrong thing · `f9ebd07`
+
+**Files** `shamsu/agents/simple_chat.py` — `_out_of_room_message`;
+`shamsu/agents/chat_state.py` — the harness-status filter
+
+**Why** It blamed the window every time and advised `/new` — on a conversation
+five messages long, where the window was 7% full. Then the notice was replayed
+into later prompts as if the model had said it; RC3 counted one frozen copy 54
+times, teaching the model that *"I ran out of room"* is how a turn ends.
+
+**Decision**
+
+```
+reply stopped by done_reason == "length"
+├─ window left less room than the cap ... "the conversation filled the window"
+│                                          + `/new`
+└─ otherwise ........................... "that answer hit my per-reply limit of N"
+                                           + "ask for one piece at a time"
+
+either notice, standing alone ......... never hydrated back into history
+a partial answer with real content ..... KEPT — the model's words are not ours
+```
+
+**Proof** Force `window_bound = True` → the tests fail quoting the false claim
+verbatim, *"filled the window - 2,270 tokens of 32,768"*.
+
+---
+
+## V1 — a failing verify never reached the run outcome · `987079a`
+
+**File** `shamsu/agents/simple_chat.py` — `_append_verification`
+
+**Why** The C2 verifier worked exactly as designed: the 3B wrote the broken file
+back unchanged, and it reported `SyntaxError: Unexpected end of input` to the
+model. **The run then exited 0.** The verdict lived only in the chat transcript,
+so `evidence_outcome()` saw a mutation applied and no verification event.
+
+**Approach** Emit the `verification_passed` / `verification_failed` events the
+ledger already understands — no new machinery. Keyed per file, so the existing
+supersede rule works: only a file whose LAST verdict failed counts against the
+run.
+
+`skipped` emits nothing. It is C2's escape and must neither fail a run nor claim
+a verification that never happened.
+
+---
+
+## Still open from this round
+
+| # | |
+|---|---|
+| H1 | The mirror image of V1: one denied command marks a fully successful run `denied` and exits 1. `ledger.py:445` treats any `approval_denied` as terminal, while the branch below it gives every other failure kind an `_has_unrecovered_*` test. |
 
 ---
 
