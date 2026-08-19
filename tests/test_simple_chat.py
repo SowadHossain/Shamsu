@@ -4219,3 +4219,41 @@ def test_a_composite_that_finds_nothing_explains_rather_than_erroring(tmp_path):
 
     assert found.ok and searched.ok
     assert "No files match" in found.message
+
+
+def test_the_toolset_can_be_narrowed_so_the_trade_can_be_measured(tmp_path, monkeypatch):
+    """19 tools is ~2,100 tokens on every call and 19 choices for a 7B model.
+
+    Whether that beats six cannot be settled by reading: more tools means
+    fewer rounds when the model picks well and more flailing when it does not.
+    """
+    from shamsu.agents.simple_chat import CORE_TOOLS, active_tool_schemas
+
+    assert len(active_tool_schemas()) == len(SIMPLE_TOOL_SCHEMAS)
+
+    monkeypatch.setenv("SHAMSU_TOOLSET", "core")
+    narrowed = {s["function"]["name"] for s in active_tool_schemas()}
+
+    assert narrowed == set(CORE_TOOLS)
+
+
+def test_narrowing_the_toolset_also_lowers_what_the_budget_is_charged(tmp_path, monkeypatch):
+    """The sent schemas and the charged schemas must never disagree."""
+    loop = _loop(tmp_path, [_text("ok")])
+    full = loop._fixed_overhead()
+
+    monkeypatch.setenv("SHAMSU_TOOLSET", "core")
+    core = loop._fixed_overhead()
+
+    assert core < full, "the budget kept charging for tools that are no longer sent"
+
+
+def test_what_is_sent_is_what_is_charged(tmp_path):
+    """Item A's whole lesson, applied to the roster growth."""
+    from shamsu.context.budget import tool_schema_tokens
+
+    loop = _loop(tmp_path, [_text("ok")])
+    asyncio.run(loop.run("hi"))
+
+    sent = loop.client.calls[0]["tools"]
+    assert loop._fixed_overhead() >= tool_schema_tokens(sent)

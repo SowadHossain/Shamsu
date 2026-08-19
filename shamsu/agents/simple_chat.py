@@ -655,6 +655,31 @@ _COMPOSITE_TOOLS = frozenset(
     {"find_and_read", "search_and_read", "read_and_patch", "create_and_run"}
 )
 
+# The six that existed before any of this, plus nothing. Kept as a named set
+# because the roster grew from 6 schemas (~630 tokens) to 19 (~2,100), which is
+# 6.4% of a 32k window on EVERY call - and, more worrying than the tokens, 19
+# choices for a 7B model that has to pick one.
+#
+# Whether that trade is worth it cannot be settled by reading: more tools means
+# fewer rounds when the model picks well and more flailing when it does not.
+# `SHAMSU_TOOLSET=core` restores the original six so the two can be measured
+# against the same task on the same model, which is the only way to know.
+CORE_TOOLS = frozenset(
+    {"read_file", "list_files", "search_files", "write_file", "patch_file", "run_command"}
+)
+
+
+def active_tool_schemas() -> list[dict[str, Any]]:
+    """The schemas this session offers - all of them, or just the core six."""
+    if os.environ.get("SHAMSU_TOOLSET", "").strip().lower() != "core":
+        return SIMPLE_TOOL_SCHEMAS
+    return [
+        schema
+        for schema in SIMPLE_TOOL_SCHEMAS
+        if (schema.get("function") or {}).get("name") in CORE_TOOLS
+    ]
+
+
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
 
 # Every `name` simple mode itself writes into a transcript. This is the set
@@ -1456,7 +1481,7 @@ class SimpleChatLoop:
         kwargs = {
             "model": self.model_name,
             "messages": messages,
-            "tools": SIMPLE_TOOL_SCHEMAS,
+            "tools": active_tool_schemas(),
             "stream": False,
             "think": not self._should_disable_thinking(),
             "options": {
@@ -1771,7 +1796,7 @@ class SimpleChatLoop:
         """
         allocation = TokenAllocation(
             system_prompt=count_tokens(self.state.system_prompt) + PER_MESSAGE_OVERHEAD,
-            tool_schemas=tool_schema_tokens(SIMPLE_TOOL_SCHEMAS),
+            tool_schemas=tool_schema_tokens(active_tool_schemas()),
         )
         grounding = render_workspace_files(self._files)
         remembered = render_memory(self.workspace, self._request)
@@ -1874,7 +1899,7 @@ class SimpleChatLoop:
         by ~3,900 tokens, which is the difference between the ~8,192 of headroom
         the reply reserve promises and the ~5,300 it would actually deliver.
         """
-        total = tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+        total = tool_schema_tokens(active_tool_schemas())
         grounding = render_workspace_files(self._files)
         remembered = render_memory(self.workspace, self._request)
         if remembered:
@@ -1919,7 +1944,7 @@ class SimpleChatLoop:
         applying the factor here would feed the correction back into its own
         input and converge on the square root of the truth instead of the truth.
         """
-        return messages_tokens(messages) + tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+        return messages_tokens(messages) + tool_schema_tokens(active_tool_schemas())
 
     def _bucket_for(self, prompt_tokens: int) -> int:
         """One window for the whole session: the ceiling. No side effects.
@@ -3174,6 +3199,8 @@ __all__ = [
     "REPEATED_READS_BEFORE_WARNING",
     "SIMPLE_TOOLS",
     "SIMPLE_TOOL_SCHEMAS",
+    "active_tool_schemas",
+    "CORE_TOOLS",
     "SIMPLE_TRANSCRIPT_TOOLS",
     "SimpleChatLoop",
     "SimpleChatResult",
