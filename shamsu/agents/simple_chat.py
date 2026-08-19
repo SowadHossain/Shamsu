@@ -755,7 +755,16 @@ class SimpleChatLoop:
         # eliding after budgeting would mean budgeting against bytes that are
         # about to be thrown away.
         self._elide_payloads()
-        self.state.append_user(user_input)
+        # Expand `@file` before the model sees a word. Otherwise the literal
+        # string goes through and the first round is spent on a `read_file`
+        # working out what it meant - or on a guess.
+        #
+        # The expansion is sent but NOT persisted: `Mentioned file context:` is
+        # one of the internal markers the transcript strips, so a resumed
+        # session replays what the user typed rather than a stale copy of a
+        # file that has since changed.
+        expanded = await asyncio.to_thread(expand_mentions, self.workspace, user_input)
+        self.state.append_user(expanded, persisted_content=user_input)
         # Before compaction, not after: `_fixed_overhead` charges the grounding
         # block against the budget, and compaction decides what to evict from
         # that same budget. Computed after, compaction saw a workspace listing
@@ -2227,6 +2236,54 @@ def elide_tool_result(name: str, payload: str) -> str:
     return json.dumps(kept, ensure_ascii=True)
 
 
+# An `@file` is expanded before the model sees a word, but it must not be able
+# to swallow the window on its own. Same order as a tool result, and the model
+# can always `read_file` the rest.
+MAX_MENTION_TOKENS = 4000
+
+
+def expand_mentions(workspace: Path, text: str) -> str:
+    """Turn `@file` into the file, before any tokens are spent.
+
+    The user typed `@ASTEROID_SHOOTER_SHAMSU_BUILD_SPEC.md` and the literal
+    string was passed straight through: the model had to spend a whole round
+    calling `read_file` to find out what it referred to, and sometimes guessed
+    at it instead. `MentionResolver` already did this for the legacy path and
+    simple mode was never wired to it.
+
+    Best-effort: an unresolvable mention leaves the text exactly as typed,
+    because a mention that is really just an email address or a decorator must
+    not turn a request into a file dump.
+    """
+    try:
+        from shamsu.tools.workspace import MentionResolver, render_mention_context
+
+        contexts = MentionResolver(workspace).resolve_all(text or "")
+    except Exception:  # noqa: BLE001 - never let grounding break a turn
+        return text
+    usable = [c for c in contexts if c.resolved or c.error or c.kind == "ambiguous"]
+    if not usable:
+        return text
+    rendered = render_mention_context(usable)
+    if not rendered.strip():
+        return text
+    # Two things can shorten this: our cap, and MentionResolver own cap. Either
+    # way the model ends up holding part of a file, and must be told how to get
+    # the rest - a truncated mention with no recovery route is how a turn ends
+    # up answering from half a spec.
+    clipped = "[truncated" in rendered
+    if count_tokens(rendered) > MAX_MENTION_TOKENS:
+        rendered = rendered[: MAX_MENTION_TOKENS * 4]
+        clipped = True
+    if clipped:
+        rendered += (
+            chr(10)
+            + "... [only part of this file is shown - call read_file with "
+            + "start_line/end_line for the rest]"
+        )
+    return text + chr(10) * 2 + "Mentioned file context:" + chr(10) + rendered
+
+
 def _budgeted(payload: str) -> str:
     """Cap one tool result so it cannot crowd the conversation out of the window.
 
@@ -2305,6 +2362,7 @@ __all__ = [
     "codebase_brief",
     "command_needs_approval",
     "describes_an_unmade_edit",
+    "expand_mentions",
     "make_approval_func",
     "names_a_workspace_file",
     "normalize_arguments",

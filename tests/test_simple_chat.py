@@ -3464,3 +3464,63 @@ def test_a_quiet_session_warns_about_nothing(tmp_path):
     asyncio.run(loop.run("hello"))
 
     assert not [m for m in said if "filling the window" in m]
+
+
+# ---------------------------------------------------------------------------
+# @file expansion (SMALLCODE plan item G)
+# ---------------------------------------------------------------------------
+
+
+def test_an_at_mention_arrives_as_content_not_as_a_literal_string(tmp_path):
+    """The user typed @SPEC.md and the model had to spend a round on read_file."""
+    (tmp_path / "SPEC.md").write_text("The ship must slow to 4.5 max speed.", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("understood")])
+
+    asyncio.run(loop.run("build what @SPEC.md describes"))
+
+    sent = json.dumps(loop.client.calls[0]["messages"])
+    assert "must slow to 4.5" in sent, "the file was never expanded"
+    assert loop.client.calls[0]["messages"][-1]["role"] == "user"
+
+
+def test_the_expansion_is_sent_but_never_persisted(tmp_path):
+    """A resumed session must replay what was typed, not a stale file copy."""
+    (tmp_path / "SPEC.md").write_text("original contents", encoding="utf-8")
+    logger = _session(tmp_path)
+    loop = SimpleChatLoop(
+        tmp_path,
+        client=FakeClient([_text("ok")]),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        session_logger=logger,
+        model_name="qwen3:8b",
+    )
+
+    asyncio.run(loop.run("summarise @SPEC.md"))
+
+    stored = [m for m in logger.read_messages(10) if m["role"] == "user"]
+    assert stored[-1]["content"] == "summarise @SPEC.md"
+    assert "original contents" not in stored[-1]["content"]
+
+
+def test_a_decorator_is_not_mistaken_for_a_mention(tmp_path):
+    """`@app.route(...)` in pasted code must not turn a request into a file dump."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    asyncio.run(loop.run("why does @app.route('/') fail?"))
+
+    sent = loop.client.calls[0]["messages"][-1]["content"]
+    assert "Mentioned file context" not in sent
+
+
+def test_a_huge_mention_cannot_swallow_the_window(tmp_path):
+    from shamsu.agents.simple_chat import MAX_MENTION_TOKENS
+    from shamsu.context.budget import count_tokens
+
+    (tmp_path / "HUGE.md").write_text("padding word " * 40_000, encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    asyncio.run(loop.run("read @HUGE.md"))
+
+    sent = loop.client.calls[0]["messages"][-1]["content"]
+    assert count_tokens(sent) < MAX_MENTION_TOKENS * 1.5
+    assert "read_file" in sent, "it must say how to get the rest"
