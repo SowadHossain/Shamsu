@@ -3152,6 +3152,38 @@ def test_an_unknown_model_is_assumed_not_to_think(tmp_path):
     assert loop.client.calls[0]["think"] is False
 
 
+def test_the_system_prompt_survives_an_overflow_the_budget_missed(tmp_path):
+    """Ollama keeps 4 tokens from the front by default - not the system prompt.
+
+    The budget is meant to make overflow impossible. It is also the thing that
+    was wrong by 9,500 tokens this week, so `num_keep` is the floor under that
+    assumption: when the estimate IS wrong, the model should lose old turns,
+    not its own identity and tool list.
+    """
+    from shamsu.context.budget import PER_MESSAGE_OVERHEAD, count_tokens
+
+    loop = _loop(tmp_path, [_text("done")])
+    asyncio.run(loop.run("hi"))
+
+    options = loop.client.calls[0]["options"]
+    system_cost = count_tokens(loop.state.system_prompt) + PER_MESSAGE_OVERHEAD
+    assert options["num_keep"] >= system_cost, (
+        "the whole system prompt must be inside the kept prefix"
+    )
+    # And it cannot be the thing that starves the window it is protecting.
+    assert options["num_keep"] <= options["num_ctx"] // 8
+
+
+def test_num_keep_cannot_starve_the_window_with_a_long_system_prompt(tmp_path):
+    """The clamp, proved by making the system prompt absurd."""
+    loop = _loop(tmp_path, [_text("done")])
+    loop.state.system_prompt = "you are a helpful assistant. " * 4000
+    asyncio.run(loop.run("hi"))
+
+    options = loop.client.calls[0]["options"]
+    assert options["num_keep"] == options["num_ctx"] // 8
+
+
 def test_a_cut_off_answer_is_never_presented_as_a_finished_one(tmp_path):
     """`done_reason == "length"` means the model was still speaking."""
     loop = _loop(tmp_path, [_cut(content="The fix is to set window.asteroid")])

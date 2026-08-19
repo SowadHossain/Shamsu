@@ -1534,6 +1534,9 @@ class SimpleChatLoop:
                 # truncation it exists to prevent. At this value it only stops
                 # a runaway from eating the window the prompt still occupies.
                 "num_predict": output_reserve(num_ctx),
+                # The system prompt survives an overflow the budget failed to
+                # prevent. Ollama keeps 4 tokens by default; see `_num_keep`.
+                "num_keep": self._num_keep(num_ctx),
             },
         }
         self._trace(
@@ -2018,6 +2021,25 @@ class SimpleChatLoop:
         chosen = self._bucket_for(self._estimate_prompt(messages))
         self._num_ctx_floor = chosen
         return chosen
+
+    def _num_keep(self, num_ctx: int) -> int:
+        """Tokens Ollama must keep from the FRONT if the prompt ever overflows.
+
+        The server's default is 4. Four. If a prompt does overflow, Ollama
+        shifts the context by dropping from the front and keeps essentially
+        nothing - so the first thing lost is the system prompt, and the model
+        carries on with no idea what it is or which tools it has.
+
+        The budget is supposed to make overflow impossible, and mostly does.
+        This is the floor under that assumption: our estimate can be wrong (it
+        was wrong by 9,500 tokens as recently as this week), and the failure
+        mode when it is should not be a lobotomy.
+
+        Clamped to an eighth of the window so a long system prompt cannot
+        itself become the thing that starves the conversation.
+        """
+        wanted = count_tokens(self.state.system_prompt) + PER_MESSAGE_OVERHEAD
+        return max(4, min(wanted, num_ctx // 8))
 
     def _estimate_prompt(self, messages: list[dict[str, Any]]) -> int:
         """Our best guess at what Ollama will report as `prompt_eval_count`.
