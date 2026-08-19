@@ -28,7 +28,7 @@ where SHAMSU already has the better backend, keep it and expose it.**
 | `memory_forget` | — | `memory_forget` | **taken** |
 | — | — | `history_search` | **SHAMSU only** — neither project had it |
 | `list_files` (n/a) | `list_files` | `list_files` | SHAMSU only |
-| `find_and_read`, `search_and_read`, `read_and_patch`, `create_and_run` | — | **not taken** | see below |
+| `find_and_read`, `search_and_read`, `read_and_patch`, `create_and_run` | — | all four | **taken, with a rule of ours** |
 | `run_tests` | — | not taken | `run_command` covers it; a second path to the same thing |
 | `web_search`, `web_fetch` | exists, unexposed | not exposed | deliberate — needs a network policy decision |
 | `use_skill` | `skills/` exists, unexposed | not exposed | same |
@@ -38,7 +38,7 @@ where SHAMSU already has the better backend, keep it and expose it.**
 | cloud escalation | — | **refused** | against the prime directive: inference is local |
 | two-stage tool routing | — | not taken | real at 18 tools; the indirection simple mode exists to remove |
 
-**7 tools → 15.**
+**7 tools → 19.**
 
 ---
 
@@ -117,15 +117,30 @@ which is the only reason it is safe to offer.
 
 ---
 
-## The composite tools, and why they are not here yet
+## The composite tools, and the rule that made them safe
 
 `find_and_read`, `search_and_read`, `read_and_patch`, `create_and_run` collapse
-two round trips into one. On a 24-round budget at ~100s a round that is a real
-saving and the idea is sound.
+two round trips into one. On a 24-round budget at ~100s a round that is the
+difference between finishing and stopping half way.
 
-Not taken **yet**, deliberately: each one doubles the number of ways a call can
-half-fail, and the failure modes are the interesting part — what should
-`read_and_patch` report when the read works and the patch does not match? That
-wants designing rather than porting, and it should be measured against a live
-model before it earns four more schemas in every prompt. Noted here so it is a
-decision rather than an oversight.
+The objection was never the saving, it was that **each one doubles the ways a
+call can half-fail** — and a composite that errors when its second step misses
+is *worse* than two plain calls, because the model paid for the first step and
+got nothing back.
+
+So they carry a rule that is ours rather than theirs:
+
+> **A half-failure returns the half that worked.**
+
+- `read_and_patch` whose snippet does not match hands back **the file
+  contents**, so the next attempt is computed from the real text instead of
+  guessed at again. This is aimed squarely at the measured failure in this
+  harness: twelve no-op patches in a single turn, because a bare "did not
+  match" leaves the model retrying from memory.
+- `create_and_run` whose command fails still wrote the file, and says so.
+- `find_and_read` names the other files that matched, so a silent pick between
+  two `settings.py` is visible.
+- `search_and_read` lists the runners-up with their scores.
+
+A composite is then never worse than the two calls it replaces, which is the
+only condition under which it is worth four more schemas in every prompt.

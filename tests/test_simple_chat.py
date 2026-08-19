@@ -81,6 +81,7 @@ _NON_REGISTRY_TOOLS = frozenset({
     "memory_remember", "memory_load", "memory_list", "memory_forget",
     "graph_search", "explain_symbol", "history_search", "append_file",
     "find_files",
+    "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
 })
 
 
@@ -212,6 +213,8 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
         "graph_search", "explain_symbol",
         # the whole conversation, and building files in pieces
         "history_search", "append_file", "find_files",
+        # two steps in one call
+        "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
     }
     # `remember` is an accepted alias, not an offered tool.
     assert offered == {n for n in SIMPLE_TOOLS if n != "remember"}
@@ -2066,10 +2069,20 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 "history_search": {"query": "anything"},
                 "append_file": {"filepath": "grown.py", "content": "# section"},
                 "find_files": {"pattern": "**/*.py"},
+                "find_and_read": {"pattern": "**/*.py"},
+                "search_and_read": {"query": "value"},
+                "read_and_patch": {"filepath": "hello.py", "old_string": "value",
+                                   "new_string": "other"},
+                "create_and_run": {"filepath": "made.py", "content": "x = 1",
+                                   "command": "echo done"},
             }[name]
             result = loop._execute(name, probe)
             # memory_forget on a missing id is a legitimate no.
-            assert result.ok or name == "memory_forget", f"{name} -> {result.message}"
+            # memory_forget on a missing id, and read_and_patch whose snippet
+            # is absent, are both legitimate NOs.
+            assert result.ok or name in {"memory_forget", "read_and_patch"}, (
+                f"{name} -> {result.message}"
+            )
             continue
         arguments = {key: "hello.py" if "file" in key else "value" for key in required}
         normalized = normalize_arguments(name, arguments)
@@ -4110,3 +4123,99 @@ def test_the_model_can_search_the_whole_conversation(tmp_path):
 
     assert result.ok
     assert "8080" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Composite tools (smallcode shapes, our half-failure rule)
+#
+# Two steps in one call saves a round; the risk is that each doubles the ways
+# a call can HALF-fail. A composite that errors when its second step misses is
+# worse than two plain calls, because the model paid for the first step and got
+# nothing. So: a half-failure returns the half that worked.
+# ---------------------------------------------------------------------------
+
+
+def test_a_failed_patch_still_hands_back_the_file(tmp_path):
+    """The measured failure this prevents: 12 no-op patches in a single turn.
+
+    Refused with only 'did not match', the model retries from memory. Given
+    the real text, the next attempt is computed rather than guessed.
+    """
+    (tmp_path / "game.js").write_text("const speed = 5;\nconst lives = 3;\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "read_and_patch",
+        {"filepath": "game.js", "old_string": "const speed = 9;", "new_string": "const speed = 2;"},
+    )
+
+    assert not result.ok
+    assert "did not apply" in result.message
+    assert "const speed = 5;" in result.message, "the real text was not returned"
+    assert result.data.get("patch_failed")
+
+
+def test_a_matching_patch_just_patches(tmp_path):
+    (tmp_path / "game.js").write_text("const speed = 5;\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "read_and_patch",
+        {"filepath": "game.js", "old_string": "const speed = 5;", "new_string": "const speed = 2;"},
+    )
+
+    assert result.ok
+    assert "const speed = 2;" in (tmp_path / "game.js").read_text(encoding="utf-8")
+
+
+def test_create_and_run_keeps_the_file_when_the_command_fails(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "create_and_run",
+        {"filepath": "made.py", "content": "x = 1\n", "command": "this-command-does-not-exist"},
+    )
+
+    assert (tmp_path / "made.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert result.data.get("file_written") is True
+    assert "made.py" in result.message
+
+
+def test_find_and_read_returns_the_file_and_names_the_alternatives(tmp_path):
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "settings.py").write_text("DEBUG = True\n", encoding="utf-8")
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "settings.py").write_text("DEBUG = False\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("find_and_read", {"pattern": "**/settings.py"})
+
+    assert result.ok
+    # The model is handed the whole serialised result, not just the message -
+    # `read_file` carries content in `data`, which is what reaches the prompt.
+    assert "DEBUG" in result.to_json()
+    assert "other file(s) also matched" in result.message, "a silent pick between two files"
+
+
+def test_search_and_read_reads_the_best_hit_and_shows_the_runners_up(tmp_path):
+    (tmp_path / "auth.py").write_text(
+        "def validateAuthToken(raw):\n    return len(raw) > 10\n", encoding="utf-8"
+    )
+    (tmp_path / "maths.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("search_and_read", {"query": "the function that validates tokens"})
+
+    assert result.ok
+    assert "auth.py" in result.message
+    assert "validateAuthToken" in result.to_json(), "it found the file but did not read it"
+
+
+def test_a_composite_that_finds_nothing_explains_rather_than_erroring(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+
+    found = loop._execute("find_and_read", {"pattern": "**/*.nope"})
+    searched = loop._execute("search_and_read", {"query": "quantum flux capacitor"})
+
+    assert found.ok and searched.ok
+    assert "No files match" in found.message

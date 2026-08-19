@@ -291,6 +291,15 @@ SIMPLE_TOOLS: dict[str, str] = {
     # rather than only being told it may not rewrite one.
     "append_file": "append_file",
     "find_files": "find_files",
+    # Composite tools, from smallcode `bin/tools.js`. Two round trips in one
+    # call: on a 24-round budget at ~100s a round that is the difference
+    # between finishing and stopping half way. The rule that makes them safe
+    # is ours - see `_composite_tool`: a half-failure returns the half that
+    # WORKED, so a wasted round is impossible.
+    "find_and_read": "find_and_read",
+    "search_and_read": "search_and_read",
+    "read_and_patch": "read_and_patch",
+    "create_and_run": "create_and_run",
 }
 
 SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -563,7 +572,88 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_and_read",
+            "description": (
+                "Find a file by glob and read it, in one call. Use when you know roughly "
+                "what the file is called but not where it lives."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob, e.g. **/settings.py."}
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_and_read",
+            "description": (
+                "Search the code and read the best match, in one call. Plain English "
+                "works. Use when you know what the code DOES but not where it is."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What the code does, or a pattern."}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_and_patch",
+            "description": (
+                "Read a file and change one exact snippet in it, in one call. If the "
+                "snippet does not match, you get the file contents back anyway, so you "
+                "can see the real text and retry without spending another read."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "description": "Path relative to the workspace."},
+                    "old_string": {"type": "string", "description": "The exact text to replace."},
+                    "new_string": {"type": "string", "description": "The text to put in its place."},
+                },
+                "required": ["filepath", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_and_run",
+            "description": (
+                "Write a file and then run a command, in one call - typically to run the "
+                "file you just wrote, or its tests. If the command fails you still get "
+                "the error, and the file is still written."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "description": "Path relative to the workspace."},
+                    "content": {"type": "string", "description": "The complete file content."},
+                    "command": {"type": "string", "description": "The command to run afterwards."},
+                },
+                "required": ["filepath", "content", "command"],
+            },
+        },
+    },
 ]
+
+# Two-step tools. Listed here so `_execute` can route them before the registry
+# lookup, and so the rule they share - a half-failure returns the half that
+# worked - lives in one place.
+_COMPOSITE_TOOLS = frozenset(
+    {"find_and_read", "search_and_read", "read_and_patch", "create_and_run"}
+)
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
 
@@ -1936,6 +2026,8 @@ class SimpleChatLoop:
             return self._append_file(arguments)
         if name == "find_files":
             return self._find_files(arguments)
+        if name in _COMPOSITE_TOOLS:
+            return self._composite_tool(name, arguments)
         target = SIMPLE_TOOLS.get(name)
         if target is None:
             return ToolResult(
@@ -1967,6 +2059,114 @@ class SimpleChatLoop:
         if before is not None and result.ok:
             return self._with_diff(arguments, before, result)
         return result
+
+    def _composite_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """Two steps in one call, and never a wasted round.
+
+        Shapes from smallcode `bin/tools.js`. The reason to want them is a
+        small model's round budget: 24 rounds at ~100s each, and half of them
+        spent on "find the file" then "read the file" is half a session gone
+        on bookkeeping.
+
+        The reason NOT to want them - and what stopped this being a port - is
+        that each one doubles the ways a call can half-fail. A composite that
+        errors when its second step misses is worse than two plain calls,
+        because the model paid for the first step and got nothing.
+
+        So the rule here, which is ours and not theirs: **a half-failure
+        returns the half that worked.** `read_and_patch` whose patch does not
+        match hands back the file contents, so the next attempt is computed
+        from the real text rather than guessed at again - which is the
+        measured failure this harness has (12 no-op patches in one turn).
+        `create_and_run` whose command fails still wrote the file, and says
+        so. The composite is then never worse than the two calls it replaces.
+        """
+        if name == "find_and_read":
+            found = self._find_files({"pattern": arguments.get("pattern")})
+            files = (found.data or {}).get("files") or []
+            if not files:
+                return found  # already explains the usual glob mistake
+            target = files[0]
+            read = self._execute("read_file", {"filepath": target})
+            others = (
+                f" ({len(files) - 1} other file(s) also matched: "
+                + ", ".join(files[1:4])
+                + ")"
+                if len(files) > 1
+                else ""
+            )
+            return ToolResult(
+                read.ok,
+                f"Matched {target}{others}." + chr(10) + chr(10) + read.message,
+                {**(read.data or {}), "matched": files[:5], "read": target},
+            )
+
+        if name == "search_and_read":
+            query = str(arguments.get("query") or arguments.get("pattern") or "")
+            found = self._execute("search_files", {"query": query})
+            matches = (found.data or {}).get("matches") or []
+            if not matches:
+                return found
+            target = str(matches[0].get("file") or matches[0].get("filepath") or "")
+            if not target:
+                return found
+            read = self._execute("read_file", {"filepath": target})
+            runners_up = ", ".join(
+                str(m.get("file") or "") for m in matches[1:4] if m.get("file")
+            )
+            note = f" Other candidates: {runners_up}." if runners_up else ""
+            return ToolResult(
+                read.ok,
+                f"Best match for {query!r}: {target}.{note}"
+                + chr(10) + chr(10) + read.message,
+                {**(read.data or {}), "read": target, "candidates": matches[:5]},
+            )
+
+        if name == "read_and_patch":
+            path = str(arguments.get("filepath") or "")
+            patched = self._execute(
+                "patch_file",
+                {
+                    "filepath": path,
+                    "old_string": arguments.get("old_string"),
+                    "new_string": arguments.get("new_string"),
+                },
+            )
+            if patched.ok:
+                return patched
+            # The patch missed. Hand back the file rather than the refusal
+            # alone: without it the model retries from memory, which is how a
+            # turn ends up running twelve patches that change nothing.
+            read = self._execute("read_file", {"filepath": path})
+            if not read.ok:
+                return patched
+            return ToolResult(
+                False,
+                f"The patch did not apply: {patched.message}"
+                + chr(10) + chr(10)
+                + "Here is the file as it actually is - match against this "
+                + "text rather than retrying the same snippet:"
+                + chr(10) + read.message,
+                {**(read.data or {}), "patch_failed": True, "filepath": path},
+            )
+
+        if name == "create_and_run":
+            written = self._execute(
+                "write_file",
+                {"filepath": arguments.get("filepath"), "content": arguments.get("content")},
+            )
+            if not written.ok:
+                return written  # nothing was created, so nothing to run
+            ran = self._execute("run_command", {"command": arguments.get("command")})
+            return ToolResult(
+                ran.ok,
+                written.message + chr(10) + chr(10) + "Then ran the command:"
+                + chr(10) + ran.message,
+                {**(ran.data or {}), "file_written": True,
+                 "filepath": arguments.get("filepath")},
+            )
+
+        return ToolResult(False, f"There is no tool called {name}.", {"tool": name})
 
     def _history_search(self, arguments: dict[str, Any]) -> ToolResult:
         """Search everything ever said, not just what still fits.
