@@ -1719,7 +1719,7 @@ def test_decisions_outrank_routine_asks_in_the_summary(tmp_path):
 
     asyncio.run(loop.run("carry on"))
 
-    lines = [l for l in state.rolling_summary.splitlines() if l.strip()]
+    lines = [line for line in state.rolling_summary.splitlines() if line.strip()]
     assert "TTL is 900s" in lines[0], f"decisions must lead, got {lines[0]!r}"
     # Protected by ORDER, not by trimming the asks - `_bounded_summary` keeps
     # both ends, so leading with decisions guarantees they outlive the middle.

@@ -6,7 +6,6 @@ refactor that reintroduces the behaviour fails loudly.
 from __future__ import annotations
 
 import tempfile
-from io import StringIO
 from pathlib import Path
 
 from rich.console import Console

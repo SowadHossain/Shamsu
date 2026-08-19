@@ -7,7 +7,7 @@ from unittest.mock import patch
 from shamsu.agents.orchestrator import AgentOrchestrator
 from shamsu.memory.graphiti_adapter import FALKORDB_IMAGE, GraphitiAdapter, is_local_uri
 from shamsu.memory.policy import MemoryPolicy
-from shamsu.memory.service import REQUIRED_MEMORY_MESSAGE, MemoryService
+from shamsu.memory.service import MemoryService
 from shamsu.memory.types import GraphitiHealth, LongTermMemory
 from tests.test_abstract_service import FakeCodebaseMemoryAdapter
 from shamsu.abstract.service import AbstractService

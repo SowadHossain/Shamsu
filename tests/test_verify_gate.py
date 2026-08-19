@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from shamsu.agents import chat_loop as chat_loop_module
 from shamsu.verification import verifier as verifier_module
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.tools.agent_tools import AgentToolRegistry

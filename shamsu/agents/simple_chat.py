@@ -49,9 +49,8 @@ from shamsu.context.budget import (
     messages_tokens,
     tool_schema_tokens,
 )
-from shamsu.llm.manager import OLLAMA_BASE_URL
 from shamsu.llm.output import parse_model_turn
-from shamsu.runtime.models import model_for_role
+from shamsu.runtime.models import model_for_role, model_is_reasoning
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.types import CommandRisk, ToolResult

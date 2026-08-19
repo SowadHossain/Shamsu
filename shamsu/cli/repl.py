@@ -591,6 +591,7 @@ def _print_help(console: Console) -> None:
                     "  /django fix-tests [dir]   Run tests and apply bug-fix loop",
                     "  /context status           Show model context windows and calibration",
                     "  /context budget           Show last model call's token budget",
+                    "  /context meter            Live context meter, counters and efficiency",
                     "  /context inspect          Detailed budget breakdown",
                     "  /context compact          Show auto-compact threshold and last status",
                     "  /context show             Show observability + what the working trace surfaces",
@@ -3763,7 +3764,9 @@ def _handle_context(
         console.print(Panel("\n".join(lines), title="Context & Observability", border_style="cyan"))
 
     else:
-        console.print("[red]Usage: /context status|budget|inspect|compact|show[/red]")
+        console.print(
+            "[red]Usage: /context status|budget|meter|inspect|compact|show[/red]"
+        )
 
 
 def _os_env_flag(name: str) -> bool:
@@ -9201,15 +9204,15 @@ def _persist_prd_milestone_contracts(
     if not contracts:
         return []
     validated: list[TaskContract] = []
-    for contract in contracts:
-        result = validate_contract(contract, workspace)
+    for task_contract in contracts:
+        result = validate_contract(task_contract, workspace)
         if result.ok:
-            validated.append(contract)
+            validated.append(task_contract)
         else:
             _log_task_contract_event(
                 session_logger,
                 "task_contract.rejected",
-                {"task_id": contract.task_id, "errors": list(result.errors)},
+                {"task_id": task_contract.task_id, "errors": list(result.errors)},
                 "Milestone task contract failed validation",
             )
     if not validated:

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import io
-import json
 from pathlib import Path
 
 import pytest
@@ -11,7 +9,6 @@ from rich.console import Console
 from shamsu.agents.chat_loop import AgentChatLoop
 from shamsu.plans.contracts import (
     TaskContract,
-    contracts_from_markdown,
     load_plan_contracts,
     request_scope_expansion,
     run_file_preflight,

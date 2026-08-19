@@ -18,7 +18,7 @@ from shamsu.runtime.models import (
 # hardcoded: swapping the anchor (qwen3:8b -> qwen3.5:9b-q4_K_M, 2026-08-18)
 # broke 20 tests that had the old name baked in. The behaviour under test is
 # "every role resolves to the ONE anchor", never "it is called qwen3:8b".
-from shamsu.runtime.models import ModelTier, TIER_MODEL_SPECS
+from shamsu.runtime.models import TIER_MODEL_SPECS
 
 ANCHOR = TIER_MODEL_SPECS[ModelTier.DEFAULT][0].name
 

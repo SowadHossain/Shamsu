@@ -258,7 +258,6 @@ def run_file_preflight(contract: TaskContract, workspace: Path, *, max_candidate
     selected = _dedupe(path for path in proposed if path)
     if not selected:
         selected = candidates[:2]
-    selected_set = set(selected)
     rationale = [
         ScopeDecision(path=path, reason=_scope_reason(path, proposed, existing), source="preflight")
         for path in selected
