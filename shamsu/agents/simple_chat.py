@@ -713,14 +713,101 @@ _COMPOSITE_TOOLS = frozenset(
 # tight, send everything when it is not - which is better reasoning than
 # defaulting to narrow and hoping someone measures it. See `simple_router`.
 
+# Tool families that can only answer once something exists to answer FROM, and
+# what each one needs. Measured 2026-08-19: the full roster costs a flat 2,111
+# tokens on every single call - 85% of a fresh 3B prompt, and never under 30%
+# however long the session runs. Across seven live sessions the model called 7
+# of 19 tools; the 12 it never touched cost 1,131 of those tokens.
+#
+# These three families are the ones that can be answered honestly by asking the
+# filesystem, and the check is a file stat. A graph tool with no index, a
+# history search with no prior session, and a memory reader with no notes can
+# only return "nothing here" - so sending their schemas buys nothing and costs
+# 516 tokens on every call of a fresh workspace.
+#
+# `memory_remember` is deliberately NOT in here. It is the tool that CREATES the
+# notes the readers need, and gating it behind notes existing would mean a
+# workspace could never get its first one - which is M1, and the point is not to
+# make it permanent.
+CONDITIONAL_TOOL_FAMILIES: dict[str, tuple[str, ...]] = {
+    "memory": ("memory_load", "memory_list", "memory_forget"),
+    "graph": ("graph_search", "explain_symbol"),
+    "history": ("history_search",),
+}
+
+
+def available_tool_families(workspace: Path) -> frozenset[str]:
+    """Which conditional families have something to answer from, right now.
+
+    Three file stats. Deliberately generous on failure: anything that cannot be
+    determined counts as AVAILABLE, because withholding a tool the model needed
+    is a worse error than paying for a schema it did not.
+    """
+    available: set[str] = set()
+    for family, probe in (
+        ("memory", _has_memory_notes),
+        ("graph", _has_code_graph),
+        ("history", _has_earlier_sessions),
+    ):
+        try:
+            if probe(workspace):
+                available.add(family)
+        except Exception:  # noqa: BLE001 - an unreadable probe must not remove a tool
+            available.add(family)
+    return frozenset(available)
+
+
+def _has_memory_notes(workspace: Path) -> bool:
+    from shamsu import paths
+
+    notes = paths.memory_notes_dir(workspace)
+    return notes.is_dir() and any(notes.glob("*.md"))
+
+
+def _has_code_graph(workspace: Path) -> bool:
+    # The same file `AbstractService.ensure_ready()` gates on, so this agrees
+    # with whether the graph would actually answer.
+    return (workspace / ".shamsu" / "abstract" / "last-index.json").is_file()
+
+
+def _has_earlier_sessions(workspace: Path) -> bool:
+    from shamsu import paths
+
+    sessions = paths.sessions_dir(workspace)
+    if not sessions.is_dir():
+        return False
+    # More than the one being written right now: with a single session there is
+    # no history to search that is not already in the window.
+    return sum(1 for entry in sessions.iterdir() if entry.is_dir()) > 1
+
+
+def _without_unavailable_families(
+    schemas: list[dict[str, Any]], available: frozenset[str]
+) -> list[dict[str, Any]]:
+    withheld = {
+        name
+        for family, names in CONDITIONAL_TOOL_FAMILIES.items()
+        if family not in available
+        for name in names
+    }
+    if not withheld:
+        return schemas
+    return [s for s in schemas if s.get("function", {}).get("name") not in withheld]
+
+
 def active_tool_schemas(
-    context_window: int = 0, category: str = ""
+    context_window: int = 0,
+    category: str = "",
+    available: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """The tools to send on this call.
 
-    Everything, unless the window is tight enough that two-stage routing earns
-    its extra round: then the category selector alone, and once the model has
-    chosen, that category tools.
+    Everything that can currently do something, unless the window is tight
+    enough that two-stage routing earns its extra round: then the category
+    selector alone, and once the model has chosen, that category tools.
+
+    `available=None` means "do not filter" - the old behaviour, kept so every
+    existing caller and test still gets the full roster.
     """
     from shamsu.agents.simple_router import (
         category_selector_tool,
@@ -729,10 +816,14 @@ def active_tool_schemas(
     )
 
     if not context_window or routing_mode(context_window) == "direct":
-        return SIMPLE_TOOL_SCHEMAS
-    if not category:
+        schemas = SIMPLE_TOOL_SCHEMAS
+    elif not category:
         return [category_selector_tool()]
-    return tools_for_category(category, SIMPLE_TOOL_SCHEMAS)
+    else:
+        schemas = tools_for_category(category, SIMPLE_TOOL_SCHEMAS)
+    if available is None:
+        return schemas
+    return _without_unavailable_families(schemas, available)
 
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
@@ -1219,6 +1310,13 @@ class SimpleChatLoop:
         # listening, which is the case for tests and embedders.
         self.feedback = feedback
         self._tool_category = ""
+        # Which conditional tool families have anything to answer from. Computed
+        # once per turn in `run()`, not per round: three file stats are cheap,
+        # but a roster that changes mid-turn would invalidate the KV prefix on
+        # every call for no gain.
+        self._available_families: frozenset[str] = frozenset(
+            CONDITIONAL_TOOL_FAMILIES
+        )
         self._calls_since_elide = 0
         # Said once per loop, not once per round.
         self._warned_filling = False
@@ -1318,6 +1416,14 @@ class SimpleChatLoop:
         # that same budget. Computed after, compaction saw a workspace listing
         # of nothing and believed it had hundreds of tokens more than it did.
         self._files = await asyncio.to_thread(workspace_files, self.workspace)
+        # Once per turn, before anything is budgeted: the roster is part of
+        # the prompt, and `_fixed_overhead` has to charge for what will
+        # really be sent. Not per round - three file stats are cheap, but a
+        # roster that changed mid-turn would invalidate the KV prefix on
+        # every call for no gain.
+        self._available_families = await asyncio.to_thread(
+            available_tool_families, self.workspace
+        )
         # Once per user message, not per round: the graph lookup costs ~2s and
         # what a file exports does not change between rounds of the same turn.
         self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
@@ -1793,7 +1899,9 @@ class SimpleChatLoop:
         kwargs = {
             "model": self.model_name,
             "messages": messages,
-            "tools": active_tool_schemas(num_ctx, self._tool_category),
+            "tools": active_tool_schemas(
+                num_ctx, self._tool_category, self._available_families
+            ),
             "stream": False,
             "think": self._should_think(),
             "options": {
@@ -2257,7 +2365,9 @@ class SimpleChatLoop:
         under two-stage routing those differ by ~1,700 tokens, and item A is
         entirely about not letting the estimate and the request disagree.
         """
-        return active_tool_schemas(self._ceiling(), self._tool_category)
+        return active_tool_schemas(
+            self._ceiling(), self._tool_category, self._available_families
+        )
 
     def _ceiling(self) -> int:
         """The context window this session asks Ollama for.

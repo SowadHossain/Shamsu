@@ -34,7 +34,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
 | [G2](#g2) | Graph indexes `reference/`, `other peoples work/`, `legacy-code/` and answers out of them | **high** | graph |
-| [L3](#l3) | Tool schemas are **57–81% of every prompt**; two-stage routing is off at 32k | **high** | context |
 | [W1](#w1) | `.shamsu/` records the same turn four times; `paths.py` governs 7 of its 13 entries | medium | structure |
 | [W2](#w2) | **No session retention** — 127 sessions / 9.9 MB in one workspace, never pruned | medium | structure |
 | [W3](#w3) | Session files carry conversation content with default permissions | low | security |
@@ -62,6 +61,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `4e70775` |
 | [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `9cbdde9` |
 | [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `d1ba009` |
+| [L3](#l3) | Tool schemas were a flat **2,111 tokens on every call** — 85% of a fresh 3B prompt. Measured, then gated by relevance | `ac256c1`+1 |
 | [H1](#h1) | **A denied command marked a fully successful run `denied`** — found by the first live run of the fixes | `1d93b76`+1 |
 | [N1](#n1) | **A byte-identical write reported `ok: true`** — five no-op writes read as successes, and the no-op counter could not see any of them | `1d93b76` |
 | [C13](#c13) | C7 missed a promise ending in a full stop — found live on a 3B | `e25da63` |
@@ -558,6 +558,24 @@ call** and it is the one bucket nothing currently reduces.
 window size alone. See `shamsu/agents/simple_router.py`.
 
 ---
+
+### The C5 / L3 contradiction, resolved by measurement
+
+C5 said the verbatim tail was 51% of the prompt; L3 said tool schemas were
+57-81% of it. Both were true, of different sessions, and neither said which -
+so together they read as impossible. Measured 2026-08-19 on the real
+transcripts:
+
+| session | prompt | schemas | tool results | conversation |
+|---|---|---|---|---|
+| fresh turn | 2,479 | **2,111 (85%)** | 0 | 0 |
+| real 3B repair (29 msgs) | 6,920 | 2,111 (31%) | 2,945 (43%) | 1,495 (22%) |
+| real 9B repair (16 msgs) | 5,450 | 2,111 (39%) | 2,640 (48%) | 330 (6%) |
+
+**The schemas are a constant, not a share.** A flat 2,111 tokens on every call
+whatever the session length; the percentage only falls because the tail grows
+past it. That is why the two numbers disagreed, and it is why the fix is the
+roster rather than the window threshold L3 originally proposed.
 
 <a name="w1"></a>
 ## W1 — four stores for one turn, and a layout module that governs half of it · MEDIUM

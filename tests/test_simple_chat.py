@@ -201,23 +201,49 @@ def test_an_unknown_tool_is_answered_with_the_names_that_exist(tmp_path):
 
 
 def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
+    """The name was always the contract; the roster did not honour it.
+
+    A graph tool with no index, a history search with no earlier session and a
+    memory reader with no notes can only answer "nothing here" - and they cost
+    516 tokens on every single call to say it. In a fresh workspace they cannot
+    run, so they are not offered.
+    """
     loop = _loop(tmp_path, [_text("ok")])
     asyncio.run(loop.run("hi"))
 
     offered = {t["function"]["name"] for t in loop.client.calls[0]["tools"]}
-    assert offered == {
-        "read_file", "list_files", "search_files", "write_file", "patch_file",
-        "run_command",
-        # memory and code graph, named as smallcode names them
-        "memory_remember", "memory_load", "memory_list", "memory_forget",
-        "graph_search", "explain_symbol",
-        # the whole conversation, and building files in pieces
-        "history_search", "append_file", "find_files",
-        # two steps in one call
-        "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
+    conditional = {
+        "memory_load", "memory_list", "memory_forget",
+        "graph_search", "explain_symbol", "history_search",
     }
-    # `remember` is an accepted alias, and `select_category` belongs to
-    # two-stage routing - it is never offered alongside the real tools.
+
+    # Everything that can act on a bare workspace, and nothing that cannot.
+    assert offered == {
+        n for n in SIMPLE_TOOLS
+        if n not in {"remember", "select_category"} and n not in conditional
+    }
+    assert "memory_remember" in offered, "the tool that creates notes is never withheld"
+
+
+def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_path):
+    """The gate is about relevance, not removal: give each family what it needs
+    and the roster is exactly what it always was."""
+    from shamsu import paths
+
+    notes = paths.memory_notes_dir(tmp_path)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "n.md").write_text("# port" + chr(10) + "8080" + chr(10), encoding="utf-8")
+    index = tmp_path / ".shamsu" / "abstract"
+    index.mkdir(parents=True, exist_ok=True)
+    (index / "last-index.json").write_text("{}", encoding="utf-8")
+    for name in ("20260819-000001-aaaa", "20260819-000002-bbbb"):
+        (paths.sessions_dir(tmp_path) / name).mkdir(parents=True, exist_ok=True)
+
+    loop = _loop(tmp_path, [_text("ok")])
+    asyncio.run(loop.run("hi"))
+
+    offered = {t["function"]["name"] for t in loop.client.calls[0]["tools"]}
+
     assert offered == {
         n for n in SIMPLE_TOOLS if n not in {"remember", "select_category"}
     }
@@ -5788,3 +5814,131 @@ def test_a_missing_ledger_never_breaks_a_turn(tmp_path, monkeypatch):
     result = asyncio.run(loop.run("write main.js"))
 
     assert result.final == "done"
+
+
+# --- the roster only carries what can answer (L3) ------------------------
+#
+# Measured 2026-08-19 on real transcripts: the full roster costs a flat 2,111
+# tokens on EVERY call - 85% of a fresh 3B prompt, 31% deep into a 29-message
+# session, never less. Across seven live sessions the model called 7 of 19
+# tools; the 12 it never touched cost 1,131 of those tokens.
+
+
+def test_a_fresh_workspace_is_not_charged_for_tools_that_cannot_answer(tmp_path):
+    from shamsu.agents.simple_chat import (
+        SIMPLE_TOOL_SCHEMAS,
+        active_tool_schemas,
+        available_tool_families,
+    )
+    from shamsu.context.budget import tool_schema_tokens
+
+    families = available_tool_families(tmp_path)
+    gated = active_tool_schemas(32768, "", families)
+
+    assert tool_schema_tokens(gated) < tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
+    names = {s["function"]["name"] for s in gated}
+    assert "graph_search" not in names
+    assert "history_search" not in names
+    assert "memory_load" not in names
+
+
+def test_the_tool_that_creates_notes_is_never_withheld(tmp_path):
+    """Gating memory_remember behind notes existing would mean a workspace could
+    never get its first one. That is M1, and the point is not to make it
+    permanent."""
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    gated = active_tool_schemas(32768, "", available_tool_families(tmp_path))
+
+    assert "memory_remember" in {s["function"]["name"] for s in gated}
+
+
+def test_the_core_coding_tools_are_never_withheld(tmp_path):
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    names = {
+        s["function"]["name"]
+        for s in active_tool_schemas(32768, "", available_tool_families(tmp_path))
+    }
+
+    for tool in ("read_file", "write_file", "patch_file", "search_files", "run_command"):
+        assert tool in names, tool
+
+
+def test_notes_on_disk_bring_the_memory_readers_back(tmp_path):
+    from shamsu import paths
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    notes = paths.memory_notes_dir(tmp_path)
+    notes.mkdir(parents=True, exist_ok=True)
+    (notes / "a-note.md").write_text("# port\n8080\n", encoding="utf-8")
+
+    names = {
+        s["function"]["name"]
+        for s in active_tool_schemas(32768, "", available_tool_families(tmp_path))
+    }
+
+    assert "memory_load" in names
+
+
+def test_an_indexed_workspace_brings_the_graph_tools_back(tmp_path):
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    index = tmp_path / ".shamsu" / "abstract"
+    index.mkdir(parents=True, exist_ok=True)
+    (index / "last-index.json").write_text("{}", encoding="utf-8")
+
+    names = {
+        s["function"]["name"]
+        for s in active_tool_schemas(32768, "", available_tool_families(tmp_path))
+    }
+
+    assert "graph_search" in names
+    assert "explain_symbol" in names
+
+
+def test_a_second_session_brings_history_search_back(tmp_path):
+    from shamsu import paths
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    sessions = paths.sessions_dir(tmp_path)
+    for name in ("20260819-000001-aaaa", "20260819-000002-bbbb"):
+        (sessions / name).mkdir(parents=True, exist_ok=True)
+
+    names = {
+        s["function"]["name"]
+        for s in active_tool_schemas(32768, "", available_tool_families(tmp_path))
+    }
+
+    assert "history_search" in names
+
+
+def test_an_unreadable_probe_keeps_the_tool(tmp_path, monkeypatch):
+    """Withholding a tool the model needed is worse than paying for a schema it
+    did not, so anything undeterminable counts as available."""
+    from shamsu.agents import simple_chat
+
+    def boom(_workspace):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(simple_chat, "_has_code_graph", boom)
+
+    assert "graph" in simple_chat.available_tool_families(tmp_path)
+
+
+def test_the_estimate_still_matches_what_is_sent_when_gated(tmp_path):
+    """Item A's invariant: the number budgeted and the number sent are one. A
+    roster that filtered in one place and not the other would break it."""
+    from shamsu.context.budget import messages_tokens, tool_schema_tokens
+
+    loop = _loop(tmp_path, [_text("done")])
+    asyncio.run(loop.run("hi"))
+
+    sent = loop.client.calls[0]["tools"]
+    built = loop._messages()
+
+    assert len(sent) == len(loop._sent_schemas())
+    assert abs(
+        loop._estimate_prompt(built)
+        - (messages_tokens(built) + tool_schema_tokens(loop._sent_schemas()))
+    ) <= 1
