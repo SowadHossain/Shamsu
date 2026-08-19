@@ -1264,6 +1264,9 @@ class SimpleChatLoop:
         self.last_completion_tokens = 0
         self.last_estimate = 0
         self.last_done_reason = ""
+        # The per-reply cap the last call actually carried, so a cut-off message
+        # can name the limit that bound instead of guessing at the window.
+        self._last_reply_cap = 0
         # Per-model correction factor, persisted in `.shamsu/`. Already built
         # and already used by `llm/manager.py`; simple mode talks to Ollama
         # directly, so it was the one caller estimating without ever checking.
@@ -1682,22 +1685,47 @@ class SimpleChatLoop:
         return self.last_done_reason.strip().lower() == "length"
 
     def _out_of_room_message(self, partial: str = "") -> str:
-        """Say plainly that the answer was cut, and what to do about it.
+        """Say which limit actually bound, and give advice that fits it.
 
-        The window holds the prompt and the reply in one buffer, so a long
-        conversation genuinely leaves less room to speak in. Saying that costs
-        two sentences and is the difference between a tool that looks broken
-        and one the user can work with.
+        The old message blamed the window every time. Live 2026-08-19 it told a
+        user
+
+            "I ran out of room to answer in. The prompt was 2,270 tokens of a
+             32,768 window. ... `/new` starts a fresh conversation."
+
+        on a conversation five messages long. The window was 7% full and was
+        never the constraint; the reply hit its own per-reply cap. `/new` would
+        have changed nothing, and the same sentence was then replayed into later
+        prompts - RC3 counted one frozen copy of it 54 times - teaching the model
+        that "I ran out of room" is how a turn ends.
+
+        Two different failures now, and they need different advice. The window
+        binding means the conversation really is too long. The reply cap binding
+        means one answer was too long, and the fix is a smaller piece of work,
+        not a fresh conversation.
         """
         used = self.last_prompt_tokens or self.last_estimate
         ceiling = self._ceiling()
-        where = f" The prompt was {used:,} tokens of a {ceiling:,} window." if used else ""
-        text = (
-            "I ran out of room to answer in." + where + " The window holds the "
-            "conversation and the reply together, so a long conversation leaves "
-            "less space to speak in." + chr(10) + chr(10) +
-            "`/new` starts a fresh conversation, or ask for a smaller piece of this one."
-        )
+        cap = self._last_reply_cap or output_reserve(ceiling)
+        # The window is only the constraint when the prompt left less room than
+        # the reply was allowed to use. Otherwise the cap stopped it, whatever
+        # the window happened to be.
+        window_bound = bool(used) and (ceiling - used) <= cap
+        if window_bound:
+            text = (
+                f"I ran out of room to answer in. The conversation filled the window - "
+                f"{used:,} tokens of {ceiling:,} - so there was little left to reply in."
+                + chr(10) * 2 +
+                "`/new` starts a fresh conversation, or ask for a smaller piece of this one."
+            )
+        else:
+            where = f" The conversation is only using {used:,} of {ceiling:,} tokens, so the window is not the problem." if used else ""
+            text = (
+                f"That answer hit my per-reply limit of {cap:,} tokens - one reply "
+                "cannot be longer than that." + where + chr(10) * 2 +
+                "Ask for one piece at a time: a single function, or one section of the "
+                "file, and I can build it up."
+            )
         if partial.strip():
             cut = "**This answer was cut off.** "
             return partial.rstrip() + chr(10) * 2 + "---" + chr(10) * 2 + cut + text
@@ -1753,6 +1781,12 @@ class SimpleChatLoop:
         free = num_ctx - self._estimate_prompt(messages) - SAFETY_MARGIN_TOKENS
         return max(output_reserve(num_ctx), min(free, MAX_REPLY_TOKENS))
 
+    def _remember_reply_cap(self, messages: list[dict[str, Any]], num_ctx: int) -> int:
+        """`_reply_cap`, recorded - the cut-off message has to name the real
+        number, and computing it twice invites the two to drift apart."""
+        self._last_reply_cap = self._reply_cap(messages, num_ctx)
+        return self._last_reply_cap
+
     async def _call_model(self) -> Any:
         messages = self._messages()
         num_ctx = self._num_ctx(messages)
@@ -1766,7 +1800,7 @@ class SimpleChatLoop:
                 "temperature": self.temperature,
                 "num_ctx": num_ctx,
                 # What is actually FREE, not a fixed share. See `_reply_cap`.
-                "num_predict": self._reply_cap(messages, num_ctx),
+                "num_predict": self._remember_reply_cap(messages, num_ctx),
                 # The system prompt survives an overflow the budget failed to
                 # prevent. Ollama keeps 4 tokens by default; see `_num_keep`.
                 "num_keep": self._num_keep(num_ctx),

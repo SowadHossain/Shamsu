@@ -5579,3 +5579,78 @@ def test_the_cap_is_what_the_model_is_actually_asked_for(tmp_path):
     built = loop._messages()
 
     assert sent == loop._reply_cap(built, loop.client.calls[0]["options"]["num_ctx"])
+
+
+# --- the cut-off message names the limit that bound (C4) -----------------
+#
+# RC3. The old message blamed the window every time, and one frozen copy of it
+# was replayed 54 times into later prompts of a single session. Live 2026-08-19
+# it told a user "The prompt was 2,270 tokens of a 32,768 window" on a
+# conversation five messages long.
+
+
+def _cut_loop(tmp_path, prompt_tokens: int, cap: int):
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.last_prompt_tokens = prompt_tokens
+    loop._last_reply_cap = cap
+    return loop
+
+
+def test_a_reply_cap_truncation_does_not_blame_the_window(tmp_path):
+    """The live case: 2,270 tokens of 32,768 is not a full window."""
+    loop = _cut_loop(tmp_path, 2_270, 16_384)
+
+    message = loop._out_of_room_message()
+
+    assert "per-reply limit" in message
+    assert "16,384" in message
+    assert "window is not the problem" in message
+
+
+def test_a_reply_cap_truncation_does_not_advise_new(tmp_path):
+    """`/new` shortens the conversation, which was never the limit."""
+    loop = _cut_loop(tmp_path, 2_270, 16_384)
+
+    assert "/new" not in loop._out_of_room_message()
+
+
+def test_a_genuinely_full_window_still_says_so(tmp_path):
+    """The other half must keep working, or this has just swapped one wrong
+    diagnosis for another."""
+    loop = _cut_loop(tmp_path, 30_000, 8_192)
+
+    message = loop._out_of_room_message()
+
+    assert "filled the window" in message
+    assert "/new" in message
+
+
+def test_the_message_names_the_cap_the_call_actually_carried(tmp_path):
+    """Computing it twice invites the two to drift apart."""
+    loop = _loop(tmp_path, [_text("done")])
+    asyncio.run(loop.run("hi"))
+
+    assert loop._last_reply_cap == loop.client.calls[0]["options"]["num_predict"]
+
+
+def test_the_cut_off_notice_never_becomes_conversation(tmp_path):
+    """One frozen copy was replayed 54 times, teaching the model that "I ran out
+    of room" is how a turn ends."""
+    from shamsu.agents.chat_state import _should_hydrate_chat_message
+
+    window = _cut_loop(tmp_path, 30_000, 8_192)._out_of_room_message()
+    capped = _cut_loop(tmp_path, 2_270, 16_384)._out_of_room_message()
+
+    assert not _should_hydrate_chat_message("assistant", window)
+    assert not _should_hydrate_chat_message("assistant", capped)
+
+
+def test_a_partial_answer_with_real_content_is_still_kept(tmp_path):
+    """The filter must not swallow what the model actually managed to say."""
+    from shamsu.agents.chat_state import _should_hydrate_chat_message
+
+    loop = _cut_loop(tmp_path, 2_270, 16_384)
+    message = loop._out_of_room_message("Here is the first half of the file.")
+
+    assert "Here is the first half of the file." in message
+    assert _should_hydrate_chat_message("assistant", message)

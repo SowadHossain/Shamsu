@@ -35,6 +35,13 @@ _HARNESS_STATUS_PREFIXES = (
     # carried "The model did not respond within 600s." into every later turn.
     "the model did not respond within",
     "the model returned an empty reply",
+    # The cut-off notice. RC3 counted ONE frozen copy of it replayed 54 times
+    # into later prompts of a single session - the harness's own error message
+    # became conversation, and taught the model that "I ran out of room" is a
+    # normal way to end a turn. A reply that carried real content is a different
+    # message and keeps it: this only matches the notice standing alone.
+    "i ran out of room to answer in",
+    "that answer hit my per-reply limit",
 )
 
 # The same thing, where a leading number or path makes a prefix unsafe - "I
