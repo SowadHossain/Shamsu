@@ -132,6 +132,8 @@ REPEATED_READS_BEFORE_WARNING = 3
 # whole of the edit it is in the middle of.
 KEEP_VERBATIM_MESSAGES = 20
 
+# Thresholds and approach adapted from smallcode `bin/smallcode.js` (~L1000),
+# MIT, (c) 2026 Doorman11991 - see reference/smallcode/LICENSE.
 # A tool_call argument longer than this is shortened in OLD messages. Keys are
 # always kept, so the model still reads `write_file(filepath=game.js)` rather
 # than a hole where a call used to be.
@@ -157,6 +159,7 @@ ELIDE_EVERY_N_TOOL_CALLS = 3
 # SmallCode uses 0.6 of the detected window for the same decision. Below this
 # the sweep keeps the normal verbatim tail; above it, the turn is on course to
 # fill the window before it ever reaches the user, so it keeps only what the
+# The 0.6 trigger is smallcode's (`bin/smallcode.js`), MIT, (c) 2026 Doorman11991.
 # edit in progress needs.
 ELIDE_PRESSURE_FRACTION = 0.6
 KEEP_VERBATIM_UNDER_PRESSURE = 8
@@ -592,6 +595,8 @@ def make_approval_func(console_approval: Any, *, main_loop: Any = None) -> Any:
 # --------------------------------------------------------------------------
 
 
+# Bucket breakdown modelled on smallcode `marrow/src/context/budget.ms`
+# (TokenAllocation), MIT, (c) 2026 Doorman11991.
 @dataclass
 class TokenAllocation:
     """Where the prompt actually goes, by category rather than as one number.
@@ -634,6 +639,8 @@ class TokenAllocation:
         return max(self.buckets.items(), key=lambda item: item[1])[0]
 
 
+# Meter and compaction/eviction counters modelled on smallcode
+# `bin/token_monitor.js`, MIT, (c) 2026 Doorman11991.
 @dataclass
 class ContextCounters:
     """What the context machinery actually did, per session.

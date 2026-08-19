@@ -1,6 +1,6 @@
 # Implementing SmallCode's approach in SHAMSU — code-level plan
 
-**Status: PLAN ONLY. No harness code changed.**
+**Status: IMPLEMENTED on branch `small-shamsu`, 2026-08-19. A-H all landed.**
 Written 2026-08-19. Source read locally at `reference/smallcode` (MIT, ©2026
 Doorman11991 — reuse permitted **with attribution**; anything lifted verbatim
 carries a credit line in the file header).
@@ -415,4 +415,67 @@ A–E fix bugs measured on our own harness this week. F–H are improvements.
 - **Prove each guard by removing it** and watching the test fail. Three
   would-be-vacuous tests were caught that way this week.
 
-**Nothing here is implemented. Confirm or reorder before any code moves.**
+**Superseded by the implementation notes at the end of this document.**
+
+---
+
+## What actually shipped — 2026-08-19, branch `small-shamsu`
+
+All eight items, one commit each, every guard verified by removing it and
+watching the right test fail. Suite green throughout.
+
+| Item | Commit | Note |
+|---|---|---|
+| A | `24cda8a` | + three uncounted overheads the plan missed (below) |
+| B | `24cda8a` | gated on `done_reason`, not blanket (below) |
+| C | `4575ac7` | 400-token threshold, escape on second attempt |
+| D | `37ca22a` | at **hydration**, not in-memory (below); **5.3x measured** |
+| E | `30a161b` | + the re-compaction bug **fixed**, not just counted |
+| F | `ee4af6f` | five buckets; eviction picks by fattest |
+| G | `1318018` | `MentionResolver` wired; sent, not persisted |
+| H | `affa3a7` | `remember` tool, capped **and charged** |
+
+### Five corrections found while implementing
+
+1. **D as written would have saved nothing across turns.** A fresh
+   `SimpleChatLoop`, and so a fresh `ChatState`, is built per user message, and
+   hydration reloads the transcript from disk with every payload intact. The
+   44,833 → 10,476 measurement was taken on exactly that cross-turn case, so
+   elision had to run at hydration, not on what the current turn produced.
+
+2. **A's own acceptance criterion would have failed.** Charging `tool_calls`
+   still leaves the tool schemas (~630 tokens, every call), the grounding block
+   (`_messages` appends it *after* the budget is spent), and the rolling summary
+   (up to 2,048) uncounted — about 3,900 tokens. Headroom would have returned as
+   ~5,300 against the ~8,192 the plan predicted. There is now a test that builds
+   a real prompt and measures.
+
+3. **The existing calibration was fed its own output.** `calibrate_from_response`
+   received the already-corrected estimate, so the EMA settled on the *square
+   root* of the true ratio and left over half of any undercount in place. Fixed
+   in `ContextBudgetManager`, which also means item A was mostly wiring, not
+   building — the machinery already existed and simple mode was the one caller
+   never feeding it.
+
+4. **Shell output is not lossless.** D's justification — "every elided byte is
+   still on disk and `read_file` gets it back" — is true for file reads and
+   writes and false for a test failure or a stack trace. Those are compacted
+   head-and-tail instead.
+
+5. **B's blanket "never use thinking as the answer" would produce a false
+   error.** Reasoning models genuinely end turns with a complete thought and no
+   content; telling that user they ran out of room is a lie. `done_reason`
+   separates the two cases and both have tests.
+
+### Also fixed: the bug item E only made visible
+
+`_restore_summary` reset the compaction watermark to 1 unconditionally, so every
+turn re-summarised the whole history — one wasted model call per turn, forever
+(§3 of `CONTEXT_AND_TRUNCATION_PLAN.md`, dropped from this document). The
+watermark is now transcript-absolute on both the save and the load side.
+
+### Not done
+
+**No live run yet.** Everything above is unit-tested against a scripted client.
+The numbers are real but synthetic; a session against a real model on a real
+workspace is the remaining verification.

@@ -16,6 +16,10 @@ is hard-capped, and - unlike every other standing block this codebase has grown
 - it is CHARGED to the context budget from the day it ships. An uncounted block
 that grows for the life of a project is precisely the bug that made a 21,381
 token estimate out of a ~31,400 token prompt.
+
+Modelled on smallcode `marrow/src/context/working_memory.ms`
+(MIT, (c) 2026 Doorman11991 - see reference/smallcode/LICENSE). The idea and
+the shape are theirs; the code here is ours.
 """
 from __future__ import annotations
 
