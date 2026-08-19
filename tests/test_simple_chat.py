@@ -5438,3 +5438,69 @@ def test_the_no_op_stop_does_not_stop_the_next_turn_before_it_starts(tmp_path):
 
     assert not again.stopped
     assert again.final == "here you go"
+
+
+# --- promises that do not end in a colon (C13) ---------------------------
+#
+# The C7 detector was built from the report's fourteen examples, and the report
+# says "Every one ends in a colon." Live 2026-08-19 on qwen2.5:3b-instruct, the
+# model was handed an honest verify failure and answered "...I will ensure this
+# is fixed." - promise, no tool call, turn over, file still broken - and the
+# guard sat silent because of the full stop. Small models do not punctuate like
+# the model the report was written from.
+
+
+def test_the_live_3b_promise_that_ended_in_a_full_stop_is_caught():
+    from shamsu.agents.simple_chat import ends_on_an_unmade_promise
+
+    said = (
+        "It appears that there was an issue with the syntax error correction. "
+        "The `main.js` file still contains a `SyntaxError`. I will ensure this is fixed."
+    )
+
+    assert ends_on_an_unmade_promise(said) != ""
+
+
+def test_a_promise_that_asks_the_user_for_something_is_left_alone():
+    """The second arm exists to separate "I am about to edit a file" from a
+    question, which is a legitimate way to end a turn."""
+    from shamsu.agents.simple_chat import ends_on_an_unmade_promise
+
+    for said in (
+        "I will need more information about which file you mean.",
+        "I'll leave that decision to you.",
+        "Let me know which file you mean.",
+    ):
+        assert ends_on_an_unmade_promise(said) == "", said
+
+
+def test_a_completed_action_is_not_a_promise():
+    """Past tense. "I fixed it" is a report, not an intention."""
+    from shamsu.agents.simple_chat import ends_on_an_unmade_promise
+
+    assert ends_on_an_unmade_promise("I fixed it by moving the call.") == ""
+    assert ends_on_an_unmade_promise("I rewrote the update loop and it parses.") == ""
+
+
+def test_a_colon_promise_still_fires_without_an_action_verb():
+    """The original arm is untouched: nothing followed the colon."""
+    from shamsu.agents.simple_chat import ends_on_an_unmade_promise
+
+    assert ends_on_an_unmade_promise("Let me check the file:") != ""
+
+
+def test_the_full_stop_promise_reaches_the_nudge(tmp_path):
+    """End to end, the shape of the live 3B turn."""
+    promise = "The file still contains a SyntaxError. I will ensure this is fixed."
+    loop = _loop(
+        tmp_path,
+        [_text(promise), _tool("write_file", filepath="main.js", content="ok\n"), _text("Done.")],
+        max_rounds=4,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("fix main.js"))
+
+    assert result.final == "Done."
+    nudges = [m.content for m in loop.state.all_messages if m.role == "user"]
+    assert any("called no tool" in c for c in nudges)

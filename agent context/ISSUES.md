@@ -26,6 +26,9 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 
 | # | Issue | Severity | Area |
 |---|---|---|---|
+| [H1](#h1) | **A denied command marks a fully successful run `denied` and exits 1** — found by the first live run of the fixes | **high** | headless |
+| [V1](#v1) | **A failing `verify` never reaches the run outcome** — file left broken, run exited 0 | **high** | verify |
+| [V2](#v2) | `num_predict` is a fixed share of the window, so a reply is capped at 8k with 30k free | **high** | context |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
@@ -60,6 +63,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ` in `old_string` could never match | `66fc252` |
 | [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | `4dfc17b` |
 | [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalated | `a342fd1` |
+| [C13](#c13) | C7 missed a promise ending in a full stop — found live on a 3B | `82e05d5` |
 | [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call was accepted as done** (14x) | `a7a5631` |
 | [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `09f29ee` |
 | [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `b08d298` |
@@ -75,6 +79,147 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ---
 
 # OPEN
+
+<a name="v1"></a>
+## V1 — a failing verify never reaches the run outcome · **HIGH**
+
+Live 2026-08-19, `qwen2.5:3b-instruct`, workspace seeded with the truncated
+`js/main.js` (8 open braces, 3 closed).
+
+```
+1 assistant  read_file
+3 assistant  write_file   -> "Overwrote js/main.js (+0 -0 lines, 30 total)"
+5 tool       verify       -> {"ok": false, "problems":
+                              ["js/main.js: SyntaxError: Unexpected end of input"]}
+6 assistant  "...I will ensure this is fixed."   (no tool call)
+```
+
+`node --check` on the file afterwards: still `SyntaxError`. Braces still 8/3.
+
+**And the run exited 0.**
+
+The C2 verifier did its job — it caught a no-op write that left the file broken,
+which is exactly the 572x defect it was built for, and it said so in the tool
+result the model could read. But that verdict lives only in the chat transcript.
+`evidence_outcome()` never sees it: a `verify` result with `ok: false` produces
+no ledger event, so `_has_unrecovered_verification_failure` has nothing to find.
+A mutation was applied, so the run reports success.
+
+So the harness knows the file is broken, tells the model, and tells the caller
+the run succeeded. Related to [H1](#h1) from the other direction: one reports
+failure on success, this reports success on failure.
+
+### Fix
+
+Emit a verification event when `_append_verification` reports problems, so the
+outcome machinery can see it, and let it clear when a later write passes. The
+"unrecovered" shape already exists for command and patch failures.
+
+---
+
+<a name="v2"></a>
+## V2 — the reply cap ignores the window that is actually free · **HIGH**
+
+Same session, second run. `qwen2.5:3b-instruct`, asked for a whole game file.
+The reply was cut off mid-sentence and the harness said:
+
+```
+**This answer was cut off.** I ran out of room to answer in. The prompt was
+2,270 tokens of a 32,768 window.
+```
+
+**2,270 of 32,768.** The window was 7% full. 30,498 tokens were free and the
+reply was stopped at 8,192 by `simple_chat.py:1738`:
+
+```python
+"num_predict": output_reserve(num_ctx),     # a fixed quarter of the window
+```
+
+This is the live proof of the diagnosis half of [C4](TRUNCATED_FILES_REPORT.md)
+— the message blames the window when the window was never the constraint — and
+it is also why the run produced nothing: the model was writing a file and was
+cut off with four times the room it needed still unused.
+
+`output_reserve` is correct as a *budget*: it is what the prompt assembler holds
+back. Using the same number as the generation CAP is what wastes the rest.
+
+### Fix
+
+Cap the reply at what is actually free — `num_ctx - prompt - margin` — floored
+at `output_reserve` so it never gets smaller than the reserve the budget already
+promised. RC3 asks for exactly this ("raise `num_predict` toward the free space
+when a write is in flight"); the measurement above says it need not be
+conditional on a write.
+
+Then C4's message can name the limit that actually bound: the window, or the
+per-reply cap.
+
+---
+
+<a name="h1"></a>
+## H1 — one denied command marks the whole run failed · **HIGH**
+
+Found on 2026-08-19 by the first live run of the C1/C2/C7/C10 fixes, which is
+the only reason it was seen at all.
+
+### The run
+
+Workspace seeded with a truncated `js/main.js` — 8 open braces, 3 closed, the
+exact damage shape from the report. Model `qwen3.5:9b-q4_K_M`, the same one.
+
+```
+shamsu run --prompt "js/main.js has a syntax error. Read it and fix it."            --approval allow --timeout 600
+```
+
+**It worked.** One `patch_file` (+116 -1), the file went from 8/3 braces to
+26/26, and `node --check` on the result passes. One turn, seven rounds, against
+a session that previously spent eight user turns and 53 patch calls achieving
+nothing.
+
+**And it reported:**
+
+```
+Status: denied
+EXIT=1
+```
+
+### Why
+
+`shamsu/action_ledger/ledger.py:445`:
+
+```python
+elif "approval_denied" in event_types:
+    outcome = "denied"
+```
+
+The model tried `cat js/main.js | wc -l && tail -20 js/main.js` early on. That
+was denied — shell redirection policy, correctly — and the model simply used
+`read_file` instead and finished the job. One denied event anywhere in the run
+is enough, forever, whatever happens next.
+
+Note the asymmetry with the branch immediately below it: command failures,
+verification failures, patch failures and tool failures all go through
+`_has_unrecovered_*` checks, because the code already knows that a failure the
+agent recovered from is not a failed run. `approval_denied` has no such check.
+
+### Why it is high
+
+* Headless mode is what CI and scripts use, and it says a successful run failed.
+* It is silent in the interactive REPL, so nobody hits it by hand — exactly the
+  class of defect that survives for a long time.
+* It also makes the exit code useless as a signal for the eval harness, which is
+  the thing that would have caught it.
+
+### Fix
+
+Give `approval_denied` the same recovery test the other failure kinds have: a
+denied approval the agent worked around is not a failed run. The narrow version
+is to drop it below the success branch, so a run with mutations applied and
+verification passed reports success even if something was denied on the way.
+`denied` should mean *the run could not proceed*, not *something was refused
+once*.
+
+---
 
 <a name="c12"></a>
 ## C12 — the other two thirds of RC10's fix · MEDIUM

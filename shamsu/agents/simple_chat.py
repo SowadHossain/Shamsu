@@ -3547,6 +3547,29 @@ _PROMISE_OPENERS = (
 )
 
 
+# Verbs whose presence in a promise means WORK, not a request for information.
+# Inflected explicitly rather than stemmed: `_CHANGE_VERBS` is matched on word
+# boundaries elsewhere for a good reason - a substring match once made "it" mean
+# "this names a product" - and "fixed" has to match without "prefixed" doing so.
+_PROMISE_ACTIONS = (
+    "fix", "fixes", "fixed", "fixing",
+    "write", "writes", "writing", "wrote", "rewrite", "rewriting",
+    "create", "creates", "creating",
+    "add", "adds", "adding",
+    "update", "updates", "updating",
+    "change", "changes", "changing",
+    "patch", "patches", "patching",
+    "edit", "edits", "editing",
+    "correct", "corrects", "corrected", "correcting",
+    "apply", "applies", "applying",
+    "replace", "replaces", "replacing",
+    "remove", "removes", "removing",
+    "delete", "deletes", "deleting",
+    "implement", "implements", "implementing",
+    "refactor", "refactors", "refactoring",
+)
+
+
 def ends_on_an_unmade_promise(text: str) -> str:
     """The announcement a turn ended on and never carried out, or ``""``.
 
@@ -3567,25 +3590,43 @@ def ends_on_an_unmade_promise(text: str) -> str:
     nothing happened, the agent remained dumb."* It was not dumb; it stopped at
     the exact moment it was about to act, and was told that was complete.
 
-    Both conditions are required. A colon alone is an ordinary way to introduce
-    the next paragraph, and an announcement alone is an ordinary way to open
-    one - it is a promise as the FINAL word of a reply that means nothing
-    followed it.
+    Two halves are required, and the second half is not just the colon.
+
+    The first version demanded one, because all fourteen examples in the report
+    ended that way and it says so. Live 2026-08-19 on qwen2.5:3b-instruct, the
+    model was handed an honest verify failure and answered
+
+        "...I will ensure this is fixed."
+
+    - a promise, no tool call, turn over, file still broken, and the guard sat
+    silent because of the full stop. Small models do not punctuate like the one
+    the report was written from.
+
+    So: an announcement of intent, and then either a colon OR a verb that
+    changes something. The second arm is what separates "I am about to edit a
+    file" from "I will need more information", which is a legitimate way to end
+    a turn - it is a question to the user, not an unmade edit.
     """
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
     if not lines:
         return ""
     last = lines[-1]
-    if not last.endswith(":"):
-        return ""
     if last.startswith(("#", "|", ">", "```")):
         # A heading or a table row introduces a section that was cut, which is
         # a different problem and not a promise to act.
         return ""
     lowered = f" {last.lower()} "
-    for opener in _PROMISE_OPENERS:
-        if re.search(rf"(?<![a-z]){re.escape(opener)}(?![a-z])", lowered):
-            return last
+
+    def names(vocabulary) -> bool:
+        return any(
+            re.search(rf"(?<![a-z]){re.escape(word)}(?![a-z])", lowered)
+            for word in vocabulary
+        )
+
+    if not names(_PROMISE_OPENERS):
+        return ""
+    if last.endswith(":") or names(_PROMISE_ACTIONS):
+        return last
     return ""
 
 
