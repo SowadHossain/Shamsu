@@ -4810,3 +4810,171 @@ def test_the_bracket_scan_reports_a_stray_closer():
 
     assert "line 2" in problem
     assert "unexpected }" in problem
+
+
+# --- a severed generation never reaches the disk (C1) --------------------
+
+
+def _cut_tool(name: str, **arguments) -> dict:
+    """A tool call the output cap severed part-way through its arguments."""
+    return {
+        "message": {
+            "content": "",
+            "tool_calls": [{"function": {"name": name, "arguments": arguments}}],
+        },
+        "done_reason": "length",
+        "prompt_eval_count": 21_472,
+        "eval_count": 8_192,
+    }
+
+
+def test_a_write_cut_off_mid_argument_never_reaches_the_disk(tmp_path):
+    """RC1: five rounds of `write_file -> ok` each followed by a cut-off notice.
+    game.js ended with 60 open braces and 39 closes."""
+    loop = _loop(
+        tmp_path,
+        [_cut_tool("write_file", filepath="game.js", content="function update() {\n  if (a) {\n")],
+        max_rounds=1,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write the game loop"))
+
+    assert not (tmp_path / "game.js").exists()
+
+
+def test_a_truncated_write_never_overwrites_a_file_that_was_already_good(tmp_path):
+    """`write_file` REPLACES. This is the loss that cannot be undone."""
+    (tmp_path / "game.js").write_text("// the whole working file\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_cut_tool("write_file", filepath="game.js", content="function update() {\n")],
+        max_rounds=1,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add a pause key"))
+
+    assert (tmp_path / "game.js").read_text(encoding="utf-8") == "// the whole working file\n"
+
+
+def test_the_refusal_reaches_the_model_and_names_the_next_call(tmp_path):
+    """The correction belongs in the tool result, and it names the call."""
+    loop = _loop(
+        tmp_path,
+        [_cut_tool("write_file", filepath="game.js", content="x")],
+        max_rounds=1,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write the game loop"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert any("REFUSED" in c and "append_file" in c for c in said)
+    assert any("unchanged on disk" in c for c in said)
+
+
+def test_append_file_is_refused_when_cut_off_too(tmp_path):
+    """`Round 9 append_file -> ok` sits above a cut-off notice in the log, and
+    append_file was never in MUTATING_TOOLS."""
+    (tmp_path / "main.js").write_text("start\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_cut_tool("append_file", filepath="main.js", content="function f() {\n")],
+        max_rounds=1,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add a function"))
+
+    assert (tmp_path / "main.js").read_text(encoding="utf-8") == "start\n"
+
+
+def test_a_read_in_a_cut_off_generation_still_runs(tmp_path):
+    """Only writes damage anything. Refusing reads would strand the model."""
+    (tmp_path / "main.js").write_text("line one\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_cut_tool("read_file", filepath="main.js"), _text("got it")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read main.js"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert any("line one" in c for c in said)
+
+
+def test_only_the_severed_call_is_refused_not_the_ones_that_finished(tmp_path):
+    """Earlier calls in the same reply finished generating; the cap took the last."""
+    two = {
+        "message": {
+            "content": "",
+            "tool_calls": [
+                {"function": {"name": "write_file", "arguments": {"filepath": "a.js", "content": "const a = 1;\n"}}},
+                {"function": {"name": "write_file", "arguments": {"filepath": "b.js", "content": "const b = {\n"}}},
+            ],
+        },
+        "done_reason": "length",
+    }
+    loop = _loop(tmp_path, [two], max_rounds=1, verify_changes=False)
+
+    asyncio.run(loop.run("write both files"))
+
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == "const a = 1;\n"
+    assert not (tmp_path / "b.js").exists()
+
+
+def test_a_complete_generation_writes_normally(tmp_path):
+    """The guard must not touch the ordinary path."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="ok.js", content="const a = 1;\n"), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write ok.js"))
+
+    assert (tmp_path / "ok.js").read_text(encoding="utf-8") == "const a = 1;\n"
+
+
+def test_the_second_refusal_says_something_the_first_did_not(tmp_path):
+    """A repeated identical error teaches nothing - RC8, one issue over."""
+    cut = _cut_tool("write_file", filepath="game.js", content="function f() {\n")
+    loop = _loop(tmp_path, [cut, cut], max_rounds=2, verify_changes=False)
+
+    asyncio.run(loop.run("write the game loop"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert len(said) == 2
+    assert said[0] != said[1]
+    assert "FIRST 60 LINES ONLY" in said[1]
+
+
+def test_the_refusal_guard_has_an_exit(tmp_path):
+    """A guard with no escape is a deadlock. Three refusals ends the turn with
+    a reason, rather than spending the whole round budget on it."""
+    from shamsu.agents.simple_chat import MAX_TRUNCATED_WRITE_REFUSALS
+
+    cut = _cut_tool("write_file", filepath="game.js", content="function f() {\n")
+    loop = _loop(tmp_path, [cut] * 24, max_rounds=24, verify_changes=False)
+
+    result = asyncio.run(loop.run("write the game loop"))
+
+    assert result.stopped
+    assert result.rounds < 24
+    assert str(MAX_TRUNCATED_WRITE_REFUSALS) in result.final
+    assert "one part at a time" in result.final
+
+
+def test_a_write_that_lands_intact_clears_the_refusal_streak(tmp_path):
+    """Consecutive, not lifetime: a session must not be poisoned by one bad round."""
+    cut = _cut_tool("write_file", filepath="game.js", content="function f() {\n")
+    good = _tool("write_file", filepath="game.js", content="const a = 1;\n")
+    loop = _loop(tmp_path, [cut, good, cut, _text("done")], max_rounds=4, verify_changes=False)
+
+    asyncio.run(loop.run("write the game loop"))
+
+    assert loop._truncated_refusals == 1

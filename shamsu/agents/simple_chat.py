@@ -689,6 +689,22 @@ def active_tool_schemas(
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
 
+# Every call that puts bytes on disk. Wider than MUTATING_TOOLS on purpose:
+# that set drives the no-op and repeated-edit counters, which only make sense
+# for the two tools that report a diff. THIS set answers a different question -
+# would executing this call, cut off mid-argument, damage the workspace? - and
+# `append_file` belongs in it. Live 2026-08-19, `Round 9 append_file -> ok` sits
+# directly above a cut-off notice in the log.
+WRITING_TOOLS = frozenset(
+    {"write_file", "patch_file", "append_file", "read_and_patch", "create_and_run"}
+)
+
+# Consecutive writes refused for arriving truncated, before the turn stops.
+# The refusal tells the model to send the file in pieces; if it will not, the
+# window is the wrong shape for this file and spinning proves nothing. Every
+# guard needs an exit, and this is that guard's.
+MAX_TRUNCATED_WRITE_REFUSALS = 3
+
 # Every `name` simple mode itself writes into a transcript. This is the set
 # history is filtered against on rehydration, so it must include names the loop
 # APPENDS as well as the ones the model calls - `verify` is written by
@@ -1013,6 +1029,10 @@ class _Round:
     repeated_edit: int = 0
     repeated_path: str = ""
     repeated_read: str = ""
+    # A write arrived cut off mid-argument and was refused rather than
+    # committed. The loop reads this to know the turn made no progress for a
+    # reason it must eventually stop on.
+    refused_truncated: str = ""
 
 
 class SimpleChatLoop:
@@ -1104,6 +1124,11 @@ class SimpleChatLoop:
         self._seen_ranges: dict[str, list[tuple[int, int]]] = {}
         # Consecutive mutations that changed nothing.
         self._unproductive = 0
+        # Consecutive writes refused for arriving truncated, and the file the
+        # last one was aimed at - so the second refusal can say something the
+        # first did not.
+        self._truncated_refusals = 0
+        self._truncated_target = ""
         # Successful edits per file this turn - repeated blind fixes.
         self._edits_per_file: dict[str, int] = {}
         # How many times each identical read-only call has been made this turn.
@@ -1334,6 +1359,23 @@ class SimpleChatLoop:
             outcome = await self._run_tools(turn.tool_calls)
             tool_calls += len(turn.tool_calls)
             changed.extend(outcome.written)
+            if self._truncated_refusals >= MAX_TRUNCATED_WRITE_REFUSALS:
+                # The guard's exit. Three replies in a row cut off mid-write
+                # means the file does not fit in one generation and the model
+                # will not break it up on being asked. Spinning on that proves
+                # nothing, and every refusal costs a full round.
+                return self._stop(
+                    f"My last {self._truncated_refusals} attempts to write "
+                    f"{outcome.refused_truncated or 'that file'} were cut off by my own "
+                    "output limit part-way through, so I refused all of them rather than "
+                    "leave a half-written file on disk. Nothing was changed.\n\n"
+                    "The file is too large for me to produce in one reply. Ask me for one "
+                    "part at a time - a single function, or one section - and I can build "
+                    "it up.",
+                    round_index,
+                    tool_calls,
+                    changed,
+                )
             if self._unproductive >= MAX_UNPRODUCTIVE_EDITS:
                 # Spinning. Live 2026-08-18 a turn ran 12 no-op patches and 5
                 # failed ones across 24 rounds and ~25 minutes, changing nothing
@@ -2086,10 +2128,18 @@ class SimpleChatLoop:
 
     async def _run_tools(self, calls: list[Any]) -> _Round:
         outcome = _Round()
-        for call in calls:
+        # Was this whole generation stopped by the output cap? If so its LAST
+        # call is the one the cap severed - everything before it finished
+        # generating - and a write whose arguments were cut off is not a write.
+        cut_off = self._hit_the_length_limit()
+        last = len(calls) - 1
+        for index, call in enumerate(calls):
             name = canonical_tool_name(_call_name(call))
             arguments = normalize_arguments(name, _call_arguments(call))
             outcome.tool_names.append(name)
+            if cut_off and index == last and name in WRITING_TOOLS:
+                self._refuse_truncated_write(call, name, arguments, outcome)
+                continue
             self._activity(f"{name} {_argument_summary(arguments)}")
             self._trace("simple.tool", f"{name} {_argument_summary(arguments)}", {"tool": name})
             # A tool can block for as long as its timeout allows - `run_command`
@@ -2145,7 +2195,77 @@ class SimpleChatLoop:
                     self._edits_per_file[path.lower()] = count
                     outcome.repeated_edit = max(outcome.repeated_edit, count)
                     outcome.repeated_path = path if count >= EDITS_PER_FILE_BEFORE_WARNING else outcome.repeated_path
+                # A write that landed intact ends the truncation streak. The
+                # counter is about consecutive refusals, not lifetime ones.
+                self._truncated_refusals = 0
+                self._truncated_target = ""
         return outcome
+
+    def _refuse_truncated_write(
+        self,
+        call: Any,
+        name: str,
+        arguments: dict[str, Any],
+        outcome: _Round,
+    ) -> None:
+        """Do not put a severed generation on disk.
+
+        `_hit_the_length_limit()` has existed and worked the whole time - it was
+        only ever consulted where the PROSE answer is assembled, never where the
+        writes happen. So the harness knew the reply had been cut off mid
+        `write_file` and executed the partial call anyway, five rounds running,
+        reporting each one as `ok`. That is how `game.js` reached 60 open braces
+        against 39 closes.
+
+        Refused rather than written-and-flagged, because `write_file` REPLACES.
+        A truncated write does not produce a slightly short file; it destroys
+        whatever was already there and leaves the half that fit. There is no
+        recovering the rest - the model no longer has it either.
+
+        The correction goes in the tool result, where the model is already
+        looking, and it names the exact next call rather than describing a
+        principle. Vague guidance cost 674s and a failure on 2026-08-18 where
+        naming the call took 42s.
+        """
+        target = str(
+            arguments.get("filepath") or arguments.get("path") or arguments.get("file") or ""
+        ).strip()
+        same_file = bool(target) and target == self._truncated_target
+        self._truncated_refusals += 1
+        self._truncated_target = target
+        outcome.refused_truncated = target or name
+        self._repair_attempts += 1
+
+        named = target or "that file"
+        message = (
+            f"REFUSED - nothing was written and {named} is unchanged on disk.\n\n"
+            f"Your reply hit the output limit part-way through this {name} call, so the "
+            "content you sent is cut off mid-way. Writing it would replace the file with "
+            "the half that fit and lose the rest permanently."
+        )
+        if same_file or self._truncated_refusals > 1:
+            message += (
+                "\n\nThis is the second time. The file is too big to emit in one reply. "
+                f"Call write_file for {named} with the FIRST 60 LINES ONLY and stop there. "
+                "Then call append_file once per following section, 60 lines at a time. "
+                "Do not resend the whole file."
+            )
+        else:
+            message += (
+                f"\n\nSend it in pieces instead: call write_file for {named} with the first "
+                "section only, then call append_file for each following section. One "
+                "section per reply."
+            )
+        result = ToolResult(False, message, {"refused": "truncated_generation", "tool": name})
+        self._activity(f"{name} arrived cut off; refused rather than writing a partial {named}")
+        self._trace(
+            "simple.refused_truncated",
+            f"{name} {named}",
+            {"tool": name, "filepath": target, "refusals": self._truncated_refusals},
+        )
+        if self.turn_log:
+            self.turn_log.log_tool_result(name, arguments, False, message)
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         name = canonical_tool_name(name)

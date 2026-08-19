@@ -26,7 +26,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 
 | # | Issue | Severity | Area |
 |---|---|---|---|
-| [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations still commit their writes** — 3 JS files cut mid-code | **critical** | agent loop |
 | [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
 ` in `old_string` can never match | **high** | tools |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
@@ -62,6 +61,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Fixed by |
 |---|---|---|
 | [L1](#l1) | `think=` sent to models that cannot think → HTTP 400, **every turn dead** | `c5486ef` |
+| [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `b08d298` |
 | [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reported "no syntax errors" for files it never opened** (572x in one session) | `dbbaaa1` |
 | [F1](#f1) | Rolling summary dropped when hydration skipped what it described | `8b338d5` |
 | [F2](#f2) | Context meter reported 42,440 tokens of tool results inside a 23,595-token prompt | `8b338d5` |
