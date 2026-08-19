@@ -29,7 +29,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
 | [C9](TRUNCATED_FILES_REPORT.md) | Harness nudges recorded as "you asked" in the compaction digest | medium | context |
-| [M1](#m1) | **Memory is only written if the model volunteers** — a real 2-turn run produced none | **high** | memory |
 | [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
 | [G2](#g2) | Graph indexes `reference/`, `other peoples work/`, `legacy-code/` and answers out of them | **high** | graph |
@@ -60,6 +59,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [V1](#v1) | **A failing `verify` never reached the run outcome** — file left broken, run exited 0 | `4e70775` |
 | [V2](#v2) | `num_predict` was a fixed share of the window — reply capped at 8k with 30k free | `9cbdde9` |
 | [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `d1ba009` |
+| [M1](#m1) | **Memory was only written if the model volunteered** — a real 2-turn run produced none | `7284641`+1 |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail was 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | `8bc7f6c`+1 |
 | [L3](#l3) | Tool schemas were a flat **2,111 tokens on every call** — 85% of a fresh 3B prompt. Measured, then gated by relevance | `ac256c1`+1 |
 | [H1](#h1) | **A denied command marked a fully successful run `denied`** — found by the first live run of the fixes | `1d93b76`+1 |

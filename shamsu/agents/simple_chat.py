@@ -1362,6 +1362,8 @@ class SimpleChatLoop:
         # Consecutive writes refused for arriving truncated, and the file the
         # last one was aimed at - so the second refusal can say something the
         # first did not.
+        # Tool failures this turn, for the evidence note written at turn end.
+        self._turn_failures: list[tuple[str, str]] = []
         self._truncated_refusals = 0
         self._truncated_target = ""
         # Successful edits per file this turn - repeated blind fixes.
@@ -1405,6 +1407,33 @@ class SimpleChatLoop:
     # -- public ----------------------------------------------------------
 
     async def run(self, user_input: str) -> SimpleChatResult:
+        """One turn, and a note about what it did.
+
+        The note is the point of the wrapper: `memory_remember` is the only
+        caller of `remember()` in simple mode, so memory exists ONLY when the
+        model volunteers a tool call - and it does not. A real 2-turn run
+        produced no notes at all, and across seven live sessions on 2026-08-19
+        `memory_load`, `memory_list` and `memory_forget` were called zero times
+        between them.
+
+        smallcode has two writers and SHAMSU had one. `src/memory/evidence.js`
+        says why: evidence is "auto-derived from the trace recorder at task
+        end", distinct from the manual notes a model chooses to write. The
+        models that most need a scratchpad are exactly the ones least likely to
+        spend a tool call on it.
+        """
+        started = time.perf_counter()
+        self._turn_failures = []
+        result = await self._run_turn(user_input)
+        try:
+            await asyncio.to_thread(
+                self._record_evidence, user_input, result, time.perf_counter() - started
+            )
+        except Exception:  # noqa: BLE001 - a note must never fail a turn
+            pass
+        return result
+
+    async def _run_turn(self, user_input: str) -> SimpleChatResult:
         # Refresh the ownership heartbeat every turn. Claiming only at resume
         # left it stale after 5 minutes, so a second window would decide the
         # thread was free and attach to it - the interleaving this is meant to
@@ -2584,6 +2613,11 @@ class SimpleChatLoop:
                 beat.cancel()
             if self.turn_log:
                 self.turn_log.log_tool_result(name, arguments, result.ok, result.message)
+            if not result.ok:
+                # Kept for the evidence note. smallcode keeps the error TAIL for
+                # the same reason: the last line says what went wrong, the rest
+                # is where it happened, and a full trace is 5-50KB.
+                self._turn_failures.append((name, _first_line(result.message)))
             payload = _budgeted(result.to_json())
             if name == "read_file" and '"content_truncated": true' in payload.lower():
                 # `_budgeted` trims AFTER `_execute` has run, so the ToolResult
@@ -3377,6 +3411,48 @@ class SimpleChatLoop:
         self._trace("simple.verify", report.splitlines()[0] if report else "", {})
         self._record_verification(report)
 
+    def _record_evidence(
+        self, user_input: str, result: SimpleChatResult, duration: float
+    ) -> None:
+        """Distil what this turn DID into one note, from what already happened.
+
+        Nothing new is captured. `.shamsu/runs/`, `.shamsu/mutations/` and the
+        turn log already hold every fact here; what was missing was something
+        to summarise them, which is exactly what smallcode's evidence layer
+        does ("distinct from manual memory... auto-derived at task end").
+
+        Written only when the turn CHANGED something or FAILED at something. A
+        question that was answered leaves no trace worth keeping, and a store
+        that fills with "the user said hi" is one nobody can recall from.
+
+        Type `context` and tag `evidence`, so `render_memory`'s existing
+        relevance scoring loads it only when it bears on the request - a growing
+        memory must not become a growing tax on the window.
+        """
+        changed = list(result.changed_files)
+        failures = list(dict.fromkeys(self._turn_failures))
+        if not changed and not failures:
+            return
+        task = " ".join((user_input or "").split())
+        lines = [f"Task: {task[:200]}"]
+        if changed:
+            lines.append("Files changed: " + ", ".join(changed[:8]))
+        if failures:
+            lines.append("What failed:")
+            lines.extend(f"- {name}: {error[:160]}" for name, error in failures[:5])
+        if result.stopped:
+            lines.append("The turn stopped before finishing.")
+        lines.append(f"Took {duration:.0f}s over {result.rounds} rounds.")
+        from shamsu.agents.simple_memory import remember
+
+        remember(
+            self.workspace,
+            "context",
+            _evidence_title(task, changed),
+            chr(10).join(lines),
+            ["evidence"],
+        )
+
     def _record_verification(self, report: str) -> None:
         """Put the verdict where the RUN OUTCOME can see it, not only the model.
 
@@ -4037,6 +4113,28 @@ def _signature_path(signature: str) -> str:
     """The file a signature was recorded against, or ``""``."""
     parts = signature.split("|")
     return parts[1] if len(parts) >= 3 else ""
+
+
+def _first_line(message: str) -> str:
+    """The sentence of an error worth remembering."""
+    for line in (message or "").splitlines():
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def _evidence_title(task: str, changed: list[str]) -> str:
+    """A title a later recall can match on.
+
+    smallcode titles these with the user's raw prompt, typos preserved, and
+    that is right: the words the user used are the words they will use again.
+    The files are appended because two turns of "fix it" are otherwise
+    indistinguishable.
+    """
+    head = (task or "a turn").strip()[:80]
+    if changed:
+        head += " [" + ", ".join(Path(c).name for c in changed[:3]) + "]"
+    return head
 
 
 def _read_result_path(payload: str) -> str:

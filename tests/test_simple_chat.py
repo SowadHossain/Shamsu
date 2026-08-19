@@ -6049,3 +6049,127 @@ def test_pressure_shrinks_the_tail_further(tmp_path):
     assert loop._verbatim_tail(VERBATIM_TAIL_FRACTION_UNDER_PRESSURE) <= loop._verbatim_tail(
         VERBATIM_TAIL_FRACTION
     )
+
+
+# --- the harness writes memory too (M1) ---------------------------------
+#
+# `memory_remember` was the ONLY caller of remember() in simple mode, so memory
+# existed only when the model volunteered a tool call - and it did not. A real
+# 2-turn run produced no notes at all, and across seven live sessions on
+# 2026-08-19 memory_load/memory_list/memory_forget were called zero times.
+
+
+def _notes(tmp_path):
+    from shamsu.agents.simple_memory import MemoryStore
+
+    return list(MemoryStore(tmp_path).notes.values())
+
+
+def test_a_turn_that_changed_a_file_writes_a_note_without_being_asked(tmp_path):
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="app.py", content="print(1)\n"), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add a hello world to app.py"))
+
+    notes = _notes(tmp_path)
+    assert notes, "the harness wrote no memory at all"
+    assert "app.py" in notes[0].content
+
+
+def test_the_note_records_what_failed_and_why(tmp_path):
+    """smallcode keeps the error tail for the same reason: the last line says
+    what went wrong and a full trace is 5-50KB."""
+    (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("patch_file", filepath="a.js", old_string="not in the file", new_string="x"),
+         _text("could not")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("fix a.js"))
+
+    notes = _notes(tmp_path)
+    assert notes
+    assert "What failed" in notes[0].content
+    assert "patch_file" in notes[0].content
+
+
+def test_a_question_that_changed_nothing_leaves_no_note(tmp_path):
+    """A store that fills with "the user said hi" is one nobody can recall from."""
+    loop = _loop(tmp_path, [_text("The port is 8080.")])
+
+    asyncio.run(loop.run("what port does it use?"))
+
+    assert _notes(tmp_path) == []
+
+
+def test_the_note_is_typed_so_recall_can_score_it(tmp_path):
+    """Type `context`, tag `evidence` - so render_memory loads it only when it
+    bears on the request, never as a standing tax on the window."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="app.py", content="print(1)\n"), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add a hello world to app.py"))
+
+    note = _notes(tmp_path)[0]
+    assert note.type == "context"
+    assert "evidence" in note.tags
+
+
+def test_the_title_carries_the_words_the_user_used(tmp_path):
+    """The words the user used are the words they will use again - which is what
+    a later recall matches on."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="app.py", content="print(1)\n"), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add a hello world to app.py"))
+
+    assert "hello world" in _notes(tmp_path)[0].title
+
+
+def test_the_note_is_recalled_when_a_later_turn_is_about_the_same_thing(tmp_path):
+    """End to end: memory that accumulates on its own and comes back."""
+    from shamsu.agents.simple_memory import render_memory
+
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="app.py", content="print(1)\n"), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+    asyncio.run(loop.run("add a hello world to app.py"))
+
+    assert "app.py" in render_memory(tmp_path, "change the hello world in app.py")
+
+
+def test_a_failing_memory_write_never_fails_the_turn(tmp_path, monkeypatch):
+    from shamsu.agents import simple_chat
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(simple_chat.SimpleChatLoop, "_record_evidence", boom)
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="app.py", content="print(1)\n"), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("add a hello world"))
+
+    assert result.final == "done"
