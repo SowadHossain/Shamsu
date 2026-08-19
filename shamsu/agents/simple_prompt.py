@@ -12,6 +12,15 @@ at the moment a call goes wrong, which is where a small model can actually act
 on it; repeating those errors as standing prohibitions only dilutes the
 instruction that says what to do.
 
+Sections are CONDITIONAL, which is smallcode's shape: they add the BoneScript
+paragraph only for backend tasks, and advertise web tools only when browsing
+is on. The reason is their issue #58 and it is the important part - *a small
+model trusts this prose over the raw `tools` array*. Theirs refused research
+tasks with "my tools are for code files only" while the web tools sat right
+there in the schema list. So a capability not named here is one the model will
+not use; and one named here that does not work is a wasted round. Name them,
+but only when they are real.
+
 One instruction here WAS unconditional and cost real work: "Work in small
 steps: make one change, check it" presumes the task is a change. Asked to
 "review the PRD and plan the next steps" the model wrote five backend files,
@@ -42,10 +51,46 @@ are real: refer back to them, and when they say "continue" or "next", carry on
 from what you were doing.\
 """
 
+# Named in prose because a small model reads prose, not the schema list. Each
+# is added only when the thing behind it actually works - see above.
+RECALL_CAPABILITY = (
+    chr(10) * 2
+    + "You remember this project: memory_remember keeps a decision or a "
+    + "gotcha, memory_load brings back what bears on the job, and "
+    + "history_search finds anything said earlier, including turns you can no "
+    + "longer see."
+)
+
+BIG_FILE_CAPABILITY = (
+    chr(10) * 2
+    + "For a file too big to write in one go: write_file the first section, "
+    + "then append_file the rest. To change part of one, patch_file."
+)
+
+GRAPH_CAPABILITY = (
+    chr(10) * 2
+    + "This workspace is indexed: graph_search finds a symbol without reading "
+    + "files, explain_symbol says who calls it."
+)
+
 
 def simple_system_prompt(workspace: Path) -> str:
     """Render the simple-mode system prompt for *workspace*."""
-    return SIMPLE_SYSTEM_PROMPT.format(workspace=Path(workspace).as_posix())
+    prompt = SIMPLE_SYSTEM_PROMPT.format(workspace=Path(workspace).as_posix())
+    prompt += RECALL_CAPABILITY + BIG_FILE_CAPABILITY
+    if _graph_is_usable(workspace):
+        prompt += GRAPH_CAPABILITY
+    return prompt
+
+
+def _graph_is_usable(workspace: Path) -> bool:
+    """Whether this workspace actually has a code graph worth advertising."""
+    try:
+        from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+
+        return bool(CodebaseMemoryAdapter().is_available(Path(workspace)))
+    except Exception:  # noqa: BLE001 - never let the prompt fail to render
+        return False
 
 
 BUILD_INSTRUCTION = """\

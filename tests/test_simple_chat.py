@@ -379,14 +379,26 @@ def test_a_model_error_is_reported_verbatim_not_swallowed(tmp_path):
 
 def test_the_system_prompt_is_small_and_carries_no_prohibitions(tmp_path):
     """The legacy path sent 49 bullet rules, 24% of them prohibitions, with
-    "do not claim complete" repeated four times."""
+    "do not claim complete" repeated four times.
+
+    The bound was 250 when the prompt described six tools. There are now 19,
+    and naming a capability in prose is what makes a small model use it -
+    smallcode's issue #58 was a model refusing research tasks with "my tools
+    are for code files only" while the web tools sat in its own schema list.
+    So the ceiling moved to 320 for capability lines that are all positive
+    statements of what CAN be done.
+
+    The size was never the real guard anyway; the three assertions below are.
+    A prompt can be short and still be a wall of prohibitions, and that is the
+    failure this test exists to catch.
+    """
     import re
 
     from shamsu.context.budget import count_tokens
 
     prompt = simple_system_prompt(tmp_path)
 
-    assert count_tokens(prompt) < 250
+    assert count_tokens(prompt) < 320
     assert not re.search(r"(?im)^\s*[-*]\s", prompt), "no bullet wall"
     lowered = prompt.lower()
     assert "do not" not in lowered
@@ -4307,3 +4319,109 @@ def test_what_is_sent_is_what_is_charged(tmp_path):
 
     sent = loop.client.calls[0]["tools"]
     assert loop._fixed_overhead() >= tool_schema_tokens(sent)
+
+
+# ---------------------------------------------------------------------------
+# Speaking to the agent while it works
+#
+# A turn here can run 24 rounds. Live sessions have spent 18 minutes on 18
+# whole-file writes, and 25 minutes on 17 mutations that changed nothing. Until
+# now the user could watch that happen or Ctrl-C and lose the turn.
+# ---------------------------------------------------------------------------
+
+
+def test_feedback_typed_mid_turn_reaches_the_model(tmp_path):
+    from shamsu.agents.simple_feedback import FeedbackQueue
+
+    feedback = FeedbackQueue()
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="a.py"), _text("done")],
+        feedback=feedback,
+    )
+    feedback.push("stop - you are editing the wrong file")
+
+    asyncio.run(loop.run("look at a.py"))
+
+    sent = json.dumps(loop.client.calls[0]["messages"])
+    assert "wrong file" in sent
+
+
+def test_feedback_is_framed_as_an_interruption_not_the_next_request(tmp_path):
+    """Dropped in bare it reads like a new task, and the model finishes first."""
+    from shamsu.agents.simple_feedback import render_interjection
+
+    rendered = render_interjection(["use the other file"])
+
+    assert "interrupted" in rendered.lower()
+    assert "takes precedence" in rendered.lower()
+    assert "use the other file" in rendered
+
+
+def test_feedback_lands_between_rounds_never_inside_one(tmp_path):
+    """Appended mid-round it orphans a tool_call_id from its result."""
+    from shamsu.agents.simple_feedback import FeedbackQueue
+
+    feedback = FeedbackQueue()
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="a.py"), _tool("read_file", filepath="a.py"), _text("done")],
+        feedback=feedback,
+    )
+    feedback.push("actually look at b.py")
+
+    asyncio.run(loop.run("look at a.py"))
+
+    roles = [m.role for m in loop.state.all_messages]
+    for index, role in enumerate(roles):
+        if role == "tool":
+            assert roles[index - 1] in {"assistant", "tool"}, (
+                "a user message was injected between a call and its result"
+            )
+
+
+def test_feedback_is_recorded_not_whispered(tmp_path):
+    """A steer that changed a session and left no trace makes the log unreadable."""
+    from shamsu.agents.simple_feedback import FeedbackQueue
+
+    feedback = FeedbackQueue()
+    loop = _loop(tmp_path, [_text("ok")], feedback=feedback)
+    feedback.push("prefer tabs")
+
+    asyncio.run(loop.run("format it"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "user"]
+    assert any("prefer tabs" in text for text in said)
+
+
+def test_several_interjections_arrive_together_in_order(tmp_path):
+    from shamsu.agents.simple_feedback import FeedbackQueue, render_interjection
+
+    feedback = FeedbackQueue()
+    feedback.push("first thing")
+    feedback.push("second thing")
+
+    rendered = render_interjection(feedback.drain())
+
+    assert rendered.index("first thing") < rendered.index("second thing")
+
+
+def test_blank_typing_is_not_an_interruption(tmp_path):
+    from shamsu.agents.simple_feedback import FeedbackQueue
+
+    feedback = FeedbackQueue()
+
+    assert feedback.push("   ") is False
+    assert feedback.push("") is False
+    assert not feedback
+
+
+def test_a_turn_with_nobody_listening_behaves_exactly_as_before(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = asyncio.run(loop.run("hi"))
+
+    assert result.final == "ok"
+    assert loop.feedback is None

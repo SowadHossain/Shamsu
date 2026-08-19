@@ -20,6 +20,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 import sys
 import time
 import traceback
@@ -4680,6 +4681,90 @@ def _simple_build_seed(user_input: str, workspace: Path) -> str:
     return build_instruction(argument)
 
 
+class _LiveFeedbackReader:
+    """Collect what the user types while a turn is running.
+
+    smallcode gets this for free: its TUI is a raw-stdin event loop, so
+    keystrokes are handled whether or not the agent is mid-turn. SHAMSU blocks
+    on the model instead, so the keyboard has to be watched deliberately.
+
+    Two things it must not do, both learned here the hard way:
+
+    * never read while an approval prompt is waiting. On Windows the whole
+      input stack is main-thread-owned, and a second reader competing for
+      stdin is the run_in_executor+stdin trap that made turns hang.
+    * never raise. A keyboard that cannot be polled - a pipe, a non-tty, a CI
+      runner - must cost nothing at all; the turn simply proceeds as before.
+    """
+
+    POLL_SECONDS = 0.15
+
+    def __init__(self, queue: Any, console: Console) -> None:
+        self._queue = queue
+        self._console = console
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_LiveFeedbackReader":
+        if self._usable():
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _usable(self) -> bool:
+        if os.environ.get("SHAMSU_LIVE_FEEDBACK", "").strip() == "0":
+            return False
+        try:
+            return sys.stdin is not None and sys.stdin.isatty()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _run(self) -> None:
+        buffer: list[str] = []
+        try:
+            import msvcrt
+        except ImportError:
+            msvcrt = None  # type: ignore[assignment]
+        while not self._stop.is_set():
+            try:
+                if prompt_is_active():
+                    # The approval prompt owns the keyboard. Stay out of it.
+                    self._stop.wait(self.POLL_SECONDS)
+                    continue
+                if msvcrt is not None:
+                    if not msvcrt.kbhit():
+                        self._stop.wait(self.POLL_SECONDS)
+                        continue
+                    char = msvcrt.getwch()
+                    if char in (chr(13), chr(10)):
+                        self._submit("".join(buffer))
+                        buffer.clear()
+                    elif char == chr(8):
+                        if buffer:
+                            buffer.pop()
+                    elif char.isprintable():
+                        buffer.append(char)
+                else:
+                    import select
+
+                    ready, _w, _e = select.select([sys.stdin], [], [], self.POLL_SECONDS)
+                    if ready:
+                        self._submit(sys.stdin.readline())
+            except Exception:  # noqa: BLE001 - a broken keyboard costs nothing
+                return
+
+    def _submit(self, text: str) -> None:
+        if self._queue.push(text):
+            self._console.print(
+                "[dim]noted - passing that to the agent at the next step[/dim]"
+            )
+
+
 async def _run_simple_chat(
     user_input: str,
     workspace: Path,
@@ -4718,9 +4803,15 @@ async def _run_simple_chat(
         session_logger=session_logger,
         action_ledger=action_ledger,
     )
+    from shamsu.agents.simple_feedback import FeedbackQueue
+
+    feedback = FeedbackQueue()
     loop = SimpleChatLoop(
         workspace,
         client=_default_ollama_client(OLLAMA_BASE_URL, timeouts),
+        # Anything typed while the turn runs reaches the model at the next
+        # round. A 24-round turn was previously watch-only.
+        feedback=feedback,
         tools=tools,
         session_logger=session_logger,
         action_ledger=action_ledger,
@@ -4731,7 +4822,8 @@ async def _run_simple_chat(
         # costs a line nobody has to scroll past.
         on_status=_status_updater(thinking_status),
     )
-    result = await loop.run(user_input)
+    with _LiveFeedbackReader(feedback, console):
+        result = await loop.run(user_input)
     body = result.final.strip() or "No response returned."
     console.print(Markdown(body))
     _log_assistant_message(session_logger, body, workflow_id="simple-chat")

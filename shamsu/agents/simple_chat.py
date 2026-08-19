@@ -1034,6 +1034,7 @@ class SimpleChatLoop:
         temperature: float = 0.2,
         request_timeout: float = 600.0,
         log_turns: bool = True,
+        feedback: Any | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.client = client
@@ -1081,6 +1082,9 @@ class SimpleChatLoop:
         # The tool category the model has selected this turn, when the window
         # is small enough for two-stage routing. Cleared per turn: what it
         # needs next is rarely what it needed last.
+        # Where anything the user types mid-turn arrives. None means nobody is
+        # listening, which is the case for tests and embedders.
+        self.feedback = feedback
         self._tool_category = ""
         self._calls_since_elide = 0
         # Said once per loop, not once per round.
@@ -1193,6 +1197,10 @@ class SimpleChatLoop:
         prose_nudges = 0
         empty_nudges = 0
         for round_index in range(self.max_rounds):
+            # Before the model is called, never during: a message appended
+            # while a tool call is in flight lands between the assistant turn
+            # and its own result and orphans the tool_call_id.
+            self._take_feedback()
             self._files = await asyncio.to_thread(workspace_files, self.workspace)
             try:
                 response = await self._call_model()
@@ -1868,6 +1876,33 @@ class SimpleChatLoop:
             return self._elide_payloads()
         self._activity("context is filling; eliding older tool payloads")
         return self._elide_payloads(KEEP_VERBATIM_UNDER_PRESSURE)
+
+    def _take_feedback(self) -> bool:
+        """Fold anything the user typed mid-turn into the conversation.
+
+        A turn here can run 24 rounds - live sessions have spent 18 minutes on
+        18 whole-file writes, and 25 minutes on 17 mutations that changed
+        nothing. Until now the user could watch that happen or Ctrl-C and lose
+        the turn. "You are editing the wrong file" is one sentence that saves
+        twenty minutes, and there was nowhere to put it.
+        """
+        if self.feedback is None:
+            return False
+        try:
+            said = self.feedback.drain()
+        except Exception:  # noqa: BLE001 - never let a steer break the turn
+            return False
+        if not said:
+            return False
+        from shamsu.agents.simple_feedback import render_interjection
+
+        # An ordinary user message: recorded, archived, and findable by
+        # history_search later. A steer that changed a session and left no
+        # trace makes the log unreadable six weeks on.
+        self.state.append_user(render_interjection(said))
+        for message in said:
+            self._activity(f"you said: {message}")
+        return True
 
     def _sent_schemas(self) -> list[dict[str, Any]]:
         """Exactly the schemas the next call will carry.
