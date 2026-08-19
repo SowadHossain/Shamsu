@@ -373,16 +373,93 @@ becoming conversation.
 
 ---
 
+---
+
+## RC10 — elision deletes the evidence and keeps the wrong conclusion
+
+**This is why reading the file did not help.** It is the mechanism behind the
+whole loop, and it is a policy decision rather than a bug in any one function.
+
+Elision treats `read_file` as *recoverable* — the file is still on disk, so the
+bytes are dropped and a stub is left. Assistant prose is not elidable at all, so
+it survives verbatim forever.
+
+Over fifteen rounds that produces a context which is **all conclusion and no
+evidence**. From the final prompt of the session:
+
+**What the model still sees, in full, eight times over:**
+
+```
+"I can see the issue! Line 426 has a stray comment without an opening marker."
+"I found it! The issue is on line 426 - there's a stray comment..."
+"I can see there's a syntax error in your main.js! Let me check line 426:"
+```
+
+**What it sees for every file read that would disprove them:**
+
+```json
+{"ok": true, "message": "Read file.", "data": {"resolved_filepath": "js/main.js",
+ "total_lines": 492, "elided": "call read_file for the current contents"}}
+```
+
+In the last prompt: **15 reads reduced to that stub, 4 still carrying bytes.**
+
+So the model is handed a transcript asserting eight times that the bug is at
+line 426, with every observation that contradicts it deleted, and asked to fix
+the file. It re-diagnoses line 426. Of course it does — that is the only
+evidence left in the room.
+
+The stub then says `"call read_file for the current contents"`, so it reads
+again. That read is elided on the next round while the wrong claim persists.
+**The elision policy is what drives the loop**, and it tightens under pressure:
+`KEEP_VERBATIM_UNDER_PRESSURE = 8` means a read survives barely one exchange
+once the window is filling.
+
+The user's corrections could not break it either. *"The first error does not
+exist"* is one user line against eight of the model's own confident restatements,
+and the read that would settle it is gone by the next round.
+
+### Why "recoverable" is the wrong test
+
+`RECOVERABLE_TOOLS` asks *can this be fetched again?* That is true of a file read
+and it is the wrong question. The right one is **what is this result still doing
+in the reasoning?** A read taken to check a specific claim is evidence for that
+claim, and it stays load-bearing for as long as the claim is live.
+
+Note the asymmetry that makes it self-reinforcing: the harness elides what it
+*can* re-fetch, and keeps what it cannot — which is exactly backwards, because
+the un-refetchable thing is the model's own speculation.
+
+### Fix
+
+1. **Never elide the most recent read of a file that is still under discussion.**
+   Cheapest version: keep the latest `read_file` result per path verbatim, and
+   elide only superseded reads of the same path. Fifteen stubs for one file is
+   pure loss — they carry no information and cost tokens.
+2. **Elide stale assistant claims too.** A conclusion is not more durable than
+   the observation it rests on. If the read behind it is gone, the claim should
+   be summarised or dropped with it.
+3. **When a read follows a user correction, mark it.** *"Re-read after the user
+   said the previous diagnosis was wrong"* is exactly the context a small model
+   needs to override its own earlier statement, and it is one line.
+
+Fix 1 alone would have ended this session's loop.
+
+---
+
 ## What the user experienced, in order
 
-1. Model reads `main.js` — succeeds (RC4 note: reads were never the problem)
+1. Model reads `main.js` — succeeds. Reads were never the problem.
 2. Emits a patch with a literal `\n` that can never match — **RC4**
 3. Gets the same unhelpful error — **RC8**
 4. Retries it verbatim, up to nine times — **RC6**
-5. Eventually stops calling tools and just promises a fix — **RC7**
-6. Harness accepts the promise as a finished answer — **RC7**
-7. User prompts again; counters reset — **RC6**
-8. Repeat, with the digest quietly filling with fake user requests — **RC9**
+5. **The read is elided; its own wrong diagnosis is not** — **RC10**
+6. With no evidence left, it re-derives the same wrong diagnosis — **RC10**
+7. Eventually stops calling tools and just promises a fix — **RC7**
+8. Harness accepts the promise as a finished answer — **RC7**
+9. User prompts again; counters reset — **RC6**
+10. Repeat, with the digest filling with fake user requests — **RC9**
 
-Fix order for Part 2: **RC7** (the loop-breaker — without it the agent stops
-mid-intent forever), then **RC6**, then **RC8**, then **RC9**.
+Fix order for Part 2: **RC10** (without it the model cannot learn anything from
+reading, so nothing else matters), then **RC7** (the loop-breaker), then
+**RC6**, **RC8**, **RC9**.

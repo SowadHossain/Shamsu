@@ -31,6 +31,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
 ` in `old_string` can never match | **high** | tools |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
+| [C10](TRUNCATED_FILES_REPORT.md) | **Elision deletes the file it read and keeps the wrong conclusion** — 15 stubs vs 8 surviving false claims | **critical** | context |
 | [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call is accepted as done** (14x) | **critical** | agent loop |
 | [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | **high** | agent loop |
 | [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalates | medium | tools |
