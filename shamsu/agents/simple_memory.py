@@ -33,9 +33,8 @@ import json
 import re
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from shamsu.context.budget import count_tokens
 
@@ -130,8 +129,18 @@ class MemoryStore:
 
     def _load(self) -> None:
         try:
-            raw = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            text = self.index_path.read_text(encoding="utf-8")
+        except OSError:
+            return
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            # Do NOT return quietly. The store is now empty, and the next
+            # `remember()` would write a fresh index straight over notes that
+            # are still on disk and may be recoverable by hand. This codebase
+            # has been bitten by exactly this shape before - a reformatted
+            # transcript hydrated ONE message and nothing anywhere said so.
+            self._quarantine_index()
             return
         for entry in raw.get("notes", []):
             if not isinstance(entry, dict) or not entry.get("id"):
@@ -144,6 +153,20 @@ class MemoryStore:
                 self.notes[str(known["id"])] = Note(**known)  # type: ignore[arg-type]
             except TypeError:
                 continue
+
+    def _quarantine_index(self) -> None:
+        """Move an unreadable index aside instead of letting it be overwritten.
+
+        Best-effort and silent about failure - but the file is kept, which is
+        the whole point. A user who lost notes can open the `.corrupt` copy.
+        """
+        try:
+            spoiled = self.index_path.with_suffix(".json.corrupt")
+            if spoiled.exists():
+                spoiled.unlink()
+            self.index_path.rename(spoiled)
+        except OSError:
+            pass
 
     def _save(self) -> None:
         try:

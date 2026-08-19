@@ -3890,3 +3890,26 @@ def test_the_model_can_write_a_typed_note_through_the_tool(tmp_path):
     asyncio.run(later.run("what port did we choose?"))
 
     assert "8080" in json.dumps(later.client.calls[0]["messages"])
+
+
+def test_a_corrupt_memory_index_is_kept_not_overwritten(tmp_path):
+    """Losing notes silently is the worst failure this class of code has.
+
+    An unreadable index left the store empty, and the next `remember()` wrote
+    a fresh one straight over notes that were still on disk. Same shape as the
+    reformatted transcript that once hydrated a single message and said
+    nothing about it.
+    """
+    from shamsu.agents.simple_memory import MemoryStore, remember
+
+    remember(tmp_path, "decision", "the original", "A fact worth keeping.")
+    index = MemoryStore(tmp_path).index_path
+    index.write_text("{ this is not json", encoding="utf-8")
+
+    remember(tmp_path, "decision", "a later note", "Written after the damage.")
+
+    spoiled = index.with_suffix(".json.corrupt")
+    assert spoiled.exists(), "the unreadable index was destroyed, not kept"
+    assert "not json" in spoiled.read_text(encoding="utf-8")
+    # And the store keeps working rather than refusing every turn from here on.
+    assert any(n.title == "a later note" for n in MemoryStore(tmp_path).all_notes())
