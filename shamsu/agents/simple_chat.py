@@ -38,6 +38,9 @@ from shamsu.agents.chat_state import ChatState
 from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
 from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_prompt import simple_system_prompt
+from shamsu.agents.simple_verify import PROBLEM as VERIFY_PROBLEM
+from shamsu.agents.simple_verify import SKIPPED as VERIFY_SKIPPED
+from shamsu.agents.simple_verify import check_file
 from shamsu.context.budget import (
     PER_MESSAGE_OVERHEAD,
     message_tokens,
@@ -2765,33 +2768,50 @@ class SimpleChatLoop:
         self._trace("simple.verify", report.splitlines()[0] if report else "", {})
 
     def _verify(self, written: list[str]) -> str:
+        """Parse what was just written, and claim only what was parsed.
+
+        The old version appended the filename to `checked` BEFORE testing the
+        extension, so every non-Python write came back as "no syntax errors"
+        from a checker that never opened it - 572 such claims in the session of
+        2026-08-19, on files with 21 unclosed braces. A false pass is worse than
+        no check: it is the signal that told the model the truncated code was
+        complete.
+
+        Three outcomes now, and `skipped` is the escape - a `.md` file nobody
+        can parse is reported as unchecked, never as a problem to repair.
+        """
         problems: list[str] = []
         checked: list[str] = []
+        skipped: list[str] = []
         for relative in dict.fromkeys(written):
             path = (self.workspace / relative).resolve()
             if not path.is_file():
                 problems.append(f"{relative}: file was not created")
                 continue
-            checked.append(relative)
-            if path.suffix != ".py":
-                continue
-            try:
-                compile(path.read_text(encoding="utf-8", errors="replace"), str(path), "exec")
-            except SyntaxError as exc:
-                problems.append(f"{relative}: line {exc.lineno}: {exc.msg}")
-            except Exception as exc:  # noqa: BLE001
-                problems.append(f"{relative}: {type(exc).__name__}: {exc}")
+            verdict = check_file(path)
+            if verdict.status == VERIFY_PROBLEM:
+                problems.append(f"{relative}: {verdict.detail}")
+            elif verdict.status == VERIFY_SKIPPED:
+                skipped.append(f"{relative} ({verdict.detail})")
+            else:
+                checked.append(relative)
         if problems:
             return json.dumps(
                 {"ok": False, "message": "Problems in the files just written.",
-                 "data": {"problems": problems}},
+                 "data": {"problems": problems, "checked": checked, "skipped": skipped}},
                 ensure_ascii=True,
             )
-        if not checked:
+        if not checked and not skipped:
             return ""
+        if checked:
+            message = f"Checked {', '.join(checked)}: no syntax errors."
+            if skipped:
+                message += f" NOT checked: {', '.join(skipped)}."
+        else:
+            message = f"Nothing was syntax-checked. NOT checked: {', '.join(skipped)}."
         return json.dumps(
-            {"ok": True, "message": f"Checked {', '.join(checked)}: no syntax errors.",
-             "data": {"checked": checked}},
+            {"ok": True, "message": message,
+             "data": {"checked": checked, "skipped": skipped}},
             ensure_ascii=True,
         )
 

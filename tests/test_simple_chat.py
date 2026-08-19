@@ -4674,3 +4674,139 @@ def test_the_estimate_matches_the_assembled_prompt(tmp_path):
     sent = messages_tokens(built) + tool_schema_tokens(loop._sent_schemas())
 
     assert abs(loop._estimate_prompt(built) - sent) <= 1
+
+
+# --- verification: only claim what was actually parsed (C2) --------------
+
+
+def _verify_json(loop, written):
+    report = loop._verify(written)
+    return json.loads(report) if report else {}
+
+
+def test_verify_never_reports_a_file_it_has_no_checker_for_as_checked(tmp_path):
+    """RC2: `game-plan.md` came back as "no syntax errors" from a checker that
+    never opened it. 572 such claims in one session."""
+    (tmp_path / "game-plan.md").write_text("# Plan\n", encoding="utf-8")
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["game-plan.md"])
+
+    assert "game-plan.md: no syntax errors" not in report["message"]
+    assert report["data"]["checked"] == []
+    assert "game-plan.md" in report["message"]
+    assert "NOT checked" in report["message"]
+
+
+def test_a_file_type_with_no_checker_is_not_a_problem_to_repair(tmp_path):
+    """The escape. Reporting `.md` as broken would leave the model fixing prose."""
+    (tmp_path / "notes.md").write_text("# Notes\n", encoding="utf-8")
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["notes.md"])
+
+    assert report["ok"] is True
+    assert "problems" not in report["data"]
+
+
+def test_a_javascript_file_cut_off_mid_block_is_reported_as_a_problem(tmp_path, monkeypatch):
+    """The three real files: game.js 60/39 braces, player.js 47/30, bullet.js
+    24/17, every one of them certified clean."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "game.js").write_text(
+        "function update() {\n  if (alive) {\n    for (const a of rocks) {\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["game.js"])
+
+    assert report["ok"] is False
+    problem = report["data"]["problems"][0]
+    assert problem.startswith("game.js:")
+    assert "unclosed {" in problem
+    assert "cut off mid-block" in problem
+
+
+def test_a_complete_javascript_file_passes(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "ok.js").write_text(
+        "const half = (a) => a / 2;\n"
+        "// a } in a comment\n"
+        "const s = \"a } in a string\";\n"
+        "const re = /[{]/;\n"
+        "function go() { return { a: [1, 2] }; }\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["ok.js"])
+
+    assert report["ok"] is True
+    assert report["data"]["checked"] == ["ok.js"]
+
+
+def test_python_is_still_compiled(tmp_path):
+    (tmp_path / "broken.py").write_text("def f(:\n", encoding="utf-8")
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["broken.py"])
+
+    assert report["ok"] is False
+    assert "broken.py: line" in report["data"]["problems"][0]
+
+
+def test_a_mix_says_which_files_were_checked_and_which_were_not(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "plan.md").write_text("# hi\n", encoding="utf-8")
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["app.py", "plan.md"])
+
+    assert report["data"]["checked"] == ["app.py"]
+    assert report["data"]["skipped"] == ["plan.md (no checker for .md)"]
+    assert "Checked app.py: no syntax errors." in report["message"]
+    assert "NOT checked: plan.md" in report["message"]
+
+
+def test_node_check_is_used_when_node_is_installed(tmp_path, monkeypatch):
+    """A real parser beats a bracket count - and its absence must not become a
+    missing check, which is the defect this whole module exists for."""
+    import subprocess as _subprocess
+
+    from shamsu.agents import simple_verify
+
+    monkeypatch.delenv("SHAMSU_DISABLE_NODE_CHECK", raising=False)
+    monkeypatch.setattr(simple_verify.shutil, "which", lambda _name: "/usr/bin/node")
+
+    def fake_run(argv, **kwargs):
+        assert argv[1] == "--check"
+        return _subprocess.CompletedProcess(
+            argv, 1, "", "file.js:3\nSyntaxError: Unexpected end of input\n    at wrap\n"
+        )
+
+    monkeypatch.setattr(simple_verify.subprocess, "run", fake_run)
+    (tmp_path / "cut.js").write_text("function f() {\n", encoding="utf-8")
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["cut.js"])
+
+    assert report["ok"] is False
+    assert "SyntaxError: Unexpected end of input" in report["data"]["problems"][0]
+
+
+def test_the_bracket_scan_stays_quiet_on_prose_apostrophes():
+    """A false "your file is broken" is the same defect pointed the other way."""
+    from shamsu.agents.simple_verify import bracket_problem
+
+    assert bracket_problem("// it's fine\nfunction f() { return 1; }\n") == ""
+
+
+def test_the_bracket_scan_reports_a_stray_closer():
+    from shamsu.agents.simple_verify import bracket_problem
+
+    problem = bracket_problem("function f() { return 1; }\n}\n")
+
+    assert "line 2" in problem
+    assert "unexpected }" in problem

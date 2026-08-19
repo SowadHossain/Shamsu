@@ -27,9 +27,9 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Severity | Area |
 |---|---|---|---|
 | [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations still commit their writes** — 3 JS files cut mid-code | **critical** | agent loop |
-| [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reports "no syntax errors" for files it never opens** (572x in one session) | **critical** | verify |
 | [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
 ` in `old_string` can never match | **high** | tools |
+| [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
 | [C10](TRUNCATED_FILES_REPORT.md) | **Elision deletes the file it read and keeps the wrong conclusion** — 15 stubs vs 8 surviving false claims | **critical** | context |
 | [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call is accepted as done** (14x) | **critical** | agent loop |
@@ -62,6 +62,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Fixed by |
 |---|---|---|
 | [L1](#l1) | `think=` sent to models that cannot think → HTTP 400, **every turn dead** | `c5486ef` |
+| [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reported "no syntax errors" for files it never opened** (572x in one session) | `dbbaaa1` |
 | [F1](#f1) | Rolling summary dropped when hydration skipped what it described | `8b338d5` |
 | [F2](#f2) | Context meter reported 42,440 tokens of tool results inside a 23,595-token prompt | `8b338d5` |
 | [F3](#f3) | 11 ruff errors while docs claimed "Lint: passes" | `152fbb0` |
@@ -73,6 +74,69 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ---
 
 # OPEN
+
+<a name="c11"></a>
+## C11 — the checker roster stops short of "every major language" · MEDIUM
+
+Opened out of C2. `dbbaaa1` made the verifier honest — it now says `skipped
+(no checker for .html)` instead of certifying a file it never opened — but
+honest is not the same as covered.
+
+### What is checked today
+
+`shamsu/agents/simple_verify.py`, after `dbbaaa1`:
+
+| checker | extensions | needs |
+|---|---|---|
+| `compile()` | `.py` `.pyi` | stdlib |
+| `json.loads` | `.json` | stdlib |
+| `node --check` | `.js` `.mjs` `.cjs` | node on PATH |
+| bracket scan | `.js` `.mjs` `.cjs` `.jsx` `.ts` `.tsx` `.css` `.scss` `.less` `.c` `.h` `.cpp` `.hpp` `.java` `.go` `.rs` | nothing |
+
+Uncovered and common: `.html` `.xml` `.php` `.rb` `.cs` `.swift` `.kt` `.dart`
+`.yaml` `.yml` `.toml` `.sh` `.sql` `.md`.
+
+### For comparison, smallcode
+
+`reference/smallcode/bin/model_client.js:183` (`runValidation`) covers **seven**
+extensions and gates four of them on a project marker:
+
+```
+.ts/.tsx  tsc --noEmit        only if tsconfig.json exists
+.py       python -m py_compile
+.rs       cargo check         only if Cargo.toml exists
+.go       go build ./...      only if go.mod exists
+.js/.mjs  node --check
+.json     JSON.parse
+.bone     their own compiler
+everything else -> return null
+```
+
+No `.jsx`, no `.cjs`, no `.css`, no `.html`, no `.java`, no `.c`. Their
+`src/lsp/client.js` adds tsserver / pyright / rust-analyzer / gopls, but only
+when the user has installed those servers.
+
+So this is not a gap against them — the zero-dependency bracket scan already
+covers more ground than their whole table on a machine with no toolchain
+installed, which is the machine SHAMSU is built for. It is a gap against the
+claim "all major languages".
+
+### Fix
+
+Two tiers, and the second must never become a requirement.
+
+1. **Always on, zero-dependency.** Extend the bracket scan to `.php` `.cs`
+   `.swift` `.kt` `.dart`; tag balance for `.html` and `.xml`; `tomllib` for
+   `.toml` (stdlib since 3.11); `yaml.safe_load` for `.yml` when PyYAML
+   imports; fence balance for `.md`. This is the tier that catches truncation,
+   which is the failure that opened this whole investigation.
+2. **When the toolchain happens to be present.** `ruby -c`, `php -l`,
+   `gofmt -e`, `tsc --noEmit`, `cargo check` — behind the same `shutil.which`
+   gate `node --check` already uses, falling back to tier 1 when absent.
+
+Anything still unmatched keeps saying `skipped`. The escape stays.
+
+---
 
 <a name="m1"></a>
 ## M1 — memory only exists if the model volunteers, and it usually does not · **HIGH**
