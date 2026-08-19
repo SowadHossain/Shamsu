@@ -13,7 +13,8 @@ Rules for this file, because a tracker nobody trusts is worse than none:
   them, because the next person needs to know it was once broken.
 * Severity is about **what a user loses**, not how hard the fix is.
 
-Companion docs: `SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
+Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation),
+`SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
 `CONTEXT_AND_TRUNCATION_PLAN.md` (the context investigation),
 `SMALLCODE_TOOL_COMPARISON.md` (what was taken from smallcode and what was not).
 
@@ -25,6 +26,11 @@ Companion docs: `SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
 
 | # | Issue | Severity | Area |
 |---|---|---|---|
+| [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations still commit their writes** — 3 JS files cut mid-code | **critical** | agent loop |
+| [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reports "no syntax errors" for files it never opens** (572x in one session) | **critical** | verify |
+| [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
+` in `old_string` can never match | **high** | tools |
+| [C4](TRUNCATED_FILES_REPORT.md) | Cut-off message blames the window; the real cap was `num_predict` | medium | context |
 | [M1](#m1) | **Memory is only written if the model volunteers** — a real 2-turn run produced none | **high** | memory |
 | [M2](#m2) | `memory.db` absence in simple mode is expected; `status.json` says otherwise | info | memory |
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
