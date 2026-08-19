@@ -291,6 +291,9 @@ SIMPLE_TOOLS: dict[str, str] = {
     # rather than only being told it may not rewrite one.
     "append_file": "append_file",
     "find_files": "find_files",
+    # Stage 1 of two-stage routing. Never offered alongside the real tools -
+    # `active_tool_schemas` sends this OR them, never both.
+    "select_category": "select_category",
     # Composite tools, from smallcode `bin/tools.js`. Two round trips in one
     # call: on a 24-round budget at ~100s a round that is the difference
     # between finishing and stopping half way. The rule that makes them safe
@@ -655,29 +658,31 @@ _COMPOSITE_TOOLS = frozenset(
     {"find_and_read", "search_and_read", "read_and_patch", "create_and_run"}
 )
 
-# The six that existed before any of this, plus nothing. Kept as a named set
-# because the roster grew from 6 schemas (~630 tokens) to 19 (~2,100), which is
-# 6.4% of a 32k window on EVERY call - and, more worrying than the tokens, 19
-# choices for a 7B model that has to pick one.
-#
-# Whether that trade is worth it cannot be settled by reading: more tools means
-# fewer rounds when the model picks well and more flailing when it does not.
-# `SHAMSU_TOOLSET=core` restores the original six so the two can be measured
-# against the same task on the same model, which is the only way to know.
-CORE_TOOLS = frozenset(
-    {"read_file", "list_files", "search_files", "write_file", "patch_file", "run_command"}
-)
+# A hand-rolled `SHAMSU_TOOLSET=core` switch used to live here. smallcode
+# routes on the CONTEXT WINDOW instead - narrow the tools when the window is
+# tight, send everything when it is not - which is better reasoning than
+# defaulting to narrow and hoping someone measures it. See `simple_router`.
 
+def active_tool_schemas(
+    context_window: int = 0, category: str = ""
+) -> list[dict[str, Any]]:
+    """The tools to send on this call.
 
-def active_tool_schemas() -> list[dict[str, Any]]:
-    """The schemas this session offers - all of them, or just the core six."""
-    if os.environ.get("SHAMSU_TOOLSET", "").strip().lower() != "core":
+    Everything, unless the window is tight enough that two-stage routing earns
+    its extra round: then the category selector alone, and once the model has
+    chosen, that category tools.
+    """
+    from shamsu.agents.simple_router import (
+        category_selector_tool,
+        routing_mode,
+        tools_for_category,
+    )
+
+    if not context_window or routing_mode(context_window) == "direct":
         return SIMPLE_TOOL_SCHEMAS
-    return [
-        schema
-        for schema in SIMPLE_TOOL_SCHEMAS
-        if (schema.get("function") or {}).get("name") in CORE_TOOLS
-    ]
+    if not category:
+        return [category_selector_tool()]
+    return tools_for_category(category, SIMPLE_TOOL_SCHEMAS)
 
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
@@ -1073,6 +1078,10 @@ class SimpleChatLoop:
         # with no exit is a deadlock waiting for a user. The partial-read guard
         # once had none and blocked writes forever.
         # Tool calls since the last mid-turn elision sweep.
+        # The tool category the model has selected this turn, when the window
+        # is small enough for two-stage routing. Cleared per turn: what it
+        # needs next is rarely what it needed last.
+        self._tool_category = ""
         self._calls_since_elide = 0
         # Said once per loop, not once per round.
         self._warned_filling = False
@@ -1142,6 +1151,7 @@ class SimpleChatLoop:
         # eliding after budgeting would mean budgeting against bytes that are
         # about to be thrown away.
         self._request = user_input
+        self._tool_category = ""
         self._elide_payloads()
         # Expand `@file` before the model sees a word. Otherwise the literal
         # string goes through and the first round is spent on a `read_file`
@@ -1481,7 +1491,7 @@ class SimpleChatLoop:
         kwargs = {
             "model": self.model_name,
             "messages": messages,
-            "tools": active_tool_schemas(),
+            "tools": active_tool_schemas(num_ctx, self._tool_category),
             "stream": False,
             "think": not self._should_disable_thinking(),
             "options": {
@@ -1796,7 +1806,7 @@ class SimpleChatLoop:
         """
         allocation = TokenAllocation(
             system_prompt=count_tokens(self.state.system_prompt) + PER_MESSAGE_OVERHEAD,
-            tool_schemas=tool_schema_tokens(active_tool_schemas()),
+            tool_schemas=tool_schema_tokens(self._sent_schemas()),
         )
         grounding = render_workspace_files(self._files)
         remembered = render_memory(self.workspace, self._request)
@@ -1859,6 +1869,15 @@ class SimpleChatLoop:
         self._activity("context is filling; eliding older tool payloads")
         return self._elide_payloads(KEEP_VERBATIM_UNDER_PRESSURE)
 
+    def _sent_schemas(self) -> list[dict[str, Any]]:
+        """Exactly the schemas the next call will carry.
+
+        The budget must charge what goes over the wire, not the full roster -
+        under two-stage routing those differ by ~1,700 tokens, and item A is
+        entirely about not letting the estimate and the request disagree.
+        """
+        return active_tool_schemas(self._ceiling(), self._tool_category)
+
     def _ceiling(self) -> int:
         """The context window this session asks Ollama for.
 
@@ -1899,7 +1918,7 @@ class SimpleChatLoop:
         by ~3,900 tokens, which is the difference between the ~8,192 of headroom
         the reply reserve promises and the ~5,300 it would actually deliver.
         """
-        total = tool_schema_tokens(active_tool_schemas())
+        total = tool_schema_tokens(self._sent_schemas())
         grounding = render_workspace_files(self._files)
         remembered = render_memory(self.workspace, self._request)
         if remembered:
@@ -1944,7 +1963,7 @@ class SimpleChatLoop:
         applying the factor here would feed the correction back into its own
         input and converge on the square root of the truth instead of the truth.
         """
-        return messages_tokens(messages) + tool_schema_tokens(active_tool_schemas())
+        return messages_tokens(messages) + tool_schema_tokens(self._sent_schemas())
 
     def _bucket_for(self, prompt_tokens: int) -> int:
         """One window for the whole session: the ceiling. No side effects.
@@ -2051,6 +2070,28 @@ class SimpleChatLoop:
             return self._append_file(arguments)
         if name == "find_files":
             return self._find_files(arguments)
+        if name == "select_category":
+            from shamsu.agents.simple_router import TOOL_CATEGORIES
+
+            chosen = str(arguments.get("category") or "").strip().lower()
+            if chosen not in TOOL_CATEGORIES:
+                # Do not strand it. An invented category still says the model
+                # wants to act; `tools_for_category` answers with everything.
+                self._tool_category = chosen or "read"
+                return ToolResult(
+                    True,
+                    f"{chosen!r} is not a category, so you now have every tool. "
+                    "Categories are: " + ", ".join(TOOL_CATEGORIES) + ".",
+                    {"category": chosen},
+                )
+            self._tool_category = chosen
+            names = ", ".join(TOOL_CATEGORIES[chosen]["tools"])
+            return ToolResult(
+                True,
+                f"You now have the {chosen} tools: {names}. Call one.",
+                {"category": chosen},
+            )
+
         if name in _COMPOSITE_TOOLS:
             return self._composite_tool(name, arguments)
         target = SIMPLE_TOOLS.get(name)
@@ -3200,7 +3241,6 @@ __all__ = [
     "SIMPLE_TOOLS",
     "SIMPLE_TOOL_SCHEMAS",
     "active_tool_schemas",
-    "CORE_TOOLS",
     "SIMPLE_TRANSCRIPT_TOOLS",
     "SimpleChatLoop",
     "SimpleChatResult",

@@ -216,8 +216,11 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
         # two steps in one call
         "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
     }
-    # `remember` is an accepted alias, not an offered tool.
-    assert offered == {n for n in SIMPLE_TOOLS if n != "remember"}
+    # `remember` is an accepted alias, and `select_category` belongs to
+    # two-stage routing - it is never offered alongside the real tools.
+    assert offered == {
+        n for n in SIMPLE_TOOLS if n not in {"remember", "select_category"}
+    }
 
 
 # --- verification -------------------------------------------------------
@@ -4221,31 +4224,78 @@ def test_a_composite_that_finds_nothing_explains_rather_than_erroring(tmp_path):
     assert "No files match" in found.message
 
 
-def test_the_toolset_can_be_narrowed_so_the_trade_can_be_measured(tmp_path, monkeypatch):
-    """19 tools is ~2,100 tokens on every call and 19 choices for a 7B model.
+def test_a_big_window_sends_every_tool(tmp_path):
+    """smallcode routes on the window: above ~16k the schemas are affordable
+    and paying an extra round to save 2k out of 32k is a bad trade."""
+    from shamsu.agents.simple_chat import active_tool_schemas
 
-    Whether that beats six cannot be settled by reading: more tools means
-    fewer rounds when the model picks well and more flailing when it does not.
-    """
-    from shamsu.agents.simple_chat import CORE_TOOLS, active_tool_schemas
-
-    assert len(active_tool_schemas()) == len(SIMPLE_TOOL_SCHEMAS)
-
-    monkeypatch.setenv("SHAMSU_TOOLSET", "core")
-    narrowed = {s["function"]["name"] for s in active_tool_schemas()}
-
-    assert narrowed == set(CORE_TOOLS)
+    assert len(active_tool_schemas(32768)) == len(SIMPLE_TOOL_SCHEMAS)
 
 
-def test_narrowing_the_toolset_also_lowers_what_the_budget_is_charged(tmp_path, monkeypatch):
+def test_a_tight_window_offers_only_the_category_selector(tmp_path):
+    from shamsu.agents.simple_chat import active_tool_schemas
+    from shamsu.agents.simple_router import SELECTOR_TOOL_NAME
+
+    offered = [t["function"]["name"] for t in active_tool_schemas(8192)]
+
+    assert offered == [SELECTOR_TOOL_NAME]
+
+
+def test_choosing_a_category_hands_over_that_categorys_tools(tmp_path):
+    from shamsu.agents.simple_chat import active_tool_schemas
+
+    offered = {t["function"]["name"] for t in active_tool_schemas(8192, "write")}
+
+    assert "write_file" in offered and "patch_file" in offered
+    assert "graph_search" not in offered, "the narrowing did nothing"
+    # Recall is cross-cutting: needing a fact mid-edit must not cost a switch.
+    assert "memory_load" in offered and "history_search" in offered
+
+
+def test_an_invented_category_gets_everything_rather_than_nothing(tmp_path):
+    """It has still told us it wants to act; an empty tool list strands it."""
+    from shamsu.agents.simple_chat import active_tool_schemas
+
+    assert len(active_tool_schemas(8192, "wibble")) == len(SIMPLE_TOOL_SCHEMAS)
+
+
+def test_routing_can_be_forced_either_way(tmp_path, monkeypatch):
+    from shamsu.agents.simple_router import routing_mode
+
+    monkeypatch.setenv("SHAMSU_TOOL_ROUTING", "two_stage")
+    assert routing_mode(131072) == "two_stage"
+    monkeypatch.setenv("SHAMSU_TOOL_ROUTING", "direct")
+    assert routing_mode(4096) == "direct"
+
+
+def test_the_model_can_pick_a_category_and_then_act(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_TOOL_ROUTING", "two_stage")
+    loop = _loop(
+        tmp_path,
+        [_tool("select_category", category="write"),
+         _tool("write_file", filepath="made.py", content="x = 1" + chr(10)),
+         _text("written")],
+    )
+
+    asyncio.run(loop.run("create made.py"))
+
+    assert (tmp_path / "made.py").read_text(encoding="utf-8") == "x = 1" + chr(10)
+    first = [t["function"]["name"] for t in loop.client.calls[0]["tools"]]
+    second = [t["function"]["name"] for t in loop.client.calls[1]["tools"]]
+    assert first == ["select_category"]
+    assert "write_file" in second, "the chosen category was not handed over"
+
+
+def test_narrowed_routing_charges_the_budget_less(tmp_path, monkeypatch):
     """The sent schemas and the charged schemas must never disagree."""
+    monkeypatch.setenv("SHAMSU_TOOL_ROUTING", "direct")
     loop = _loop(tmp_path, [_text("ok")])
     full = loop._fixed_overhead()
 
-    monkeypatch.setenv("SHAMSU_TOOLSET", "core")
-    core = loop._fixed_overhead()
+    monkeypatch.setenv("SHAMSU_TOOL_ROUTING", "two_stage")
+    narrowed = loop._fixed_overhead()
 
-    assert core < full, "the budget kept charging for tools that are no longer sent"
+    assert narrowed < full
 
 
 def test_what_is_sent_is_what_is_charged(tmp_path):
