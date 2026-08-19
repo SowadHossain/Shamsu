@@ -189,13 +189,14 @@ def test_an_unknown_tool_is_answered_with_the_names_that_exist(tmp_path):
     assert "write_file" in tool_messages[0]["content"]
 
 
-def test_only_the_six_tools_are_offered(tmp_path):
+def test_only_the_seven_tools_are_offered(tmp_path):
     loop = _loop(tmp_path, [_text("ok")])
     asyncio.run(loop.run("hi"))
 
     offered = {t["function"]["name"] for t in loop.client.calls[0]["tools"]}
     assert offered == {
-        "read_file", "list_files", "search_files", "write_file", "patch_file", "run_command",
+        "read_file", "list_files", "search_files", "write_file", "patch_file",
+        "run_command", "remember",
     }
     assert offered == set(SIMPLE_TOOLS)
 
@@ -2034,6 +2035,12 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
         required = (function.get("parameters") or {}).get("required", [])
         if name in {"write_file", "patch_file", "run_command"}:
             continue  # mutating/shell: covered by their own tests
+        if name == "remember":
+            # Not a registry tool: it writes a scratchpad, not a workspace
+            # file. Same contract though - the schema name must reach it.
+            loop = _loop(tmp_path, [_text("ok")])
+            assert loop._execute("remember", {"note": "a fact"}).ok
+            continue
         arguments = {key: "hello.py" if "file" in key else "value" for key in required}
         normalized = normalize_arguments(name, arguments)
         result = tools.execute(SIMPLE_TOOLS[name], normalized)
@@ -3605,3 +3612,99 @@ def test_the_buckets_add_up_to_what_the_budget_counts(tmp_path):
     )
 
     assert abs(allocation.total - counted) <= 2, f"{allocation.total} vs {counted}"
+
+
+# ---------------------------------------------------------------------------
+# Working memory (SMALLCODE plan item H)
+#
+# Distinct from the rolling summary: that is OUR lossy digest, written when the
+# window fills. This is the model's own note, written when it decides
+# something, and it survives compaction because it was never part of the
+# conversation being compacted.
+# ---------------------------------------------------------------------------
+
+
+def test_a_remembered_fact_reaches_the_next_turns_prompt(tmp_path):
+    loop = _loop(tmp_path, [_tool("remember", note="the dev server runs on port 8080"),
+                            _text("noted")])
+
+    asyncio.run(loop.run("we settled on port 8080"))
+
+    later = _loop(tmp_path, [_text("still 8080")])
+    asyncio.run(later.run("what port again?"))
+
+    sent = json.dumps(later.client.calls[0]["messages"])
+    assert "port 8080" in sent
+
+
+def test_working_memory_survives_compaction(tmp_path):
+    """The rolling summary is lossy by definition; a deliberate note is not."""
+    from shamsu.agents.simple_memory import remember, render_memory
+
+    remember(tmp_path, "the window is 900x700")
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    for i in range(60):
+        state.append_user(f"turn {i} " + "padding " * 200)
+        state.append_assistant(f"reply {i} " + "padding " * 200)
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+    loop._files = workspace_files(tmp_path)
+
+    prompt = json.dumps(loop._messages())
+
+    assert "900x700" in prompt
+
+
+def test_the_memory_block_is_charged_to_the_budget(tmp_path):
+    """A permanent block nobody counts is the exact bug item A fixed."""
+    from shamsu.agents.simple_memory import remember
+
+    loop = _loop(tmp_path, [_text("ok")])
+    before = loop._fixed_overhead()
+    for i in range(20):
+        remember(tmp_path, f"decision number {i} about the architecture of the thing")
+
+    assert loop._fixed_overhead() > before
+
+
+def test_working_memory_cannot_grow_without_limit(tmp_path):
+    from shamsu.agents.simple_memory import MAX_MEMORY_TOKENS, remember, render_memory
+    from shamsu.context.budget import count_tokens
+
+    for i in range(200):
+        remember(tmp_path, f"fact {i} " + "detail " * 20)
+
+    assert count_tokens(render_memory(tmp_path)) <= MAX_MEMORY_TOKENS * 1.2
+
+
+def test_the_oldest_notes_go_first(tmp_path):
+    """A note from before the project took its current shape is the stale one."""
+    from shamsu.agents.simple_memory import remember, render_memory
+
+    remember(tmp_path, "OLDEST decision " + "x " * 100)
+    for i in range(40):
+        remember(tmp_path, f"newer decision {i} " + "y " * 20)
+
+    kept = render_memory(tmp_path)
+    assert "OLDEST decision" not in kept
+    assert "newer decision 39" in kept
+
+
+def test_the_same_fact_is_not_remembered_twice(tmp_path):
+    from shamsu.agents.simple_memory import read_memory, remember
+
+    remember(tmp_path, "the port is 8080")
+    ok, message = remember(tmp_path, "the  port   is 8080")
+
+    assert ok
+    assert "Already remembered" in message
+    assert read_memory(tmp_path).count("port is 8080") == 1
+
+
+def test_an_empty_note_says_what_to_do_instead(tmp_path):
+    from shamsu.agents.simple_memory import remember
+
+    ok, message = remember(tmp_path, "   ")
+
+    assert not ok
+    assert "note" in message

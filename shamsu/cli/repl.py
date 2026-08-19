@@ -4645,7 +4645,7 @@ async def _run_simple_chat(
     session_logger: SessionLogger | None = None,
     thinking_status: Any = None,
 ) -> None:
-    """The default path: one conversation, six tools, no routing.
+    """The default path: one conversation, seven tools, no routing.
 
     Everything the legacy path does before the model sees a word - orchestrator,
     PRD-plan detection, the 27-branch router, the planner, phases, task objects,

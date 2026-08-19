@@ -311,7 +311,7 @@ class LocalShamsuSessionGateway:
             clear_current_run()
 
     def _run_simple(self, text, logger, tools, ledger, progress) -> str:
-        """The same loop the desktop uses, on the same session, same six tools."""
+        """The same loop the desktop uses, on the same session, same seven tools."""
         from shamsu.agents.chat_loop import _default_ollama_client
         from shamsu.agents.simple_chat import SimpleChatLoop
         from shamsu.llm.manager import OLLAMA_BASE_URL

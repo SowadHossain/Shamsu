@@ -1,7 +1,7 @@
 """Simple mode: Ollama chat with coding tools attached.
 
 The default path SHAMSU should have had. One conversation, a small system
-prompt, six tools, and a loop that does exactly this:
+prompt, seven tools, and a loop that does exactly this:
 
     call the model -> it asks for a tool -> run it -> put the REAL result back
     into the same conversation -> call the model again -> it answers.
@@ -36,6 +36,7 @@ from typing import Any
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
+from shamsu.agents.simple_memory import render_memory
 from shamsu.agents.simple_prompt import simple_system_prompt
 from shamsu.context.budget import (
     PER_MESSAGE_OVERHEAD,
@@ -254,8 +255,9 @@ def looks_like_out_of_memory(error: str) -> bool:
 # --------------------------------------------------------------------------
 # Tools
 # --------------------------------------------------------------------------
-# Six, named the way a model expects them to be named. Each maps to a method the
-# registry already implements, with its sandbox and ledger intact.
+# Seven, named the way a model expects them to be named. Six map to a method the
+# registry already implements, with its sandbox and ledger intact; `remember`
+# writes the working-memory scratchpad and is handled in `_execute`.
 
 SIMPLE_TOOLS: dict[str, str] = {
     "read_file": "read_file",
@@ -264,6 +266,10 @@ SIMPLE_TOOLS: dict[str, str] = {
     "write_file": "write_file",
     "patch_file": "edit_file",
     "run_command": "run_command",
+    # Handled inside `_execute`, not by the registry: it writes a scratchpad,
+    # not a workspace file, and routing it through `write_file` would put it
+    # behind the patch-first guard and the sandbox path rules for no reason.
+    "remember": "remember",
 }
 
 SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -366,6 +372,27 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "command": {"type": "string", "description": "The command to run."}
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Keep one short fact about this project for later turns - a decision, "
+                "a number, a path, a convention. Use it when you decide something you "
+                "would otherwise have to work out again."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note": {
+                        "type": "string",
+                        "description": "One short line, e.g. 'the dev server runs on port 8080'.",
+                    }
+                },
+                "required": ["note"],
             },
         },
     },
@@ -676,7 +703,7 @@ class _Round:
 
 
 class SimpleChatLoop:
-    """One conversation, six tools, no ceremony."""
+    """One conversation, seven tools, no ceremony."""
 
     def __init__(
         self,
@@ -1305,6 +1332,9 @@ class SimpleChatLoop:
         # Two halves of one question: the listing says which files exist, the
         # brief says what is inside the ones this turn is about.
         grounding = render_workspace_files(self._files)
+        remembered = render_memory(self.workspace)
+        if remembered:
+            grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
             grounding = f"{grounding}\n\n{self._brief}"
         # LAST, not at position 1. llama.cpp reuses the KV cache for the
@@ -1417,6 +1447,9 @@ class SimpleChatLoop:
             tool_schemas=tool_schema_tokens(SIMPLE_TOOL_SCHEMAS),
         )
         grounding = render_workspace_files(self._files)
+        remembered = render_memory(self.workspace)
+        if remembered:
+            grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
             grounding = grounding + chr(10) * 2 + self._brief
         allocation.grounding = count_tokens(grounding) + PER_MESSAGE_OVERHEAD
@@ -1516,6 +1549,9 @@ class SimpleChatLoop:
         """
         total = tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
         grounding = render_workspace_files(self._files)
+        remembered = render_memory(self.workspace)
+        if remembered:
+            grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
             grounding = grounding + chr(10) + chr(10) + self._brief
         total += count_tokens(grounding) + PER_MESSAGE_OVERHEAD
@@ -1647,6 +1683,11 @@ class SimpleChatLoop:
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         name = canonical_tool_name(name)
+        if name == "remember":
+            from shamsu.agents.simple_memory import remember
+
+            ok, message = remember(self.workspace, str(arguments.get("note") or ""))
+            return ToolResult(ok, message, {"tool": "remember"})
         target = SIMPLE_TOOLS.get(name)
         if target is None:
             return ToolResult(
@@ -2458,6 +2499,7 @@ __all__ = [
     "command_needs_approval",
     "describes_an_unmade_edit",
     "expand_mentions",
+    "render_memory",
     "make_approval_func",
     "names_a_workspace_file",
     "normalize_arguments",
