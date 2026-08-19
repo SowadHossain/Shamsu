@@ -30,6 +30,7 @@ Companion docs: `SMALL_MODEL_LIVE_RUNS.md` (the per-run log),
 | [G1](#g1) | Code graph holds **239 projects**, mostly July eval scratch dirs; this repo is not among them | **high** | graph |
 | [G2](#g2) | Graph indexes `reference/`, `other peoples work/`, `legacy-code/` and answers out of them | **high** | graph |
 | [L3](#l3) | Tool schemas are **57–81% of every prompt**; two-stage routing is off at 32k | **high** | context |
+| [W1](#w1) | `.shamsu/` records the same turn four times; `paths.py` governs 7 of its 13 entries | medium | structure |
 | [G3](#g3) | Graph answers are truncated in arrival order, not ranked by relevance | medium | graph |
 | [L2](#l2) | Token estimate runs **~15% heavy** on qwen2.5 | medium | context |
 | [L4](#l4) | Small model thrashes — 8 rounds / 292s to write a one-line file | medium | agent loop |
@@ -278,6 +279,114 @@ call** and it is the one bucket nothing currently reduces.
 
 **Fix:** gate two-stage routing on the schemas' *share of the prompt*, not on
 window size alone. See `shamsu/agents/simple_router.py`.
+
+---
+
+<a name="w1"></a>
+## W1 — four stores for one turn, and a layout module that governs half of it · MEDIUM
+
+Raised from a real comparison: *"they are not organized as we have — I like
+their approach of minimal clutter on those files."*
+
+### It is not file count
+
+Measured on two comparable sessions on the same machine:
+
+```
+                        top-level entries   loose files   total state files
+SHAMSU  .shamsu/                       13             5                  64
+smallcode                               4             1                 112
+  .smallcode/  sessions 3, snapshots 81, traces 15
+  .memory/ 9   .code-graph/ 3
+```
+
+**smallcode writes almost twice as many files.** Their 81 snapshots alone
+outnumber everything SHAMSU produced. So "minimal" is not about volume — it is
+about whether a directory has a shape you can hold in your head.
+
+One point in SHAMSU's favour, worth keeping: smallcode puts **three** dotted
+directories in the project root (`.smallcode/`, `.memory/`, `.code-graph/`).
+SHAMSU puts one. That part is already better here and should not be traded away.
+
+### Where the clutter actually is
+
+**1. Four directories record the same turn.** This session ran **two turns**
+and produced 29 files across four stores, all keyed by the same session id
+`20260819-074923-10d7`:
+
+```
+logs/<id>/agent-development-log.jsonl          1 file
+chat-logs/<id>--make-me-3d-asteroid-game.md    2 files  (+ latest.md)
+sessions/<id>/  events, messages, owner, report, session, state
+runs/run_<ts>/.evidence/  context-preview, decisions, diagnostics,
+                          events, final-output, manifest, ...   19 files
+```
+
+Three of those hold a rendering of *what the turn produced*
+(`sessions/report.md`, `chat-logs/*.md`, `runs/*/.evidence/final-output.md`) and
+three hold an *event stream* (`sessions/events.jsonl`,
+`logs/*/agent-development-log.jsonl`, `runs/*/.evidence/events.jsonl`).
+
+smallcode also has three stores — but they are three **different kinds of
+thing**: `sessions/` is the conversation, `traces/` is tool execution,
+`snapshots/` is file state for undo. No two of them tell the same story twice.
+That is the difference worth copying, and it is a design difference, not a
+tidiness one.
+
+**2. Five loose files at the top level.**
+
+```
+SHAMSU      README.md  audit.jsonl  first-run-report.json
+            model_tier.json  state.json
+smallcode   tool_scores.json
+```
+
+Loose files are what make a directory unreadable, because nothing groups them
+and nothing suggests where a sixth would go.
+
+Note also that `audit/` is a *directory* in the documented layout while
+`audit.jsonl` is a *file* at the top level — both concepts exist, and this
+workspace only has the file.
+
+**3. `paths.py` does not enforce `paths.py`.** The module opens by making
+exactly this comparison against smallcode and states its own contract:
+
+> *"A new location has to be added here to exist, which means the layout is
+> reviewable in one diff."*
+
+It is not true. Checked against what is on disk:
+
+```
+named in paths.py   cache config memory sessions runs audit plans mutations
+                    trash abstract tools skills taskmaster documents
+                    first-run-report.json
+NOT named           chat-logs/  logs/  README.md  audit.jsonl
+                    model_tier.json  state.json
+```
+
+**Six of the thirteen entries on disk bypass it**, including two whole
+directories. So the file whose purpose is to make the layout reviewable does not
+describe the layout, and nothing fails when a new path is added elsewhere.
+
+This is the root cause of 1 and 2 rather than a separate issue: the module
+documented an intent and never got the enforcement that would hold it.
+
+### Fix, in the order that makes each next step safe
+
+1. **Make `paths.py` true.** Add the six missing entries so it describes reality,
+   then add a test that walks a real workspace after a run and fails on any
+   top-level entry the module does not name. Without that test this regresses
+   the next time somebody needs a file.
+2. **Collapse the four record stores into three by kind**, matching smallcode's
+   split rather than their file count: the conversation, tool execution, and
+   recoverable file state. `chat-logs/` is a *rendering* of the session, not a
+   separate store — it belongs under `sessions/<id>/`.
+3. **Move the loose files into `config/` and `cache/`**, both of which exist and
+   are already documented. `paths.py` has a `migrated()` helper for exactly this,
+   so nothing is lost from existing workspaces.
+
+Do **not** follow smallcode into three root directories. One `.shamsu/` is the
+better call and is already ours.
 
 ---
 
