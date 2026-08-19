@@ -212,7 +212,9 @@ class ContextBudgetManager:
     def _calibration_path(self) -> Path | None:
         if self._workspace is None:
             return None
-        return self._workspace / ".shamsu" / _CALIBRATION_FILENAME
+        from shamsu import paths
+
+        return paths.context_calibration(self._workspace)
 
     def _load_calibration(self) -> None:
         path = self._calibration_path()

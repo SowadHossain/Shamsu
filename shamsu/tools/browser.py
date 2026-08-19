@@ -181,7 +181,7 @@ class BrowserTool:
     def screenshot(self) -> BrowserActionResult:
         if self._page is None:
             return BrowserActionResult(ok=False, message="No browser page is open yet.")
-        output_dir = self.sandbox.validate(Path(".shamsu") / "browser")
+        output_dir = self.sandbox.validate(Path(".shamsu") / "cache" / "browser")
         output_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.png"
         path = self.sandbox.validate(output_dir / filename)

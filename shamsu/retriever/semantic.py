@@ -40,7 +40,9 @@ _ENABLED = os.environ.get("SHAMSU_SEMANTIC_SEARCH", "1").strip().lower() not in 
     "no",
 }
 
-_INDEX_RELATIVE_PATH = Path(".shamsu") / "semantic_index.json"
+# Location owned by `shamsu/paths.py`; kept as a module constant only for
+# the tests that assert where it lands.
+_INDEX_RELATIVE_PATH = Path(".shamsu") / "cache" / "semantic_index.json"
 _MAX_INDEXED_FILES = 400
 _MAX_EMBED_CHARS = 6000          # nomic handles ~8k tokens; stay safely under
 _SNIPPET_LINES = 30
@@ -177,7 +179,11 @@ class SemanticIndex:
     # -- persistence ----------------------------------------------------------------
 
     def _index_path(self) -> Path:
-        return self.workspace_root / _INDEX_RELATIVE_PATH
+        from shamsu import paths
+
+        # Moves an index written by an older build rather than silently
+        # rebuilding it - one embed call per file is not free.
+        return paths.semantic_index(self.workspace_root)
 
     def _load(self) -> dict[str, dict]:
         try:

@@ -36,7 +36,7 @@ from typing import Any
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
-from shamsu.agents.simple_memory import render_memory
+from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_prompt import simple_system_prompt
 from shamsu.context.budget import (
     PER_MESSAGE_OVERHEAD,
@@ -394,19 +394,29 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "remember",
             "description": (
-                "Keep one short fact about this project for later turns - a decision, "
-                "a number, a path, a convention. Use it when you decide something you "
-                "would otherwise have to work out again."
+                "Keep one durable fact about this project for later turns. Use it when you decide something, discover a trap, or learn how this project is built - not for things only this turn cares about."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "note": {
+                    "type": {
                         "type": "string",
-                        "description": "One short line, e.g. 'the dev server runs on port 8080'.",
-                    }
+                        "enum": list(MEMORY_TYPES),
+                        "description": (
+                            "decision (a choice to respect), workflow (how to build/run/test), "
+                            "gotcha (a trap and its workaround), convention (naming, layout, style), "
+                            "context (what the project is)."
+                        ),
+                    },
+                    "title": {"type": "string", "description": "A few words naming the fact."},
+                    "content": {"type": "string", "description": "The fact itself, one or two sentences."},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional words that should bring this back later.",
+                    },
                 },
-                "required": ["note"],
+                "required": ["type", "title", "content"],
             },
         },
     },
@@ -827,6 +837,10 @@ class SimpleChatLoop:
         self.turn_log: SimpleTurnLog | None = None
         self._files: list[str] = []
         self._brief = ""
+        # The user request this turn is about. Memory is recalled AGAINST it -
+        # a store of hundreds of notes puts five in the prompt, which is what
+        # keeps a growing memory from becoming a growing tax on the window.
+        self._request = ""
         # Ground truth from the last response, and the estimate that predicted
         # it. `prompt_eval_count` is the only number in this file that is not a
         # guess; everything else is calibrated against it.
@@ -867,6 +881,7 @@ class SimpleChatLoop:
         # just reloaded the transcript from disk with every payload intact, and
         # eliding after budgeting would mean budgeting against bytes that are
         # about to be thrown away.
+        self._request = user_input
         self._elide_payloads()
         # Expand `@file` before the model sees a word. Otherwise the literal
         # string goes through and the first round is spent on a `read_file`
@@ -1397,7 +1412,7 @@ class SimpleChatLoop:
         # Two halves of one question: the listing says which files exist, the
         # brief says what is inside the ones this turn is about.
         grounding = render_workspace_files(self._files)
-        remembered = render_memory(self.workspace)
+        remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
@@ -1524,7 +1539,7 @@ class SimpleChatLoop:
             tool_schemas=tool_schema_tokens(SIMPLE_TOOL_SCHEMAS),
         )
         grounding = render_workspace_files(self._files)
-        remembered = render_memory(self.workspace)
+        remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
@@ -1626,7 +1641,7 @@ class SimpleChatLoop:
         """
         total = tool_schema_tokens(SIMPLE_TOOL_SCHEMAS)
         grounding = render_workspace_files(self._files)
-        remembered = render_memory(self.workspace)
+        remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
@@ -1769,7 +1784,17 @@ class SimpleChatLoop:
         if name == "remember":
             from shamsu.agents.simple_memory import remember
 
-            ok, message = remember(self.workspace, str(arguments.get("note") or ""))
+            tags = arguments.get("tags")
+            ok, message = remember(
+                self.workspace,
+                str(arguments.get("type") or "context"),
+                str(arguments.get("title") or ""),
+                # `note` is the old single-field spelling and the one a model
+                # reaches for anyway; accepting it costs nothing and saves a
+                # failed round.
+                str(arguments.get("content") or arguments.get("note") or ""),
+                [str(t) for t in tags] if isinstance(tags, list) else None,
+            )
             return ToolResult(ok, message, {"tool": "remember"})
         target = SIMPLE_TOOLS.get(name)
         if target is None:
@@ -1822,19 +1847,30 @@ class SimpleChatLoop:
             mode = "hybrid"
         try:
             from shamsu.indexer.policy import SOURCE_SUFFIXES, walk_workspace_files
-            from shamsu.tools.hybrid_search import format_results, hybrid_search
+            from shamsu.tools.hybrid_search import (
+                format_results,
+                hybrid_search,
+                index_was_truncated,
+            )
 
-            root = self.workspace
+            # `walk_workspace_files` resolves its root, so the paths coming
+            # back are absolute. Resolve ours too before relativising, or a
+            # symlinked or differently-cased workspace raises instead of
+            # searching.
+            root = self.workspace.resolve()
             sub = str(arguments.get("path") or "").strip().strip("./")
             if sub and (root / sub).is_dir():
-                root = root / sub
-            files = [
-                path.relative_to(root).as_posix()
-                for path in walk_workspace_files(root, suffixes=SOURCE_SUFFIXES)
-            ]
+                root = (root / sub).resolve()
+            files = []
+            for found in walk_workspace_files(root, suffixes=SOURCE_SUFFIXES):
+                try:
+                    files.append(found.resolve().relative_to(root).as_posix())
+                except ValueError:
+                    continue
             if not files:
                 return None
             results = hybrid_search(query, root, files, mode=mode, limit=10)
+            truncated = index_was_truncated(root)
         except Exception:  # noqa: BLE001 - grep is always there
             return None
         if not results and mode == "hybrid":
@@ -1843,8 +1879,14 @@ class SimpleChatLoop:
             return None
         return ToolResult(
             True,
-            format_results(results, query, mode),
-            {"query": query, "mode": mode, "matches": results, "count": len(results)},
+            format_results(results, query, mode, index_was_truncated(root)),
+            {
+                "query": query,
+                "mode": mode,
+                "matches": results,
+                "count": len(results),
+                "index_truncated": truncated,
+            },
         )
 
     def _snapshot(self, arguments: dict[str, Any]) -> str:

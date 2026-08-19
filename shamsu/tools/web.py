@@ -28,6 +28,7 @@ from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.session.manager import SessionLogger
 from shamsu.types import ApprovalRequest
+from shamsu import paths
 
 _TRAFILATURA_NOT_LOADED = object()
 trafilatura: Any = _TRAFILATURA_NOT_LOADED
@@ -337,7 +338,7 @@ class WebServiceManager:
     ) -> None:
         self.workspace = Path(workspace)
         self.searxng_url = searxng_url
-        self.web_dir = self.workspace / ".shamsu" / "web"
+        self.web_dir = paths.web_dir(self.workspace)
         self.runner = runner or self._run
 
     @property
@@ -655,7 +656,7 @@ class WebTool:
         self.action_ledger = action_ledger
         self.service_manager = WebServiceManager(self.workspace, self.config.searxng_url)
         self.cache = WebCache(
-            self.workspace / ".shamsu" / "web_cache.db",
+            paths.web_cache_db(self.workspace),
             ttl_seconds=self.config.cache_ttl_seconds,
             enabled=self.config.cache_enabled,
         )

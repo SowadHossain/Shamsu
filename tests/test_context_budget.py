@@ -354,3 +354,63 @@ def test_calibration_affects_compute_estimate(tmp_path):
 
     result_after = mgr.compute("qwen2.5-coder:7b-instruct", "coder", text)
     assert result_after.estimated_tokens > result_before.estimated_tokens
+
+
+# ---------------------------------------------------------------------------
+# .shamsu layout
+#
+# The directory had grown to 35 top-level entries, because thirty modules each
+# built their own path inline and no single file ever showed what it held.
+# ---------------------------------------------------------------------------
+
+
+def test_regenerable_state_lands_under_cache_not_at_the_top_level(tmp_path):
+    from shamsu import paths
+
+    assert paths.web_cache_db(tmp_path).parent.name == "cache"
+    assert paths.semantic_index(tmp_path).parent.name == "cache"
+    assert paths.context_calibration(tmp_path).parent.name == "cache"
+    assert paths.ocr_dir(tmp_path).parent.name == "cache"
+
+
+def test_an_older_workspace_keeps_its_files_when_the_layout_moves(tmp_path):
+    """A tidier tree is not worth silently losing what a workspace already had."""
+    from shamsu import paths
+
+    old = paths.shamsu_dir(tmp_path) / "semantic_index.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text('{"expensive": "to rebuild"}', encoding="utf-8")
+
+    new = paths.semantic_index(tmp_path)
+
+    assert new.parent.name == "cache"
+    assert new.read_text(encoding="utf-8") == '{"expensive": "to rebuild"}'
+    assert not old.exists(), "the old copy should have moved, not been duplicated"
+
+
+def test_migration_never_clobbers_a_newer_file(tmp_path):
+    from shamsu import paths
+
+    old = paths.shamsu_dir(tmp_path) / "semantic_index.json"
+    old.parent.mkdir(parents=True, exist_ok=True)
+    old.write_text("stale", encoding="utf-8")
+    new_path = paths.cache_dir(tmp_path) / "semantic_index.json"
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    new_path.write_text("current", encoding="utf-8")
+
+    assert paths.semantic_index(tmp_path).read_text(encoding="utf-8") == "current"
+
+
+def test_work_that_cannot_be_regenerated_is_left_where_it_is(tmp_path):
+    """Sessions and runs hold history; relocating them would lose it."""
+    from shamsu import paths
+
+    assert paths.sessions_dir(tmp_path).parent.name == ".shamsu"
+    assert paths.runs_dir(tmp_path).parent.name == ".shamsu"
+
+
+def test_model_written_notes_sit_beside_the_long_term_memory_store(tmp_path):
+    """One place to look for 'what does SHAMSU remember', not two."""
+    from shamsu import paths
+
+    assert paths.memory_notes_dir(tmp_path).parent == paths.memory_dir(tmp_path)

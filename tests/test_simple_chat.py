@@ -2036,10 +2036,14 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
         if name in {"write_file", "patch_file", "run_command"}:
             continue  # mutating/shell: covered by their own tests
         if name == "remember":
-            # Not a registry tool: it writes a scratchpad, not a workspace
-            # file. Same contract though - the schema name must reach it.
+            # Not a registry tool: it writes typed project notes, not a
+            # workspace file. Same contract though - the schema names must
+            # reach the implementation.
             loop = _loop(tmp_path, [_text("ok")])
-            assert loop._execute("remember", {"note": "a fact"}).ok
+            assert loop._execute(
+                "remember",
+                {"type": "decision", "title": "a title", "content": "a fact"},
+            ).ok
             continue
         arguments = {key: "hello.py" if "file" in key else "value" for key in required}
         normalized = normalize_arguments(name, arguments)
@@ -3644,92 +3648,6 @@ def test_the_buckets_add_up_to_what_the_budget_counts(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_a_remembered_fact_reaches_the_next_turns_prompt(tmp_path):
-    loop = _loop(tmp_path, [_tool("remember", note="the dev server runs on port 8080"),
-                            _text("noted")])
-
-    asyncio.run(loop.run("we settled on port 8080"))
-
-    later = _loop(tmp_path, [_text("still 8080")])
-    asyncio.run(later.run("what port again?"))
-
-    sent = json.dumps(later.client.calls[0]["messages"])
-    assert "port 8080" in sent
-
-
-def test_working_memory_survives_compaction(tmp_path):
-    """The rolling summary is lossy by definition; a deliberate note is not."""
-    from shamsu.agents.simple_memory import remember, render_memory
-
-    remember(tmp_path, "the window is 900x700")
-    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
-    for i in range(60):
-        state.append_user(f"turn {i} " + "padding " * 200)
-        state.append_assistant(f"reply {i} " + "padding " * 200)
-    loop = _loop(tmp_path, [_text("ok")])
-    loop.state = state
-    loop._files = workspace_files(tmp_path)
-
-    prompt = json.dumps(loop._messages())
-
-    assert "900x700" in prompt
-
-
-def test_the_memory_block_is_charged_to_the_budget(tmp_path):
-    """A permanent block nobody counts is the exact bug item A fixed."""
-    from shamsu.agents.simple_memory import remember
-
-    loop = _loop(tmp_path, [_text("ok")])
-    before = loop._fixed_overhead()
-    for i in range(20):
-        remember(tmp_path, f"decision number {i} about the architecture of the thing")
-
-    assert loop._fixed_overhead() > before
-
-
-def test_working_memory_cannot_grow_without_limit(tmp_path):
-    from shamsu.agents.simple_memory import MAX_MEMORY_TOKENS, remember, render_memory
-    from shamsu.context.budget import count_tokens
-
-    for i in range(200):
-        remember(tmp_path, f"fact {i} " + "detail " * 20)
-
-    assert count_tokens(render_memory(tmp_path)) <= MAX_MEMORY_TOKENS * 1.2
-
-
-def test_the_oldest_notes_go_first(tmp_path):
-    """A note from before the project took its current shape is the stale one."""
-    from shamsu.agents.simple_memory import remember, render_memory
-
-    remember(tmp_path, "OLDEST decision " + "x " * 100)
-    for i in range(40):
-        remember(tmp_path, f"newer decision {i} " + "y " * 20)
-
-    kept = render_memory(tmp_path)
-    assert "OLDEST decision" not in kept
-    assert "newer decision 39" in kept
-
-
-def test_the_same_fact_is_not_remembered_twice(tmp_path):
-    from shamsu.agents.simple_memory import read_memory, remember
-
-    remember(tmp_path, "the port is 8080")
-    ok, message = remember(tmp_path, "the  port   is 8080")
-
-    assert ok
-    assert "Already remembered" in message
-    assert read_memory(tmp_path).count("port is 8080") == 1
-
-
-def test_an_empty_note_says_what_to_do_instead(tmp_path):
-    from shamsu.agents.simple_memory import remember
-
-    ok, message = remember(tmp_path, "   ")
-
-    assert not ok
-    assert "note" in message
-
-
 # ---------------------------------------------------------------------------
 # Methods taken from smallcode's own source (not from the plan's summary of it)
 # ---------------------------------------------------------------------------
@@ -3819,3 +3737,156 @@ def test_efficiency_reports_output_earned_per_token_of_context(tmp_path):
     assert counters.total_completion == 250
     assert abs(counters.efficiency - 25.0) < 0.01
     assert counters.average_prompt == 1000
+
+
+# ---------------------------------------------------------------------------
+# Typed, task-scoped project memory (plan item H, rebuilt on smallcode's model)
+#
+# The first version loaded every note into every prompt. This one holds
+# hundreds and shows the five that score against the request - which is the
+# difference between memory and a permanent tax on the window.
+# ---------------------------------------------------------------------------
+
+
+def test_a_remembered_decision_comes_back_for_a_related_request(tmp_path):
+    from shamsu.agents.simple_memory import remember, render_memory
+
+    remember(tmp_path, "decision", "dev server port", "The dev server runs on port 8080.")
+
+    assert "8080" in render_memory(tmp_path, "what port does the server use?")
+
+
+def test_memory_is_scoped_to_the_request_not_dumped_wholesale(tmp_path):
+    """The whole reason the store can grow without the prompt growing with it."""
+    from shamsu.agents.simple_memory import remember, render_memory
+
+    remember(tmp_path, "decision", "dev server port", "The dev server runs on port 8080.")
+    for i in range(40):
+        remember(tmp_path, "context", f"unrelated topic {i}", f"Something about widget {i}.")
+
+    block = render_memory(tmp_path, "what port does the server use?")
+
+    assert "8080" in block
+    assert block.count("\n") <= 6, "a request pulled in more than the top few notes"
+    assert "widget 7" not in block
+
+
+def test_a_request_matching_nothing_costs_no_tokens(tmp_path):
+    from shamsu.agents.simple_memory import remember, render_memory
+
+    remember(tmp_path, "gotcha", "sqlite locking", "Close the cursor before forking.")
+
+    assert render_memory(tmp_path, "how do I centre a div?") == ""
+    assert render_memory(tmp_path, "") == ""
+
+
+def test_the_type_is_carried_through_so_a_gotcha_reads_as_one(tmp_path):
+    from shamsu.agents.simple_memory import remember, render_memory
+
+    remember(tmp_path, "gotcha", "cursor forking", "Close the cursor before forking.")
+
+    assert "[gotcha]" in render_memory(tmp_path, "problem with the cursor")
+
+
+def test_an_unknown_type_is_refused_with_the_list_of_real_ones(tmp_path):
+    from shamsu.agents.simple_memory import MEMORY_TYPES, remember
+
+    ok, message = remember(tmp_path, "reminder", "a title", "a fact")
+
+    assert not ok
+    assert all(kind in message for kind in MEMORY_TYPES)
+
+
+def test_the_same_fact_is_not_stored_twice(tmp_path):
+    from shamsu.agents.simple_memory import MemoryStore, remember
+
+    remember(tmp_path, "decision", "port", "The port is 8080.")
+    ok, message = remember(tmp_path, "decision", "port", "The  port   is 8080.")
+
+    assert ok
+    assert "Already remembered" in message
+    assert len(MemoryStore(tmp_path).all_notes()) == 1
+
+
+def test_notes_are_readable_and_deletable_by_hand(tmp_path):
+    """A memory a user cannot inspect is one they cannot trust."""
+    from shamsu.agents.simple_memory import MEMORY_DIR, remember
+
+    remember(tmp_path, "convention", "naming", "Modules are snake_case.", ["style"])
+
+    written = list((tmp_path / MEMORY_DIR).glob("convention-*.md"))
+    assert written, "no human-readable note was written"
+    body = written[0].read_text(encoding="utf-8")
+    assert "snake_case" in body and "type: convention" in body
+
+
+def test_unused_notes_are_archived_then_forgotten(tmp_path):
+    from shamsu.agents.simple_memory import MemoryStore, remember
+    from datetime import datetime, timedelta, timezone
+
+    remember(tmp_path, "context", "ancient", "Something decided long ago.")
+    store = MemoryStore(tmp_path)
+    old = (datetime.now(timezone.utc) - timedelta(days=70)).isoformat()
+    for note in store.notes.values():
+        note.last_used_at = old
+
+    store.tidy()
+    assert all(n.tier == "archive" for n in store.notes.values())
+
+    ancient = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
+    for note in store.notes.values():
+        note.last_used_at = ancient
+    store.tidy()
+
+    assert not store.notes, "a note archived long ago was never forgotten"
+
+
+def test_the_hot_set_is_capped_so_recall_stays_sharp(tmp_path):
+    from shamsu.agents.simple_memory import HOT_CAP, MemoryStore, remember
+
+    for i in range(HOT_CAP + 8):
+        remember(tmp_path, "context", f"note {i}", f"Fact number {i} about the project.")
+
+    hot = [n for n in MemoryStore(tmp_path).all_notes() if n.tier == "hot"]
+    assert len(hot) <= HOT_CAP
+
+
+def test_an_archived_note_is_de_ranked_not_lost(tmp_path):
+    from shamsu.agents.simple_memory import MemoryStore, remember
+
+    remember(tmp_path, "decision", "storage choice", "Payments use the ledger table.")
+    store = MemoryStore(tmp_path)
+    for note in store.notes.values():
+        note.tier = "archive"
+    store._save()
+
+    found = MemoryStore(tmp_path).recall("which table do payments use?")
+
+    assert found and "ledger" in found[0].content
+
+
+def test_the_memory_block_is_charged_to_the_budget(tmp_path):
+    """A permanent block nobody counts is the exact bug item A fixed."""
+    from shamsu.agents.simple_memory import remember
+
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._request = "what port does the dev server use?"
+    before = loop._fixed_overhead()
+    remember(tmp_path, "decision", "dev server port", "The dev server runs on port 8080.")
+
+    assert loop._fixed_overhead() > before
+
+
+def test_the_model_can_write_a_typed_note_through_the_tool(tmp_path):
+    loop = _loop(
+        tmp_path,
+        [_tool("remember", type="decision", title="port", content="The port is 8080."),
+         _text("noted")],
+    )
+
+    asyncio.run(loop.run("we settled on port 8080"))
+
+    later = _loop(tmp_path, [_text("still 8080")])
+    asyncio.run(later.run("what port did we choose?"))
+
+    assert "8080" in json.dumps(later.client.calls[0]["messages"])

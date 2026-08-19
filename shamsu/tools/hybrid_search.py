@@ -43,6 +43,35 @@ MAX_CHUNK_LINES = 80
 MAX_INDEXED_FILES = 1500
 MAX_FILE_BYTES = 512 * 1024
 
+# Hard ceiling on the corpus. Files alone is not a bound - one 4,000-line
+# module is 50 chunks - and the cold build is the only part a user waits on:
+# measured on this repo, 1,500 files became 18,084 chunks and ~18s. Warm calls
+# are ~0.9s, so this only ever caps the FIRST search in a workspace.
+MAX_INDEXED_CHUNKS = 12_000
+
+# When the cap bites, it must drop prose before it drops code. Capping in walk
+# order silently truncated `shamsu/` on this repo because `agent context/`
+# sorts first, and the top hit for a code question became the word "of" in a
+# markdown file. A cap that changes the ANSWER is worse than a slow search.
+_CODE_SUFFIXES = frozenset({
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".php",
+    ".c", ".h", ".cpp", ".hpp", ".cs", ".kt", ".swift", ".scala", ".sh", ".sql",
+    ".vue", ".svelte",
+})
+
+
+def _code_first(files: list[str]) -> list[str]:
+    """Source before configuration before prose, each group in walk order."""
+    def rank(relative: str) -> int:
+        suffix = ("." + relative.rsplit(".", 1)[-1].lower()) if "." in relative else ""
+        if suffix in _CODE_SUFFIXES:
+            return 0
+        if suffix in {".json", ".toml", ".yaml", ".yml", ".ini", ".cfg"}:
+            return 1
+        return 2
+
+    return sorted(files, key=lambda relative: (rank(relative), relative))
+
 # Fusion weights, from smallcode. An exact match outweighs a semantic one by a
 # lot, which is what keeps this usable as a grep replacement rather than as a
 # fuzzy suggestion box.
@@ -132,14 +161,18 @@ def hash_token(token: str, dims: int = VECTOR_DIMS) -> int:
     return value % dims
 
 
-def embed(text: str, dims: int = VECTOR_DIMS) -> dict[int, float]:
+def embed_tokens(tokens: list[str], dims: int = VECTOR_DIMS) -> dict[int, float]:
     """A normalised sparse hashed bag of words. No model, no service."""
     vector: dict[int, float] = {}
-    for token in tokenize(text):
+    for token in tokens:
         key = hash_token(token, dims)
         vector[key] = vector.get(key, 0.0) + 1.0
     norm = math.sqrt(sum(value * value for value in vector.values())) or 1.0
     return {key: value / norm for key, value in vector.items()}
+
+
+def embed(text: str, dims: int = VECTOR_DIMS) -> dict[int, float]:
+    return embed_tokens(tokenize(text), dims)
 
 
 def cosine(left: dict[int, float], right: dict[int, float]) -> float:
@@ -245,9 +278,9 @@ def compile_pattern(query: str, mode: str) -> re.Pattern[str] | None:
         return re.compile(re.escape(query), re.IGNORECASE)
 
 
-def build_index(root: Path, files: list[str]) -> list[Chunk]:
+def _build_index_uncached(root: Path, files: list[str]) -> list[Chunk]:
     chunks: list[Chunk] = []
-    for relative in files[:MAX_INDEXED_FILES]:
+    for relative in _code_first(files)[:MAX_INDEXED_FILES]:
         full = Path(root) / relative
         try:
             if full.stat().st_size > MAX_FILE_BYTES:
@@ -267,8 +300,58 @@ def build_index(root: Path, files: list[str]) -> list[Chunk]:
                 frequency[token] = frequency.get(token, 0) + 1
             chunk.term_freq = frequency
             chunk.doc_length = len(tokens)
-            chunk.embedding = embed(searchable)
+            # `embed(text)` would tokenise this a second time - measured at
+            # 1.65s against 0.90s for the tokenise alone, i.e. most of the
+            # index build was doing the same work twice.
+            chunk.embedding = embed_tokens(tokens)
             chunks.append(chunk)
+            if len(chunks) >= MAX_INDEXED_CHUNKS:
+                # Partial index. The caller must SAY so - a cap that silently
+                # changes which files are searchable turns "no results" into a
+                # lie, and the model has no way to tell the difference.
+                _TRUNCATED.add(str(root))
+                return chunks
+    return chunks
+
+
+# One index per workspace, rebuilt only when a file actually changes. Without
+# this every search re-read and re-tokenised the whole project: measured on
+# this repo, 1,906 files and 18,084 chunks at ~8s a call. A model that searches
+# three times in a turn cannot pay that.
+_INDEX_CACHE: dict[str, tuple[tuple[Any, ...], list[Chunk]]] = {}
+
+# Workspaces whose index hit the chunk cap.
+_TRUNCATED: set[str] = set()
+
+
+def index_was_truncated(root: Path) -> bool:
+    return str(root) in _TRUNCATED
+
+
+def _signature(root: Path, files: list[str]) -> tuple[Any, ...]:
+    """Cheap fingerprint of the corpus: names plus modification times."""
+    stamps = []
+    for relative in files[:MAX_INDEXED_FILES]:
+        try:
+            stamps.append((relative, (root / relative).stat().st_mtime_ns))
+        except OSError:
+            stamps.append((relative, 0))
+    return tuple(stamps)
+
+
+def build_index(root: Path, files: list[str]) -> list[Chunk]:
+    """The chunk index for *root*, reusing the last one when nothing changed."""
+    key = str(root)
+    signature = _signature(root, files)
+    cached = _INDEX_CACHE.get(key)
+    if cached is not None and cached[0] == signature:
+        return cached[1]
+    chunks = _build_index_uncached(root, files)
+    # One workspace at a time in practice; more would be a memory leak with a
+    # long-lived REPL open on several projects.
+    if len(_INDEX_CACHE) >= 4:
+        _INDEX_CACHE.clear()
+    _INDEX_CACHE[key] = (signature, chunks)
     return chunks
 
 
@@ -353,7 +436,12 @@ def hybrid_search(
     return results[:limit]
 
 
-def format_results(results: list[dict[str, Any]], query: str, mode: str) -> str:
+def format_results(
+    results: list[dict[str, Any]],
+    query: str,
+    mode: str,
+    truncated: bool = False,
+) -> str:
     """A compact block a small model can act on.
 
     The score and the exact/semantic marker are shown deliberately: an exact
@@ -373,4 +461,10 @@ def format_results(results: list[dict[str, Any]], query: str, mode: str) -> str:
             lines.append(f"    {item['text']}")
     lines.append("")
     lines.append("* exact + semantic match   ~ semantic only (a lead, not a fact)")
+    if truncated:
+        lines.append(
+            "NOTE: the project was too large to index whole, so this searched "
+            "the first portion of it (code before prose). Pass `path` to scope "
+            "the search to a directory if what you want is missing."
+        )
     return "\n".join(lines)
