@@ -30,7 +30,6 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 ` in `old_string` can never match | **high** | tools |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
-| [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call is accepted as done** (14x) | **critical** | agent loop |
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
 | [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | **high** | agent loop |
 | [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalates | medium | tools |
@@ -61,6 +60,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Fixed by |
 |---|---|---|
 | [L1](#l1) | `think=` sent to models that cannot think → HTTP 400, **every turn dead** | `c5486ef` |
+| [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call was accepted as done** (14x) | `a7a5631` |
 | [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `09f29ee` |
 | [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `b08d298` |
 | [C2](TRUNCATED_FILES_REPORT.md) | **`_verify` reported "no syntax errors" for files it never opened** (572x in one session) | `dbbaaa1` |

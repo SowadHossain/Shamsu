@@ -5141,3 +5141,121 @@ def test_the_read_that_survives_is_the_one_the_model_reasons_from(tmp_path):
     prompt = "".join(m.content for m in state.all_messages)
     assert "line 426 - a stray comment" in prompt          # the claim survives
     assert "a perfectly ordinary comment" in prompt        # so does what disproves it
+
+
+# --- a turn that ends on a promise is not finished (C7) ------------------
+#
+# RC7. Fourteen assistant turns in the 2026-08-19 session ended with prose
+# announcing an edit and no tool call, every one on a colon, every one handed
+# back to the user as a complete answer. This is the defect the user felt:
+# "I told it to read files but nothing happened, the agent remained dumb."
+
+
+def test_the_three_promises_from_the_log_are_all_caught():
+    from shamsu.agents.simple_chat import ends_on_an_unmade_promise
+
+    for said in (
+        "I found it. I'll use patch_file to replace just those two lines:",
+        "...with proper code structure. I'll read lines 420-435 to see what to replace:",
+        "Now let me create a simple test to verify everything works:",
+    ):
+        assert ends_on_an_unmade_promise(said) == said.splitlines()[-1]
+
+
+def test_an_ordinary_answer_is_not_a_promise():
+    """A colon alone introduces the next paragraph; an announcement alone opens
+    one. It is a promise as the FINAL word that means nothing followed."""
+    from shamsu.agents.simple_chat import ends_on_an_unmade_promise
+
+    for said in (
+        "The port is 8080.",
+        "Here are the steps:" + chr(10) + "1. install it" + chr(10) + "2. run it",
+        "I'll read the file, and here is what it says: the port is 8080.",
+        "## What I changed:",
+        "I fixed it by moving the call.",
+    ):
+        assert ends_on_an_unmade_promise(said) == ""
+
+
+def test_a_turn_ending_on_a_promise_is_not_returned_as_the_answer(tmp_path):
+    """`describes_an_unmade_edit` cannot catch this: it needs a 4-line fence,
+    and here the model shows nothing at all."""
+    from shamsu.agents.simple_chat import describes_an_unmade_edit
+
+    promise = "I can see the problem. I'll use patch_file to fix those two lines:"
+    assert describes_an_unmade_edit(promise, ["main.js"]) == "", "the old guard cannot see it"
+
+    loop = _loop(
+        tmp_path,
+        [_text(promise), _tool("write_file", filepath="main.js", content="fixed\n"), _text("Done.")],
+        max_rounds=4,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("fix main.js"))
+
+    assert result.final == "Done."
+    assert (tmp_path / "main.js").read_text(encoding="utf-8") == "fixed\n"
+
+
+def test_the_nudge_quotes_what_was_promised_and_names_what_to_do(tmp_path):
+    """The correction goes where the model is looking, and it is specific."""
+    promise = "Let me read lines 420-435 to see exactly what needs replacing:"
+    loop = _loop(tmp_path, [_text(promise), _text("The port is 8080.")], max_rounds=3)
+
+    asyncio.run(loop.run("what is on line 426?"))
+
+    nudges = [m.content for m in loop.state.all_messages if m.role == "user"]
+    assert any(promise in c and "called no tool" in c for c in nudges)
+    assert any("Do it now, in this turn" in c for c in nudges)
+
+
+def test_a_promise_kept_after_the_nudge_ends_the_turn_normally(tmp_path):
+    loop = _loop(
+        tmp_path,
+        [_text("Let me fix that:"), _tool("write_file", filepath="a.js", content="x\n"), _text("Fixed.")],
+        max_rounds=4,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("fix a.js"))
+
+    assert not result.stopped
+    assert result.final == "Fixed."
+
+
+def test_the_promise_guard_has_an_exit(tmp_path):
+    """A guard with no escape is a deadlock. Saying it a third time is not going
+    to become doing it."""
+    from shamsu.agents.simple_chat import MAX_PROMISE_NUDGES
+
+    loop = _loop(tmp_path, [_text("Let me fix that:")] * 12, max_rounds=12)
+
+    result = asyncio.run(loop.run("fix a.js"))
+
+    assert result.stopped
+    assert result.rounds < 12
+    assert "Let me fix that:" in result.final
+    assert str(MAX_PROMISE_NUDGES + 1) in result.final
+
+
+def test_the_promise_stop_never_becomes_conversation(tmp_path):
+    """RC3's lesson: a harness notice replayed into later prompts teaches the
+    model that this is how a turn ends. It said so 54 times."""
+    from shamsu.agents.chat_state import _should_hydrate_chat_message
+
+    loop = _loop(tmp_path, [_text("Let me fix that:")] * 12, max_rounds=12)
+    result = asyncio.run(loop.run("fix a.js"))
+
+    assert not _should_hydrate_chat_message("assistant", result.final)
+
+
+def test_a_reply_the_output_cap_severed_is_not_treated_as_a_promise(tmp_path):
+    """That is C1's case. A cut-off reply ends mid-sentence for a different
+    reason, and nudging it to "just do it" is the wrong correction."""
+    loop = _loop(tmp_path, [_cut(content="I can fix that. Let me patch it:")], max_rounds=3)
+
+    result = asyncio.run(loop.run("fix it"))
+
+    assert "cut off" in result.final.lower()
+    assert "called no tool" not in result.final

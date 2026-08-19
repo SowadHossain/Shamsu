@@ -86,6 +86,12 @@ _IGNORED_DIRS = frozenset(
 # How many times one run may tell the model "you described it, now do it".
 MAX_PROSE_NUDGES = 2
 
+# How many times one run may tell the model "you said you would, so do it".
+# Separate from MAX_PROSE_NUDGES because it is a different failure: the prose
+# nudge fires when the model SHOWS the code instead of writing it, this one when
+# it shows nothing at all and only promises. Live 2026-08-19 that ended 14 turns.
+MAX_PROMISE_NUDGES = 2
+
 # How many empty replies one run tolerates before stopping and saying so.
 # Unbounded, this was a 24-round hang.
 MAX_EMPTY_NUDGES = 2
@@ -1253,6 +1259,7 @@ class SimpleChatLoop:
         tool_calls = 0
         prose_nudges = 0
         empty_nudges = 0
+        promise_nudges = 0
         for round_index in range(self.max_rounds):
             # Before the model is called, never during: a message appended
             # while a tool call is in flight lands between the assistant turn
@@ -1366,6 +1373,47 @@ class SimpleChatLoop:
                     )
                     self._activity(f"described a change to {described} without making it; asked it to apply")
                     continue
+                promised = ""
+                if not self._hit_the_length_limit():
+                    # A reply the OUTPUT CAP severed also ends mid-sentence, and
+                    # that is C1's case, not a broken promise. Only an intact
+                    # turn that chose to stop here is one.
+                    promised = ends_on_an_unmade_promise(text)
+                if promised and promise_nudges < MAX_PROMISE_NUDGES:
+                    # The defect the user actually experienced: "I told it to
+                    # read files but nothing happened, the agent remained dumb."
+                    # It was not dumb - it was cut off at the exact moment it was
+                    # about to act, every time, and told that was a complete
+                    # answer. 14 turns in one session ended on a colon with no
+                    # tool call, and every one was handed back as finished.
+                    promise_nudges += 1
+                    self._repair_attempts += 1
+                    self.state.append_assistant(text)
+                    self.state.append_user(
+                        f"Your reply ended on {promised!r} and then stopped. Nothing "
+                        "followed it and you called no tool, so nothing happened.\n\n"
+                        "Do it now, in this turn: call the tool that carries out what you "
+                        "just said you would do. Do not say you are about to do it again."
+                    )
+                    self._activity("ended on a promise with no tool call; asked it to act")
+                    continue
+                if promised and promise_nudges >= MAX_PROMISE_NUDGES:
+                    # The exit. Saying it a third time is not going to become
+                    # doing it, and handing the promise back as an answer is the
+                    # defect itself. `_HARNESS_STATUS_PREFIXES` in chat_state
+                    # already filters this opening on rehydration, so the notice
+                    # never becomes conversation the model learns to imitate.
+                    return self._stop(
+                        "I said I would take an action and then did not take it, "
+                        f"{promise_nudges + 1} times in a row. The last thing I said was "
+                        f"{promised!r}, and no tool call followed it, so nothing in the "
+                        "workspace changed.\n\n"
+                        "Ask me for the single next step - one file, one change - and I "
+                        "will carry it out rather than announce it.",
+                        round_index,
+                        tool_calls,
+                        changed,
+                    )
                 if self._hit_the_length_limit():
                     # The model was still speaking when the window ran out.
                     # Keep what it managed to say, but never present it as a
@@ -3338,6 +3386,68 @@ def describes_an_unmade_edit(text: str, files: list[str]) -> str:
     return names_a_workspace_file(text, files)
 
 
+# Ways a model announces that it is about to act. Only ever consulted on the
+# LAST line of a reply, where "about to" was never followed by anything.
+_PROMISE_OPENERS = (
+    "let me",
+    "let's",
+    "lets",
+    "i'll",
+    "i will",
+    "i am going to",
+    "i'm going to",
+    "i need to",
+    "i should",
+    "now i",
+    "next i",
+    "first i",
+    "here is what i",
+    "here's what i",
+)
+
+
+def ends_on_an_unmade_promise(text: str) -> str:
+    """The announcement a turn ended on and never carried out, or ``""``.
+
+    `describes_an_unmade_edit` is meant to catch this and cannot: it requires a
+    fenced code block of four lines or more, so it only fires when the model
+    SHOWS the code instead of writing it. Here the model shows nothing at all -
+    it promises, and stops.
+
+    Fourteen assistant turns in the session of 2026-08-19 ended this way:
+
+        "...I'll use patch_file to replace just those two lines:"
+        "...I'll read lines 420-435 to see exactly what needs to be replaced:"
+        "...let me create a simple test to verify everything works:"
+
+    Every one ends in a colon. The next thing should be a tool call; there is
+    none, and the turn was handed back to the user as a finished answer. This is
+    the defect the user actually experienced - *"I told it to read files but
+    nothing happened, the agent remained dumb."* It was not dumb; it stopped at
+    the exact moment it was about to act, and was told that was complete.
+
+    Both conditions are required. A colon alone is an ordinary way to introduce
+    the next paragraph, and an announcement alone is an ordinary way to open
+    one - it is a promise as the FINAL word of a reply that means nothing
+    followed it.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    last = lines[-1]
+    if not last.endswith(":"):
+        return ""
+    if last.startswith(("#", "|", ">", "```")):
+        # A heading or a table row introduces a section that was cut, which is
+        # a different problem and not a promise to act.
+        return ""
+    lowered = f" {last.lower()} "
+    for opener in _PROMISE_OPENERS:
+        if re.search(rf"(?<![a-z]){re.escape(opener)}(?![a-z])", lowered):
+            return last
+    return ""
+
+
 # Verbs that ask for WORDS, and verbs that ask for a CHANGE. Matched on word
 # boundaries: `_PRD_BUILD_NOUNS` once held "it" as a raw substring, which made
 # almost any English sentence "name a product". The same mistake here would
@@ -3651,6 +3761,7 @@ __all__ = [
     "command_needs_approval",
     "asks_only_for_words",
     "describes_an_unmade_edit",
+    "ends_on_an_unmade_promise",
     "expand_mentions",
     "render_memory",
     "make_approval_func",
