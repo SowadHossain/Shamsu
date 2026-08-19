@@ -36,7 +36,7 @@ where SHAMSU already has the better backend, keep it and expose it.**
 | `tdd_loop`, `contract_*` | `verify/` gate | not taken | SHAMSU verifies after every write already |
 | `bone_compile`, `bone_check` | — | not taken | their DSL |
 | cloud escalation | — | **refused** | against the prime directive: inference is local |
-| two-stage tool routing | — | not taken | real at 18 tools; the indirection simple mode exists to remove |
+| two-stage tool routing | — | **taken, ctx-gated** | reversed on evidence: at 19 tools the schemas cost 2,111 tokens/call, so it is on at or below 16k and off above |
 
 **7 tools → 19.**
 

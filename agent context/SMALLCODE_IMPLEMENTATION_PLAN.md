@@ -474,11 +474,116 @@ turn re-summarised the whole history — one wasted model call per turn, forever
 (§3 of `CONTEXT_AND_TRUNCATION_PLAN.md`, dropped from this document). The
 watermark is now transcript-absolute on both the save and the load side.
 
-### Not done
+### The live run — 2026-08-19, qwen2.5:3b-instruct, 8/9
 
-**No live run yet.** Everything above is unit-tested against a scripted client.
-The numbers are real but synthetic; a session against a real model on a real
-workspace is the remaining verification.
+This section used to read *"No live run yet. Everything above is unit-tested
+against a scripted client."* It has now been run: five turns, fresh workspace,
+a fresh `SimpleChatLoop` per turn rehydrating from disk, `--approval allow`.
+
+| | |
+|---|---|
+| A calibration recorded | **PASS** |
+| A estimate within 15% of `prompt_eval_count` | **FAIL** — see below |
+| B `num_keep` covers the system prompt | **PASS** (308) |
+| B no reply cut off and passed off as finished | **PASS** (`done_reason` `stop` on all five) |
+| C `server.py` created | **PASS** |
+| C `server.py` later edited | **PASS** |
+| **RECALL: the port survived four turns** | **PASS** |
+| no turn stopped on a guard | **PASS** |
+| all five turns completed | **PASS** |
+
+#### It found a bug on the first call, and the bug was total
+
+```
+ResponseError: "qwen2.5:3b-instruct" does not support thinking (status code: 400)
+```
+
+Every turn, dead before a token was generated. Simple mode sent `think=`
+unconditionally; Ollama rejects it outright for a model with no reasoning
+channel. **Every non-reasoning model was unusable** — which is most of the
+roster, qwen2.5-coder:7b-instruct included, the default on an 8GB machine. The
+cookbook had `is_reasoning=False` recorded for all of them and
+`runtime/models.py` exposes `model_is_reasoning()` for exactly this question;
+simple mode never asked it. Fixed in `c5486ef`.
+
+Nothing in 2,800 unit tests could have caught this. That is the argument for
+the live run, made by the live run.
+
+#### The recall probe passed — the one the plan said the prompt cannot test
+
+§D's verification list says *"the model can still name every file it
+touched"* cannot be tested through the prompt, because the always-fresh
+workspace listing names every file whether history remembers it or not. So the
+probe used a fact only the conversation carries: a port number stated in turn
+1, asked back in turn 5, with two file writes and a command run in between.
+
+> **"The dev server was said to run on port 8731."**
+
+It reached it via `memory_load` — item H, doing the job it was added for.
+
+#### A: the calibration works; the raw estimator is 15% heavy
+
+Drift (`prompt_eval_count / our estimate`) was flat across all five turns, and
+the correction factor walked straight to it:
+
+```
+turn      1       2       3       4       5
+drift   0.848   0.879   0.857   0.852   0.848
+factor  0.944   0.879   0.861   0.856   0.853
+```
+
+The acceptance line failed, and it failed in the *safe* direction: we
+over-count, so the budget under-fills the window rather than overflowing it.
+But 15% of a 32k window is ~4,900 tokens left on the table on this model. The
+machinery is right — the factor found the truth in four turns, which is
+exactly what it was built to do. What is wrong is the uncalibrated estimate,
+and the likely cause is the vendored Qwen3 tokenizer counting a Qwen2.5 prompt.
+
+#### The real finding: tool schemas ARE the prompt
+
+Per-turn buckets, live:
+
+```
+turn   system  schemas  grounding  conversation  tool results   total
+  1      308     2111        50           47            92      2,608
+  2      308     2111        49          482           738      3,688
+  5      308     2111        49           33            83      2,584
+```
+
+**The tool schemas are 57–81% of every prompt.** The conversation — the thing
+all of §D's elision machinery protects — is 29 to 482 tokens.
+
+`_elide_under_pressure` already reports this correctly: it checks
+`fattest() != "tool results"` and says *"eliding payloads will not help much
+here"*. It is right, and it has nothing to offer instead.
+
+Two-stage routing is the mechanism that would fix it, and it is **off**, because
+it gates on the context window (≤ 16k) and this session runs at 32k. That gate
+is smallcode's and the reasoning holds for a full window — paying a round to
+save 2k out of 32k is a bad trade. It does not hold here: the prompt is 2.6k,
+so the schemas are not 6% of the window, they are 81% of the prompt.
+
+**Recommended next change:** gate two-stage routing on the schema *share of the
+prompt*, not on the window size alone. A 2,111-token schema block in front of a
+477-token conversation is the trade the router exists to make, whatever the
+window happens to be.
+
+#### Also observed, not yet actioned
+
+* **The small model thrashes.** Turn 2 — "create server.py that prints hello" —
+  took 292s, 8 rounds and 4 tool calls. Turn 3 took 5 rounds and 4 tool calls to
+  change one string. No guard fired, because none of them was unproductive by
+  the counters' definition. Worth a look before the round budget is trusted.
+* **The first call costs ~110s** (model load plus 32k KV allocation); turns 4
+  and 5 took 3.7s and 1.4s. Cold start dominates a short session.
+
+### Still not done
+
+* A second live run on a **reasoning** model (qwen3:8b), to exercise the `think=`
+  path the 3B model cannot reach.
+* A long-session live run — every turn above sat far inside the window, so
+  compaction, elision and eviction were never triggered (`compactions=0`,
+  `elisions=0` throughout). §D and §F remain **synthetic-only**.
 
 ### Measured end to end — and a correction to how D should be stated
 

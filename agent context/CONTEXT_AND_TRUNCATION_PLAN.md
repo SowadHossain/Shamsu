@@ -548,9 +548,14 @@ For the record, since these came out of the same investigation.
 
 | # | Item | Note |
 |---|---|---|
-| 14 | **`repl.py` split** | 451 functions, 18,780 lines; the CLI imports **271 of 292 modules** because of it. Gates ~47,000 lines of legacy removal. |
-| 15 | **Prose-nudge false positive when planning** | `describes_an_unmade_edit` fired during a plan ("described a change ... without making it"). Describing a change *is* the deliverable when planning. Cost one round; did not derail the result. |
-| 16 | **Ollama's `n_keep = 4`** | if a prompt ever does overflow, the server drops from the front and keeps almost nothing. Worth setting deliberately so the system prompt survives. |
+| 14 | **`repl.py` split** | 451 functions, **19,041** lines as of 2026-08-19 — it grew, it did not shrink. The CLI imports **271 of 292 modules** because of it. Gates ~47,000 lines of legacy removal. **Still the one big open item.** |
+
+### Closed since — 2026-08-19
+
+| # | Item | How |
+|---|---|---|
+| 15 | **Prose-nudge false positive when planning** | New `asks_only_for_words(request)` gates the nudge: a words-verb (plan / review / explain / …) with **no** change-verb present means prose is the deliverable, so showing code is not a skipped job. Deliberately asymmetric — "review it and fix the bug" still nudges, because skipping the nudge wrongly means the work silently never happens while nudging wrongly costs one round. Guard proved by removal: planning goes 1 round → 2. |
+| 16 | **Ollama's `n_keep = 4`** | `_num_keep()` now sends `num_keep` sized to the system prompt (297 tokens today), clamped to `num_ctx // 8` so a long prompt cannot starve the window it is protecting. The budget is meant to make overflow impossible; this is the floor under an estimate that was wrong by 9,500 tokens as recently as this week. Guard proved by removal: `4 >= 297` fails. |
 
 ### Method notes worth keeping
 

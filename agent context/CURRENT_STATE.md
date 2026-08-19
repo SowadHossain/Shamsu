@@ -1,10 +1,45 @@
 # SHAMSU — Current State
 
-**As of:** 2026-07-21 · **Version:** `0.4.0b1` · **Branch base:** `develop`
+> ## ⚠ STALE BELOW THIS LINE — read this banner first
+>
+> **The body of this file describes 2026-07-21.** It was accurate then. It has
+> not been re-audited since, and the project moved a long way in between: the
+> default execution path is no longer the one described here.
+>
+> **What changed, and where the current record is:**
+>
+> | Since 2026-07-21 | Read |
+> |---|---|
+> | **SIMPLE MODE is the default** — plain Ollama chat plus a tool roster, no router/planner/phase objects. Legacy routing is behind `SHAMSU_LEGACY_ROUTING=1`, so most of the routing analysis below describes a path that no longer runs by default. | `shamsu/agents/simple_chat.py` |
+> | **The smallcode adoption arc (A–H)** — ground-truth token accounting, thinking budget, patch-first editing, payload elision, context meter, per-category budgets, `@file` expansion, a model-written scratchpad. | `SMALLCODE_IMPLEMENTATION_PLAN.md` |
+> | **The tool roster grew 7 → 19**, hybrid search replaced a literal-substring grep, and two-stage tool routing was adopted (context-gated). | `SMALLCODE_TOOL_COMPARISON.md` |
+> | **Context/truncation work** — 13 bugs fixed; of the 3 left open there, the prose-nudge false positive and Ollama's `n_keep` were closed on 2026-08-19, leaving the `repl.py` split. | `CONTEXT_AND_TRUNCATION_PLAN.md` |
+> | **Active branch is `small-shamsu`**, 63 commits ahead of `main`, unmerged. | `git log main..small-shamsu` |
+>
+> **Corrections to the Numbers table below, verified 2026-08-19:**
+>
+> * *"Unit/integration tests: 1449 passed"* — stale; the suite is far larger
+>   now. Re-run it rather than quoting this.
+> * *"Lint: passes"* — was **false** as of 2026-08-19 morning (11 ruff
+>   errors). Fixed the same day; it passes again, but the line had been
+>   asserting something nobody had checked in weeks.
+> * *"Codebase: 202 modules"* — stale. `shamsu/cli/repl.py` alone is now
+>   ~19,000 lines and is the open blocker on removing the legacy tree.
+>
+> **What is NOT verified, and matters most:** every context/budget number in
+> the smallcode work is measured against a *scripted* client. There has been no
+> live run against a real model on a real workspace. That is the outstanding
+> acceptance gate for the current branch — not anything described below.
 
-This is the honest snapshot. `PROGRESS.md` is the long historical ledger;
-`REQUIREMENTS.md` is the spec. This file is what an agent or a new contributor
-should read to know where the project actually stands.
+---
+
+**As of:** 2026-07-21 · **Version:** `0.4.0b1` · **Branch base:** `develop`
+**Superseded:** 2026-08-19 — see the banner above.
+
+This was the honest snapshot on 2026-07-21. `PROGRESS.md` is the long
+historical ledger; `REQUIREMENTS.md` is the spec. Read it as history: it
+records a real investigation whose root-cause analysis still holds, but it is
+no longer a description of what runs today.
 
 ---
 

@@ -1,7 +1,19 @@
 # Adopting SmallCode's practices — plan
 
-**Status: PLAN ONLY. No harness code changed.**
+**Status: IMPLEMENTED. A-H all landed on branch `small-shamsu`, 2026-08-19.**
 Written 2026-08-19.
+
+This file is kept as the *reasoning*: what was worth taking from smallcode, and the number on
+our own harness that justified each item. It is not the record of what was built.
+For that - including the five places implementing it proved the plan wrong, and
+the second round read from smallcode's source rather than from this summary of
+it - see `SMALLCODE_IMPLEMENTATION_PLAN.md`.
+
+One decision here was later REVERSED on evidence: two-stage tool routing is
+listed below under "Explicitly NOT adopting" on the grounds that we send 6 tools.
+The roster then grew to 19 (~2,100 tokens of schema per call) and the premise
+no longer held, so it was adopted in `1d0444a` - gated on the context window,
+the way smallcode gates it. See `shamsu/agents/simple_router.py`.
 
 ## What was cloned, and the rules around it
 
@@ -228,10 +240,16 @@ for our workload.
 - **Cloud escalation** (`bin/escalation.js`, cloud pricing tables). Routes hard
   failures to Claude/GPT/DeepSeek. Directly against SHAMSU's prime directive:
   inference is local.
-- **Two-stage tool routing.** Real savings at 18–20 tools (~800 tokens when the
-  category is "respond"). We send **6** small schemas, so the payoff is minor and
+- ~~**Two-stage tool routing.**~~ **REVERSED — adopted in `1d0444a`.** The
+  original reasoning: *"Real savings at 18–20 tools (~800 tokens when the
+  category is 'respond'). We send **6** small schemas, so the payoff is minor and
   the cost is exactly the routing indirection simple mode was built to delete.
-  Revisit only if the tool count grows.
+  Revisit only if the tool count grows."* The tool count grew, the same day: 19
+  tools, 2,111 tokens of schema on every call, 6.4% of a 32k window. The part
+  worth copying exactly turned out to be **when not to use it** — smallcode routes
+  on the context window (two-stage at or below 16k, everything above it), which
+  is better than the manual switch reached for first. See
+  `shamsu/agents/simple_router.py`.
 - **MarrowScript cognition layer.** Their own DSL and compiler. Interesting, not
   a fit.
 
@@ -253,5 +271,7 @@ for our workload.
 A–E are the ones tied to bugs measured on our own harness this week. F–H are
 improvements rather than fixes.
 
-**Nothing here has been implemented.** Confirm the order — or reorder it — before
-any code moves.
+**All eight landed in this order**, one commit each, every guard verified by
+removing it and watching the right test fail. What shipped, what it cost, and
+where the plan turned out to be wrong is recorded in
+`SMALLCODE_IMPLEMENTATION_PLAN.md`.
