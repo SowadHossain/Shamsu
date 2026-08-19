@@ -429,7 +429,7 @@ watching the right test fail. Suite green throughout.
 | A | `24cda8a` | + three uncounted overheads the plan missed (below) |
 | B | `24cda8a` | gated on `done_reason`, not blanket (below) |
 | C | `4575ac7` | 400-token threshold, escape on second attempt |
-| D | `37ca22a` | at **hydration**, not in-memory (below); **5.3x measured** |
+| D | `37ca22a` | at **hydration**, not in-memory (below); **2x history retained** |
 | E | `30a161b` | + the re-compaction bug **fixed**, not just counted |
 | F | `ee4af6f` | five buckets; eviction picks by fattest |
 | G | `1318018` | `MentionResolver` wired; sent, not persisted |
@@ -479,3 +479,36 @@ watermark is now transcript-absolute on both the save and the load side.
 **No live run yet.** Everything above is unit-tested against a scripted client.
 The numbers are real but synthetic; a session against a real model on a real
 workspace is the remaining verification.
+
+### Measured end to end — and a correction to how D should be stated
+
+A 30-turn write-heavy session, scripted client, same workspace, elision on and
+off:
+
+```
+config             msgs in prompt    tokens   decisions kept   oldest kept
+WITHOUT elision                35    28,815            30/30        turn 1
+WITH elision                   71    28,525            30/30        turn 1
+```
+
+**The prompt does not get smaller, and it was never going to.** `select_for_budget`
+caps it either way — that is its job. What changes is what fits inside the cap:
+**twice as much verbatim conversation** (35 messages against 71) for the same
+28.5k tokens.
+
+So the honest statement of D is *"the same window now holds twice the history"*,
+not *"the prompt drops 75%"*. The 5.3x figure — 184,520 tokens verbatim against
+34,904 elided on a 130-message session — is real, but it measures what sending
+everything **would** cost, and the budget was already truncating instead. The
+plan's own framing ("~13 turns → ~57 before the window fills") is the right
+shape; the "prompt drops ~75%" verification line in §D is not, and would have
+been recorded as a pass that never happened.
+
+Both configurations kept all 30 decisions here, because the deterministic digest
+carries them independently. A longer or more payload-heavy session is where the
+retained-history difference starts to cost recall; that needs a live run.
+
+Also worth noting for anyone reading §D's verification list: "the model can still
+name every file it touched" cannot be tested through the prompt alone — the
+always-fresh workspace listing names every file whether history remembers it or
+not. It has to be probed with a fact only the conversation carries.
