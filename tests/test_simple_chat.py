@@ -3114,6 +3114,44 @@ def test_generation_is_capped_at_the_reserve_the_budget_held_back(tmp_path):
     assert options["num_predict"] == output_reserve(options["num_ctx"])
 
 
+def test_a_model_that_cannot_think_is_never_asked_to(tmp_path):
+    """LIVE 2026-08-19: every turn died on `does not support thinking` (400).
+
+    Ollama rejects `think=` outright for a model with no reasoning channel, so
+    the turn is over before a token is generated. Against qwen2.5:3b-instruct
+    that killed all five turns of the first live run. The cookbook had recorded
+    `is_reasoning=False` for it the whole time - simple mode never asked, so
+    most of the roster (the 8GB default included) could not run at all.
+    """
+    loop = _loop(tmp_path, [_text("done")])
+    loop.model_name = "qwen2.5-coder:7b-instruct"
+    asyncio.run(loop.run("hi"))
+
+    assert loop.client.calls[0]["think"] is False
+
+
+def test_a_reasoning_model_is_still_asked_to_think(tmp_path):
+    """The other half: the gate must not switch thinking off for everyone."""
+    loop = _loop(tmp_path, [_text("done")])
+    loop.model_name = "qwen3:8b"
+    asyncio.run(loop.run("hi"))
+
+    assert loop.client.calls[0]["think"] is True
+
+
+def test_an_unknown_model_is_assumed_not_to_think(tmp_path):
+    """False is the safe default, and the asymmetry is the reason.
+
+    A reasoning model asked NOT to think still answers. A plain model asked to
+    think returns a 400 and nothing else.
+    """
+    loop = _loop(tmp_path, [_text("done")])
+    loop.model_name = "some-model-nobody-has-heard-of"
+    asyncio.run(loop.run("hi"))
+
+    assert loop.client.calls[0]["think"] is False
+
+
 def test_a_cut_off_answer_is_never_presented_as_a_finished_one(tmp_path):
     """`done_reason == "length"` means the model was still speaking."""
     loop = _loop(tmp_path, [_cut(content="The fix is to set window.asteroid")])

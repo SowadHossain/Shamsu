@@ -1415,6 +1415,31 @@ class SimpleChatLoop:
             "`/new` starts a fresh one; older file payloads are already elided."
         )
 
+    def _should_think(self) -> bool:
+        """Whether to ask for a reasoning trace on THIS call.
+
+        Two independent questions, and only the second one used to be asked.
+
+        **Can this model think at all?** Ollama rejects `think=` outright for a
+        model without a reasoning channel - `does not support thinking`, status
+        400, and the turn is over before a single token is generated. Live
+        2026-08-19 against qwen2.5:3b-instruct that killed all five turns. The
+        cookbook had recorded `is_reasoning=False` for it the whole time; simple
+        mode simply never consulted it, so every non-reasoning model - which is
+        most of the roster, the 8GB default included - could not run at all.
+
+        An unknown model falls back to the family patterns in
+        `runtime/models.py`, which answer False unless the name says otherwise.
+        False is the safe default here: a reasoning model asked not to think
+        still answers, while a plain model asked to think returns nothing.
+
+        **Should it think on this particular call?** That is
+        `_should_disable_thinking` below, unchanged.
+        """
+        if not model_is_reasoning(self.model_name):
+            return False
+        return not self._should_disable_thinking()
+
     def _should_disable_thinking(self) -> bool:
         """Whether this call should be made without a reasoning trace.
 
@@ -1500,7 +1525,7 @@ class SimpleChatLoop:
             "messages": messages,
             "tools": active_tool_schemas(num_ctx, self._tool_category),
             "stream": False,
-            "think": not self._should_disable_thinking(),
+            "think": self._should_think(),
             "options": {
                 "temperature": self.temperature,
                 "num_ctx": num_ctx,
