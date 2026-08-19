@@ -7,8 +7,8 @@ in `ISSUES.md`. This file is the summary you read first.
 Every guard below was proved by **removing it** and watching the named test fail
 with the named message. A commit is not proof.
 
-Suite: `.venv/Scripts/python.exe -m pytest tests/test_simple_chat.py -q`
-254 passed at the start of the run, 288 at the end, 0 failures.
+Suites: `tests/test_simple_chat.py` 254 -> 297 passed; `tests/test_agent_tools.py`
+17 -> 34 passed. 0 failures. Ruff clean. 433 passed across every suite touched.
 
 ---
 
@@ -203,10 +203,143 @@ how a turn ends.
 | C11 | C2 made the verifier honest about what it skips. 14 common extensions (`.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs`) still have no checker. Scheduled after the patch cluster. |
 | C12 | `09f29ee` landed RC10 fix 1 only. Fixes 2 (elide stale claims with the read behind them) and 3 (mark a re-read that follows a user correction) are not done, and closing C10 without saying so would overstate it. |
 
-## Known limitation carried forward
+---
 
-Every stall counter in simple mode — `MAX_UNPRODUCTIVE_EDITS`, the per-file edit
-ceiling, and the two guards added above — lives on `SimpleChatLoop`, and a fresh
-one is built per user message. **They all reset whenever the user types.** That
-is C6, and it is why one failing patch was retried nine times across a session.
-Fixing it at the counter's home fixes all of them at once.
+## C3 — a literal `
+` in `old_string` could never match · `66fc252`
+
+**File** `shamsu/tools/agent_tools.py` — `edit_file`, new `_decode_literal_escapes`
+
+**Why** The model emits `
+` as two characters where a newline belongs, mixed
+with real newlines in the same string. That text is in no file, so it can never
+match: 24 patch attempts and 0 successes in one session, 29 more in the next.
+The harness's error was accurate and useless because it compared the mangled
+string as given.
+
+**Approach** The salvage principle already used for malformed tool calls — if
+the raw form does not match and the decoded form does, decode it. `new_string`
+is decoded with it, or the literal backslash lands **in** the file and one
+corruption is traded for another.
+
+**Decision**
+
+```
+old_string not found by exact match
+├─ contains an unescaped 
+, 
+ or 	
+│  └─ decoded form matches the file? ..... yes .. apply, and SAY so
+│                                          no ... fall through
+├─ whitespace / line-ending drift ........ unique fuzzy hit .. apply
+└─ still nothing ......................... fail, and name the format mistake
+```
+
+**Narrow on purpose** `n`, `r`, `t` only. `\d`, `\s` and `\` are ordinary
+content in a regex or a Windows path, and decoding them would corrupt the very
+edit being made. A real `"\n"` in JavaScript source is left exactly as the
+file has it.
+
+**Reported either way** On success the message says the salvage happened — one
+the model never hears about is one it makes every turn, and the next may not be
+salvageable.
+
+**Proof** Disable the decode →
+`test_a_patch_whose_newlines_arrived_as_two_characters_still_applies` fails on
+the log's own `main.js` payload.
+
+---
+
+## C6 — stall counters reset every time the user typed · `4dfc17b`
+
+**File** `shamsu/agents/simple_chat.py` — new `SessionStalls`, `_run_tools`
+
+**Why** `MAX_UNPRODUCTIVE_EDITS = 4` existed the whole time and would have
+caught the failure. It never fired: `_unproductive` lived on `SimpleChatLoop`,
+and `repl.py:4812` builds a fresh one per user message. The model failed four
+times, the user typed, and it started again from zero. 29 patch calls, 11
+distinct payloads, one sent **nine times** byte-for-byte.
+
+**Approach** Key the store by session id, so `/new` gives a clean slate without
+the `/new` handler having to know it exists. Signatures digest the *whole*
+argument set — `_argument_summary` truncates, which would have made two
+4,000-character patches differing only at the end look like one call.
+
+**Decision**
+
+```
+writing call about to run
+├─ this exact call already failed >= 2 times in this conversation
+│     └─ NOT RUN: hand back the error it already had + what to do instead
+└─ run it
+   ├─ succeeded ......... forget every remembered failure for THAT file
+   └─ failed ............ remember (signature -> error), count it
+
+no-op mutations reach 4 (across turns) .... stop, tell the user, THEN reset
+```
+
+**Two escapes** A successful edit to a file forgets that file's failures — the
+world changed, and a patch that could not match before may match now. And the
+no-op counter resets once it has *fired*: the defect was a counter that reset
+silently without ever tripping, but one that stayed hot would stop the next turn
+before it started.
+
+**Proof** Put the counters back on the loop object →
+`test_the_no_op_counter_is_not_reset_by_the_user_typing` fails with
+`a new turn wiped the count`.
+
+**A test that was wrong first** The original version bound `_stalls` by hand and
+passed with the fix removed — it exercised the store, not the wiring. It now
+builds the loop through the constructor with a session id, the way `repl.py`
+does.
+
+---
+
+## C8 — the same patch error returned 29x, unchanged · `a342fd1`
+
+**File** `shamsu/tools/agent_tools.py` — `_nearby_edit_hint`
+
+**Why** Every failure returned one sentence: *"Nearest similar line is line 424:
+..."*. It never widened, never escalated, and never offered the actual text, so
+the model had nothing new to reason from and recomputed the same call from
+memory — which is where the error was in the first place.
+
+**Approach** `read_and_patch` already carries the rule *a half-failure returns
+the half that worked*; plain `patch_file` did not. It now hands back the real,
+numbered lines around the nearest anchor, so the next attempt can be **copied**
+rather than recalled.
+
+**Decision**
+
+```
+old_string not found
+├─ nothing in the file resembles its first line
+│     └─ say exactly that + "call read_file"   <- no fake anchor
+└─ an anchor exists
+      └─ 7 lines either side, numbered, 160 chars each
+         + "copy it character for character, not from memory"
+
+(the same call a 3rd time is not run at all — C6)
+```
+
+**Proof** Restore the one-line hint → three tests fail, quoting the 29x sentence
+back verbatim.
+
+---
+
+## Correction to an earlier note in this file
+
+An earlier draft said every stall counter — *including the two guards added for
+C1 and C7* — reset when the user types, and that C6 would fix all of them at
+once. Half of that was wrong, and only the counters C6 actually moved were
+moved:
+
+| counter | scope | why |
+|---|---|---|
+| `unproductive` (no-op edits) | **session** | tracks the model repeating itself, which spans user turns. This was the bug. |
+| remembered failed calls | **session** | same reason |
+| `promise_nudges` (C7) | turn | a nudge *budget*, not a stall detector. A new user message is a new question and deserves a fresh one. |
+| `_truncated_refusals` (C1) | turn | same — and it already stops the turn on the third, so it cannot run away |
+
+Making the last two session-scoped would end a whole conversation after two
+nudges ever, which is a worse failure than the one it would prevent.

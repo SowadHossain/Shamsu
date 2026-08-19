@@ -3904,9 +3904,28 @@ def _fuzzy_match_block(content: str, old_string: str) -> str | None:
     return "\n".join(file_lines[start:start + span])
 
 
+# Lines of real file shown either side of a failed edit's nearest anchor, and
+# the cap on each. Fifteen lines is enough to copy an anchor out of and small
+# enough that a wrong guess costs little.
+EDIT_HINT_CONTEXT_LINES = 7
+EDIT_HINT_LINE_CHARS = 160
+
+
 def _nearby_edit_hint(content: str, old_string: str) -> str:
-    """When edit_file's old_string is not found, point at the closest existing
-    line so the model can fix whitespace/exact-text instead of guessing again."""
+    """When `old_string` is not found, hand back the file's OWN text there.
+
+    The old version returned one line - *"Nearest similar line is line 424:
+    ..."* - which is accurate and useless on repeat. Live 2026-08-19 that exact
+    sentence came back 29 times unchanged. It never widened and never offered
+    the actual text, so the model had nothing new to reason from and computed
+    the same call again from memory, which is where the error was in the first
+    place.
+
+    `read_and_patch` already carries the right rule: a half-failure returns the
+    half that worked. Plain `patch_file` did not. Now it does - the real,
+    numbered lines around the nearest anchor, so the next attempt can be copied
+    rather than recalled.
+    """
     probe_lines = [line.strip() for line in old_string.splitlines() if line.strip()]
     if not probe_lines:
         return "Read the file (optionally with start_line/end_line) to copy the exact text."
@@ -3915,14 +3934,25 @@ def _nearby_edit_hint(content: str, old_string: str) -> str:
     stripped = [line.strip() for line in file_lines]
     close = difflib.get_close_matches(probe, stripped, n=1, cutoff=0.6)
     if not close:
-        return "Read the file (optionally with start_line/end_line) to copy the exact text, including whitespace."
-    for idx, line in enumerate(file_lines, start=1):
-        if line.strip() == close[0]:
-            return (
-                f"Nearest similar line is line {idx}: {close[0][:120]!r}. "
-                "Match the exact text and whitespace (read a line range first if unsure)."
-            )
-    return "Read the file to copy the exact text, including whitespace."
+        return (
+            "Nothing in the file resembles the first line of your old_string. Call "
+            "read_file (optionally with start_line/end_line) and copy the exact text, "
+            "including whitespace, out of the result."
+        )
+    anchor = stripped.index(close[0])
+    start = max(0, anchor - EDIT_HINT_CONTEXT_LINES)
+    end = min(len(file_lines), anchor + EDIT_HINT_CONTEXT_LINES + 1)
+    width = len(str(end))
+    window = chr(10).join(
+        f"{number:>{width}} | {file_lines[number - 1][:EDIT_HINT_LINE_CHARS]}"
+        for number in range(start + 1, end + 1)
+    )
+    return (
+        f"The nearest line is {anchor + 1}. This is what the file ACTUALLY says "
+        f"around it:" + chr(10) * 2 + window + chr(10) * 2 +
+        "Copy the text you want to replace out of those lines, character for "
+        "character, rather than writing it from memory."
+    )
 
 
 def _edit_recovery_excerpt(content: str, old_string: str, *, max_chars: int = 4000) -> str:

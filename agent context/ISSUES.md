@@ -26,13 +26,9 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 
 | # | Issue | Severity | Area |
 |---|---|---|---|
-| [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
-` in `old_string` can never match | **high** | tools |
 | [C11](#c11) | Syntax checking covers 13 extensions; `.html`, `.php`, `.rb`, `.yaml`, `.toml`, `.cs` and more get no check at all | medium | verify |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail is 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | **high** | context |
 | [C12](#c12) | A stale assistant claim outlives the read behind it, and a re-read after a user correction is not marked as one | medium | context |
-| [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | **high** | agent loop |
-| [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalates | medium | tools |
 | [C9](TRUNCATED_FILES_REPORT.md) | Harness nudges recorded as "you asked" in the compaction digest | medium | context |
 | [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blames the window, is replayed 53x into later prompts | medium | context |
 | [M1](#m1) | **Memory is only written if the model volunteers** — a real 2-turn run produced none | **high** | memory |
@@ -60,6 +56,10 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | # | Issue | Fixed by |
 |---|---|---|
 | [L1](#l1) | `think=` sent to models that cannot think → HTTP 400, **every turn dead** | `c5486ef` |
+| [C3](TRUNCATED_FILES_REPORT.md) | `patch_file` 0/24 success — literal `
+` in `old_string` could never match | `66fc252` |
+| [C6](TRUNCATED_FILES_REPORT.md) | Identical failing patch retried 9x — stall counters reset every user turn | `4dfc17b` |
+| [C8](TRUNCATED_FILES_REPORT.md) | Same patch error returned 29x unchanged, never escalated | `a342fd1` |
 | [C7](TRUNCATED_FILES_REPORT.md) | **A turn ending on "let me fix this:" with no tool call was accepted as done** (14x) | `a7a5631` |
 | [C10](TRUNCATED_FILES_REPORT.md) | **Elision deleted the file it read and kept the wrong conclusion** — 15 stubs vs 8 surviving false claims | `09f29ee` |
 | [C1](TRUNCATED_FILES_REPORT.md) | **Truncated generations committed their writes** — 3 JS files cut mid-code | `b08d298` |

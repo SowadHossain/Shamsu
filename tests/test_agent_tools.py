@@ -366,3 +366,76 @@ def test_a_mangled_patch_that_still_does_not_match_names_the_format_mistake(tmp_
     assert result.ok is False
     assert "literal backslash-n" in result.message
     assert "The file was NOT changed" in result.message
+
+
+# --- a failed patch returns the file's own text (C8) --------------------
+#
+# RC8. The same sentence came back 29 times unchanged: "Nearest similar line is
+# line 424: ...". Accurate, and useless on repeat - it never widened and never
+# offered the actual text, so the model had nothing new to reason from and
+# computed the same call again from memory, which is where the error was.
+
+
+def _numbered_file(tmp_path: Path) -> AgentToolRegistry:
+    lines = [f"line {i} of main.js" for i in range(1, 40)]
+    lines[23] = "// Start the application when DOM is ready"
+    (tmp_path / "main.js").write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+    return _registry(tmp_path)
+
+
+def test_a_failed_patch_returns_the_real_lines_around_the_nearest_hit(tmp_path: Path):
+    registry = _numbered_file(tmp_path)
+
+    result = registry.edit_file(
+        "main.js", "// Start the application when the DOM is ready", "// fixed"
+    )
+
+    assert result.ok is False
+    assert "The file was NOT changed" in result.message
+    assert "24 | // Start the application when DOM is ready" in result.message
+    assert "21 | line 21 of main.js" in result.message, "context before the anchor"
+    assert "27 | line 27 of main.js" in result.message, "context after the anchor"
+
+
+def test_the_failure_tells_it_to_copy_rather_than_recall(tmp_path: Path):
+    registry = _numbered_file(tmp_path)
+
+    result = registry.edit_file("main.js", "// Start the application when the DOM is ready", "x")
+
+    assert "character for character" in result.message
+    assert "from memory" in result.message
+
+
+def test_the_window_is_bounded(tmp_path: Path):
+    """A recovery hint must not become the tool result."""
+    from shamsu.tools.agent_tools import EDIT_HINT_CONTEXT_LINES
+
+    registry = _numbered_file(tmp_path)
+
+    result = registry.edit_file("main.js", "// Start the application when the DOM is ready", "x")
+
+    numbered = [ln for ln in result.message.splitlines() if " | " in ln]
+    assert len(numbered) <= EDIT_HINT_CONTEXT_LINES * 2 + 1
+
+
+def test_an_anchor_at_the_top_of_the_file_does_not_run_off_the_start(tmp_path: Path):
+    (tmp_path / "a.js").write_text("const a = 1;" + chr(10) + "const b = 2;" + chr(10), encoding="utf-8")
+    registry = _registry(tmp_path)
+
+    result = registry.edit_file("a.js", "const a = 11;", "x")
+
+    assert result.ok is False
+    assert "1 | const a = 1;" in result.message
+
+
+def test_nothing_resembling_the_text_says_so_plainly(tmp_path: Path):
+    """No anchor means no window, and a hint that pretends otherwise is worse
+    than none."""
+    (tmp_path / "a.js").write_text("const a = 1;" + chr(10), encoding="utf-8")
+    registry = _registry(tmp_path)
+
+    result = registry.edit_file("a.js", "zzzzzzzz qqqqqqqq wwwwwwww", "x")
+
+    assert result.ok is False
+    assert "Nothing in the file resembles" in result.message
+    assert "read_file" in result.message
