@@ -3175,15 +3175,22 @@ def _cut(content: str = "", thinking: str = "") -> dict:
     }
 
 
-def test_generation_is_capped_at_the_reserve_the_budget_held_back(tmp_path):
-    """Without num_predict, generation was bounded only by leftover window."""
-    from shamsu.agents.simple_chat import output_reserve
+def test_generation_is_always_capped(tmp_path):
+    """Without num_predict at all, generation was bounded only by leftover
+    window - which is the bug this was written for and still holds.
+
+    It used to assert equality with `output_reserve`. That pinned the reserve as
+    the VALUE, and the reserve is what the prompt assembler holds back, not what
+    the reply may use: live 2026-08-19 a reply was cut at 8,192 with a 2,270
+    token prompt in a 32,768 window. The reserve is now the FLOOR - see V2.
+    """
+    from shamsu.agents.simple_chat import MAX_REPLY_TOKENS, output_reserve
 
     loop = _loop(tmp_path, [_text("done")])
     asyncio.run(loop.run("hi"))
 
     options = loop.client.calls[0]["options"]
-    assert options["num_predict"] == output_reserve(options["num_ctx"])
+    assert output_reserve(options["num_ctx"]) <= options["num_predict"] <= MAX_REPLY_TOKENS
 
 
 def test_a_model_that_cannot_think_is_never_asked_to(tmp_path):
@@ -5504,3 +5511,71 @@ def test_the_full_stop_promise_reaches_the_nudge(tmp_path):
     assert result.final == "Done."
     nudges = [m.content for m in loop.state.all_messages if m.role == "user"]
     assert any("called no tool" in c for c in nudges)
+
+
+# --- the reply cap follows the free window (V2) --------------------------
+#
+# Live 2026-08-19, qwen2.5:3b-instruct, mid-way through writing a file:
+#   "This answer was cut off. The prompt was 2,270 tokens of a 32,768 window."
+# The window was 7% full. 30,498 tokens were free and the reply stopped at
+# 8,192, so the run produced nothing.
+
+
+def test_a_short_prompt_gets_more_room_than_the_reserve(tmp_path):
+    from shamsu.agents.simple_chat import output_reserve
+
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state.append_user("Write a complete 2D asteroid shooter game in js/game.js")
+    built = loop._messages()
+    ceiling = loop._ceiling()
+
+    assert loop._reply_cap(built, ceiling) > output_reserve(ceiling)
+
+
+def test_the_cap_is_never_smaller_than_the_reserve_the_budget_promised(tmp_path):
+    """A cap below the reserve would cause the truncation the reserve exists to
+    prevent. This can only ever be an increase."""
+    from shamsu.agents.simple_chat import output_reserve
+
+    loop = _loop(tmp_path, [_text("ok")])
+    for i in range(200):
+        loop.state.append_user(f"turn {i} " + "padding " * 200)
+    built = loop._messages()
+    ceiling = loop._ceiling()
+
+    assert loop._reply_cap(built, ceiling) >= output_reserve(ceiling)
+
+
+def test_one_generation_cannot_spend_the_whole_window(tmp_path):
+    """Without a ceiling a looping reply burns the window in a single call, and
+    at 24 rounds that is a turn nobody waits out."""
+    from shamsu.agents.simple_chat import MAX_REPLY_TOKENS
+
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state.append_user("hi")
+    built = loop._messages()
+
+    assert loop._reply_cap(built, loop._ceiling()) <= MAX_REPLY_TOKENS
+
+
+def test_the_cap_leaves_the_prompt_its_room(tmp_path):
+    """prompt + reply must still fit the window, or the cap has just moved the
+    truncation somewhere worse."""
+    loop = _loop(tmp_path, [_text("ok")])
+    for i in range(40):
+        loop.state.append_user(f"turn {i} " + "padding " * 100)
+    built = loop._messages()
+    ceiling = loop._ceiling()
+
+    assert loop._estimate_prompt(built) + loop._reply_cap(built, ceiling) <= ceiling
+
+
+def test_the_cap_is_what_the_model_is_actually_asked_for(tmp_path):
+    """The number computed and the number sent are one."""
+    loop = _loop(tmp_path, [_text("ok")])
+    asyncio.run(loop.run("write js/game.js"))
+
+    sent = loop.client.calls[0]["options"]["num_predict"]
+    built = loop._messages()
+
+    assert sent == loop._reply_cap(built, loop.client.calls[0]["options"]["num_ctx"])

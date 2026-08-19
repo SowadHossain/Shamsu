@@ -284,6 +284,16 @@ def output_reserve(ceiling: int) -> int:
     return max(RESERVE_OUTPUT_TOKENS, ceiling // 4)
 
 
+# The most a single reply may generate, however much window is free.
+#
+# Without a ceiling, one looping generation can spend the entire window in a
+# single call, and at 24 rounds that is a turn nobody will wait out. 16,384
+# tokens is roughly 60KB - about 1,500 lines of JavaScript - which is far more
+# than any file worth writing in one go. Anything genuinely larger is what the
+# truncation refusal teaches: first section with write_file, then append_file
+# per section.
+MAX_REPLY_TOKENS = 16384
+
 # Substrings Ollama/llama.cpp use when the GPU cannot fit what was asked for.
 _OOM_MARKERS = (
     "out of memory",
@@ -1719,6 +1729,30 @@ class SimpleChatLoop:
                 attempt.pop(shed, None)
         raise TypeError("the model client rejected every supported keyword")
 
+    def _reply_cap(self, messages: list[dict[str, Any]], num_ctx: int) -> int:
+        """How many tokens this reply may actually use.
+
+        `output_reserve` is what the prompt assembler HOLDS BACK, and it is
+        right about that. Using the same number as the generation CAP throws
+        away every token the prompt did not spend.
+
+        Live 2026-08-19 on qwen2.5:3b-instruct, mid-way through writing a file:
+
+            "This answer was cut off. The prompt was 2,270 tokens of a 32,768
+             window."
+
+        The window was 7% full. 30,498 tokens were free and the reply was
+        stopped at 8,192 - so the run produced nothing, and the message blamed
+        the window that was never the constraint.
+
+        Floored at the reserve, so this can never be smaller than it was;
+        ceilinged at `MAX_REPLY_TOKENS`, so one looping generation cannot spend
+        the whole window; and the safety margin covers the estimator, which runs
+        about 15% heavy on qwen2.5 and must not be trusted to the last token.
+        """
+        free = num_ctx - self._estimate_prompt(messages) - SAFETY_MARGIN_TOKENS
+        return max(output_reserve(num_ctx), min(free, MAX_REPLY_TOKENS))
+
     async def _call_model(self) -> Any:
         messages = self._messages()
         num_ctx = self._num_ctx(messages)
@@ -1731,11 +1765,8 @@ class SimpleChatLoop:
             "options": {
                 "temperature": self.temperature,
                 "num_ctx": num_ctx,
-                # Pinned to the reserve the budget already held back, never
-                # below it: a cap smaller than the reserve would cause the
-                # truncation it exists to prevent. At this value it only stops
-                # a runaway from eating the window the prompt still occupies.
-                "num_predict": output_reserve(num_ctx),
+                # What is actually FREE, not a fixed share. See `_reply_cap`.
+                "num_predict": self._reply_cap(messages, num_ctx),
                 # The system prompt survives an overflow the budget failed to
                 # prevent. Ollama keeps 4 tokens by default; see `_num_keep`.
                 "num_keep": self._num_keep(num_ctx),
