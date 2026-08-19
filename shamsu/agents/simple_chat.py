@@ -162,6 +162,10 @@ ELIDE_EVERY_N_TOOL_CALLS = 3
 # The 0.6 trigger is smallcode's (`bin/smallcode.js`), MIT, (c) 2026 Doorman11991.
 # edit in progress needs.
 ELIDE_PRESSURE_FRACTION = 0.6
+# Elide down TO this fraction of the budget, then stop - smallcode uses
+# `maxBudget * 0.7`. Leaves slack so the next few calls do not immediately
+# trigger another sweep.
+ELIDE_TARGET_FRACTION = 0.7
 KEEP_VERBATIM_UNDER_PRESSURE = 8
 
 WHOLE_REWRITE_LIMIT_TOKENS = 400
@@ -318,12 +322,19 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Search the workspace for text or a pattern and return matching lines.",
+            "description": "Search the workspace by meaning AND by pattern at once. Plain English works ('the function that validates tokens'), so does a regex. Returns ranked code locations with the symbol name.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string", "description": "Text or regular expression to find."},
                     "path": {"type": "string", "description": "Directory to search. Defaults to the whole workspace."},
+                    "mode": {
+                        "type": "string",
+                        "description": (
+                            "hybrid (default, meaning + pattern), regex or keyword "
+                            "for exact matches only, semantic for meaning only."
+                        ),
+                    },
                 },
                 "required": ["pattern"],
             },
@@ -655,6 +666,13 @@ class ContextCounters:
     evictions: int = 0
     truncations: int = 0
     calls: int = 0
+    # Cumulative, from smallcode `bin/token_monitor.js`. The ratio of these
+    # two is the number that says whether the context work is paying off:
+    # completion tokens are the useful output, prompt tokens are what it cost
+    # to get them. A session whose efficiency falls as it runs is one where
+    # the window is filling with things the model is not using.
+    total_prompt: int = 0
+    total_completion: int = 0
     # Ground truth from the most recent response, for the meter.
     last_prompt_tokens: int = 0
     last_window: int = 0
@@ -665,6 +683,17 @@ class ContextCounters:
         if not self.last_window:
             return 0
         return round(100 * self.last_prompt_tokens / self.last_window)
+    @property
+    def efficiency(self) -> float:
+        """Completion tokens per 100 prompt tokens. Higher is better."""
+        if not self.total_prompt:
+            return 0.0
+        return 100.0 * self.total_completion / self.total_prompt
+
+    @property
+    def average_prompt(self) -> int:
+        return round(self.total_prompt / self.calls) if self.calls else 0
+
 
     def meter(self) -> str:
         """`ctx 68% (22.3k/32.8k)` - driven by prompt_eval_count, not a guess."""
@@ -777,6 +806,9 @@ class SimpleChatLoop:
         self._calls_since_elide = 0
         # Said once per loop, not once per round.
         self._warned_filling = False
+        # Rounds spent recovering rather than progressing: an empty reply, a
+        # nudge, a no-op edit. Drives `_should_disable_thinking`.
+        self._repair_attempts = 0
         # How many sweeps and how many messages they shrank, for `/status`.
         self.evictions = 0
         self._rewrite_refused: set[str] = set()
@@ -909,6 +941,7 @@ class SimpleChatLoop:
                     # 24 rounds: half an hour of "Thinking..." and no reply.
                     if empty_nudges < MAX_EMPTY_NUDGES:
                         empty_nudges += 1
+                        self._repair_attempts += 1
                         # Keep the transcript alternating: an assistant turn,
                         # then the nudge. Stacking user messages is what broke
                         # it. And nudge BEFORE salvaging - a reasoning model's
@@ -970,6 +1003,7 @@ class SimpleChatLoop:
                     # naming the file, and let it act - the alternative is what
                     # the user saw: a perfect answer and an unchanged file.
                     prose_nudges += 1
+                    self._repair_attempts += 1
                     self.state.append_assistant(text)
                     self.state.append_user(
                         f"You showed the new contents of {described} but did not change the file. "
@@ -1089,6 +1123,27 @@ class SimpleChatLoop:
             "`/new` starts a fresh one; older file payloads are already elided."
         )
 
+    def _should_disable_thinking(self) -> bool:
+        """Whether this call should be made without a reasoning trace.
+
+        Adapted from smallcode `src/model/thinking_budget.js`
+        (`shouldDisableThinking`), MIT, (c) 2026 Doorman11991. Their reasoning,
+        which matches what was measured here: on a retry the model "already
+        overthought the original solution. A fast, low-creativity retry is
+        better."
+
+        It is also the cheapest fix for the specific failure that started all
+        of this - a reasoning model spending its whole reply budget thinking
+        and returning empty. After the first recovery round, stop paying for
+        the reasoning that just failed to produce anything.
+
+        `SHAMSU_THINKING_DISABLE=1` forces it off everywhere, their
+        SMALLCODE_THINKING_DISABLE equivalent.
+        """
+        if os.environ.get("SHAMSU_THINKING_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+        return self._repair_attempts > 1
+
     def _hit_the_length_limit(self) -> bool:
         """Did the last generation stop because it ran out of room?
 
@@ -1153,6 +1208,7 @@ class SimpleChatLoop:
             "messages": messages,
             "tools": SIMPLE_TOOL_SCHEMAS,
             "stream": False,
+            "think": not self._should_disable_thinking(),
             "options": {
                 "temperature": self.temperature,
                 "num_ctx": num_ctx,
@@ -1200,6 +1256,8 @@ class SimpleChatLoop:
         self.last_done_reason = str(_response_field(raw, "done_reason") or "")
         self.last_estimate = estimate
         SESSION_COUNTERS.calls += 1
+        SESSION_COUNTERS.total_prompt += self.last_prompt_tokens
+        SESSION_COUNTERS.total_completion += self.last_completion_tokens
         SESSION_COUNTERS.last_window = self._ceiling()
         if self.last_prompt_tokens:
             # Only when the server actually reported one. A response without a
@@ -1432,7 +1490,19 @@ class SimpleChatLoop:
                 return elide_tool_result(name, message.content), message.tool_calls
             return None
 
-        changed = self.state.elide_old_payloads(keep_recent, elide)
+        # Stop as soon as the history is under target rather than eliding
+        # everything past the cutoff. smallcode evicts to `maxBudget * 0.7`
+        # for the same reason: a session only just over budget should keep
+        # almost all of its detail.
+        target = int(self._history_budget() * ELIDE_TARGET_FRACTION)
+        changed = self.state.elide_old_payloads(
+            keep_recent,
+            elide,
+            target=target,
+            cost_of=lambda: messages_tokens(
+                m.to_ollama() for m in self.state.all_messages
+            ),
+        )
         if changed:
             SESSION_COUNTERS.evictions += changed
             self._trace(
@@ -1670,6 +1740,7 @@ class SimpleChatLoop:
             if name in MUTATING_TOOLS:
                 if _changed_nothing(result):
                     self._unproductive += 1
+                    self._repair_attempts += 1
                 else:
                     self._unproductive = 0
             else:
@@ -1690,6 +1761,11 @@ class SimpleChatLoop:
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         name = canonical_tool_name(name)
+        if name == "search_files":
+            hybrid = self._hybrid_search(arguments)
+            if hybrid is not None:
+                return hybrid
+
         if name == "remember":
             from shamsu.agents.simple_memory import remember
 
@@ -1726,6 +1802,50 @@ class SimpleChatLoop:
         if before is not None and result.ok:
             return self._with_diff(arguments, before, result)
         return result
+
+    def _hybrid_search(self, arguments: dict[str, Any]) -> ToolResult | None:
+        """Search by meaning and by pattern in one call.
+
+        `grep_files` matched with `query in line` - a literal substring, not
+        even a regex. So a model asking for `def handle_.*login`, or for "the
+        function that validates tokens", was told "Found 0 match(es)" as though
+        it had asked a fair question and got a truthful no. Both now work.
+
+        Returns None to fall back to `grep_files` - an empty workspace, or any
+        failure at all. A search that errors is worse than a plain one.
+        """
+        query = str(arguments.get("query") or arguments.get("pattern") or "").strip()
+        if not query:
+            return None
+        mode = str(arguments.get("mode") or "hybrid").strip().lower()
+        if mode not in {"hybrid", "regex", "keyword", "semantic"}:
+            mode = "hybrid"
+        try:
+            from shamsu.indexer.policy import SOURCE_SUFFIXES, walk_workspace_files
+            from shamsu.tools.hybrid_search import format_results, hybrid_search
+
+            root = self.workspace
+            sub = str(arguments.get("path") or "").strip().strip("./")
+            if sub and (root / sub).is_dir():
+                root = root / sub
+            files = [
+                path.relative_to(root).as_posix()
+                for path in walk_workspace_files(root, suffixes=SOURCE_SUFFIXES)
+            ]
+            if not files:
+                return None
+            results = hybrid_search(query, root, files, mode=mode, limit=10)
+        except Exception:  # noqa: BLE001 - grep is always there
+            return None
+        if not results and mode == "hybrid":
+            # Nothing scored at all. grep may still find a literal the
+            # tokeniser threw away - punctuation, a stopword, a bare number.
+            return None
+        return ToolResult(
+            True,
+            format_results(results, query, mode),
+            {"query": query, "mode": mode, "matches": results, "count": len(results)},
+        )
 
     def _snapshot(self, arguments: dict[str, Any]) -> str:
         path = str(arguments.get("filepath") or "").strip()

@@ -228,6 +228,8 @@ class ChatState:
         self,
         keep_recent: int,
         elide: Callable[[ChatMessage], tuple[str, list[dict[str, Any]]] | None],
+        target: int | None = None,
+        cost_of: Callable[[], int] | None = None,
     ) -> int:
         """Shrink the payloads of messages older than the last *keep_recent*.
 
@@ -256,6 +258,12 @@ class ChatState:
         for message in history[:cutoff]:
             if message.elided:
                 continue
+            if target is not None and cost_of is not None and cost_of() <= target:
+                # Under the target already. smallcode stops here too, and it
+                # is the difference between eliding what has to go and eliding
+                # everything older than an arbitrary line: a session just over
+                # budget keeps almost all of its detail.
+                break
             replacement = elide(message)
             if replacement is None:
                 continue

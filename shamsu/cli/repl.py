@@ -3672,6 +3672,12 @@ def _handle_context(
             f"  payload elisions   : {counters.evictions}",
             f"  truncated replies  : {counters.truncations}",
             "",
+            f"  total prompt       : {counters.total_prompt:,} tokens "
+            f"(avg {counters.average_prompt:,}/call)",
+            f"  total completion   : {counters.total_completion:,} tokens",
+            f"  efficiency         : {counters.efficiency:.1f}%  "
+            "[dim](completion per 100 prompt tokens - higher is better)[/dim]",
+            "",
             "[dim]Where the last prompt went (one total tells you the window is",
             "full, never what filled it):[/dim]",
             *_context_bucket_rows(),

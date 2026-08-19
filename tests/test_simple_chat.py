@@ -3224,13 +3224,14 @@ def _session(tmp_path):
 
 
 def test_an_old_write_payload_is_dropped_but_the_call_is_still_legible(tmp_path):
-    from shamsu.agents.simple_chat import KEEP_VERBATIM_MESSAGES
-
+    """Keys are kept, long values are not - so the call still reads as
+    `write_file(filepath=game.js)` rather than as a hole in the history."""
     state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
     state.append_user("build it")
-    state.append_assistant("", tool_calls=_write_call_body("game.js", "x=1;\n" * 500))
-    for i in range(KEEP_VERBATIM_MESSAGES + 2):
-        state.append_user(f"later {i}")
+    state.append_assistant("", tool_calls=_write_call_body("game.js", "x=1;" + chr(10)))
+    # Enough weight after it to push the session over the elision target.
+    for i in range(60):
+        state.append_user(f"later {i} " + "padding " * 400)
     loop = _loop(tmp_path, [_text("ok")])
     loop.state = state
 
@@ -3238,9 +3239,27 @@ def test_an_old_write_payload_is_dropped_but_the_call_is_still_legible(tmp_path)
 
     payload = state.all_messages[2]
     arguments = payload.tool_calls[0]["function"]["arguments"]
-    assert "game.js" == arguments["filepath"], "the model must still see WHICH file"
-    assert len(arguments["content"]) < 150, "the file body should be gone"
-    assert "elided" in arguments["content"]
+    assert arguments["filepath"] == "game.js", "the model must still see WHICH file"
+    assert payload.elided
+
+
+def test_nothing_is_elided_while_there_is_room(tmp_path):
+    """Eliding what does not need to go throws away detail for nothing.
+
+    smallcode evicts down TO a target and stops; so does this. A short session
+    keeps every byte of every payload.
+    """
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    body = "x=1;" + chr(10) * 2
+    for i in range(30):
+        state.append_user(f"step {i}")
+        state.append_assistant("", tool_calls=_write_call_body(f"f{i}.js", body))
+    loop = _loop(tmp_path, [_text("ok")])
+    loop.state = state
+
+    changed = loop._elide_payloads()
+
+    assert changed == 0, "elided under budget, losing detail for no reason"
 
 
 def test_elision_survives_the_turn_boundary(tmp_path):
@@ -3420,7 +3439,8 @@ def _reset_counters():
     from shamsu.agents.simple_chat import SESSION_COUNTERS
 
     for field_name in ("compactions", "evictions", "truncations", "calls",
-                       "last_prompt_tokens", "last_window", "last_estimate"):
+                       "last_prompt_tokens", "last_window", "last_estimate",
+                       "total_prompt", "total_completion"):
         setattr(SESSION_COUNTERS, field_name, 0)
     return SESSION_COUNTERS
 
@@ -3708,3 +3728,94 @@ def test_an_empty_note_says_what_to_do_instead(tmp_path):
 
     assert not ok
     assert "note" in message
+
+
+# ---------------------------------------------------------------------------
+# Methods taken from smallcode's own source (not from the plan's summary of it)
+# ---------------------------------------------------------------------------
+
+
+def test_search_finds_code_by_meaning_when_no_word_matches(tmp_path):
+    """`grep_files` matched with `query in line` - a literal substring.
+
+    So "the function that validates tokens" found nothing, and the model was
+    told "Found 0 match(es)" as though it had asked a fair question.
+    """
+    (tmp_path / "auth.py").write_text(
+        "def validateAuthToken(raw):\n"
+        "    return raw and len(raw) > 10\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "unrelated.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("search_files", {"query": "the function that validates tokens"})
+
+    assert result.ok
+    assert "auth.py" in result.message
+    assert result.data["matches"][0]["symbol"] == "validateAuthToken"
+
+
+def test_search_still_honours_a_real_regex(tmp_path):
+    """Substring matching meant a regex was searched for literally."""
+    (tmp_path / "views.py").write_text(
+        "def handle_user_login():\n    pass\n\ndef handle_admin_login():\n    pass\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("search_files", {"query": r"def handle_\w+_login", "mode": "regex"})
+
+    assert result.ok
+    assert result.data["count"] >= 1
+    assert all(m["exact"] for m in result.data["matches"])
+
+
+def test_an_invalid_regex_is_searched_for_literally_not_refused(tmp_path):
+    """Refusing costs a round and teaches nothing."""
+    (tmp_path / "a.py").write_text("x = handle_(1)\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("search_files", {"query": "handle_("})
+
+    assert result.ok
+
+
+def test_search_falls_back_to_grep_rather_than_erroring(tmp_path):
+    """A search that errors is worse than a plain one."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("search_files", {"query": "anything"})
+
+    assert result.ok  # empty workspace -> grep path, still a clean answer
+
+
+def test_thinking_is_switched_off_once_the_turn_is_repairing(tmp_path):
+    """smallcode: on a retry the model 'already overthought the original'."""
+    loop = _loop(tmp_path, [_text("ok")])
+    assert loop._should_disable_thinking() is False
+
+    loop._repair_attempts = 2
+
+    assert loop._should_disable_thinking() is True
+
+
+def test_thinking_can_be_switched_off_entirely_by_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_THINKING_DISABLE", "1")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    assert loop._should_disable_thinking() is True
+
+
+def test_efficiency_reports_output_earned_per_token_of_context(tmp_path):
+    """The number that says whether the context work is paying off."""
+    counters = _reset_counters()
+    loop = _loop(tmp_path, [{"message": {"content": "hi", "tool_calls": []},
+                             "prompt_eval_count": 1000, "eval_count": 250}])
+
+    asyncio.run(loop.run("hello"))
+
+    assert counters.total_prompt == 1000
+    assert counters.total_completion == 250
+    assert abs(counters.efficiency - 25.0) < 0.01
+    assert counters.average_prompt == 1000
