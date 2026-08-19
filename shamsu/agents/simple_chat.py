@@ -2663,14 +2663,27 @@ class SimpleChatLoop:
                 self._read_signatures[read_signature] = seen
                 if seen >= REPEATED_READS_BEFORE_WARNING:
                     outcome.repeated_read = read_signature
-            if result.ok and name in MUTATING_TOOLS:
+            if result.ok and name in WRITING_TOOLS:
+                # WRITING_TOOLS, not MUTATING_TOOLS: `append_file` puts bytes on
+                # disk and was not in the narrower set, so nothing verified a
+                # file built up in pieces. The last verdict the model saw was
+                # the one taken after the FIRST chunk - "1 unclosed {" - which
+                # is true of half a file and false of the finished one, and is
+                # exactly the sort of stale verdict that sends a model
+                # repairing something already correct.
                 path = str(arguments.get("filepath") or "").strip()
                 if path:
                     outcome.written.append(path)
-                    count = self._edits_per_file.get(path.lower(), 0) + 1
-                    self._edits_per_file[path.lower()] = count
-                    outcome.repeated_edit = max(outcome.repeated_edit, count)
-                    outcome.repeated_path = path if count >= EDITS_PER_FILE_BEFORE_WARNING else outcome.repeated_path
+                    if name in MUTATING_TOOLS:
+                        # Only whole-file writes and patches count toward the
+                        # repeated-edit ceiling. Appending section after section
+                        # is how a large file is MEANT to be built here, so
+                        # counting each one would stop the very behaviour the
+                        # truncation refusal asks for.
+                        count = self._edits_per_file.get(path.lower(), 0) + 1
+                        self._edits_per_file[path.lower()] = count
+                        outcome.repeated_edit = max(outcome.repeated_edit, count)
+                        outcome.repeated_path = path if count >= EDITS_PER_FILE_BEFORE_WARNING else outcome.repeated_path
                 # A write that landed intact ends the truncation streak. The
                 # counter is about consecutive refusals, not lifetime ones.
                 self._truncated_refusals = 0

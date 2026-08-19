@@ -59,6 +59,7 @@ Companion docs: `TRUNCATED_FILES_REPORT.md` (C1-C4, the truncation investigation
 | [C4](TRUNCATED_FILES_REPORT.md) | Cut-off notice blamed the window and was replayed 53x into later prompts | `d1ba009` |
 | [G1](#g1) | Code graph held **243 projects**, 129 of them dead scratch dirs — and this repo indexed **twice** | `3fede9e`+1 |
 | [G2](#g2) | Graph indexed `reference/`, `other peoples work/`, `legacy-code/` and answered out of them | `b1f81bf`+1 |
+| [N2](#n2) | **A file built up with `append_file` was never verified** — the last verdict the model saw described half a file | `cbe7544`+1 |
 | [M1](#m1) | **Memory was only written if the model volunteered** — a real 2-turn run produced none | `7284641`+1 |
 | [C5](TRUNCATED_FILES_REPORT.md) | **Verbatim tail was 51% of the prompt** — 20 messages kept whole, one was 25,473 chars | `8bc7f6c`+1 |
 | [L3](#l3) | Tool schemas were a flat **2,111 tokens on every call** — 85% of a fresh 3B prompt. Measured, then gated by relevance | `ac256c1`+1 |
@@ -154,6 +155,39 @@ conditional on a write.
 
 Then C4's message can name the limit that actually bound: the window, or the
 per-reply cap.
+
+---
+
+<a name="n2"></a>
+## N2 - a file built up in pieces was never verified - **HIGH** - FIXED
+
+Found by asking a question the tests had not: *if one output is cut off, can the
+next one finish the remaining code?*
+
+The truncation refusal (C1) tells the model to send a large file in pieces -
+`write_file` for the first section, `append_file` for each one after. That path
+works, and the file does end up complete and balanced on disk. But
+`append_file` was not in `MUTATING_TOOLS`, and only `MUTATING_TOOLS` put a path
+into `outcome.written`, which is what triggers verification.
+
+So nothing verified the file after the last piece. The most recent verdict left
+in the model's context was the one taken after the FIRST chunk:
+
+```
+{"ok": false, "problems": ["game.js: 1 unclosed { - ... cut off mid-block"]}
+```
+
+True of half a file. False of the finished one. And precisely the sort of stale
+verdict that sends a model repairing something already correct - the loop C2,
+C6 and N1 all exist to break.
+
+### Fix
+
+Verification follows `WRITING_TOOLS`, so anything that puts bytes on disk gets
+checked. The repeated-edit ceiling still follows `MUTATING_TOOLS` only:
+appending section after section is what the truncation refusal ASKS for, and
+counting each one toward an edit ceiling would stop the very behaviour being
+requested. Both halves have a test.
 
 ---
 

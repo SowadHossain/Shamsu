@@ -6173,3 +6173,144 @@ def test_a_failing_memory_write_never_fails_the_turn(tmp_path, monkeypatch):
     result = asyncio.run(loop.run("add a hello world"))
 
     assert result.final == "done"
+
+
+# --- after a cut-off, can it finish the file? (C1 recovery path) ---------
+
+
+def test_a_refused_write_is_still_visible_to_the_model(tmp_path):
+    """The refusal discards the WRITE, not the attempt. The assistant turn
+    carrying the partial content is appended before the refusal, so the model
+    can see how far it got."""
+    body = "function update() {" + chr(10) + "  const a = 1;" + chr(10)
+    loop = _loop(
+        tmp_path,
+        [_cut_tool("write_file", filepath="game.js", content=body)],
+        max_rounds=1,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write the game loop"))
+
+    calls = [
+        c for m in loop.state.all_messages for c in (m.tool_calls or [])
+    ]
+    sent = str(calls[0]["function"]["arguments"])
+    assert "const a = 1" in sent, "the model cannot see what it already emitted"
+
+
+def test_a_cut_off_write_is_finished_in_pieces_on_the_next_turns(tmp_path, monkeypatch):
+    """The whole point of the refusal: write_file for the first section, then
+    append_file for each following one, and the file ends up complete."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    first = "function update() {" + chr(10) + "  const a = 1;" + chr(10)
+    rest = "}" + chr(10)
+
+    loop = _loop(
+        tmp_path,
+        [
+            _cut_tool("write_file", filepath="game.js", content=first + "  const b ="),
+            _tool("write_file", filepath="game.js", content=first),
+            _tool("append_file", filepath="game.js", content=rest),
+            _text("Done - game.js is complete."),
+        ],
+        max_rounds=5,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("write the game loop"))
+
+    on_disk = (tmp_path / "game.js").read_text(encoding="utf-8")
+    assert on_disk == first + rest
+    assert on_disk.count("{") == on_disk.count("}"), "the finished file balances"
+    assert not result.stopped
+
+
+def test_the_finished_file_passes_verification(tmp_path, monkeypatch):
+    """End to end: cut off, rebuilt in pieces, and the verifier agrees."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    loop = _loop(
+        tmp_path,
+        [
+            _cut_tool("write_file", filepath="game.js", content="function f() {"),
+            _tool("write_file", filepath="game.js", content="function f() {" + chr(10)),
+            _tool("append_file", filepath="game.js", content="}" + chr(10)),
+            _text("done"),
+        ],
+        max_rounds=5,
+    )
+
+    asyncio.run(loop.run("write game.js"))
+
+    verdicts = [m.content for m in loop.state.all_messages if m.name == "verify"]
+    assert verdicts, "nothing was verified"
+    assert '"ok": true' in verdicts[-1], verdicts[-1]
+
+
+def test_each_completed_chunk_clears_the_truncation_streak(tmp_path, monkeypatch):
+    """A long file may be cut off more than once while being built. Only
+    CONSECUTIVE refusals count, or a file needing four chunks could never be
+    finished."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    loop = _loop(
+        tmp_path,
+        [
+            _cut_tool("write_file", filepath="a.js", content="// part 1"),
+            _tool("write_file", filepath="a.js", content="// part 1" + chr(10)),
+            _cut_tool("append_file", filepath="a.js", content="// part 2"),
+            _tool("append_file", filepath="a.js", content="// part 2" + chr(10)),
+            _cut_tool("append_file", filepath="a.js", content="// part 3"),
+            _tool("append_file", filepath="a.js", content="// part 3" + chr(10)),
+            _text("done"),
+        ],
+        max_rounds=8,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("build a.js in pieces"))
+
+    on_disk = (tmp_path / "a.js").read_text(encoding="utf-8")
+    assert "part 1" in on_disk and "part 2" in on_disk and "part 3" in on_disk
+    assert not result.stopped, "three separate cut-offs must not end the turn"
+
+
+def test_a_file_built_by_appending_is_verified_after_the_last_piece(tmp_path, monkeypatch):
+    """`append_file` was not in MUTATING_TOOLS, so nothing verified a file built
+    up in pieces. The last verdict the model saw was the one taken after the
+    FIRST chunk - true of half a file, false of the finished one."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("write_file", filepath="a.js", content="function f() {" + chr(10)),
+            _tool("append_file", filepath="a.js", content="}" + chr(10)),
+            _text("done"),
+        ],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("build a.js"))
+
+    verdicts = [m.content for m in loop.state.all_messages if m.name == "verify"]
+    assert len(verdicts) == 2, "the append was never verified"
+    assert '"ok": false' in verdicts[0], "half a file really is unbalanced"
+    assert '"ok": true' in verdicts[-1], "the finished file must come back clean"
+
+
+def test_appending_section_after_section_does_not_trip_the_edit_ceiling(tmp_path, monkeypatch):
+    """Building a large file in pieces is what the truncation refusal ASKS for.
+    Counting each append toward the repeated-edit ceiling would stop the very
+    behaviour being requested."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    turns = [_tool("write_file", filepath="a.js", content="// 0" + chr(10))]
+    turns += [
+        _tool("append_file", filepath="a.js", content=f"// {i}" + chr(10))
+        for i in range(1, 8)
+    ]
+    turns.append(_text("done"))
+    loop = _loop(tmp_path, turns, max_rounds=12, verify_changes=False)
+
+    result = asyncio.run(loop.run("build a.js in eight pieces"))
+
+    assert not result.stopped, result.final
+    assert (tmp_path / "a.js").read_text(encoding="utf-8").count("//") == 8
