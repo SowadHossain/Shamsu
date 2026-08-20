@@ -18,6 +18,7 @@ from rich.console import Console
 from shamsu.integrations.telegram.models import (
     OutboundMessage,
     TelegramChat,
+    TelegramFile,
     TelegramInboundMetadata,
     TelegramMessage,
     TelegramUpdate,
@@ -131,7 +132,10 @@ def test_a_telegram_turn_edits_one_card_instead_of_one_message_per_line(
     body = sender.sent[-1].text
     assert "read_file a.py" in body
     assert "model responded in" in body
-    assert "shamsu (remote-telegram)&gt; read a.py" in body
+    # The thread's name comes from the real SessionManager, through the real
+    # metadata - the seam that silently returned "" when this reached for the
+    # wrong attribute and let its own `except` hide the mistake.
+    assert "shamsu (remote) telegram&gt; read a.py" in body
     # And the notification feed the card replaces has gone quiet.
     assert progress.live_card is True
     assert not [m for m in notified if "Working:" in m.text]
@@ -226,14 +230,17 @@ def test_a_routed_prompt_is_echoed_on_the_desktop_as_a_terminal_line():
     mirror = ConsoleTelegramMirror(
         Console(file=buffer, width=200, no_color=True, highlight=False)
     )
-    mirror.prompt_echo("add a pause menu")
+    mirror.prompt_echo("add a pause menu", "asteroids")
     renderer = mirror.turn_renderer()
     renderer(
         TurnEvent(seq=1, kind="activity", text="model responded in 9s", source="telegram")
     )
 
     printed = buffer.getvalue()
-    assert "shamsu (remote-telegram)> add a pause menu" in printed
+    # Same builder as the REPL's own prompt, so a turn from the phone differs
+    # from a local one by one word rather than by shape - and it keeps the
+    # thread name, which `remote-telegram` used to displace.
+    assert "shamsu (asteroids) telegram> add a pause menu" in printed
     assert "model responded in 9s" in printed
 
 
@@ -245,7 +252,7 @@ def test_the_service_prefers_the_prompt_echo_for_a_routed_task(tmp_path):
         def __call__(self, title: str, text: str) -> None:
             panels.append((title, text))
 
-        def prompt_echo(self, prompt: str, label: str = "remote-telegram") -> None:
+        def prompt_echo(self, prompt: str, title: str = "") -> None:
             echoed.append(prompt)
 
     service = TelegramService(
@@ -269,9 +276,25 @@ def test_the_service_prefers_the_prompt_echo_for_a_routed_task(tmp_path):
     assert echoed == ["build the thing"]
     assert panels == []
 
-    # Everything else - a status reply, a button press - keeps the panel.
+    # And everything else is now SILENT rather than panelled. A `/status` typed
+    # on the phone is the phone reading its own screen; narrating it here was
+    # noise about someone else's session. Only a file - which lands in this
+    # workspace - still earns a panel.
     service._mirror_inbound(update)
-    assert len(panels) == 1
+    assert panels == []
+
+    with_file = TelegramUpdate(
+        2,
+        message=TelegramMessage(
+            message_id=2,
+            user=TelegramUser(user_id=7, first_name="Sam"),
+            chat=TelegramChat(chat_id=CHAT_ID),
+            text="",
+            document=TelegramFile(file_id="f1", file_name="spec.md"),
+        ),
+    )
+    service._mirror_inbound(with_file)
+    assert panels == [("Telegram", "Sam sent a file: spec.md")]
 
 
 def test_a_card_edit_is_not_mirrored_to_the_desktop_as_a_panel(tmp_path):

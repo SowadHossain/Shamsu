@@ -32,6 +32,7 @@ const state = {
   seenApprovals: new Set(),
   commands: [],
   paletteIndex: 0,
+  telegram: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -293,31 +294,62 @@ async function openSession(session, workspace) {
 function renderMessages(messages) {
   const pane = el("conversation");
   pane.replaceChildren();
-  const visible = messages.filter(
-    (message) => message.role === "user" || message.role === "assistant",
-  );
-  if (!visible.length) {
+  // The server already decided what counts as conversation - see
+  // `api.session_messages`. It builds this list from the turn stream, the same
+  // record the terminal and the phone render, rather than from the model's
+  // context file. Filtering again here would be a second opinion about which
+  // messages are real, and the two would drift.
+  if (!messages.length) {
     const empty = document.createElement("p");
     empty.className = "welcome";
     empty.textContent = "Nothing here yet. Say something below.";
     pane.append(empty);
     return;
   }
-  for (const message of visible) {
-    pane.append(bubble(message.role, message.content));
+  for (const message of messages) {
+    pane.append(bubble(message.role, message.content, message));
   }
 }
 
-function bubble(role, content) {
+function bubble(role, content, meta) {
+  const info = typeof meta === "string" ? { source: meta } : meta || {};
   const block = document.createElement("article");
   block.className = `msg ${role}`;
   const who = document.createElement("span");
   who.className = "who";
   who.textContent = role === "user" ? "you" : "shamsu";
-  const body = document.createElement("div");
-  body.className = "body";
-  body.textContent = content;
-  block.append(who, body);
+  block.append(who);
+
+  const text = content || "";
+  if (text) {
+    const body = document.createElement("div");
+    body.className = "body";
+    body.textContent = text;
+    block.append(body);
+  } else if (info.verdict) {
+    // A turn that ended without an answer - stopped, failed, cancelled. Shown
+    // as its verdict rather than skipped, so a thread never looks like it
+    // swallowed your question.
+    const body = document.createElement("div");
+    body.className = "body quiet";
+    body.textContent = info.verdict;
+    block.append(body);
+  }
+
+  const marks = [];
+  // Badged only when the prompt came from somewhere OTHER than this browser.
+  // A thread is driven from three places, and the question a web reader
+  // actually has is "did I send this, or did it arrive from my phone?" -
+  // tagging every one of your own messages "web" would answer a question
+  // nobody asked, on every line.
+  if (role === "user" && info.source && info.source !== "web") marks.push(info.source);
+  if (role === "assistant" && text && info.verdict) marks.push(info.verdict);
+  if (marks.length) {
+    const tag = document.createElement("span");
+    tag.className = "from";
+    tag.textContent = marks.join(" · ");
+    block.append(tag);
+  }
   return block;
 }
 
@@ -353,7 +385,7 @@ function handleEvent(event) {
   switch (event.kind) {
     case "turn.start":
       setRunning(true);
-      if (event.text) el("conversation").append(bubble("user", event.text));
+      if (event.text) el("conversation").append(bubble("user", event.text, event.source));
       openTurnCard();
       break;
     case "activity":
@@ -628,10 +660,6 @@ function onComposerKey(event) {
   }
 }
 
-function closeSettings() {
-  el("drawer").hidden = true;
-}
-
 /* --- sticky bottom ------------------------------------------------------ */
 
 function isAtBottom() {
@@ -819,69 +847,354 @@ async function addWorkspace(path) {
   }
 }
 
-/* --- settings ------------------------------------------------------------ */
+/* --- settings ------------------------------------------------------------ *
+ *
+ * The drawer opens on ONE cheap request. Everything that costs a round trip to
+ * Ollama, to Telegram or to the control database loads afterwards and fills in,
+ * because a settings page that hangs because a model server is down is a
+ * settings page you cannot use to notice the model server is down.
+ */
 
 async function openSettings() {
   el("drawer").hidden = false;
-  let settings;
   try {
-    settings = await api("/api/settings");
+    renderSettings(await api("/api/settings"));
   } catch (error) {
     notice(error.message, true);
     return;
   }
-  renderSettings(settings);
+  loadModels();
+  loadTelegram();
+  loadLocks();
+}
+
+function closeSettings() {
+  el("drawer").hidden = true;
 }
 
 function renderSettings(settings) {
   el("set-model").textContent = settings.model || "no model configured";
+  renderContext(settings.context);
+  renderVerbosity(settings.verbosity);
+  el("set-telegram").textContent = settings.telegram.configured
+    ? `token configured (${settings.telegram.source})`
+    : "no bot token";
+  fillList(el("set-tools"), settings.tools, (tool) => tool);
+}
 
-  const context = settings.context;
+function renderContext(context) {
   const buttons = el("ctx-buttons");
   buttons.replaceChildren();
   for (const bucket of context.buckets) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = "ctx-btn";
-    button.textContent = `${Math.round(bucket / 1024)}k`;
-    button.setAttribute("aria-pressed", String(bucket === context.max_ctx));
-    button.disabled = context.env_override;
-    button.addEventListener("click", () => saveContext(bucket));
-    buttons.append(button);
+    buttons.append(
+      choice(`${Math.round(bucket / 1024)}k`, bucket === context.max_ctx, context.env_override, () =>
+        saveSetting({ chat_max_ctx: bucket }, `context window set to ${bucket}`),
+      ),
+    );
   }
-  const auto = document.createElement("button");
-  auto.type = "button";
-  auto.className = "ctx-btn";
-  auto.textContent = "default";
-  auto.setAttribute("aria-pressed", String(!context.saved));
-  auto.disabled = context.env_override;
-  auto.addEventListener("click", () => saveContext(null));
-  buttons.append(auto);
-
+  buttons.append(
+    choice("default", !context.saved, context.env_override, () =>
+      saveSetting({ chat_max_ctx: null }, "context window reset"),
+    ),
+  );
   el("ctx-env").hidden = !context.env_override;
   el("ctx-meter").textContent = context.last_window
     ? `last turn used ${Math.round(context.last_prompt_tokens / 100) / 10}k of ` +
       `${Math.round(context.last_window / 1024)}k (${context.pct}%)`
     : "no turn measured in this process yet";
+}
 
-  el("set-telegram").textContent = settings.telegram.configured
-    ? `configured (${settings.telegram.source})`
-    : "not configured";
+function renderVerbosity(verbosity) {
+  const buttons = el("verb-buttons");
+  buttons.replaceChildren();
+  for (const level of verbosity.levels) {
+    buttons.append(
+      choice(level, level === verbosity.level, false, () =>
+        saveSetting({ verbosity: level }, `verbosity set to ${level}`),
+      ),
+    );
+  }
+  el("verb-kinds").textContent = `shows: ${verbosity.body_kinds.join(", ")}`;
+}
 
-  const tools = el("set-tools");
-  tools.replaceChildren();
-  for (const tool of settings.tools) {
-    const item = document.createElement("li");
-    item.textContent = tool;
-    tools.append(item);
+function choice(label, pressed, disabled, onClick) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "ctx-btn";
+  button.textContent = label;
+  button.setAttribute("aria-pressed", String(pressed));
+  button.disabled = Boolean(disabled);
+  button.addEventListener("click", onClick);
+  return button;
+}
+
+function fillList(list, items, label) {
+  list.replaceChildren();
+  for (const item of items) {
+    const row = document.createElement("li");
+    row.textContent = label(item);
+    list.append(row);
   }
 }
 
-async function saveContext(window_) {
+async function saveSetting(change, message) {
   try {
-    const settings = await post("/api/settings", { chat_max_ctx: window_ });
-    renderSettings(settings);
-    notice(window_ ? `context window set to ${window_}` : "context window reset");
+    renderSettings(await post("/api/settings", change));
+    notice(message);
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+/* --- models -------------------------------------------------------------- */
+
+async function loadModels() {
+  const pick = el("model-pick");
+  let models;
+  try {
+    models = await api("/api/models");
+  } catch (error) {
+    el("model-source").textContent = error.message;
+    return;
+  }
+  el("set-model").textContent = models.effective || "no model configured";
+  el("model-source").textContent = models.server_running
+    ? models.source_label
+    : `${models.source_label} - Ollama is not reachable at ${models.base_url}`;
+  // A workspace pin outranks anything chosen here. Saying so is the difference
+  // between a picker that looks broken and one that is merely outranked.
+  el("model-shadow").hidden = !models.workspace_pin_shadows;
+
+  pick.replaceChildren();
+  pick.append(option("", "use the default for this machine"));
+  for (const model of models.models) {
+    const marks = [];
+    if (!model.installed) marks.push("not pulled");
+    if (!model.known) marks.push("untested");
+    if (model.loaded) marks.push("in VRAM");
+    pick.append(option(model.name, marks.length ? `${model.name} (${marks.join(", ")})` : model.name));
+  }
+  pick.value = models.source === "install" ? models.effective : "";
+  pick.disabled = models.source === "env";
+  renderOllama(models);
+}
+
+function option(value, label) {
+  const item = document.createElement("option");
+  item.value = value;
+  item.textContent = label;
+  return item;
+}
+
+async function saveModel() {
+  const chosen = el("model-pick").value;
+  try {
+    renderSettings(await post("/api/settings", { model: chosen || null }));
+    await loadModels();
+    notice(chosen ? `model set to ${chosen}` : "model reset to the default");
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+/* --- ollama -------------------------------------------------------------- */
+
+function renderOllama(models) {
+  el("ol-state").textContent = models.server_running
+    ? `running at ${models.base_url}`
+    : `not reachable at ${models.base_url}`;
+  el("ol-loaded").textContent = models.loaded.length
+    ? `in VRAM now: ${models.loaded.join(", ")}`
+    : "nothing loaded";
+  el("ol-unload").disabled = !models.loaded.length;
+}
+
+async function unloadModels() {
+  try {
+    const { unloaded } = await post("/api/ollama/unload", {});
+    notice(unloaded.length ? `unloaded ${unloaded.join(", ")}` : "nothing of ours was loaded");
+    await loadModels();
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+/* --- telegram ------------------------------------------------------------ */
+
+async function loadTelegram() {
+  let telegram;
+  try {
+    ({ telegram } = await api("/api/telegram"));
+  } catch (error) {
+    el("tg-run").textContent = error.message;
+    return;
+  }
+  state.telegram = telegram;
+  renderTelegram(telegram);
+}
+
+function renderTelegram(telegram) {
+  el("set-telegram").textContent = telegram.configured
+    ? `token configured (${telegram.token_source})`
+    : "no bot token";
+
+  el("tg-run").textContent = telegram.running
+    ? `polling in pid ${telegram.owner_pid}${telegram.is_this_process ? " (this server)" : ""}`
+    : "not running";
+
+  const facts = el("tg-facts");
+  facts.replaceChildren();
+  // Stated, not detected: SHAMSU only ever long-polls, and leaving that
+  // ambiguous is how a registered webhook went unnoticed.
+  addFact(facts, "Transport", telegram.transport);
+  addFact(facts, "Project", telegram.workspace || "not started yet");
+  addFact(facts, "Paired", String(telegram.paired_count));
+  addFact(facts, "Sent", String(telegram.messages_sent));
+  addFact(facts, "Failures", String(telegram.send_failures));
+  if (telegram.last_error) addFact(facts, "Last error", telegram.last_error);
+
+  el("tg-start").disabled = !telegram.configured || telegram.running;
+  el("tg-stop").disabled = !telegram.running || !telegram.is_this_process;
+  el("tg-test").disabled = !telegram.configured;
+
+  fillWorkspacePicker(telegram.workspace);
+  renderPairings(telegram.pairings || []);
+}
+
+function addFact(list, name, value) {
+  const key = document.createElement("dt");
+  key.textContent = name;
+  const detail = document.createElement("dd");
+  detail.textContent = value;
+  list.append(key, detail);
+}
+
+function fillWorkspacePicker(current) {
+  const pick = el("tg-workspace");
+  pick.replaceChildren();
+  for (const workspace of state.workspaces) {
+    pick.append(option(workspace.id, workspace.name));
+    if (workspace.path === current) pick.value = workspace.id;
+  }
+}
+
+function renderPairings(pairings) {
+  const list = el("tg-pairings");
+  list.replaceChildren();
+  if (!pairings.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty";
+    empty.textContent = "nobody paired yet";
+    list.append(empty);
+    return;
+  }
+  for (const pairing of pairings) {
+    const row = document.createElement("li");
+    const who = document.createElement("span");
+    who.textContent = `${pairing.display_name || pairing.user_id} (${pairing.permission_level})`;
+    const drop = document.createElement("button");
+    drop.type = "button";
+    drop.className = "link-btn";
+    drop.textContent = "Unpair";
+    drop.addEventListener("click", () => unpair(pairing.user_id));
+    row.append(who, drop);
+    list.append(row);
+  }
+}
+
+async function startBot() {
+  try {
+    const payload = await post("/api/telegram/start", {});
+    renderTelegram(payload.telegram);
+    notice(payload.detail || "bot started");
+  } catch (error) {
+    notice(error.message, true);
+    loadTelegram();
+  }
+}
+
+async function stopBot() {
+  try {
+    const { telegram } = await post("/api/telegram/stop", {});
+    renderTelegram(telegram);
+    notice("bot stopped");
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+async function bindBot() {
+  const workspace_id = el("tg-workspace").value;
+  if (!workspace_id) return;
+  try {
+    const payload = await post("/api/telegram/bind", { workspace_id });
+    renderTelegram(payload.telegram);
+    notice("bot rebound - pairings kept");
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+async function testBot() {
+  try {
+    const { probe } = await post("/api/telegram/test", {});
+    renderProbe(probe);
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+function renderProbe(probe) {
+  const line = el("tg-webhook");
+  if (!probe.ok) {
+    line.hidden = false;
+    line.textContent = `Telegram refused: ${probe.error}`;
+    el("tg-fix").hidden = true;
+    return;
+  }
+  if (probe.webhook_blocks_polling) {
+    // The failure this whole panel exists for: getUpdates returns 409 while a
+    // webhook stands, the poll loop retries forever, and the bot looks fine.
+    line.hidden = false;
+    line.textContent =
+      `A webhook is registered (${probe.webhook_url}), so long polling cannot ` +
+      `receive anything. ${probe.pending_updates} update(s) are waiting.`;
+    el("tg-fix").hidden = false;
+    return;
+  }
+  line.hidden = false;
+  line.textContent = `@${probe.bot_username} answered, no webhook registered.`;
+  el("tg-fix").hidden = true;
+}
+
+async function deleteWebhook() {
+  try {
+    const payload = await post("/api/telegram/webhook/delete", {});
+    notice(payload.message);
+    if (payload.probe && payload.probe.ok) renderProbe(payload.probe);
+    loadTelegram();
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+async function pairDevice() {
+  try {
+    const { pairing } = await post("/api/telegram/pairings", {});
+    const slot = el("tg-code");
+    slot.hidden = false;
+    slot.textContent = pairing.code;
+    notice("send this code to the bot within 5 minutes");
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+async function unpair(userId) {
+  try {
+    const { pairings } = await post(`/api/telegram/pairings/${userId}/unpair`, {});
+    renderPairings(pairings);
+    notice("device unpaired");
   } catch (error) {
     notice(error.message, true);
   }
@@ -895,7 +1208,54 @@ async function saveTelegramToken() {
     await post("/api/telegram", { token });
     box.value = "";
     notice("bot token saved for this installation");
-    openSettings();
+    loadTelegram();
+  } catch (error) {
+    notice(error.message, true);
+  }
+}
+
+/* --- locks --------------------------------------------------------------- */
+
+async function loadLocks() {
+  let locks;
+  try {
+    locks = await api("/api/locks");
+  } catch (error) {
+    notice(error.message, true);
+    return;
+  }
+  renderLocks(locks);
+}
+
+function renderLocks(locks) {
+  const list = el("lock-list");
+  list.replaceChildren();
+  if (!locks.leases.length) {
+    const empty = document.createElement("li");
+    empty.className = "empty";
+    empty.textContent = "nothing running";
+    list.append(empty);
+    return;
+  }
+  for (const lease of locks.leases) {
+    const row = document.createElement("li");
+    row.textContent = lease.is_machine_slot
+      ? `${lease.session_id} - ${lease.owner_surface}, pid ${lease.owner_pid}`
+      : `${shortPath(lease.workspace)} / ${lease.session_id} - ${lease.owner_surface}, pid ${lease.owner_pid}`;
+    list.append(row);
+  }
+}
+
+function shortPath(path) {
+  const parts = String(path).split(/[\\/]/).filter(Boolean);
+  return parts.slice(-2).join("/") || path;
+}
+
+async function clearStaleLocks() {
+  try {
+    const locks = await post("/api/locks/clear-stale", {});
+    renderLocks(locks);
+    notice(locks.released ? `released ${locks.released} stale lock(s)` : "no stale locks");
   } catch (error) {
     notice(error.message, true);
   }
@@ -924,6 +1284,15 @@ async function boot() {
   el("close-settings").addEventListener("click", closeSettings);
   el("drawer-scrim").addEventListener("click", closeSettings);
   el("tg-save").addEventListener("click", saveTelegramToken);
+  el("model-pick").addEventListener("change", saveModel);
+  el("tg-start").addEventListener("click", startBot);
+  el("tg-stop").addEventListener("click", stopBot);
+  el("tg-bind").addEventListener("click", bindBot);
+  el("tg-test").addEventListener("click", testBot);
+  el("tg-fix").addEventListener("click", deleteWebhook);
+  el("tg-pair").addEventListener("click", pairDevice);
+  el("ol-unload").addEventListener("click", unloadModels);
+  el("lock-clear").addEventListener("click", clearStaleLocks);
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape" && !el("drawer").hidden) closeSettings();
   });

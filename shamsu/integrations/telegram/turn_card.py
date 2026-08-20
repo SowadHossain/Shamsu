@@ -26,6 +26,7 @@ from typing import Callable
 
 from shamsu.integrations.telegram.formatter import MAX_MESSAGE_CHARS
 from shamsu.integrations.telegram.models import OutboundMessage
+from shamsu.cli.prompt_label import SURFACE_TELEGRAM, prompt_label
 from shamsu.runtime.turn_stream import TurnEvent, body_kinds
 
 #: Telegram allows roughly one message per second per chat and rate-limits
@@ -51,7 +52,7 @@ class TelegramTurnCard:
         chat_id: int,
         send: Callable[[OutboundMessage], int],
         prompt: str,
-        label: str = "remote-telegram",
+        title: str = "",
         typing: Callable[[], None] | None = None,
         verbosity: str = "normal",
         flush_interval: float = DEFAULT_FLUSH_SECONDS,
@@ -62,7 +63,11 @@ class TelegramTurnCard:
         self.chat_id = int(chat_id)
         self.send = send
         self.prompt = prompt or ""
-        self.label = label or "remote-telegram"
+        # The thread's name, not a surface name. `remote-telegram` in the
+        # header told a Telegram reader they were on Telegram; the thread they
+        # are driving is the thing they cannot see from here, and the one they
+        # switch between from this same chat.
+        self.title = title or ""
         self.typing = typing
         self.verbosity = verbosity
         self.flush_interval = float(flush_interval)
@@ -85,7 +90,8 @@ class TelegramTurnCard:
         self.message_ids: list[int] = []
 
         self._card_lines: list[str] = []
-        self._header = f"shamsu ({self.label})> {self.prompt}".rstrip()
+        header = prompt_label(self.title, SURFACE_TELEGRAM, trailing_space=False)
+        self._header = f"{header} {self.prompt}".rstrip()
         self._footer = ""
         self._message_id: int | None = None
         self._last_text = ""

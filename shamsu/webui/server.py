@@ -284,6 +284,22 @@ def _build_handler(portal: WebPortal):
                 self._json(_configure_telegram(body))
                 return
 
+            if parts and parts[0] == "telegram":
+                status, payload = _telegram_action(portal, parts[1:], body)
+                self._json(payload, status=status)
+                return
+
+            if parts == ["locks", "clear-stale"]:
+                removed = portal.runner.store.clear_stale_leases()
+                payload = api.locks_payload(portal.runner.store)
+                payload["released"] = removed
+                self._json(payload)
+                return
+
+            if parts == ["ollama", "unload"]:
+                self._json({"unloaded": api.unload_our_models()})
+                return
+
             # Add a workspace by path. The only route that takes a path from a
             # caller, and it is checked rather than trusted - see api.add_workspace.
             if parts == ["workspaces"]:
@@ -341,6 +357,21 @@ def _build_handler(portal: WebPortal):
                 return
             if parts == ["commands"]:
                 self._json(api.commands_payload())
+                return
+            # Deliberately separate routes: each costs a round trip to Ollama or
+            # the control DB, and the settings drawer must open without waiting
+            # on either.
+            if parts == ["models"]:
+                self._json(api.models_payload(portal.workspace))
+                return
+            if parts == ["locks"]:
+                self._json(api.locks_payload(portal.runner.store))
+                return
+            if parts == ["telegram"]:
+                self._json(api.telegram_payload(_bot_workspace(portal)))
+                return
+            if parts == ["telegram", "pairings"]:
+                self._json(api.pairings_payload(_bot_workspace(portal)))
                 return
             if parts == ["workspaces"]:
                 self._json(api.workspaces_payload(portal.workspaces()))
@@ -426,6 +457,8 @@ def _apply_settings(body: dict) -> dict:
     """
     from shamsu.runtime.settings import update_settings
 
+    from shamsu.runtime.settings import VERBOSITY_LEVELS
+
     changes: dict = {}
     if "chat_max_ctx" in body:
         raw = body.get("chat_max_ctx")
@@ -439,10 +472,116 @@ def _apply_settings(body: dict) -> dict:
             if window < 4096:
                 raise ValueError("chat_max_ctx must be at least 4096")
             changes["chat_max_ctx"] = window
+    if "model" in body:
+        raw = body.get("model")
+        if raw in (None, "", "default"):
+            changes["model"] = None
+        else:
+            name = str(raw).strip()
+            # A model name is passed straight to Ollama, so it is checked for
+            # shape, not for membership: refusing anything outside the cookbook
+            # would block every model the user has actually pulled.
+            if not name or any(character.isspace() for character in name):
+                raise ValueError("model must be a single Ollama model name")
+            changes["model"] = name
+    if "verbosity" in body:
+        level = str(body.get("verbosity") or "").strip().lower()
+        if level not in VERBOSITY_LEVELS:
+            raise ValueError(f"verbosity must be one of: {', '.join(VERBOSITY_LEVELS)}")
+        changes["verbosity"] = level
     if not changes:
         raise ValueError("nothing to change")
     update_settings(**changes)
     return api.settings_payload()
+
+
+def _bot_workspace(portal: Any) -> Path:
+    """Which project the Telegram bot drives.
+
+    Saved choice first, then the portal's own workspace, then the most recently
+    active one. The portal is a view over every workspace and often has none of
+    its own, so "wherever the server was started" is the weakest answer here,
+    not the default.
+    """
+    from shamsu.runtime.settings import telegram_workspace
+
+    chosen = telegram_workspace()
+    if chosen is not None:
+        return chosen.resolve()
+    if portal.workspace is not None:
+        return portal.workspace
+    known = portal.workspaces()
+    return known[0] if known else Path.cwd()
+
+
+def _telegram_action(portal: Any, parts: list[str], body: dict) -> tuple[int, dict]:
+    """Run the bot, probe it, or fix the one setting that silently breaks it."""
+    from shamsu.integrations.telegram import diagnostics
+    from shamsu.integrations.telegram.local import bridge_manager
+    from shamsu.integrations.telegram.service import HELD_ELSEWHERE, load_telegram_bot_token
+
+    workspace = _bot_workspace(portal)
+    manager = bridge_manager()
+
+    if parts == ["start"]:
+        started = manager.start(workspace)
+        payload = api.telegram_payload(workspace)
+        payload["outcome"] = started.outcome
+        payload["detail"] = started.detail
+        if started.outcome == HELD_ELSEWHERE:
+            # 409 is the honest code, and it is also the code Telegram itself
+            # returns for the same situation.
+            payload["error"] = (
+                f"Another SHAMSU process (pid {started.holder_pid}) is already polling this bot."
+            )
+            return 409, payload
+        return 200, payload
+
+    if parts == ["stop"]:
+        manager.stop()
+        return 200, api.telegram_payload(workspace)
+
+    if parts == ["bind"]:
+        target = api.workspace_for_id(str(body.get("workspace_id") or ""), portal.workspaces())
+        started = manager.rebind(target)
+        payload = api.telegram_payload(target)
+        payload["outcome"] = started.outcome
+        payload["detail"] = started.detail
+        return 200, payload
+
+    if parts == ["test"]:
+        token, _ = load_telegram_bot_token(workspace)
+        return 200, {"probe": diagnostics.probe(token).to_dict()}
+
+    if parts == ["webhook", "delete"]:
+        token, _ = load_telegram_bot_token(workspace)
+        ok, message = diagnostics.delete_webhook(token)
+        return (200 if ok else 400), {
+            "ok": ok,
+            "message": message,
+            "probe": diagnostics.probe(token).to_dict() if ok else {},
+        }
+
+    if parts == ["pairings"]:
+        service = manager.service_for(workspace)
+        code = service.pairing.create_code()
+        # Shown once, in a loopback page, exactly as `/remote_control` already
+        # prints it in a terminal. It is stored only as a hash and is single-use.
+        return 201, {
+            "pairing": {"code": code.code, "expires_at": code.expires_at},
+        }
+
+    if len(parts) == 3 and parts[0] == "pairings" and parts[2] == "unpair":
+        try:
+            user_id = int(parts[1])
+        except ValueError as exc:
+            raise ValueError("malformed telegram user id") from exc
+        from shamsu.integrations.telegram.storage import TelegramStateStore
+
+        TelegramStateStore(workspace).disconnect_user(user_id)
+        return 200, api.pairings_payload(workspace)
+
+    raise api.NotFound("not found")
 
 
 def _configure_telegram(body: dict) -> dict:

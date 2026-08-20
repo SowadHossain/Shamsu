@@ -707,13 +707,13 @@ string/comment-aware scanner, which already covers JS, TS, JSX, CSS and JSON.
 
 Ordered so each step is independently shippable and testable.
 
-- [ ] **1.** Add `MAX_WRITE_CHARS` per §6.3 — clamp(2,000 · 0.85×reply_cap · 8,000). One function, derived from the existing `_reply_cap`.
-- [ ] **2.** Enforce it in the tool layer for every member of `WRITING_TOOLS`, with SmallCode's strategy-naming error message (§6.4, point 3).
-- [ ] **3.** Put **60 lines** in the system prompt (`BIG_FILE_CAPABILITY`) and in the `write_file` / `append_file` schema descriptions.
-- [ ] **4.** Change `_append_verification` to report open blocks as *progress* on a file still under construction this turn (§6.6, option a).
-- [ ] **5.** Add the pre-write **truncation-signature** gate — for new files too, and for every language `bracket_problem` handles, not just Python (§6.7). This closes hole 1.1.
-- [ ] **6.** Add the continue-from-the-tail recovery from `chat_loop.py:4465` to simple mode, language-agnostic (§4 item 3). With steps 1–3 in place this should fire rarely — it is the safety net, not the primary path.
-- [ ] **7.** Fix the unknown-model context fallback (§1, hole 1.5) — pattern matching so an unlisted model does not silently drop to 8,192 and shrink every cap in the table.
+- [x] **1.** Add `MAX_WRITE_CHARS` per §6.3 — clamp(2,000 · 0.85×reply_cap · 8,000). One function, derived from the existing `_reply_cap`.
+- [x] **2.** Enforce it in the tool layer for every member of `WRITING_TOOLS`, with SmallCode's strategy-naming error message (§6.4, point 3).
+- [x] **3.** Put **60 lines** in the system prompt (`BIG_FILE_CAPABILITY`) and in the `write_file` / `append_file` schema descriptions.
+- [x] **4.** Change `_append_verification` to report open blocks as *progress* on a file still under construction this turn (§6.6, option a).
+- [x] **5.** Add the pre-write **truncation-signature** gate — for new files too, and for every language `bracket_problem` handles, not just Python (§6.7). This closes hole 1.1.
+- [x] **6.** Add the continue-from-the-tail recovery from `chat_loop.py:4465` to simple mode, language-agnostic (§4 item 3). With steps 1–3 in place this should fire rarely — it is the safety net, not the primary path.
+- [x] **7.** Fix the unknown-model context fallback (§1, hole 1.5) — pattern matching so an unlisted model does not silently drop to 8,192 and shrink every cap in the table.
 
 **Verification that this worked:** write a 1,500-line file from a single prompt
 on `qwen2.5:3b-instruct` (per the project's small-model testing rule). Expect

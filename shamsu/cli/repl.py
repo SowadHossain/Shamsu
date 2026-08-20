@@ -192,7 +192,9 @@ from shamsu.runtime.ollama import (
     status_text,
     wait_until_running,
 )
+from shamsu.cli.prompt_label import SURFACE_CLI, TITLE_MAX_CHARS, session_prompt_label
 from shamsu.runtime.run_control import active_run_ids, cancel_run
+from shamsu.runtime.settings import verbosity as saved_verbosity
 from shamsu.runtime.session_registry import claim_ollama_ownership, register_session
 from shamsu.safety import dry_run, read_only
 from shamsu.safety.approval import (
@@ -4831,7 +4833,13 @@ async def _run_simple_chat(
     # replaces. A model call is still silent for as long as it runs, and at the
     # 600s timeout that is ten minutes that look exactly like a hang - so the
     # status still ticks the spinner's own text rather than costing a line.
-    stream.add_renderer(CliTurnRenderer(console, status_updater=_status_updater(thinking_status)))
+    stream.add_renderer(
+        CliTurnRenderer(
+            console,
+            status_updater=_status_updater(thinking_status),
+            verbosity=saved_verbosity(),
+        )
+    )
     loop = SimpleChatLoop(
         workspace,
         client=_default_ollama_client(OLLAMA_BASE_URL, timeouts),
@@ -18517,21 +18525,14 @@ def _handle_compact(user_input: str, session_logger: Any, console: Any) -> None:
     console.print("[dim]`/compact clear` to forget it and rebuild from the transcript.[/dim]")
 
 
-def _session_prompt_label(session_logger: Any, max_chars: int = 24) -> str:
-    """`shamsu (asteroids)> ` - which thread you are talking to.
+def _session_prompt_label(session_logger: Any, max_chars: int = TITLE_MAX_CHARS) -> str:
+    """`shamsu (asteroids) cli> ` - which thread, and which surface.
 
-    Falls back to a bare `shamsu> ` if anything is missing: a decorative label
-    must never be able to stop the REPL from accepting input.
+    Thin wrapper kept for the call sites; the rule itself lives in
+    `cli/prompt_label.py`, shared with the Telegram and web echoes so all three
+    surfaces cannot drift into three different-looking prompts.
     """
-    try:
-        title = str(getattr(getattr(session_logger, "metadata", None), "title", "") or "").strip()
-    except Exception:
-        title = ""
-    if not title or title.lower() in {"shamsu session", "session", "untitled"}:
-        return "shamsu> "
-    if len(title) > max_chars:
-        title = title[:max_chars].rstrip() + "..."
-    return f"shamsu ({title})> "
+    return session_prompt_label(session_logger, SURFACE_CLI, max_chars=max_chars)
 
 
 def _force_utf8_stdio() -> None:

@@ -14,17 +14,20 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from rich.markup import escape
+
+from shamsu.cli.prompt_label import prompt_label
 from shamsu.runtime.turn_stream import TurnEvent, body_kinds
 
 
 class CliTurnRenderer:
     """Paint a turn on a rich console.
 
-    `echo_label`, when set, prints a `shamsu (<label>)> <prompt>` line at
-    `turn.start`. The local REPL leaves it unset - it already shows the prompt
-    the user typed - and the Telegram desktop mirror sets it to
-    `remote-telegram`, so a turn started from the phone reads on the desktop
-    like any other terminal turn instead of arriving as a coloured panel.
+    `echo_surface`, when set, prints a `shamsu (<title>) <surface>> <prompt>`
+    line at `turn.start`, built by the shared `prompt_label`. The local REPL
+    leaves it unset - it already shows the prompt the user typed - while a
+    remote turn sets it, so a turn started elsewhere reads on the desktop like
+    any other terminal turn instead of arriving as a coloured panel.
     """
 
     def __init__(
@@ -33,12 +36,14 @@ class CliTurnRenderer:
         *,
         status_updater: Callable[[str], None] | None = None,
         verbosity: str = "normal",
-        echo_label: str = "",
+        echo_surface: str = "",
+        echo_title: str = "",
     ) -> None:
         self.console = console
         self.status_updater = status_updater
         self.verbosity = verbosity
-        self.echo_label = echo_label
+        self.echo_surface = echo_surface
+        self.echo_title = echo_title
         self._body = body_kinds(verbosity)
         #: Every body line this renderer printed, in order. The parity test
         #: compares this against the Telegram card's list.
@@ -52,8 +57,11 @@ class CliTurnRenderer:
                 self.status_updater(event.text)
             return
         if event.kind == "turn.start":
-            if self.echo_label and event.text:
-                self.console.print(f"[bold]shamsu ({self.echo_label})>[/bold] {event.text}")
+            if self.echo_surface and event.text:
+                label = prompt_label(
+                    self.echo_title, self.echo_surface, trailing_space=False
+                )
+                self.console.print(f"[bold]{escape(label)}[/bold] {event.text}")
             return
         if event.kind not in self._body or not event.text:
             return

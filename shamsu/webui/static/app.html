@@ -86,6 +86,11 @@
         <section class="setting">
           <h3>Model</h3>
           <p class="value" id="set-model">&mdash;</p>
+          <p class="note" id="model-source">&mdash;</p>
+          <div class="row"><select id="model-pick" aria-label="Model"></select></div>
+          <p class="note warn" id="model-shadow" hidden>
+            This workspace pins its own model, so the choice above will not apply here.
+          </p>
         </section>
 
         <section class="setting">
@@ -99,13 +104,70 @@
         </section>
 
         <section class="setting">
+          <h3>Verbosity</h3>
+          <p class="note">How much of a turn every surface shows while it works.</p>
+          <div class="row" id="verb-buttons"></div>
+          <p class="meter" id="verb-kinds">&mdash;</p>
+        </section>
+
+        <section class="setting">
           <h3>Telegram</h3>
+
+          <!-- Token first, then where the bot points, then who may talk to it,
+               then run it. That is also the order you do these in the first
+               time, so the panel reads top to bottom on day one. -->
           <p class="value" id="set-telegram">&mdash;</p>
           <div class="row">
             <input id="tg-token" type="password" placeholder="Bot token" autocomplete="off" spellcheck="false">
             <button id="tg-save" class="btn" type="button">Save</button>
           </div>
-          <p class="note">Saved to this installation. Never displayed again.</p>
+          <p class="note">
+            Saved to this installation, never displayed again. Paste a new one any
+            time to replace it.
+          </p>
+
+          <h4 class="sub">Workspace</h4>
+          <p class="note">The bot drives one project at a time. Pairings survive a change.</p>
+          <div class="row">
+            <select id="tg-workspace" aria-label="Telegram workspace"></select>
+            <button id="tg-bind" class="btn" type="button">Bind</button>
+          </div>
+
+          <h4 class="sub">Paired devices</h4>
+          <ul id="tg-pairings" class="pairings"></ul>
+          <div class="row">
+            <button id="tg-pair" class="btn" type="button">Pair a device</button>
+            <span id="tg-code" class="code" hidden></span>
+          </div>
+
+          <h4 class="sub">Connection</h4>
+          <p class="value" id="tg-run">&mdash;</p>
+          <dl class="facts" id="tg-facts"></dl>
+          <p class="note danger" id="tg-webhook" hidden></p>
+          <div class="row">
+            <button id="tg-start" class="btn" type="button">Start</button>
+            <button id="tg-stop" class="btn" type="button">Stop</button>
+            <button id="tg-test" class="btn" type="button">Test connection</button>
+            <button id="tg-fix" class="btn danger-btn" type="button" hidden>Delete webhook</button>
+          </div>
+        </section>
+
+        <section class="setting">
+          <h3>Ollama</h3>
+          <p class="value" id="ol-state">&mdash;</p>
+          <p class="note" id="ol-loaded">&mdash;</p>
+          <div class="row">
+            <button id="ol-unload" class="btn" type="button">Unload models</button>
+          </div>
+        </section>
+
+        <section class="setting">
+          <h3>Runs &amp; locks</h3>
+          <ul id="lock-list" class="locks"></ul>
+          <div class="row">
+            <button id="lock-clear" class="btn" type="button">Release stale locks</button>
+          </div>
+          <p class="note">A live lock cannot be taken &mdash; only one left behind by a process that died.</p>
         </section>
 
         <section class="setting">

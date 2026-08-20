@@ -381,14 +381,38 @@ class LocalShamsuSessionGateway:
         typing_action = getattr(self, "typing_action", None)
         if typing_action is not None:
             typing = lambda: typing_action(chat_id)  # noqa: E731
+        from shamsu.runtime.settings import verbosity as saved_verbosity
+
         card = TelegramTurnCard(
             chat_id=chat_id,
             send=send,
             prompt=prompt,
+            title=self._session_title(getattr(metadata, "session_id", "")),
             typing=typing,
+            # One saved level for every surface: verbosity describes how much
+            # you want to watch, not which screen you happen to be at.
+            verbosity=saved_verbosity(),
         )
         stream.add_renderer(card)
         return card
+
+    def _session_title(self, session_id: str) -> str:
+        """The thread's name for the card header, or "" if it cannot be had.
+
+        Best-effort: a header is decoration, and a turn must never fail on one.
+        """
+        if not session_id:
+            return ""
+        try:
+            from shamsu.session.manager import SessionManager
+
+            # `resolve` returns SessionMetadata, NOT a logger - the title is on
+            # it directly. Reaching for `.metadata.title` here returned "" via
+            # the except below, so the header silently lost its thread name and
+            # nothing said why.
+            return str(SessionManager(self.workspace).resolve(str(session_id)).title or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _attach_desktop_mirror(self, stream) -> Any:
         """Mirror the remote turn onto the desktop, if a REPL is watching.

@@ -205,6 +205,69 @@ def _no_live_ollama(monkeypatch):
     yield
 
 
+class LiveTelegramCalled(ConnectionError):
+    """Raised instead of letting a test talk to `api.telegram.org`.
+
+    Same shape and same reasoning as :class:`LiveOllamaCalled`: the diagnostics
+    layer already treats any transport failure as "unreachable", so a blocked
+    call degrades the way a real outage would. Which again means the block is
+    invisible from the return value - see `BLOCKED_CALLS`.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _no_live_telegram(monkeypatch):
+    """The suite must not reach a real bot, even if a token is lying around.
+
+    `diagnostics.probe()` and `delete_webhook()` are the first code here that
+    calls Telegram from a plain request handler rather than from the poll loop,
+    and `deleteWebhook` MUTATES someone's bot. A test that ran it against a
+    developer's real token would silently reconfigure their bot, which is the
+    same class of harm as `unload_model` evicting their model from VRAM.
+
+    Tests exercise these by passing `base_url=` at a local fake, which is
+    exactly why that parameter exists.
+    """
+    import httpx
+
+    real_post = httpx.Client.post
+    real_send = httpx.Client.send
+
+    def _is_telegram(url: Any) -> bool:
+        return "api.telegram.org" in str(url)
+
+    def guarded_post(self, url, *args, **kwargs):
+        if _is_telegram(url):
+            BLOCKED_CALLS.append(str(url))
+            raise LiveTelegramCalled(
+                "This test tried to call the real Telegram API. Pass base_url= "
+                "pointing at a local fake instead."
+            )
+        return real_post(self, url, *args, **kwargs)
+
+    def guarded_send(self, request, *args, **kwargs):
+        if _is_telegram(getattr(request, "url", "")):
+            BLOCKED_CALLS.append(str(getattr(request, "url", "?")))
+            raise LiveTelegramCalled("This test tried to call the real Telegram API.")
+        return real_send(self, request, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.Client, "post", guarded_post, raising=False)
+    monkeypatch.setattr(httpx.Client, "send", guarded_send, raising=False)
+
+    # The poll loop is async and uses its own client. A test that configures a
+    # token and starts the bridge would otherwise long-poll the real API.
+    real_async_post = httpx.AsyncClient.post
+
+    async def guarded_async_post(self, url, *args, **kwargs):
+        if _is_telegram(url):
+            BLOCKED_CALLS.append(str(url))
+            raise LiveTelegramCalled("This test tried to call the real Telegram API.")
+        return await real_async_post(self, url, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", guarded_async_post, raising=False)
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _install_home_not_ambient(monkeypatch, tmp_path_factory):
     """No test may read - or overwrite - the real `~/.shamsu`.

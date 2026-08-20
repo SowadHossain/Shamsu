@@ -38,7 +38,56 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "qwen2.5-coder:14b":          32_768,
 }
 
-SAFE_FALLBACK_CTX_WINDOW = 8_192   # conservative fallback for unknown models
+SAFE_FALLBACK_CTX_WINDOW = 8_192   # last resort, for a name nothing recognises
+
+# Families, matched on a SUBSTRING of the tag, for every model not spelled
+# exactly as one of the nine names above.
+#
+# The table was exact-match only, and the fallback below it is 8,192 - so
+# `qwen2.5:3b-instruct-q4_K_M`, one quantisation suffix away from a listed
+# model, asked for an 8k window. That is not a cosmetic default: at 8k with a
+# 4k prompt the reply cap collapses to a couple of thousand tokens, which
+# shrinks `max_write_chars` to its floor and makes every write of any size
+# truncate. A pulled tag almost never matches a hardcoded string exactly - it
+# carries a size, a quantisation, or a date - so the exact table was answering
+# for the minority of real model names.
+#
+# Ordered: the FIRST match wins, so a longer, more specific pattern must come
+# before the family it belongs to. Conservative where a family spans windows -
+# these are what the model can be ASKED for, and `shared_num_ctx` still caps
+# the answer at `DEFAULT_CHAT_CTX`, so an over-generous entry costs nothing
+# while an under-generous one costs every write in the session.
+MODEL_CONTEXT_PATTERNS: tuple[tuple[str, int], ...] = (
+    ("qwen3.5", 262_144),
+    ("qwen3", 32_768),
+    ("qwen2.5-coder", 32_768),
+    ("qwen2.5", 32_768),
+    ("qwen", 32_768),
+    ("deepseek-r1", 32_768),
+    ("deepseek", 32_768),
+    ("gemma3", 131_072),
+    ("gemma", 8_192),
+    ("mistral-nemo", 131_072),
+    ("mistral", 32_768),
+    ("mixtral", 32_768),
+    ("codestral", 32_768),
+    ("llama3.3", 131_072),
+    ("llama3.2", 131_072),
+    ("llama3.1", 131_072),
+    ("llama3", 8_192),
+    ("codellama", 16_384),
+    ("phi4", 16_384),
+    ("phi3.5", 131_072),
+    ("phi3", 131_072),
+    ("granite", 131_072),
+    ("starcoder", 16_384),
+    ("smollm", 8_192),
+    ("olmo", 32_768),
+    ("command-r", 131_072),
+    ("glm", 131_072),
+    ("devstral", 131_072),
+    ("gpt-oss", 131_072),
+)
 
 
 def _reserve_output_tokens() -> int:
@@ -78,8 +127,20 @@ DEFAULT_CHAT_CTX = 32768
 
 
 def ctx_window_for_model(model_name: str) -> int:
-    """Return the known context window for *model_name*, or the safe fallback."""
-    return MODEL_CONTEXT_WINDOWS.get(model_name, SAFE_FALLBACK_CTX_WINDOW)
+    """The window *model_name* may be asked for: exact name, then family, then 8k.
+
+    Three steps rather than one, because a model pulled by tag - `qwen2.5:3b`,
+    `qwen2.5-coder:7b-instruct-q4_K_M` - matches the exact table only by luck,
+    and the fallback it landed on shrank every cap downstream of it.
+    """
+    exact = MODEL_CONTEXT_WINDOWS.get(model_name)
+    if exact:
+        return exact
+    lowered = (model_name or "").strip().lower()
+    for pattern, window in MODEL_CONTEXT_PATTERNS:
+        if pattern in lowered:
+            return window
+    return SAFE_FALLBACK_CTX_WINDOW
 
 
 def shared_num_ctx(model_name: str) -> int:

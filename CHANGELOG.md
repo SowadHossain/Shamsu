@@ -2,6 +2,59 @@
 
 All notable SHAMSU release changes are documented here.
 
+## Unreleased
+
+### Added
+
+- A per-call content cap for every tool that carries a payload
+  (`write_file`, `append_file`, `patch_file`, `read_and_patch`,
+  `create_and_run`): `clamp(2,000 | 0.85 x reply_cap | 8,000)` characters. This
+  restores smallcode's 4x headroom ratio, where the model is never permitted to
+  attempt a write large enough to exhaust its own output budget. The ceiling is
+  llama.cpp's ~13KB tool-argument wall, which does NOT report
+  `done_reason: "length"` and so was invisible to the existing truncation
+  guard; the floor says the window is the wrong shape for the task rather than
+  degrading to useless chunk sizes. `MAX_REPLY_TOKENS` is deliberately
+  unchanged - the unit of work is bounded, not the budget.
+- The number 60 lines is now stated in the system prompt AND in the schema
+  description of every payload argument, not only enforced in the tool. A
+  refusal names the strategy ("write the first 60 lines, then append_file each
+  section") rather than only the limit, which turns an unrecoverable failure
+  into a recoverable one: the content was fully generated and is merely
+  rejected at the door.
+- A pre-write gate that tests for TRUNCATION SIGNATURES rather than validity -
+  an unterminated string or comment, a dangling operator, a bracket opened on
+  the last line - for new files and for every language, closing the hole where
+  both write-time gates bailed out when the target did not already exist and
+  only understood Python. A first section with unclosed blocks passes, because
+  a gate testing for validity would refuse every legitimate chunk.
+- Continue-from-the-tail recovery in simple mode, language-agnostic: a file
+  found stopping mid-construct is asked for ONLY the missing remainder, quoted
+  against its own last twelve lines, instead of being resent whole.
+
+### Fixed
+
+- A file still being built now reports its open blocks as PROGRESS ("3 block(s)
+  still open - continue with append_file") instead of as a fault. Verifying
+  after every chunk was correct and had to stay; reporting an unfinished
+  section as broken would have sent the model repairing a file that was simply
+  not finished yet. A file left open when the turn ENDS is still failed, so the
+  run outcome cannot read a half-written file as a success.
+- A write that GROWS a file no longer counts toward the repeated-edit ceiling.
+  Live 2026-08-20, told to build a 1,500-line file, qwen2.5:3b chunked as asked
+  but carried each section with `write_file`; five verified-clean sections in,
+  the turn was stopped for "5 blind edits I cannot confirm". The exemption
+  already existed for `append_file` and now follows the shape rather than the
+  tool.
+- Unknown models no longer silently drop to an 8,192-token window. The table
+  was exact-match only, so `qwen2.5:3b-instruct-q4_K_M` - one quantisation
+  suffix from a listed model - asked for 8k, which collapses the reply cap and
+  shrinks every write cap derived from it. Family patterns are consulted before
+  the fallback.
+- `test_count_tokens_falls_back_when_asset_missing` left the tokenizer cache
+  memoised on a missing asset, so every later `count_tokens` in the session
+  silently used chars/4.
+
 ## 0.4.0b1 - 2026-07-20
 
 ### Added

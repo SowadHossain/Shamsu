@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["coding", "bugfix", "refactor", "large-files"],
+  "triggers": ["fix", "part by part", "section", "large file", "skeleton", "outline", "refactor", "broken"],
+  "applies_to": ["code_edit", "bug_fix", "generate"],
+  "allowed_tools": ["read_file", "read_symbol", "search_files", "patch_file", "append_file", "write_file", "run_tests"],
+  "context_budget_tokens": 700
+}

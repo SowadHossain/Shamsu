@@ -42,7 +42,15 @@ def test_count_tokens_falls_back_when_asset_missing(monkeypatch, tmp_path):
 
     text = "def add(a,b): return a+b"
 
-    assert budget.count_tokens(text) == len(text) // budget.CHARS_PER_TOKEN_ESTIMATE
+    try:
+        assert budget.count_tokens(text) == len(text) // budget.CHARS_PER_TOKEN_ESTIMATE
+    finally:
+        # The cache is memoised on the MISSING asset, and `monkeypatch` undoing
+        # the path does not undo that. Left poisoned, every `count_tokens` for
+        # the rest of the session silently drops to chars/4 - which reads ~15%
+        # heavy on prose and failed a prompt-size assertion in another file
+        # while passing on its own.
+        budget._load_tokenizer.cache_clear()
 
 
 def test_tokenizer_asset_is_vendored_under_context_assets():
@@ -60,6 +68,29 @@ def test_known_model_returns_correct_window():
 def test_unknown_model_returns_safe_fallback():
     assert ctx_window_for_model("totally-unknown-model:99b") == SAFE_FALLBACK_CTX_WINDOW
     assert SAFE_FALLBACK_CTX_WINDOW == 8_192
+
+
+def test_a_quantisation_suffix_does_not_cost_the_window():
+    """The exact table answered for the MINORITY of real model names: a pulled
+    tag carries a size, a quantisation or a date. Landing on 8,192 here shrinks
+    the reply cap, which shrinks the write cap to its floor, which truncates
+    every write in the session."""
+    assert ctx_window_for_model("qwen2.5:3b-instruct-q4_K_M") == 32_768
+    assert ctx_window_for_model("qwen2.5-coder:7b-instruct-q4_K_M") == 32_768
+    assert ctx_window_for_model("qwen3:8b-q8_0") == 32_768
+
+
+def test_an_unlisted_model_of_a_known_family_is_recognised():
+    assert ctx_window_for_model("llama3.1:8b") == 131_072
+    assert ctx_window_for_model("gemma3:12b") == 131_072
+    assert ctx_window_for_model("mistral-nemo:12b-instruct-2407-q4_0") == 131_072
+
+
+def test_the_more_specific_family_wins():
+    """`qwen3.5` must not be answered by the `qwen3` entry it contains."""
+    assert ctx_window_for_model("qwen3.5:9b") == 262_144
+    assert ctx_window_for_model("llama3.1:70b") == 131_072
+    assert ctx_window_for_model("llama3:8b") == 8_192
 
 
 def test_planner_and_coder_can_have_different_windows():

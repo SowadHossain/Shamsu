@@ -696,8 +696,11 @@ def test_service_mirrors_authorized_telegram_messages_to_cli(tmp_path: Path) -> 
 
     asyncio.run(scenario())
 
-    assert ("Telegram Ada", "Do work") in mirrored
-    assert ("SHAMSU -> Telegram", "Task accepted by SHAMSU.") in mirrored
+    # A routed prompt reaches the desktop as a PROMPT LINE, not as panels. The
+    # bare `cli_mirror` callable here has no `prompt_echo`, so the echo has
+    # nowhere to go - and the acks it used to print alongside are gone, because
+    # the turn renderer already shows that turn properly.
+    assert mirrored == []
 
 
 def test_service_masks_pairing_code_in_cli_mirror(tmp_path: Path) -> None:
@@ -723,9 +726,14 @@ def test_service_masks_pairing_code_in_cli_mirror(tmp_path: Path) -> None:
 
     asyncio.run(service.process_update(TelegramUpdate(52, message=_message(code))))
 
-    assert ("Telegram Ada", "entered a pairing code.") in mirrored
+    # The code itself never reaches the terminal - now because the inbound side
+    # prints nothing at all for a pairing code, which masks it more thoroughly
+    # than the old "entered a pairing code." summary did.
     assert not any(code in text for _title, text in mirrored)
-    assert any("Connected to this SHAMSU installation." in text for _title, text in mirrored)
+    # What the desktop IS told is that a device gained control, in the third
+    # person and naming who. The phone reads "Connected to this SHAMSU
+    # installation."; a terminal needs to know whose phone.
+    assert ("Telegram", "Ada paired with this installation.") in mirrored
 
 
 def test_bot_restart_keeps_pairing_active_session_and_offset(tmp_path: Path) -> None:

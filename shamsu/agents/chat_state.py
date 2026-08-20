@@ -100,9 +100,15 @@ class ChatState:
         hydrate: bool = True,
         hydrate_max_messages: int = HYDRATE_MAX_MESSAGES,
         known_tools: frozenset[str] | None = None,
+        source: str = "",
     ) -> None:
         self.system_prompt = system_prompt
         self.session_logger = session_logger
+        # Which surface is driving this loop, stamped onto every message it
+        # appends. The transcript is shared by the terminal, the browser and
+        # the phone; without this, a thread read back tomorrow cannot say which
+        # of them asked for what.
+        self.source = str(source or "")
         # Tool names this caller can actually execute. A transcript is shared by
         # every SHAMSU that opens the workspace, and the legacy router speaks a
         # DIFFERENT vocabulary - `project.inspect`, `file.read`, `code.search`,
@@ -132,7 +138,15 @@ class ChatState:
             self._hydrate_from_session()
             self._restore_summary()
 
-    def append_user(self, content: str, persisted_content: str | None = None) -> None:
+    def append_user(
+        self, content: str, persisted_content: str | None = None, *, origin: str = ""
+    ) -> None:
+        """A message in the USER role - which is not the same as from the user.
+
+        The loop steers the model with messages in this role because that is the
+        role the model must read them in. Pass `origin=ORIGIN_LOOP` for those,
+        so a transcript reader can tell them from what a person typed.
+        """
         self._append(
             ChatMessage("user", content),
             persist=True,
@@ -141,6 +155,7 @@ class ChatState:
                 if persisted_content is not None
                 else None
             ),
+            origin=origin,
         )
 
     def append_assistant(self, content: str, tool_calls: list[dict[str, Any]] | None = None) -> None:
@@ -389,6 +404,7 @@ class ChatState:
         message: ChatMessage,
         persist: bool,
         persisted_content: str | None = None,
+        origin: str = "",
     ) -> None:
         self._messages.append(message)
         if persist and self.session_logger:
@@ -414,6 +430,8 @@ class ChatState:
                 tool_call_id=message.tool_call_id,
                 name=message.name,
                 tool_calls=message.tool_calls,
+                source=self.source,
+                origin=origin,
             )
 
     def _hydrate_from_session(self) -> None:

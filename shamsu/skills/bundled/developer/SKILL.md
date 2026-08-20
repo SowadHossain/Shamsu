@@ -11,13 +11,18 @@ touch workspace files.
 - Make one bounded change at a time.
 - Prefer existing project conventions and helper APIs.
 - Use transactional file tools for mutations.
-- Default to `write_file` with the COMPLETE file content, for new files and for
-  changes to existing ones alike: read the file, then re-emit all of it with the
-  change applied. Reserve `edit_file` for files too large to re-emit, and
-  `append_file` for content added at the end. A failed `edit_file` match should
-  become a `write_file` call, not a retry.
-- Change one file per turn. Re-emitting a whole file is only safe when that file
-  is the turn's single target.
+- Change part of an existing file with `patch_file`, not by re-emitting the
+  whole file. Its cost does not grow with the file, and it cannot lose the parts
+  you did not mean to touch. A failed match means read the real text and copy it
+  exactly - not a whole-file rewrite.
+- Keep every `write_file` and `append_file` under 60 lines. Build anything
+  larger in sections: `write_file` the first 60 lines, then `append_file` each
+  following section. Calls much larger than that cannot be parsed reliably and
+  are refused at the door.
+- Read a large file by its outline first, then `read_symbol` for the one
+  function or class you need. Reading the whole thing wastes the window on parts
+  the task never touches.
+- Change one file per turn.
 - Run Python and package commands normally through `run_command`; the command
   harness selects an existing project environment or creates a local `.venv`
   before a bare package install.

@@ -28,6 +28,8 @@ import hashlib
 import json
 import os
 import re
+from functools import lru_cache
+from hashlib import sha256
 import threading
 import time
 import uuid
@@ -40,7 +42,14 @@ from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
 from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
+from shamsu.agents.simple_outline import (
+    can_outline,
+    find_symbol,
+    outline,
+    render_outline,
+)
 from shamsu.agents.simple_prompt import simple_system_prompt
+from shamsu.agents.simple_tests import detect_test_command
 from shamsu.agents.simple_verify import PROBLEM as VERIFY_PROBLEM
 from shamsu.agents.simple_verify import SKIPPED as VERIFY_SKIPPED
 from shamsu.agents.simple_verify import (
@@ -62,8 +71,8 @@ from shamsu.context.budget import (
 from shamsu.llm.output import parse_model_turn
 from shamsu.runtime.models import model_for_role, model_is_reasoning
 from shamsu.runtime.turn_stream import TurnEvent
-from shamsu.session.manager import SessionLogger
-from shamsu.tools.agent_tools import AgentToolRegistry
+from shamsu.session.manager import ORIGIN_LOOP, SessionLogger
+from shamsu.tools.agent_tools import MAX_READ_CHARS, AgentToolRegistry
 from shamsu.types import CommandRisk, ToolResult
 
 # Bounded so a confused model cannot loop forever. Generous, because each round
@@ -368,9 +377,27 @@ WRITE_CHARS_CEILING = 8_000
 WRITE_CHARS_PER_REPLY_TOKEN = 0.85
 
 # Every argument that carries a payload rather than a reference. `patch_file`
-# replacing ten lines with eight hundred has the identical problem, so the cap
-# is not a `write_file` special case.
+# replacing ten lines with eight hundred has the identical problem, so the SIZE
+# cap is not a `write_file` special case.
 CONTENT_ARGUMENTS = ("content", "new_string")
+
+# The much narrower set whose payload is a WHOLE FILE, and the only set the
+# truncation gate may judge.
+#
+# Live 2026-08-20 this distinction cost a user their session. The gate ran on
+# `patch_file.new_string` and refused it three times with "it ends inside a /*
+# comment opened on line 23". A fragment is not a file: a patch replaces a
+# region that may START inside one block and END inside another, and an
+# `append_file` chunk is unfinished BY DESIGN - that is the entire point of
+# chunked writing. Judging either by whole-file structure produces confident,
+# repeatable false refusals, and the run then stopped blaming an output limit
+# that had never fired.
+#
+# smallcode does not do this at all: `bin/executor.js` caps payload SIZE and
+# checks nothing else. The gate is ours, it closes a real hole (§1.1 - a
+# brand-new file had no structural check at write time), and it earns its place
+# only where the payload really is the whole file.
+WHOLE_FILE_ARGUMENTS = frozenset({"write_file", "create_and_run"})
 
 
 def max_write_chars(reply_cap_tokens: int) -> int:
@@ -408,6 +435,35 @@ def write_budget_is_unworkable(reply_cap_tokens: int) -> bool:
 # deliberate belt-and-braces - it is what smallcode does too (their prompt says
 # 60 lines, their enforced cap is 8,000 chars, about 200).
 WRITE_LINES_GUIDANCE = 60
+
+# --- how much of a file the model is handed at once --------------------------
+#
+# Above this many lines, `read_file` with no range returns the file's OUTLINE -
+# every class and function, its signature and its exact line range - instead of
+# its body. The body is then fetched per symbol or per range, on demand.
+#
+# The read cap it replaces was a fixed 24,000-character head clip
+# (`agent_tools.MAX_READ_CHARS`), and head-clipping is what starts the dead end
+# in SMALLCODE_GAP_ANALYSIS.md §2: the model patches from what it saw,
+# `old_string` is not found because the part it needed was in the half it never
+# saw, the fuzzy retry misses too, and the whole-file rewrite is refused for
+# being a partial read. There is no fifth move.
+#
+# 200 lines is smallcode's threshold (`bin/executor.js:132`) and it is a sound
+# one - below it a file is worth reading whole, and the outline would cost a
+# round to save nothing.
+OUTLINE_OVER_LINES = 200
+
+# The gutter `read_file` puts in front of every line, smallcode's shape
+# (`bin/executor.js:110`). Line numbers are what make the follow-up call
+# possible: "patch line 412" and "read_file(start_line=400)" are both guesses
+# unless the model was shown which line is which, and an outline that names
+# ranges is worthless if the body it points at is unnumbered.
+LINE_NUMBER_GUTTER = "|"
+
+# Matches a numbered line the model copied straight back out of a read. See
+# `_strip_line_numbers`.
+_NUMBERED_LINE = re.compile(r"^\s*\d+\s*\|\s?", re.MULTILINE)
 
 # Substrings Ollama/llama.cpp use when the GPU cannot fit what was asked for.
 _OOM_MARKERS = (
@@ -456,6 +512,19 @@ SIMPLE_TOOLS: dict[str, str] = {
     # rather than only being told it may not rewrite one.
     "append_file": "append_file",
     "find_files": "find_files",
+    # The other half of outlining a large file. An outline is only useful if
+    # the thing it points at can be fetched, and a line range the model derived
+    # from a listing is a guess - this one is computed from the same parse.
+    "read_symbol": "read_symbol",
+    # The model was already told to check its work and then left to guess the
+    # command. Detection lives in `simple_tests`; the run goes through
+    # `run_command`, so approval and the risk classifier still apply.
+    "run_tests": "run_tests",
+    # smallcode's `use_skill`, over the skill loader SHAMSU already had and
+    # never showed the model. The INDEX goes in the prompt (a name and one
+    # line); the body is fetched only when the model asks, so a dozen skills
+    # cost a dozen lines of window instead of a dozen documents.
+    "use_skill": "use_skill",
     # Stage 1 of two-stage routing. Never offered alongside the real tools -
     # `active_tool_schemas` sends this OR them, never both.
     "select_category": "select_category",
@@ -558,6 +627,28 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "read_symbol",
+            "description": (
+                "Read ONE function or class from a file, by name - the exact source, "
+                "nothing else. Use this after read_file shows you an outline, rather "
+                "than reading the whole file to see one function."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "description": "Path relative to the workspace."},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Function or class name, e.g. render or Game.render.",
+                    },
+                },
+                "required": ["filepath", "symbol"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "patch_file",
             "description": "Replace an exact snippet in an existing file, leaving the rest untouched.",
             "parameters": {
@@ -571,6 +662,45 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["filepath", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "use_skill",
+            "description": (
+                "Load the full instructions for a named skill - a short worked "
+                "procedure for a kind of task. Use it when the skill index lists one "
+                "that fits what you are doing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name from the index."}
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_tests",
+            "description": (
+                "Run this project's tests. Finds the right command itself - npm test, "
+                "pytest, cargo test - so you do not have to guess it. Use this to check "
+                "your work after a change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "test_filter": {
+                        "type": "string",
+                        "description": "Optional: run only tests matching this name.",
+                    }
+                },
+                "required": [],
             },
         },
     },
@@ -1440,6 +1570,10 @@ class SimpleChatLoop:
             # shares the same transcript and speaks a different vocabulary; a
             # model shown `project.inspect` in its own history will call it.
             known_tools=SIMPLE_TRANSCRIPT_TOOLS,
+            # Stamped onto every message this turn writes, so the transcript
+            # says which surface asked - the same value the turn stream already
+            # carries on its events.
+            source=self.source,
         )
         self._num_ctx_floor = 0
         # Lowered from what the GPU will actually accept, once it has refused.
@@ -1497,6 +1631,16 @@ class SimpleChatLoop:
         # writing, and settled at turn end, when "not finished yet" stops being
         # a true description of a file the model has walked away from.
         self._unfinished: dict[str, str] = {}
+        # Did the streak come from a REFUSED payload rather than from Ollama
+        # cutting the generation off? The two need different endings - one is
+        # "the file is too big for one reply", the other is "what you sent would
+        # not have parsed" - and telling a user the first when it was the second
+        # sends them to a limit that never fired.
+        self._refused_unparseable = False
+        # Content hash of the last WHOLE read per file, so a re-read of an
+        # unchanged file can say so instead of resending it. Dropped on every
+        # elision sweep - see `_note_unchanged_since_last_read`.
+        self._read_digests: dict[str, str] = {}
         # Successful edits per file this turn - repeated blind fixes.
         self._edits_per_file: dict[str, int] = {}
         # How many times each identical read-only call has been made this turn.
@@ -1707,7 +1851,8 @@ class SimpleChatLoop:
                         # main.py never written.)
                         self.state.append_assistant("")
                         self.state.append_user(
-                            "That reply was empty. Answer the question, or call one tool."
+                            "That reply was empty. Answer the question, or call one tool.",
+                            origin=ORIGIN_LOOP,
                         )
                         continue
                     if turn.thinking and not self._hit_the_length_limit():
@@ -1767,8 +1912,10 @@ class SimpleChatLoop:
                     self.state.append_assistant(text)
                     self.state.append_user(
                         f"You showed the new contents of {described} but did not change the file. "
-                        f"Apply it now: call write_file for the complete new {described}, "
-                        "or patch_file for one exact replacement. Do not repeat the code in prose."
+                        f"Apply it now: call append_file to add it to the end of {described}, "
+                        "patch_file for one exact replacement, or write_file if it really is "
+                        "the whole file. Do not repeat the code in prose.",
+                        origin=ORIGIN_LOOP,
                     )
                     self._activity(f"described a change to {described} without making it; asked it to apply")
                     continue
@@ -1792,7 +1939,8 @@ class SimpleChatLoop:
                         f"Your reply ended on {promised!r} and then stopped. Nothing "
                         "followed it and you called no tool, so nothing happened.\n\n"
                         "Do it now, in this turn: call the tool that carries out what you "
-                        "just said you would do. Do not say you are about to do it again."
+                        "just said you would do. Do not say you are about to do it again.",
+                        origin=ORIGIN_LOOP,
                     )
                     self._activity("ended on a promise with no tool call; asked it to act")
                     continue
@@ -1842,18 +1990,31 @@ class SimpleChatLoop:
                 # means the file does not fit in one generation and the model
                 # will not break it up on being asked. Spinning on that proves
                 # nothing, and every refusal costs a full round.
-                return self._stop(
-                    f"My last {self._truncated_refusals} attempts to write "
-                    f"{outcome.refused_truncated or 'that file'} were cut off by my own "
-                    "output limit part-way through, so I refused all of them rather than "
-                    "leave a half-written file on disk. Nothing was changed.\n\n"
-                    "The file is too large for me to produce in one reply. Ask me for one "
-                    "part at a time - a single function, or one section - and I can build "
-                    "it up.",
-                    round_index,
-                    tool_calls,
-                    changed,
-                )
+                named = outcome.refused_truncated or self._truncated_target or "that file"
+                if self._refused_unparseable:
+                    # Live 2026-08-20 a user was told "cut off by my own output
+                    # limit" three times for writes the output limit never
+                    # touched - they were refused by the content gate. Blaming a
+                    # limit that did not fire sends someone to the wrong dial.
+                    reason = (
+                        f"My last {self._truncated_refusals} attempts to write {named} "
+                        "each stopped part-way through a string or a block, so I refused "
+                        "them rather than leave a file on disk that will not parse. "
+                        "Nothing was changed.\n\n"
+                        "Tell me which function or section to write and I will do that "
+                        "one on its own, or say `continue` for the next section only."
+                    )
+                else:
+                    reason = (
+                        f"My last {self._truncated_refusals} attempts to write {named} "
+                        "were cut off by my own output limit part-way through, so I "
+                        "refused all of them rather than leave a half-written file on "
+                        "disk. Nothing was changed.\n\n"
+                        "The file is too large for me to produce in one reply. Ask me "
+                        "for one part at a time - a single function, or one section - "
+                        "and I can build it up."
+                    )
+                return self._stop(reason, round_index, tool_calls, changed)
             if self._stalls.unproductive >= MAX_UNPRODUCTIVE_EDITS:
                 # Spinning. Live 2026-08-18 a turn ran 12 no-op patches and 5
                 # failed ones across 24 rounds and ~25 minutes, changing nothing
@@ -1883,7 +2044,8 @@ class SimpleChatLoop:
                 self.state.append_user(
                     f"You have already called {outcome.repeated_read} this turn and the "
                     "result has not changed. Use the result you already have, and either "
-                    "answer now or make a DIFFERENT call."
+                    "answer now or make a DIFFERENT call.",
+                    origin=ORIGIN_LOOP,
                 )
                 self._read_signatures[outcome.repeated_read] = 0
                 self._activity(f"repeated {outcome.repeated_read}; asked it to move on")
@@ -1916,7 +2078,8 @@ class SimpleChatLoop:
                     f"{outcome.repeated_edit} times this turn and cannot confirm any of "
                     "them worked. Do not edit it again on a guess. Either say precisely "
                     "what you changed and what the user should check, or ask for the "
-                    "exact error or the lines around the problem."
+                    "exact error or the lines around the problem.",
+                    origin=ORIGIN_LOOP,
                 )
             if outcome.written and self.verify_changes:
                 await self._append_verification(outcome.written)
@@ -2827,7 +2990,13 @@ class SimpleChatLoop:
                 # 18 whole-file writes - and by the time the user speaks again
                 # the truncation has already happened.
                 self._calls_since_elide = 0
-                self.evictions += self._elide_under_pressure()
+                swept = self._elide_under_pressure()
+                self.evictions += swept
+                if swept:
+                    # The copies the model "already has" may be exactly what was
+                    # just evicted. Forgetting here keeps "unchanged since you
+                    # last read it" from ever being a lie.
+                    self._read_digests.clear()
             if name in WRITING_TOOLS:
                 if result.ok:
                     # The world moved. A patch that could not match before may
@@ -2846,7 +3015,7 @@ class SimpleChatLoop:
                 else:
                     self._stalls.unproductive = 0
             else:
-                read_signature = f"{name}({_argument_summary(arguments)})"
+                read_signature = f"{name}({_read_argument_summary(arguments)})"
                 seen = self._read_signatures.get(read_signature, 0) + 1
                 self._read_signatures[read_signature] = seen
                 if seen >= REPEATED_READS_BEFORE_WARNING:
@@ -2862,12 +3031,27 @@ class SimpleChatLoop:
                 path = str(arguments.get("filepath") or "").strip()
                 if path:
                     outcome.written.append(path)
-                    if name in MUTATING_TOOLS:
+                    # It changed, so the remembered read is stale.
+                    self._read_digests.pop(path.lower(), None)
+                    if name in MUTATING_TOOLS and not _extended_the_file(result):
                         # Only whole-file writes and patches count toward the
                         # repeated-edit ceiling. Appending section after section
                         # is how a large file is MEANT to be built here, so
                         # counting each one would stop the very behaviour the
                         # truncation refusal asks for.
+                        #
+                        # `_extended_the_file` extends that exemption from the
+                        # TOOL to the SHAPE, and it had to. Live 2026-08-20, told
+                        # to build a 1,500-line file, qwen2.5:3b said "I will
+                        # write 60 lines at a time" and did exactly that - with
+                        # `write_file`, re-sending the growing file each time
+                        # rather than appending. Five sections in, all five
+                        # verified clean, the turn was stopped for "5 blind edits
+                        # I cannot confirm". Every one of them was confirmed and
+                        # every one of them added lines; the ceiling was reading
+                        # a build as a repair loop. A write that GROWS a file is
+                        # the chunked path the prompt now asks for, whichever
+                        # tool carries it.
                         count = self._edits_per_file.get(path.lower(), 0) + 1
                         self._edits_per_file[path.lower()] = count
                         outcome.repeated_edit = max(outcome.repeated_edit, count)
@@ -3051,6 +3235,9 @@ class SimpleChatLoop:
         string, a dangling operator, a bracket opened on the last line and never
         closed - and lets an unfinished-but-clean section through.
         """
+        if name not in WHOLE_FILE_ARGUMENTS:
+            # A fragment cannot be judged as a file. See WHOLE_FILE_ARGUMENTS.
+            return None
         key, content = self._content_argument(arguments)
         if not key:
             return None
@@ -3082,6 +3269,7 @@ class SimpleChatLoop:
         named = target or "that file"
         self._truncated_refusals += 1
         self._truncated_target = target
+        self._refused_unparseable = True
         self._repair_attempts += 1
 
         message = (
@@ -3190,6 +3378,12 @@ class SimpleChatLoop:
             return self._history_search(arguments)
         if name == "append_file":
             return self._append_file(arguments)
+        if name == "read_symbol":
+            return self._read_symbol(arguments)
+        if name == "run_tests":
+            return self._run_tests(arguments)
+        if name == "use_skill":
+            return self._use_skill(arguments)
         if name == "find_files":
             return self._find_files(arguments)
         if name == "select_category":
@@ -3224,6 +3418,8 @@ class SimpleChatLoop:
                 + ", ".join(sorted(SIMPLE_TOOLS)),
                 {"unknown_tool": name},
             )
+        if name in {"patch_file", "read_and_patch"}:
+            arguments = _strip_line_numbers(arguments)
         if name == "write_file":
             blocked = self._refuse_blind_overwrite(arguments)
             if blocked is not None:
@@ -3243,6 +3439,9 @@ class SimpleChatLoop:
         except Exception as exc:  # noqa: BLE001 - the model can act on the message
             return ToolResult(False, f"{type(exc).__name__}: {exc}", {"tool": name})
         if name == "read_file":
+            result = self._outline_instead_of_body(arguments, result)
+            result = self._note_unchanged_since_last_read(arguments, result)
+            result = self._number_the_lines(arguments, result)
             self._note_partial_read(arguments, result)
         if before is not None and result.ok:
             return self._with_diff(arguments, before, result)
@@ -3431,6 +3630,286 @@ class SimpleChatLoop:
             f"Appended {added} line(s) to {path}; it is now {total} lines."
             + ("" if existed else " (the file did not exist and was created)"),
             {"filepath": path, "added_lines": added, "total_lines": total},
+        )
+
+    def _outline_instead_of_body(
+        self, arguments: dict[str, Any], result: ToolResult
+    ) -> ToolResult:
+        """Hand back the SHAPE of a large file, not its contents.
+
+        Only when the model asked for the whole thing. An explicit
+        start_line/end_line is a request for exactly those lines and is answered
+        with exactly those lines - the outline is what replaces the *unbounded*
+        read, which is the one that could never fit.
+
+        Marked as a partial read on the way out, which matters: the model has
+        genuinely not seen the body, so `_refuse_blind_overwrite` must still stop
+        it rewriting the file whole. An outline that quietly counted as having
+        read the file would license exactly the data loss that guard exists for.
+        """
+        if not result.ok:
+            return result
+        if arguments.get("start_line") or arguments.get("end_line"):
+            return result
+        data = dict(result.data) if isinstance(result.data, dict) else {}
+        body = str(data.get("content") or "")
+        relative = str(data.get("resolved_filepath") or arguments.get("filepath") or "")
+        if not body or not relative:
+            return result
+        total = int(data.get("total_lines") or (body.count(chr(10)) + 1))
+        if total <= OUTLINE_OVER_LINES:
+            return result
+        suffix = Path(relative).suffix
+        if not can_outline(suffix):
+            # No parser and no declaration scan for this file type. The old
+            # head-clip is still the honest answer - it is not a good one, but
+            # inventing structure for a `.md` file would be worse.
+            return result
+        rendered = render_outline(relative, body, suffix)
+        if not rendered:
+            return result
+        data["content"] = rendered
+        data["outlined"] = True
+        # `_note_partial_read` keys on this, and it is TRUE in the only sense
+        # that matters here: the bodies were not sent.
+        data["truncated"] = True
+        self._activity(f"{relative} is {total:,} lines; sent its outline instead of the body")
+        return ToolResult(
+            True,
+            f"{relative} is {total:,} lines, so this is its outline rather than its "
+            "contents. Call read_symbol for one function or class, or read_file with "
+            "start_line and end_line for a specific part.",
+            data,
+        )
+
+    def _use_skill(self, arguments: dict[str, Any]) -> ToolResult:
+        """The body of one skill, by name.
+
+        The catalogue, the frontmatter parsing and the override rules all
+        existed already - bundled, then user, then workspace, later winning -
+        and nothing in simple mode had ever called them. A skill nobody can load
+        is a document, not a capability.
+
+        A miss lists what IS available, for the same reason `read_symbol` does:
+        the model asked the right kind of question with the wrong noun, and the
+        roster answers it in the same round.
+        """
+        wanted = str(arguments.get("name") or arguments.get("skill") or "").strip()
+        catalog = _skill_catalog(self.workspace)
+        if not catalog.skills:
+            return ToolResult(
+                False, "There are no skills installed in this workspace.", {"skills": []}
+            )
+        if not wanted:
+            return ToolResult(
+                False,
+                "use_skill needs a name. Available: "
+                + ", ".join(sorted(catalog.skills)),
+                {"skills": sorted(catalog.skills)},
+            )
+        skill = catalog.skills.get(wanted) or catalog.skills.get(wanted.lower())
+        if skill is None:
+            lowered = wanted.lower()
+            skill = next(
+                (
+                    candidate
+                    for name, candidate in catalog.skills.items()
+                    if lowered in name.lower()
+                ),
+                None,
+            )
+        if skill is None:
+            return ToolResult(
+                False,
+                f"There is no skill called {wanted!r}. Available: "
+                + ", ".join(sorted(catalog.skills)),
+                {"skills": sorted(catalog.skills)},
+            )
+        body = (skill.instructions or "").strip()
+        if not body:
+            return ToolResult(
+                False, f"The skill {skill.name!r} has no instructions.", {"skill": skill.name}
+            )
+        self._activity(f"loaded the {skill.name} skill")
+        return ToolResult(
+            True,
+            f"Skill: {skill.name} - {skill.description}" + chr(10) * 2 + body,
+            {"skill": skill.name, "source": skill.source},
+        )
+
+    def _run_tests(self, arguments: dict[str, Any]) -> ToolResult:
+        """Find this project's test command and run it.
+
+        Delegated to `run_command` rather than executed here, deliberately: that
+        path already carries approval, the command risk classifier and output
+        redaction, and a second way to run a subprocess would be a second place
+        for those to be forgotten.
+        """
+        found = detect_test_command(self.workspace, str(arguments.get("test_filter") or ""))
+        if not found:
+            return ToolResult(
+                False,
+                f"I could not work out how to run tests here: {found.reason}. "
+                "If you know the command, call run_command with it - or say what it "
+                "is and I will use it from now on.",
+                {"detected": False, "reason": found.reason},
+            )
+        self._activity(f"running tests: {found.command} ({found.reason})")
+        result = self._execute("run_command", {"command": found.command})
+        prefix = f"Ran `{found.command}` ({found.reason})." + chr(10) * 2
+        data = dict(result.data) if isinstance(result.data, dict) else {}
+        data.update({"detected": True, "command": found.command, "reason": found.reason})
+        return ToolResult(result.ok, prefix + (result.message or ""), data)
+
+    def _number_the_lines(
+        self, arguments: dict[str, Any], result: ToolResult
+    ) -> ToolResult:
+        """Put a line number in front of every line of a read.
+
+        smallcode does this on every read and it is the cheapest accuracy win
+        available: a model that has seen `412| ` can ask for line 412. Without
+        it, `start_line` is arithmetic performed on a wall of text, and the
+        outline's ranges point into a body with no landmarks.
+
+        The obvious hazard is the model copying the gutter back into a
+        `patch_file` old_string, which would never match. `_strip_line_numbers`
+        removes it on the way back in, so the round trip is safe.
+        """
+        if not result.ok:
+            return result
+        data = dict(result.data) if isinstance(result.data, dict) else {}
+        if data.get("outlined") or data.get("unchanged"):
+            return result  # already a summary; numbering it would be nonsense
+        body = str(data.get("content") or "")
+        if not body:
+            return result
+        first = int(data.get("start_line") or 1)
+        width = len(str(first + body.count(chr(10))))
+        numbered = chr(10).join(
+            f"{str(first + offset).rjust(width)}{LINE_NUMBER_GUTTER} {line}"
+            for offset, line in enumerate(body.split(chr(10)))
+        )
+        data["content"] = numbered
+        data["line_numbers"] = True
+        return ToolResult(result.ok, result.message, data)
+
+    def _note_unchanged_since_last_read(
+        self, arguments: dict[str, Any], result: ToolResult
+    ) -> ToolResult:
+        """Say "unchanged" instead of resending a file the model already has.
+
+        Live 2026-08-20 a user watched eight `read_file js/game.js` calls in one
+        turn. Every one re-sent the whole file, and by the third the window was
+        being elided to make room for copies of a file that had not changed.
+
+        smallcode's Feature 16 does this and stops there. That would be unsafe
+        here, because SHAMSU elides old tool payloads under pressure - so the
+        copy the model "already has" may have been evicted, and answering
+        "unchanged" would leave it with nothing at all. The memory of what was
+        sent is therefore dropped whenever an elision sweep runs, which makes
+        this claim true whenever it is made.
+        """
+        if not result.ok or arguments.get("start_line") or arguments.get("end_line"):
+            return result
+        data = dict(result.data) if isinstance(result.data, dict) else {}
+        path = str(data.get("resolved_filepath") or arguments.get("filepath") or "")
+        body = str(data.get("content") or "")
+        if not path or not body:
+            return result
+        digest = sha256(body.encode("utf-8", "replace")).hexdigest()
+        key = path.lower()
+        if self._read_digests.get(key) == digest:
+            total = data.get("total_lines") or (body.count(chr(10)) + 1)
+            self._activity(f"{path} is unchanged since the last read; did not resend it")
+            return ToolResult(
+                True,
+                f"{path} is unchanged since you last read it ({total:,} lines). "
+                "Use the copy you already have. If you need a part of it again, "
+                "call read_file with start_line and end_line, or read_symbol.",
+                {**data, "content": "", "unchanged": True},
+            )
+        self._read_digests[key] = digest
+        return result
+
+    def _read_symbol(self, arguments: dict[str, Any]) -> ToolResult:
+        """One function or class, exactly - the follow-up an outline earns.
+
+        The line range is computed from the same parse that produced the
+        outline, so it cannot drift from what the model was shown. That is the
+        whole reason this exists rather than leaving the model to pass
+        start_line and end_line it read off a listing: a guessed range that is
+        two lines short produces a patch that will not apply, and the model
+        cannot tell the difference from a wrong `old_string`.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        wanted = str(arguments.get("symbol") or arguments.get("name") or "").strip()
+        if not path or not wanted:
+            return ToolResult(False, "read_symbol needs a filepath and a symbol.", {})
+        try:
+            target = self.tools.sandbox.validate(path)
+        except Exception as exc:  # noqa: BLE001 - the sandbox owns this refusal
+            return ToolResult(False, str(exc), {"filepath": path})
+        if not target.is_file():
+            return ToolResult(
+                False,
+                f"Not a file: {path}. Use find_files to locate it.",
+                {"filepath": path},
+            )
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return ToolResult(False, f"Could not read {path}: {exc}", {"filepath": path})
+        suffix = target.suffix
+        found = find_symbol(text, suffix, wanted)
+        if found is None:
+            # Say what IS there. A bare "not found" costs a round and teaches
+            # nothing; the roster is the answer to the question behind the
+            # question, and it is already computed.
+            names = [symbol.name for symbol in outline(text, suffix)]
+            if not names:
+                return ToolResult(
+                    False,
+                    f"Nothing in {path} can be outlined, so there is no symbol to "
+                    "fetch. Read it with read_file and start_line/end_line.",
+                    {"filepath": path, "symbol": wanted},
+                )
+            listed = ", ".join(names[:30])
+            more = f" (+{len(names) - 30} more)" if len(names) > 30 else ""
+            return ToolResult(
+                False,
+                f"{path} has no symbol called {wanted!r}. It defines: {listed}{more}.",
+                {"filepath": path, "symbol": wanted, "available": names[:60]},
+            )
+        lines = text.splitlines()[found.start - 1 : found.end]
+        body = chr(10).join(lines)
+        # The same cap every other payload obeys. A single 900-line function is
+        # rare and is exactly the case where a range read is the right call.
+        capped = False
+        if len(body) > MAX_READ_CHARS:
+            body = body[:MAX_READ_CHARS]
+            capped = True
+        message = (
+            f"{path} lines {found.start}-{found.end}, {found.signature}:"
+            + chr(10) + body
+        )
+        if capped:
+            message += (
+                chr(10)
+                + f"... [that symbol is {found.lines} lines; this is the first part. "
+                f"Read the rest with read_file(start_line=..., end_line={found.end}).]"
+            )
+        return ToolResult(
+            True,
+            message,
+            {
+                "filepath": path,
+                "resolved_filepath": path,
+                "symbol": found.name,
+                "start_line": found.start,
+                "end_line": found.end,
+                "total_lines": len(text.splitlines()),
+                "content_truncated": capped,
+            },
         )
 
     def _find_files(self, arguments: dict[str, Any]) -> ToolResult:
@@ -3637,6 +4116,9 @@ class SimpleChatLoop:
             shown.append(f"... [{len(diff) - MAX_DIFF_LINES} more diff lines]")
         data = dict(result.data) if isinstance(result.data, dict) else {}
         data["diff_lines"] = len(diff)
+        # Net lines gained. The repeated-edit ceiling reads this to tell a file
+        # being BUILT from a file being churned; see `_run_tools`.
+        data["grew_by"] = len(after.splitlines()) - len(before.splitlines())
         return ToolResult(
             result.ok,
             f"{result.message}\n\nWhat changed:\n" + "\n".join(shown),
@@ -3910,12 +4392,20 @@ class SimpleChatLoop:
             if not path.is_file():
                 problems.append(f"{relative}: file was not created")
                 continue
+            # Asked FIRST, and of every file rather than only of one a checker
+            # already complained about. The structural scan is deliberately
+            # quiet about an unterminated single-line string - far more often an
+            # apostrophe in prose than a fault - so a `.js` file ending
+            # `const label = "sco` passes it, and would have been reported as
+            # having no syntax errors. That is the false pass this whole module
+            # exists to prevent.
+            cut = self._cut_off_on_disk(path, relative)
+            if cut:
+                problems.append(cut)
+                self._unfinished.pop(relative, None)
+                continue
             verdict = check_file(path)
             if verdict.status == VERIFY_PROBLEM:
-                cut = self._cut_off_on_disk(path, relative)
-                if cut:
-                    problems.append(cut)
-                    continue
                 still_open = self._still_being_built(path)
                 if still_open:
                     unfinished.append(f"{relative}: {still_open}")
@@ -4223,6 +4713,113 @@ def _turn_verdict(elapsed: float, changed: tuple[str, ...] | list[str], *, stopp
     return f"{verdict} {spent} - {count} file{'s' if count != 1 else ''} changed"
 
 
+def _read_argument_summary(arguments: dict[str, Any]) -> str:
+    """`_argument_summary`, plus whatever NARROWS the read.
+
+    The repeated-read warning keys on this, and `_argument_summary` returns the
+    filepath alone - so `read_file(app.py, 1-60)` and `read_file(app.py, 61-120)`
+    were the same signature, and the THIRD section of a file read in pieces was
+    answered with "you have already called this and the result has not changed.
+    Use the result you already have."
+
+    That is false, and it is worse than merely false: reading a large file in
+    ranges is the strategy the outline tells the model to use, so the guard
+    fired on precisely the behaviour the read path now asks for. The partial-read
+    tracker on the other side of this file (`_seen_ranges`) has always
+    accumulated ranges correctly - only this counter disagreed.
+    """
+    base = _argument_summary(arguments)
+    narrowing = [
+        f"{key}={arguments[key]}"
+        for key in ("start_line", "end_line", "symbol")
+        if arguments.get(key) not in (None, "")
+    ]
+    return f"{base} {' '.join(narrowing)}".strip() if narrowing else base
+
+
+@lru_cache(maxsize=8)
+def _skill_catalog(workspace: Path) -> Any:
+    """The skill catalogue for *workspace*, discovered once per run.
+
+    Cached because discovery walks three directories and the answer cannot
+    change inside a turn; keyed by workspace so two open projects do not share
+    one roster.
+    """
+    try:
+        from shamsu.skills.loader import discover_skills
+
+        return discover_skills(workspace)
+    except Exception:  # noqa: BLE001 - a bad skill must not end a turn
+        from shamsu.skills.types import SkillCatalog
+
+        return SkillCatalog()
+
+
+def skill_index(workspace: Path) -> str:
+    """One line per skill, for the prompt. ``""`` when there are none.
+
+    smallcode's arrangement, and the reason it is an INDEX rather than the
+    documents themselves: a model that cannot see a skill exists will never call
+    `use_skill` for it (their issue #58 again), while pasting every skill body
+    into the prompt would spend the window on instructions for tasks this turn
+    is not doing.
+    """
+    catalog = _skill_catalog(workspace)
+    skills = getattr(catalog, "sorted_skills", list)()
+    if not skills:
+        return ""
+    lines = ["Skills you can load with use_skill, when one fits the job:"]
+    # Indented rather than bulleted: the prompt deliberately carries no bullet
+    # list, because the legacy path's 49-bullet wall is what this mode replaced,
+    # and a roster is data rather than rules.
+    lines += [f"  {skill.name}: {_gist(skill.description)}" for skill in skills[:12]]
+    return chr(10).join(lines)
+
+
+def _gist(description: str, limit: int = 58) -> str:
+    """Enough of a description to choose by, and no more.
+
+    This index is paid for on EVERY turn, and SHAMSU's skill descriptions were
+    written for a settings screen - one runs to 140 characters listing four
+    database engines. Full descriptions cost ~200 tokens of window per turn to
+    answer a question the model asks once. The name carries most of the signal;
+    this is the tiebreaker.
+    """
+    text = " ".join((description or "").split())
+    for separator in (" - ", ". "):
+        head = text.split(separator, 1)[0]
+        if 12 <= len(head) < len(text):
+            text = head
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _strip_line_numbers(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Undo the read gutter when the model pastes it back into a patch.
+
+    Numbering every line makes a read far more useful and creates exactly one
+    hazard: `old_string` copied verbatim out of the result carries `  12| ` in
+    front of each line and can never match the file. Stripping it here means the
+    model can copy what it was shown - which is precisely what it was told to
+    do - and be right.
+
+    Only when EVERY non-empty line carries a gutter. A snippet where one line
+    happens to start with a number and a pipe is far more likely to be real
+    code (a markdown table, a bit of ASCII art) than a half-copied read.
+    """
+    cleaned = dict(arguments)
+    for key in ("old_string", "new_string"):
+        value = arguments.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        lines = [line for line in value.split(chr(10)) if line.strip()]
+        if not lines or not all(_NUMBERED_LINE.match(line) for line in lines):
+            continue
+        cleaned[key] = _NUMBERED_LINE.sub("", value)
+    return cleaned
+
+
 def _argument_summary(arguments: dict[str, Any]) -> str:
     for key in ("filepath", "path", "pattern", "command"):
         value = arguments.get(key)
@@ -4315,6 +4912,24 @@ def _digest(previous: str, evicted: list[Any]) -> str:
     return _bounded_summary(lines, summary_budget(max_ctx()))
 
 
+
+
+def _extended_the_file(result: ToolResult) -> bool:
+    """Did this write ADD to the file rather than rework it?
+
+    The one signal that separates building from churning, and the reason the
+    repeated-edit ceiling can stay strict about the second while a chunked write
+    grows a file over a dozen calls.
+
+    Conservative: only a write whose diff was computed - `_with_diff` records
+    this - and only one with a net gain in lines. A rewrite that shuffles a file
+    without growing it is exactly the blind repair the ceiling exists for.
+    """
+    data = result.data if isinstance(result.data, dict) else {}
+    try:
+        return int(data.get("grew_by") or 0) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def _changed_nothing(result: ToolResult) -> bool:

@@ -74,11 +74,34 @@ class TelegramController:
             if result.ok:
                 session_id = self.gateway.ensure_default_session()
                 self.store.set_active_session(message.user.user_id, session_id)
-            return [OutboundMessage(message.chat.chat_id, text)]
+            # One of the two things the desktop is told about: a device just
+            # gained - or was refused - control of this installation. That is
+            # not turn output, and you want to see it even if you were not
+            # looking at your phone.
+            who = message.user.display_name
+            return [
+                OutboundMessage(
+                    message.chat.chat_id,
+                    text,
+                    mirror_to_cli=True,
+                    cli_text=(
+                        f"{who} paired with this installation."
+                        if result.ok
+                        else f"{who} failed to pair: {result.reason}"
+                    ),
+                )
+            ]
         authorization = self.authenticator.authorize(message.user, message.chat)
         if not authorization.ok:
             self.store.increment_metric("telegram_updates_rejected")
-            return [OutboundMessage(message.chat.chat_id, authorization.reason)]
+            return [
+                OutboundMessage(
+                    message.chat.chat_id,
+                    authorization.reason,
+                    mirror_to_cli=True,
+                    cli_text=f"{message.user.display_name} was refused: {authorization.reason}",
+                )
+            ]
         if command is not None:
             return await self._handle_command(message, command.name)
         if message.document is not None:

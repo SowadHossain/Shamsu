@@ -59,6 +59,17 @@ def _tool(name: str, **arguments) -> dict:
 
 
 
+
+def _named_tool(tool: str, arguments: dict) -> dict:
+    """`_tool`, for a call whose ARGUMENT is called `name` - which collides with
+    `_tool`'s own first parameter."""
+    return {
+        "message": {
+            "content": "",
+            "tool_calls": [{"function": {"name": tool, "arguments": arguments}}],
+        }
+    }
+
 def _grounding_of(call: dict) -> str:
     """The workspace-grounding system block, wherever the loop chose to put it.
 
@@ -80,7 +91,7 @@ def _grounding_of(call: dict) -> str:
 _NON_REGISTRY_TOOLS = frozenset({
     "memory_remember", "memory_load", "memory_list", "memory_forget",
     "graph_search", "explain_symbol", "history_search", "append_file",
-    "find_files",
+    "find_files", "read_symbol", "run_tests", "use_skill",
     "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
 })
 
@@ -419,7 +430,14 @@ def test_the_system_prompt_is_small_and_carries_no_prohibitions(tmp_path):
     smallcode's issue #58 was a model refusing research tasks with "my tools
     are for code files only" while the web tools sat in its own schema list.
     So the ceiling moved to 320 for capability lines that are all positive
-    statements of what CAN be done.
+    statements of what CAN be done, and to 360 when two more were added: the
+    60-line write rule, and the outline-first read. Both replace a decision the
+    model was previously making badly on its own - "too big" is not a number,
+    and neither is "read the file". 420 when the `act` section landed: a model
+    that stops to ask after one section spends the user's turn on a question
+    they already answered (live 2026-08-20). 520 when the skill index landed -
+    a skill the model cannot see is one it will never load, and the roster is
+    the only thing that makes `use_skill` reachable.
 
     The size was never the real guard anyway; the three assertions below are.
     A prompt can be short and still be a wall of prohibitions, and that is the
@@ -431,7 +449,7 @@ def test_the_system_prompt_is_small_and_carries_no_prohibitions(tmp_path):
 
     prompt = simple_system_prompt(tmp_path)
 
-    assert count_tokens(prompt) < 320
+    assert count_tokens(prompt) < 520
     assert not re.search(r"(?im)^\s*[-*]\s", prompt), "no bullet wall"
     lowered = prompt.lower()
     assert "do not" not in lowered
@@ -2166,7 +2184,9 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
     query" - one of six tools dead, silently, for as long as it existed.
     """
     tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
-    (tmp_path / "hello.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "hello.py").write_text(
+        "value = 1\n\n\ndef greet():\n    return value\n", encoding="utf-8"
+    )
 
     for schema in SIMPLE_TOOL_SCHEMAS:
         function = schema.get("function", schema)
@@ -2189,6 +2209,9 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 "history_search": {"query": "anything"},
                 "append_file": {"filepath": "grown.py", "content": "# section"},
                 "find_files": {"pattern": "**/*.py"},
+                "read_symbol": {"filepath": "hello.py", "symbol": "greet"},
+                "run_tests": {"test_filter": "nothing_matches_this"},
+                "use_skill": {"name": "developer"},
                 "find_and_read": {"pattern": "**/*.py"},
                 "search_and_read": {"query": "value"},
                 "read_and_patch": {"filepath": "hello.py", "old_string": "value",
@@ -2200,7 +2223,9 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
             # memory_forget on a missing id is a legitimate no.
             # memory_forget on a missing id, and read_and_patch whose snippet
             # is absent, are both legitimate NOs.
-            assert result.ok or name in {"memory_forget", "read_and_patch"}, (
+            assert result.ok or name in {
+                "memory_forget", "read_and_patch", "run_tests",
+            }, (
                 f"{name} -> {result.message}"
             )
             continue
@@ -4772,9 +4797,12 @@ def test_a_file_type_with_no_checker_is_not_a_problem_to_repair(tmp_path):
     assert "problems" not in report["data"]
 
 
-def test_a_javascript_file_cut_off_mid_block_is_reported_as_a_problem(tmp_path, monkeypatch):
-    """The three real files: game.js 60/39 braces, player.js 47/30, bullet.js
-    24/17, every one of them certified clean."""
+def test_a_javascript_file_with_open_blocks_reads_as_progress_not_a_fault(tmp_path, monkeypatch):
+    """The three real files - game.js 60/39 braces, player.js 47/30, bullet.js
+    24/17 - were once certified clean, and that was the defect. This is the
+    OTHER edge of the same knife: once a large file is meant to arrive in
+    sections, an open block is what the first section looks like, and calling it
+    a fault sends the model repairing a file that is not finished yet."""
     monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
     (tmp_path / "game.js").write_text(
         "function update() {\n  if (alive) {\n    for (const a of rocks) {\n",
@@ -4784,11 +4812,54 @@ def test_a_javascript_file_cut_off_mid_block_is_reported_as_a_problem(tmp_path, 
 
     report = _verify_json(loop, ["game.js"])
 
-    assert report["ok"] is False
-    problem = report["data"]["problems"][0]
-    assert problem.startswith("game.js:")
-    assert "unclosed {" in problem
-    assert "cut off mid-block" in problem
+    assert report["ok"] is True
+    assert not report["data"]["problems"] if "problems" in report["data"] else True
+    unfinished = report["data"]["unfinished"][0]
+    assert unfinished.startswith("game.js:")
+    assert "3 block(s) still open" in unfinished
+    assert "append_file" in unfinished
+    assert "game.js" not in report["data"]["checked"], "it must not read as verified"
+
+
+def test_a_file_still_open_when_the_turn_ends_counts_against_the_run(tmp_path, monkeypatch):
+    """The other half of calling open blocks progress. Mid-turn there is nothing
+    to pass or fail; once the model has declared itself done, a file it left
+    mid-block is broken, and the run outcome has to see that."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [_tool("write_file", filepath="game.js", content="function f() {" + chr(10)),
+         _text("all done")],
+        ledger,
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("write game.js"))
+
+    failures = [e for e in ledger.events if e["type"] == "verification_failed"]
+    assert failures, "a file abandoned mid-block read as a success"
+    assert failures[0]["verifier_id"] == "syntax:game.js"
+    assert "still open" in failures[0]["detail"]
+
+
+def test_a_file_finished_before_the_turn_ends_is_not_failed_for_being_unfinished(tmp_path, monkeypatch):
+    """The settle pass must not punish the file it was watching get built."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    ledger = _RecordingLedger()
+    loop = _verified(
+        tmp_path,
+        [_tool("write_file", filepath="game.js", content="function f() {" + chr(10)),
+         _tool("append_file", filepath="game.js", content="}" + chr(10)),
+         _text("all done")],
+        ledger,
+        max_rounds=3,
+    )
+
+    asyncio.run(loop.run("build game.js in two pieces"))
+
+    assert not [e for e in ledger.events if e["type"] == "verification_failed"]
+    assert [e for e in ledger.events if e["type"] == "verification_passed"]
 
 
 def test_a_complete_javascript_file_passes(tmp_path, monkeypatch):
@@ -4850,7 +4921,10 @@ def test_node_check_is_used_when_node_is_installed(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(simple_verify.subprocess, "run", fake_run)
-    (tmp_path / "cut.js").write_text("function f() {\n", encoding="utf-8")
+    # A stray closer, not an open block: an open block is now reported as
+    # progress by whichever checker found it, so it could no longer show that
+    # node was the one that ran.
+    (tmp_path / "cut.js").write_text("function f() { ) }\n", encoding="utf-8")
     loop = _loop(tmp_path, [])
 
     report = _verify_json(loop, ["cut.js"])
@@ -6323,8 +6397,12 @@ def test_a_file_built_by_appending_is_verified_after_the_last_piece(tmp_path, mo
 
     verdicts = [m.content for m in loop.state.all_messages if m.name == "verify"]
     assert len(verdicts) == 2, "the append was never verified"
-    assert '"ok": false' in verdicts[0], "half a file really is unbalanced"
+    # Half a file really is unbalanced - and while it is being built that is
+    # progress, not a fault. It must not read as CHECKED either.
+    assert "still open" in verdicts[0] and "append_file" in verdicts[0]
+    assert '"checked": []' in verdicts[0]
     assert '"ok": true' in verdicts[-1], "the finished file must come back clean"
+    assert "still open" not in verdicts[-1]
 
 
 def test_appending_section_after_section_does_not_trip_the_edit_ceiling(tmp_path, monkeypatch):
@@ -6344,3 +6422,856 @@ def test_appending_section_after_section_does_not_trip_the_edit_ceiling(tmp_path
 
     assert not result.stopped, result.final
     assert (tmp_path / "a.js").read_text(encoding="utf-8").count("//") == 8
+
+
+# --- the write cap: bound the unit of work, not the budget (SMALLCODE 6.8) ---
+#
+# smallcode's ratio is an 8,192-token reply budget against an 8,000-char write
+# cap - four times the headroom, so the model is never permitted to attempt a
+# write large enough to exhaust its own output budget. SHAMSU had one times.
+# Restoring the ratio means capping the CONTENT, because the alternative -
+# shrinking `MAX_REPLY_TOKENS` - would take the room prose legitimately needs.
+
+
+def test_the_reply_budget_is_not_shrunk_to_pay_for_the_write_cap():
+    """Bound the unit of work, not the budget. A large reply is still the right
+    thing for a review or a plan; it was only ever wrong for a write."""
+    from shamsu.agents.simple_chat import MAX_REPLY_TOKENS
+
+    assert MAX_REPLY_TOKENS == 16384
+
+
+def test_the_write_cap_never_exceeds_the_llama_cpp_tool_argument_wall():
+    """Two INDEPENDENT walls, and this is the one SHAMSU did not know existed.
+    llama.cpp's tool-argument parser gives up around 13KB WITHOUT reporting
+    `done_reason: "length"`, so a cap derived from the reply budget alone would
+    allow a 60KB write on a large window and walk straight into it."""
+    from shamsu.agents.simple_chat import WRITE_CHARS_CEILING, max_write_chars
+
+    assert max_write_chars(16384) == WRITE_CHARS_CEILING == 8_000
+    assert max_write_chars(1_000_000) == WRITE_CHARS_CEILING
+
+
+def test_the_write_cap_follows_the_reply_budget_down():
+    """Wall A. On a half-full window the budget binds before llama.cpp does."""
+    from shamsu.agents.simple_chat import max_write_chars
+
+    assert max_write_chars(8192) == 6963
+    assert max_write_chars(4096) == 3481
+
+
+def test_the_write_cap_has_a_floor_and_says_the_window_is_wrong_below_it():
+    """Chunking to 1,700 characters at a time is not a strategy, it is 24
+    rounds of nothing. Below the floor the honest answer is that the window is
+    the wrong shape for the task."""
+    from shamsu.agents.simple_chat import (
+        WRITE_CHARS_FLOOR,
+        max_write_chars,
+        write_budget_is_unworkable,
+    )
+
+    assert max_write_chars(2048) == WRITE_CHARS_FLOOR == 2_000
+    assert write_budget_is_unworkable(2048)
+    assert not write_budget_is_unworkable(8192)
+
+
+def test_a_write_larger_than_the_cap_is_refused_before_it_reaches_disk(tmp_path):
+    """Refused at the door, not cut off at the source. The content was fully
+    generated and the model still holds every character of it - which is what
+    makes this recoverable where a truncated generation is not."""
+    huge = ("const a = 1;" + chr(10)) * 900
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="big.js", content=huge), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write big.js"))
+
+    assert not (tmp_path / "big.js").exists()
+
+
+def test_the_oversize_refusal_names_the_strategy_not_just_the_limit(tmp_path):
+    """A refusal stating only the limit spends a round and teaches nothing."""
+    huge = ("const a = 1;" + chr(10)) * 900
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="big.js", content=huge), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write big.js"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert any("REFUSED" in c for c in said)
+    assert any("append_file" in c and "60 lines" in c for c in said)
+    assert any("Nothing you generated is lost" in c for c in said)
+
+
+def test_the_cap_covers_every_tool_that_carries_content(tmp_path):
+    """`patch_file` replacing ten lines with eight hundred has the identical
+    problem, so this is not a `write_file` special case."""
+    (tmp_path / "app.js").write_text("const a = 1;" + chr(10), encoding="utf-8")
+    huge = ("const b = 2;" + chr(10)) * 900
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("patch_file", filepath="app.js", old_string="const a = 1;",
+                  new_string=huge),
+            _text("ok"),
+        ],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("expand app.js"))
+
+    assert (tmp_path / "app.js").read_text(encoding="utf-8") == "const a = 1;" + chr(10)
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert any("too large" in c for c in said)
+
+
+def test_a_write_at_the_cap_still_goes_through(tmp_path):
+    """The guard must not touch the ordinary path - and 60 lines of dense code
+    is ~2,500 characters, comfortably inside it."""
+    body = ("const a = 1;" + chr(10)) * 60
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="fine.js", content=body), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write fine.js"))
+
+    assert (tmp_path / "fine.js").read_text(encoding="utf-8") == body
+
+
+# --- the pre-write gate tests for TRUNCATION, not validity (SMALLCODE 6.7) ---
+#
+# Both write-time gates in the tool layer bailed out when the target did not
+# already exist, and only understood Python - so SHAMSU would refuse to damage a
+# good file and happily create a broken one. The gate that closes that hole must
+# not test for validity: under a chunking strategy a first section correctly has
+# unclosed blocks, and refusing those would refuse every legitimate chunk.
+
+
+def test_a_new_file_ending_mid_string_is_refused(tmp_path):
+    """Hole 1.1: a brand-new file had NO structural gate at write time."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="views.py",
+               content='def index(request):' + chr(10) + '    return render(request, "item'),
+         _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write views.py"))
+
+    assert not (tmp_path / "views.py").exists()
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert any("REFUSED" in c and "stops part-way through" in c for c in said)
+
+
+def test_the_gate_is_not_python_only(tmp_path):
+    """`_breaks_working_python` returned "" for anything but `.py`. A new
+    `game.js` that stops mid-function had nothing between it and the disk."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="game.js", content="const label = \"score"),
+         _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write game.js"))
+
+    assert not (tmp_path / "game.js").exists()
+
+
+def test_a_first_section_with_open_blocks_is_allowed_through(tmp_path):
+    """The trap this gate has to avoid. A gate testing for VALIDITY would refuse
+    every legitimate first chunk, and the fix would create a new bug."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="game.js",
+               content="function update() {" + chr(10) + "  if (alive) {" + chr(10)),
+         _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write the first section of game.js"))
+
+    assert (tmp_path / "game.js").exists(), "a legitimate first section was refused"
+
+
+def test_the_cut_off_refusal_counts_toward_the_streak_that_has_an_exit(tmp_path):
+    """llama.cpp's parser does not report `done_reason: "length"`, so this
+    failure is invisible to the `done_reason` guard. Sharing its counter is what
+    keeps the exit covering both."""
+    from shamsu.agents.simple_chat import MAX_TRUNCATED_WRITE_REFUSALS
+
+    cut = _tool("write_file", filepath="a.py", content="x = foo(")
+    loop = _loop(tmp_path, [cut] * 24, max_rounds=24, verify_changes=False)
+
+    result = asyncio.run(loop.run("write a.py"))
+
+    assert result.stopped
+    assert result.rounds < 24
+    assert str(MAX_TRUNCATED_WRITE_REFUSALS) in result.final
+
+
+# --- continue from the tail, not from the start (SMALLCODE 6.8 item 6) -------
+
+
+def test_a_file_left_stopping_mid_construct_is_asked_to_CONTINUE(tmp_path, monkeypatch):
+    """Simple mode threw the content away and asked the model to start again in
+    sections; the legacy loop had the better answer and it was never carried
+    over. Continue-from-the-tail keeps the good 80%."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "app.js").write_text(
+        "const a = 1;" + chr(10) + "const label = \"sco", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["app.js"])
+
+    problem = report["data"]["problems"][0]
+    assert report["ok"] is False
+    assert "STOPS PART-WAY THROUGH" in problem
+    assert "append_file" in problem and "ONLY the missing remainder" in problem
+    assert "current end of file" in problem
+    assert "const a = 1;" in problem, "the tail has to be quoted verbatim"
+
+
+def test_the_continuation_advice_is_not_python_only(tmp_path, monkeypatch):
+    """The legacy version read `.py` and returned "" for everything else."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "views.py").write_text(
+        "def index(request):" + chr(10) + '    return render(request, "item',
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [])
+
+    report = _verify_json(loop, ["views.py"])
+
+    assert "STOPS PART-WAY THROUGH" in report["data"]["problems"][0]
+
+
+# --- the number is stated in all three places (SMALLCODE 6.4) ---------------
+
+
+def test_sixty_lines_is_stated_in_the_system_prompt(tmp_path):
+    """"Too big" is not a number a 3B model can act on."""
+    prompt = simple_system_prompt(tmp_path)
+
+    assert "60 lines" in prompt
+    assert "append_file" in prompt
+
+
+def test_sixty_lines_is_stated_in_the_schemas_the_model_reads():
+    """A small model reads these more reliably than it reads the system prompt,
+    and smallcode states the rule in all three places for that reason."""
+    carriers = {"write_file", "append_file", "patch_file", "read_and_patch",
+                "create_and_run"}
+    seen = set()
+    for schema in SIMPLE_TOOL_SCHEMAS:
+        function = schema["function"]
+        if function["name"] not in carriers:
+            continue
+        seen.add(function["name"])
+        properties = function["parameters"]["properties"]
+        payload = properties.get("content") or properties.get("new_string")
+        assert "8KB" in payload["description"], function["name"]
+        assert "60 lines" in payload["description"], function["name"]
+    assert seen == carriers, sorted(carriers - seen)
+
+
+# --- a build is not a repair loop (live 2026-08-20) -------------------------
+#
+# The acceptance run for the write cap. Told to build a 1,500-line file,
+# qwen2.5:3b said "I will write 60 lines at a time" - the prompt worked - and
+# then did it with `write_file`, re-sending the growing file each time rather
+# than appending. Five sections in, every one verified clean, the turn stopped
+# with "5 blind edits I cannot confirm". The chunking the prompt asks for was
+# being read as the churn the ceiling exists to stop.
+
+
+def test_a_file_grown_section_by_section_does_not_trip_the_edit_ceiling(tmp_path, monkeypatch):
+    """Whichever tool carries it. `append_file` was already exempt; a model that
+    chunks with `write_file` is doing the same thing and must not be stopped."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    body = ""
+    turns = []
+    for index in range(7):
+        body += f"def f{index}():" + chr(10) + f"    return {index}" + chr(10)
+        turns.append(_tool("write_file", filepath="grow.py", content=body))
+    turns.append(_text("done"))
+    loop = _loop(tmp_path, turns, max_rounds=12)
+
+    result = asyncio.run(loop.run("build grow.py section by section"))
+
+    assert not result.stopped, result.final
+    assert (tmp_path / "grow.py").read_text(encoding="utf-8").count("def f") == 7
+
+
+def test_a_rewrite_that_does_not_grow_still_trips_the_edit_ceiling(tmp_path, monkeypatch):
+    """The exemption is for GROWTH, not for `write_file`. Seven rewrites that
+    shuffle a file without adding to it are the blind repair loop this guard was
+    built for - 7 patches to one file in a turn, chasing a stale browser cache."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "same.py").write_text("x = 0" + chr(10), encoding="utf-8")
+    turns = [
+        _tool("write_file", filepath="same.py", content=f"x = {index}" + chr(10))
+        for index in range(1, 9)
+    ]
+    turns.append(_text("done"))
+    loop = _loop(tmp_path, turns, max_rounds=12)
+
+    result = asyncio.run(loop.run("fix same.py"))
+
+    assert result.stopped
+    assert "without being able to confirm" in result.final
+
+
+def test_the_prose_nudge_offers_appending_now_that_chunking_is_the_default(tmp_path):
+    """It said "call write_file for the COMPLETE new file", which steers a model
+    building in sections straight back to the whole-file write the cap refuses."""
+    (tmp_path / "app.py").write_text("x = 0" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_text(
+            "Here is app.py:" + chr(10) + "```python" + chr(10)
+            + "def one():" + chr(10) + "    return 1" + chr(10)
+            + "def two():" + chr(10) + "    return 2" + chr(10) + "```"
+        ), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write app.py"))
+
+    nudges = [
+        m.content for m in loop.state.all_messages
+        if m.role == "user" and "did not change the file" in m.content
+    ]
+    assert nudges, "the prose nudge never fired"
+    assert "append_file" in nudges[0]
+
+
+# --- a fragment is not a file (live 2026-08-20) -----------------------------
+#
+# The truncation gate ran on `patch_file.new_string` and refused it three times
+# with "it ends inside a /* comment opened on line 23", then ended the turn
+# blaming an output limit that had never fired. A patch replaces a region that
+# may start inside one block and end inside another; an append chunk is
+# unfinished by design. Neither owes a whole-file structure.
+
+
+def test_a_patch_carrying_a_jsdoc_fragment_is_not_refused(tmp_path):
+    """The exact payload shape from the live failure."""
+    (tmp_path / "game.js").write_text(
+        "class Game {" + chr(10) + "  step(dt) {" + chr(10) + "    return dt;" + chr(10)
+        + "  }" + chr(10) + "}" + chr(10),
+        encoding="utf-8",
+    )
+    fragment = (
+        "  /**" + chr(10) + "   * Step, fixed." + chr(10) + "   */" + chr(10)
+        + "  step(dt) {" + chr(10) + "    return dt * 2;" + chr(10) + "  }"
+    )
+    loop = _loop(
+        tmp_path,
+        [_tool("patch_file", filepath="game.js",
+               old_string="  step(dt) {" + chr(10) + "    return dt;" + chr(10) + "  }",
+               new_string=fragment),
+         _text("patched")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("fix the step method"))
+
+    on_disk = (tmp_path / "game.js").read_text(encoding="utf-8")
+    assert "return dt * 2;" in on_disk, "a legitimate patch fragment was refused"
+    said = [m.content for m in loop.state.all_messages if m.role == "tool"]
+    assert not any("REFUSED" in c for c in said), said
+
+
+def test_an_append_chunk_opening_a_block_is_not_refused(tmp_path):
+    """Unfinished by design. Refusing this refuses chunked writing itself."""
+    (tmp_path / "a.js").write_text("// start" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("append_file", filepath="a.js", content="function f() {" + chr(10)),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add the opening of f"))
+
+    assert "function f() {" in (tmp_path / "a.js").read_text(encoding="utf-8")
+
+
+def test_a_whole_file_write_is_still_gated(tmp_path):
+    """Narrowing the gate must not switch it off where it was earning its keep."""
+    loop = _loop(
+        tmp_path,
+        [_tool("write_file", filepath="views.py",
+               content="def index(request):" + chr(10) + '    return render(request, "item'),
+         _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write views.py"))
+
+    assert not (tmp_path / "views.py").exists()
+
+
+def test_the_stop_message_does_not_blame_a_limit_that_never_fired(tmp_path):
+    """The user was told "cut off by my own output limit" three times for writes
+    the output limit never touched. Blaming the wrong dial sends them to it."""
+    cut = _tool("write_file", filepath="a.py", content="x = foo(")
+    loop = _loop(tmp_path, [cut] * 24, max_rounds=24, verify_changes=False)
+
+    result = asyncio.run(loop.run("write a.py"))
+
+    assert result.stopped
+    assert "output limit" not in result.final, result.final
+    assert "will not parse" in result.final
+
+
+# --- outline first, body on demand (SMALLCODE_GAP_ANALYSIS §2) --------------
+
+
+def _big_python(functions: int = 60) -> str:
+    parts = ["import os", ""]
+    for index in range(functions):
+        parts += [
+            f"def handler_{index}(request):",
+            f'    """Handle case {index}."""',
+            f"    return {index}",
+            "",
+        ]
+    return chr(10).join(parts)
+
+
+def test_a_large_file_comes_back_as_an_outline_not_a_body(tmp_path):
+    """Head-clipping at 24,000 bytes is what starts the dead end: the model
+    patches from what it saw, and old_string was in the half it never saw."""
+    (tmp_path / "big.py").write_text(_big_python(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="big.py"), _text("read it")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read big.py"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_file"][0]
+    data = json.loads(payload)["data"]
+    assert data["outlined"] is True
+    assert "handler_0" in data["content"] and "handler_59" in data["content"]
+    assert "return 0" not in data["content"], "the BODIES must not be sent"
+
+
+def test_a_small_file_is_still_read_whole(tmp_path):
+    """The outline is what replaces an UNBOUNDED read, not every read."""
+    (tmp_path / "small.py").write_text("def f():" + chr(10) + "    return 1" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="small.py"), _text("read it")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read small.py"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_file"][0]
+    assert "return 1" in json.loads(payload)["data"]["content"]
+
+
+def test_an_explicit_range_is_answered_with_those_lines_not_an_outline(tmp_path):
+    """A range is a request for exactly those lines."""
+    (tmp_path / "big.py").write_text(_big_python(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="big.py", start_line=3, end_line=6), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read part of big.py"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_file"][0]
+    content = json.loads(payload)["data"]["content"]
+    assert "def handler_0" in content and "return 0" in content
+
+
+def test_an_outlined_read_still_counts_as_only_part_of_the_file(tmp_path):
+    """The model has genuinely not seen the bodies, so the whole-file rewrite
+    guard must still fire - an outline that counted as having read the file
+    would license exactly the data loss that guard exists for."""
+    (tmp_path / "big.py").write_text(_big_python(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="big.py"),
+         _tool("write_file", filepath="big.py", content="x = 1" + chr(10)),
+         _text("done")],
+        max_rounds=3,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("rewrite big.py"))
+
+    assert "handler_0" in (tmp_path / "big.py").read_text(encoding="utf-8")
+
+
+def test_read_symbol_returns_one_function_exactly(tmp_path):
+    """The follow-up an outline earns. The range comes from the same parse, so
+    it cannot drift from what the model was shown."""
+    (tmp_path / "big.py").write_text(_big_python(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_symbol", filepath="big.py", symbol="handler_7"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("show me handler_7"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_symbol"][0]
+    parsed = json.loads(payload)
+    assert parsed["ok"] is True
+    assert "return 7" in parsed["message"]
+    assert "return 8" not in parsed["message"], "it must return ONE symbol"
+
+
+def test_read_symbol_names_what_is_there_when_the_name_is_wrong(tmp_path):
+    """A bare "not found" costs a round and teaches nothing."""
+    (tmp_path / "big.py").write_text(_big_python(4), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_symbol", filepath="big.py", symbol="nope"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("show me nope"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_symbol"][0]
+    assert "handler_0" in json.loads(payload)["message"]
+
+
+def test_reading_a_file_in_ranges_is_not_called_a_repeated_read(tmp_path):
+    """`_argument_summary` returned the filepath alone, so section 3 of a file
+    read in pieces was answered with "you already called this". That fired on
+    exactly the behaviour the outline tells the model to use."""
+    (tmp_path / "big.py").write_text(_big_python(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="big.py", start_line=1, end_line=20),
+         _tool("read_file", filepath="big.py", start_line=21, end_line=40),
+         _tool("read_file", filepath="big.py", start_line=41, end_line=60),
+         _tool("read_file", filepath="big.py", start_line=61, end_line=80),
+         _text("done")],
+        max_rounds=6,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read big.py in pieces"))
+
+    nudges = [
+        m.content for m in loop.state.all_messages
+        if m.role == "user" and "already called" in m.content
+    ]
+    assert not nudges, nudges
+
+
+# --- line numbers, and not resending what the model already has -------------
+
+
+def test_a_read_carries_line_numbers(tmp_path):
+    """smallcode numbers every read (`bin/executor.js:110`) and it is the
+    cheapest accuracy win there is: `start_line` is arithmetic on a wall of text
+    until the model has seen which line is which."""
+    (tmp_path / "app.py").write_text(
+        "import os" + chr(10) + "x = 1" + chr(10), encoding="utf-8"
+    )
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="app.py"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read app.py"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_file"][0]
+    content = json.loads(payload)["data"]["content"]
+    assert "1| import os" in content
+    assert "2| x = 1" in content
+
+
+def test_a_ranged_read_numbers_from_the_real_first_line(tmp_path):
+    """Numbering a range from 1 would be worse than not numbering it."""
+    (tmp_path / "app.py").write_text(
+        chr(10).join(f"line{n}" for n in range(1, 21)) + chr(10), encoding="utf-8"
+    )
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="app.py", start_line=11, end_line=13), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read part"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_file"][0]
+    content = json.loads(payload)["data"]["content"]
+    assert "11| line11" in content
+    assert "1| line11" not in content.replace("11| line11", "")
+
+
+def test_reading_an_unchanged_file_again_does_not_resend_it(tmp_path):
+    """Live 2026-08-20: eight `read_file js/game.js` calls in one turn, each
+    resending the whole file, until the window was being elided to make room for
+    copies of a file that had not changed."""
+    (tmp_path / "app.py").write_text("x = 1" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="app.py"),
+         _tool("read_file", filepath="app.py"),
+         _text("ok")],
+        max_rounds=3,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read app.py twice"))
+
+    reads = [m.content for m in loop.state.all_messages if m.name == "read_file"]
+    assert "x = 1" in json.loads(reads[0])["data"]["content"]
+    second = json.loads(reads[1])
+    assert second["data"]["unchanged"] is True
+    assert second["data"]["content"] == ""
+    assert "unchanged since you last read it" in second["message"]
+
+
+def test_a_file_that_changed_is_sent_again(tmp_path):
+    """"Unchanged" must be a fact, not an optimisation."""
+    (tmp_path / "app.py").write_text("x = 1" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_file", filepath="app.py"),
+         _tool("write_file", filepath="app.py", content="x = 2" + chr(10)),
+         _tool("read_file", filepath="app.py"),
+         _text("ok")],
+        max_rounds=4,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("read, change, read"))
+
+    reads = [m.content for m in loop.state.all_messages if m.name == "read_file"]
+    assert "x = 2" in json.loads(reads[1])["data"]["content"]
+    assert not json.loads(reads[1])["data"].get("unchanged")
+
+
+def test_a_patch_that_copied_the_line_numbers_back_still_matches(tmp_path):
+    """Numbering creates exactly one hazard - the model pastes the gutter into
+    old_string - and it must not cost a round. The model copying what it was
+    shown is the behaviour we asked for."""
+    (tmp_path / "app.py").write_text(
+        "import os" + chr(10) + "def greet():" + chr(10) + "    return 1" + chr(10),
+        encoding="utf-8",
+    )
+    copied = " 2| def greet():" + chr(10) + " 3|     return 1"
+    loop = _loop(
+        tmp_path,
+        [_tool("patch_file", filepath="app.py", old_string=copied,
+               new_string="def greet():" + chr(10) + "    return 2"),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("make greet return 2"))
+
+    assert "return 2" in (tmp_path / "app.py").read_text(encoding="utf-8")
+
+
+def test_real_code_that_looks_like_a_gutter_is_left_alone(tmp_path):
+    """Stripping is only safe because it needs EVERY line to carry a gutter."""
+    from shamsu.agents.simple_chat import _strip_line_numbers
+
+    table = "| 1 | one |" + chr(10) + "| 2 | two |"
+    assert _strip_line_numbers({"old_string": table})["old_string"] == table
+    mixed = " 1| real" + chr(10) + "not numbered"
+    assert _strip_line_numbers({"old_string": mixed})["old_string"] == mixed
+
+
+# --- the prompt is a file now, and the tools that make it true --------------
+
+
+def test_the_system_prompt_comes_from_the_markdown_file(tmp_path):
+    """The words live in `prompts/simple_system.md`, so they can be read and
+    changed without opening Python - smallcode keeps its skills and knowledge
+    the same way."""
+    from shamsu.agents import simple_prompt
+
+    assert simple_prompt.PROMPT_FILE.is_file()
+    assert simple_prompt.section("base").startswith("You are SHAMSU")
+    assert "{workspace}" not in simple_system_prompt(tmp_path)
+
+
+def test_the_prompt_carries_no_editor_comments(tmp_path):
+    """The file explains itself to whoever edits it. Sending that to the model
+    would be paying tokens to say why a line exists."""
+    prompt = simple_system_prompt(tmp_path)
+
+    assert "<!--" not in prompt and "-->" not in prompt
+
+
+def test_the_prompt_survives_a_missing_markdown_file(tmp_path, monkeypatch):
+    """A packaging mistake must not leave the model with no instructions."""
+    from shamsu.agents import simple_prompt
+
+    monkeypatch.setattr(simple_prompt, "PROMPT_FILE", tmp_path / "gone.md")
+    simple_prompt._sections.cache_clear()
+    try:
+        prompt = simple_prompt.simple_system_prompt(tmp_path)
+        assert "SHAMSU" in prompt
+    finally:
+        simple_prompt._sections.cache_clear()
+
+
+def test_the_prompt_tells_the_model_to_act_rather_than_ask(tmp_path):
+    """Live 2026-08-20: asked for a 1,500-line file, the model wrote 39 lines
+    and stopped with "What would you like to do next?" - nothing had refused it.
+    A model that asks instead of acting spends the turn on a question the user
+    already answered."""
+    prompt = simple_system_prompt(tmp_path).lower()
+
+    assert "act on what you were asked" in prompt
+    assert "carry on through them" in prompt
+
+
+# --- run_tests --------------------------------------------------------------
+
+
+def test_run_tests_finds_the_command_itself(tmp_path):
+    """The model was told to check its work and left to guess the command."""
+    from shamsu.agents.simple_tests import detect_test_command
+
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
+    found = detect_test_command(tmp_path)
+
+    assert found.command == "python -m pytest -q"
+    assert "pytest" in found.reason
+
+
+def test_run_tests_prefers_a_declared_script_over_an_inference(tmp_path):
+    """A test script in package.json is a statement by whoever wrote the
+    project; "there are test_*.py files" is a guess."""
+    from shamsu.agents.simple_tests import detect_test_command
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": "vitest"}}), encoding="utf-8"
+    )
+    (tmp_path / "conftest.py").write_text("", encoding="utf-8")
+    found = detect_test_command(tmp_path)
+
+    assert found.command == "npm test -- --run", "vitest without --run never exits"
+
+
+def test_the_npm_init_placeholder_is_not_treated_as_a_test_suite(tmp_path):
+    """`npm init` writes a stub that exits 1. Running it proves nothing and
+    reads as a failing suite."""
+    from shamsu.agents.simple_tests import detect_test_command
+
+    (tmp_path / "package.json").write_text(
+        json.dumps({"scripts": {"test": 'echo "Error: no test specified" && exit 1'}}),
+        encoding="utf-8",
+    )
+
+    assert not detect_test_command(tmp_path)
+
+
+def test_run_tests_says_so_when_there_is_no_runner(tmp_path):
+    """"There is no test command here" is a fact the model can act on;
+    `pytest: command not found` is a puzzle."""
+    loop = _loop(
+        tmp_path,
+        [_tool("run_tests"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("run the tests"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "run_tests"][0]
+    parsed = json.loads(payload)
+    assert parsed["ok"] is False
+    assert "could not work out how to run tests" in parsed["message"]
+
+
+# --- use_skill --------------------------------------------------------------
+
+
+def test_the_skill_index_reaches_the_prompt(tmp_path):
+    """A skill the model cannot see is one it will never load - the loader had
+    existed the whole time and simple mode never called it."""
+    prompt = simple_system_prompt(tmp_path)
+
+    assert "use_skill" in prompt
+    assert "large-file-surgery" in prompt
+
+
+def test_use_skill_returns_the_body(tmp_path):
+    loop = _loop(
+        tmp_path,
+        [_named_tool("use_skill", {"name": "large-file-surgery"}), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("how do I fix a big file"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "use_skill"][0]
+    parsed = json.loads(payload)
+    assert parsed["ok"] is True
+    assert "read_symbol" in parsed["message"]
+
+
+def test_use_skill_names_what_is_there_when_the_name_is_wrong(tmp_path):
+    loop = _loop(
+        tmp_path,
+        [_named_tool("use_skill", {"name": "does-not-exist"}), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("use a skill"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "use_skill"][0]
+    assert "developer" in json.loads(payload)["message"]
+
+
+def test_the_developer_skill_agrees_with_the_shipped_write_path(tmp_path):
+    """It said "Default to write_file with the COMPLETE file content" - the
+    exact opposite of the 60-line rule the tool now enforces. A skill that
+    fights the harness is worse than no skill."""
+    from shamsu.agents.simple_chat import _skill_catalog
+
+    _skill_catalog.cache_clear()
+    body = _skill_catalog(tmp_path).skills["developer"].instructions
+
+    assert "COMPLETE file content" not in body
+    assert "60 lines" in body
+    assert "patch_file" in body

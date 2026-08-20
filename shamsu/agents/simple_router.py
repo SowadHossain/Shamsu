@@ -40,7 +40,9 @@ TWO_STAGE_CTX_THRESHOLD = 16_384
 TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
     "read": {
         "description": "Read a file, or find files by name or glob",
-        "tools": ["read_file", "list_files", "find_files", "find_and_read"],
+        "tools": [
+            "read_file", "read_symbol", "list_files", "find_files", "find_and_read",
+        ],
     },
     "write": {
         "description": "Create, edit, extend or rewrite files",
@@ -58,7 +60,7 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
     },
     "run": {
         "description": "Run a shell command, the project, or its tests",
-        "tools": ["run_command", "create_and_run"],
+        "tools": ["run_command", "run_tests", "create_and_run"],
     },
     "recall": {
         "description": "Remember or look up project knowledge, and search this conversation",

@@ -22,7 +22,7 @@ from typing import Any
 
 from shamsu.runtime.turn_stream import TurnStream, activity_path
 from shamsu.safety.commands import redact
-from shamsu.session.manager import SessionManager
+from shamsu.session.manager import ORIGIN_LOOP, SessionManager
 
 #: Enough of the digest to be unambiguous across a handful of projects, short
 #: enough to sit in a URL without looking like a hash of something secret.
@@ -101,7 +101,26 @@ def sessions_payload(workspace: Path) -> dict[str, Any]:
 
 
 def session_messages(workspace: Path, session_id: str, after: int = 0) -> dict[str, Any]:
-    """The transcript, from `messages.jsonl`, redacted, sliced from `after`.
+    """The conversation, as a person had it.
+
+    Built from the **turn stream** when there is one, and only from
+    `messages.jsonl` when there is not. That inversion is the fix for a real
+    complaint: `messages.jsonl` is the model's context, not the conversation,
+    and rendering it as chat produced a transcript nobody recognised.
+
+    Measured on a live session (2026-08-20, two questions asked): the file held
+    89 records, of which the browser drew 50 bubbles - 12 of them attributed to
+    the user, when the user had typed exactly 2. The other ten were loop
+    nudges - "You have already called read_file(js/game.js) this turn" - which
+    are written with `role: user` because that is the role the MODEL must see
+    them in. Four more bubbles were empty, being assistant turns that carried
+    only tool calls.
+
+    `activity.jsonl` already had it right: two `turn.start` events, two
+    `assistant` events, and the correct source on each - one `telegram`, one
+    `cli`. The terminal and the phone both render from that stream. The browser
+    was the only surface reading the other file, which is exactly why it was
+    the only one showing the wrong conversation.
 
     `after` is an INDEX, not a byte offset: the browser already holds the first
     N and wants the rest, and an index survives the file being rewritten by
@@ -112,24 +131,149 @@ def session_messages(workspace: Path, session_id: str, after: int = 0) -> dict[s
         logger = manager.logger_for(session_id)
     except Exception as exc:  # noqa: BLE001 - resolve() raises ValueError
         raise NotFound(f"unknown session: {session_id}") from exc
-    messages = logger.read_messages()
+
+    rows = _conversation_from_turns(workspace, logger.session_id)
+    built_from = "turns"
+    if rows is None:
+        rows = _conversation_from_transcript(logger.read_messages())
+        built_from = "transcript"
+
     start = max(0, int(after))
-    sliced = messages[start : start + MAX_MESSAGES]
     return {
         "session_id": logger.session_id,
         "title": logger.metadata.title,
-        "total": len(messages),
+        "total": len(rows),
         "after": start,
-        "messages": [
+        "built_from": built_from,
+        "messages": rows[start : start + MAX_MESSAGES],
+    }
+
+
+#: Event kinds that describe the CONVERSATION rather than the working. Status
+#: ticks, tool calls and activity lines belong to the turn log, which the
+#: browser renders separately and which must not become chat bubbles.
+_CONVERSATION_KINDS = ("turn.start", "assistant", "turn.end")
+
+
+def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str, Any]] | None:
+    """Prompts and answers, in order, from `activity.jsonl`.
+
+    Returns None when this session has no turn stream to read - an older
+    session, or one written before the stream existed - so the caller can fall
+    back rather than show an empty thread.
+    """
+    try:
+        events = TurnStream(workspace, session_id, persist=False).replay(-1)
+    except Exception:  # noqa: BLE001 - an unreadable log costs the nicer
+        # rendering, never the thread.
+        return None
+
+    turns: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for event in events:
+        if event.kind not in _CONVERSATION_KINDS:
+            continue
+        turn = turns.get(event.turn_id)
+        if turn is None:
+            # All three start as None, not "": these hold EVENTS, and an empty
+            # string here read as "present" against `is not None`.
+            turn = {"source": event.source, "prompt": None, "answer": None, "verdict": None}
+            turns[event.turn_id] = turn
+            order.append(event.turn_id)
+        if event.kind == "turn.start":
+            turn["prompt"] = event
+            turn["source"] = event.source or turn["source"]
+        elif event.kind == "assistant":
+            turn["answer"] = event
+        else:
+            turn["verdict"] = event
+
+    if not any(turns[turn_id]["prompt"] is not None for turn_id in order):
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for turn_id in order:
+        turn = turns[turn_id]
+        source = str(turn["source"] or "")
+        prompt = turn["prompt"]
+        if prompt is not None and prompt.text:
+            rows.append(_row("user", prompt, source, turn_id))
+        answer = turn["answer"]
+        end = turn["verdict"]
+        if answer is not None and answer.text:
+            row = _row("assistant", answer, source, turn_id)
+            if end is not None:
+                # What the turn cost, on the answer it produced. Without it a
+                # three-minute run that changed nothing reads as a quick reply.
+                row["verdict"] = redact(str(end.text or ""))
+                row["changed_files"] = list((end.data or {}).get("changed_files") or [])
+            rows.append(row)
+        elif end is not None and end.text:
+            # A turn that ended without an answer - stopped, failed, cancelled.
+            # Shown, so a thread never looks like it swallowed your question.
+            row = _row("assistant", end, source, turn_id)
+            row["content"] = ""
+            row["verdict"] = redact(str(end.text or ""))
+            rows.append(row)
+    return rows
+
+
+def _row(role: str, event: Any, source: str, turn_id: str) -> dict[str, Any]:
+    return {
+        "role": role,
+        "content": redact(str(event.text or "")),
+        "timestamp": _iso(getattr(event, "ts", 0.0)),
+        "name": "",
+        "source": source,
+        "turn_id": turn_id,
+        "verdict": "",
+        "changed_files": [],
+    }
+
+
+def _iso(ts: float) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).isoformat()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return ""
+
+
+def _conversation_from_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The fallback, for a session with no turn stream.
+
+    Still filtered, because the two things that made the raw file unreadable as
+    chat are visible here too: a `user` record the loop wrote to steer the
+    model, and an `assistant` record that is empty because it carried only tool
+    calls. `origin` marks the first kind going forward; anything unmarked is
+    SHOWN, so a missing marker can only ever leak a message in, never hide one.
+    """
+    rows: list[dict[str, Any]] = []
+    for item in messages:
+        role = str(item.get("role") or "")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(item.get("content") or "")
+        if not content.strip():
+            continue
+        if role == "user" and str(item.get("origin") or "") == ORIGIN_LOOP:
+            continue
+        rows.append(
             {
-                "role": str(item.get("role") or ""),
-                "content": redact(str(item.get("content") or "")),
+                "role": role,
+                "content": redact(content),
                 "timestamp": str(item.get("timestamp") or ""),
                 "name": str(item.get("name") or ""),
+                # Empty for anything written before the field existed - the
+                # browser shows no badge rather than guessing.
+                "source": str(item.get("source") or ""),
+                "turn_id": "",
+                "verdict": "",
+                "changed_files": [],
             }
-            for item in sliced
-        ],
-    }
+        )
+    return rows
 
 
 def session_activity(
@@ -230,7 +374,7 @@ def health_payload(workspace: Path | None) -> dict[str, Any]:
 #: mean the same thing by the same word.
 WEB_COMMANDS: tuple[dict[str, str], ...] = (
     {"name": "/new", "args": "[title]", "help": "Start a new thread here"},
-    {"name": "/settings", "args": "", "help": "Model, context window, tools, Telegram"},
+    {"name": "/settings", "args": "", "help": "Model, context, Telegram, Ollama, locks"},
     {"name": "/workspace", "args": "<path>", "help": "Add a workspace by path"},
     {"name": "/threads", "args": "", "help": "Focus the thread filter"},
     {"name": "/queue", "args": "", "help": "Show what is waiting on this thread"},
@@ -249,17 +393,28 @@ def settings_payload() -> dict[str, Any]:
     Deliberately assembled rather than cached: a context window changed in the
     terminal must show here on the next open, and a cached copy would be the
     same class of bug as the workspace-scoped bot token.
+
+    Deliberately CHEAP, too. Anything that costs a round trip - the Ollama tag
+    list, the Telegram probe - lives on its own route, so the drawer opens
+    instantly and fills in rather than hanging on a server that is down.
     """
     from shamsu.agents.simple_chat import CTX_BUCKETS, SESSION_COUNTERS, SIMPLE_TOOLS, max_ctx
-    from shamsu.runtime.models import model_for_role
-    from shamsu.runtime.settings import load_settings
+    from shamsu.runtime.models import model_source
+    from shamsu.runtime.settings import (
+        VERBOSITY_LEVELS,
+        load_settings,
+        verbosity,
+    )
+    from shamsu.runtime.turn_stream import body_kinds
 
     try:
-        model = model_for_role("agent-chat")
+        source, model = model_source("agent-chat")
     except Exception:  # noqa: BLE001
-        model = ""
+        source, model = "tier", ""
+    level = verbosity()
     return {
         "model": model,
+        "model_source": source,
         "context": {
             "max_ctx": max_ctx(),
             "buckets": list(CTX_BUCKETS),
@@ -269,8 +424,171 @@ def settings_payload() -> dict[str, Any]:
             "last_window": SESSION_COUNTERS.last_window,
             "pct": SESSION_COUNTERS.pct,
         },
+        "verbosity": {
+            "level": level,
+            "levels": list(VERBOSITY_LEVELS),
+            # Served rather than reimplemented in JS, so the browser filters by
+            # the same rule the terminal and the phone do.
+            "body_kinds": sorted(body_kinds(level)),
+        },
         "tools": sorted(SIMPLE_TOOLS),
         "telegram": telegram_status(),
+    }
+
+
+#: Where an effective model came from, in words the panel can print. A workspace
+#: pin outranks the install-wide choice, and a page that let you pick a model
+#: and then silently did nothing would be worse than offering no picker at all.
+MODEL_SOURCE_LABELS = {
+    "env": "pinned by SHAMSU_MODEL in the environment",
+    "workspace": "pinned by this workspace",
+    "install": "chosen here, for every project",
+    "tier": "the hardware tier's default",
+}
+
+
+def models_payload(workspace: Path | None = None) -> dict[str, Any]:
+    """What can be run, what is running, and what is currently eating the GPU.
+
+    Kept off `/api/settings` because every field costs a request to Ollama and
+    a settings drawer must not wait on a model server to draw itself.
+    """
+    from shamsu.runtime.models import (
+        allowed_model_names,
+        is_allowed_model,
+        model_is_reasoning,
+        model_source,
+        model_supports_native_tools,
+    )
+    from shamsu.runtime.ollama import (
+        OLLAMA_BASE_URL,
+        is_ollama_running,
+        list_available_models,
+        list_loaded_models,
+    )
+
+    running = is_ollama_running()
+    available = list_available_models() if running else []
+    loaded = list_loaded_models() if running else []
+    try:
+        source, effective = model_source("agent-chat")
+    except Exception:  # noqa: BLE001
+        source, effective = "tier", ""
+
+    # Anything pulled is offerable. A model outside the cookbook still gets the
+    # right treatment - `model_supports_native_tools` and `model_is_reasoning`
+    # fall back to family-name matching - so refusing it would be a restriction
+    # with nothing behind it. It is marked, not blocked.
+    names = sorted(set(available) | set(allowed_model_names()) | ({effective} if effective else set()))
+    return {
+        "server_running": running,
+        "base_url": OLLAMA_BASE_URL,
+        "effective": effective,
+        "source": source,
+        "source_label": MODEL_SOURCE_LABELS.get(source, source),
+        "workspace_pin_shadows": source == "workspace",
+        "loaded": loaded,
+        "models": [
+            {
+                "name": name,
+                "installed": name in available,
+                "known": is_allowed_model(name),
+                "reasoning": model_is_reasoning(name),
+                "native_tools": model_supports_native_tools(name),
+                "loaded": name in loaded,
+            }
+            for name in names
+        ],
+    }
+
+
+def unload_our_models() -> list[str]:
+    """Free the GPU of what SHAMSU put there, and nothing else.
+
+    `unload_shamsu_models()` only knows the cookbook, which was right when the
+    cookbook was the only way to choose a model. Now that any pulled model can
+    be selected, the model this install is actually configured to use may not be
+    in it - and a button labelled "Unload models" that leaves the one model you
+    are running loaded is worse than no button.
+
+    Still narrow, deliberately: the configured model is ours, an unrelated model
+    somebody else loaded is not, and this must never evict theirs.
+    """
+    from shamsu.runtime.models import model_for_role
+    from shamsu.runtime.ollama import list_loaded_models, unload_model, unload_shamsu_models
+
+    unloaded = list(unload_shamsu_models())
+    try:
+        effective = model_for_role("agent-chat")
+    except Exception:  # noqa: BLE001
+        return unloaded
+    if effective and effective not in unloaded and effective in list_loaded_models():
+        if unload_model(effective):
+            unloaded.append(effective)
+    return unloaded
+
+
+def locks_payload(store: Any) -> dict[str, Any]:
+    """Who holds the machine's run slot, and every thread being run right now.
+
+    The answer to "why has my prompt been queued for ten minutes": usually a
+    process that died holding a lease. Stale ones are reclaimable; live ones
+    are not, because being un-stealable is the entire point of a lease.
+    """
+    from shamsu.control.store import MACHINE_LEASE_KEY
+
+    leases = store.active_leases()
+    return {
+        "leases": [
+            {
+                "workspace": lease.workspace,
+                "session_id": lease.session_id,
+                "owner_pid": lease.owner_pid,
+                "owner_surface": lease.owner_surface,
+                "heartbeat": lease.heartbeat,
+                "is_machine_slot": lease.workspace == MACHINE_LEASE_KEY,
+                "is_mine": lease.is_mine,
+            }
+            for lease in leases
+        ],
+        "machine_slot_held": any(
+            lease.workspace == MACHINE_LEASE_KEY and lease.session_id == MACHINE_LEASE_KEY
+            for lease in leases
+        ),
+    }
+
+
+def telegram_payload(workspace: Path | None = None) -> dict[str, Any]:
+    """The full Telegram panel: token, transport, poller, pairings, counters."""
+    from shamsu.integrations.telegram.service import poller_status
+
+    status = poller_status(workspace)
+    status["pairings"] = pairings_payload(workspace)["pairings"]
+    return {"telegram": status}
+
+
+def pairings_payload(workspace: Path | None = None) -> dict[str, Any]:
+    """Paired devices, and what each is currently pointed at.
+
+    Read from the install-scoped state DB, so this is the same list whichever
+    project happens to be open - which is also why rebinding the bot to another
+    workspace does not unpair anybody.
+    """
+    from shamsu.integrations.telegram.storage import TelegramStateStore
+
+    resolved = Path(workspace).resolve() if workspace is not None else Path.cwd()
+    store = TelegramStateStore(resolved)
+    return {
+        "pairings": [
+            {
+                "user_id": int(row.get("telegram_user_id") or 0),
+                "chat_id": int(row.get("telegram_chat_id") or 0),
+                "display_name": str(row.get("display_name") or ""),
+                "permission_level": str(row.get("permission_level") or ""),
+                "paired_at": str(row.get("paired_at") or ""),
+            }
+            for row in store.authorized_users()
+        ]
     }
 
 

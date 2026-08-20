@@ -143,6 +143,22 @@ class OutboundMessage:
     #: an unescaped `<` in plain mode is a character, in HTML mode it is a
     #: parse error that Telegram rejects the whole message for.
     parse_mode: str = ""
+    #: Whether this message deserves a panel on the desktop.
+    #:
+    #: **False by default, and that is the point.** Every outbound message used
+    #: to be mirrored, so one prompt from the phone printed three cyan panels
+    #: on the terminal - the ack, a progress note, and the reply - all of which
+    #: the turn renderer was already showing as ordinary turn output. The rule
+    #: now is: the desktop shows a remote turn AS A TURN, and reserves panels
+    #: for things that are not a turn at all - pairing, a stranger being
+    #: refused, an error. Defaulting to False also means a message type added
+    #: later cannot silently start spamming the terminal.
+    mirror_to_cli: bool = False
+    #: What the DESKTOP should read, when that differs from what the phone
+    #: reads. "Connected to this SHAMSU installation." is right in second person
+    #: on the phone and useless on a terminal, which needs to know *who*.
+    #: Empty means "use `text`".
+    cli_text: str = ""
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from shamsu.control.store import MACHINE_LEASE_KEY
 from shamsu.integrations.telegram import install
 from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
@@ -15,7 +16,12 @@ from shamsu.integrations.telegram.callbacks import CallbackRegistry
 from shamsu.integrations.telegram.commands import parse_command
 from shamsu.integrations.telegram.controller import TelegramController
 from shamsu.integrations.telegram.formatter import TelegramFormatter
-from shamsu.integrations.telegram.models import OutboundMessage, RemoteControlStatus, TelegramUpdate
+from shamsu.integrations.telegram.models import (
+    OutboundMessage,
+    RemoteControlStatus,
+    TelegramUpdate,
+    utc_now,
+)
 from shamsu.integrations.telegram.pairing import PairingCode, PairingManager
 from shamsu.integrations.telegram.sessions import LocalShamsuSessionGateway, SessionGateway
 from shamsu.integrations.telegram.storage import TelegramStateStore
@@ -23,6 +29,30 @@ from shamsu.integrations.telegram.transport import TelegramBotApiTransport, Tele
 from shamsu.safety.sandbox import Sandbox
 
 TOKEN_ENV_VAR = "SHAMSU_TELEGRAM_BOT_TOKEN"
+
+#: The bot's slot in the install-wide lease table. Telegram allows exactly one
+#: `getUpdates` caller per token and answers the second one with 409, so two
+#: SHAMSU processes polling the same bot is not a degraded mode, it is an
+#: outage - and the loser's exception is swallowed by the poll loop's retry.
+#:
+#: Expressing "who is running the bot" as a lease rather than a status file
+#: gets three answers from one row: is it running, in which process, and since
+#: when. The settings page reads the same row the arbitration writes, so the
+#: display cannot drift from the truth.
+POLLER_SESSION = "telegram-poller"
+
+#: Meta keys in the Telegram state DB. Durable because the process that saw the
+#: failure is usually not the process being asked about it.
+META_POLL_ERROR = "last_poll_error"
+META_POLL_ERROR_AT = "last_poll_error_at"
+META_POLLER_WORKSPACE = "poller_workspace"
+
+#: A constant, because the title used to be `f"Telegram {display_name}"` while
+#: the body carried the rest of the sentence - so a pairing produced a panel
+#: titled "Telegram sus" containing "entered a pairing code.", one sentence sawn
+#: in half across a border. The title names the channel; the body is a whole
+#: sentence and reads on its own.
+TELEGRAM_PANEL_TITLE = "Telegram"
 
 #: How long the agent thread will wait for one live-card send. This blocks the
 #: turn, so it is deliberately short: long enough for a slow phone network,
@@ -37,6 +67,32 @@ class RemoteControlPanel:
     status: RemoteControlStatus
     message: str
     pairing: PairingCode | None = None
+
+
+@dataclass(frozen=True)
+class PollerStart:
+    """Why `start()` did or did not begin polling.
+
+    A tri-state rather than a bool, for the same reason `QueuedRunner` has one:
+    "did not start" hides two different situations - it was already running, or
+    somebody else owns the bot - and only the second one is worth telling the
+    user about.
+    """
+
+    outcome: str
+    holder_pid: int = 0
+    holder_surface: str = ""
+    detail: str = ""
+
+    @property
+    def running(self) -> bool:
+        return self.outcome in {"started", "already-running"}
+
+
+STARTED = "started"
+ALREADY_RUNNING = "already-running"
+HELD_ELSEWHERE = "held-elsewhere"
+NO_TOKEN = "no-token"
 
 
 class TelegramService:
@@ -74,6 +130,8 @@ class TelegramService:
             else None
         )
         self._poll_task: asyncio.Task[Any] | None = None
+        self._heartbeat_task: asyncio.Task[Any] | None = None
+        self._control: Any = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self.approval_broker = TelegramApprovalBroker(
             self.store,
@@ -146,17 +204,80 @@ class TelegramService:
             pairing=pairing,
         )
 
-    async def start(self) -> None:
+    async def start(self) -> PollerStart:
         self._loop = asyncio.get_running_loop()
         if self.transport is None:
             self.status = RemoteControlStatus.DISABLED
-            return
+            return PollerStart(NO_TOKEN, detail="Telegram is not configured.")
         if self._poll_task is not None and not self._poll_task.done():
-            return
+            return PollerStart(ALREADY_RUNNING)
+        if not self._claim_poller_lease():
+            holder = self._poller_holder()
+            self.status = RemoteControlStatus.DISABLED
+            return PollerStart(
+                HELD_ELSEWHERE,
+                holder_pid=holder.owner_pid if holder is not None else 0,
+                holder_surface=holder.owner_surface if holder is not None else "",
+                detail="Another SHAMSU process is already polling this bot.",
+            )
+        self.store.set_meta(META_POLLER_WORKSPACE, str(self.workspace))
         self.status = RemoteControlStatus.STARTING
         self._poll_task = asyncio.create_task(self._poll_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        return PollerStart(STARTED)
+
+    def _claim_poller_lease(self) -> bool:
+        try:
+            return self._control_store().acquire_lease(
+                MACHINE_LEASE_KEY, POLLER_SESSION, surface="telegram"
+            )
+        except Exception:  # noqa: BLE001 - an unusable control DB must not be
+            # the reason the bot refuses to run. Losing arbitration is worse
+            # than losing it entirely only when two pollers actually collide,
+            # and that is the rarer failure.
+            return True
+
+    def _poller_holder(self) -> Any:
+        try:
+            return self._control_store().lease_holder(MACHINE_LEASE_KEY, POLLER_SESSION)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _control_store(self) -> Any:
+        from shamsu.control.store import ControlStore
+
+        if self._control is None:
+            self._control = ControlStore()
+        return self._control
+
+    async def _heartbeat_loop(self) -> None:
+        """Keep the poller lease warm.
+
+        Needed because long polling can idle for a full `getUpdates` timeout
+        with nothing to report, and the lease goes stale after 90 seconds. A
+        bot waiting quietly for a message must not look like a crashed one.
+        """
+        from shamsu.control.store import LEASE_HEARTBEAT_SECONDS
+
+        while True:
+            await asyncio.sleep(LEASE_HEARTBEAT_SECONDS)
+            try:
+                self._control_store().renew_lease(MACHINE_LEASE_KEY, POLLER_SESSION)
+            except Exception:  # noqa: BLE001
+                pass
 
     async def stop(self) -> None:
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except (asyncio.CancelledError, Exception):  # noqa: B014 - either is fine
+                pass
+            self._heartbeat_task = None
+        try:
+            self._control_store().release_lease(MACHINE_LEASE_KEY, POLLER_SESSION)
+        except Exception:  # noqa: BLE001
+            pass
         if self._poll_task is not None:
             self._poll_task.cancel()
             try:
@@ -241,11 +362,27 @@ class TelegramService:
                     await self.process_update(update)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 self.status = RemoteControlStatus.ERROR
                 self.store.increment_metric("telegram_send_failures")
+                # Recorded, not just retried. This loop's favourite failure is
+                # a 409 from a webhook registered against the token, which it
+                # will otherwise retry silently until someone gives up on the
+                # bot. The settings page reads this back.
+                self._record_poll_error(exc)
                 await asyncio.sleep(2)
                 self.status = RemoteControlStatus.CONNECTED
+
+    def _record_poll_error(self, exc: BaseException) -> None:
+        message = f"{type(exc).__name__}: {exc}"
+        token = self.token or ""
+        if token:
+            message = message.replace(token, "<token>")
+        try:
+            self.store.set_meta(META_POLL_ERROR, message[:500])
+            self.store.set_meta(META_POLL_ERROR_AT, utc_now())
+        except Exception:  # noqa: BLE001 - reporting a failure must not raise one
+            pass
 
     async def _send(self, message: OutboundMessage) -> None:
         if self.transport is None:
@@ -356,6 +493,13 @@ class TelegramService:
         )
 
     def _mirror_inbound(self, update: TelegramUpdate, *, as_prompt: bool = False) -> None:
+        """Show the desktop only what changes ITS world.
+
+        A prompt starts a turn here, so it is echoed as a prompt line. A file
+        lands in this workspace, so it gets a panel. Everything else - a
+        `/status`, a button press, a pairing code - is the phone reading its own
+        screen, and printing it here was noise about someone else's session.
+        """
         if self.cli_mirror is None:
             return
         if update.message is not None:
@@ -364,31 +508,47 @@ class TelegramService:
                 return
             echo = getattr(self.cli_mirror, "prompt_echo", None)
             if as_prompt and callable(echo) and message.text:
-                echo(message.text)
+                echo(message.text, self._active_session_title(message.user.user_id))
                 return
-            self.cli_mirror(
-                f"Telegram {message.user.display_name}",
-                _safe_inbound_preview(message.text, has_document=message.document is not None),
-            )
+            if message.document is not None:
+                self.cli_mirror(
+                    TELEGRAM_PANEL_TITLE,
+                    f"{message.user.display_name} sent a file: {message.document.file_name}",
+                )
             return
-        if update.callback_query is not None:
-            callback = update.callback_query
-            if not self.authenticator.authorize(callback.user, callback.message.chat).ok:
-                return
-            self.cli_mirror(
-                f"Telegram {callback.user.display_name}",
-                "pressed a Telegram action button.",
-            )
+
+    def _active_session_title(self, telegram_user_id: int) -> str:
+        """The thread this phone is talking to, for the prompt line.
+
+        Best-effort by design: an unknown title costs `shamsu telegram>`
+        instead of `shamsu (asteroids) telegram>`, which is a smaller loss than
+        an exception between a user's prompt and their answer.
+        """
+        try:
+            from shamsu.session.manager import SessionManager
+
+            session_id = self.store.active_session_for(int(telegram_user_id))
+            if not session_id:
+                return ""
+            # `resolve` hands back SessionMetadata, so the title is right here.
+            return str(SessionManager(self.workspace).resolve(session_id).title or "")
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _mirror_outbound(self, message: OutboundMessage) -> None:
         if self.cli_mirror is None:
             return
-        if not self._chat_is_authorized(message.chat_id):
+        # Opt-in. See `OutboundMessage.mirror_to_cli`: turn output already
+        # reaches the desktop through the turn renderer, so mirroring it as
+        # well printed the same turn twice, once as a transcript and once as a
+        # stack of notifications about itself.
+        if not message.mirror_to_cli:
             return
-        text = message.text
-        if message.edit_message_id is not None:
-            text = f"(edited Telegram message)\n{text}"
-        self.cli_mirror("SHAMSU -> Telegram", text)
+        # Deliberately NOT gated on the chat being authorized. The events that
+        # opt in are pairing and refusal, and "a stranger just tried to drive
+        # your installation" is the one the authorization check would have
+        # swallowed - which is precisely the one worth printing.
+        self.cli_mirror(TELEGRAM_PANEL_TITLE, message.cli_text or message.text)
 
     def _chat_is_authorized(self, chat_id: int) -> bool:
         return any(int(user["telegram_chat_id"]) == int(chat_id) for user in self.store.authorized_users())
@@ -402,6 +562,55 @@ class TelegramService:
 
     def _offset_setter(self, offset: int) -> None:
         self.store.set_meta("telegram_update_offset", str(int(offset)))
+
+
+def poller_status(workspace: Path | None = None) -> dict[str, Any]:
+    """Whether the bot is running, and everything the settings page needs.
+
+    A module function, not a method, because the process that asks is almost
+    never the process that polls: the web portal and the REPL are separate
+    programs, and the answer has to come from durable state rather than from an
+    object one of them happens to hold.
+
+    Every source here is already install-scoped - the lease table, the Telegram
+    state DB - so this is the same answer wherever it is asked from.
+    """
+    from shamsu.integrations.telegram.storage import TelegramStateStore
+
+    resolved = Path(workspace).resolve() if workspace is not None else Path.cwd()
+    token, source = load_telegram_bot_token(resolved)
+
+    holder = None
+    try:
+        from shamsu.control.store import ControlStore
+
+        holder = ControlStore().lease_holder(MACHINE_LEASE_KEY, POLLER_SESSION)
+    except Exception:  # noqa: BLE001 - an unreadable control DB means "unknown",
+        # which is reported as not running rather than raised at the caller.
+        holder = None
+
+    store = TelegramStateStore(resolved)
+    metrics = store.metrics()
+    users = store.authorized_users()
+    return {
+        "configured": bool(token),
+        "token_source": source if token else "missing",
+        # Stated rather than detected: SHAMSU has no webhook mode, and a page
+        # that left this ambiguous is what let a registered webhook go
+        # unnoticed in the first place.
+        "transport": "long polling",
+        "running": holder is not None,
+        "owner_pid": holder.owner_pid if holder is not None else 0,
+        "owner_surface": holder.owner_surface if holder is not None else "",
+        "since": holder.heartbeat if holder is not None else "",
+        "is_this_process": bool(holder is not None and holder.is_mine),
+        "workspace": store.get_meta(META_POLLER_WORKSPACE, ""),
+        "paired_count": len(users),
+        "messages_sent": int(metrics.get("telegram_messages_sent", 0)),
+        "send_failures": int(metrics.get("telegram_send_failures", 0)),
+        "last_error": store.get_meta(META_POLL_ERROR, ""),
+        "last_error_at": store.get_meta(META_POLL_ERROR_AT, ""),
+    }
 
 
 def load_telegram_bot_token(workspace: Path) -> tuple[str, str]:
@@ -501,16 +710,10 @@ def _looks_like_bot_token(token: str) -> bool:
     return left.isdigit() and len(right) >= 20 and not any(char.isspace() for char in token)
 
 
-def _safe_inbound_preview(text: str, *, has_document: bool = False) -> str:
-    stripped = (text or "").strip()
-    if _looks_like_pairing_code(stripped):
-        return "entered a pairing code."
-    command = parse_command(stripped)
-    if command and command.name == "/start":
-        return "/start"
-    if has_document and not stripped:
-        return "sent a file."
-    return stripped or "sent a message."
+# `_safe_inbound_preview` lived here and turned an inbound message into a verb
+# phrase for a panel title that was a name - "Telegram sus" / "entered a pairing
+# code." Both halves are gone: the desktop no longer narrates what the phone is
+# reading, so there is nothing left to preview.
 
 
 def _looks_like_pairing_code(text: str) -> bool:

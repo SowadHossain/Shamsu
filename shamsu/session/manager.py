@@ -19,6 +19,14 @@ from shamsu.action_ledger.context import get_current_run
 from shamsu.safety.sandbox import Sandbox
 from shamsu.types import ContextPack
 
+#: `origin` values for `append_message`. A `role: user` record written by the
+#: LOOP - a nudge, a repeat-tool warning - is not something a person said, and
+#: a reader that cannot tell them apart shows the user words they never typed.
+#: Unmarked is treated as authored, so the failure mode is a leaked message
+#: rather than a hidden one.
+ORIGIN_USER = "user"
+ORIGIN_LOOP = "loop"
+
 SNIPPET_PREVIEW_CHARS = 600
 MAX_STRING_CHARS = 4000
 MESSAGE_PREVIEW_CHARS = 16000
@@ -732,10 +740,29 @@ class SessionLogger:
         tool_call_id: str = "",
         name: str = "",
         tool_calls: list[dict[str, Any]] | None = None,
+        source: str = "",
+        origin: str = "",
     ) -> dict[str, Any]:
         """Append one clean transcript turn. Kept separate from the richer
         `chat.message` event so hydration can prefer a compact, redacted
-        transcript and moving fully off events.jsonl later is trivial."""
+        transcript and moving fully off events.jsonl later is trivial.
+
+        `source` records WHICH SURFACE this turn came from - cli, web,
+        telegram. One thread is now driven from three places, and a transcript
+        that cannot say where a prompt came from loses the one piece of context
+        you cannot reconstruct later. Safe to add: this is JSONL, so records
+        written before the field existed simply do not carry it, and every
+        reader defaults it to empty.
+
+        `origin` says WHO WROTE IT. A `role: user` record is not necessarily
+        something a person typed: the loop steers the model with messages in
+        that role ("You have already called read_file this turn"), because that
+        is the role the model must see them in. Rendered as chat they became
+        things the user appeared to have said - ten of them, in a session where
+        two questions were asked. `ORIGIN_LOOP` marks them. Unmarked means
+        shown, so a forgotten marker can leak a message into a transcript but
+        can never hide one.
+        """
         # LOSSLESS on purpose - see `redact_payload`. This file is the archive
         # the whole conversation is read back from; clipping here silently
         # shrank what a resumed session could see, and what "show me the full
@@ -747,6 +774,8 @@ class SessionLogger:
             "tool_call_id": tool_call_id,
             "name": name,
             "tool_calls": redact_payload(tool_calls or []),
+            "source": source,
+            "origin": origin,
         }
         path = self.messages_path
         path.parent.mkdir(parents=True, exist_ok=True)

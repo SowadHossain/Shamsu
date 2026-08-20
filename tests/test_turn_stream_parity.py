@@ -316,12 +316,20 @@ def test_the_legacy_callbacks_still_fire_alongside_emit(tmp_path):
 def test_the_card_header_echoes_the_prompt_like_a_terminal():
     sender = FakeSender()
     card = TelegramTurnCard(
-        chat_id=CHAT_ID, send=sender, prompt="add a pause menu", clock=FakeClock()
+        chat_id=CHAT_ID,
+        send=sender,
+        prompt="add a pause menu",
+        title="asteroids",
+        clock=FakeClock(),
     )
     card(_event(1, "turn.start", "add a pause menu"))
 
     assert sender.sent
-    assert "shamsu (remote-telegram)&gt; add a pause menu" in sender.sent[0].text
+    # The THREAD's name, not the surface's. Telling a Telegram reader they are
+    # on Telegram spends the header on the one fact they already have; the
+    # thread they are driving is what they cannot see from this chat, and what
+    # they switch between without leaving it.
+    assert "shamsu (asteroids) telegram&gt; add a pause menu" in sender.sent[0].text
 
 
 def test_the_card_is_html_and_escapes_the_body():
@@ -558,12 +566,12 @@ def test_the_cli_renderer_survives_having_no_status_line():
 def test_the_mirror_renderer_echoes_a_remote_prompt_on_the_desktop():
     """G2: a Telegram prompt reads like a terminal line on the desktop too."""
     console, buffer = _console()
-    renderer = CliTurnRenderer(console, echo_label="remote-telegram")
+    renderer = CliTurnRenderer(console, echo_surface="telegram", echo_title="asteroids")
     renderer(_event(1, "turn.start", "add a pause menu"))
     renderer(_event(2, "activity", "model responded in 9s"))
 
     printed = buffer.getvalue()
-    assert "shamsu (remote-telegram)> add a pause menu" in printed
+    assert "shamsu (asteroids) telegram> add a pause menu" in printed
     assert "model responded in 9s" in printed
 
 

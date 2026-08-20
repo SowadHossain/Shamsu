@@ -1,5 +1,15 @@
 """The system prompt for simple mode.
 
+The words now live in `prompts/simple_system.md`, not in this file. That is
+smallcode's arrangement - their skills and knowledge are markdown - and the
+reason to copy it is that the prompt is the single most-edited thing in the
+agent and the least code-like. A markdown file can be read, diffed and changed
+by someone who does not want to open Python, and the sections are addressable
+by name rather than by which `+` they were concatenated with.
+
+This module is now the loader and the policy: which sections go out, in what
+order, and under what condition.
+
 Deliberately one short, POSITIVE block. The legacy path sends 49 bullet rules
 across the system prompt and the state frame, and measurement on 2026-08-17
 found the same four instructions repeated 3-4 times each - "do not claim
@@ -30,68 +40,94 @@ right - still a statement of what to do, not a prohibition.
 """
 from __future__ import annotations
 
+import re
+from functools import lru_cache
 from pathlib import Path
 
-SIMPLE_SYSTEM_PROMPT = """\
-You are SHAMSU, a coding assistant working in {workspace}.
+PROMPT_FILE = Path(__file__).resolve().parent / "prompts" / "simple_system.md"
 
-You can read, search and change files in that folder, and run commands there.
-Use a tool when you need real information or need to change something. If the
-question does not need one, just answer normally.
+# Sections sent on every turn, in this order. The rest are added by condition.
+ALWAYS = ("base", "act")
 
-When someone asks you to review, explain, or plan, the answer IS the work: say
-what you found and what you would do next. Change files when you are asked to
-change something.
+# Fallbacks, used only if the markdown is missing or unreadable - a packaging
+# mistake must not leave the model with no instructions at all. Kept terse on
+# purpose: this is a lifeboat, not a second copy to maintain.
+_FALLBACK = {
+    "base": (
+        "You are SHAMSU, a coding assistant working in {workspace}.\n\n"
+        "You can read, search and change files in that folder, and run commands "
+        "there. Use a tool when you need real information or need to change "
+        "something."
+    ),
+    "act": (
+        "Act on what you were asked. If a task has several parts, carry on "
+        "through them and say what you did at the end."
+    ),
+}
 
-When you are changing code, check it works - run it, run its tests, or run the
-build - and work in small steps: make one change, check it, then move on.
+_SECTION = re.compile(r"^##\s+([a-z_]+)\s*$", re.MULTILINE)
+_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 
-You are talking to one person over time. Earlier messages in this conversation
-are real: refer back to them, and when they say "continue" or "next", carry on
-from what you were doing.\
-"""
 
-# Named in prose because a small model reads prose, not the schema list. Each
-# is added only when the thing behind it actually works - see above.
-RECALL_CAPABILITY = (
-    chr(10) * 2
-    + "You remember this project: memory_remember keeps a decision or a "
-    + "gotcha, memory_load brings back what bears on the job, and "
-    + "history_search finds anything said earlier, including turns you can no "
-    + "longer see."
-)
+@lru_cache(maxsize=1)
+def _sections() -> dict[str, str]:
+    """Parse the markdown into `{section name: text}`.
 
-# A NUMBER, because "too big" is not something a 3B model can act on. This said
-# "a file too big to write in one go" and named no limit, so the model decided
-# for itself and decided wrong - one reply, whole file, cut off part-way.
-#
-# The number here is deliberately far stricter than the cap the tool enforces
-# (~8,000 characters, about 200 lines). Prose guidance has to be memorable; the
-# tool is what has to be exact. Sixty lines of dense code is ~2,500 characters,
-# so a model that follows this never reaches the hard refusal at all - the gap
-# is belt-and-braces, and it is what smallcode does too.
-BIG_FILE_CAPABILITY = (
-    chr(10) * 2
-    + "Keep every write_file and append_file under 60 lines. For anything "
-    + "larger: write_file the first 60 lines, then append_file each following "
-    + "section, 60 lines at a time. To change part of an existing file, "
-    + "patch_file."
-)
+    Cached: the file does not change inside a run, and this is called once per
+    turn. HTML comments are stripped - they are notes for whoever edits the
+    file, and sending them would be paying tokens to tell the model why a line
+    exists.
+    """
+    try:
+        raw = PROMPT_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return dict(_FALLBACK)
+    if raw.startswith("---"):
+        end = raw.find("\n---", 3)
+        if end != -1:
+            raw = raw[end + 4 :]
+    raw = _COMMENT.sub("", raw)
+    found: dict[str, str] = {}
+    matches = list(_SECTION.finditer(raw))
+    for index, match in enumerate(matches):
+        stop = matches[index + 1].start() if index + 1 < len(matches) else len(raw)
+        body = raw[match.end() : stop].strip()
+        if body:
+            found[match.group(1)] = body
+    return found or dict(_FALLBACK)
 
-GRAPH_CAPABILITY = (
-    chr(10) * 2
-    + "This workspace is indexed: graph_search finds a symbol without reading "
-    + "files, explain_symbol says who calls it."
-)
+
+def section(name: str) -> str:
+    """One named section of the prompt, or ``""``."""
+    return _sections().get(name, _FALLBACK.get(name, ""))
 
 
 def simple_system_prompt(workspace: Path) -> str:
     """Render the simple-mode system prompt for *workspace*."""
-    prompt = SIMPLE_SYSTEM_PROMPT.format(workspace=Path(workspace).as_posix())
-    prompt += RECALL_CAPABILITY + BIG_FILE_CAPABILITY
+    parts = [section(name) for name in ALWAYS]
+    parts.append(section("recall"))
+    parts.append(section("big_read"))
+    parts.append(section("big_file"))
     if _graph_is_usable(workspace):
-        prompt += GRAPH_CAPABILITY
-    return prompt
+        parts.append(section("graph"))
+    parts.append(_skill_index(workspace))
+    prompt = (chr(10) * 2).join(part for part in parts if part)
+    return prompt.replace("{workspace}", Path(workspace).as_posix())
+
+
+def _skill_index(workspace: Path) -> str:
+    """The one-line-per-skill index, when this workspace has any.
+
+    Conditional for the same reason every other capability line is: a skill the
+    model cannot see is one it will never call `use_skill` for, and a roster
+    advertised into a workspace with no skills is a wasted line every turn.
+    """
+    try:
+        from shamsu.agents.simple_chat import skill_index
+
+        return skill_index(workspace)
+    except Exception:  # noqa: BLE001 - never let the prompt fail to render
+        return ""
 
 
 def _graph_is_usable(workspace: Path) -> bool:
