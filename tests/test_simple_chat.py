@@ -8744,3 +8744,69 @@ def test_a_missing_content_argument_is_still_an_error(tmp_path):
 
     assert not result.ok
     assert "needs a filepath" in result.message
+
+
+def test_a_patch_that_erases_the_last_definition_is_put_back(tmp_path):
+    """`replace_symbol` refuses to silently drop members; `patch_file` had no
+    equivalent, and it can delete any number of lines. A deleting patch that
+    leaves the file parsing passes every other check there is."""
+    (tmp_path / "a.js").write_text(
+        "function keep() {\n  return 1;\n}\n\n"
+        "function only() {\n  return 2;\n}\n\n"
+        "function alsoKeep() {\n  return 3;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+    original = (tmp_path / "a.js").read_text(encoding="utf-8")
+
+    result = loop._execute(
+        "patch_file",
+        {
+            "filepath": "a.js",
+            "old_string": "function only() {\n  return 2;\n}\n\n",
+            "new_string": "",
+        },
+    )
+
+    assert not result.ok
+    assert "only" in result.message
+    assert (tmp_path / "a.js").read_text(encoding="utf-8") == original, "put back exactly"
+
+
+def test_removing_one_of_two_duplicate_definitions_is_allowed(tmp_path):
+    """The narrow half of the rule, and the reason it is narrow. Going from two
+    definitions to one is what removing a duplicate looks like, and it is
+    usually the whole task."""
+    (tmp_path / "a.js").write_text(
+        "function dupe() {\n  return 1;\n}\n\n"
+        "function other() {\n  return 2;\n}\n\n"
+        "function dupe() {\n  return 3;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "patch_file",
+        {
+            "filepath": "a.js",
+            "old_string": "\nfunction dupe() {\n  return 3;\n}\n",
+            "new_string": "",
+        },
+    )
+
+    assert result.ok, result.message
+    body = (tmp_path / "a.js").read_text(encoding="utf-8")
+    assert body.count("function dupe") == 1
+    assert "function other" in body
+
+
+def test_an_indented_definition_counts_as_a_definition(tmp_path):
+    """The measurement error this guard was written after: a nested
+    `function handleQuit()` is a definition, and a regex anchored at the start
+    of the line does not see it. Counting is by parse for that reason."""
+    from shamsu.agents.simple_chat import _symbols_erased
+
+    before = "function outer() {\n    function inner() {\n        return 1;\n    }\n}\n"
+    after = "function outer() {\n    return 1;\n}\n"
+
+    assert "inner" in _symbols_erased(before, after, ".js")

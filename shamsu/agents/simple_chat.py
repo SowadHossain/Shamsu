@@ -4284,8 +4284,62 @@ class SimpleChatLoop:
             result = self._number_the_lines(arguments, result)
             self._note_partial_read(arguments, result)
         if before is not None and result.ok:
+            erased = self._erased_a_definition(name, arguments, before)
+            if erased is not None:
+                return erased
             return self._with_diff(arguments, before, result)
         return result
+
+    def _erased_a_definition(
+        self, name: str, arguments: dict[str, Any], before: str
+    ) -> ToolResult | None:
+        """Put the file back if the edit removed the last of something.
+
+        Judged after the write and rolled back, which is the pattern
+        `_append_file` already uses and for the same reason: the question needs
+        a real parse of the real result, and a parse needs the file.
+
+        `replace_symbol` is exempt - it has its own, better-targeted guard
+        (`_members_lost`) that knows which symbol was deliberately replaced, and
+        deleting by name through it is now an explicit, supported move.
+        """
+        if name not in {"patch_file", "read_and_patch", "write_file"}:
+            return None
+        path = str(arguments.get("filepath") or "").strip()
+        if not path:
+            return None
+        try:
+            target = self.tools.sandbox.validate(path)
+            after = target.read_text(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - unreadable is not evidence of loss
+            return None
+        erased = _symbols_erased(before, after, target.suffix)
+        if not erased:
+            return None
+        try:
+            target.write_text(before, encoding="utf-8", newline="")
+        except OSError:
+            # Could not undo it. Say so loudly rather than reporting a refusal
+            # that did not happen - the file really is changed.
+            return ToolResult(
+                False,
+                f"{path} lost {', '.join(erased)} and could NOT be restored. "
+                "Check the file before going further.",
+                {"filepath": path, "erased": erased, "rolled_back": False},
+            )
+        listed = ", ".join(erased[:6]) + (f" (+{len(erased) - 6} more)" if len(erased) > 6 else "")
+        self._activity(f"that edit would have deleted {listed}; put {path} back")
+        return ToolResult(
+            False,
+            f"NOT APPLIED - {path} is back as it was.{chr(10) * 2}"
+            f"That edit removed the last definition of: {listed}. The file still "
+            f"parsed afterwards, which is why nothing else caught it.{chr(10) * 2}"
+            "If you meant to delete only a DUPLICATE, the other copy has to "
+            "survive - narrow the range so it does not reach past the copy you "
+            "are removing. If you did mean to delete these, say so and use "
+            "replace_symbol on each one by name.",
+            {"filepath": path, "erased": erased, "rolled_back": True},
+        )
 
     def _composite_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         """Two steps in one call, and never a wasted round.
@@ -6131,6 +6185,39 @@ def _match_indentation(original_line: str, content: str) -> tuple[str, bool]:
         (indent + line) if line.strip() else line for line in content.split(chr(10))
     )
     return shifted, True
+
+
+def _symbols_erased(original: str, updated: str, suffix: str) -> list[str]:
+    """Symbols the edit removed the LAST definition of.
+
+    `replace_symbol` has refused to silently drop members since 2026-08-20
+    (`_members_lost`). `patch_file` had no equivalent, and a patch can delete
+    any number of lines - so the wider, blunter tool was the unguarded one, and
+    a deleting patch that leaves the file parsing passes every check there is.
+
+    Written after a scare that turned out to be a measurement error rather than
+    a real incident: a `grep "^function"` over a 582-line file missed the
+    definitions that were indented, which made a correctly-removed duplicate
+    look like a deleted function. Kept anyway, because the hole it covers is
+    real whether or not it has been fallen into - `_members_lost` exists for
+    exactly this risk on the narrower tool.
+
+    The rule is deliberately narrow, because deleting IS often the task: going
+    from two definitions to one is exactly what removing a duplicate looks like
+    and must stay allowed. Only going from one to NONE is caught - the edit
+    removed the last trace of something the file used to have. Counting is by
+    parse rather than by regex, which is the whole lesson above.
+    """
+    from shamsu.agents.simple_outline import outline as _outline
+
+    def _names(text: str) -> set[str]:
+        return {symbol.name.rsplit(".", 1)[-1] for symbol in _outline(text, suffix)}
+
+    try:
+        before, after = _names(original), _names(updated)
+    except Exception:  # noqa: BLE001 - an unparseable side is not evidence of loss
+        return []
+    return sorted(before - after)
 
 
 def _members_lost(original: str, updated: str, suffix: str, replaced: Any) -> list[str]:
