@@ -481,6 +481,8 @@ SYSTEM_COMMANDS = (
     "/context inspect",
     "/context compact",
     "/context show",
+    "/context window",
+    "/context window ",
     "/edit ",
     "/fix ",
     "/test-gen ",
@@ -3634,6 +3636,79 @@ def _context_bucket_rows() -> list[str]:
     return rows
 
 
+#: Windows offered by `/context window` with no argument. Powers of two from
+#: the floor `settings.chat_max_ctx` enforces up to the ceiling `max_ctx`
+#: defaults to - the range where a local KV cache actually fits on one card.
+_OFFERED_WINDOWS = (4096, 8192, 16384, 32768)
+
+
+def _handle_context_window(argument: str, console: Console) -> None:
+    """Show or set the context window, from the chat.
+
+    The setting has existed install-wide since the web portal needed it
+    (`runtime/settings.chat_max_ctx`, read live by `simple_chat.max_ctx`), and
+    the terminal - the surface people actually use - had no way to reach it.
+    Changing a window meant exporting an environment variable and restarting.
+    """
+    from shamsu.agents.simple_chat import max_ctx, output_reserve, summary_budget
+    from shamsu.runtime.settings import chat_max_ctx, update_settings
+
+    pinned = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
+    wanted = argument.strip().lower().replace("k", "024") if argument.strip().endswith("k") else argument.strip()
+
+    if not wanted:
+        current = max_ctx()
+        saved = chat_max_ctx()
+        source = (
+            "SHAMSU_CHAT_MAX_CTX (an environment variable, which always wins)"
+            if pinned.isdigit()
+            else ("saved with /context window" if saved else "the default")
+        )
+        reserve = output_reserve(current)
+        console.print(
+            f"Context window: [bold]{current:,}[/bold] tokens ({current // 1024}k), from {source}.\n"
+            f"  reply reserve : {reserve:,} ({100 * reserve // current}% of it)\n"
+            f"  rolling summary cap : {summary_budget(current):,}\n\n"
+            f"[dim]Set it with `/context window <tokens>` - e.g. "
+            f"{', '.join(str(w) for w in _OFFERED_WINDOWS)}. Bigger is not free: "
+            "Ollama reserves the KV cache for the WHOLE window up front, so a "
+            "window your card cannot hold spills to CPU and gets slower, not "
+            "bigger.[/dim]"
+        )
+        return
+
+    if not wanted.isdigit():
+        console.print("[red]Usage: /context window <tokens>, e.g. /context window 16384[/red]")
+        return
+    size = int(wanted)
+    if size < 4096:
+        # The same floor `settings.chat_max_ctx` enforces, said out loud rather
+        # than silently ignored - a number that is accepted and then discarded
+        # is how someone spends an afternoon wondering why nothing changed.
+        console.print(
+            "[red]4096 is the smallest usable window - below it the system prompt "
+            "and one tool schema do not both fit.[/red]"
+        )
+        return
+    try:
+        update_settings(chat_max_ctx=size)
+    except Exception as exc:  # noqa: BLE001 - the user asked for a change; say if it failed
+        console.print(f"[red]Could not save that: {exc}[/red]")
+        return
+    console.print(
+        f"Context window set to [bold]{size:,}[/bold] tokens ({size // 1024}k). "
+        "It applies to the next turn, on every surface."
+    )
+    if pinned.isdigit():
+        # Saved, but not in effect. Reporting success without this would be a
+        # lie by omission: the env var wins by design.
+        console.print(
+            f"[yellow]Note: SHAMSU_CHAT_MAX_CTX={pinned} is set in this "
+            "environment and overrides it. Unset it for the saved value to "
+            "take effect.[/yellow]"
+        )
+
+
 def _handle_context(
     normalized_input: str,
     workspace: Path,
@@ -3723,33 +3798,52 @@ def _handle_context(
         console.print(Panel("\n".join(lines), title="Context Budget", border_style="cyan"))
 
     elif sub == "compact":
-        result = mgr.last_result
-        threshold_pct = round(mgr._compact_threshold * 100)
-        if result is None:
-            console.print(
-                f"[dim]Auto-compact threshold: {threshold_pct}%. "
-                "No model calls made yet this session.[/dim]"
-            )
-        else:
-            status = "triggered" if result.usage_pct >= threshold_pct else "not triggered"
-            console.print(
-                f"Auto-compact threshold: {threshold_pct}%  |  "
-                f"Last call: {result.usage_pct}% used  |  "
-                f"Status: {status}"
-            )
-            console.print(
-                "[dim]Compaction runs automatically before each planner/coder call "
-                "when usage exceeds the threshold. "
-                "Exact code snippets, file paths, error codes, and imports are always preserved.[/dim]"
-            )
+        # Simple mode's compaction, not `ContextBudgetManager`'s. That manager
+        # belongs to the legacy path; describing its threshold here told people
+        # about a mechanism that was not the one running, on the default loop.
+        from shamsu.agents.simple_chat import SESSION_COUNTERS as counters
+        from shamsu.agents.simple_chat import max_ctx, summary_budget
+
+        window = max_ctx()
+        lines = [
+            "Compaction summarises the turns that no longer fit, once per user "
+            "turn, before the round loop runs.",
+            "",
+            f"  window                : {window:,} tokens",
+            f"  rolling summary cap   : {summary_budget(window):,} tokens (~6% of the window)",
+            f"  compactions so far    : {counters.compactions}",
+            f"  payload elisions      : {counters.evictions}",
+            "",
+            "[dim]Elision is the cheap one and runs mid-turn: it shrinks old "
+            "tool-call payloads in memory, losslessly, because the file is "
+            "still on disk. Compaction is the model-driven one and records what "
+            "was DECIDED, which a deterministic digest cannot.[/dim]",
+            "",
+            "[dim]`/compact` shows the summary the model is carrying, "
+            "`/compact clear` forgets it. A compaction count that climbs once "
+            "per turn means the window is too small for the work - "
+            "`/context window` to change it.[/dim]",
+        ]
+        console.print(Panel("\n".join(lines), title="Compaction", border_style="cyan"))
+    elif sub == "window":
+        _handle_context_window(parts[2] if len(parts) > 2 else "", console)
+
     elif sub == "show":
-        from shamsu.agents.chat_loop import _CHAT_MAX_CTX, _TOOL_RESULT_MAX_TOKENS
+        # Simple mode's numbers, not `chat_loop`'s. Those constants belong to
+        # the legacy path, are frozen at import, and disagree: this panel was
+        # reporting a 2,000-token per-tool-result cap while the default loop
+        # was using 8,000. A status command that lies about the number most
+        # responsible for filling the window is worse than no status command.
+        from shamsu.agents.simple_chat import MAX_TOOL_RESULT_TOKENS, max_ctx, output_reserve
         from shamsu.ui.trace import read_trace_mode
 
+        window = max_ctx()
         lines = [
             f"Trace mode         : {read_trace_mode(workspace)}",
-            f"Chat context window: {_CHAT_MAX_CTX // 1024}k tokens (SHAMSU_CHAT_MAX_CTX)",
-            f"Per-tool-result cap: {_TOOL_RESULT_MAX_TOKENS:,} tokens (SHAMSU_TOOL_RESULT_MAX_TOKENS)",
+            f"Chat context window: {window // 1024}k tokens  (`/context window` to change)",
+            f"Reserved for reply : {output_reserve(window):,} tokens "
+            f"({100 * output_reserve(window) // window}% of the window)",
+            f"Per-tool-result cap: {MAX_TOOL_RESULT_TOKENS:,} tokens",
             "",
             "The working trace now surfaces (at 'normal' verbosity):",
             "  - Search : each search_index query + its top file hits and scores",
@@ -3774,7 +3868,8 @@ def _handle_context(
 
     else:
         console.print(
-            "[red]Usage: /context status|budget|meter|inspect|compact|show[/red]"
+            "[red]Usage: /context "
+            "status|budget|meter|inspect|compact|show|window[/red]"
         )
 
 

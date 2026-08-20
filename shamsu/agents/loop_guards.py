@@ -158,6 +158,39 @@ def greeting_regression(text: str, *, work_happened: bool) -> Signal | None:
     )
 
 
+#: A reply that is nothing but a tool-call object. `{"name": ..., "arguments":
+#: ...}`, optionally fenced. Anchored at both ends on purpose - see
+#: `leaked_tool_call`.
+_BARE_TOOL_CALL = re.compile(
+    r"^\s*(?:```(?:json)?\s*)?\{\s*\"(?:name|tool|function)\"\s*:\s*\"([A-Za-z0-9_.]+)\""
+    r".*\}\s*(?:```)?\s*$",
+    re.DOTALL,
+)
+
+
+def leaked_tool_call(text: str) -> str:
+    """The tool name in a reply that is ONLY a tool call, or ``""``.
+
+    `parse_model_turn` salvages a call from prose only when the name is exactly
+    a registered tool, and that gate is right: an unregistered name in the
+    middle of an explanation is an example, not a call, and executing prose
+    would be worse than ignoring it.
+
+    But when the ENTIRE reply is the object, there is no prose for it to be an
+    example in. Live 2026-08-20 a fresh turn answered
+    `{"name": "run_file", "arguments": {"filepath": "hello.py"}}` - raw JSON,
+    handed to the user as the finished answer, for a tool that does not exist.
+    The closest-match correction `_execute` offers never fired, because the
+    call never reached dispatch.
+
+    So: only the whole-reply case, which cannot be prose, and it produces a
+    NUDGE rather than an execution - the model is told the name is not a tool
+    and asked to make a real call.
+    """
+    match = _BARE_TOOL_CALL.match(text or "")
+    return match.group(1) if match else ""
+
+
 def closest_tool_names(wanted: str, known: list[str], limit: int = 3) -> list[str]:
     """The registered names most like one the model invented.
 

@@ -102,9 +102,21 @@ def section(name: str) -> str:
     return _sections().get(name, _FALLBACK.get(name, ""))
 
 
-def simple_system_prompt(workspace: Path) -> str:
-    """Render the simple-mode system prompt for *workspace*."""
+def simple_system_prompt(workspace: Path, *, has_history: bool = True) -> str:
+    """Render the simple-mode system prompt for *workspace*.
+
+    `has_history=False` drops the continuity section. Sent unconditionally it
+    asserts, on the first message of a fresh thread, that earlier messages exist
+    - and a small model believes it: live 2026-08-20 turn one of an empty
+    session opened with *"I apologize for any confusion earlier. Let's proceed
+    with the next step."* There was no earlier and no next.
+
+    Defaults to True so every existing caller keeps the section it already had;
+    only a caller that KNOWS the thread is empty passes False.
+    """
     parts = [section(name) for name in ALWAYS]
+    if has_history:
+        parts.append(section("continuity"))
     parts.append(section("symbols"))
     parts.append(section("done"))
     parts.append(section("recall"))

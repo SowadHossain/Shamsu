@@ -3,6 +3,32 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-21 - Context control from the chat, and three commands that were lying
+Files edited: `shamsu/cli/repl.py`, `shamsu/agents/simple_chat.py`,
+`shamsu/agents/simple_prompt.py`, `shamsu/agents/prompts/simple_system.md`,
+`shamsu/agents/loop_guards.py`, tests
+What changed: added `/context window` (the setting existed install-wide; the
+terminal could not reach it). Fixed `/context show`, which reported the legacy
+loop's frozen constants - a 2,000-token tool-result cap against the 8,000 simple
+mode actually uses - and `/context compact`, which described the legacy budget
+manager's threshold rather than the compaction that runs. Then the budget
+itself: the reply reserve was 100% of a 4,096 window and 50% of an 8,192 one,
+which `/context window` had just made reachable; one tool result could be 97.7%
+of an 8k window. Both are shares now. The prompt stopped claiming earlier
+messages on a fresh thread, and a reply that is nothing but a tool-call object
+is nudged instead of being handed over as the answer.
+Verified: compaction checked LIVE on qwen2.5-coder:3b at a forced 4,096 window -
+it fired at turn 3 and the turn-1 fact survived eviction, recalled correctly at
+turn 6. The summary grows 0 -> 133 -> 401 -> 669 -> 937 -> 1098 then stops at
+its budget cap, which is correct.
+Corrections to my own earlier findings, both from checking rather than assuming:
+HYDRATE_MAX_MESSAGES is 400 in simple mode, not 24 - the 24 is chat_state's
+default and simple mode overrides it, so there was nothing to fix. And the
+continuity prompt section was a real false claim but NOT the cause of the turn-1
+apology: with it removed the 3B still apologises to a non-coding instruction,
+and answers a coding one cleanly on the same fresh thread.
+Tests: 8 new; full suite 3443 passing / 0 failing.
+
 ### 2026-08-20 — Phase 3: a plan that is written down, and shown again
 Files edited: `shamsu/agents/plan_anchor.py` (new), `tests/test_plan_anchor.py`
 (new), `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_router.py`,

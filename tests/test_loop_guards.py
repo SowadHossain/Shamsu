@@ -203,3 +203,27 @@ def test_the_temperature_never_leaves_the_legal_range():
     for base in (0.0, 0.05, 0.95, 1.0):
         for streak in range(6):
             assert 0.0 <= adapted_temperature(base, streak) <= 1.0
+
+
+# --- a reply that is nothing but a tool call ----------------------------
+
+
+def test_a_reply_that_is_only_a_tool_call_is_recognised():
+    """`parse_model_turn` salvages a leaked call only on an EXACT name match,
+    and that gate is right for prose. But when the whole reply is the object
+    there is no prose for it to be an example in - live 2026-08-20 a turn
+    answered `{"name": "run_file", ...}` as its finished answer."""
+    from shamsu.agents.loop_guards import leaked_tool_call
+
+    assert leaked_tool_call('{"name": "run_file", "arguments": {"filepath": "a.py"}}') == "run_file"
+    assert leaked_tool_call('```json\n{"name": "read_files", "arguments": {}}\n```') == "read_files"
+
+
+def test_a_tool_call_MENTIONED_in_prose_is_left_alone():
+    """The reason the parser's gate exists. Executing an example would be worse
+    than ignoring it."""
+    from shamsu.agents.loop_guards import leaked_tool_call
+
+    assert leaked_tool_call('I would call {"name": "read_file", "arguments": {}} to see it.') == ""
+    assert leaked_tool_call("Done! I created hello.py.") == ""
+    assert leaked_tool_call("") == ""

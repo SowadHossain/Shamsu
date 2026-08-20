@@ -4,6 +4,62 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Added (context control and honest context reporting, 2026-08-21)
+
+- **`/context window [tokens]`** - read or set the context window from the chat.
+  The setting has existed install-wide since the web portal needed it
+  (`runtime/settings.chat_max_ctx`, read live by `simple_chat.max_ctx`) and the
+  terminal, the surface people actually use, had no way to reach it: changing a
+  window meant exporting an environment variable and restarting. Says where the
+  current value came from, and says so when an environment variable is
+  overriding what was just saved, rather than reporting success for a change
+  that will not take effect.
+
+### Fixed (three status commands were reporting the legacy loop, 2026-08-21)
+
+- **`/context show` reported a 2,000-token per-tool-result cap while the default
+  loop used 8,000.** It read `chat_loop._CHAT_MAX_CTX` and
+  `_TOOL_RESULT_MAX_TOKENS` - constants belonging to the legacy path, frozen at
+  import, and disagreeing with simple mode. A status command that lies about the
+  number most responsible for filling the window is worse than no status
+  command. It now reads simple mode's live values and shows the reply reserve
+  as a share.
+- **`/context compact` described `ContextBudgetManager`'s threshold**, which is
+  the legacy compaction, not the one running. It now reports the real thing:
+  window, summary cap, compaction count, elision count, and the distinction
+  between them.
+
+### Fixed (context construction: shares, not flat constants, 2026-08-21)
+
+- **The reply reserve could be the entire window.** `max(4096, ceiling // 4)`
+  returned 4096 at every window below 16k - 50% of an 8k window and **100% of a
+  4k one**, leaving nothing for the prompt. Unreachable while 32k was the only
+  setting anyone used; `/context window` makes it reachable and
+  `_shrink_for_oom` was already walking sessions down into it. The floor now
+  gives way rather than eating the window, capped at a third.
+- **One tool result could be 97.7% of an 8k window.** `MAX_TOOL_RESULT_TOKENS`
+  was flat at 8,000 - a quarter of a 32k window and nearly all of an 8k one.
+  Now a share with that value as its ceiling. This is the same defect
+  `output_reserve` already fixed once: *"a fixed 4096 reserve is what starved
+  simple mode."*
+- **The prompt no longer claims a past on a fresh thread.** *"Earlier messages
+  in this conversation are real... including turns you can no longer see"* was
+  sent on every turn including the first. Now a conditional section, gated on
+  the session having turns behind it. (Honest note: this removed a false claim
+  but did NOT fix the reply that exposed it - a 3B still opens with an apology
+  when given a non-coding instruction, and the same model on the same fresh
+  thread answers a CODING request cleanly. The prompt was wrong; it was not the
+  cause.)
+- **A reply that is nothing but a tool-call object is no longer the answer.**
+  `parse_model_turn` salvages a leaked call only on an exact name match, which
+  is right for prose - an unregistered name mid-explanation is an example, not
+  a call. But when the whole reply is the object there is no prose for it to be
+  an example in, and live 2026-08-21 a turn answered
+  `{"name": "run_file", "arguments": {"filepath": "hello.py"}}` as its finished
+  answer, for a tool that does not exist. The closest-match correction never
+  fired because the call never reached dispatch. Now nudged, with the nearest
+  real names.
+
 ### Added (agent loop phase 3 - a plan that is written down and shown again, 2026-08-20)
 
 - **A job with parts is asked to write them down.** `contract_create` has been

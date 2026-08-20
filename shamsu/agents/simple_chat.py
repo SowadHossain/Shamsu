@@ -47,6 +47,7 @@ from shamsu.agents.loop_guards import (
     TrustDecay,
     closest_tool_names,
     greeting_regression,
+    leaked_tool_call,
 )
 from shamsu.agents.plan_anchor import anchor as plan_anchor
 from shamsu.agents.plan_anchor import ask_for_a_plan
@@ -101,7 +102,36 @@ CTX_BUCKETS = (8192, 16384, 32768, 49152, 65536)
 # tokens (~32k chars) against a ~24k-token prompt budget: a source file the
 # model has to EDIT is worth a large share of it, and 2000 silently cut
 # ordinary files down to a fragment.
+#
+# A CEILING now, not the cap itself - see `tool_result_budget`. Flat, it was
+# 24% of a 32k window and 97.7% of an 8k one, and `_shrink_for_oom` walks
+# sessions INTO 8k. This is the same defect `output_reserve` already fixed once
+# ("a fixed 4096 reserve is what starved simple mode"): a number that is right
+# at one window size and silently wrong at every other.
 MAX_TOOL_RESULT_TOKENS = 8000
+
+#: The share of the window one tool result may occupy. A quarter leaves three
+#: quarters for the system prompt, the schemas, the conversation and the reply -
+#: and a file worth editing is genuinely worth a quarter.
+TOOL_RESULT_WINDOW_SHARE = 4
+
+#: Below this a result is a fragment rather than a smaller answer, so the floor
+#: holds even when the share would go lower. At the 4096 minimum window this is
+#: what binds, and it should: the honest reading is that the window is too small
+#: for the file, which `_refuse_unwritable_rewrite` and the read guard say out
+#: loud rather than by silently truncating.
+TOOL_RESULT_FLOOR_TOKENS = 1500
+
+
+def tool_result_budget(ceiling: int | None = None) -> int:
+    """How many tokens one tool result may carry, for this window."""
+    window = ceiling or max_ctx()
+    return int(
+        max(
+            TOOL_RESULT_FLOOR_TOKENS,
+            min(MAX_TOOL_RESULT_TOKENS, window // TOOL_RESULT_WINDOW_SHARE),
+        )
+    )
 
 # Files named in the always-fresh workspace listing, and the noise excluded from
 # it. Small enough to be nearly free; the point is grounding, not a project dump.
@@ -338,8 +368,23 @@ def output_reserve(ceiling: int) -> int:
     empty reply and nudged, forever.
 
     A quarter of the window scales with it: 8k -> 4096, 32k -> 8192.
+
+    But the FLOOR must not outgrow the window it is a share of. Taken as a bare
+    `max(4096, ceiling // 4)` this returned 4096 at every window below 16k -
+    50% of an 8k window and **100% of a 4k one**, leaving nothing at all for the
+    prompt. It was unreachable while 32k was the only setting anyone used;
+    `/context window` makes it reachable, and `_shrink_for_oom` was already
+    walking sessions down into it.
+
+    So the floor applies only where it still leaves room to think: capped at a
+    third of the window. A model given a third of 4k to answer in is
+    constrained, which is true and survivable. One given all of it cannot be
+    sent a prompt.
     """
-    return max(RESERVE_OUTPUT_TOKENS, ceiling // 4)
+    quarter = ceiling // 4
+    if quarter >= RESERVE_OUTPUT_TOKENS:
+        return quarter
+    return max(1, min(RESERVE_OUTPUT_TOKENS, ceiling // 3))
 
 
 # The most a single reply may generate, however much window is free.
@@ -1966,7 +2011,9 @@ class SimpleChatLoop:
         # transcript, since that is the only record of what the model SAW.
         self.log_turns = log_turns and not os.environ.get("SHAMSU_NO_CHAT_LOG", "").strip()
         self.state = state or ChatState(
-            simple_system_prompt(self.workspace),
+            simple_system_prompt(
+                self.workspace, has_history=_thread_has_history(session_logger)
+            ),
             session_logger=session_logger,
             # Pull far more than the 24-message default and let the TOKEN budget
             # decide what fits. A fresh loop is built per user message, so the
@@ -2427,6 +2474,28 @@ class SimpleChatLoop:
                         tool_calls,
                         changed,
                     )
+                leaked = leaked_tool_call(text)
+                if leaked and empty_nudges < MAX_EMPTY_NUDGES:
+                    # The whole reply was a tool-call object for a name the
+                    # parser did not recognise, so it was never salvaged and
+                    # was about to be handed over as the answer. Raw JSON is
+                    # not an answer; say which names exist and let it retry.
+                    empty_nudges += 1
+                    self._repair_streak += 1
+                    close = closest_tool_names(leaked, sorted(SIMPLE_TOOLS))
+                    suggestion = (
+                        f" Did you mean {' or '.join(close)}?" if close
+                        else " Pick one from the tools you were given."
+                    )
+                    self.state.append_assistant(text)
+                    self.state.append_user(
+                        f"That reply was a tool call for {leaked!r}, which is not a "
+                        f"tool.{suggestion} Make the call properly this time - as a "
+                        "tool call, not as text in your reply.",
+                        origin=ORIGIN_LOOP,
+                    )
+                    self._activity(f"replied with a bare {leaked} call; asked it to call a real tool")
+                    continue
                 lost = greeting_regression(text, work_happened=tool_calls > 0)
                 if lost and empty_nudges < MAX_EMPTY_NUDGES:
                     # Counted against the empty-turn budget rather than getting
@@ -6218,6 +6287,33 @@ _PROJECT_MARKERS: tuple[tuple[str, str], ...] = (
 )
 
 
+def _thread_has_history(session_logger: Any) -> bool:
+    """Has this conversation had a turn before the one about to run?
+
+    Decides whether the prompt may claim there are earlier messages. Read from
+    the session's own metadata rather than from the transcript, because the
+    prompt is built BEFORE hydration - and a wrong answer here is cheap in one
+    direction only: claiming history that exists is harmless, claiming history
+    that does not exist is what produced "I apologize for any confusion
+    earlier" on the first message of an empty thread.
+
+    So it fails towards True. A logger that cannot be read is assumed to have
+    history, which loses one paragraph of accuracy rather than inventing a
+    conversation.
+    """
+    if session_logger is None:
+        return False
+    try:
+        metadata = getattr(session_logger, "metadata", None)
+        if metadata is None:
+            return True
+        if str(getattr(metadata, "last_user_prompt", "") or "").strip():
+            return True
+        return int(getattr(metadata, "message_count", 0) or 0) > 0
+    except Exception:  # noqa: BLE001 - a prompt section must not fail a turn
+        return True
+
+
 def project_brief(workspace: Path) -> str:
     """One line saying what this project IS, for the first turn and every one after.
 
@@ -6703,9 +6799,10 @@ def _budgeted(payload: str) -> str:
     unterminated string and unclosed braces - a payload the model can only read
     as garbage. Whatever survives the cap must still be shaped like a result.
     """
-    if count_tokens(payload) <= MAX_TOOL_RESULT_TOKENS:
+    cap = tool_result_budget()
+    if count_tokens(payload) <= cap:
         return payload
-    keep = MAX_TOOL_RESULT_TOKENS * 4
+    keep = cap * 4
     try:
         parsed = json.loads(payload)
         data = parsed.get("data")

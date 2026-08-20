@@ -941,12 +941,22 @@ def test_the_default_context_is_the_full_32k(tmp_path):
 
 def test_the_reply_reserve_scales_with_the_window(tmp_path):
     """A fixed 4096 reserve at 32k left the prompt 28160 and the reply the same
-    4096 it got at 8k - the model spent it thinking and returned nothing."""
+    4096 it got at 8k - the model spent it thinking and returned nothing.
+
+    8192 no longer returns 4096, and that change is the point rather than a
+    regression: 4096 was HALF that window, and the same expression returned
+    100% of a 4096 one. The floor now applies only where it still leaves room
+    to send a prompt - see `test_the_reply_reserve_never_outgrows_the_window`.
+    """
     from shamsu.agents.simple_chat import output_reserve
 
-    assert output_reserve(8192) == 4096
     assert output_reserve(32768) == 8192
     assert output_reserve(65536) == 16384
+    assert output_reserve(16384) == 4096
+    # Below 16k the quarter falls under the floor, and the floor gives way
+    # rather than eating the window.
+    assert output_reserve(8192) == 2730
+    assert output_reserve(4096) == 1365
 
 
 def test_an_out_of_memory_reply_is_recognised():
@@ -8534,3 +8544,89 @@ def test_a_finished_plan_is_not_re_shown(tmp_path):
         m["content"] for m in loop.client.calls[0]["messages"] if m["role"] == "system"
     )
     assert "ACTIVE PLAN" not in sent
+
+
+# --- context construction: shares, not flat constants -------------------------
+
+
+def test_the_reply_reserve_never_outgrows_the_window_it_is_a_share_of(tmp_path):
+    """`max(4096, ceiling // 4)` returned 4096 at every window below 16k - half
+    of an 8k window and ALL of a 4k one, leaving nothing for the prompt. It was
+    unreachable while 32k was the only setting anyone used; `/context window`
+    makes it reachable and `_shrink_for_oom` was already walking into it."""
+    from shamsu.agents.simple_chat import output_reserve
+
+    for window in (4096, 6144, 8192, 12288, 16384, 32768, 65536):
+        reserve = output_reserve(window)
+        assert 0 < reserve <= window // 2, f"{window} -> {reserve}"
+        assert window - reserve > 1024, "there must be room left for a prompt"
+
+
+def test_a_big_window_still_gets_the_full_quarter(tmp_path):
+    """The floor must not become a ceiling: the original defect was a REPLY
+    starved at 32k, and that fix has to survive this one."""
+    from shamsu.agents.simple_chat import output_reserve
+
+    assert output_reserve(32768) == 8192
+    assert output_reserve(16384) == 4096
+
+
+def test_one_tool_result_cannot_swallow_the_window(tmp_path):
+    """A flat 8,000 was 24% of a 32k window and 97.7% of an 8k one. Same defect
+    the reserve already had once: right at one size, silently wrong at others."""
+    from shamsu.agents.simple_chat import tool_result_budget
+
+    for window in (4096, 8192, 16384, 32768):
+        assert tool_result_budget(window) <= max(1500, window // 4), window
+    assert tool_result_budget(32768) == 8000, "the big window keeps the old cap"
+    assert tool_result_budget(8192) < 8000, "the small one must not"
+
+
+def test_a_fresh_thread_is_not_told_it_has_a_past(tmp_path):
+    """Live 2026-08-20, turn one of an empty session replied "I apologize for
+    any confusion earlier. Let's proceed with the next step." There was no
+    earlier and no next; the prompt asserted both on every turn."""
+    from shamsu.agents.simple_prompt import simple_system_prompt
+
+    fresh = simple_system_prompt(tmp_path, has_history=False)
+    ongoing = simple_system_prompt(tmp_path, has_history=True)
+
+    assert "Earlier messages in this conversation" not in fresh
+    assert "Earlier messages in this conversation" in ongoing
+    assert "You are SHAMSU" in fresh, "the rest of the prompt is unchanged"
+
+
+def test_an_unreadable_session_is_assumed_to_have_history(tmp_path):
+    """Fails towards True on purpose: claiming history that exists is harmless,
+    claiming history that does not is the defect."""
+    from shamsu.agents.simple_chat import _thread_has_history
+
+    class Broken:
+        @property
+        def metadata(self):
+            raise RuntimeError("no")
+
+    assert _thread_has_history(Broken()) is True
+    assert _thread_has_history(None) is False
+
+
+def test_a_bare_tool_call_is_not_handed_back_as_the_answer(tmp_path):
+    """Live 2026-08-20 on qwen2.5-coder:3b, a fresh turn replied
+    `{"name": "run_file", "arguments": {"filepath": "hello.py"}}` - raw JSON,
+    presented as the finished answer, for a tool that does not exist. The
+    closest-match correction never fired because the call never reached
+    dispatch."""
+    loop = _loop(
+        tmp_path,
+        [
+            _text('{"name": "run_file", "arguments": {"filepath": "hello.py"}}'),
+            _text("Created hello.py."),
+        ],
+    )
+
+    result = asyncio.run(loop.run("create hello.py"))
+
+    assert result.final == "Created hello.py."
+    nudge = [m.content for m in loop.state.all_messages if m.role == "user"][-1]
+    assert "run_file" in nudge
+    assert "not a tool" in nudge
