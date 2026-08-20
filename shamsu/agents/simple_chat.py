@@ -586,6 +586,8 @@ SIMPLE_TOOLS: dict[str, str] = {
     # what it believes it did. `_with_diff` shows one edit; these show the turn,
     # the branch and the history. Withheld outside a repository - see
     # CONDITIONAL_TOOL_FAMILIES.
+    "web_search": "web_search",
+    "fetch_url": "fetch_url",
     "git_status": "git_status",
     "git_diff": "git_diff",
     "git_log": "git_log",
@@ -755,6 +757,38 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["source", "destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the web for CURRENT or EXTERNAL information this workspace "
+                "cannot answer: a library's API, a third-party error message, a "
+                "version, published documentation. Never for this project's own "
+                "code - use search_files or graph_search for that. Needs approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "What to search for."}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "Fetch one web page's readable text - typically a documentation page "
+                "found with web_search. Needs approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "Absolute http(s) URL."}},
+                "required": ["url"],
             },
         },
     },
@@ -1348,6 +1382,11 @@ CONDITIONAL_TOOL_FAMILIES: dict[str, tuple[str, ...]] = {
     # `run_command` reaches it with approval and the risk classifier, and 19
     # more schemas is not a trade worth making for that.
     "git": ("git_status", "git_diff", "git_log"),
+    # Offered only when a search backend is actually answering AND the user has
+    # opted in - see `_web_is_reachable`. Both halves matter: reaching the
+    # network is a decision a local-first tool must be asked to make, and a tool
+    # pointed at nothing is a round spent learning that.
+    "web": ("web_search", "fetch_url"),
 }
 
 
@@ -1364,6 +1403,7 @@ def available_tool_families(workspace: Path) -> frozenset[str]:
         ("graph", _has_code_graph),
         ("history", _has_earlier_sessions),
         ("git", _is_a_git_repo),
+        ("web", _web_is_reachable),
     ):
         try:
             if probe(workspace):
@@ -1371,6 +1411,41 @@ def available_tool_families(workspace: Path) -> frozenset[str]:
         except Exception:  # noqa: BLE001 - an unreadable probe must not remove a tool
             available.add(family)
     return frozenset(available)
+
+
+def _web_is_reachable(_workspace: Path) -> bool:
+    """Is there a search backend actually answering right now?
+
+    The probe the web tools were waiting on. They were built, tested and never
+    offered, because offering a tool that may always fail contradicts the rule
+    this codebase committed under the title *"Offer only the tools that have
+    something to answer from"* - and `web_search` depends on a SearXNG instance
+    that may or may not be up. Reporting that as a permanent gap was the wrong
+    call: the missing piece was a probe, and every other conditional family
+    already has one.
+
+    A one-second HEAD against the configured URL, and DISABLED by default -
+    `SHAMSU_WEB_ENABLED` gates it, because reaching the network is a decision a
+    local-first tool should not make on the user's behalf without being asked.
+    Unreachable is a normal answer here, not an error, so it is quiet.
+    """
+    import os as _os
+
+    if _os.environ.get("SHAMSU_WEB_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return False
+    try:
+        import httpx
+
+        from shamsu.tools.web import DEFAULT_SEARXNG_URL
+
+        url = _os.environ.get("SHAMSU_SEARXNG_URL", DEFAULT_SEARXNG_URL).rstrip("/")
+        # Any HTTP answer means something is listening; the tool itself handles
+        # a backend that is up but unhappy. What is being excluded here is the
+        # case where nothing is there at all.
+        httpx.head(url, timeout=1.0, follow_redirects=True)
+        return True
+    except Exception:  # noqa: BLE001 - unreachable is the expected answer
+        return False
 
 
 def _is_a_git_repo(workspace: Path) -> bool:

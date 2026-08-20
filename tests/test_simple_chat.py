@@ -232,6 +232,8 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
         # answer "not a git repository" - the same 516-token nothing the
         # families above were withheld for.
         "git_status", "git_diff", "git_log",
+        # And nothing is serving search on a test machine.
+        "web_search", "fetch_url",
     }
 
     # Everything that can act on a bare workspace, and nothing that cannot.
@@ -242,7 +244,7 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
     assert "memory_remember" in offered, "the tool that creates notes is never withheld"
 
 
-def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_path):
+def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_path, monkeypatch):
     """The gate is about relevance, not removal: give each family what it needs
     and the roster is exactly what it always was."""
     from shamsu import paths
@@ -256,10 +258,15 @@ def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_
     for name in ("20260819-000001-aaaa", "20260819-000002-bbbb"):
         (paths.sessions_dir(tmp_path) / name).mkdir(parents=True, exist_ok=True)
     # "Everything has something to answer from" now includes a repository for
-    # read-only git to describe.
+    # read-only git to describe, and a reachable search backend. The web probe
+    # is faked rather than served: this test is about the ROSTER honouring
+    # availability, not about httpx.
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    monkeypatch.setattr(
+        "shamsu.agents.simple_chat._web_is_reachable", lambda _ws: True
+    )
 
     loop = _loop(tmp_path, [_text("ok")])
     asyncio.run(loop.run("hi"))
@@ -2285,11 +2292,18 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
             "move_file": {"source": "to_move.py", "destination": "moved.py"},
             # No arguments at all, and "value" is not a file to delete.
             "delete_file": {"filepath": "to_delete.py"},
+            # Reaching a real search backend is not this test's business - it
+            # asks whether schema names reach the implementation, and these two
+            # would need a live SearXNG to answer at all.
+            "web_search": None,
+            "fetch_url": None,
             "git_status": {},
             "git_diff": {},
             "git_log": {"limit": "3"},
             "ask_user": {"question": "Which one?"},
         }
+        if name in {"web_search", "fetch_url"}:
+            continue
         arguments = distinct.get(name) or {
             key: "hello.py" if "file" in key else "value" for key in required
         }

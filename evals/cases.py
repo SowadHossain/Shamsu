@@ -315,3 +315,135 @@ SEED_CASES: list[EvalCase] = [
         tags=("plan", "grounding", "chat"),
     ),
 ]
+
+
+# --- degenerate behaviour: the cases the guards actually exist for -------------
+#
+# Every seed case above is a single-step one-liner, and that is why the read-loop
+# guard, the greeting detector, trust decay, the plan anchor and the third exit
+# all measured as NOISE across three phases of work: nothing in the suite makes
+# a model lose the thread, so nothing could tell whether the guards catch it.
+# These reproduce the failures instead of describing them.
+
+
+def _seed_broken_brace(workspace: Path) -> None:
+    """A `.js` file a patch has already eaten a closing brace from.
+
+    Shaped to be hard to patch by memory on purpose - repeated near-identical
+    lines, so an `old_string` written from recall matches the wrong one or
+    nothing. That is the user-reported failure: the model can see the fault and
+    cannot produce an edit that lands, and the loop used to answer with "I tried
+    4 edits in a row that changed nothing" and hand the work back.
+    """
+    _write(
+        workspace,
+        "game.js",
+        "function update(state) {\n"
+        "  if (state.alive) {\n"
+        "    state.x += state.vx;\n"
+        "    state.y += state.vy;\n"
+        "\n"                       # the closing brace of `if` is gone
+        "}\n"
+        "\n"
+        "function render(state) {\n"
+        "  if (state.alive) {\n"
+        "    draw(state.x, state.y);\n"
+        "  }\n"
+        "}\n"
+        "\n"
+        "module.exports = { update, render };\n",
+    )
+
+
+def _check_broken_brace(workspace: Path, final: str) -> bool:
+    """It parses, and both functions survived.
+
+    The second half matters as much as the first: deleting the broken function
+    also makes the file parse, and is not a fix.
+    """
+    content = _read(workspace, "game.js")
+    if not content or "function update" not in content or "function render" not in content:
+        return False
+    if "module.exports" not in content:
+        return False
+    return content.count("{") == content.count("}")
+
+
+def _seed_many_small_files(workspace: Path) -> None:
+    """Enough files that "review this" has no natural stopping point."""
+    for index in range(12):
+        _write(
+            workspace,
+            f"mod_{index}.py",
+            f'"""Module {index}."""\n\n\ndef step_{index}(value):\n    return value + {index}\n',
+        )
+
+
+def _check_produced_findings(workspace: Path, final: str) -> bool:
+    """It answered, rather than reading until the round budget ran out.
+
+    Deliberately lenient about the prose and strict about the shape: some real
+    answer, naming at least two of the things it looked at, and nothing written
+    - a review is not an edit.
+    """
+    if len(final.strip()) < 80:
+        return False
+    named = sum(1 for index in range(12) if f"mod_{index}" in final or f"step_{index}" in final)
+    if named < 2:
+        return False
+    for index in range(12):
+        expected = f'"""Module {index}."""'
+        if expected not in _read(workspace, f"mod_{index}.py"):
+            return False
+    return True
+
+
+def _seed_multi_part(workspace: Path) -> None:
+    _write(workspace, "app.py", "def handler(request):\n    return {'ok': True}\n")
+    _write(workspace, "README.md", "# Service\n\nOne endpoint.\n")
+
+
+def _check_wrote_the_steps_down(workspace: Path, final: str) -> bool:
+    """A contract exists with more than one item.
+
+    The plan anchor's whole claim is that a job with parts gets written down
+    before it is started, and `contract_create` was offered for weeks without
+    a model ever reaching for it unprompted.
+    """
+    from shamsu.agents.simple_contract import load_contract
+
+    contract = load_contract(workspace)
+    return contract is not None and len(contract.assertions) >= 2
+
+
+DEGENERATE_CASES: tuple[EvalCase, ...] = (
+    EvalCase(
+        name="repairs_a_file_it_cannot_pattern_match",
+        prompt="game.js has a syntax error - a block is not closed. Fix it, keeping both functions.",
+        check=_check_broken_brace,
+        seed=_seed_broken_brace,
+        tags=("repair", "degenerate"),
+    ),
+    EvalCase(
+        name="answers_instead_of_reading_forever",
+        prompt="Review the modules in this project and tell me what they do.",
+        check=_check_produced_findings,
+        seed=_seed_many_small_files,
+        tags=("read-loop", "degenerate"),
+    ),
+    EvalCase(
+        name="writes_the_steps_down_before_starting",
+        prompt=(
+            "Add a /health endpoint to app.py, then document it in README.md, "
+            "then add a test for it in test_app.py."
+        ),
+        check=_check_wrote_the_steps_down,
+        seed=_seed_multi_part,
+        tags=("plan", "degenerate"),
+    ),
+)
+
+
+# Part of the suite, not an optional extra. Held back, they would measure
+# nothing - which is exactly the state the guards were in for three phases.
+SEED_CASES.extend(DEGENERATE_CASES)

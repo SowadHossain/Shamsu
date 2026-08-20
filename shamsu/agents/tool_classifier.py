@@ -81,7 +81,8 @@ def _signals(*pairs: tuple[str, float]) -> tuple[Signal, ...]:
 
 
 # These are `simple_router.TOOL_CATEGORIES`, not smallcode's eight: their
-# `code_intel` lives inside our `search`, we have no web tools wired, and their
+# `code_intel` lives inside our `search`, our `web` family is gated on a
+# reachability probe rather than always present, and their
 # `respond` has no equivalent. Keeping the two lists identical is what makes a
 # category a usable answer from `select_category` as well as from this scorer.
 CATEGORY_SIGNALS: dict[str, tuple[Signal, ...]] = {
@@ -125,6 +126,14 @@ CATEGORY_SIGNALS: dict[str, tuple[Signal, ...]] = {
         (r"\b(contract|assert|prove|confirm\s+that)\b", 2.0),
         (r"\b(tests?\s+pass|all\s+green|is\s+it\s+done)\b", 2.0),
     ),
+    "web": _signals(
+        (r"\b(look (it|this) up online|search the web|on the internet)\b", 3.0),
+        (r"\b(latest version|release notes|changelog for|docs for|documentation for)\b", 2.5),
+        (r"\b(what does .{0,30}(error|exception) mean)\b", 2.0),
+        # Anything about THIS project is answered from the workspace. Without
+        # this, "search the codebase" would score here.
+        (r"\b(this (project|repo|codebase|workspace)|our code|in the code)\b", -3.0),
+    ),
     "plan": _signals(
         (r"\b(plan|approach|strategy|design|outline the|how should (we|i))\b", 3.0),
         (r"\b(before (you|we) start|first work out|think through|scope)\b", 2.5),
@@ -143,7 +152,7 @@ CATEGORY_SIGNALS: dict[str, tuple[Signal, ...]] = {
 # Ties break toward the category that fails most gracefully. `write` first
 # because a write-shaped request handed read tools cannot act at all, while a
 # read-shaped request handed write tools simply does not use them.
-PRIORITY: tuple[str, ...] = ("write", "read", "search", "run", "plan", "recall", "verify")
+PRIORITY: tuple[str, ...] = ("write", "read", "search", "run", "plan", "recall", "verify", "web")
 
 
 @dataclass(frozen=True)
@@ -222,5 +231,7 @@ def categories_for(message: str) -> tuple[str, ...]:
         # something - a planning turn that can call `write_file` is just a
         # normal turn with a different label.
         "plan": ("plan", "read"),
+        # Paired with `read` so a lookup can still open the file it is about.
+        "web": ("web", "read"),
     }
     return companions.get(verdict.category, (verdict.category,))

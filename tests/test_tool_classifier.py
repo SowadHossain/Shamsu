@@ -227,3 +227,39 @@ def test_a_skill_can_still_be_opened_after_a_category_is_chosen():
             for s in active_tool_schemas(context_window=8192, category=category)
         }
         assert "use_skill" in names, category
+
+
+# --- the web family: built, and gated on a probe rather than on hope ------
+
+
+def test_web_tools_are_withheld_when_nothing_is_listening(tmp_path):
+    """They were built, tested and never offered, because offering a tool that
+    may always fail contradicts "offer only the tools that have something to
+    answer from". Reporting that as a permanent gap was the wrong call: the
+    missing piece was a probe, and every other conditional family has one."""
+    from shamsu.agents.simple_chat import available_tool_families
+
+    assert "web" not in available_tool_families(tmp_path)
+
+
+def test_web_tools_stay_withheld_without_an_explicit_opt_in(tmp_path, monkeypatch):
+    """Reaching the network is a decision a local-first tool must be asked to
+    make. The probe is not even attempted unless SHAMSU_WEB_ENABLED says so."""
+    from shamsu.agents.simple_chat import _web_is_reachable
+
+    monkeypatch.delenv("SHAMSU_WEB_ENABLED", raising=False)
+    assert _web_is_reachable(tmp_path) is False
+
+
+def test_an_unreachable_backend_is_a_normal_answer_not_a_crash(tmp_path, monkeypatch):
+    from shamsu.agents.simple_chat import _web_is_reachable
+
+    monkeypatch.setenv("SHAMSU_WEB_ENABLED", "1")
+    monkeypatch.setenv("SHAMSU_SEARXNG_URL", "http://127.0.0.1:1")
+    assert _web_is_reachable(tmp_path) is False
+
+
+def test_asking_about_this_project_never_routes_to_the_web():
+    """"search the codebase" must not become a web lookup."""
+    for local in ("search this project for parse_config", "what does our code do here"):
+        assert classify_request(local).category != "web", local

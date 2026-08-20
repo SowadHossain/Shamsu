@@ -68,6 +68,12 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
         "description": "Search the code by meaning or pattern, query the code graph",
         "tools": ["search_files", "search_and_read", "graph_search", "explain_symbol"],
     },
+    "web": {
+        "description": "Look something up on the web that this workspace cannot answer",
+        # Withheld entirely unless a backend is reachable and the user opted in,
+        # so this category is empty on a normal local install.
+        "tools": ["web_search", "fetch_url", "read_file"],
+    },
     "run": {
         "description": "Run a shell command, the project, or its tests",
         "tools": ["run_command", "run_tests", "create_and_run"],
