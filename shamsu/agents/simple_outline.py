@@ -86,8 +86,17 @@ def outline(text: str, suffix: str) -> list[Symbol]:
     return []
 
 
-def find_symbol(text: str, suffix: str, name: str) -> Symbol | None:
-    """The declaration called *name*, or ``None``.
+def find_symbols(text: str, suffix: str, name: str) -> list[Symbol]:
+    """EVERY declaration called *name*, in file order.
+
+    Plural because a name can be declared more than once, and the case that
+    matters most is the one where that is the bug. Live 2026-08-21 a 582-line
+    `main.js` held four functions defined twice; asked to remove the
+    duplicates, the model called `read_symbol` for one of them, was handed the
+    FIRST definition with no hint that a second existed, and fell back to
+    hunting the file with overlapping line ranges - eleven to thirteen reads
+    per turn. A tool that cannot express "show me both" cannot be used for the
+    task.
 
     Matched leniently on purpose: a model asks for `render`, `Game.render` and
     `def render` for the same thing, and refusing two of the three would spend a
@@ -95,21 +104,30 @@ def find_symbol(text: str, suffix: str, name: str) -> Symbol | None:
     """
     wanted = (name or "").strip().strip("()").replace("()", "")
     if not wanted:
-        return None
+        return []
+    # `handleMouseMove(event)` - the heading an outline shows, signature and all.
+    wanted = wanted.split("(", 1)[0].strip() or wanted
     symbols = outline(text, suffix)
     tail = wanted.rsplit(".", 1)[-1].lower()
     exact = [s for s in symbols if s.name.lower() == wanted.lower()]
     if exact:
-        return exact[0]
+        return exact
     # `Game.render` when the outline holds the method as plain `render`, and the
     # reverse - a bare `render` when the outline qualified it.
-    qualified = [
+    return [
         s for s in symbols
         if s.name.lower() == tail or s.name.lower().endswith("." + tail)
     ]
-    if qualified:
-        return qualified[0]
-    return None
+
+
+def find_symbol(text: str, suffix: str, name: str) -> Symbol | None:
+    """The FIRST declaration called *name*, or ``None``.
+
+    Kept for the callers that genuinely want one - `replace_symbol` edits a
+    single range. See `find_symbols` for why the plural exists.
+    """
+    found = find_symbols(text, suffix, name)
+    return found[0] if found else None
 
 
 def render_outline(relative: str, text: str, suffix: str) -> str:

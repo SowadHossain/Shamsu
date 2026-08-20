@@ -56,6 +56,7 @@ from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_outline import (
     can_outline,
     find_symbol,
+    find_symbols,
     outline,
     render_outline,
 )
@@ -1717,6 +1718,30 @@ _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
     },
 }
 
+# The contract tools take `assertion_id`, and across four live runs on
+# qwen3.5:9b the model called them 23 times without ever using that name.
+# Seventeen of those carried the RIGHT id under a different key:
+#
+#     7x  assertion_index='a01'      6x  contract_id=...      2x  claim=...
+#     1x  claim_id=...               1x  assertion='a01.1'
+#
+# Every one was refused with "No such assertion", and those refusals were the
+# single largest waste in the roster - more rounds than every other failure
+# combined, 7 of 24 in one run. This is the `search_files` defect again, where
+# the schema said `pattern` and the implementation read `query`: a name the
+# model reaches for and the code does not answer to.
+_ASSERTION_ID_ALIASES = {
+    name: "assertion_id"
+    for name in (
+        "assertion_id", "assertion_index", "assertion", "assertion_number",
+        "contract_id", "claim", "claim_id", "id", "index", "number", "item",
+    )
+}
+for _contract_tool_name in (
+    "contract_assert_pass", "contract_assert_fail", "contract_assert_skip",
+):
+    _TOOL_ARG_ALIASES[_contract_tool_name] = dict(_ASSERTION_ID_ALIASES)
+
 
 def normalize_arguments(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Accept the near-miss argument names small models produce.
@@ -2161,6 +2186,12 @@ class SimpleChatLoop:
         # Line ranges seen per file, so reading a big file IN PIECES still
         # adds up to having seen it.
         self._seen_ranges: dict[str, list[tuple[int, int]]] = {}
+        # Ranges actually SENT to the model, per file - kept apart from
+        # `_seen_ranges` above, which answers a different question and clears
+        # itself once a file has been covered in pieces. This one only ever
+        # grows within a turn, and is emptied by an elision sweep, because a
+        # payload that has been elided is one the model no longer has.
+        self._ranges_sent: dict[str, list[tuple[int, int]]] = {}
         # Stalls that must OUTLIVE this object. A fresh SimpleChatLoop is built
         # per user message, so anything tracking "the model is repeating itself"
         # has to be keyed by the conversation or it resets whenever the user
@@ -3761,6 +3792,7 @@ class SimpleChatLoop:
                     # just evicted. Forgetting here keeps "unchanged since you
                     # last read it" from ever being a lie.
                     self._read_digests.clear()
+                    self._ranges_sent.clear()
             if name in WRITING_TOOLS:
                 if result.ok:
                     # The world moved. A patch that could not match before may
@@ -4258,6 +4290,10 @@ class SimpleChatLoop:
                 f"There is no tool called {name}.{suggestion}",
                 {"unknown_tool": name, "closest": close},
             )
+        if name == "read_file":
+            already = self._already_sent_this_range(arguments)
+            if already is not None:
+                return already
         if name in {"patch_file", "read_and_patch"}:
             arguments = _strip_line_numbers(arguments)
         if name == "write_file":
@@ -4283,6 +4319,7 @@ class SimpleChatLoop:
             result = self._note_unchanged_since_last_read(arguments, result)
             result = self._number_the_lines(arguments, result)
             self._note_partial_read(arguments, result)
+            self._record_range_sent(arguments, result)
         if before is not None and result.ok:
             erased = self._erased_a_definition(name, arguments, before)
             if erased is not None:
@@ -4878,12 +4915,44 @@ class SimpleChatLoop:
         if name == "contract_status":
             return ToolResult(True, contract.render(), {"done": contract.done})
 
-        item = contract.find(str(arguments.get("assertion_id") or arguments.get("id") or ""))
+        wanted = str(arguments.get("assertion_id") or arguments.get("id") or "").strip()
+        item = contract.find(wanted)
+        if item is None and not wanted and len(contract.blockers) == 1:
+            # The model sent evidence and no id. Measured across four live runs
+            # on qwen3.5:9b this was the single most-failing call in the whole
+            # roster - 23 refusals, more than every other tool combined - and
+            # every one of them carried real evidence for the only thing left
+            # to check. Refusing that is the harness insisting on a label while
+            # the model hands it the answer.
+            #
+            # Only when exactly ONE is unresolved, because then there is nothing
+            # to guess between. With several, the id genuinely matters and the
+            # error below says so.
+            item = contract.blockers[0]
+        if item is None and wanted:
+            # An id that matched nothing, but the TEXT of an assertion might.
+            # A model that quotes the assertion instead of naming it has still
+            # said which one unambiguously.
+            lowered = wanted.lower()
+            matches = [
+                entry for entry in contract.assertions
+                if lowered in entry.text.lower() or entry.text.lower() in lowered
+            ]
+            if len(matches) == 1:
+                item = matches[0]
         if item is None:
-            listed = ", ".join(entry.id for entry in contract.assertions)
+            listed = ", ".join(
+                f"{entry.id} ({entry.state})" for entry in contract.assertions
+            )
+            missing = (
+                "You did not send an assertion_id. "
+                if not wanted
+                else f"There is no assertion {wanted!r}. "
+            )
             return ToolResult(
                 False,
-                f"No such assertion. This contract has: {listed}.",
+                f"{missing}This contract has: {listed}. "
+                "Pass the id of the one you are recording.",
                 {"assertions": listed},
             )
         detail = str(
@@ -5107,7 +5176,10 @@ class SimpleChatLoop:
         except OSError as exc:
             return ToolResult(False, f"Could not read {path}: {exc}", {"filepath": path})
         suffix = target.suffix
-        found = find_symbol(text, suffix, wanted)
+        matches = find_symbols(text, suffix, wanted)
+        if len(matches) > 1:
+            return self._every_definition_of(path, text, wanted, matches)
+        found = matches[0] if matches else None
         if found is None:
             # Say what IS there. A bare "not found" costs a round and teaches
             # nothing; the roster is the answer to the question behind the
@@ -5431,6 +5503,105 @@ class SimpleChatLoop:
             f"{result.message}\n\nWhat changed:\n" + "\n".join(shown),
             data,
         )
+
+    def _every_definition_of(
+        self, path: str, text: str, wanted: str, matches: list[Any]
+    ) -> ToolResult:
+        """All of them, when a name is declared more than once.
+
+        Returning only the first is what sent the model hunting. Live
+        2026-08-21 a 582-line `main.js` held four functions defined twice; asked
+        to remove the duplicates, the model fetched one definition, got no hint
+        that another existed, and spent the rest of the turn re-reading
+        overlapping line ranges looking for it.
+
+        Duplicated definitions are usually the BUG - the later one silently
+        wins - so this says so rather than leaving the model to notice.
+        """
+        lines = text.splitlines()
+        blocks = []
+        for index, symbol in enumerate(matches, start=1):
+            body = chr(10).join(lines[symbol.start - 1 : symbol.end])
+            blocks.append(
+                f"--- definition {index} of {len(matches)}: "
+                f"lines {symbol.start}-{symbol.end} ---{chr(10)}{body}"
+            )
+        listed = ", ".join(f"{symbol.start}-{symbol.end}" for symbol in matches)
+        self._activity(f"{wanted} is defined {len(matches)} times in {path}; sent all of them")
+        return ToolResult(
+            True,
+            f"{wanted} is defined {len(matches)} times in {path} (lines {listed}). "
+            "In most languages the LAST one wins, so the earlier definitions are "
+            f"dead - which is usually the bug.{chr(10) * 2}"
+            + (chr(10) * 2).join(blocks)
+            + f"{chr(10) * 2}To remove one, call replace_symbol on {path} with "
+            "empty content - it deletes the first definition. To change one, "
+            "patch_file against the exact text above.",
+            {
+                "filepath": path,
+                "resolved_filepath": path,
+                "symbol": wanted,
+                "definitions": [
+                    {"start_line": s.start, "end_line": s.end} for s in matches
+                ],
+                "duplicate_definitions": len(matches),
+            },
+        )
+
+    def _already_sent_this_range(self, arguments: dict[str, Any]) -> ToolResult | None:
+        """Answer a re-read from what the model already has, or ``None``.
+
+        The repeated-read guard compares SIGNATURES, so it caught `105-210`
+        asked twice and missed `100-215` against `100-250`. Across four live
+        runs on qwen3.5:9b that gap cost four to six rounds each, re-fetching
+        regions the model had been given minutes earlier at slightly different
+        numbers.
+
+        Returns a note rather than the content. Re-sending it would cost the
+        same tokens the re-read was going to cost, which is the whole thing
+        being saved - and the note names the exact ranges already sent so the
+        model can find them in its own history rather than guess.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        start, end = arguments.get("start_line"), arguments.get("end_line")
+        if not path or not isinstance(start, int) or not isinstance(end, int):
+            return None
+        seen = self._ranges_sent.get(path.lower())
+        if not seen:
+            return None
+        covered = _covered_fraction((start, end), seen)
+        if covered < RANGE_ALREADY_SEEN_FRACTION:
+            return None
+        listed = ", ".join(f"{low}-{high}" for low, high in sorted(seen)[:6])
+        self._activity(f"{path} lines {start}-{end} were already sent; did not re-read")
+        return ToolResult(
+            True,
+            f"You already have lines {start}-{end} of {path} - "
+            f"{round(covered * 100)}% of that range was in a read earlier this "
+            f"turn. Ranges already sent: {listed}.{chr(10) * 2}"
+            "Use what you have. If you need a part you have NOT seen, ask for "
+            "that range specifically; if you need to change something, make the "
+            "edit now.",
+            {
+                "filepath": path,
+                "resolved_filepath": path,
+                "start_line": start,
+                "end_line": end,
+                "already_sent": True,
+                "content": "",
+            },
+        )
+
+    def _record_range_sent(self, arguments: dict[str, Any], result: ToolResult) -> None:
+        """Remember a range the model has now been given."""
+        data = result.data if isinstance(result.data, dict) else {}
+        if not result.ok or data.get("already_sent"):
+            return
+        path = str(data.get("resolved_filepath") or arguments.get("filepath") or "").strip()
+        start, end = data.get("start_line"), data.get("end_line")
+        if not path or not isinstance(start, int) or not isinstance(end, int):
+            return
+        self._ranges_sent.setdefault(path.lower(), []).append((start, end))
 
     def _note_partial_read(self, arguments: dict[str, Any], result: ToolResult) -> None:
         """Track how much of each file the model has actually seen.
@@ -6441,6 +6612,46 @@ def _changed_nothing(result: ToolResult) -> bool:
         return True
     message = (result.message or "").lower()
     return "nothing to change" in message or "identical" in message
+
+
+#: How much of a NEWLY REQUESTED range must already have been sent before the
+#: read is answered from what the model has rather than re-read.
+#:
+#: Measured from four live runs on qwen3.5:9b, where the same file was read
+#: eleven to thirteen times in one turn at overlapping ranges:
+#:
+#:     t1:  105-210, 105-210, 100-215, 100-250, 105-210, 105-210
+#:     t4:  530-610, 530-610, 520-610, 528-590, 528-590, 520-610
+#:
+#: The existing guard only caught IDENTICAL signatures, so `105-210` twice was
+#: caught and `100-215` against `100-250` was not.
+#:
+#: 90% rather than 100%, because a model re-asking for the same region jitters
+#: its numbers by a few lines and exact containment misses that. Not lower,
+#: because a genuine scroll - extending the window to see what comes next -
+#: overlaps heavily with what came before and must still be answered.
+RANGE_ALREADY_SEEN_FRACTION = 0.90
+
+
+def _covered_fraction(wanted: tuple[int, int], seen: list[tuple[int, int]]) -> float:
+    """How much of *wanted* the union of *seen* already covers, 0.0 to 1.0.
+
+    The denominator is deliberately the NEWLY REQUESTED range, not the union:
+    the question is "does this request ask for anything the model has not been
+    given?", and dividing by the union would let a large earlier read swallow
+    every later one.
+    """
+    start, end = wanted
+    if end < start:
+        return 0.0
+    requested = set(range(start, end + 1))
+    if not requested:
+        return 0.0
+    covered = set()
+    for low, high in seen:
+        if high >= low:
+            covered |= requested & set(range(low, high + 1))
+    return len(covered) / len(requested)
 
 
 def _covers(ranges: list[tuple[int, int]], total_lines: int) -> bool:

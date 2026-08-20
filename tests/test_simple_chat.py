@@ -8810,3 +8810,197 @@ def test_an_indented_definition_counts_as_a_definition(tmp_path):
     after = "function outer() {\n    return 1;\n}\n"
 
     assert "inner" in _symbols_erased(before, after, ".js")
+
+
+# --- the contract, measured against four live runs ----------------------------
+
+
+def test_evidence_for_the_only_unresolved_assertion_lands_without_an_id(tmp_path):
+    """Measured across four live runs on qwen3.5:9b, `contract_assert_pass` was
+    the single most-failing call in the roster - 23 refusals, more than every
+    other tool combined - and every one carried real evidence with no
+    `assertion_id`. Refusing that is the harness insisting on a label while the
+    model hands it the answer."""
+    from shamsu.agents.simple_contract import load_contract, new_contract, save_contract
+
+    save_contract(tmp_path, new_contract("t", "", ["the duplicates are gone"]))
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "contract_assert_pass", {"evidence": "read_file shows one definition each"}
+    )
+
+    assert result.ok, result.message
+    assert load_contract(tmp_path).done
+
+
+def test_several_unresolved_assertions_still_need_an_id(tmp_path):
+    """With more than one left the id genuinely matters - and the error has to
+    say what was actually wrong, which "No such assertion" never did."""
+    from shamsu.agents.simple_contract import new_contract, save_contract
+
+    save_contract(tmp_path, new_contract("t", "", ["a", "b", "c"]))
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("contract_assert_pass", {"evidence": "did something"})
+
+    assert not result.ok
+    assert "did not send an assertion_id" in result.message
+    assert "a01" in result.message and "pending" in result.message
+
+
+def test_quoting_the_assertion_instead_of_naming_it_works(tmp_path):
+    """A model that quotes the assertion has still said which one, unambiguously."""
+    from shamsu.agents.simple_contract import new_contract, save_contract
+
+    save_contract(tmp_path, new_contract("t", "", ["remove the duplicates", "run the tests"]))
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "contract_assert_pass",
+        {"assertion_id": "remove the duplicates", "evidence": "one definition each"},
+    )
+
+    assert result.ok, result.message
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        {"assertion_index": "a01", "evidence": "checked it"},
+        {"contract_id": "a01", "evidence": "checked it"},
+        {"claim": "a01", "evidence": "checked it"},
+        {"claim_id": "a01", "evidence": "checked it"},
+        {"assertion": "a01", "evidence": "checked it"},
+        {"id": "a01", "evidence": "checked it"},
+    ],
+)
+def test_every_name_the_model_reached_for_finds_the_assertion(tmp_path, shape):
+    """Replayed from four live runs on qwen3.5:9b. The contract tools take
+    `assertion_id` and the model never once used that name - 23 calls, of which
+    17 carried the RIGHT id under a different key and were all refused with
+    "No such assertion". That was the largest single waste in the roster.
+
+    Same defect as `search_files`, where the schema said `pattern` and the
+    implementation read `query`: a name the model reaches for that the code
+    does not answer to.
+    """
+    from shamsu.agents.simple_contract import load_contract, new_contract, save_contract
+
+    save_contract(tmp_path, new_contract("t", "", ["the duplicates are gone", "it parses"]))
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "contract_assert_pass", normalize_arguments("contract_assert_pass", shape)
+    )
+
+    assert result.ok, f"{sorted(shape)} -> {result.message}"
+    assert load_contract(tmp_path).find("a01").state == "passed"
+
+
+# --- overlapping re-reads, measured from four live runs -----------------------
+
+
+@pytest.mark.parametrize(
+    ("wanted", "seen", "blocked"),
+    [
+        ((105, 210), [(105, 210)], True),          # exact repeat
+        ((100, 215), [(100, 250)], True),          # wholly inside a bigger read
+        ((528, 590), [(520, 610)], True),          # ditto, from t4
+        ((520, 610), [(530, 610), (528, 590)], True),   # covered by a UNION
+        ((196, 514), [(105, 210)], False),         # genuinely new region
+        ((200, 300), [(100, 250)], False),         # a real scroll forward
+    ],
+)
+def test_only_a_range_the_model_already_has_is_withheld(wanted, seen, blocked):
+    """The old guard compared SIGNATURES, so `105-210` twice was caught and
+    `100-215` against `100-250` was not. Across four live runs on qwen3.5:9b
+    that gap cost four to seven rounds per run.
+
+    90% of the NEWLY REQUESTED range, not of the union: dividing by the union
+    would let one large early read swallow every later one. And a scroll
+    forward - 200-300 after 100-250, 50% covered - must still be answered.
+    """
+    from shamsu.agents.simple_chat import RANGE_ALREADY_SEEN_FRACTION, _covered_fraction
+
+    assert (_covered_fraction(wanted, seen) >= RANGE_ALREADY_SEEN_FRACTION) is blocked
+
+
+def test_a_re_read_of_a_range_already_sent_costs_no_read(tmp_path):
+    (tmp_path / "big.py").write_text(
+        "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    first = loop._execute("read_file", {"filepath": "big.py", "start_line": 100, "end_line": 250})
+    again = loop._execute("read_file", {"filepath": "big.py", "start_line": 105, "end_line": 210})
+
+    assert first.ok and "line_150" in (first.data or {}).get("content", "")
+    assert again.ok, "it must not be an error - the model did nothing wrong"
+    assert (again.data or {}).get("already_sent")
+    assert "already have lines" in again.message
+    assert "100-250" in again.message, "it must name what it already sent"
+    assert not (again.data or {}).get("content"), "re-sending costs the tokens being saved"
+
+
+def test_a_range_it_has_not_seen_is_still_read(tmp_path):
+    (tmp_path / "big.py").write_text(
+        "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    loop._execute("read_file", {"filepath": "big.py", "start_line": 100, "end_line": 250})
+    later = loop._execute("read_file", {"filepath": "big.py", "start_line": 300, "end_line": 380})
+
+    assert not (later.data or {}).get("already_sent")
+    assert "line_350" in (later.data or {}).get("content", "")
+
+
+# --- a name declared more than once -------------------------------------------
+
+
+def test_read_symbol_returns_every_definition_of_a_duplicated_name(tmp_path):
+    """Returning only the first is what sent the model hunting. Live 2026-08-21
+    a 582-line main.js held four functions defined twice; asked to remove the
+    duplicates, the model fetched one definition, got no hint another existed,
+    and spent the rest of the turn re-reading overlapping line ranges."""
+    (tmp_path / "a.js").write_text(
+        "function dupe(a) {\n  return 1;\n}\n\n"
+        "function other() {\n  return 2;\n}\n\n"
+        "function dupe(b) {\n  return 3;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("read_symbol", {"filepath": "a.js", "symbol": "dupe"})
+
+    assert result.ok
+    assert (result.data or {}).get("duplicate_definitions") == 2
+    assert "return 1;" in result.message and "return 3;" in result.message, "both bodies"
+    assert "defined 2 times" in result.message
+    ranges = [(d["start_line"], d["end_line"]) for d in result.data["definitions"]]
+    assert len(ranges) == 2 and ranges[0][0] < ranges[1][0]
+
+
+def test_a_name_declared_once_still_returns_just_its_body(tmp_path):
+    """The plural path must not change the ordinary case."""
+    (tmp_path / "a.js").write_text(
+        "function only() {\n  return 1;\n}\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("read_symbol", {"filepath": "a.js", "symbol": "only"})
+
+    assert result.ok
+    assert (result.data or {}).get("duplicate_definitions") is None
+    assert "defined 2 times" not in result.message
+
+
+def test_a_symbol_asked_for_with_its_signature_is_found(tmp_path):
+    """`handleMouseMove(event)` is the heading the outline prints, so it is what
+    a model copies back."""
+    from shamsu.agents.simple_outline import find_symbols
+
+    text = "function greet(name) {\n  return name;\n}\n"
+
+    assert len(find_symbols(text, ".js", "greet(name)")) == 1
