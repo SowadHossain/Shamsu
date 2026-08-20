@@ -25,7 +25,14 @@ it.**
 Do not re-read a file you have already read. If it has not changed you will be
 told so, and the copy you already have is still correct.
 
-## Changing: patch the part, do not re-emit the file
+## Changing: name the symbol, or patch the part
+
+Replacing a **whole function or class**? `replace_symbol(filepath, symbol,
+content)` - name it and send the new source. You do not have to reproduce its
+old text, and if the result would stop the file parsing you are told so and
+nothing is written.
+
+For a smaller change inside one:
 
 1. Copy the exact text you are replacing out of a `read_symbol` or `read_file`
    result. Copy it character for character - do not retype it from memory.
@@ -53,6 +60,10 @@ unfinished line is not, and will be refused.
 
 ## Finishing
 
+- On a job with several parts, `contract_create` at the START: write down what
+  done means as checkable claims. Then `contract_assert_pass` each one with the
+  evidence. You cannot report the task finished while a claim is unchecked, and
+  that is the point - it stops a half-finished job reading as a done one.
 - `run_tests` after the change - it finds the project's test command itself.
 - If there are no tests, run the file or the build.
 - Say what you changed and what you checked. Report a failure as a failure.

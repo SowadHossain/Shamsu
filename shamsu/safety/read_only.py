@@ -47,6 +47,26 @@ _CARVE_OUT_RE = re.compile(
     r"\b(?:other|else|remaining|rest\s+of|besides|except|outside)\b", re.IGNORECASE
 )
 
+# What "read only" is READING, when the two words are a verb and an adverb
+# rather than the name of a mode.
+#
+# Live 2026-08-20: "Fix the file part by part: read the skeleton first, **read
+# only the functions you need**, then fix the issues" was classified read-only,
+# so a run that fixed a real bug and left the tests better than it found them
+# reported `contract violation: prompt forbade file changes but 2 changed`. The
+# sentence asks the model to read SELECTIVELY - it is the opposite of a refusal
+# to write, and it is exactly the phrasing the outline-first read path invites.
+#
+# The hyphenated and closed forms stay unconditional: "read-only" and "readonly"
+# are only ever the mode. Only the spaced form has to prove it is not governing
+# an object.
+_READ_OBJECT = (
+    r"(?:the|that|this|these|those|what|whatever|which|a|an|any|some|each|"
+    r"its|their|your|my|our|his|her|first|last|one|two|three|"
+    r"lines?|files?|functions?|methods?|classes|parts?|sections?|symbols?|"
+    r"code|source|tests?|docs?|enough)\b"
+)
+
 # NOTE: "dry run only" is deliberately NOT here. A dry run is "plan the change
 # but don't apply it" - the opposite of a read-only refusal, which blocks the
 # write outright. When both fired, read-only won and the tool refused before the
@@ -55,7 +75,9 @@ _CARVE_OUT_RE = re.compile(
 READ_ONLY_RE = re.compile(
     rf"\b{_FORBID}\s+{_CHANGE_VERB}\s+{_TARGET}\b"
     rf"|\bwithout\s+{_CHANGE_GERUND}\s+{_TARGET}\b"
-    rf"|\b(?:read[\s-]?only|no\s+file\s+changes?|don'?t\s+save\s+anything)\b"
+    rf"|\b(?:read-only|readonly)\b"
+    rf"|\bread\s+only\b(?!\s+{_READ_OBJECT})"
+    rf"|\b(?:no\s+file\s+changes?|don'?t\s+save\s+anything)\b"
     rf"|\bleave\s+(?:the\s+)?(?:files?|code|workspace)\s+(?:alone|untouched|unchanged)\b",
     re.IGNORECASE,
 )

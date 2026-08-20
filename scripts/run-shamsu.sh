@@ -15,7 +15,35 @@ elif [[ -x "${VENV_PYTHON_WIN}" ]]; then
   VENV_PYTHON="${VENV_PYTHON_WIN}"
   USES_WINDOWS_PYTHON=1
 else
-  echo "Local .venv not found. Run scripts/install.sh from the SHAMSU repo first." >&2
+  VENV_PYTHON=""
+fi
+
+# `python` EXISTING is not the same as the environment working. Live 2026-08-20
+# `.venv/pyvenv.cfg` was gone - removed with a whole alphabetical block of
+# site-packages, the signature of an antivirus quarantine - while the
+# interpreter was still on disk. The old check passed, the launcher ran it
+# anyway, and the user got `failed to locate pyvenv.cfg` with no idea what to
+# do. The one question worth asking is whether the environment can import
+# SHAMSU, so ask that.
+VENV_BROKEN=""
+if [[ -z "${VENV_PYTHON}" ]]; then
+  VENV_BROKEN="there is no .venv in ${REPO_ROOT}"
+elif [[ ! -f "${REPO_ROOT}/.venv/pyvenv.cfg" ]]; then
+  VENV_BROKEN="the .venv is missing pyvenv.cfg, so it is no longer a usable environment"
+elif ! "${VENV_PYTHON}" -c "import shamsu" >/dev/null 2>&1; then
+  VENV_BROKEN="the .venv cannot import SHAMSU"
+fi
+
+if [[ -n "${VENV_BROKEN}" ]]; then
+  {
+    echo "SHAMSU cannot start: ${VENV_BROKEN}."
+    echo
+    echo "Repair it by running the installer again from the repo:"
+    echo "  ${REPO_ROOT}/scripts/install.sh"
+    echo
+    echo "It will rebuild the environment in place. If this keeps happening, check"
+    echo "whether antivirus is quarantining files under ${REPO_ROOT}/.venv."
+  } >&2
   exit 1
 fi
 

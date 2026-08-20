@@ -49,6 +49,7 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
         "tools": [
             "write_file",
             "patch_file",
+            "replace_symbol",
             "append_file",
             "read_and_patch",
             "create_and_run",
@@ -61,6 +62,17 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
     "run": {
         "description": "Run a shell command, the project, or its tests",
         "tools": ["run_command", "run_tests", "create_and_run"],
+    },
+    "verify": {
+        "description": "Write down what done means, and check it off",
+        "tools": [
+            "contract_create",
+            "contract_status",
+            "contract_assert_pass",
+            "contract_assert_fail",
+            "contract_assert_skip",
+            "run_tests",
+        ],
     },
     "recall": {
         "description": "Remember or look up project knowledge, and search this conversation",

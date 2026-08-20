@@ -91,7 +91,9 @@ def _grounding_of(call: dict) -> str:
 _NON_REGISTRY_TOOLS = frozenset({
     "memory_remember", "memory_load", "memory_list", "memory_forget",
     "graph_search", "explain_symbol", "history_search", "append_file",
-    "find_files", "read_symbol", "run_tests", "use_skill",
+    "find_files", "read_symbol", "run_tests", "use_skill", "replace_symbol",
+    "contract_create", "contract_status", "contract_assert_pass",
+    "contract_assert_fail", "contract_assert_skip",
     "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
 })
 
@@ -437,7 +439,11 @@ def test_the_system_prompt_is_small_and_carries_no_prohibitions(tmp_path):
     that stops to ask after one section spends the user's turn on a question
     they already answered (live 2026-08-20). 520 when the skill index landed -
     a skill the model cannot see is one it will never load, and the roster is
-    the only thing that makes `use_skill` reachable.
+    the only thing that makes `use_skill` reachable. It grows by ~14 tokens per
+    bundled skill, so the ceiling has headroom for a few more rather than
+    tracking the roster exactly. 640 when `symbols` and `done` landed - a
+    capability not named here is one a small model will not use, which is the
+    single most expensive thing this prompt can get wrong.
 
     The size was never the real guard anyway; the three assertions below are.
     A prompt can be short and still be a wall of prohibitions, and that is the
@@ -449,7 +455,7 @@ def test_the_system_prompt_is_small_and_carries_no_prohibitions(tmp_path):
 
     prompt = simple_system_prompt(tmp_path)
 
-    assert count_tokens(prompt) < 520
+    assert count_tokens(prompt) < 640
     assert not re.search(r"(?im)^\s*[-*]\s", prompt), "no bullet wall"
     lowered = prompt.lower()
     assert "do not" not in lowered
@@ -2212,6 +2218,15 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 "read_symbol": {"filepath": "hello.py", "symbol": "greet"},
                 "run_tests": {"test_filter": "nothing_matches_this"},
                 "use_skill": {"name": "developer"},
+                # Ordered so the contract exists before anything asserts on it -
+                # `SIMPLE_TOOL_SCHEMAS` lists create first.
+                "contract_create": {"title": "probe", "assertions": ["it runs"]},
+                "contract_status": {},
+                "contract_assert_pass": {"assertion_id": "a01", "evidence": "ran it"},
+                "contract_assert_fail": {"assertion_id": "a01", "evidence": "broke"},
+                "contract_assert_skip": {"assertion_id": "a01", "reason": "n/a"},
+                "replace_symbol": {"filepath": "hello.py", "symbol": "greet",
+                                   "content": "def greet():" + chr(10) + "    return 2"},
                 "find_and_read": {"pattern": "**/*.py"},
                 "search_and_read": {"query": "value"},
                 "read_and_patch": {"filepath": "hello.py", "old_string": "value",
@@ -7275,3 +7290,535 @@ def test_the_developer_skill_agrees_with_the_shipped_write_path(tmp_path):
     assert "COMPLETE file content" not in body
     assert "60 lines" in body
     assert "patch_file" in body
+
+
+# --- symbol-aware editing ---------------------------------------------------
+#
+# The move `patch_file` could never make cheaply. Replacing a whole function
+# with `old_string` means reproducing every line of the OLD one exactly - and a
+# model that can write the new function correctly will still fail to retype the
+# old one, which is the failure the patch error message spends its whole body
+# trying to correct.
+
+
+def _class_file() -> str:
+    return chr(10).join([
+        "import os",
+        "",
+        "",
+        "class Game:",
+        "    def render(self):",
+        "        return 1",
+        "",
+        "    def update(self):",
+        "        return 2",
+        "",
+    ])
+
+
+def test_replace_symbol_swaps_one_function_without_matching_its_old_text(tmp_path):
+    (tmp_path / "game.py").write_text(_class_file(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="game.py", symbol="Game.render",
+               content="    def render(self):" + chr(10) + "        return 99"),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("make render return 99"))
+
+    body = (tmp_path / "game.py").read_text(encoding="utf-8")
+    assert "return 99" in body
+    assert "return 2" in body, "the neighbouring method must be untouched"
+    assert "import os" in body
+
+
+def test_replace_symbol_indents_a_method_the_model_sent_flat(tmp_path):
+    """A small model asked for "the new render" hands back a function at column
+    zero far more often than not. Without this the replacement is wrong in a way
+    it did not intend and cannot see."""
+    (tmp_path / "game.py").write_text(_class_file(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="game.py", symbol="render",
+               content="def render(self):" + chr(10) + "    return 99"),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("make render return 99"))
+
+    body = (tmp_path / "game.py").read_text(encoding="utf-8")
+    assert "    def render(self):" in body
+    import ast
+
+    ast.parse(body)
+
+
+def test_replace_symbol_refuses_an_edit_that_would_break_a_working_file(tmp_path):
+    """The check `patch_file` cannot make and this one can: `replace_symbol`
+    produces a COMPLETE file, so the whole-file question is available honestly
+    instead of being guessed at from a fragment."""
+    (tmp_path / "game.py").write_text(_class_file(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="game.py", symbol="render",
+               content="    def render(self:" + chr(10) + "        return ("),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("break render"))
+
+    assert (tmp_path / "game.py").read_text(encoding="utf-8") == _class_file()
+    said = [m.content for m in loop.state.all_messages if m.name == "replace_symbol"][0]
+    assert "NOT APPLIED" in said
+
+
+def test_replace_symbol_still_repairs_a_file_that_was_already_broken(tmp_path):
+    """Refusing to touch an unparseable file would lock the model out of exactly
+    the fix it was asked for."""
+    (tmp_path / "broken.py").write_text(
+        "def one():" + chr(10) + "    return (" + chr(10), encoding="utf-8"
+    )
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="broken.py", symbol="one",
+               content="def one():" + chr(10) + "    return 1"),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("fix one"))
+
+    assert "return 1" in (tmp_path / "broken.py").read_text(encoding="utf-8")
+
+
+def test_replace_symbol_names_what_is_there_when_the_symbol_is_wrong(tmp_path):
+    (tmp_path / "game.py").write_text(_class_file(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="game.py", symbol="nope", content="x = 1"),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("replace nope"))
+
+    said = [m.content for m in loop.state.all_messages if m.name == "replace_symbol"][0]
+    assert "Game.render" in said
+
+
+def test_replace_symbol_obeys_the_write_cap(tmp_path):
+    """It carries a payload, so both walls apply to it like any other writer."""
+    from shamsu.agents.simple_chat import WRITING_TOOLS
+
+    assert "replace_symbol" in WRITING_TOOLS
+
+
+# --- the Definition of Done -------------------------------------------------
+#
+# The failure: the model stops before the work is finished and says something
+# that reads like success. "Do not claim complete" has been in this project's
+# prompts four separate times and is measurably not the fix. A contract moves
+# the claim out of PROSE and into STATE.
+
+
+def _contracted(tmp_path, turns, **kwargs):
+    return _loop(tmp_path, turns, verify_changes=False, **kwargs)
+
+
+def test_a_contract_records_what_done_means(tmp_path):
+    loop = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {
+            "title": "Fix the pause bug",
+            "assertions": ["node --check game.js exits 0", "pressing P pauses"],
+        }), _text("noted")],
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("fix the pause bug"))
+
+    from shamsu.agents.simple_contract import load_contract
+
+    contract = load_contract(tmp_path)
+    assert contract is not None
+    assert [item.id for item in contract.assertions] == ["a01", "a02"]
+    assert not contract.done
+
+
+def test_a_contract_outlives_the_turn_that_made_it(tmp_path):
+    """A `SimpleChatLoop` is rebuilt for every user message. A contract held on
+    the object would reset the moment the user typed - which is exactly how the
+    unproductive-edit counter failed to fire for months."""
+    first = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {"title": "T", "assertions": ["it runs"]}),
+         _text("noted")],
+        max_rounds=2,
+    )
+    asyncio.run(first.run("start"))
+
+    second = _contracted(tmp_path, [_named_tool("contract_status", {}), _text("ok")], max_rounds=2)
+    asyncio.run(second.run("where are we"))
+
+    said = [m.content for m in second.state.all_messages if m.name == "contract_status"][0]
+    assert "it runs" in said
+
+
+def test_claiming_done_with_assertions_open_is_sent_back(tmp_path):
+    """The guard fires at the moment of the claim and names the exact next call."""
+    loop = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {"title": "T", "assertions": ["the tests pass"]}),
+         _text("All done! The task is complete."),
+         _text("Actually let me check.")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("do the thing"))
+
+    nudges = [
+        m.content for m in loop.state.all_messages
+        if m.role == "user" and "nobody has checked" in m.content
+    ]
+    assert nudges, "a premature done claim went through"
+    assert "contract_assert_pass" in nudges[0]
+    assert "the tests pass" in nudges[0]
+
+
+def test_a_resolved_contract_lets_the_claim_through(tmp_path):
+    loop = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {"title": "T", "assertions": ["the tests pass"]}),
+         _named_tool("contract_assert_pass",
+                     {"assertion_id": "a01", "evidence": "pytest: 12 passed"}),
+         _text("All done! The task is complete.")],
+        max_rounds=4,
+    )
+
+    result = asyncio.run(loop.run("do the thing"))
+
+    assert "All done" in result.final
+    nudges = [m for m in loop.state.all_messages
+              if m.role == "user" and "nobody has checked" in m.content]
+    assert not nudges
+
+
+def test_a_failed_assertion_counts_as_resolved(tmp_path):
+    """Resolved means the model looked and said what it found. Blocking on a
+    failure would leave it unable to REPORT a failure."""
+    loop = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {"title": "T", "assertions": ["the tests pass"]}),
+         _named_tool("contract_assert_fail",
+                     {"assertion_id": "a01", "evidence": "3 tests still red"}),
+         _text("The task is complete - but the tests are red.")],
+        max_rounds=4,
+    )
+
+    result = asyncio.run(loop.run("do the thing"))
+
+    assert "tests are red" in result.final
+
+
+def test_passing_an_assertion_needs_evidence(tmp_path):
+    """An assertion marked passed with no evidence is the claim this whole
+    thing exists to stop."""
+    loop = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {"title": "T", "assertions": ["the tests pass"]}),
+         _named_tool("contract_assert_pass", {"assertion_id": "a01"}),
+         _text("ok")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("do the thing"))
+
+    said = [m.content for m in loop.state.all_messages if m.name == "contract_assert_pass"][0]
+    assert "needs evidence" in said
+
+
+def test_the_guard_has_an_exit(tmp_path):
+    """A guard the model cannot get past is a deadlock waiting for a user."""
+    from shamsu.agents.simple_chat import MAX_CONTRACT_NUDGES
+
+    turns = [_named_tool("contract_create", {"title": "T", "assertions": ["x"]})]
+    turns += [_text("All done! The task is complete.")] * 8
+    loop = _contracted(tmp_path, turns, max_rounds=10)
+
+    result = asyncio.run(loop.run("do the thing"))
+
+    nudges = [m for m in loop.state.all_messages
+              if m.role == "user" and "nobody has checked" in m.content]
+    assert len(nudges) == MAX_CONTRACT_NUDGES
+    assert "All done" in result.final
+
+
+def test_a_question_is_never_a_done_claim(tmp_path):
+    from shamsu.agents.simple_contract import looks_like_a_done_claim
+
+    assert not looks_like_a_done_claim("Shall I mark the task complete?")
+    assert looks_like_a_done_claim("The task is complete.")
+
+
+def test_an_assertion_id_survives_a_small_model_retyping_it(tmp_path):
+    from shamsu.agents.simple_contract import new_contract
+
+    contract = new_contract("T", "", ["one", "two"])
+
+    assert contract.find("a01") is contract.assertions[0]
+    assert contract.find("a1") is contract.assertions[0]
+    assert contract.find("2") is contract.assertions[1]
+
+
+def test_contracts_can_be_switched_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("SHAMSU_CONTRACT", "0")
+    loop = _contracted(
+        tmp_path,
+        [_named_tool("contract_create", {"title": "T", "assertions": ["x"]}), _text("ok")],
+        max_rounds=2,
+    )
+
+    asyncio.run(loop.run("do the thing"))
+
+    said = [m.content for m in loop.state.all_messages if m.name == "contract_create"][0]
+    assert "switched off" in said
+
+
+# --- a class is a symbol, and a class can be most of a file -----------------
+#
+# Live 2026-08-20, qwen2.5-coder:3b did exactly what it was told - read the
+# outline, then `read_symbol` the class it needed - and got 313 lines back,
+# because `export class Player` spanned lines 34-347. The outline had just saved
+# the window and the very next call spent it.
+
+
+def _big_class(methods: int = 20) -> str:
+    parts = ["export class Player {"]
+    for index in range(methods):
+        parts += [
+            f"  step{index}(dt) {{",
+            f"    this.t += dt * {index};",
+            "    return this.t;",
+            "  }",
+            "",
+        ]
+    parts.append("}")
+    return chr(10).join(parts) + chr(10)
+
+
+def test_read_symbol_on_a_long_class_returns_its_shape_not_its_body(tmp_path):
+    (tmp_path / "player.js").write_text(_big_class(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_symbol", filepath="player.js", symbol="Player"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("show me Player"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_symbol"][0]
+    parsed = json.loads(payload)
+    assert parsed["data"]["outlined"] is True
+    assert "step0(dt)" in parsed["message"] and "step19(dt)" in parsed["message"]
+    assert "this.t += dt" not in parsed["message"], "the bodies must not be sent"
+
+
+def test_read_symbol_on_one_method_still_returns_its_source(tmp_path):
+    """Only a CONTAINER is outlined. A method is the unit of work."""
+    (tmp_path / "player.js").write_text(_big_class(), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_symbol", filepath="player.js", symbol="step7"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("show me step7"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_symbol"][0]
+    assert "this.t += dt * 7" in json.loads(payload)["message"]
+
+
+def test_a_short_class_is_returned_whole(tmp_path):
+    """Outlining a 12-line class would cost a round to save nothing."""
+    (tmp_path / "small.js").write_text(_big_class(2), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("read_symbol", filepath="small.js", symbol="Player"), _text("ok")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("show me Player"))
+
+    payload = [m.content for m in loop.state.all_messages if m.name == "read_symbol"][0]
+    assert "this.t += dt * 0" in json.loads(payload)["message"]
+
+
+# --- an append that breaks a working file is undone (live 2026-08-20) -------
+#
+# qwen2.5-coder:3b was shown a REPLACEMENT for `takeDamage` and appended it to
+# the end of player.js - past the closing brace of the class, so the method
+# landed at top level and node rejected the module. The verifier said so; the
+# model appended the same eleven lines again. The nudge that sent it there was
+# ours: it said "call append_file to add it to the end", which is right for a
+# new section and wrong for a rewrite.
+
+
+def test_an_append_that_breaks_a_working_file_is_rolled_back(tmp_path):
+    """Structural counting cannot catch this - the appended block is perfectly
+    brace-balanced. Only a real parser sees it, which is why the write happens,
+    is judged, and is undone."""
+    good = chr(10).join([
+        "export class Player {",
+        "  takeDamage(n) {",
+        "    this.health -= n;",
+        "  }",
+        "}",
+    ]) + chr(10)
+    (tmp_path / "player.js").write_text(good, encoding="utf-8")
+    (tmp_path / "package.json").write_text('{"type":"module"}', encoding="utf-8")
+    stray = chr(10).join([
+        "",
+        "/** Take a hit. */",
+        "takeDamage(amount) {",
+        "  if (this.invulnerable === 0) {",
+        "    this.health -= amount;",
+        "  }",
+        "}",
+    ]) + chr(10)
+    loop = _loop(
+        tmp_path,
+        [_tool("append_file", filepath="player.js", content=stray), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("fix takeDamage"))
+
+    assert (tmp_path / "player.js").read_text(encoding="utf-8") == good
+    said = [m.content for m in loop.state.all_messages if m.name == "append_file"][0]
+    assert "NOT APPENDED" in said
+    assert "replace_symbol" in said, "the message must name the right move"
+
+
+def test_appending_a_new_section_to_a_complete_file_still_works(tmp_path):
+    """The guard must not stop a file GROWING - that is what append is for."""
+    (tmp_path / "app.js").write_text("export const a = 1;" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("append_file", filepath="app.js",
+               content="export function twice(n) {" + chr(10) + "  return n * 2;" + chr(10) + "}" + chr(10)),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("add twice"))
+
+    assert "twice" in (tmp_path / "app.js").read_text(encoding="utf-8")
+
+
+def test_the_prose_nudge_leads_with_replacing_not_appending(tmp_path):
+    """It said "call append_file to add it to the end", and a model showing a
+    REPLACEMENT took that literally."""
+    (tmp_path / "app.py").write_text("x = 0" + chr(10), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_text(
+            "Here is app.py:" + chr(10) + "```python" + chr(10)
+            + "def one():" + chr(10) + "    return 1" + chr(10)
+            + "def two():" + chr(10) + "    return 2" + chr(10) + "```"
+        ), _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("write app.py"))
+
+    nudge = [m.content for m in loop.state.all_messages
+             if m.role == "user" and "did not change the file" in m.content][0]
+    assert nudge.index("replace_symbol") < nudge.index("append_file")
+    assert "only if it belongs at the END" in nudge
+
+
+def test_replace_symbol_refuses_to_gut_a_class(tmp_path):
+    """Live 2026-08-20: qwen2.5-coder:3b replaced the whole 314-line `Player`
+    class with 45 lines. The file still PARSED - so the parse check passed - and
+    22 methods plus the `export` keyword were simply gone. Parsing is not the
+    same as keeping the code."""
+    (tmp_path / "player.js").write_text(_big_class(10), encoding="utf-8")
+    original = (tmp_path / "player.js").read_text(encoding="utf-8")
+    sketch = chr(10).join([
+        "export class Player {",
+        "  step0(dt) {",
+        "    return 0;",
+        "  }",
+        "}",
+    ])
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="player.js", symbol="Player", content=sketch),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("rewrite Player"))
+
+    assert (tmp_path / "player.js").read_text(encoding="utf-8") == original
+    said = [m.content for m in loop.state.all_messages if m.name == "replace_symbol"][0]
+    assert "would delete" in said
+    assert "step5" in said, "it must name what would be lost"
+    assert "replace_symbol on that member" in said, "and name the right move"
+
+
+def test_replacing_a_whole_class_is_allowed_when_nothing_is_lost(tmp_path):
+    """The guard is about LOSS, not about size. A genuine full rewrite that
+    keeps every member goes through."""
+    (tmp_path / "player.js").write_text(_big_class(3), encoding="utf-8")
+    full = chr(10).join(
+        ["export class Player {"]
+        + [f"  step{i}(dt) {{" + chr(10) + f"    return {i} * 2;" + chr(10) + "  }" for i in range(3)]
+        + ["}"]
+    )
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="player.js", symbol="Player", content=full),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("rewrite Player"))
+
+    assert "* 2" in (tmp_path / "player.js").read_text(encoding="utf-8")
+
+
+def test_replacing_one_method_with_a_shorter_one_is_ordinary_work(tmp_path):
+    """Only a container with members is guarded - shrinking a function is fine."""
+    (tmp_path / "player.js").write_text(_big_class(3), encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("replace_symbol", filepath="player.js", symbol="step1",
+               content="  step1(dt) { return 1; }"),
+         _text("done")],
+        max_rounds=2,
+        verify_changes=False,
+    )
+
+    asyncio.run(loop.run("shorten step1"))
+
+    body = (tmp_path / "player.js").read_text(encoding="utf-8")
+    assert "step1(dt) { return 1; }" in body
+    assert "step2" in body

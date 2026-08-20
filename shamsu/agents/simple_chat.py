@@ -454,6 +454,17 @@ WRITE_LINES_GUIDANCE = 60
 # round to save nothing.
 OUTLINE_OVER_LINES = 200
 
+# The same rule applied to ONE symbol. A class is a symbol, and a class can be
+# most of a file: live 2026-08-20 on qwen2.5-coder:3b, the model did exactly what
+# it was told - read the outline, then `read_symbol` the class it needed - and
+# got 313 lines back, because `export class Player` spans lines 34-347. The
+# outline had just saved the window and the very next call spent it.
+#
+# So a container symbol answers the way the file does: its shape, and the ranges
+# to fetch the parts. Lower than the file threshold because a symbol this long is
+# already a container rather than a unit of work.
+OUTLINE_SYMBOL_OVER_LINES = 80
+
 # The gutter `read_file` puts in front of every line, smallcode's shape
 # (`bin/executor.js:110`). Line numbers are what make the follow-up call
 # possible: "patch line 412" and "read_file(start_line=400)" are both guesses
@@ -525,6 +536,18 @@ SIMPLE_TOOLS: dict[str, str] = {
     # line); the body is fetched only when the model asks, so a dozen skills
     # cost a dozen lines of window instead of a dozen documents.
     "use_skill": "use_skill",
+    # Symbol-aware editing: "replace Game.render" instead of matching a snippet
+    # by hand. The range comes from the same parse `read_symbol` uses, so the
+    # thing being replaced is exactly the thing the model was shown.
+    "replace_symbol": "replace_symbol",
+    # Definition of Done. The point is to move a claim of completion out of
+    # PROSE and into STATE: "done" stops being a sentence to believe and becomes
+    # a set of assertions that are resolved or are not.
+    "contract_create": "contract_create",
+    "contract_status": "contract_status",
+    "contract_assert_pass": "contract_assert_pass",
+    "contract_assert_fail": "contract_assert_fail",
+    "contract_assert_skip": "contract_assert_skip",
     # Stage 1 of two-stage routing. Never offered alongside the real tools -
     # `active_tool_schemas` sends this OR them, never both.
     "select_category": "select_category",
@@ -621,6 +644,127 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["filepath", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "contract_create",
+            "description": (
+                "Write down what DONE means for this task, as a list of checkable "
+                "assertions. Use it at the start of a job with more than one part - you "
+                "cannot report the task finished while an assertion is unchecked."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short name for the task."},
+                    "brief": {"type": "string", "description": "What the task is. Optional."},
+                    "assertions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "One checkable claim each, e.g. 'npm test exits 0' or "
+                            "'/login returns 200'."
+                        ),
+                    },
+                },
+                "required": ["title", "assertions"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "contract_status",
+            "description": (
+                "Show the current contract and which assertions are still unchecked. "
+                "Call this before you say the task is finished."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "contract_assert_pass",
+            "description": (
+                "Record that an assertion holds, with the evidence that shows it - what "
+                "you ran and what it said."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "assertion_id": {"type": "string", "description": "Assertion id, e.g. a01."},
+                    "evidence": {
+                        "type": "string",
+                        "description": "What you ran and what it returned.",
+                    },
+                },
+                "required": ["assertion_id", "evidence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "contract_assert_fail",
+            "description": (
+                "Record that an assertion does NOT hold, with what actually happened. "
+                "Use this when you checked and the answer was bad - not to skip a check."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "assertion_id": {"type": "string", "description": "Assertion id, e.g. a01."},
+                    "evidence": {"type": "string", "description": "What went wrong."},
+                },
+                "required": ["assertion_id", "evidence"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "contract_assert_skip",
+            "description": "Record that an assertion is out of scope, and why.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "assertion_id": {"type": "string", "description": "Assertion id, e.g. a01."},
+                    "reason": {"type": "string", "description": "Why it does not apply."},
+                },
+                "required": ["assertion_id", "reason"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_symbol",
+            "description": (
+                "Replace ONE whole function or class with new source, by name. Use this "
+                "instead of patch_file when you are rewriting a whole function - you do "
+                "not have to match the old text, only name it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {"type": "string", "description": "Path relative to the workspace."},
+                    "symbol": {
+                        "type": "string",
+                        "description": "Function or class name, e.g. render or Game.render.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": (
+                            "The complete new source for it, including its signature line. "
+                            "60 lines / 8KB maximum."
+                        ),
+                    },
+                },
+                "required": ["filepath", "symbol", "content"],
             },
         },
     },
@@ -1089,7 +1233,7 @@ def active_tool_schemas(
     return _without_unavailable_families(schemas, available)
 
 
-MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
+MUTATING_TOOLS = frozenset({"write_file", "patch_file", "replace_symbol"})
 
 # Every call that puts bytes on disk. Wider than MUTATING_TOOLS on purpose:
 # that set drives the no-op and repeated-edit counters, which only make sense
@@ -1098,7 +1242,10 @@ MUTATING_TOOLS = frozenset({"write_file", "patch_file"})
 # `append_file` belongs in it. Live 2026-08-19, `Round 9 append_file -> ok` sits
 # directly above a cut-off notice in the log.
 WRITING_TOOLS = frozenset(
-    {"write_file", "patch_file", "append_file", "read_and_patch", "create_and_run"}
+    {
+        "write_file", "patch_file", "append_file", "read_and_patch",
+        "create_and_run", "replace_symbol",
+    }
 )
 
 # Consecutive writes refused for arriving truncated, before the turn stops.
@@ -1106,6 +1253,10 @@ WRITING_TOOLS = frozenset(
 # window is the wrong shape for this file and spinning proves nothing. Every
 # guard needs an exit, and this is that guard's.
 MAX_TRUNCATED_WRITE_REFUSALS = 3
+
+# How many times a turn may be sent back for claiming done with the contract
+# unresolved. Every guard here needs an exit; this is that guard's.
+MAX_CONTRACT_NUDGES = 2
 
 # Every `name` simple mode itself writes into a transcript. This is the set
 # history is filtered against on rehydration, so it must include names the loop
@@ -1801,6 +1952,10 @@ class SimpleChatLoop:
         changed: list[str] = []
         tool_calls = 0
         prose_nudges = 0
+        # Bounded like every other nudge here. A guard the model cannot get past
+        # is a deadlock waiting for a user to notice, and two rounds is enough
+        # to either check the assertions or say what is blocking them.
+        contract_nudges = 0
         empty_nudges = 0
         promise_nudges = 0
         for round_index in range(self.max_rounds):
@@ -1912,9 +2067,10 @@ class SimpleChatLoop:
                     self.state.append_assistant(text)
                     self.state.append_user(
                         f"You showed the new contents of {described} but did not change the file. "
-                        f"Apply it now: call append_file to add it to the end of {described}, "
-                        "patch_file for one exact replacement, or write_file if it really is "
-                        "the whole file. Do not repeat the code in prose.",
+                        f"Apply it now: replace_symbol if that is a whole function or class, "
+                        f"patch_file for one exact replacement inside {described}, or "
+                        "append_file only if it belongs at the END of the file. Do not "
+                        "repeat the code in prose.",
                         origin=ORIGIN_LOOP,
                     )
                     self._activity(f"described a change to {described} without making it; asked it to apply")
@@ -1961,6 +2117,20 @@ class SimpleChatLoop:
                         tool_calls,
                         changed,
                     )
+                blocked = self._contract_blocks_this_claim(text, contract_nudges)
+                if blocked:
+                    # Not a block and not a rewrite: the sentence stands in the
+                    # history and the model is handed the list of things it has
+                    # not checked. A standing "do not claim complete" has been in
+                    # this project's prompts four times over and never worked;
+                    # this one arrives at the moment of the claim and names the
+                    # exact next call.
+                    contract_nudges += 1
+                    self._repair_attempts += 1
+                    self.state.append_assistant(text)
+                    self.state.append_user(blocked)
+                    self._activity("claimed done with the contract unresolved; asked it to check")
+                    continue
                 if self._hit_the_length_limit():
                     # The model was still speaking when the window ran out.
                     # Keep what it managed to say, but never present it as a
@@ -3380,6 +3550,10 @@ class SimpleChatLoop:
             return self._append_file(arguments)
         if name == "read_symbol":
             return self._read_symbol(arguments)
+        if name == "replace_symbol":
+            return self._replace_symbol(arguments)
+        if name.startswith("contract_"):
+            return self._contract_tool(name, arguments)
         if name == "run_tests":
             return self._run_tests(arguments)
         if name == "use_skill":
@@ -3618,11 +3792,41 @@ class SimpleChatLoop:
             except OSError as exc:
                 return ToolResult(False, f"Could not read {path}: {exc}", {"filepath": path})
         joiner = "" if (not before or before.endswith(chr(10))) else chr(10)
+        healthy = existed and bool(before.strip()) and check_file(target).status != VERIFY_PROBLEM
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(before + joiner + content, encoding="utf-8", newline="")
         except OSError as exc:
             return ToolResult(False, f"Could not write {path}: {exc}", {"filepath": path})
+        broke = self._append_broke_it(target, healthy)
+        if broke:
+            # Put it back. Live 2026-08-20 on qwen2.5-coder:3b, the model was
+            # shown a REPLACEMENT for `takeDamage` and appended it to the end of
+            # the file instead - past the closing brace of the class, so the
+            # method landed at top level and node rejected the whole module. The
+            # verifier said so; the model appended the same eleven lines AGAIN
+            # and broke it a second way.
+            #
+            # Structural counting cannot catch this: the appended block is
+            # perfectly brace-balanced. Only a real parser sees it, and a real
+            # parser needs the file on disk - so the write happens, is judged,
+            # and is rolled back. Silent when the file was ALREADY failing,
+            # because a file being built in sections is failing by design and
+            # refusing to grow it would break chunked writing entirely.
+            try:
+                target.write_text(before, encoding="utf-8", newline="")
+            except OSError:
+                pass
+            return ToolResult(
+                False,
+                f"NOT APPENDED - {path} is back as it was.{chr(10) * 2}"
+                f"Adding that to the END of the file broke it: {broke}{chr(10) * 2}"
+                "If that content REPLACES something already in the file, use "
+                "replace_symbol to name what it replaces, or patch_file with the exact "
+                "old text. append_file only adds to the end, which is right for a new "
+                "section and wrong for a rewrite.",
+                {"filepath": path, "would_break": broke, "rolled_back": True},
+            )
         added = content.count(chr(10)) + 1
         total = (before + joiner + content).count(chr(10)) + 1
         return ToolResult(
@@ -3681,6 +3885,17 @@ class SimpleChatLoop:
             "start_line and end_line for a specific part.",
             data,
         )
+
+    def _contract_blocks_this_claim(self, text: str, already_nudged: int) -> str:
+        """The contract's correction for a premature "done", or ``""``."""
+        if already_nudged >= MAX_CONTRACT_NUDGES:
+            return ""
+        try:
+            from shamsu.agents import simple_contract as contracts
+
+            return contracts.done_guard(contracts.load_contract(self.workspace), text)
+        except Exception:  # noqa: BLE001 - a contract must never end a turn
+            return ""
 
     def _use_skill(self, arguments: dict[str, Any]) -> ToolResult:
         """The body of one skill, by name.
@@ -3831,6 +4046,212 @@ class SimpleChatLoop:
         self._read_digests[key] = digest
         return result
 
+    def _contract_tool(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        """The five Definition-of-Done calls, over one on-disk contract.
+
+        On disk because a `SimpleChatLoop` is rebuilt for every user message: a
+        contract held on the object would reset the moment the user typed, which
+        is precisely how the unproductive-edit counter failed to fire for
+        months. A contract that does not outlive one turn is not a contract.
+        """
+        from shamsu.agents import simple_contract as contracts
+
+        if contracts.contract_disabled():
+            return ToolResult(
+                False, "Contracts are switched off (SHAMSU_CONTRACT=0).", {"disabled": True}
+            )
+        if name == "contract_create":
+            raw = arguments.get("assertions")
+            if isinstance(raw, str):
+                # A small model sends a newline- or comma-separated string about
+                # as often as it sends a list. Both mean the same thing.
+                raw = [part for part in re.split(r"[" + chr(10) + r";]|(?<=[.)])\s*,", raw) if part.strip()]
+            items = [str(item) for item in (raw or []) if str(item).strip()]
+            if not items:
+                return ToolResult(
+                    False,
+                    "contract_create needs at least one assertion - a checkable claim "
+                    "like 'npm test exits 0'.",
+                    {},
+                )
+            contract = contracts.new_contract(
+                str(arguments.get("title") or ""), str(arguments.get("brief") or ""), items
+            )
+            contracts.save_contract(self.workspace, contract)
+            self._activity(f"contract set: {contract.title} ({len(contract.assertions)} assertions)")
+            return ToolResult(True, contract.render(), {"assertions": len(contract.assertions)})
+
+        contract = contracts.load_contract(self.workspace)
+        if contract is None:
+            return ToolResult(
+                False,
+                "There is no contract for this task yet. Call contract_create with what "
+                "done means, then check the assertions off.",
+                {"contract": None},
+            )
+        if name == "contract_status":
+            return ToolResult(True, contract.render(), {"done": contract.done})
+
+        item = contract.find(str(arguments.get("assertion_id") or arguments.get("id") or ""))
+        if item is None:
+            listed = ", ".join(entry.id for entry in contract.assertions)
+            return ToolResult(
+                False,
+                f"No such assertion. This contract has: {listed}.",
+                {"assertions": listed},
+            )
+        detail = str(
+            arguments.get("evidence") or arguments.get("reason") or ""
+        ).strip()
+        if name == "contract_assert_pass":
+            if not detail:
+                return ToolResult(
+                    False,
+                    f"{item.id} needs evidence: what did you run, and what did it say? "
+                    "An assertion marked passed without evidence is the claim this "
+                    "contract exists to stop.",
+                    {"assertion": item.id},
+                )
+            item.state, item.evidence = contracts.PASSED, detail
+        elif name == "contract_assert_fail":
+            item.state, item.evidence = contracts.FAILED, detail or "no detail given"
+        elif name == "contract_assert_skip":
+            if not detail:
+                return ToolResult(
+                    False, f"{item.id} needs a reason to be skipped.", {"assertion": item.id}
+                )
+            item.state, item.evidence = contracts.SKIPPED, detail
+        else:
+            return ToolResult(False, f"There is no tool called {name}.", {})
+        contracts.save_contract(self.workspace, contract)
+        self._activity(f"{item.id} {item.state}: {item.text[:60]}")
+        return ToolResult(True, contract.render(), {"assertion": item.id, "state": item.state})
+
+    def _replace_symbol(self, arguments: dict[str, Any]) -> ToolResult:
+        """Swap one whole function or class for new source, by name.
+
+        The move `patch_file` could never make cheaply. Replacing a whole
+        function with `old_string` means reproducing every line of the old one
+        exactly - and a small model that can write the NEW function correctly
+        will still fail to retype the OLD one, which is the failure the patch
+        error message spends its whole body trying to correct. Naming the symbol
+        removes the retyping entirely.
+
+        The range comes from the same parse `read_symbol` returns, so what is
+        replaced is exactly what the model was shown.
+
+        Two guards, and the second is the one that makes this safe:
+
+        - the replacement is re-indented to the original's column when the model
+          sends a method without its class indentation, which is the mistake a
+          small model makes most often here;
+        - the RESULTING FILE must still parse if the original did. That check is
+          possible here and is not possible for `patch_file` fragments, because
+          this tool produces a complete file rather than a snippet - so it can
+          ask the whole-file question honestly instead of guessing at a
+          fragment.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        wanted = str(arguments.get("symbol") or arguments.get("name") or "").strip()
+        content = arguments.get("content")
+        if not path or not wanted or not isinstance(content, str) or not content.strip():
+            return ToolResult(
+                False, "replace_symbol needs a filepath, a symbol and content.", {}
+            )
+        try:
+            target = self.tools.sandbox.validate(path)
+        except Exception as exc:  # noqa: BLE001 - the sandbox owns this refusal
+            return ToolResult(False, str(exc), {"filepath": path})
+        if not target.is_file():
+            return ToolResult(
+                False, f"Not a file: {path}. Use find_files to locate it.", {"filepath": path}
+            )
+        try:
+            original = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return ToolResult(False, f"Could not read {path}: {exc}", {"filepath": path})
+
+        suffix = target.suffix
+        found = find_symbol(original, suffix, wanted)
+        if found is None:
+            names = [symbol.name for symbol in outline(original, suffix)]
+            return ToolResult(
+                False,
+                _no_such_symbol(path, wanted, names)
+                + " Use patch_file if you meant to change something that is not a whole "
+                "function or class.",
+                {"filepath": path, "symbol": wanted, "available": names[:60]},
+            )
+
+        lines = original.splitlines()
+        replacement, reindented = _match_indentation(
+            lines[found.start - 1], content.rstrip(chr(10))
+        )
+        updated = lines[: found.start - 1] + replacement.split(chr(10)) + lines[found.end :]
+        body = chr(10).join(updated)
+        if original.endswith(chr(10)):
+            body += chr(10)
+        if body == original:
+            return ToolResult(
+                False,
+                f"{found.name} in {path} is already exactly that - nothing changed.",
+                {"filepath": path, "symbol": found.name, "unchanged": True},
+            )
+
+        lost = _members_lost(original, body, suffix, found)
+        if lost:
+            # Live 2026-08-20, qwen2.5-coder:3b replaced the whole 314-line
+            # `Player` class with 45 lines: the file still parsed, so the parse
+            # check passed, and 22 methods plus the `export` keyword were simply
+            # gone. Parsing is not the same as keeping the code.
+            #
+            # The right move was never to replace the class - it was to replace
+            # the ONE method. Saying which members would vanish makes that
+            # obvious in the same round, instead of after a test run that fails
+            # for a reason the model will not connect to this edit.
+            missing = ", ".join(lost[:8]) + (f" (+{len(lost) - 8} more)" if len(lost) > 8 else "")
+            return ToolResult(
+                False,
+                f"NOT APPLIED - {path} is unchanged. Replacing {found.name} with that "
+                f"content would delete {len(lost)} member(s) it still contains: "
+                f"{missing}." + chr(10) * 2
+                + f"If you meant to change one part of {found.name}, call replace_symbol "
+                "on that member by name, or patch_file for a smaller change. To replace "
+                f"the whole of {found.name}, include every member it has.",
+                {"filepath": path, "symbol": found.name, "would_delete": lost},
+            )
+        broke = _breaks_a_working_file(original, body, suffix)
+        if broke:
+            return ToolResult(
+                False,
+                f"NOT APPLIED - {path} is unchanged. Replacing {found.name} with that "
+                f"content would stop the file parsing: {broke}" + chr(10) * 2
+                + "Check the new source is complete and closes every block, then send it "
+                "again.",
+                {"filepath": path, "symbol": found.name, "would_break": broke},
+            )
+        try:
+            target.write_text(body, encoding="utf-8", newline="")
+        except OSError as exc:
+            return ToolResult(False, f"Could not write {path}: {exc}", {"filepath": path})
+
+        note = " (re-indented to match the original)" if reindented else ""
+        was, now = found.lines, replacement.count(chr(10)) + 1
+        result = ToolResult(
+            True,
+            f"Replaced {found.name} in {path}{note}: lines {found.start}-{found.end}, "
+            f"{was} line(s) -> {now}.",
+            {
+                "filepath": path,
+                "resolved_filepath": path,
+                "symbol": found.name,
+                "start_line": found.start,
+                "end_line": found.end,
+                "reindented": reindented,
+            },
+        )
+        return self._with_diff(arguments, original, result)
+
     def _read_symbol(self, arguments: dict[str, Any]) -> ToolResult:
         """One function or class, exactly - the follow-up an outline earns.
 
@@ -3873,12 +4294,44 @@ class SimpleChatLoop:
                     "fetch. Read it with read_file and start_line/end_line.",
                     {"filepath": path, "symbol": wanted},
                 )
-            listed = ", ".join(names[:30])
-            more = f" (+{len(names) - 30} more)" if len(names) > 30 else ""
             return ToolResult(
                 False,
-                f"{path} has no symbol called {wanted!r}. It defines: {listed}{more}.",
+                _no_such_symbol(path, wanted, names),
                 {"filepath": path, "symbol": wanted, "available": names[:60]},
+            )
+        nested = [
+            symbol
+            for symbol in outline(text, suffix)
+            if symbol is not found
+            and symbol.start > found.start
+            and symbol.end <= found.end
+        ]
+        if found.lines > OUTLINE_SYMBOL_OVER_LINES and nested:
+            # A container, not a unit of work. Answer the way the file does.
+            listed = chr(10).join(
+                f"  L{symbol.start}-{symbol.end}  {symbol.signature}"
+                + (f"  - {symbol.purpose}" if symbol.purpose else "")
+                for symbol in nested
+            )
+            self._activity(
+                f"{found.name} is {found.lines} lines; sent its outline instead of its body"
+            )
+            return ToolResult(
+                True,
+                f"{path} lines {found.start}-{found.end}, {found.signature} - "
+                f"{found.lines} lines, so this is its outline rather than its body. "
+                f"It contains {len(nested)} member(s):" + chr(10) + listed + chr(10) * 2
+                + "Call read_symbol again for one of these by name to see its source.",
+                {
+                    "filepath": path,
+                    "resolved_filepath": path,
+                    "symbol": found.name,
+                    "start_line": found.start,
+                    "end_line": found.end,
+                    "outlined": True,
+                    "members": [symbol.name for symbol in nested],
+                    "content_truncated": True,
+                },
             )
         lines = text.splitlines()[found.start - 1 : found.end]
         body = chr(10).join(lines)
@@ -3911,6 +4364,34 @@ class SimpleChatLoop:
                 "content_truncated": capped,
             },
         )
+
+    def _append_broke_it(self, target: Path, was_healthy: bool) -> str:
+        """Did this append stop a file parsing that parsed a moment ago?
+
+        Judged with the same checker the post-write verifier uses, so an append
+        cannot leave behind a state the verifier would immediately call broken.
+        Silent unless the file was healthy BEFORE - a file part-way through
+        being built in sections is unparseable by design, and refusing to grow
+        it would break the very strategy the write cap asks for.
+        """
+        if not was_healthy:
+            return ""
+        verdict = check_file(target)
+        if verdict.status != VERIFY_PROBLEM:
+            return ""
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        if unfinished_blocks(text, target.suffix):
+            # Open blocks and nothing else: this is a first section, not damage.
+            # Appending `function f() {` to a complete file makes it stop
+            # parsing and that is EXPECTED - it is how a section gets built. The
+            # damage this guard is for looks different: the player.js corruption
+            # was perfectly brace-balanced and still nonsense, which is why the
+            # question has to be "is anything OPEN?" and not "does it parse?".
+            return ""
+        return verdict.detail or "it no longer parses"
 
     def _find_files(self, arguments: dict[str, Any]) -> ToolResult:
         """Files matching a glob. `list_files` shows one directory; this hunts."""
@@ -4793,6 +5274,107 @@ def _gist(description: str, limit: int = 58) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _no_such_symbol(path: str, wanted: str, names: list[str]) -> str:
+    """Say what IS there - nearest first, and never as an undifferentiated wall.
+
+    Live 2026-08-20 on qwen2.5-coder:3b, the model asked for `initializePlayer`,
+    `updatePlayerState` and `renderPlayer` in three consecutive calls. None
+    existed. Each time it was handed all thirty symbols in the file in one line,
+    which is a list to skim rather than an answer to act on, and it invented a
+    fourth name rather than picking from it.
+
+    A ranked suggestion is the answer to the question actually being asked -
+    *what is this thing called here?* - and the full roster stays available
+    underneath it for the case where nothing is close.
+    """
+    import difflib
+
+    if not names:
+        return (
+            f"{path} has no symbols this can parse, so there is nothing to fetch by "
+            "name. Read it with read_file and start_line/end_line."
+        )
+    bare = wanted.rsplit(".", 1)[-1]
+    close = difflib.get_close_matches(bare, [n.rsplit(".", 1)[-1] for n in names], n=3, cutoff=0.6)
+    message = f"{path} has no symbol called {wanted!r}."
+    if close:
+        named = [n for n in names if n.rsplit(".", 1)[-1] in close]
+        message += " Did you mean " + ", ".join(named[:3]) + "?"
+    listed = ", ".join(names[:24])
+    more = f" (+{len(names) - 24} more)" if len(names) > 24 else ""
+    return message + f" It defines: {listed}{more}."
+
+
+def _match_indentation(original_line: str, content: str) -> tuple[str, bool]:
+    """Indent *content* to the column the symbol it replaces sat at.
+
+    A method inside a class starts indented, and a small model asked for "the
+    new render" hands back a function at column zero far more often than not.
+    Without this the replacement is syntactically wrong in a way the model did
+    not intend and cannot see; with it, the obvious answer is also the correct
+    one.
+
+    Only when the original was indented AND the replacement is not - never
+    re-indent content the model already positioned, and never de-indent.
+    Reported in the result rather than done silently.
+    """
+    indent = original_line[: len(original_line) - len(original_line.lstrip())]
+    if not indent:
+        return content, False
+    first = content.split(chr(10), 1)[0]
+    if first[:1] in (" ", chr(9)):
+        return content, False
+    shifted = chr(10).join(
+        (indent + line) if line.strip() else line for line in content.split(chr(10))
+    )
+    return shifted, True
+
+
+def _members_lost(original: str, updated: str, suffix: str, replaced: Any) -> list[str]:
+    """Members of a container symbol that the replacement silently drops.
+
+    Exact rather than a size ratio: the question is not "is this much smaller?"
+    but "is something that was here now gone?", and the names answer it in a
+    form the model can act on.
+
+    Only for a symbol that HAS members. Replacing one function with a shorter
+    function is ordinary work; replacing a class with a sketch of a class is the
+    loss this catches.
+    """
+    from shamsu.agents.simple_outline import outline as _outline
+
+    before = {
+        symbol.name.rsplit(".", 1)[-1]
+        for symbol in _outline(original, suffix)
+        if symbol.start > replaced.start and symbol.end <= replaced.end
+    }
+    if not before:
+        return []
+    after = {symbol.name.rsplit(".", 1)[-1] for symbol in _outline(updated, suffix)}
+    return sorted(before - after)
+
+
+def _breaks_a_working_file(original: str, updated: str, suffix: str) -> str:
+    """Would this edit stop a file parsing that parsed before? The reason, or "".
+
+    The check `patch_file` cannot make and this one can. A patch carries a
+    fragment, and asking whether a fragment closes every block it opens is the
+    question that produced three false refusals on a legitimate JSDoc comment.
+    `replace_symbol` produces a COMPLETE FILE, so the honest whole-file question
+    is available: did it parse before, and does it still?
+
+    Silent when the file was already broken - refusing to repair an unparseable
+    file would lock the model out of exactly the fix it was asked for.
+    """
+    from shamsu.agents.simple_verify import PROBLEM, check_text
+
+    before = check_text(original, suffix)
+    if before.status == PROBLEM:
+        return ""
+    after = check_text(updated, suffix)
+    return after.detail or "it no longer parses" if after.status == PROBLEM else ""
 
 
 def _strip_line_numbers(arguments: dict[str, Any]) -> dict[str, Any]:

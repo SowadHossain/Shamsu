@@ -105,6 +105,8 @@ def section(name: str) -> str:
 def simple_system_prompt(workspace: Path) -> str:
     """Render the simple-mode system prompt for *workspace*."""
     parts = [section(name) for name in ALWAYS]
+    parts.append(section("symbols"))
+    parts.append(section("done"))
     parts.append(section("recall"))
     parts.append(section("big_read"))
     parts.append(section("big_file"))

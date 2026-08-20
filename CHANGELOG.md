@@ -32,7 +32,109 @@ All notable SHAMSU release changes are documented here.
   found stopping mid-construct is asked for ONLY the missing remainder, quoted
   against its own last twelve lines, instead of being resent whole.
 
+### Added (read path, 2026-08-20)
+
+- **Outline-first reading.** `read_file` on a file over 200 lines returns its
+  outline - every class and function, its signature and its exact line range,
+  bodies omitted - instead of the first 24,000 bytes. Head-clipping is what
+  started the dead end in §2: the model patched from what it saw, `old_string`
+  was in the half it never saw, the fuzzy retry missed too, and the whole-file
+  rewrite was refused for being a partial read. Deterministic - Python through
+  `ast`, braced languages through a declaration scan - rather than smallcode's
+  LLM summary of the first 8KB, which derives a 2,000-line file's outline from
+  its first ~200 lines and costs a full generation.
+- **`read_symbol`**, the follow-up an outline earns: one function or class,
+  exactly, from the same parse that produced the outline, so the range cannot
+  drift from what the model was shown.
+- **Line numbers on every read**, smallcode's gutter. `start_line` is arithmetic
+  on a wall of text until the model has seen which line is which. The gutter is
+  stripped back out of `patch_file` arguments, so copying what you were shown is
+  safe.
+- **`run_tests`**, which detects the project's test command (npm script, pytest
+  layout, Cargo, go.mod, Makefile) instead of leaving the model to guess it, and
+  runs it through `run_command` so approval and the risk classifier still apply.
+- **`use_skill` and a skill index in the prompt.** The skill loader, its
+  frontmatter parsing and its override rules all existed and nothing in simple
+  mode had ever called them. Adds a `large-file-surgery` skill for the
+  outline -> symbol -> patch -> verify workflow.
+- **The system prompt is now `agents/prompts/simple_system.md`**, section by
+  section, so the most-edited and least code-like thing in the agent can be read
+  and changed without opening Python. Adds smallcode's acting rule: a model that
+  writes one section and asks "what would you like next?" spends the turn on a
+  question the user already answered.
+
+### Added (symbol editing + Definition of Done, 2026-08-20)
+
+- **`replace_symbol(filepath, symbol, content)`** - replace a whole function or
+  class by NAME. `patch_file` could never do this cheaply: replacing a function
+  means reproducing every line of the old one exactly, and a model that can
+  write the new one will still fail to retype the old one. Three guards, live
+  proven: content is re-indented to the original's column (a small model sends a
+  method at column zero far more often than not); an edit that would stop a
+  working file parsing is refused; and an edit that would silently DELETE
+  members of a container is refused by name.
+- **Definition-of-Done contracts** - `contract_create`, `contract_status`,
+  `contract_assert_pass` / `_fail` / `_skip`, and a done-guard that sends a
+  premature "the task is complete" back with the list of unchecked assertions.
+  Stored on disk, because a `SimpleChatLoop` is rebuilt for every user message
+  and a contract that does not outlive one turn is not a contract. `passed`
+  requires evidence; `failed` counts as resolved, so the model can still REPORT
+  a failure. `SHAMSU_CONTRACT=0` disables it.
+  (Distinct from `verify/contract.py`, which DERIVES a contract from the
+  prompt, and from `verify/dod.py`, which runs registry-declared checks. This
+  one is authored by the model for the task in hand.)
+- `read_symbol` on a container returns ITS outline rather than its body. Live
+  2026-08-20 the model did exactly as told - read the outline, then read_symbol
+  the class it needed - and got 313 lines back, because `export class Player`
+  spanned lines 34-347. The outline had just saved the window and the next call
+  spent it.
+- A missing symbol now suggests the closest matches before listing the roster.
+  The model asked for `initializePlayer`, `updatePlayerState` and `renderPlayer`
+  in three consecutive calls; each time it was handed thirty names in one line
+  and invented a fourth.
+
 ### Fixed
+
+- **An append that breaks a working file is rolled back.** Live 2026-08-20 the
+  model was shown a REPLACEMENT for `takeDamage` and appended it past the
+  closing brace of the class, leaving the module unparseable - then appended the
+  same eleven lines again. Structural counting cannot catch this (the block is
+  perfectly brace-balanced), so the write happens, is judged by the real
+  checker, and is undone. Silent when the file was already unfinished, or the
+  guard would break chunked writing.
+- **The prose nudge no longer leads with `append_file`.** It said "call
+  append_file to add it to the end", and a model showing a replacement took that
+  literally - which is what produced the corruption above. It now leads with
+  `replace_symbol`, then `patch_file`, and offers append only for content that
+  belongs at the end.
+- `read only the functions you need` is no longer classified as read-only MODE.
+  A run that fixed a real bug reported `contract violation: prompt forbade file
+  changes but 2 changed`, because the spaced form matched. `read-only` and
+  `readonly` still match unconditionally; the spaced form now has to prove it is
+  not governing an object.
+
+- **The truncation gate no longer judges a fragment as a file.** It ran on
+  `patch_file.new_string` and refused a legitimate JSDoc block three times with
+  "it ends inside a /* comment opened on line 23", then ended the turn blaming
+  an output limit that had never fired. A patch replaces a region that may start
+  inside one block and end inside another, and an append chunk is unfinished by
+  design. The gate now runs only on `write_file` and `create_and_run`, where the
+  payload really is a whole file; the size cap still applies to all five.
+  smallcode caps payload size and checks nothing else.
+- Reading an unchanged file again says so instead of resending it - eight
+  `read_file js/game.js` calls in one turn were eliding the window to make room
+  for copies of a file that had not changed. Unlike smallcode's version, the
+  memory is dropped whenever an elision sweep runs, so the claim is true
+  whenever it is made.
+- Ranged reads are no longer counted as repeated reads. `_argument_summary`
+  returned the filepath alone, so section 3 of a file read in pieces was
+  answered with "you have already called this" - firing on exactly the strategy
+  the outline now tells the model to use.
+- The stop message after three refused writes names the cause it actually had,
+  instead of blaming the output limit for a content refusal.
+- The bundled `developer` skill said "Default to `write_file` with the COMPLETE
+  file content" - the exact opposite of the 60-line rule the tool enforces. A
+  skill that fights the harness is worse than no skill.
 
 - A file still being built now reports its open blocks as PROGRESS ("3 block(s)
   still open - continue with append_file") instead of as a fault. Verifying

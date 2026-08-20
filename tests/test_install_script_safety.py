@@ -6,6 +6,19 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _code_only(text: str, comment: str = "#") -> str:
+    """The script with its comment lines removed.
+
+    Several of these tests assert that a broken pattern is ABSENT, and the fix
+    for each of those patterns left a comment explaining what it used to be and
+    why it was wrong. That comment is the most useful line in the file and it
+    must not fail the test that guards it.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith(comment)
+    )
+
+
 def test_install_scripts_do_not_edit_shell_profiles_registry_or_global_python():
     scripts = [
         REPO_ROOT / "scripts" / "install.ps1",
@@ -57,7 +70,7 @@ def test_install_scripts_default_to_lazy_model_downloads():
     ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
     sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
 
-    assert "if ($PrefetchModels -and -not $SkipModels -and $RuntimeStatus.ollama_path)" in ps1
+    assert "if ($PrefetchModels -and -not $SkipModels -and $OllamaPath)" in ps1
     assert "ask which model tier to use" in ps1
 
     assert 'if [[ "${PREFETCH_MODELS}" -eq 1 && "${SKIP_MODELS}" -eq 0 ]]' in sh
@@ -177,9 +190,115 @@ def test_uninstall_scripts_clean_up_stray_nested_shamsu_folders():
     sh = (REPO_ROOT / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
 
     assert "-Recurse -Directory -Filter \".shamsu\"" in ps1
-    assert "Removed stray nested workspace state" in ps1
+    assert "stray nested workspace state" in ps1
     assert '-notmatch \'\\\\\\.venv\\\\\'' in ps1
 
     assert 'find "${REPO_ROOT}" -type d -name ".shamsu"' in sh
-    assert "Removed stray nested workspace state" in sh
+    assert "stray nested workspace state" in sh
     assert "-not -path \"*/.venv/*\"" in sh
+
+
+# --- proven defects, 2026-08-20 ---------------------------------------------
+
+
+def test_install_sh_reads_the_ollama_status_instead_of_grepping_for_a_semicolon():
+    """`grep -q '"ollama_path": "";'` can never match - no JSON contains `";`.
+
+    Every test built on it therefore read the wrong way round: the "install
+    Ollama now?" prompt was unreachable, the "Ollama is still missing" warning
+    never printed, and --prefetch-models ran `models repair` against an Ollama
+    that was not there. install.ps1 always parsed the JSON properly.
+    """
+    sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+    assert '"";' not in _code_only(sh), "the pattern that can never match is back"
+    assert "have_ollama" in sh
+    assert "json.load(sys.stdin)" in sh
+
+
+def test_install_scripts_survive_a_status_command_that_fails():
+    """A status check that cannot answer is not a reason to stop installing.
+
+    Every caller used to be a bare `& $VenvPython ... | ConvertFrom-Json`. With
+    $ErrorActionPreference = "Stop" a partly-installed venv or a traceback on
+    stderr leaves nothing on stdout, ConvertFrom-Json throws on the empty
+    string, and the install dies AFTER pip install and BEFORE the launcher is
+    written.
+    """
+    ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+
+    assert "function Read-ShamsuJson" in ps1
+    assert "function Get-JsonValue" in ps1
+    # No status command may be piped straight into ConvertFrom-Json any more.
+    for line in ps1.splitlines():
+        if "ConvertFrom-Json" in line and "shamsu." in line:
+            raise AssertionError(f"unguarded status parse: {line.strip()}")
+
+
+def test_install_scripts_do_not_abort_when_writing_the_ollama_config_fails():
+    """Reached after the package is installed and before the launcher exists.
+    The config is a convenience; the install is not."""
+    ps1 = (REPO_ROOT / "scripts" / "install.ps1").read_text(encoding="utf-8")
+    sh = (REPO_ROOT / "scripts" / "install.sh").read_text(encoding="utf-8")
+
+    assert "Could not write the Ollama config" in ps1
+    assert "could not write the ollama config" in sh.lower()
+
+
+def test_uninstall_scripts_do_not_stop_at_the_first_problem():
+    """Proven 2026-08-20: a `path.json` missing one property made uninstall.ps1
+    die inside the PATH step - after deleting a launcher, before removing the
+    virtual environment or the runtime state. Both were left on disk and the
+    script exited 1: a half uninstall that reports failure and does not say what
+    remains."""
+    ps1 = (REPO_ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
+    sh = (REPO_ROOT / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+
+    assert '$ErrorActionPreference = "Continue"' in ps1
+    assert "function Invoke-Step" in ps1
+    assert "finished with" in ps1
+
+    assert "set -e" not in _code_only(sh), "an uninstaller must not abort on the first failure"
+    assert "set -uo pipefail" in sh
+    assert "FAILURES" in sh
+
+
+def test_uninstall_scripts_read_the_path_manifest_defensively():
+    """StrictMode makes a missing property a terminating error, so
+    `$Manifest.added_by_shamsu` is only safe while the file is perfect."""
+    ps1 = (REPO_ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
+
+    assert "function Get-JsonValue" in ps1
+    assert "function Read-PathManifest" in ps1
+    assert "$Manifest.added_by_shamsu" not in ps1
+    assert "$Manifest.managed_by" not in ps1
+
+
+def test_uninstall_never_removes_an_empty_path():
+    """`set -u` is kept precisely so an unset variable cannot become `rm -rf ''`
+    with the caller's working directory as the target."""
+    sh = (REPO_ROOT / "scripts" / "uninstall.sh").read_text(encoding="utf-8")
+
+    assert 'if [[ -z "${target}" ]]; then' in sh
+    assert "no path was resolved" in sh
+
+
+def test_uninstall_removes_its_own_path_manifest():
+    """A stale manifest is what makes the NEXT install think it already owns a
+    PATH entry it no longer has - and it is the file that broke uninstall."""
+    ps1 = (REPO_ROOT / "scripts" / "uninstall.ps1").read_text(encoding="utf-8")
+
+    assert 'Describe "PATH manifest"' in ps1
+    assert 'Describe "empty launcher directory"' in ps1
+
+
+def test_the_prompt_and_bundled_skills_are_packaged():
+    """The system prompt is a markdown file now, and skills are markdown too.
+    A packaging rule that only ships `*.py` would leave the installed agent with
+    no instructions and no skills - and the fallback in `simple_prompt` would
+    quietly hide it."""
+    import shamsu.agents.simple_prompt as simple_prompt
+    from shamsu.skills.loader import bundled_skills_root
+
+    assert simple_prompt.PROMPT_FILE.is_file()
+    assert (bundled_skills_root() / "large-file-surgery" / "SKILL.md").is_file()

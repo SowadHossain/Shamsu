@@ -30,6 +30,7 @@ __all__ = [
     "bracket_problem",
     "bracket_scan",
     "check_file",
+    "check_text",
     "checker_name",
     "unfinished_blocks",
     "truncation_signature",
@@ -96,10 +97,31 @@ def check_file(path: Path) -> CheckResult:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return CheckResult(PROBLEM, f"could not be read: {exc}", kind)
+    return _check(text, suffix, kind, path)
 
+
+def check_text(text: str, suffix: str) -> CheckResult:
+    """`check_file`, for content that is not on disk yet.
+
+    So a caller can ask "would this parse?" BEFORE writing it. `replace_symbol`
+    is the reason: it builds a complete file in memory, and the honest question
+    there is whether the result still parses - which cannot be asked of a file
+    that has not been written, and must not be asked by writing it first and
+    checking afterwards.
+    """
+    lowered = (suffix or "").lower()
+    kind = checker_name(lowered)
+    if not kind:
+        return CheckResult(SKIPPED, f"no checker for {lowered or 'this file type'}")
+    return _check(text, lowered, kind, None)
+
+
+def _check(text: str, suffix: str, kind: str, path: Path | None) -> CheckResult:
+    """The shared body. `path` is only ever used to name the source and to let
+    `node --check` run against a real file."""
     if kind == "python":
         try:
-            compile(text, str(path), "exec")
+            compile(text, str(path) if path else "<content>", "exec")
         except SyntaxError as exc:
             return CheckResult(PROBLEM, f"line {exc.lineno}: {exc.msg}", kind)
         except Exception as exc:  # noqa: BLE001 - a crashed checker is not a pass
@@ -113,7 +135,9 @@ def check_file(path: Path) -> CheckResult:
             return CheckResult(PROBLEM, str(exc), kind)
         return CheckResult(OK, "", kind)
 
-    if suffix in _NODE:
+    if suffix in _NODE and path is not None:
+        # `node --check` needs a real file. Unwritten content falls through to
+        # the structural scan rather than being written somewhere to satisfy it.
         verdict = _node_check(path)
         if verdict is not None:
             return verdict
