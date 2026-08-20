@@ -199,3 +199,31 @@ def test_being_told_to_get_on_with_it_is_not_planning():
     however much the word "just" sounds like deliberation."""
     assert classify_request("now just fix the typo").category == "write"
     assert classify_request("refactor the session store").category == "write"
+
+
+def test_every_offered_tool_is_reachable_from_some_category():
+    """A tool in no category vanishes the moment two-stage routing engages -
+    which is the path SMALL models take, the ones that need the roster narrowed
+    most. `use_skill` was invisible there while the skill index was still being
+    injected into the prompt every turn: a list of skills, and no tool to open
+    one."""
+    from shamsu.agents.simple_chat import SIMPLE_TOOL_SCHEMAS
+    from shamsu.agents.simple_router import ALWAYS_TOOLS, TOOL_CATEGORIES
+
+    reachable = set(ALWAYS_TOOLS)
+    for body in TOOL_CATEGORIES.values():
+        reachable |= set(body["tools"])
+    offered = {s["function"]["name"] for s in SIMPLE_TOOL_SCHEMAS}
+
+    assert not offered - reachable, f"unreachable under two-stage: {sorted(offered - reachable)}"
+
+
+def test_a_skill_can_still_be_opened_after_a_category_is_chosen():
+    from shamsu.agents.simple_chat import active_tool_schemas
+
+    for category in ("read", "write", "run", "search", "verify", "recall", "plan"):
+        names = {
+            s["function"]["name"]
+            for s in active_tool_schemas(context_window=8192, category=category)
+        }
+        assert "use_skill" in names, category

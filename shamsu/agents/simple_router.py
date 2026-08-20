@@ -124,7 +124,13 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
 # switch standing between it and the question is exactly the friction that
 # makes a small model guess instead. It is also the escape hatch `delete_file`
 # and `write_file` point at when several files could be the target.
-ALWAYS_TOOLS = ("memory_load", "history_search", "ask_user")
+#
+# `use_skill` for a plainer reason: the skill INDEX is injected into the system
+# prompt on every turn, so a model on a small window was being shown a list of
+# skills and then handed a tool set that could not open any of them. Direct-mode
+# narrowing already kept it (`_narrowed_by_request`); two-stage routing dropped
+# it, which is the half of the roster small models actually use.
+ALWAYS_TOOLS = ("memory_load", "history_search", "ask_user", "use_skill")
 
 SELECTOR_TOOL_NAME = "select_category"
 
