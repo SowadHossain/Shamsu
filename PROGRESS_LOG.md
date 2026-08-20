@@ -3,6 +3,144 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-20 — Phase 3: a plan that is written down, and shown again
+Files edited: `shamsu/agents/plan_anchor.py` (new), `tests/test_plan_anchor.py`
+(new), `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_router.py`,
+`shamsu/agents/tool_classifier.py`, `evals/diff.py`, tests
+What changed: the contract has held ordered, persisted, checkable items for
+weeks and reached the model only when it called `contract_status` - invisible to
+exactly the model that had lost the thread. It is now re-injected every turn,
+capped, and dropped once resolved. A multi-part request is asked once to write
+the steps down. Added a read-only `plan` tool category: smallcode's planner
+persona works because its frontmatter gives it no write tools, and that needs no
+sub-agent here. Also adaptive retry temperature, and a significance test in
+`evals.diff` replacing the flat flaky-exclusion - which I had flagged that
+morning as too blunt and which real use confirmed within hours.
+Tests: 20 plan-anchor + 4 loop-level + 3 plan-role + 4 diff tests. Full suite
+3433 passed / 0 failed. The suite caught a real false positive I would have
+shipped: `port` was in the multi-step hint list for "port this to X" and matched
+"remember: the port is 8080" - a 26-character note being asked to plan itself.
+Eval: **NOISE, exit 2 - unmeasured.** The plan anchor fires on ZERO of the 12
+eval cases; every prompt in the suite is a single-step one-liner. So the +348s
+walltime is NOT the anchor - it cannot be - it is variance (the same suite has
+run 1585, 1415, 895, 972 and 1320s). Cumulative against the original baseline
+stays IMPROVED (+0.100, exit 0).
+Log: logs/test-runs/2026-08-20-phase3-plan-anchor.log
+
+### 2026-08-20 — OPEN: the eval suite cannot see most of this work
+Not a task; a finding worth not re-deriving. All 12 seed cases are single-step,
+one-line prompts ("Create a file hello.py", "Rename old_name.py"). The plan
+anchor, the read-loop guard, greeting regression, trust decay and the third exit
+all fire on MULTI-step or degenerate behaviour, and no case produces either. The
+only thing the suite could measure this session was a missing tool - and it did,
+cleanly: `rename_file_via_move_tool` 0/3 -> 3/3, exit 0.
+Also open, and NOT caused by this session's work: `run_command_verify` and
+`ask_before_choosing_an_approach` were 3/3 in the committed BENCHMARK.md of
+2026-08-16 and are 0/3 in every run taken today, including the baseline captured
+before any change here. Something between those dates broke them.
+
+### 2026-08-20 — Read path and onboarding: both ends of a file, and what the project IS
+Files edited: `shamsu/agents/simple_chat.py`, `tests/test_simple_chat.py`
+What changed: a file nothing can outline now returns its first AND last 60 lines
+rather than a head clip - `.md`, `.txt`, `.csv`; code still gets an outline,
+which beats two slices. Added `project_brief`, one line naming the project's
+language and test command, from manifests and `detect_test_command` that were
+already there and had never been summarised into the prompt. Added the
+Claude/OpenAI tool-name aliases (`Edit`, `Bash`, `Grep`) after watching `Edit`
+fall through the new closest-match to a re-listing of the whole roster.
+Tests: 6 new; full suite 3400 passed / 0 failed. My assertion that the brief
+would say `vitest run` was wrong - it says `npm test`, the command you actually
+run, which is the better answer.
+Log: logs/test-runs/2026-08-20-phase2-loop-guards.log
+
+### 2026-08-20 — Phase 2: the guards simple mode did not have, as objects
+Files edited: `shamsu/agents/loop_guards.py` (new), `tests/test_loop_guards.py`
+(new), `shamsu/agents/simple_chat.py`, `tests/test_simple_chat.py`
+What changed: read-loop detection (soft at 5, firm at 8 reads producing
+nothing), greeting regression, closest-match on an invented tool name, and
+per-tool trust decay that never withholds a writing tool. The four simple mode
+did not have. The eight that already existed stay inline: moving working, tested
+code is risk with no behaviour to show for it, and can follow when something in
+them needs to change anyway. The seam is the point - every one of the eight
+needed a whole loop, a fake client and a scripted turn to exercise; these are
+objects with their own tests.
+Tests: 17 new unit tests (no model, no loop) + 6 loop-level tests. Full suite
+3394 passed / 0 failed. Two of my own tests were wrong before the code was -
+one expected a single fuzzy match where the exact name should win, which became
+a real improvement; one searched for text that lives in the activity line rather
+than the correction.
+Eval: **NOISE, exit 2 - neutral.** 83.3% -> 80.6%, and the only case that moved
+was the one already proved a coin flip (`ask_user_clarifies`, 4/7 at seven
+samples). This is expected rather than disappointing: the guards fire on
+degenerate behaviour - eight fruitless reads, a greeting mid-task, an invented
+tool name, a tool failing five times - and none of the twelve cases exhibits any
+of it. They are UNMEASURED, not disproven. The gap is in the suite: it has no
+case that reproduces a model losing the thread, which is the entire class of
+failure these guards exist for. Cumulative against the original baseline is
+IMPROVED (+0.100, exit 0, walltime -613s) but that is the rename fix, not this.
+Log: logs/test-runs/2026-08-20-phase2-loop-guards.log
+
+### 2026-08-20 — A third exit before the turn gives up
+Files edited: `shamsu/agents/simple_chat.py`, `tests/test_simple_chat.py`
+What changed: four edits that changed nothing used to end the turn with "I have
+stopped rather than keep guessing - it would help to tell me the exact text to
+look for", which is the failure users reported: an apology that hands the work
+back. The loop now changes approach once first, naming the calls - outline,
+`read_symbol` the wrong function, `replace_symbol` with its new body. That is
+the tool which does not require reproducing the old text byte-for-byte, which
+is the step failing four times over. Offered once per turn; the second time it
+really stops.
+Tests: 3 new behavioural tests; one existing test updated because reaching the
+stop now requires getting past the new exit. Full suite 3371 passed / 0 failed.
+Log: logs/test-runs/2026-08-20-phase1a-tools.log
+
+### 2026-08-20 — Phase 1a-1d: the tools simple mode could not reach, and room to put them
+Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_router.py`,
+`shamsu/agents/tool_classifier.py` (new), `tests/test_tool_classifier.py` (new),
+`tests/test_simple_chat.py`
+What changed: an audit found 36 of 43 registry tools were never offered to the
+model. Wired `move_file`, `delete_file`, `ask_user` (plus the loop half that
+ends a turn on a question, which only the legacy loop had) and read-only
+`git_status`/`git_diff`/`git_log` gated on the workspace being a repository.
+Room for them came from a deterministic regex classifier that narrows the
+roster per request with no extra round - 26 schemas/3,196 tokens on a 32k window
+became 14/1,885 for an edit request - with `select_category` kept in every
+narrowed roster so a wrong guess costs one round trip rather than stranding the
+model. Web tools deliberately left out: they depend on an auto-started SearXNG
+and would violate "offer only the tools that have something to answer from".
+Tests: 23 new classifier tests + 10 new tool tests; full suite 3364 passed.
+Eval: 3 samples, default tier (7B). `python -m evals.diff` returned **IMPROVED,
+exit 0** for `move_file` + narrowing: reward 66.7% -> 75.0%, reliable delta
++0.083, and the single case that moved was `rename_file_via_move_tool` 0/3 ->
+3/3 - the one predicted in advance. Nothing regressed, and walltime fell 170s
+because the narrowed roster is also a shorter prompt.
+
+`ask_user`/`delete_file`/git measured separately and the verdict is **NOISE,
+exit 2 - unproven.** At 3 samples both asking cases read 100%; re-measured at 7
+against a worktree at HEAD they were 1/7 -> 4/7 and 4/7 -> 7/7. Reward more
+than doubled (35.7% -> 78.6%) and the tool still refuses to count it, because
+both were flaky in the baseline - Fisher's exact on 4/7 vs 7/7 is p~0.19, so
+seven samples cannot call it. The mechanism is plausible (`ask_user` ends the
+turn, so the question becomes `final`, which is what the check reads) but it is
+not measured. KNOWN LIMITATION: a case flaky BEFORE can never be shown to have
+been fixed, because the rule excludes it from either side. A significance test
+would be better than a flat exclusion.
+Log: logs/test-runs/2026-08-20-phase1a-tools.log
+
+### 2026-08-20 — Phase 1: a mechanical verdict on whether a change helped
+Files edited: `evals/diff.py` (new), `tests/test_evals_diff.py` (new)
+What changed: added `python -m evals.diff <baseline> <feature>`, ported from
+smallcode `bench/diff.js`, with exit codes 0 improved / 1 regressed / 2 noise /
+3 error. Sample-aware where smallcode is not - reward is a per-case pass
+fraction, flaky cases are held out of the verdict on both sides, and unequal
+`--samples` refuses to compare rather than warning. A case that fell from
+passing every attempt to failing every attempt overrides a positive average.
+Without this, the eval variance already recorded in this project (1/7 to 5/7 on
+identical code) makes every later phase unfalsifiable.
+Tests: 16 new tests, all passing; verified against a real `--json-out` report
+from a live 2-case run (diff against itself = NOISE, exit 2).
+Log: logs/test-runs/2026-08-20-phase1-eval-diff.log
+
 ### 2026-08-20 — Phase 0: verification stops reporting a patch-broken file as "still being built"
 Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_verify.py`,
 `shamsu/agents/chat_state.py`, `tests/test_simple_chat.py`

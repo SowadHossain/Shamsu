@@ -4,6 +4,212 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Added (agent loop phase 3 - a plan that is written down and shown again, 2026-08-20)
+
+- **A job with parts is asked to write them down.** `contract_create` has been
+  offered all along and a model that does not think to call it never does; new
+  `agents/plan_anchor.py` asks once, naming the call rather than stating a rule.
+  ("Plan before you start" has been in this project's prompts before and did not
+  survive contact with a 3B.) Conservative on purpose: a false positive costs a
+  round AND anchors the model to a plan it had no reason to write, while a false
+  negative costs nothing.
+- **And shown it again every turn.** This is the half that was missing. The
+  contract has held ordered, persisted, individually-checkable items for weeks,
+  and reached the model only if it called `contract_status` - so the thing meant
+  to keep a multi-step task on the rails was invisible to precisely the model
+  that had lost the thread and stopped asking. It is now re-injected into the
+  grounding block, capped, and dropped once every item is resolved, because a
+  finished contract is history rather than a plan.
+- **A read-only `plan` category.** smallcode's `planner.md` persona is a strong
+  planner for one reason visible in its frontmatter - `tools: [read_file,
+  find_files, search, ...]`, no write tools, so it *cannot* skip to
+  implementing. That discipline needs no sub-agent and no second model call
+  here: it is a tool category with the write tools left out. "how should we
+  approach the refactor?" now routes there rather than being handed the write
+  tools because `refactor` outscored the question.
+
+  On smallcode's step cursor, which is NOT ported: their own code says *"Don't
+  auto-advance - let the model explicitly mark completion. Auto-advance leads to
+  drift in long traces."* `contract_assert_pass` already is that mechanism.
+
+- **Adaptive retry temperature** (`src/model/adaptive_temp.js`): first retry
+  colder, second warmer, then back to the configured value. At one fixed
+  temperature a retry produces the same strategy and the same mistake, which is
+  how one payload went out nine times byte-for-byte.
+
+### Changed (the eval diff stops being too blunt, 2026-08-20)
+
+- A movement is now withheld only if it is flaky **and** not statistically
+  significant (one-tailed Fisher exact, p <= 0.05, enumerated directly so the
+  tool still runs in a bare checkout). The flat exclusion shipped that morning
+  proved too blunt within hours of real use: it meant a case that was flaky
+  BEFORE could never be shown to have been FIXED, however solid it became. The
+  live case that exposed it - `4/7 -> 7/7` - is still correctly withheld at
+  p~0.19; `1/20 -> 20/20` no longer is. Regressions are judged by the same test
+  in the other direction, so a guard that quietly destroys a case cannot hide
+  behind "it was flaky anyway".
+
+### Added (read path and onboarding, 2026-08-20)
+
+- **Both ends of a file nothing can outline.** Outline-first answered large CODE
+  files; everything else - `.md`, `.txt`, `.csv` - still got a head clip, which
+  is precisely what starts the dead end in SMALLCODE_GAP_ANALYSIS.md §2: the
+  model patches against a half it was never shown. A 900-line changelog was read
+  as its oldest entries, and then the model was asked to add one at the bottom.
+  Now the first and last 60 lines arrive with the gap named and a pointer to
+  `start_line`/`end_line`. Code is untouched: an outline shows the whole shape,
+  which beats two arbitrary slices.
+- **`This project: Python, tests: `pytest -q`.`** - smallcode's bootstrap, one
+  line in the grounding block. Every piece already existed: the manifests are
+  one `exists()` each and `detect_test_command` already read package.json
+  scripts and pytest layouts. Nothing had ever summarised them into the prompt,
+  so a model opening a fresh workspace spent three to five calls working out
+  what kind of project it was and how to run its tests - every session. Silent
+  when it knows nothing, because "Project: unknown" looks like an answer.
+- **Claude/OpenAI-shaped tool names resolve.** smallcode's `normalizeToolCall`.
+  A model trained on those transcripts reaches for `Edit`, `Bash` or `Grep` by
+  reflex, and those are far enough from a SHAMSU name that even the new fuzzy
+  matching found nothing - live, `Edit` fell all the way through to a re-listing
+  of the whole roster.
+
+### Added (agent loop phase 2 - the guards simple mode did not have, 2026-08-20)
+
+New module `agents/loop_guards.py`, adapted from smallcode
+`src/governor/early_stop.js` and `quality_monitor.js`. Simple mode already had
+eight detectors - prose, promise and empty-turn nudges, the contract nudge,
+truncation refusals, the unproductive-edit ceiling, repeated reads, the per-file
+edit ceiling - every one written inline in a `_run_turn` now past 2,600 lines.
+They work, and none could be tested without standing up a whole loop. The four
+below are the ones that did NOT exist; the older eight stay inline for now,
+because moving working, tested code is risk with no behaviour to show for it.
+
+- **Read-loop detection** - soft at 5 consecutive read/search calls that produce
+  nothing, firm at 8. Simple mode already caught the same read repeated three
+  times, which is a different fault: that is a model losing track of what it
+  has. Eight DIFFERENT reads producing nothing is a task with no terminal state
+  - "review X" can always justify one more file - and no counter saw it. Reset
+  by producing ANYTHING, not only by writing: an answer is production too.
+- **Greeting regression** - a model replying "How can I help you today?" after
+  eleven tool calls has lost the conversation. Deliberately matched on whole
+  phrases and only when work has already happened this turn, so "Hi - I've added
+  the handler" stays a normal answer.
+- **Closest-match on an invented tool name.** `There is no tool called X.
+  Available: <thirty names>` re-listed a roster already in the prompt the model
+  had just shown it was not reading. It now answers with the nearest few, and
+  with the exact name when only a `functions.` prefix was wrong.
+- **Per-tool trust decay** - three consecutive failures demote, five withhold
+  for the session. **A writing tool is never withheld**, which is the deliberate
+  difference from smallcode: theirs may drop any tool, and dropping `patch_file`
+  leaves a model that cannot edit anything - a worse state than the loop it
+  prevents. A search returning nothing can be taken away; the ability to change
+  a file cannot. Never empties the roster either.
+
+### Fixed (a third exit before the turn gives up, 2026-08-20)
+
+- **Four failed edits now change the approach instead of ending the turn.**
+  The ceiling used to stop with *"I have stopped rather than keep guessing. It
+  would help to tell me the exact text to look for, or to paste the few lines
+  around the problem"* - an apology that hands the work back to the user, and
+  the thing users actually reported when asking the agent to fix a syntax error
+  it had introduced. Patching was one strategy and it was the only one tried.
+
+  The loop now says so once, and names the call: read the file's outline,
+  `read_symbol` the one function that is wrong, then `replace_symbol` with its
+  complete new body. That is the tool which does NOT require reproducing the
+  old text byte-for-byte - precisely the step that has been failing four times
+  in a row. smallcode's equivalent forces a whole-file rewrite; here that would
+  be a harder version of what the model is already failing at, and
+  `MAX_WRITE_CHARS` would refuse it for any sizeable file, so it would swap one
+  dead end for another.
+
+  Once per turn. Offered twice it stops being a change of strategy and becomes
+  the loop repeating itself at the model, so the second time it really does
+  stop.
+
+### Added (tools simple mode could not reach, 2026-08-20)
+
+An audit of the registry against simple mode's roster found **36 of 43 tools
+were never offered to the model** - built, tested, and unreachable. The clearest
+symptom was already sitting in `BENCHMARK.md`: `rename_file_via_move_tool`, an
+eval case NAMED after `move_file`, failing and annotated as model variance. The
+only route to a pass was guessing `mv` against `move` against `ren` through
+`run_command` and getting it approved.
+
+- **`move_file`** - renaming is not a write plus a delete, and simple mode had
+  neither half.
+- **`delete_file`** - the other half of editing a project. Ships WITH `ask_user`
+  deliberately: its own description tells the model to ask rather than guess
+  between candidate targets, and until now that pointed at a tool simple mode
+  did not offer.
+- **`ask_user`, and the loop half that was missing.** The tool never blocked -
+  it returns a structured question and expects the loop to end the turn on it.
+  The legacy loop did; simple mode did not, so the tool sat unreachable while
+  the prompt told the model to ask whenever a decision was the user's to make.
+  A question now ends the turn as a normal answer (not a `stop` - nothing went
+  wrong), and stands in the transcript as an assistant turn, so the next thing
+  the user types reads as its answer. No pending-question store: the
+  conversation is the store.
+- **Read-only `git_status`, `git_diff`, `git_log`** - so the model can see what
+  it actually did rather than what it believes it did. `_with_diff` shows one
+  edit; these show the turn. Gated on the workspace being a repository, by the
+  same rule as every other conditional family. The 19 mutating git tools stay
+  out: `run_command` reaches them with approval and the risk classifier.
+
+Web search and page fetch were **deliberately not wired**. They depend on an
+auto-started SearXNG instance, and offering a tool that may always fail
+contradicts the rule this codebase already committed under the title *"Offer
+only the tools that have something to answer from."* They need a reachability
+probe first, like the other conditional families have.
+
+### Added (deterministic tool-category routing, 2026-08-20)
+
+- **`agents/tool_classifier.py`** - a weighted regex scorer over the user's
+  message that narrows the tool roster with no extra round, ported from
+  smallcode `src/compiled/tool_router.js`.
+
+  Simple mode had two ways to shrink the roster and neither covered the models
+  this project ships on. `select_category` costs a full round trip and engages
+  only at or below 16,384 tokens of context; `_without_unavailable_families`
+  is free but asks *"could this tool answer at all?"*, never *"does THIS
+  request need it?"* Above 16k the catalogue therefore went out whole -
+  measured at **26 schemas and 3,196 tokens on every turn** of a 32k window,
+  about a tenth of it, growing with every tool added. That tax is what made
+  the seven tools above look expensive.
+
+  Measured after: `fix the missing brace in game.js` sends 14 schemas / 1,885
+  tokens, `run the tests` sends 10 / 1,200.
+
+  **One deliberate difference from smallcode.** Their direct mode has no
+  escape: a wrong guess strands the model with the wrong tools and no way to
+  say so. Every narrowed roster here carries `select_category`, so a
+  misclassification costs one round trip to correct - and an explicit choice by
+  the model outranks the scorer. A guess with a way back is a different
+  proposition from a guess without one. Low confidence, a near-tie, a greeting,
+  or a request over 300 characters all send everything: a classifier unsure
+  what a request wants is not evidence that it wants little.
+
+### Added (agent loop phase 1, 2026-08-20)
+
+- **`python -m evals.diff <baseline> <feature>`** - a mechanical verdict on
+  whether a change helped, adapted from smallcode `bench/diff.js`. Exit 0
+  improved, 1 regressed, 2 noise, 3 error, so it can gate CI. It exists because
+  §31.1 scored anywhere from 1/7 to 5/7 across nine runs of identical code: at
+  that variance nobody can read a delta out of two BENCHMARK.md tables by eye,
+  and every behavioural change from here on is a change to a stochastic system.
+  Three departures from smallcode, all forced by the fact that our harness runs
+  N samples per case where theirs runs one:
+  - A case's reward is its PASS FRACTION, not a boolean. `2/3 -> 3/3` is a real
+    movement their model cannot express, and it is the size of movement a guard
+    change actually produces.
+  - A case flaky in EITHER run is reported and then held out of the verdict, on
+    both sides of the delta. `render_report`'s footer has said *"a delta that
+    lives entirely inside the flaky set is no delta"* for months and nothing
+    enforced it.
+  - Unequal sample counts REFUSE to compare instead of printing a caveat.
+  A case that passed every attempt and now fails every attempt overrides a
+  positive average outright - no mean should be able to buy back a behaviour
+  that used to work every time.
+
 ### Fixed (agent loop phase 0, 2026-08-20)
 
 - **A file a patch broke is no longer reported as one still being written.**

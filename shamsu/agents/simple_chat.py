@@ -40,6 +40,16 @@ from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
+from shamsu.agents.loop_guards import (
+    LOOKING_TOOLS,
+    adapted_temperature,
+    ReadLoopDetector,
+    TrustDecay,
+    closest_tool_names,
+    greeting_regression,
+)
+from shamsu.agents.plan_anchor import anchor as plan_anchor
+from shamsu.agents.plan_anchor import ask_for_a_plan
 from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
 from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_outline import (
@@ -465,6 +475,12 @@ OUTLINE_OVER_LINES = 200
 # already a container rather than a unit of work.
 OUTLINE_SYMBOL_OVER_LINES = 80
 
+# How many lines of each END of a file nothing can outline. smallcode's read
+# guard keeps both ends; SHAMSU's fallback kept only the head, so the model was
+# shown a changelog's oldest entries and never its newest - and then asked to
+# add one at the bottom, against text it had not seen.
+HEAD_TAIL_LINES = 60
+
 # The gutter `read_file` puts in front of every line, smallcode's shape
 # (`bin/executor.js:110`). Line numbers are what make the follow-up call
 # possible: "patch line 412" and "read_file(start_line=400)" are both guesses
@@ -504,6 +520,30 @@ SIMPLE_TOOLS: dict[str, str] = {
     "search_files": "grep_files",
     "write_file": "write_file",
     "patch_file": "edit_file",
+    # Renaming is not a write plus a delete, and simple mode had neither half.
+    # `rename_file_via_move_tool` is an eval case NAMED after this tool and it
+    # sat at 1/3, labelled model variance in BENCHMARK.md - the only route to a
+    # pass was guessing `mv` against `move` against `ren` through
+    # `run_command`. Of the 36 registry tools simple mode never offered, this is
+    # the one with a failing measurement already pointing at it.
+    "move_file": "move_file",
+    # Deleting is the other half of editing a project, and simple mode had
+    # neither half. It ships WITH `ask_user` on purpose: `delete_file`'s own
+    # description tells the model to ask rather than guess between candidate
+    # targets, and until now it was pointing at a tool simple mode did not
+    # offer.
+    "delete_file": "delete_file",
+    # The prompt has always told the model to ask when a decision is the
+    # user's. The tool that does it was built, tested and reachable only from
+    # the legacy loop.
+    "ask_user": "ask_user",
+    # Read-only git, so the model can see what it has actually done rather than
+    # what it believes it did. `_with_diff` shows one edit; these show the turn,
+    # the branch and the history. Withheld outside a repository - see
+    # CONDITIONAL_TOOL_FAMILIES.
+    "git_status": "git_status",
+    "git_diff": "git_diff",
+    "git_log": "git_log",
     "run_command": "run_command",
     # Handled inside `_execute`, not by the registry: it writes a scratchpad,
     # not a workspace file, and routing it through `write_file` would put it
@@ -644,6 +684,122 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                     },
                 },
                 "required": ["filepath", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "move_file",
+            "description": (
+                "Rename or move a file inside the workspace. Use this instead of "
+                "writing a copy under the new name and leaving the old one behind, "
+                "and instead of shell mv/move/ren. Backed up, so it can be undone. "
+                "Refuses if the destination already exists."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Existing path, relative to the workspace.",
+                    },
+                    "destination": {
+                        "type": "string",
+                        "description": "New path, relative to the workspace.",
+                    },
+                },
+                "required": ["source", "destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_status",
+            "description": (
+                "Show short git status for the workspace - which files you have "
+                "changed, staged or left untracked."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_diff",
+            "description": (
+                "Show the unstaged git diff: exactly what your edits changed, across "
+                "every file, rather than one edit at a time."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "git_log",
+            "description": "Show recent git commits.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "string",
+                        "description": "How many commits. Default 10, max 100.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_file",
+            "description": (
+                "Delete a workspace file. Backed up first, so it can be undone. "
+                "Only delete when the task clearly calls for it; if several files "
+                "could be the intended target, call ask_user instead of guessing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "Path relative to the workspace.",
+                    },
+                },
+                "required": ["filepath"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_user",
+            "description": (
+                "Ask the user a question when the answer is THEIRS to give: choosing "
+                "between valid approaches, naming, scope, anything destructive or hard "
+                "to undo, or an ambiguous target where several files match. Look up "
+                "plain facts with find_files/search_files/read_file yourself instead of "
+                "asking. Calling this ENDS your turn and waits for their answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The question to ask."},
+                    "options": {
+                        "type": "array",
+                        "description": "Optional choices, each {label, description}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+                "required": ["question"],
             },
         },
     },
@@ -1140,6 +1296,13 @@ CONDITIONAL_TOOL_FAMILIES: dict[str, tuple[str, ...]] = {
     "memory": ("memory_load", "memory_list", "memory_forget"),
     "graph": ("graph_search", "explain_symbol"),
     "history": ("history_search",),
+    # Read-only git. Gated on the workspace actually BEING a repo, which is the
+    # same principle as every family above: a `git_status` offered outside a
+    # repository is a tool with nothing to answer from, and the model spends a
+    # round finding that out. The mutating half of the git suite stays out -
+    # `run_command` reaches it with approval and the risk classifier, and 19
+    # more schemas is not a trade worth making for that.
+    "git": ("git_status", "git_diff", "git_log"),
 }
 
 
@@ -1155,6 +1318,7 @@ def available_tool_families(workspace: Path) -> frozenset[str]:
         ("memory", _has_memory_notes),
         ("graph", _has_code_graph),
         ("history", _has_earlier_sessions),
+        ("git", _is_a_git_repo),
     ):
         try:
             if probe(workspace):
@@ -1162,6 +1326,14 @@ def available_tool_families(workspace: Path) -> frozenset[str]:
         except Exception:  # noqa: BLE001 - an unreadable probe must not remove a tool
             available.add(family)
     return frozenset(available)
+
+
+def _is_a_git_repo(workspace: Path) -> bool:
+    """Is there a repository here for `git status` to describe?
+
+    A worktree keeps a `.git` FILE rather than a directory, so both count.
+    """
+    return (workspace / ".git").exists()
 
 
 def _has_memory_notes(workspace: Path) -> bool:
@@ -1206,12 +1378,21 @@ def active_tool_schemas(
     context_window: int = 0,
     category: str = "",
     available: frozenset[str] | None = None,
+    request: str = "",
 ) -> list[dict[str, Any]]:
     """The tools to send on this call.
 
     Everything that can currently do something, unless the window is tight
     enough that two-stage routing earns its extra round: then the category
     selector alone, and once the model has chosen, that category tools.
+
+    Above that threshold - which is where the 32k models this project targets
+    live - the catalogue used to go out WHOLE: measured at 26 schemas and 3,196
+    tokens on every turn, about a tenth of the window, growing with every tool
+    added. `request` narrows that deterministically, with no extra round: see
+    `agents/tool_classifier.py`. It is a guess, so it only ever narrows to a
+    category and its companion, never to one, and an unsure guess sends
+    everything.
 
     `available=None` means "do not filter" - the old behaviour, kept so every
     existing caller and test still gets the full roster.
@@ -1223,7 +1404,16 @@ def active_tool_schemas(
     )
 
     if not context_window or routing_mode(context_window) == "direct":
-        schemas = SIMPLE_TOOL_SCHEMAS
+        # An explicit choice by the MODEL outranks the scorer's guess about the
+        # user's words - that is the whole value of keeping `select_category`
+        # in the roster. Without this branch the escape hatch is decorative:
+        # the model asks for the write tools, the guess is re-applied, and it
+        # gets the same read tools back.
+        schemas = (
+            tools_for_category(category, SIMPLE_TOOL_SCHEMAS)
+            if category
+            else _narrowed_by_request(SIMPLE_TOOL_SCHEMAS, request)
+        )
     elif not category:
         return [category_selector_tool()]
     else:
@@ -1231,6 +1421,49 @@ def active_tool_schemas(
     if available is None:
         return schemas
     return _without_unavailable_families(schemas, available)
+
+
+def _narrowed_by_request(
+    schemas: list[dict[str, Any]], request: str
+) -> list[dict[str, Any]]:
+    """Drop the tool families this request plainly does not need.
+
+    The escape hatch is the reason this is safe, and it is what smallcode's
+    direct mode does not have. `select_category` stays in the roster whatever
+    the scorer decided, so a misclassified turn costs ONE round trip to
+    correct - the model asks for the write tools and gets them - rather than
+    leaving it holding read tools for an edit it cannot make and no way to say
+    so.
+    """
+    if not request:
+        return schemas
+    from shamsu.agents.simple_router import (
+        ALWAYS_TOOLS,
+        TOOL_CATEGORIES,
+        category_selector_tool,
+    )
+    from shamsu.agents.tool_classifier import categories_for
+
+    wanted = categories_for(request)
+    if not wanted:
+        return schemas
+    keep: set[str] = set()
+    for name in wanted:
+        keep.update(TOOL_CATEGORIES.get(name, {}).get("tools", ()))
+    if not keep:
+        return schemas
+    # The skill index is injected on every turn, so `use_skill` has to stay
+    # callable however the request was scored - and `ask_user` is the answer to
+    # an ambiguity, which by definition turns up in a category nobody predicted.
+    keep.update({"use_skill", *ALWAYS_TOOLS})
+    narrowed = [s for s in schemas if s.get("function", {}).get("name") in keep]
+    if not narrowed:
+        # Never hand back an empty roster over a scoring accident.
+        return schemas
+    # APPENDED, not filtered in: the selector is generated rather than being a
+    # member of `SIMPLE_TOOL_SCHEMAS`, so keeping its name in `keep` would have
+    # silently dropped the one tool that makes a wrong guess recoverable.
+    return [*narrowed, category_selector_tool()]
 
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file", "replace_symbol"})
@@ -1295,6 +1528,24 @@ _TOOL_NAME_ALIASES: dict[str, str] = {
     "shell.run": "run_command",
     "test.run": "run_command",
     "command.run": "run_command",
+    # Claude/OpenAI-shaped names, smallcode's `normalizeToolCall`. A model
+    # trained on those transcripts reaches for `Edit` or `Bash` by reflex, and
+    # they are far enough from a SHAMSU name that fuzzy matching finds nothing
+    # - live, `Edit` fell all the way through to a re-listing of the roster.
+    # Accepting them costs one dict entry and saves a whole round each time.
+    "read": "read_file",
+    "edit": "patch_file",
+    "str_replace": "patch_file",
+    "str_replace_editor": "patch_file",
+    "write": "write_file",
+    "create": "write_file",
+    "bash": "run_command",
+    "shell": "run_command",
+    "terminal": "run_command",
+    "glob": "find_files",
+    "grep": "search_files",
+    "ls": "list_files",
+    "todowrite": "contract_create",
 }
 
 
@@ -1649,6 +1900,12 @@ class _Round:
     # committed. The loop reads this to know the turn made no progress for a
     # reason it must eventually stop on.
     refused_truncated: str = ""
+    # The model asked the user something. `ask_user` does not block - it hands
+    # back a structured question and expects the LOOP to end the turn on it,
+    # which is the half simple mode never had, so the tool sat in the registry
+    # unreachable while the prompt told the model to ask when a decision was
+    # the user's to make.
+    asked: str = ""
 
 
 class SimpleChatLoop:
@@ -1812,6 +2069,20 @@ class SimpleChatLoop:
         # not have parsed" - and telling a user the first when it was the second
         # sends them to a limit that never fired.
         self._refused_unparseable = False
+        # Has the model already been told to stop patching and edit by symbol?
+        # Once per turn: a strategy change offered twice is not a strategy, and
+        # the second one would be the loop insisting rather than helping.
+        self._strategy_switched = False
+        # The file the last unproductive mutation was aimed at, so the change of
+        # strategy can NAME it. "Try a different approach" is the advice that
+        # already failed; "read_symbol then replace_symbol on game.js" is a call.
+        self._last_failed_path = ""
+        # One line about what this project IS. Computed once per loop.
+        self._project = ""
+        # The detectors simple mode did not have. See `agents/loop_guards.py`
+        # for why they live there and the older eight still live inline.
+        self._read_loop = ReadLoopDetector()
+        self._trust = TrustDecay(protected=WRITING_TOOLS | {"run_command", "ask_user"})
         # Content hash of the last WHOLE read per file, so a re-read of an
         # unchanged file can say so instead of resending it. Dropped on every
         # elision sweep - see `_note_unchanged_since_last_read`.
@@ -1953,6 +2224,21 @@ class SimpleChatLoop:
         self._available_families = await asyncio.to_thread(
             available_tool_families, self.workspace
         )
+        # Once per turn, like the roster: a project does not change its language
+        # or its test runner between rounds, and `_fixed_overhead` has to charge
+        # for what will really be sent.
+        if not self._project:
+            self._project = await asyncio.to_thread(project_brief, self.workspace)
+        # Ask for a plan ONCE, and only when there is not already one standing.
+        # `contract_create` has been offered all along and a model that does not
+        # think to call it never does; this is the ask. Skipped when a contract
+        # already exists, because the anchor is already showing it and asking
+        # again would start a second plan for the same job.
+        if not self._standing_plan():
+            wanted = ask_for_a_plan(user_input)
+            if wanted:
+                self.state.append_user(wanted, origin=ORIGIN_LOOP)
+                self._activity("this has several parts; asked it to write them down first")
         # Once per user message, not per round: the graph lookup costs ~2s and
         # what a file exports does not change between rounds of the same turn.
         self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
@@ -2141,6 +2427,18 @@ class SimpleChatLoop:
                         tool_calls,
                         changed,
                     )
+                lost = greeting_regression(text, work_happened=tool_calls > 0)
+                if lost and empty_nudges < MAX_EMPTY_NUDGES:
+                    # Counted against the empty-turn budget rather than getting
+                    # its own: both are "that reply was not an answer", and a
+                    # model producing greetings after tool calls has lost the
+                    # thread in a way one nudge either recovers or does not.
+                    empty_nudges += 1
+                    self._repair_streak += 1
+                    self.state.append_assistant(text)
+                    self.state.append_user(lost.correction, origin=ORIGIN_LOOP)
+                    self._activity(lost.activity)
+                    continue
                 blocked = self._contract_blocks_this_claim(text, contract_nudges)
                 if blocked:
                     # Not a block and not a rewrite: the sentence stands in the
@@ -2179,6 +2477,27 @@ class SimpleChatLoop:
             outcome = await self._run_tools(turn.tool_calls)
             tool_calls += len(turn.tool_calls)
             changed.extend(outcome.written)
+            if outcome.asked:
+                # The turn ends on the question. Not a stop - nothing went
+                # wrong, and marking it stopped would file a deliberate,
+                # correct ask alongside timeouts and refusals in the run
+                # outcome. The question stands in the transcript as the
+                # assistant's turn, so whatever the user types next is read as
+                # its answer without any pending-question store: the
+                # conversation IS the store.
+                if outcome.written and self.verify_changes:
+                    await self._append_verification(outcome.written)
+                self._settle_unfinished()
+                self.state.append_assistant(outcome.asked)
+                if self.turn_log:
+                    self.turn_log.close_turn(outcome.asked, round_index + 1, stopped=False)
+                self._activity("asked the user a question; waiting for the answer")
+                return SimpleChatResult(
+                    final=outcome.asked,
+                    rounds=round_index + 1,
+                    tool_calls=tool_calls,
+                    changed_files=tuple(dict.fromkeys(changed)),
+                )
             if self._truncated_refusals >= MAX_TRUNCATED_WRITE_REFUSALS:
                 # The guard's exit. Three replies in a row cut off mid-write
                 # means the file does not fit in one generation and the model
@@ -2215,6 +2534,27 @@ class SimpleChatLoop:
                 # - and the only thing that stopped it was max_rounds. Say what
                 # happened instead of burning the rest of the budget.
                 tried = self._stalls.unproductive
+                switch = self._change_of_strategy()
+                if switch:
+                    # THE THIRD EXIT. This ceiling used to end the turn on an
+                    # apology, and the apology asked the user to do the work:
+                    # "tell me the exact text to look for". That is the defect
+                    # the user reported - four failed matches and the agent
+                    # hands the problem back. smallcode's early-stop detector
+                    # does not stop here, it changes the approach, and it is
+                    # right: patching is one strategy among several and only
+                    # one of them has been tried.
+                    #
+                    # Ours names `replace_symbol`, where smallcode forces a
+                    # whole-file rewrite. We have a symbol editor they do not,
+                    # and a whole-file rewrite is what the write cap exists to
+                    # refuse - recommending it would swap one dead end for
+                    # another.
+                    self._stalls.unproductive = 0
+                    self._strategy_switched = True
+                    self.state.append_user(switch, origin=ORIGIN_LOOP)
+                    self._activity("patching is not working; asked it to change approach")
+                    continue
                 # Reset now the user has been TOLD. The defect was a counter
                 # that reset silently without ever tripping; one that stays hot
                 # after it fires would stop the next turn before it started.
@@ -2230,6 +2570,17 @@ class SimpleChatLoop:
                     tool_calls,
                     changed,
                 )
+            looping = self._read_loop.record(
+                outcome.tool_names,
+                # Producing ANYTHING ends the streak - a file changed, a command
+                # run, a note written. Not just a write: an answer is production
+                # too, and this guard is about a turn with nothing to show.
+                produced_something=bool(outcome.written)
+                or bool(set(outcome.tool_names) - LOOKING_TOOLS),
+            )
+            if looping:
+                self.state.append_user(looping.correction, origin=ORIGIN_LOOP)
+                self._activity(looping.activity)
             if outcome.repeated_read:
                 # A read that repeats verbatim is the model having lost track of
                 # what it already has, not new information. Say so once and name
@@ -2477,13 +2828,18 @@ class SimpleChatLoop:
         kwargs = {
             "model": self.model_name,
             "messages": messages,
-            "tools": active_tool_schemas(
-                num_ctx, self._tool_category, self._available_families
+            "tools": self._without_broken_tools(
+                active_tool_schemas(
+                    num_ctx, self._tool_category, self._available_families, self._request
+                )
             ),
             "stream": False,
             "think": self._should_think(),
             "options": {
-                "temperature": self.temperature,
+                # Colder on the first retry, warmer on the second. At one fixed
+                # temperature a retry produces the same strategy and the same
+                # mistake - which is how the same payload went out nine times.
+                "temperature": adapted_temperature(self.temperature, self._repair_streak),
                 "num_ctx": num_ctx,
                 # What is actually FREE, not a fixed share. See `_reply_cap`.
                 "num_predict": self._remember_reply_cap(messages, num_ctx),
@@ -2672,6 +3028,18 @@ class SimpleChatLoop:
         # Two halves of one question: the listing says which files exist, the
         # brief says what is inside the ones this turn is about.
         grounding = render_workspace_files(self._files)
+        standing = self._standing_plan()
+        if standing:
+            # The contract has existed for weeks and reached the model only if
+            # it called `contract_status` - so the thing meant to keep a
+            # multi-step task on the rails was invisible to exactly the model
+            # that had lost the thread and stopped asking.
+            grounding = standing + chr(10) * 2 + grounding
+        if self._project:
+            # First, and one line: what KIND of project this is and how its
+            # tests run. Without it a model opening a fresh workspace spends
+            # three to five calls working that out, every session.
+            grounding = self._project + chr(10) * 2 + grounding
         remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
@@ -2971,9 +3339,36 @@ class SimpleChatLoop:
         under two-stage routing those differ by ~1,700 tokens, and item A is
         entirely about not letting the estimate and the request disagree.
         """
-        return active_tool_schemas(
-            self._ceiling(), self._tool_category, self._available_families
+        return self._without_broken_tools(
+            active_tool_schemas(
+                self._ceiling(), self._tool_category, self._available_families, self._request
+            )
         )
+
+    def _without_broken_tools(
+        self, schemas: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Drop tools that have failed repeatedly THIS session.
+
+        smallcode's trust decay, with the difference that matters: a writing
+        tool is never dropped. Theirs may withhold any tool after five
+        consecutive failures, and withholding `patch_file` would leave a model
+        that cannot edit anything - a worse state than the loop it prevents. A
+        search that keeps returning nothing can be taken away; the ability to
+        change a file cannot. `TrustDecay.protected` carries that list.
+
+        Never empties the roster: if everything offered has been failing, the
+        answer is not to send zero tools.
+        """
+        dropped = self._trust.dropped()
+        if not dropped:
+            return schemas
+        kept = [
+            schema
+            for schema in schemas
+            if (schema.get("function") or {}).get("name") not in dropped
+        ]
+        return kept or schemas
 
     def _ceiling(self) -> int:
         """The context window this session asks Ollama for.
@@ -3168,11 +3563,18 @@ class SimpleChatLoop:
                 ok=bool(result.ok),
                 message=_first_line(result.message),
             )
+            self._trust.record(name, bool(result.ok))
             if not result.ok:
                 # Kept for the evidence note. smallcode keeps the error TAIL for
                 # the same reason: the last line says what went wrong, the rest
                 # is where it happened, and a full trace is 5-50KB.
                 self._turn_failures.append((name, _first_line(result.message)))
+            if result.ok and (result.data or {}).get("ask_user"):
+                # The question, for the loop to end the turn on. Recorded here
+                # rather than returned, because the calls after this one in the
+                # same generation still deserve to run - the model may have
+                # asked and read a file in one turn.
+                outcome.asked = result.message.strip() or outcome.asked
             payload = _budgeted(result.to_json())
             if name == "read_file" and '"content_truncated": true' in payload.lower():
                 # `_budgeted` trims AFTER `_execute` has run, so the ToolResult
@@ -3216,6 +3618,10 @@ class SimpleChatLoop:
                 if _changed_nothing(result):
                     self._stalls.unproductive += 1
                     self._repair_streak += 1
+                    self._last_failed_path = (
+                        str(arguments.get("filepath") or "").strip()
+                        or self._last_failed_path
+                    )
                 else:
                     self._stalls.unproductive = 0
             else:
@@ -3275,6 +3681,56 @@ class SimpleChatLoop:
                 self._truncated_refusals = 0
                 self._truncated_target = ""
         return outcome
+
+    def _change_of_strategy(self) -> str:
+        """Stop patching, edit by symbol instead - or ``""`` if already said.
+
+        The third exit. Four failed matches used to end the turn with *"I have
+        stopped rather than keep guessing. It would help to tell me the exact
+        text to look for"* - an apology that hands the work back to the user,
+        which is exactly what they reported. Patching is one strategy and it is
+        the only one that had been tried.
+
+        Why `replace_symbol` rather than smallcode's forced whole-file rewrite:
+        a failing `patch_file` means the model cannot reproduce the old text
+        byte-for-byte, and `replace_symbol` is the tool that does not require it
+        to - it names the function and sends the new body. A whole-file rewrite
+        needs the model to hold the entire file correctly, which is a harder
+        version of the thing it is currently failing at, and `MAX_WRITE_CHARS`
+        would refuse it for anything sizeable anyway.
+
+        Once per turn. Said twice it stops being a change of strategy and
+        becomes the loop repeating itself at the model.
+        """
+        if self._strategy_switched:
+            return ""
+        named = self._last_failed_path or self._stalls_last_path()
+        target = named or "that file"
+        return (
+            f"Stop patching {target}. Four edits in a row changed nothing, so the "
+            "text you are matching is not what the file actually contains, and "
+            "sending it again cannot help.\n\n"
+            "Change approach now:\n"
+            f"1. read_file on {target} - over 200 lines you get its outline, with "
+            "the exact line range of every function and class.\n"
+            "2. read_symbol on the ONE function or class that is wrong, to see "
+            "its real current text.\n"
+            f"3. replace_symbol on {target} with that symbol's name and its "
+            "complete new body. It replaces the whole symbol by NAME, so you "
+            "never have to reproduce the old text exactly - which is the step "
+            "that has been failing."
+        )
+
+    def _stalls_last_path(self) -> str:
+        """The file most of this conversation's failures were aimed at."""
+        counts: dict[str, int] = {}
+        for signature, failures in self._stalls.failures.items():
+            path = _signature_path(signature)
+            if path:
+                counts[path] = counts.get(path, 0) + failures
+        if not counts:
+            return ""
+        return max(counts.items(), key=lambda item: item[1])[0]
 
     def _refuse_repeated_failure(
         self,
@@ -3630,11 +4086,19 @@ class SimpleChatLoop:
             return self._composite_tool(name, arguments)
         target = SIMPLE_TOOLS.get(name)
         if target is None:
+            # A correction, not a repetition. This used to answer an invented
+            # name with the full list of thirty - the same list already in the
+            # prompt the model has just demonstrated it is not reading - handed
+            # back at the exact moment it is confused.
+            close = closest_tool_names(name, sorted(SIMPLE_TOOLS))
+            if close:
+                suggestion = f" Did you mean {' or '.join(close)}?"
+            else:
+                suggestion = " Available: " + ", ".join(sorted(SIMPLE_TOOLS))
             return ToolResult(
                 False,
-                f"There is no tool called {name}. Available: "
-                + ", ".join(sorted(SIMPLE_TOOLS)),
-                {"unknown_tool": name},
+                f"There is no tool called {name}.{suggestion}",
+                {"unknown_tool": name, "closest": close},
             )
         if name in {"patch_file", "read_and_patch"}:
             arguments = _strip_line_numbers(arguments)
@@ -3909,10 +4373,13 @@ class SimpleChatLoop:
             return result
         suffix = Path(relative).suffix
         if not can_outline(suffix):
-            # No parser and no declaration scan for this file type. The old
-            # head-clip is still the honest answer - it is not a good one, but
-            # inventing structure for a `.md` file would be worse.
-            return result
+            # No parser and no declaration scan for this file type - a `.md`,
+            # a `.txt`, a `.csv`. Inventing structure for those would be worse
+            # than not trying, but the old answer was a HEAD CLIP, and a head
+            # clip is what starts the dead end in SMALLCODE_GAP_ANALYSIS.md §2:
+            # the model never sees how the file ends, so it patches against a
+            # half it was never shown. smallcode's read guard keeps both ends.
+            return self._head_and_tail(relative, body, total, data)
         rendered = render_outline(relative, body, suffix)
         if not rendered:
             return result
@@ -3929,6 +4396,69 @@ class SimpleChatLoop:
             "start_line and end_line for a specific part.",
             data,
         )
+
+    def _head_and_tail(
+        self, relative: str, body: str, total: int, data: dict[str, Any]
+    ) -> ToolResult:
+        """Both ends of a file nothing can outline, rather than only the first.
+
+        smallcode's `read_guard.js` trims head AND tail; SHAMSU's fallback kept
+        the head alone. For a 900-line changelog or a long `.md` spec that means
+        the model is shown the oldest entries and never the newest - and then
+        asked to add one at the end, against text it has not seen.
+
+        Deliberately not applied to code: `can_outline` handled that first, and
+        an outline beats any amount of head-and-tail because it shows the whole
+        shape rather than two arbitrary slices.
+        """
+        lines = body.splitlines()
+        if len(lines) <= HEAD_TAIL_LINES * 2 + 10:
+            # Small enough that two ends would overlap, or nearly. Sending it
+            # whole is both simpler and more useful.
+            return ToolResult(True, f"{relative} ({total:,} lines).", data)
+        head = lines[:HEAD_TAIL_LINES]
+        tail = lines[-HEAD_TAIL_LINES:]
+        hidden = len(lines) - (HEAD_TAIL_LINES * 2)
+        shown = (
+            chr(10).join(head)
+            + f"{chr(10)}{chr(10)}... [{hidden:,} lines not shown - "
+            f"read_file with start_line and end_line for any of them] ...{chr(10)}{chr(10)}"
+            + chr(10).join(tail)
+        )
+        data = {**data, "content": shown, "truncated": True, "head_and_tail": True}
+        self._activity(
+            f"{relative} is {total:,} lines; sent its first and last "
+            f"{HEAD_TAIL_LINES} lines"
+        )
+        return ToolResult(
+            True,
+            f"{relative} is {total:,} lines, so this is its beginning and its END - "
+            f"{hidden:,} lines in the middle are not shown. Call read_file with "
+            "start_line and end_line for any part of the middle.",
+            data,
+        )
+
+    def _standing_plan(self) -> str:
+        """The active contract, re-shown as this turn's plan, or ``""``.
+
+        Read from disk rather than cached on the loop, because a fresh
+        `SimpleChatLoop` is built per user message and the plan has to survive
+        that - which is the whole point of anchoring it.
+        """
+        try:
+            from shamsu.agents.simple_contract import contract_disabled, load_contract
+
+            if contract_disabled():
+                return ""
+            contract = load_contract(self.workspace)
+        except Exception:  # noqa: BLE001 - an anchor must never fail a turn
+            return ""
+        if contract is None or contract.done:
+            # A finished contract is not a plan, it is history. Re-showing it
+            # would tell a model starting something new to keep working through
+            # a list it has already completed.
+            return ""
+        return plan_anchor(contract.render())
 
     def _contract_blocks_this_claim(self, text: str, already_nudged: int) -> str:
         """The contract's correction for a premature "done", or ``""``."""
@@ -5672,6 +6202,58 @@ def _bounded_summary(lines: list[str], budget_tokens: int) -> str:
         else:
             head -= 1
     return chr(10).join(lines[:1] + ["- (older detail compacted)"] + lines[-1:])
+
+#: What a project's manifest tells you about it, without opening it.
+_PROJECT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("package.json", "Node"),
+    ("pyproject.toml", "Python"),
+    ("setup.py", "Python"),
+    ("requirements.txt", "Python"),
+    ("Cargo.toml", "Rust"),
+    ("go.mod", "Go"),
+    ("pom.xml", "Java"),
+    ("Gemfile", "Ruby"),
+    ("composer.json", "PHP"),
+    ("CMakeLists.txt", "C/C++"),
+)
+
+
+def project_brief(workspace: Path) -> str:
+    """One line saying what this project IS, for the first turn and every one after.
+
+    smallcode's `src/session/bootstrap.js`. The machinery was all here -
+    `detect_test_command` reads package.json scripts and pytest layouts, the
+    manifests are one `exists()` each - and nothing ever summarised it into the
+    prompt. So a model opening a fresh workspace spent three to five calls
+    working out what kind of project it was and how to run its tests, every
+    session, and often guessed instead.
+
+    Costs about thirty tokens and roughly a dozen file stats. Deliberately
+    silent when it knows nothing: a line reading "Project: unknown" is worse
+    than no line, because it looks like an answer.
+    """
+    parts: list[str] = []
+    kinds: list[str] = []
+    for marker, language in _PROJECT_MARKERS:
+        try:
+            if (workspace / marker).is_file() and language not in kinds:
+                kinds.append(language)
+        except OSError:
+            continue
+    if kinds:
+        parts.append("/".join(kinds[:3]))
+    try:
+        from shamsu.agents.simple_tests import detect_test_command
+
+        command = detect_test_command(workspace).command
+        if command:
+            parts.append(f"tests: `{command}`")
+    except Exception:  # noqa: BLE001 - a brief must never fail a turn
+        pass
+    if not parts:
+        return ""
+    return "This project: " + ", ".join(parts) + "."
+
 
 def workspace_files(workspace: Path, limit: int = MAX_LISTED_FILES) -> list[str]:
     """Every file in the workspace right now, as posix-relative paths.

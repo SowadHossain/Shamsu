@@ -541,7 +541,12 @@ def render_report(report: EvalReport) -> str:
         "re-measured with more samples. Compare baselines only at equal\n"
         "`--samples`; a delta that lives entirely inside the flaky set is no\n"
         "delta. Tier-specific findings (root causes of consistent failures)\n"
-        "live in `agent context/SHAMSU_agent_gap_analysis.md` under I3."
+        "live in `agent context/SHAMSU_agent_gap_analysis.md` under I3.\n"
+        "\n"
+        "Do not read a delta out of two of these tables by eye. Run both with\n"
+        "`--json-out` and compare them with `python -m evals.diff <baseline>\n"
+        "<feature>`, which applies every rule in this paragraph mechanically\n"
+        "and exits 0 improved / 1 regressed / 2 noise."
     )
     lines.append("")
     lines.append("## Deterministic release metrics")

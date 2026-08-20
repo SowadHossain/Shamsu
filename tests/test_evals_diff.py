@@ -248,3 +248,54 @@ def test_an_old_report_without_sample_counts_still_compares(tmp_path):
     *_, result = compare(str(old), str(new))
 
     assert result == IMPROVED
+
+
+# --- the flaky rule, sharpened ------------------------------------------
+
+
+def test_a_movement_no_bigger_than_the_noise_is_still_withheld(tmp_path):
+    """4/7 -> 7/7 looks like a fix and is not distinguishable from luck at seven
+    samples (Fisher p~0.19). This is the real case from 2026-08-20."""
+    base = _report(tmp_path, "base.json", {"asking": (4, 7)})
+    feat = _report(tmp_path, "feat.json", {"asking": (7, 7)})
+
+    _b, _f, moves, delta, result = compare(base, feat)
+
+    assert [n for n, _x, _y in moves.unreliable] == ["asking"]
+    assert delta == 0.0
+    assert result == NOISE
+
+
+def test_a_flaky_case_that_becomes_solidly_fixed_IS_counted(tmp_path):
+    """The limitation the flat exclusion had: a case flaky BEFORE could never be
+    shown to have been FIXED, however solid it became. With enough samples the
+    movement stops being explicable as the same coin."""
+    base = _report(tmp_path, "base.json", {"asking": (1, 20)})
+    feat = _report(tmp_path, "feat.json", {"asking": (20, 20)})
+
+    _b, _f, moves, delta, result = compare(base, feat)
+
+    assert [n for n, _x, _y in moves.recovered] == ["asking"]
+    assert moves.unreliable == []
+    assert result == IMPROVED
+
+
+def test_a_real_collapse_out_of_a_flaky_state_is_a_regression(tmp_path):
+    """Judged as strictly in the other direction: a guard that quietly destroys
+    a case must not hide behind "it was flaky anyway"."""
+    base = _report(tmp_path, "base.json", {"asking": (19, 20)})
+    feat = _report(tmp_path, "feat.json", {"asking": (0, 20)})
+
+    _b, _f, moves, _delta, result = compare(base, feat)
+
+    assert [n for n, _x, _y in moves.regressed] == ["asking"]
+    assert result == REGRESSED
+
+
+def test_a_small_wobble_at_large_sample_counts_is_still_noise(tmp_path):
+    base = _report(tmp_path, "base.json", {"asking": (10, 20)})
+    feat = _report(tmp_path, "feat.json", {"asking": (12, 20)})
+
+    *_, result = compare(base, feat)
+
+    assert result == NOISE

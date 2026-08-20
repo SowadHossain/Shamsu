@@ -174,6 +174,61 @@ def load_run(argument: str) -> RunSummary:
     return RunSummary(path=str(target), tier=str(raw.get("tier") or ""), cases=cases)
 
 
+#: Below this, a movement is unlikely enough under "nothing changed" to count
+#: even when one side was flaky. Conventional, and deliberately strict: the cost
+#: of believing a false improvement here is shipping a guard that does nothing.
+SIGNIFICANCE = 0.05
+
+
+def _fisher_exact_greater(a: int, b: int, c: int, d: int) -> float:
+    """One-tailed Fisher exact p for a 2x2 table, by direct enumeration.
+
+    ``a``/``b`` are the baseline's passes/failures, ``c``/``d`` the feature's.
+    Written out rather than pulled from scipy because this tool must run in a
+    bare checkout, and the tables are tiny - the whole point is that sample
+    counts here are single digits.
+    """
+    from math import comb
+
+    rows = (a + b, c + d)
+    passes = a + c
+    total = a + b + c + d
+    if not all(rows) or passes in (0, total):
+        return 1.0
+    denominator = comb(total, passes)
+    # Sum the probability of every table at least as extreme as this one, in
+    # the direction of the observed movement.
+    observed = c
+    tail = 0
+    for k in range(observed, min(rows[1], passes) + 1):
+        tail += comb(rows[1], k) * comb(rows[0], passes - k)
+    return min(1.0, tail / denominator)
+
+
+def _significant(before: CaseRun, after: CaseRun) -> bool:
+    """Is this movement bigger than one case's own noise can explain?
+
+    The question a flat flaky-exclusion refuses to ask. `4/7 -> 7/7` looks like
+    a fix and is not distinguishable from luck at seven samples (p~0.19);
+    `1/20 -> 20/20` is. Only ever used to RESCUE a movement the flaky rule
+    would otherwise discard - a movement between two solid states never needs
+    it.
+    """
+    if after.rate > before.rate:
+        p = _fisher_exact_greater(
+            before.passes, before.runs - before.passes,
+            after.passes, after.runs - after.passes,
+        )
+    else:
+        # Same test with the roles swapped, so a regression is judged as
+        # strictly as an improvement.
+        p = _fisher_exact_greater(
+            after.passes, after.runs - after.passes,
+            before.passes, before.runs - before.passes,
+        )
+    return p <= SIGNIFICANCE
+
+
 def classify(base: RunSummary, feature: RunSummary) -> Moves:
     """Sort every case into moved-and-countable, moved-but-flaky, or absent."""
     moves = Moves()
@@ -189,10 +244,17 @@ def classify(base: RunSummary, feature: RunSummary) -> Moves:
         if before.rate == after.rate:
             continue
         movement = (name, before.rate, after.rate)
-        if before.flaky or after.flaky:
+        if (before.flaky or after.flaky) and not _significant(before, after):
             # The rule BENCHMARK.md has stated in prose and never enforced. A
             # case that passed 1/3 and now passes 2/3 has told us nothing: both
             # numbers are inside its own noise.
+            #
+            # `_significant` is the escape, added after a flat exclusion proved
+            # too blunt in use: it meant a case that was flaky BEFORE could
+            # never be shown to have been FIXED, however solid it became. Now
+            # the question is asked properly - could this movement plausibly be
+            # the same coin landing differently? - so 4/7 -> 7/7 is still
+            # withheld (p~0.19) while 1/20 -> 20/20 is not.
             moves.unreliable.append(movement)
         elif after.rate < before.rate:
             moves.regressed.append(movement)

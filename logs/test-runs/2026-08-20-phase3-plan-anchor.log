@@ -1,0 +1,81 @@
+### Phase 3 - plan anchor, plan role, adaptive temperature, diff significance
+
+--- unit tests ---
+...........................................................              [100%]
+59 passed in 1.93s
+
+--- the plan role withholds write tools; advice routes there ---
+  plan how to add authentication             -> plan   writes=NONE
+  how should we approach the refactor?       -> plan   writes=NONE
+  now just fix the typo                      -> write  writes=['delete_file', 'patch_file', 'replace_symbol', 'write_file']
+  refactor the session store                 -> write  writes=['delete_file', 'patch_file', 'replace_symbol', 'write_file']
+
+--- the significance test, on the REAL 7-sample data from earlier ---
+  walltime : 548s  ->  279s   (-269s)
+
+  MOVED BUT FLAKY - not counted (2):
+      ask_before_destructive_guess: 57.1% -> 100.0%
+      ask_user_clarifies: 14.3% -> 57.1%
+
+  VERDICT  : NOISE
+
+  (4/7 -> 7/7 remains withheld at p~0.19; 1/20 -> 20/20 would not be)
+
+--- EVAL: Phase 3 vs Phase 2 ---
+
+  SHAMSU eval diff
+  --------------------------------------------------------
+  baseline : tmp\bench\phase2.json  [default]
+  feature  : tmp\bench\phase3.json  [default]
+  samples  : 3 per case
+
+  reward   : 80.6%  ->  83.3%
+  reliable : +0.000   (threshold +/-0.020)
+  walltime : 972s  ->  1320s   (+348s)
+
+  MOVED BUT FLAKY - not counted (1):
+      ask_user_clarifies: 66.7% -> 100.0%
+
+  VERDICT  : NOISE
+
+EXIT=2
+
+--- EVAL: cumulative, original baseline vs now ---
+
+  SHAMSU eval diff
+  --------------------------------------------------------
+  baseline : tmp\bench\baseline-phase1.json  [default]
+  feature  : tmp\bench\phase3.json  [default]
+  samples  : 3 per case
+
+  reward   : 66.7%  ->  83.3%
+  reliable : +0.100   (threshold +/-0.020)
+  walltime : 1585s  ->  1320s   (-265s)
+
+  RECOVERED (1):
+      rename_file_via_move_tool: 0.0% -> 100.0%
+  MOVED BUT FLAKY - not counted (2):
+      ask_before_destructive_guess: 66.7% -> 100.0%
+      ask_user_clarifies: 33.3% -> 100.0%
+
+  VERDICT  : IMPROVED
+
+EXIT=0
+
+--- does the plan anchor fire on ANY eval case? ---
+  fires on 0 of 12 cases: NONE
+    e.g. 'What tax rate does pricing.py apply in its total() function?'
+    e.g. 'Create a file hello.py that prints hello world.'
+    e.g. 'In calc.py, change the add function so it subtracts b from a'
+    e.g. 'broken.py has a syntax error on the def line. Fix it so the '
+
+CONCLUSION. Phase 3 is unmeasured by this suite, and the walltime rise
+is NOT the plan anchor - it cannot be, because the anchor never fired on a
+single case. Walltime across five runs of the same suite: 1585, 1415, 895,
+972, 1320s. That is variance.
+
+The real finding is about the SUITE. All 12 cases are single-step, one-line
+prompts. Everything built this session for multi-step work and degenerate
+behaviour - the plan anchor, the read-loop guard, greeting regression,
+trust decay, the third exit - is invisible to it by construction. The only
+thing it could measure was a missing tool, and it did: rename 0/3 -> 3/3.

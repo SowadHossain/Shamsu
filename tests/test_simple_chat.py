@@ -228,6 +228,10 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
     conditional = {
         "memory_load", "memory_list", "memory_forget",
         "graph_search", "explain_symbol", "history_search",
+        # A bare tmp_path is not a repository, so read-only git can only
+        # answer "not a git repository" - the same 516-token nothing the
+        # families above were withheld for.
+        "git_status", "git_diff", "git_log",
     }
 
     # Everything that can act on a bare workspace, and nothing that cannot.
@@ -251,6 +255,11 @@ def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_
     (index / "last-index.json").write_text("{}", encoding="utf-8")
     for name in ("20260819-000001-aaaa", "20260819-000002-bbbb"):
         (paths.sessions_dir(tmp_path) / name).mkdir(parents=True, exist_ok=True)
+    # "Everything has something to answer from" now includes a repository for
+    # read-only git to describe.
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
 
     loop = _loop(tmp_path, [_text("ok")])
     asyncio.run(loop.run("hi"))
@@ -2193,6 +2202,20 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
     (tmp_path / "hello.py").write_text(
         "value = 1\n\n\ndef greet():\n    return value\n", encoding="utf-8"
     )
+    # `move_file` and `delete_file` get their own throwaways: probing them
+    # against hello.py renamed or removed the file every LATER probe depends on.
+    (tmp_path / "to_move.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "to_delete.py").write_text("x = 1\n", encoding="utf-8")
+    # `git_status` and friends need a repository to describe, and `git_log`
+    # needs it to have at least one commit - "does not have any commits yet" is
+    # git being right, and says nothing about whether the schema names reach
+    # the implementation, which is what this test is for.
+    import subprocess
+
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run([*git, "add", "-A"], cwd=tmp_path, check=True)
+    subprocess.run([*git, "commit", "-qm", "probe"], cwd=tmp_path, check=True)
 
     for schema in SIMPLE_TOOL_SCHEMAS:
         function = schema.get("function", schema)
@@ -2244,7 +2267,22 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 f"{name} -> {result.message}"
             )
             continue
-        arguments = {key: "hello.py" if "file" in key else "value" for key in required}
+        # One placeholder for every argument is fine until a tool's arguments
+        # must DIFFER from each other: `move_file("value", "value")` is
+        # correctly refused as a move onto itself, which says nothing about
+        # whether its schema names reach the implementation.
+        distinct = {
+            "move_file": {"source": "to_move.py", "destination": "moved.py"},
+            # No arguments at all, and "value" is not a file to delete.
+            "delete_file": {"filepath": "to_delete.py"},
+            "git_status": {},
+            "git_diff": {},
+            "git_log": {"limit": "3"},
+            "ask_user": {"question": "Which one?"},
+        }
+        arguments = distinct.get(name) or {
+            key: "hello.py" if "file" in key else "value" for key in required
+        }
         normalized = normalize_arguments(name, arguments)
         result = tools.execute(SIMPLE_TOOLS[name], normalized)
         assert result.ok, f"{name}({arguments}) -> {result.message}"
@@ -5665,11 +5703,15 @@ def test_the_no_op_stop_does_not_stop_the_next_turn_before_it_starts(tmp_path):
 
     reset_session_stalls("s7")
     (tmp_path / "a.js").write_text("real contents\n", encoding="utf-8")
+    # Twice the ceiling, because the ceiling is no longer the end of the road:
+    # the first time it is reached the loop offers a change of strategy and
+    # resets the counter, and only the SECOND time does it stop. Reaching the
+    # stop is what this test is about, so it has to get past the new exit.
     misses = [
         _tool("patch_file", filepath="a.js", old_string=f"missing {i}", new_string="x")
-        for i in range(MAX_UNPRODUCTIVE_EDITS + 2)
+        for i in range(MAX_UNPRODUCTIVE_EDITS * 2 + 2)
     ]
-    first = _stall_loop(tmp_path, misses, "s7", max_rounds=8, verify_changes=False)
+    first = _stall_loop(tmp_path, misses, "s7", max_rounds=14, verify_changes=False)
     result = asyncio.run(first.run("fix a.js"))
 
     assert result.stopped
@@ -7999,3 +8041,496 @@ def test_two_failures_in_a_row_still_switch_thinking_off(tmp_path):
 
     assert loop._repair_streak >= 2
     assert loop._should_disable_thinking() is True
+
+
+# --- Phase 1a: the tools simple mode could not reach --------------------------
+
+
+def test_renaming_a_file_does_not_require_guessing_a_shell_verb(tmp_path):
+    """`rename_file_via_move_tool` is an eval case named after a tool simple
+    mode never offered. It sat at 1/3 in BENCHMARK.md, read as model variance;
+    the only route to a pass was guessing `mv` against `move` against `ren`
+    through run_command and getting it approved."""
+    (tmp_path / "old_name.py").write_text("GREETING = 'hi'\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("move_file", source="old_name.py", destination="new_name.py"),
+            _text("Renamed it."),
+        ],
+    )
+
+    asyncio.run(loop.run("rename old_name.py to new_name.py"))
+
+    assert (tmp_path / "new_name.py").read_text(encoding="utf-8") == "GREETING = 'hi'\n"
+    assert not (tmp_path / "old_name.py").exists(), "a rename leaves nothing behind"
+
+
+def test_move_file_is_offered_to_the_model_and_routed_with_the_write_tools(tmp_path):
+    """A tool the schema list never mentions cannot be called, however well it
+    works - and a rename is a write, not a shell command."""
+    from shamsu.agents.simple_router import TOOL_CATEGORIES
+
+    assert "move_file" in {s["function"]["name"] for s in SIMPLE_TOOL_SCHEMAS}
+    assert "move_file" in TOOL_CATEGORIES["write"]["tools"]
+
+
+def test_a_rename_onto_an_existing_file_is_refused_rather_than_silently_losing_it(tmp_path):
+    """The destructive edge of a rename. Overwriting the destination would lose
+    a file the user never mentioned."""
+    (tmp_path / "old_name.py").write_text("keep me\n", encoding="utf-8")
+    (tmp_path / "taken.py").write_text("already here\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("move_file", source="old_name.py", destination="taken.py"),
+            _text("could not"),
+        ],
+    )
+
+    asyncio.run(loop.run("rename old_name.py to taken.py"))
+
+    assert (tmp_path / "taken.py").read_text(encoding="utf-8") == "already here\n"
+    assert (tmp_path / "old_name.py").is_file(), "the source survives a refused move"
+
+
+def test_asking_the_user_ends_the_turn_with_the_question_as_the_answer(tmp_path):
+    """`ask_user` does not block - it hands back a structured question and
+    expects the LOOP to stop on it. Simple mode never had that half, so the
+    tool sat in the registry unreachable while the prompt told the model to ask
+    whenever a decision was the user's to make."""
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("ask_user", question="Sessions or JWT?"),
+            _text("SHOULD NEVER BE REACHED"),
+        ],
+    )
+
+    result = asyncio.run(loop.run("add authentication"))
+
+    assert result.final == "Sessions or JWT?"
+    assert result.rounds == 1, "the turn ends on the question, it does not carry on"
+    assert not result.stopped, "asking is a correct outcome, not a failure"
+
+
+def test_a_question_is_a_real_assistant_turn_so_the_next_message_answers_it(tmp_path):
+    """No pending-question store: the conversation IS the store. The question
+    has to survive in the transcript or the user's answer arrives as a reply to
+    nothing."""
+    loop = _loop(tmp_path, [_tool("ask_user", question="Which config file?")])
+
+    asyncio.run(loop.run("update the config"))
+
+    said = [m.content for m in loop.state.all_messages if m.role == "assistant"]
+    assert "Which config file?" in said
+
+
+def test_the_model_can_ask_from_any_category(tmp_path):
+    """An ambiguity turns up in a category nobody predicted. A category switch
+    standing between the model and the question is exactly the friction that
+    makes a small model guess instead."""
+    from shamsu.agents.simple_router import ALWAYS_TOOLS, tools_for_category
+
+    assert "ask_user" in ALWAYS_TOOLS
+    for category in ("read", "write", "run", "search", "verify", "recall"):
+        names = {
+            s["function"]["name"]
+            for s in tools_for_category(category, SIMPLE_TOOL_SCHEMAS)
+        }
+        assert "ask_user" in names, category
+
+
+def test_deleting_a_file_is_possible_and_reversible(tmp_path):
+    """The other half of editing a project. Backed up, so it can be undone."""
+    (tmp_path / "junk.py").write_text("x = 1\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [_tool("delete_file", filepath="junk.py"), _text("Deleted it.")],
+    )
+
+    asyncio.run(loop.run("delete junk.py"))
+
+    assert not (tmp_path / "junk.py").exists()
+
+
+def test_the_model_can_see_what_it_actually_changed(tmp_path):
+    """`_with_diff` shows one edit. `git_diff` shows the turn - which is the
+    view that answers "what did I just break", the question behind the whole
+    patch-and-cannot-fix-it failure."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / "app.py").write_text("x = 1\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_tool("git_status"), _text("You have one new file.")])
+
+    asyncio.run(loop.run("what have I changed?"))
+
+    said = [m.content for m in loop.state.all_messages if getattr(m, "name", "") == "git_status"]
+    assert said and "app.py" in said[0], said
+
+
+def test_git_tools_are_withheld_where_there_is_no_repository(tmp_path):
+    """The project's own rule - offer only the tools that have something to
+    answer from. `git status` outside a repo costs a round to learn nothing."""
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    families = available_tool_families(tmp_path)
+    names = {
+        s["function"]["name"]
+        for s in active_tool_schemas(context_window=32768, available=families)
+    }
+
+    assert "git" not in families
+    assert not {"git_status", "git_diff", "git_log"} & names
+
+
+def test_git_tools_are_offered_inside_a_repository(tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    from shamsu.agents.simple_chat import active_tool_schemas, available_tool_families
+
+    families = available_tool_families(tmp_path)
+    names = {
+        s["function"]["name"]
+        for s in active_tool_schemas(context_window=32768, available=families)
+    }
+
+    assert "git" in families
+    assert {"git_status", "git_diff", "git_log"} <= names
+
+
+# --- the third exit: a strategy change before a stop --------------------------
+
+
+def test_four_failed_patches_change_the_approach_instead_of_giving_up(tmp_path):
+    """THE reported failure. Four non-matching patches ended the turn with "I
+    have stopped rather than keep guessing - it would help to tell me the exact
+    text to look for": an apology that hands the work back to the user.
+
+    Patching is one strategy and it was the only one tried. `replace_symbol`
+    names the function instead of reproducing its old text byte-for-byte, which
+    is precisely the step that has been failing.
+    """
+    (tmp_path / "game.js").write_text(
+        "function update() {\n  return 1;\n}\n", encoding="utf-8"
+    )
+    misses = [
+        _tool("patch_file", filepath="game.js", old_string=f"nope{i}", new_string="x")
+        for i in range(4)
+    ]
+    loop = _loop(tmp_path, [*misses, _text("ok")])
+
+    result = asyncio.run(loop.run("fix update()"))
+
+    assert not result.stopped, "a strategy is left to try, so the turn continues"
+    nudge = [m.content for m in loop.state.all_messages if m.role == "user"][-1]
+    assert "replace_symbol" in nudge
+    assert "game.js" in nudge, "the advice must name the file, not 'that file'"
+    assert "read_symbol" in nudge
+
+
+def test_the_strategy_change_is_offered_once_and_then_it_really_stops(tmp_path):
+    """Every guard needs an exit. Said twice, a change of strategy stops being
+    one and becomes the loop repeating itself at the model."""
+    (tmp_path / "game.js").write_text(
+        "function update() {\n  return 1;\n}\n", encoding="utf-8"
+    )
+    misses = [
+        _tool("patch_file", filepath="game.js", old_string=f"nope{i}", new_string="x")
+        for i in range(9)
+    ]
+    loop = _loop(tmp_path, [*misses, _text("ok")])
+
+    result = asyncio.run(loop.run("fix update()"))
+
+    assert result.stopped
+    assert "changed nothing" in result.final
+    assert loop._strategy_switched, "it must have tried the other approach first"
+
+
+def test_a_patch_that_lands_never_triggers_the_strategy_change(tmp_path):
+    """The counter is about being stuck. A working edit is not."""
+    (tmp_path / "game.js").write_text(
+        "function update() {\n  return 1;\n}\n", encoding="utf-8"
+    )
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("patch_file", filepath="game.js", old_string="return 1;", new_string="return 2;"),
+            _text("done"),
+        ],
+    )
+
+    asyncio.run(loop.run("bump it"))
+
+    assert not loop._strategy_switched
+
+
+# --- Phase 2 guards, wired into the loop --------------------------------------
+
+
+def test_eight_reads_without_producing_anything_is_interrupted(tmp_path):
+    """Simple mode already caught an IDENTICAL read repeated three times - the
+    model losing track of what it has. Eight DIFFERENT reads that produce
+    nothing is a different fault and no counter saw it."""
+    for i in range(9):
+        (tmp_path / f"f{i}.py").write_text(f"x = {i}\n", encoding="utf-8")
+    reads = [_tool("read_file", filepath=f"f{i}.py") for i in range(9)]
+    loop = _loop(tmp_path, [*reads, _text("done")], max_rounds=12)
+
+    asyncio.run(loop.run("review these files"))
+
+    nudges = [
+        m.content for m in loop.state.all_messages
+        if m.role == "user" and "produced nothing" in m.content
+    ]
+    assert nudges, "it read nine files and was never asked to produce anything"
+    assert any("Stop reading" in n for n in nudges)
+
+
+def test_reading_then_writing_is_never_interrupted(tmp_path):
+    """The guard must not punish the normal shape of an edit: look, then act."""
+    for i in range(6):
+        (tmp_path / f"f{i}.py").write_text(f"x = {i}\n", encoding="utf-8")
+    turns = []
+    for i in range(6):
+        turns.append(_tool("read_file", filepath=f"f{i}.py"))
+        turns.append(_tool("write_file", filepath=f"out{i}.py", content=f"y = {i}\n"))
+    loop = _loop(tmp_path, [*turns, _text("done")], max_rounds=16, verify_changes=False)
+
+    asyncio.run(loop.run("copy each one"))
+
+    assert not [
+        m for m in loop.state.all_messages
+        if m.role == "user" and "produced nothing" in m.content
+    ]
+
+
+def test_a_greeting_after_real_work_is_sent_back(tmp_path):
+    """A model that says "How can I help you?" after eleven tool calls has lost
+    the conversation. The reply reads as polite and is a context failure."""
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("read_file", filepath="a.py"),
+            _text("Hello! How can I help you today?"),
+            _text("Sorry - I was reading a.py. It sets x to 1."),
+        ],
+        max_rounds=5,
+    )
+
+    result = asyncio.run(loop.run("what is in a.py?"))
+
+    assert "How can I help" not in result.final
+    assert "x to 1" in result.final
+
+
+def test_a_greeting_with_no_work_behind_it_is_a_normal_answer(tmp_path):
+    """"hi" -> "Hi, how can I help?" is correct, and correcting it would be the
+    guard punishing the right answer."""
+    loop = _loop(tmp_path, [_text("Hi! How can I help you today?")])
+
+    result = asyncio.run(loop.run("hi"))
+
+    assert result.final == "Hi! How can I help you today?"
+
+
+def test_an_invented_tool_name_is_answered_with_the_one_it_meant(tmp_path):
+    """This used to return the full list of thirty names - the same list already
+    in the prompt the model has just shown it is not reading."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("read_files", {"filepath": "a.py"})
+
+    assert not result.ok
+    assert "read_file" in result.message
+    assert "Did you mean" in result.message
+    assert len(result.message) < 200, "a correction, not a re-listing of the roster"
+
+
+def test_a_search_that_keeps_failing_is_withheld_but_patching_never_is(tmp_path):
+    """smallcode drops any tool after five consecutive failures. Dropping
+    `patch_file` would leave a model that cannot edit anything, which is worse
+    than the loop it prevents."""
+    loop = _loop(tmp_path, [_text("ok")])
+    for _ in range(6):
+        loop._trust.record("search_files", ok=False)
+        loop._trust.record("patch_file", ok=False)
+
+    offered = {s["function"]["name"] for s in loop._sent_schemas()}
+
+    assert "search_files" not in offered
+    assert "patch_file" in offered
+
+
+def test_a_claude_shaped_tool_name_reaches_the_shamsu_tool(tmp_path):
+    """smallcode's `normalizeToolCall`. A model trained on those transcripts
+    reaches for `Edit` or `Bash` by reflex, and they are far enough from a
+    SHAMSU name that even fuzzy matching finds nothing - live, `Edit` fell all
+    the way through to a re-listing of the whole roster."""
+    from shamsu.agents.simple_chat import canonical_tool_name
+
+    for shaped, real in (
+        ("Edit", "patch_file"),
+        ("Read", "read_file"),
+        ("Bash", "run_command"),
+        ("Write", "write_file"),
+        ("Grep", "search_files"),
+        ("Glob", "find_files"),
+        ("str_replace_editor", "patch_file"),
+    ):
+        assert canonical_tool_name(shaped) == real, shaped
+
+
+def test_a_long_markdown_file_shows_its_END_not_just_its_beginning(tmp_path):
+    """The head clip is what starts the dead end in the gap analysis: the model
+    patches against a half it was never shown. An outline answers that for
+    code; nothing could outline a `.md`, so it kept getting the first N lines
+    and never the last - then was asked to add an entry at the bottom."""
+    lines = [f"- entry {i}" for i in range(400)]
+    (tmp_path / "CHANGELOG.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("read_file", {"filepath": "CHANGELOG.md"})
+
+    body = (result.data or {}).get("content", "")
+    assert "entry 0" in body, "the beginning is still there"
+    assert "entry 399" in body, "and now so is the END"
+    assert "not shown" in body, "and it says what it left out"
+    assert "entry 200" not in body, "the middle is what was dropped"
+
+
+def test_a_short_markdown_file_is_still_sent_whole(tmp_path):
+    """Two ends that would overlap is just the file, and saying otherwise would
+    be the guard inventing a gap that is not there."""
+    (tmp_path / "notes.md").write_text(
+        "\n".join(f"line {i}" for i in range(20)) + "\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("read_file", {"filepath": "notes.md"})
+
+    assert "not shown" not in (result.data or {}).get("content", "")
+
+
+def test_code_still_gets_an_outline_rather_than_two_slices(tmp_path):
+    """An outline beats head-and-tail because it shows the whole shape. The
+    fallback must not steal files the outline can handle."""
+    body = "\n".join(
+        f"def f{i}():\n    return {i}\n" for i in range(120)
+    )
+    (tmp_path / "big.py").write_text(body, encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("read_file", {"filepath": "big.py"})
+
+    assert (result.data or {}).get("outlined")
+    assert not (result.data or {}).get("head_and_tail")
+
+
+def test_the_model_is_told_what_kind_of_project_this_is(tmp_path):
+    """smallcode's bootstrap. Every piece was already here - the manifests are
+    one stat each, `detect_test_command` reads package.json scripts and pytest
+    layouts - and nothing summarised it into the prompt, so a model opening a
+    fresh workspace spent three to five calls working it out every session."""
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "vitest run"}}', encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    asyncio.run(loop.run("what is this?"))
+
+    sent = "\n".join(
+        m["content"] for m in loop.client.calls[0]["messages"] if m["role"] == "system"
+    )
+    assert "This project: Node" in sent
+    # `npm test` - the command to RUN, not the script body it expands to.
+    assert "npm test" in sent, "and how to run its tests"
+
+
+def test_a_workspace_it_knows_nothing_about_says_nothing(tmp_path):
+    """"Project: unknown" is worse than no line, because it looks like an
+    answer."""
+    from shamsu.agents.simple_chat import project_brief
+
+    assert project_brief(tmp_path) == ""
+
+
+# --- the plan anchor ----------------------------------------------------------
+
+
+def test_a_multi_part_request_is_asked_to_write_the_steps_down(tmp_path):
+    """`contract_create` has been offered all along, and a model that does not
+    think to call it never does."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    asyncio.run(loop.run(
+        "Read the auth module, then add a refresh handler, then update the middleware"
+    ))
+
+    asked = [
+        m.content for m in loop.state.all_messages
+        if m.role == "user" and "contract_create" in m.content
+    ]
+    assert asked, "a job with three parts was never asked for a plan"
+
+
+def test_a_one_line_request_is_not_asked_to_plan(tmp_path):
+    """A false positive costs a round and anchors the model to a bad plan."""
+    loop = _loop(tmp_path, [_text("ok")])
+
+    asyncio.run(loop.run("fix the typo in game.js"))
+
+    assert not [
+        m for m in loop.state.all_messages
+        if m.role == "user" and "contract_create" in m.content
+    ]
+
+
+def test_the_plan_is_shown_again_on_a_later_turn(tmp_path):
+    """THE anchor. The contract reached the model only if it called
+    contract_status - so the thing meant to keep a multi-step task on the rails
+    was invisible to exactly the model that had lost the thread."""
+    first = _loop(
+        tmp_path,
+        [
+            _named_tool("contract_create", {
+                "title": "ship login",
+                "assertions": ["form renders", "posts to the API", "tests pass"],
+            }),
+            _text("Plan written."),
+        ],
+    )
+    asyncio.run(first.run("build the login page, then wire it up, then test it"))
+
+    # A NEW loop, as repl.py builds per user message - the plan has to survive it.
+    second = _loop(tmp_path, [_text("carrying on")])
+    asyncio.run(second.run("continue"))
+
+    sent = "\n".join(
+        m["content"] for m in second.client.calls[0]["messages"] if m["role"] == "system"
+    )
+    assert "ACTIVE PLAN" in sent
+    assert "posts to the API" in sent, "the unresolved steps must still be visible"
+
+
+def test_a_finished_plan_is_not_re_shown(tmp_path):
+    """A completed contract is history, not a plan. Re-showing it would tell a
+    model starting something new to work through a list it has finished."""
+    from shamsu.agents.simple_contract import new_contract, save_contract, PASSED
+
+    contract = new_contract("done thing", "", ["it works"])
+    contract.assertions[0].state = PASSED
+    contract.assertions[0].evidence = "ran it"
+    save_contract(tmp_path, contract)
+
+    loop = _loop(tmp_path, [_text("ok")])
+    asyncio.run(loop.run("something else entirely"))
+
+    sent = "\n".join(
+        m["content"] for m in loop.client.calls[0]["messages"] if m["role"] == "system"
+    )
+    assert "ACTIVE PLAN" not in sent

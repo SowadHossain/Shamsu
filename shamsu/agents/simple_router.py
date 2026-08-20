@@ -39,13 +39,17 @@ TWO_STAGE_CTX_THRESHOLD = 16_384
 # small model can have; "this is in agent_tools" is not.
 TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
     "read": {
-        "description": "Read a file, or find files by name or glob",
+        "description": "Read a file, find files by name or glob, or see what you changed",
         "tools": [
             "read_file", "read_symbol", "list_files", "find_files", "find_and_read",
+            # Reading what you DID, as opposed to what is there. Withheld
+            # outside a repository by the `git` conditional family, so this
+            # costs nothing in a workspace that is not one.
+            "git_status", "git_diff", "git_log",
         ],
     },
     "write": {
-        "description": "Create, edit, extend or rewrite files",
+        "description": "Create, edit, extend, rename or rewrite files",
         "tools": [
             "write_file",
             "patch_file",
@@ -53,6 +57,11 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
             "append_file",
             "read_and_patch",
             "create_and_run",
+            # Renaming belongs with writing, not with running. Left out of the
+            # roster entirely, a model asked to rename reached for `run_command`
+            # and a platform-specific shell verb.
+            "move_file",
+            "delete_file",
         ],
     },
     "search": {
@@ -62,6 +71,26 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
     "run": {
         "description": "Run a shell command, the project, or its tests",
         "tools": ["run_command", "run_tests", "create_and_run"],
+    },
+    "plan": {
+        "description": "Work out what to do and write the steps down, without changing anything",
+        "tools": [
+            # Read-only ON PURPOSE, and this is the whole value of the category.
+            # smallcode's `planner.md` persona is a strong planner for one
+            # reason visible in its frontmatter: `tools: [read_file, find_files,
+            # search, hybrid_search, graph_search]` - no write tools, so it
+            # CANNOT skip to implementing. That discipline costs us nothing and
+            # needs no sub-agent: it is a category with the write tools left out.
+            "read_file",
+            "read_symbol",
+            "list_files",
+            "find_files",
+            "search_files",
+            "graph_search",
+            "explain_symbol",
+            "contract_create",
+            "contract_status",
+        ],
     },
     "verify": {
         "description": "Write down what done means, and check it off",
@@ -90,7 +119,12 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
 # model needs it is the moment it is doing something else and has realised it
 # is missing a fact - forcing a category switch to look one up is the sort of
 # friction that makes a small model give up and guess instead.
-ALWAYS_TOOLS = ("memory_load", "history_search")
+# `ask_user` for the same reason, and more strongly: the moment a model needs
+# to ask is the moment it has found an ambiguity mid-task, and a category
+# switch standing between it and the question is exactly the friction that
+# makes a small model guess instead. It is also the escape hatch `delete_file`
+# and `write_file` point at when several files could be the target.
+ALWAYS_TOOLS = ("memory_load", "history_search", "ask_user")
 
 SELECTOR_TOOL_NAME = "select_category"
 
