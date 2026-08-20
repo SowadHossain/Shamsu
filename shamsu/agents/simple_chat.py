@@ -60,6 +60,7 @@ from shamsu.agents.simple_outline import (
     render_outline,
 )
 from shamsu.agents.simple_prompt import simple_system_prompt
+from shamsu.safety.approval_context import get_approval_override
 from shamsu.agents.simple_tests import detect_test_command
 from shamsu.agents.simple_verify import PROBLEM as VERIFY_PROBLEM
 from shamsu.agents.simple_verify import SKIPPED as VERIFY_SKIPPED
@@ -1789,6 +1790,19 @@ def make_approval_func(console_approval: Any, *, main_loop: Any = None) -> Any:
     """
 
     def ask(request: Any) -> bool:
+        # A caller that has already decided answers first. `approval_override`
+        # is how the headless runner, the eval harness and `shamsu run` say
+        # "allow" or "deny" without a terminal, and simple mode never consulted
+        # it - so every one of them fell through to a console prompt with no TTY
+        # behind it and got a refusal.
+        #
+        # The visible cost: `run_command_verify` went 3/3 to 0/3 and stayed
+        # there, and the model's own answer said why - "if the command were
+        # allowed to execute". A tool that is silently denied looks exactly like
+        # a tool that does not work.
+        injected = get_approval_override()
+        if injected is not None:
+            return bool(injected(request))
         if main_loop is not None and threading.current_thread() is not threading.main_thread():
             try:
                 future = asyncio.run_coroutine_threadsafe(_ask_on_main(request), main_loop)

@@ -8644,3 +8644,30 @@ def test_a_bare_tool_call_is_not_handed_back_as_the_answer(tmp_path):
     nudge = [m.content for m in loop.state.all_messages if m.role == "user"][-1]
     assert "run_file" in nudge
     assert "not a tool" in nudge
+
+
+def test_a_caller_that_already_decided_is_not_asked_again(tmp_path):
+    """`approval_override` is how the headless runner, `shamsu run` and the eval
+    harness say "allow" without a terminal. Simple mode never consulted it, so
+    every one of them fell through to a console prompt with no TTY behind it and
+    got a refusal.
+
+    Visible cost: `run_command_verify` went 3/3 to 0/3 and stayed there, and the
+    model's own answer said why - "if the command were allowed to execute". A
+    tool that is silently denied looks exactly like a tool that does not work.
+    """
+    from shamsu.safety.approval_context import approval_override
+    from shamsu.types import ApprovalRequest
+
+    request = ApprovalRequest(
+        action_type="run_command", description="run the tests", risk_level="medium"
+    )
+    refuses = make_approval_func(lambda _r: False)
+    assert refuses(request) is False, "with no override the console still decides"
+
+    with approval_override(lambda _r: True):
+        assert make_approval_func(lambda _r: False)(request) is True
+    with approval_override(lambda _r: False):
+        assert make_approval_func(lambda _r: True)(request) is False, (
+            "an override that DENIES must also win - it is not an auto-allow"
+        )
