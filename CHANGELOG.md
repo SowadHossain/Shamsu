@@ -4,6 +4,37 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Fixed (agent loop phase 0, 2026-08-20)
+
+- **A file a patch broke is no longer reported as one still being written.**
+  An open block means two opposite things - the first section of a chunked
+  write, or a closing brace a patch just ate - and nothing distinguished them.
+  So `node --check: SyntaxError: Unexpected end of input` was thrown away,
+  replaced with "that is expected part-way through - continue with
+  `append_file`", and the whole report returned `ok: true`. A user asking the
+  model to fix the file was asking it to fix something it had just been told
+  was fine, and the advice it did get - append to the END - cannot close a
+  brace missing in the MIDDLE. The exemption now requires that the write which
+  last landed ADDED to the file: `append_file`, a creation, or any write whose
+  diff shows a net gain in lines. A patch never qualifies. Where the file
+  genuinely was being built in sections earlier in the turn, the real error is
+  reported *and* says so, rather than one fact being suppressed to protect the
+  other.
+- **An unclosed block points at the innermost opener, not line 1.**
+  `open_blocks` is the stack still standing, so its first entry is the file's
+  outermost block - for a module wrapped in a class, line 1 - which sent a
+  model repairing a missing brace to the top of a file whose damage was three
+  hundred lines lower. The last entry is the nearest to where the text stops.
+- **Two failures no longer cost a reasoning model its reasoning for the rest of
+  the turn.** smallcode's rule is `isRepair && attempt > 1` - the model already
+  overthought THIS solution. Ours read a turn-wide tally incremented by ten
+  different things, including nudges that are not repairs, and never reset. Any
+  write that lands now clears it.
+- **The write-refusal and OOM stops stop replaying into history.** Audited
+  against every message `_stop` can emit; these three were the only harness text
+  still hydrating as assistant turns. "I refused all of them. Nothing was
+  changed." is not something a model should learn is a normal way to end a turn.
+
 ### Added
 
 - A per-call content cap for every tool that carries a payload

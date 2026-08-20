@@ -2552,6 +2552,22 @@ def test_the_harnesss_stop_messages_are_not_replayed_as_the_models_answers():
         "I stopped after 24 steps without finishing. Say `continue` to keep going.",
         "I tried 4 edits in a row that changed nothing - either the snippet is missing.",
         "I have now changed frontend/game.js 5 times in this turn without confirming.",
+        # Audited 2026-08-20 against every message `_stop` can emit. These three
+        # were the only ones still replaying, and "I refused all of them.
+        # Nothing was changed." is the worst possible thing to teach a model
+        # about how a turn ends.
+        (
+            "My last 3 attempts to write game.js were cut off by my own output "
+            "limit part-way through, so I refused all of them. Nothing was changed."
+        ),
+        (
+            "My last 3 attempts to write game.js each stopped part-way through a "
+            "string or a block, so I refused them. Nothing was changed."
+        ),
+        (
+            "RuntimeError: cudaMalloc failed. The GPU ran out of memory even at "
+            "the smallest context."
+        ),
     ):
         assert not _should_hydrate_chat_message("assistant", stop), stop
 
@@ -2565,6 +2581,11 @@ def test_ordinary_prose_that_merely_starts_the_same_way_is_kept():
         "I stopped the server because the port was busy.",
         "I have now changed the approach entirely.",
         "Done! Changed bulletSpeed from 7 to 9 in frontend/game.js.",
+        # The new patterns must not eat ordinary prose either. A model
+        # explaining a crash it diagnosed is not the harness reporting one.
+        "My last 3 attempts to write the parser taught me the grammar is ambiguous.",
+        "The error: your GPU ran out of memory because two models are resident.",
+        "I fixed the out of memory crash by lowering num_ctx.",
     ):
         assert _should_hydrate_chat_message("assistant", kept), kept
 
@@ -4033,7 +4054,7 @@ def test_thinking_is_switched_off_once_the_turn_is_repairing(tmp_path):
     loop = _loop(tmp_path, [_text("ok")])
     assert loop._should_disable_thinking() is False
 
-    loop._repair_attempts = 2
+    loop._repair_streak = 2
 
     assert loop._should_disable_thinking() is True
 
@@ -4824,6 +4845,10 @@ def test_a_javascript_file_with_open_blocks_reads_as_progress_not_a_fault(tmp_pa
         encoding="utf-8",
     )
     loop = _loop(tmp_path, [])
+    # The precondition the exemption now turns on: the write that just landed
+    # ADDED to this file. Left unsaid, this test passed for a file a patch had
+    # just broken, which is the defect below.
+    loop._last_write_grew["game.js"] = True
 
     report = _verify_json(loop, ["game.js"])
 
@@ -4834,6 +4859,71 @@ def test_a_javascript_file_with_open_blocks_reads_as_progress_not_a_fault(tmp_pa
     assert "3 block(s) still open" in unfinished
     assert "append_file" in unfinished
     assert "game.js" not in report["data"]["checked"], "it must not read as verified"
+
+
+def test_a_brace_a_patch_ate_is_a_fault_not_progress(tmp_path):
+    """THE 2026-08-20 defect, and the reason Phase 0 exists.
+
+    A patch that eats a closing brace leaves open blocks and nothing else
+    wrong - byte-for-byte what the first section of a chunked write looks
+    like. So `node --check: SyntaxError` was thrown away, the report came back
+    `ok: true`, and the model was told to "continue with append_file": advice
+    that cannot close a brace missing in the MIDDLE of a file, on a file it had
+    just been told was fine. Asked to fix it, the model had nothing to fix.
+    """
+    (tmp_path / "game.js").write_text(
+        'function greet(n) {\n  if (n) {\n    console.log(n);\n\n}\n',
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [])
+    # A patch. It did not grow the file, so it cannot claim to be building it.
+    loop._last_write_grew["game.js"] = False
+
+    report = _verify_json(loop, ["game.js"])
+
+    assert report["ok"] is False, "a file a patch broke must not verify as ok"
+    assert report["data"]["unfinished"] == []
+    problem = report["data"]["problems"][0]
+    assert problem.startswith("game.js:")
+    assert "append_file" not in problem, "appending cannot close a brace in the middle"
+
+
+def test_a_patch_into_a_half_built_file_reports_the_fault_and_says_it_is_half_built(tmp_path):
+    """The one case the gate could raise a false alarm on, answered with both
+    facts rather than by suppressing one. A model told only "unexpected end of
+    input" may close the open blocks and end the file early."""
+    (tmp_path / "game.js").write_text(
+        'function greet(n) {\n  if (n) {\n    console.log(n);\n\n}\n',
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [])
+    loop._built_up.add("game.js")          # appended to earlier in this turn
+    loop._last_write_grew["game.js"] = False  # but the LAST write was a patch
+
+    report = _verify_json(loop, ["game.js"])
+
+    assert report["ok"] is False, "the error is real and is reported"
+    problem = report["data"]["problems"][0]
+    assert "building this file in sections" in problem
+    assert "closing it early" in problem
+
+
+def test_an_unclosed_block_points_at_the_innermost_not_line_one(tmp_path, monkeypatch):
+    """"the first { on line 1" points a repair at the top of a file whose damage
+    is 300 lines lower. The stack's LAST entry is the one nearest where the text
+    actually stops."""
+    monkeypatch.setenv("SHAMSU_DISABLE_NODE_CHECK", "1")
+    (tmp_path / "game.js").write_text(
+        "class Game {\n  update() {\n    if (alive) {\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [])
+    loop._last_write_grew["game.js"] = True
+
+    unfinished = _verify_json(loop, ["game.js"])["data"]["unfinished"][0]
+
+    assert "opened on line 3" in unfinished, unfinished
+    assert "line 1" not in unfinished
 
 
 def test_a_file_still_open_when_the_turn_ends_counts_against_the_run(tmp_path, monkeypatch):
@@ -7822,3 +7912,90 @@ def test_replacing_one_method_with_a_shorter_one_is_ordinary_work(tmp_path):
     body = (tmp_path / "player.js").read_text(encoding="utf-8")
     assert "step1(dt) { return 1; }" in body
     assert "step2" in body
+
+
+# --- Phase 0: a write that ADDS is the only one that may claim to be building --
+
+
+def test_appending_marks_the_file_as_being_built_and_patching_does_not(tmp_path):
+    """The bookkeeping the exemption reads. `append_file` can only add to the
+    end; a patch reworks what is there, and a patch is what ate the brace."""
+    (tmp_path / "game.js").write_text("function a() {\n  return 1;\n}\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("append_file", filepath="game.js", content="function b() {\n  return 2;\n}\n"),
+            _tool("patch_file", filepath="game.js", old_string="return 1;", new_string="return 9;"),
+            _text("done"),
+        ],
+    )
+
+    asyncio.run(loop.run("extend then tweak it"))
+
+    # Appended earlier in the turn, so the note about sections is available...
+    assert "game.js" in loop._built_up
+    # ...but the LAST write was a patch, so it may not claim to be unfinished.
+    assert loop._last_write_grew["game.js"] is False
+
+
+def test_a_write_that_grows_the_file_counts_as_building_whatever_tool_carried_it(tmp_path):
+    """qwen2.5:3b built a large file with `write_file`, re-sending the growing
+    file each time. The shape is what matters, not the tool."""
+    (tmp_path / "game.js").write_text("function a() {\n  return 1;\n}\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool(
+                "write_file",
+                filepath="game.js",
+                content="function a() {\n  return 1;\n}\nfunction b() {\n  return 2;\n}\n",
+            ),
+            _text("done"),
+        ],
+    )
+
+    asyncio.run(loop.run("add a section"))
+
+    assert loop._last_write_grew["game.js"] is True
+    assert "game.js" in loop._built_up
+
+
+def test_a_write_that_lands_gives_a_reasoning_model_its_reasoning_back(tmp_path):
+    """smallcode's rule is `isRepair && attempt > 1` - the model already
+    overthought THIS solution. Ours read a turn-wide tally that only went up,
+    so two failures anywhere switched reasoning off for every later round,
+    including the rounds that were working. A write that lands is the proof the
+    model is not stuck."""
+    (tmp_path / "game.js").write_text("function a() {\n  return 1;\n}\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("patch_file", filepath="game.js", old_string="nope", new_string="x"),
+            _tool("patch_file", filepath="game.js", old_string="also nope", new_string="y"),
+            _tool("patch_file", filepath="game.js", old_string="return 1;", new_string="return 2;"),
+            _text("fixed"),
+        ],
+    )
+
+    asyncio.run(loop.run("fix it"))
+
+    assert loop._repair_streak == 0, "the successful patch must clear the streak"
+    assert loop._should_disable_thinking() is False
+
+
+def test_two_failures_in_a_row_still_switch_thinking_off(tmp_path):
+    """The other edge: the streak must still FIRE, or the guard is gone."""
+    (tmp_path / "game.js").write_text("function a() {\n  return 1;\n}\n", encoding="utf-8")
+    loop = _loop(
+        tmp_path,
+        [
+            _tool("patch_file", filepath="game.js", old_string="nope", new_string="x"),
+            _tool("patch_file", filepath="game.js", old_string="also nope", new_string="y"),
+            _text("stuck"),
+        ],
+    )
+
+    asyncio.run(loop.run("fix it"))
+
+    assert loop._repair_streak >= 2
+    assert loop._should_disable_thinking() is True

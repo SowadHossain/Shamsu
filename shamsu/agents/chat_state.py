@@ -50,6 +50,14 @@ _HARNESS_STATUS_PATTERNS = (
     re.compile(r"^i stopped after \d+ steps? without finishing"),
     re.compile(r"^i tried \d+ edits? in a row that changed nothing"),
     re.compile(r"^i have now changed .+ \d+ times in this turn"),
+    # The write-refusal stops, both endings. Audited 2026-08-20 against every
+    # message `_stop` can emit: these two were the only harness text still
+    # replaying into history as an assistant turn, and they are the worst
+    # candidates for it - "I refused all of them. Nothing was changed." is a
+    # model being taught that declining to write is a normal way to finish.
+    re.compile(r"^my last \d+ attempts? to write .+ (were cut off|each stopped)"),
+    # And the OOM stop, which carries a CUDA error into the conversation.
+    re.compile(r"^\w*(error|exception): .*(out of memory|cudamalloc|failed to allocate)"),
 )
 
 # How many times the same assistant answer may be replayed before the rest are

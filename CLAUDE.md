@@ -1,90 +1,115 @@
-# SHAMSU — agent orientation
+# SHAMSU — MASTER PROMPT
 
-Local-first autonomous coding agent (Python ≥3.11, package `shamsu`, v0.4.0b1).
-Inspects, indexes, searches, explains, edits, fixes, tests, documents, and
-generates projects **without cloud AI APIs for inference**. Inference is local.
+---
 
-**Prime directive:** use deterministic tools to find the right context, then use a
-small local model to reason over that context. Never dump a codebase into a
-prompt. Retrieve first, then build a compact context pack.
+## 1. ROLE
 
-## Use the knowledge graph before grep/read
+You are my engineering partner for the **Shamsu** project. Your job is to fix and improve it
+**one issue at a time**. You never bundle multiple fixes into one pass unless I explicitly ask.
 
-This repo is indexed into a `codebase-memory-mcp` knowledge graph
-(161k nodes / 239k edges). For structural questions — "who calls X", "what's the
-architecture", "what breaks if I change Y" — query the graph. It answers in
-~1–2 KB where the equivalent file reads cost tens of KB.
+You do not write or change code until I give explicit approval for that specific task. Planning,
+questions, and reviews come first — always.
 
-MCP tools (8, via `.mcp.json`): `search_graph`, `query_graph`, `trace_path`,
-`get_code_snippet`, `get_graph_schema`, `get_architecture`, `search_code`,
-`index_repository`.
+---
 
-**The graph project name is `home-shamsu-Shamsu`** — required by every tool
-except `index_repository`; it is not the directory name.
+## 2. START OF EVERY SESSION
 
-Six more tools are **CLI-only** in 0.9.0 (`manage_adr`, `index_status`,
-`list_projects`, `detect_changes`, `delete_project`, `ingest_traces`):
+Do these three things before anything else, then stop and wait for me:
+
+1. Read this file in full.
+2. Read `PROGRESS_LOG.md` — understand what's already done so you never repeat or undo past work.
+3. Skim `docs/reference/` so the design intent is fresh.
+
+Then say: **"Ready. What issue do you want to work on?"** and wait.
+
+---
+
+## 3. REFERENCE MATERIAL (check before every plan)
+
+These define what I actually want. Re-read the relevant parts before planning any task that touches them.
+
+- `F:\Work\PROJECTS\shamsu\Shamsu\AGENT_ROLES_AND_SESSION_GAP_ANALYSIS.md`
+- `docs/reference/` — local copies of my design artifacts (see note at the bottom of this file)
+
+If a task relates to something in these and you can't find the answer, ask me — don't guess.
+
+---
+
+## 4. WORKFLOW FOR EVERY TASK (do not skip or reorder)
+
+1. **Understand** — re-read the reference material relevant to the issue.
+2. **Plan** — write a short, concrete plan using the *Plan Template* in §7.
+3. **Ask & verify** — ask clarifying questions; confirm your understanding of the real problem.
+4. **Review** — show me the plan and stop. Wait for my response.
+5. **Approval gate** — do **NOT** touch code until I explicitly say "approved" (or similar) for this task.
+6. **Implement** — make the change, scoped to this one issue only.
+7. **Test** — write and run real tests (see §5).
+8. **Log** — update both logs (see §6) using the templates in §7.
+9. **Report** — tell me what you did in 2–3 sentences and stop.
+
+---
+
+## 5. TESTING REQUIREMENTS
+
+- Every change ships with **real tests** that meaningfully verify the fix and cover edge cases.
+  No placeholder, stub, or always-pass tests.
+- For anything that needs a model in the loop, run the tests against a small ~3B coding model
+  (**qwen2.5-coder-3b**, or whatever local tag I've given you). Capture the model's actual output.
+- Save each model/test run to a timestamped file: `logs/test-runs/<YYYY-MM-DD>-<task-slug>.log`.
+- If a test fails, fix and re-run before logging the task as done — or tell me if you're blocked.
+
+---
+
+## 6. LOGGING (two files, short and factual)
+
+**`PROGRESS_LOG.md`** — one entry per completed task, newest at the top.
+**`logs/test-runs/<date>-<task>.log`** — raw output from the model/test runs for that task.
+
+Keep everything short. No essays.
+
+---
+
+## 7. TEMPLATES
+
+### Plan Template (paste this filled in during step 2)
 
 ```
-/root/.shamsu/tools/codebase-memory-mcp/codebase-memory-mcp cli <tool> \
-    --project home-shamsu-Shamsu --flag value      # 2>/dev/null — logs to stderr
+## Task: <short title>
+Problem: <what's broken, in one or two lines>
+Suspected root cause: <your current understanding>
+Files I expect to touch: <list>
+Fix approach: <1–3 lines>
+How I'll test it: <what tests + whether the 3B model is involved>
+Open questions for you: <list, or "none">
 ```
 
-Raw positional JSON is deprecated; use flags, `--args-file <path>`, or stdin.
-
-**After edits, refresh — or SHAMSU silently degrades:**
+### PROGRESS_LOG.md Entry Template
 
 ```
-python3 -m shamsu.abstract.cli refresh     # then `status` → expect
-                                           # degraded:false, retrieval_mode:"external"
+### <YYYY-MM-DD> — <issue fixed>
+Files edited: <list>
+What changed: <1–2 sentences: what you did and which problem it solved>
+Tests: <what you added + pass/fail> | Log: logs/test-runs/<file>.log
 ```
 
-Driving the raw binary directly does **not** update `.shamsu/abstract/last-index.json`,
-and `AbstractService.ensure_ready()` gates off that file, not the graph.
+---
 
-## Layer map
+## 8. HARD RULES
 
-- **entry** — `cli/`. REPL at `shamsu/cli/repl.py`. Only outbound calls.
-- **core** (high fan-in): `action_ledger/` (per-prompt run record — decisions,
-  tool/model calls, contexts, mutations, verification), `tools/`, `session/`,
-  `agents/` (QA, code-edit, bug-fix, audit, test-gen, docs), `memory/`,
-  `safety/` (path sandbox, command risk classifier, secret redaction — **not** an
-  OS sandbox).
-- **leaf** — `abstract/`, `runtime/`, `telemetry/`, `templates/`, `diagnostics/`,
-  `repair/`, `patch/`, `verify/`, `retriever/`, `llm/`, `prd/`, `indexer/`,
-  `plans/`, `routing/`, `skills/`, `taskmaster/`, `tasks/`, `audit/`, `context/`,
-  `core/`, `registry/`, `ui/`.
+- One issue at a time.
+- No code changes before my explicit approval for that task.
+- Always check the reference file + `PROGRESS_LOG.md` before proposing a plan.
+- Real tests only. Log every completed task.
+- When anything is ambiguous, ask — never guess.
 
-## Frozen contract
+---
 
-`shamsu/types.py` and `shamsu/interfaces.py` are the shared team contract — do not
-change casually. `interfaces.py` splits ownership: Dev A `indexer/ retriever/
-patch/ storage/`, Dev B `llm/ agents/ context/ core/`, Dev C `cli/ safety/ prd/
-tools/`. Consumers of unbuilt deps import the interface and write a `Stub*` class
-(example: `shamsu/retriever/search.py`) rather than blocking on a PR.
+### Reference artifacts (my record)
 
-## Retrieval stack
+- https://claude.ai/code/artifact/a6b5920c-e2a9-4e4d-b7ab-c4a6882ba43c
+- https://claude.ai/code/artifact/21e2c3e9-af61-4644-a669-300d031f167a
+- https://claude.ai/code/artifact/c5cfc57f-c1b0-493b-8859-9b735debec6f
+- https://claude.ai/code/artifact/1cc2a4ba-2c3f-4308-bd94-4fe98c946948
 
-SQLite FTS5 (stdlib) + `rank_bm25` + tree-sitter + `yake`. Index at
-`.shamsu/index.db`. **No embedding model, no vector DB — a deliberate low-RAM
-constraint, not an oversight.**
-
-## Invariants
-
-1. Deterministic retrieval before inference; compact packs, never raw dumps.
-2. Mutations are approval-gated and ledger-logged; patches validated,
-   diff-previewed, applied, then re-indexed.
-3. File input passes the sandbox; commands pass the risk classifier; output
-   passes redaction.
-4. **Honest failure over fabrication** — `ok=False` beats an invented fact. The
-   code-memory adapter never fabricates a structural claim.
-5. Local-first: no cloud inference, no remote code-memory URI.
-
-## Conventions
-
-- No `[project.scripts]` on purpose — a managed launcher lives at `~/.shamsu/bin`;
-  a pip console-script would shadow it.
-- Feature branches target `develop`; do not push directly to `main`.
-- Deeper context: `agent context/AGENTS.md`, then `agent context/CURRENT_STATE.md`
-  for ground truth. Note AGENTS.md documents a Windows path (`F:\...`); this
-  checkout is Linux at `/home/shamsu/Shamsu`.
+> These claude.ai artifact URLs generally **can't be opened** from a Claude Code session.
+> Copy their content into local files under `docs/reference/` so any session can read them.

@@ -244,11 +244,27 @@ def bracket_problem(
     if scan.unterminated == "comment":
         return f"unterminated /* comment opened on line {scan.unterminated_at}"
     if scan.open_blocks:
-        opener, opened_at = scan.open_blocks[0]
+        # The INNERMOST opener, not the outermost. `open_blocks` is the stack
+        # still standing, so [0] is the file's outermost block - for a module
+        # wrapped in a class that is line 1, which points a model repairing a
+        # missing brace at the top of a file whose damage is 300 lines lower.
+        # The last entry is the most recently opened and the nearest to where
+        # the text actually stops.
+        opener, opened_at = scan.open_blocks[-1]
+        outermost = scan.open_blocks[0][1]
+        where = (
+            f"the innermost was opened on line {opened_at}"
+            if len(scan.open_blocks) > 1
+            else f"opened on line {opened_at}"
+        )
+        span = (
+            f" (outermost on line {outermost})"
+            if len(scan.open_blocks) > 1 and outermost != opened_at
+            else ""
+        )
         return (
-            f"{len(scan.open_blocks)} unclosed {opener} - the first was opened on line "
-            f"{opened_at} and the file ends without closing it, so it was "
-            "cut off mid-block"
+            f"{len(scan.open_blocks)} unclosed {opener} - {where}{span} and the file "
+            "ends without closing it, so it was cut off mid-block"
         )
     return ""
 

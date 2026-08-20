@@ -1752,9 +1752,14 @@ class SimpleChatLoop:
         self._calls_since_elide = 0
         # Said once per loop, not once per round.
         self._warned_filling = False
-        # Rounds spent recovering rather than progressing: an empty reply, a
-        # nudge, a no-op edit. Drives `_should_disable_thinking`.
-        self._repair_attempts = 0
+        # CONSECUTIVE rounds spent recovering rather than progressing: an empty
+        # reply, a nudge, a no-op edit. Drives `_should_disable_thinking`, and
+        # reset by any write that lands - see `_run_tools`. A streak, not a
+        # tally: smallcode's rule is `isRepair && attempt > 1`, meaning the
+        # model already overthought THIS solution, and a turn-wide counter that
+        # only ever went up turned that into "the model made two mistakes at
+        # any point, so it may not reason for the rest of the turn."
+        self._repair_streak = 0
         # How many sweeps and how many messages they shrank, for `/status`.
         self.evictions = 0
         self._rewrite_refused: set[str] = set()
@@ -1782,6 +1787,25 @@ class SimpleChatLoop:
         # writing, and settled at turn end, when "not finished yet" stops being
         # a true description of a file the model has walked away from.
         self._unfinished: dict[str, str] = {}
+        # Did the write that LAST landed on this file add to it?
+        #
+        # The whole of the "still being built" exemption now turns on this, and
+        # it had to. A file with open blocks means two opposite things: a
+        # section of a file still being written (progress), or a file a patch
+        # just broke (a fault). Nothing distinguished them, so a patch that ate
+        # a closing brace was reported to the model as `ok: true`, "that is
+        # expected part-way through - continue with append_file" - and the
+        # advice was wrong twice over, because appending to the END cannot
+        # close a brace missing in the MIDDLE.
+        #
+        # A write that GREW the file is the chunked path the prompt asks for,
+        # whichever tool carried it. A patch that shrank it is not.
+        self._last_write_grew: dict[str, bool] = {}
+        # Every file this turn has appended to or created, ever - unlike the
+        # above, never turned off by a later patch. Only used to add context to
+        # a real failure: "you have been building this file this turn" is worth
+        # saying next to a syntax error, and is not grounds for suppressing it.
+        self._built_up: set[str] = set()
         # Did the streak come from a REFUSED payload rather than from Ollama
         # cutting the generation off? The two need different endings - one is
         # "the file is too big for one reply", the other is "what you sent would
@@ -1996,7 +2020,7 @@ class SimpleChatLoop:
                     # 24 rounds: half an hour of "Thinking..." and no reply.
                     if empty_nudges < MAX_EMPTY_NUDGES:
                         empty_nudges += 1
-                        self._repair_attempts += 1
+                        self._repair_streak += 1
                         # Keep the transcript alternating: an assistant turn,
                         # then the nudge. Stacking user messages is what broke
                         # it. And nudge BEFORE salvaging - a reasoning model's
@@ -2063,7 +2087,7 @@ class SimpleChatLoop:
                     # naming the file, and let it act - the alternative is what
                     # the user saw: a perfect answer and an unchanged file.
                     prose_nudges += 1
-                    self._repair_attempts += 1
+                    self._repair_streak += 1
                     self.state.append_assistant(text)
                     self.state.append_user(
                         f"You showed the new contents of {described} but did not change the file. "
@@ -2089,7 +2113,7 @@ class SimpleChatLoop:
                     # answer. 14 turns in one session ended on a colon with no
                     # tool call, and every one was handed back as finished.
                     promise_nudges += 1
-                    self._repair_attempts += 1
+                    self._repair_streak += 1
                     self.state.append_assistant(text)
                     self.state.append_user(
                         f"Your reply ended on {promised!r} and then stopped. Nothing "
@@ -2126,7 +2150,7 @@ class SimpleChatLoop:
                     # this one arrives at the moment of the claim and names the
                     # exact next call.
                     contract_nudges += 1
-                    self._repair_attempts += 1
+                    self._repair_streak += 1
                     self.state.append_assistant(text)
                     self.state.append_user(blocked)
                     self._activity("claimed done with the contract unresolved; asked it to check")
@@ -2319,12 +2343,22 @@ class SimpleChatLoop:
         and returning empty. After the first recovery round, stop paying for
         the reasoning that just failed to produce anything.
 
+        A CONSECUTIVE count, and that is the whole of the 2026-08-20 fix. Their
+        condition is `isRepair && attempt > 1` - attempt being the retry number
+        of one repair - and ours read a turn-wide tally that only ever went up,
+        incremented by ten different things including nudges that are not
+        repairs at all. So two failed patches anywhere in a turn switched
+        reasoning off for every round after them, including rounds working on
+        something else entirely. On a reasoning model that is the repair losing
+        its reasoning at the exact moment a brace hunt needs it. Any write that
+        lands now resets it: see `_run_tools`.
+
         `SHAMSU_THINKING_DISABLE=1` forces it off everywhere, their
         SMALLCODE_THINKING_DISABLE equivalent.
         """
         if os.environ.get("SHAMSU_THINKING_DISABLE", "").strip().lower() in {"1", "true", "yes", "on"}:
             return True
-        return self._repair_attempts > 1
+        return self._repair_streak > 1
 
     def _hit_the_length_limit(self) -> bool:
         """Did the last generation stop because it ran out of room?
@@ -3181,7 +3215,7 @@ class SimpleChatLoop:
             if name in MUTATING_TOOLS:
                 if _changed_nothing(result):
                     self._stalls.unproductive += 1
-                    self._repair_attempts += 1
+                    self._repair_streak += 1
                 else:
                     self._stalls.unproductive = 0
             else:
@@ -3203,6 +3237,16 @@ class SimpleChatLoop:
                     outcome.written.append(path)
                     # It changed, so the remembered read is stale.
                     self._read_digests.pop(path.lower(), None)
+                    # Progress. The repair streak is about being STUCK, and a
+                    # write that landed is the proof that the model is not - so
+                    # a reasoning model gets its reasoning back for whatever it
+                    # hits next, instead of losing it for the rest of the turn
+                    # over two mistakes it has already recovered from.
+                    self._repair_streak = 0
+                    grew = _added_to_the_file(name, result)
+                    self._last_write_grew[path.lower()] = grew
+                    if grew:
+                        self._built_up.add(path.lower())
                     if name in MUTATING_TOOLS and not _extended_the_file(result):
                         # Only whole-file writes and patches count toward the
                         # repeated-edit ceiling. Appending section after section
@@ -3270,7 +3314,7 @@ class SimpleChatLoop:
         # Counted, so a model that keeps finding new ways to fail still reaches
         # the session-scoped stop rather than spending every round here.
         self._stalls.unproductive += 1
-        self._repair_attempts += 1
+        self._repair_streak += 1
         self._activity(f"{name} on {named} already failed {seen} times identically; not run")
         self._trace(
             "simple.refused_repeat", f"{name} {named}", {"tool": name, "attempts": seen}
@@ -3337,7 +3381,7 @@ class SimpleChatLoop:
         ).strip()
         named = target or "that file"
         lines = content.count(chr(10)) + 1
-        self._repair_attempts += 1
+        self._repair_streak += 1
 
         message = (
             f"REFUSED - nothing was written and {named} is unchanged on disk."
@@ -3440,7 +3484,7 @@ class SimpleChatLoop:
         self._truncated_refusals += 1
         self._truncated_target = target
         self._refused_unparseable = True
-        self._repair_attempts += 1
+        self._repair_streak += 1
 
         message = (
             f"REFUSED - nothing was written and {named} is unchanged on disk."
@@ -3500,7 +3544,7 @@ class SimpleChatLoop:
         self._truncated_refusals += 1
         self._truncated_target = target
         outcome.refused_truncated = target or name
-        self._repair_attempts += 1
+        self._repair_streak += 1
 
         named = target or "that file"
         message = (
@@ -4887,12 +4931,22 @@ class SimpleChatLoop:
                 continue
             verdict = check_file(path)
             if verdict.status == VERIFY_PROBLEM:
-                still_open = self._still_being_built(path)
+                # Only a file the last write ADDED to may claim to be
+                # unfinished. Without that gate this branch swallowed every
+                # patch-induced syntax error in the codebase: a `}` eaten by a
+                # patch leaves open blocks and nothing else wrong, which is
+                # byte-for-byte what the first section of a chunked write looks
+                # like, so `node --check: SyntaxError` was replaced with "that
+                # is expected part-way through" and the whole report came back
+                # `ok: true`. The model was then asked to fix a file it had
+                # just been told was fine.
+                grew = self._last_write_grew.get(relative.lower(), False)
+                still_open = self._still_being_built(path) if grew else ""
                 if still_open:
                     unfinished.append(f"{relative}: {still_open}")
                     self._unfinished[relative] = verdict.detail or still_open
                     continue
-                problems.append(f"{relative}: {verdict.detail}")
+                problems.append(f"{relative}: {verdict.detail}{self._mid_build_note(relative)}")
                 self._unfinished.pop(relative, None)
             elif verdict.status == VERIFY_SKIPPED:
                 skipped.append(f"{relative} ({verdict.detail})")
@@ -4977,11 +5031,30 @@ class SimpleChatLoop:
         still_open = unfinished_blocks(text, path.suffix)
         if not still_open:
             return ""
-        opener, opened_at = still_open[0]
+        # The innermost, for the same reason `bracket_problem` reports it: this
+        # is the block the next section has to continue, and it is the one
+        # nearest where the text stops. The outermost is usually line 1.
+        opener, opened_at = still_open[-1]
         count = len(still_open)
         return (
-            f"{count} block(s) still open, the first a {opener} on line {opened_at}. "
-            "That is expected part-way through - continue with append_file"
+            f"{count} block(s) still open; the innermost is a {opener} opened on line "
+            f"{opened_at}. That is expected part-way through - continue with append_file"
+        )
+
+    def _mid_build_note(self, relative: str) -> str:
+        """Context for a real failure on a file this turn has been building.
+
+        The one place the exemption gate above can raise a false alarm: a patch
+        into a file that genuinely is half-written. The error is real and is
+        reported as one - that is the whole point of the gate - but a model
+        told only "unexpected end of input" may close the open blocks and end
+        the file two hundred lines early. So it gets both facts and chooses.
+        """
+        if relative.lower() not in self._built_up:
+            return ""
+        return (
+            " (you have been building this file in sections this turn - if it is not "
+            "finished, continue the next section rather than closing it early)"
         )
 
     def _cut_off_on_disk(self, path: Path, relative: str) -> str:
@@ -5512,6 +5585,32 @@ def _extended_the_file(result: ToolResult) -> bool:
         return int(data.get("grew_by") or 0) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _added_to_the_file(name: str, result: ToolResult) -> bool:
+    """Did this write ADD to the file, rather than rework what was there?
+
+    The question the "still being built" exemption turns on. An open block on a
+    file that just GREW is the first half of a section; the same open block on a
+    file a patch just shrank is a brace that patch ate.
+
+    Three shapes, one meaning:
+
+    * ``append_file`` - it can only ever add to the end.
+    * a write that CREATED the file. The skeleton of a chunked build has open
+      blocks by design, and there is nothing it could have broken.
+    * any write whose diff shows a net gain in lines. This is the shape rather
+      than the tool, and it has to be: told to build a 1,500-line file,
+      qwen2.5:3b chose `write_file` and re-sent the growing file each time.
+    """
+    if not result.ok:
+        return False
+    if name == "append_file":
+        return True
+    data = result.data if isinstance(result.data, dict) else {}
+    if data.get("created"):
+        return True
+    return _extended_the_file(result)
 
 
 def _changed_nothing(result: ToolResult) -> bool:
