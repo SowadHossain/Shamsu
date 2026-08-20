@@ -327,46 +327,57 @@ SEED_CASES: list[EvalCase] = [
 
 
 def _seed_broken_brace(workspace: Path) -> None:
-    """A `.js` file a patch has already eaten a closing brace from.
+    """A file too big to rewrite, broken in the middle, and repetitive.
 
-    Shaped to be hard to patch by memory on purpose - repeated near-identical
-    lines, so an `old_string` written from recall matches the wrong one or
-    nothing. That is the user-reported failure: the model can see the fault and
-    cannot produce an edit that lands, and the loop used to answer with "I tried
-    4 edits in a row that changed nothing" and hand the work back.
+    All three properties are load-bearing, and the first version of this case
+    had none of them: a fourteen-line file, which the model simply rewrote
+    whole. Measured against the PRE-FIX agent it scored 3/3 - which is how a
+    test proves it is testing nothing.
+
+    * **Too big to rewrite.** Over `MAX_WRITE_CHARS` (~8,000), so `write_file`
+      is refused and patching is the only route left. That is the situation
+      actually reported: the model can see the fault and has to land an edit.
+    * **Broken in the middle.** Appending cannot reach it - which is exactly
+      the advice the verifier used to give ("continue with append_file") when
+      it mistook a patch-eaten brace for a file still under construction.
+    * **Repetitive.** Eighty near-identical handlers, so an `old_string` written
+      from memory matches the wrong one or nothing. That is the failing-patch
+      loop that used to end in "I tried 4 edits in a row that changed nothing".
     """
+    block = (
+        "function handle_{i}(event, state) {{\n"
+        "  if (!state.ready) {{\n"
+        "    return null;\n"
+        "  }}\n"
+        "  state.count += {i};\n"
+        "  return state;\n"
+        "}}\n\n"
+    )
+    handlers = "".join(block.format(i=index) for index in range(80))
+    # handle_40 loses the closing brace of its `if`, three hundred lines in.
+    intact = block.format(i=40)
+    maimed = intact.replace("    return null;\n  }\n", "    return null;\n", 1)
     _write(
         workspace,
-        "game.js",
-        "function update(state) {\n"
-        "  if (state.alive) {\n"
-        "    state.x += state.vx;\n"
-        "    state.y += state.vy;\n"
-        "\n"                       # the closing brace of `if` is gone
-        "}\n"
-        "\n"
-        "function render(state) {\n"
-        "  if (state.alive) {\n"
-        "    draw(state.x, state.y);\n"
-        "  }\n"
-        "}\n"
-        "\n"
-        "module.exports = { update, render };\n",
+        "handlers.js",
+        handlers.replace(intact, maimed, 1)
+        + "module.exports = { handle_0, handle_20, handle_39 };\n",
     )
 
 
 def _check_broken_brace(workspace: Path, final: str) -> bool:
-    """It parses, and both functions survived.
+    """It parses, and nothing was thrown away to get there.
 
-    The second half matters as much as the first: deleting the broken function
-    also makes the file parse, and is not a fix.
+    Deleting the broken handler makes the file parse. So does truncating it.
+    Both are how a model "fixes" a file it cannot edit, and neither is a fix -
+    so the handlers either side of the damage are checked by name.
     """
-    content = _read(workspace, "game.js")
-    if not content or "function update" not in content or "function render" not in content:
+    content = _read(workspace, "handlers.js")
+    if not content or content.count("{") != content.count("}"):
         return False
     if "module.exports" not in content:
         return False
-    return content.count("{") == content.count("}")
+    return all(f"function handle_{index}" in content for index in (0, 40, 79))
 
 
 def _seed_many_small_files(workspace: Path) -> None:
@@ -419,7 +430,10 @@ def _check_wrote_the_steps_down(workspace: Path, final: str) -> bool:
 DEGENERATE_CASES: tuple[EvalCase, ...] = (
     EvalCase(
         name="repairs_a_file_it_cannot_pattern_match",
-        prompt="game.js has a syntax error - a block is not closed. Fix it, keeping both functions.",
+        prompt=(
+            "handlers.js has a syntax error - a block is not closed. Fix it, "
+            "keeping every handler."
+        ),
         check=_check_broken_brace,
         seed=_seed_broken_brace,
         tags=("repair", "degenerate"),
