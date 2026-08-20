@@ -13,8 +13,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("run",),
-        help="Run one prompt noninteractively instead of opening the REPL.",
+        choices=("run", "web"),
+        help=(
+            "`run` executes one prompt noninteractively; `web` serves the local "
+            "web view. Omit to open the REPL."
+        ),
+    )
+    # `--web`, and `-web` because that is what people type. argparse treats a
+    # single-dash multi-character string as one option, so this is unambiguous
+    # rather than a clash with `-w -e -b`.
+    parser.add_argument(
+        "--web",
+        "-web",
+        dest="web_flag",
+        action="store_true",
+        help="Same as the `web` command: serve the local web view.",
+    )
+    parser.add_argument(
+        "--scan",
+        action="append",
+        default=None,
+        metavar="DIR",
+        help=(
+            "For `web`: find workspaces under DIR and remember them. "
+            "Repeatable. Bounded depth; opt-in, so nothing is scanned unasked."
+        ),
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Port for `web`. Defaults to 8765; 0 picks a free one.",
     )
     parser.add_argument(
         "--workspace",
@@ -54,8 +83,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Preview approval-gated actions without allowing mutations.",
     )
     args = parser.parse_args(argv)
+    if args.web_flag:
+        if args.command not in (None, "web"):
+            parser.error(f"--web cannot be combined with `{args.command}`")
+        args.command = "web"
     if args.command == "run" and not str(args.prompt or "").strip():
         parser.error("`run` requires --prompt")
     if args.command != "run" and args.prompt is not None:
         parser.error("--prompt is only valid with `run`")
+    if args.port is not None and args.command != "web":
+        parser.error("--port is only valid with `web`")
+    if args.scan and args.command != "web":
+        parser.error("--scan is only valid with `web`")
     return args

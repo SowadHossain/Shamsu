@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from shamsu.integrations.telegram import install
 from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
 from shamsu.integrations.telegram.callbacks import CallbackRegistry
@@ -22,6 +23,13 @@ from shamsu.integrations.telegram.transport import TelegramBotApiTransport, Tele
 from shamsu.safety.sandbox import Sandbox
 
 TOKEN_ENV_VAR = "SHAMSU_TELEGRAM_BOT_TOKEN"
+
+#: How long the agent thread will wait for one live-card send. This blocks the
+#: turn, so it is deliberately short: long enough for a slow phone network,
+#: short enough that an unreachable Telegram cannot hold a run hostage. The
+#: card treats a timeout as "retry later, keeping every line", and backs off
+#: exponentially, so a dead transport costs one stall rather than one per flush.
+SEND_TIMEOUT_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,9 @@ class TelegramService:
         self.gateway = gateway or LocalShamsuSessionGateway(
             self.workspace,
             approval_broker=self.approval_broker,
+            send_message=self._send_card_from_thread,
+            typing_action=self._typing_from_thread,
+            mirror_factory=self._turn_mirror,
         )
         self.controller = TelegramController(
             store=self.store,
@@ -102,11 +113,14 @@ class TelegramService:
             return RemoteControlPanel(
                 RemoteControlStatus.DISABLED,
                 "Telegram is not configured.\n\n"
-                "Use one of:\n"
-                "1. Set SHAMSU_TELEGRAM_BOT_TOKEN\n"
-                "2. Create .shamsu/telegram.env with SHAMSU_TELEGRAM_BOT_TOKEN=...\n"
-                "3. Create .env with SHAMSU_TELEGRAM_BOT_TOKEN=...\n\n"
-                "Then run /remote_control again.\n\n"
+                "Recommended:\n"
+                "  /remote_control configure <bot-token>\n"
+                "This saves it once, for every project.\n\n"
+                "Also read, in order:\n"
+                "1. SHAMSU_TELEGRAM_BOT_TOKEN in the environment\n"
+                f"2. {install.install_token_path()}\n"
+                "3. .shamsu/telegram.env in this project\n"
+                "4. .env in this project\n\n"
                 "The bot token is never displayed.",
             )
         if subcommand == "status":
@@ -163,7 +177,10 @@ class TelegramService:
         if self._loop is None:
             self._loop = asyncio.get_running_loop()
         if self._should_process_in_background(update):
-            self._mirror_inbound(update)
+            # This branch is exactly "an authorized free-text task", so the
+            # desktop echoes it as a terminal prompt rather than as a panel -
+            # and the turn's activity lines follow it there.
+            self._mirror_inbound(update, as_prompt=True)
             await self._send(self._background_ack(update))
             self._start_background_update(update, mirror_inbound=False)
             return
@@ -245,6 +262,64 @@ class TelegramService:
             return
         self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self._send(message)))
 
+    def _send_card_from_thread(self, message: OutboundMessage) -> int:
+        """Send or edit the live turn card, BLOCKING, and return its id.
+
+        Blocking is the design, not an oversight. The card has to know the
+        `message_id` before it can edit anything, and back-pressure here is
+        what keeps two edits of the same card from racing and leaving stale
+        text on the phone. It costs the agent thread one HTTP round trip at
+        most once every 1.5 seconds.
+
+        Errors are raised rather than swallowed: the card treats a refusal as
+        "try again at the next flush, keeping every line", which is only
+        possible if it hears about it.
+        """
+        loop = self._loop
+        if loop is None or self.transport is None:
+            return 0
+        future = asyncio.run_coroutine_threadsafe(self._send_returning_id(message), loop)
+        return int(future.result(timeout=SEND_TIMEOUT_SECONDS))
+
+    async def _send_returning_id(self, message: OutboundMessage) -> int:
+        if self.transport is None:
+            return 0
+        message_id = int(await self.transport.send(message) or 0)
+        self.store.increment_metric("telegram_messages_sent")
+        # Deliberately NOT mirrored to the CLI: the desktop renders the same
+        # turn from the same stream, and mirroring every edit would print a
+        # panel per flush.
+        return message_id
+
+    def _typing_from_thread(self, chat_id: int) -> None:
+        """Fire-and-forget `sendChatAction`. A courtesy, never worth a wait."""
+        loop = self._loop
+        transport = self.transport
+        if loop is None or transport is None:
+            return
+
+        async def _act() -> None:
+            try:
+                await transport.chat_action(int(chat_id), "typing")
+            except Exception:  # noqa: BLE001
+                pass
+
+        def _spawn() -> None:
+            # Held in `_background_tasks`: asyncio keeps only a weak reference
+            # to a bare task, so one nobody holds can be collected mid-await.
+            task = asyncio.create_task(_act())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+
+        loop.call_soon_threadsafe(_spawn)
+
+    def _turn_mirror(self) -> Any:
+        """A renderer that paints a remote turn on the desktop, if one is watching."""
+        factory = getattr(self.cli_mirror, "turn_renderer", None)
+        if not callable(factory):
+            return None
+        return factory()
+
     def resolve_approval_callback(self, approval_id: str, approved: bool) -> bool:
         self.store.increment_metric("telegram_approvals")
         return self.approval_broker.resolve(approval_id, approved)
@@ -280,12 +355,16 @@ class TelegramService:
             ]
         )
 
-    def _mirror_inbound(self, update: TelegramUpdate) -> None:
+    def _mirror_inbound(self, update: TelegramUpdate, *, as_prompt: bool = False) -> None:
         if self.cli_mirror is None:
             return
         if update.message is not None:
             message = update.message
             if not self.authenticator.authorize(message.user, message.chat).ok:
+                return
+            echo = getattr(self.cli_mirror, "prompt_echo", None)
+            if as_prompt and callable(echo) and message.text:
+                echo(message.text)
                 return
             self.cli_mirror(
                 f"Telegram {message.user.display_name}",
@@ -326,31 +405,76 @@ class TelegramService:
 
 
 def load_telegram_bot_token(workspace: Path) -> tuple[str, str]:
+    """The bot token, and where it came from.
+
+    Order, and the reasoning behind it:
+
+    1. ``$SHAMSU_TELEGRAM_BOT_TOKEN`` - unchanged. The CI/ops override has
+       always won and still does.
+    2. ``~/.shamsu/telegram.env`` - the install token, and where `configure`
+       now writes. It comes before the workspace file deliberately: the whole
+       point of G3 is that switching project cannot change which bot you are
+       talking to, and a stale per-project file left over from before the
+       upgrade would silently do exactly that.
+    3. ``<workspace>/.shamsu/telegram.env`` - still read, so nobody's existing
+       setup breaks on upgrade.
+    4. ``<workspace>/.env`` - kept for compatibility.
+    """
     env_token = os.environ.get(TOKEN_ENV_VAR, "").strip()
     if env_token:
         return env_token, "environment"
     workspace = Path(workspace).resolve()
     candidates = [
-        workspace / ".shamsu" / "telegram.env",
-        workspace / ".env",
+        (install.install_token_path(), "install"),
+        (workspace / ".shamsu" / "telegram.env", ".shamsu/telegram.env"),
+        (workspace / ".env", ".env"),
     ]
-    for path in candidates:
+    for path, source in candidates:
         token = _read_token_file(path)
         if token:
-            source = ".shamsu/telegram.env" if path.name == "telegram.env" else ".env"
             return token, source
     return "", "missing"
 
 
-def configure_telegram_bot_token(workspace: Path, token: str) -> Path:
+def configure_telegram_bot_token(
+    workspace: Path, token: str, *, install_scope: bool = True
+) -> Path:
+    """Save the token. Install-wide by default; per-project on request.
+
+    `install_scope=False` is the escape hatch for someone who really does want
+    a different bot in one project. It is not the default, because needing to
+    do this once per project is the defect being fixed.
+    """
     clean = (token or "").strip().strip("'\"")
     if not _looks_like_bot_token(clean):
         raise ValueError("That does not look like a Telegram bot token.")
+    content = f"{TOKEN_ENV_VAR}={clean}\n"
+    if install_scope:
+        return install.write_private_file(install.install_token_path(), content)
     sandbox = Sandbox(Path(workspace).resolve())
     path = sandbox.validate(Path(".shamsu") / "telegram.env")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f"{TOKEN_ENV_VAR}={clean}\n", encoding="utf-8")
-    return path
+    return install.write_private_file(path, content)
+
+
+def promote_workspace_token(workspace: Path) -> Path | None:
+    """Copy a pre-upgrade workspace token up to the install, once.
+
+    Returns the install path if it promoted something, `None` otherwise, so a
+    caller can say so exactly once rather than every time.
+
+    The old file is never deleted. A downgrade, or a colleague on the previous
+    version sharing the checkout, must not find the token gone - and the cost
+    of leaving it is one stale file that nothing reads.
+    """
+    if os.environ.get(TOKEN_ENV_VAR, "").strip():
+        return None
+    destination = install.install_token_path()
+    if _read_token_file(destination):
+        return None
+    existing = _read_token_file(install.workspace_token_path(workspace))
+    if not existing:
+        return None
+    return install.write_private_file(destination, f"{TOKEN_ENV_VAR}={existing}\n")
 
 
 def _read_token_file(path: Path) -> str:

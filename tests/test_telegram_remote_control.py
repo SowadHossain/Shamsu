@@ -531,11 +531,34 @@ def test_environment_token_wins_over_local_files(tmp_path: Path, monkeypatch) ->
     assert source == "environment"
 
 
-def test_remote_control_configure_writes_ignored_local_token_file(tmp_path: Path, monkeypatch) -> None:
+def test_remote_control_configure_writes_the_install_token_file(tmp_path: Path, monkeypatch) -> None:
+    """Changed in P2: `configure` binds the token to the INSTALL, not the project.
+
+    This test previously asserted the workspace path. That was the defect, not
+    the contract - it is what made switching project mean reconfiguring - so
+    the assertion moved with the behaviour. `--workspace` still writes the old
+    file; see the test below.
+    """
+    from shamsu.integrations.telegram import install
+
     monkeypatch.delenv("SHAMSU_TELEGRAM_BOT_TOKEN", raising=False)
     token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
 
     path = configure_telegram_bot_token(tmp_path, token)
+    loaded, source = load_telegram_bot_token(tmp_path)
+
+    assert path == install.install_token_path()
+    assert loaded == token
+    assert source == "install"
+
+
+def test_remote_control_configure_can_still_write_the_local_token_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("SHAMSU_TELEGRAM_BOT_TOKEN", raising=False)
+    token = "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+
+    path = configure_telegram_bot_token(tmp_path, token, install_scope=False)
     loaded, source = load_telegram_bot_token(tmp_path)
 
     assert path == tmp_path / ".shamsu" / "telegram.env"

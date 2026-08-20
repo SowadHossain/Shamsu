@@ -317,12 +317,53 @@ def single_model_mode_enabled() -> bool:
     return not multi_model_mode_enabled()
 
 
+def installed_model() -> str:
+    """The install-wide model choice from `~/.shamsu/settings.json`, or `""`.
+
+    Imported lazily: this module is about as low-level as SHAMSU gets, and a
+    top-level import of the settings layer would make every consumer of a model
+    name depend on the install home being resolvable.
+    """
+    try:
+        from shamsu.runtime.settings import chat_model
+
+        return chat_model()
+    except Exception:  # noqa: BLE001 - an unreadable settings file costs the
+        # preference, never the ability to pick a model.
+        return ""
+
+
+#: Where an effective model name came from, weakest last. Named because the
+#: settings UI has to SHOW this: a workspace pin silently shadows an
+#: install-wide choice, and a picker that appeared to do nothing would be worse
+#: than no picker at all.
+MODEL_SOURCES = ("env", "workspace", "install", "tier")
+
+
+def model_source(role: str = "agent-chat") -> tuple[str, str]:
+    """`(source, model_name)` for the model *role* would actually get."""
+    pinned = configured_model()
+    if pinned:
+        return "env", pinned
+    if _ACTIVE_MODEL_OVERRIDE:
+        return "workspace", _ACTIVE_MODEL_OVERRIDE
+    chosen = installed_model()
+    if chosen:
+        return "install", chosen
+    return "tier", model_for_role(role)
+
+
 def model_for_role(role: str) -> str:
     pinned = configured_model()
     if pinned:
         return pinned
     if _ACTIVE_MODEL_OVERRIDE:
         return _ACTIVE_MODEL_OVERRIDE
+    # Weaker than a workspace pin and stronger than the tier default:
+    # most-specific-wins, the same precedence the bot token already uses.
+    chosen = installed_model()
+    if chosen:
+        return chosen
     tier = active_tier()
     if single_model_mode_enabled():
         # The tier's thinking anchor, qwen3.5:9b-q4_K_M on the default tier: it
@@ -418,6 +459,9 @@ def required_model_names(tier: ModelTier | None = None) -> list[str]:
         return [pinned]
     if _ACTIVE_MODEL_OVERRIDE:
         return [_ACTIVE_MODEL_OVERRIDE]
+    chosen = installed_model()
+    if chosen:
+        return [chosen]
     if single_model_mode_enabled():
         return [_thinking_model_for_tier(resolved_tier)]
     return [spec.name for spec in TIER_MODEL_SPECS[resolved_tier] if spec.required]

@@ -253,11 +253,18 @@ def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_
 
 
 def test_broken_code_comes_back_as_a_tool_result_the_model_can_fix(tmp_path):
-    """Not a verdict panel and not a separate repair loop - just information."""
+    """Not a verdict panel and not a separate repair loop - just information.
+
+    An ordinary syntax error, deliberately. `def broken(` used to stand here and
+    is now stopped BEFORE the write by the truncation gate, which is different
+    behaviour with its own tests. A missing colon is a mistake rather than a
+    severed generation, so it is written, checked, and reported - which is what
+    this test is about.
+    """
     loop = _loop(
         tmp_path,
         [
-            _tool("write_file", filepath="bad.py", content="def broken(\n"),
+            _tool("write_file", filepath="bad.py", content="def broken(x)\n    return x\n"),
             _text("Let me fix that."),
         ],
     )
@@ -2883,8 +2890,31 @@ def test_simple_mode_hands_the_real_console_to_the_prompt(tmp_path, monkeypatch)
         asyncio.run(repl._run_simple_chat("hi", tmp_path, console, None))
 
     assert "approve" in captured, "build_simple_tools was never reached"
+
+    # The approval prompt now goes through the shared control store, so that
+    # the same question reaches the browser and the phone. The property under
+    # test is unchanged and still the one that matters: whatever asks the
+    # human must be given THIS console. Called bare, it would build a fresh
+    # one, which knows nothing about the live spinner - so the status repaints
+    # over the question and over the answer being typed.
+    import shamsu.control.console as shared_console
+
+    async def _instant(_store, _approval_id, asked_console, **_kwargs):
+        seen["console"] = asked_console
+        return "deny"
+
+    monkeypatch.setattr(shared_console, "ask_here_or_anywhere", _instant)
+    monkeypatch.setattr(
+        shared_console,
+        "render_request",
+        lambda _record, rendered_console, **_kw: seen.__setitem__(
+            "rendered", rendered_console
+        ),
+    )
+
     captured["approve"](object())
     assert seen.get("console") is console, "the prompt was given a different console"
+    assert seen.get("rendered") is console, "the question was rendered elsewhere"
 
 
 def test_a_slow_tool_call_reports_that_it_is_still_running(tmp_path):

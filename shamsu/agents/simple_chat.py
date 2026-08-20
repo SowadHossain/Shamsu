@@ -30,6 +30,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,7 +43,11 @@ from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_prompt import simple_system_prompt
 from shamsu.agents.simple_verify import PROBLEM as VERIFY_PROBLEM
 from shamsu.agents.simple_verify import SKIPPED as VERIFY_SKIPPED
-from shamsu.agents.simple_verify import check_file
+from shamsu.agents.simple_verify import (
+    check_file,
+    truncation_signature,
+    unfinished_blocks,
+)
 from shamsu.context.budget import (
     PER_MESSAGE_OVERHEAD,
     message_tokens,
@@ -56,6 +61,7 @@ from shamsu.context.budget import (
 )
 from shamsu.llm.output import parse_model_turn
 from shamsu.runtime.models import model_for_role, model_is_reasoning
+from shamsu.runtime.turn_stream import TurnEvent
 from shamsu.session.manager import SessionLogger
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.types import CommandRisk, ToolResult
@@ -288,6 +294,18 @@ def max_ctx() -> int:
     raw = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
     if raw.isdigit() and int(raw) >= 4096:
         return int(raw)
+    # Then whatever was chosen in the CLI, the web portal or Telegram - one
+    # setting, install-wide, so changing it in one surface is not undone by
+    # opening another. The env var still wins: an operator who exported it did
+    # so for a reason.
+    try:
+        from shamsu.runtime.settings import chat_max_ctx
+
+        chosen = chat_max_ctx()
+    except Exception:  # noqa: BLE001 - a bad settings file is not a dead model
+        chosen = None
+    if chosen:
+        return chosen
     return 32768
 
 
@@ -314,6 +332,82 @@ def output_reserve(ceiling: int) -> int:
 # truncation refusal teaches: first section with write_file, then append_file
 # per section.
 MAX_REPLY_TOKENS = 16384
+
+# --- how much content ONE tool call may carry --------------------------------
+#
+# smallcode's ratio, and the whole mechanism behind it: an 8,192-token reply
+# budget against an 8,000-char write cap, so the model is never permitted to
+# attempt a write large enough to exhaust its own output budget. Four times the
+# headroom. SHAMSU had one times - `MAX_REPLY_TOKENS` was the only limit, and a
+# write allowed to fill the entire budget is a write that truncates.
+#
+# The ratio is restored by bounding the UNIT OF WORK, not the budget. Do not
+# shrink `MAX_REPLY_TOKENS` to fix a truncation: a large reply budget is still
+# genuinely useful for prose - a long explanation, a review, a plan - and once
+# the content cap exists the budget stops being what binds a write.
+#
+# The trade this makes is deliberate (2026-08-20): more tool calls is correct,
+# truncation is not. A truncated write is not a slow path, it is a pure-waste
+# path - every token after the cut is refused AND no longer held by the model,
+# so a 500-line file that truncates burns the full budget and produces nothing.
+# The same file in six chunks burns fewer output tokens and all of them land.
+WRITE_CHARS_FLOOR = 2_000
+
+# Wall B, and the reason a budget-derived cap alone is not enough. llama.cpp's
+# tool-argument JSON parser gives up somewhere around 13KB, and it does NOT
+# report `done_reason: "length"` when it does - it returns a mangled or empty
+# tool call, which is why the truncation guard sometimes never fires at all.
+# smallcode caps at 8,000 chars specifically to sit 1.6x under it. Absolute:
+# never scaled up, however much window is free.
+WRITE_CHARS_CEILING = 8_000
+
+# content of C chars ~= C/4 tokens (CHARS_PER_TOKEN_ESTIMATE), x ~1.10 for JSON
+# escaping, so C/3.6 tokens on the wire; wanting content <= cap/4 gives
+# C <= 0.9 x cap. `chars/4` is tuned for prose and dense code runs 3.3-3.7, so
+# the estimate runs the wrong way here - 0.85 absorbs that.
+WRITE_CHARS_PER_REPLY_TOKEN = 0.85
+
+# Every argument that carries a payload rather than a reference. `patch_file`
+# replacing ten lines with eight hundred has the identical problem, so the cap
+# is not a `write_file` special case.
+CONTENT_ARGUMENTS = ("content", "new_string")
+
+
+def max_write_chars(reply_cap_tokens: int) -> int:
+    """The most content one tool call may carry, given this reply budget.
+
+    The minimum of two INDEPENDENT walls. Wall A - the reply budget - is soft,
+    dynamic, and already understood here. Wall B - llama.cpp's tool-argument
+    parser - is hard and fixed, and a cap derived only from Wall A would still
+    allow a 60KB write on a large window and walk straight into it.
+    """
+    return int(
+        max(
+            WRITE_CHARS_FLOOR,
+            min(WRITE_CHARS_PER_REPLY_TOKEN * max(reply_cap_tokens, 0), WRITE_CHARS_CEILING),
+        )
+    )
+
+
+def write_budget_is_unworkable(reply_cap_tokens: int) -> bool:
+    """Is the floor the thing that bound, rather than either wall?
+
+    When even 2,000 chars - about fifty lines - exceeds what the budget can
+    safely carry, the honest answer is not to let the model write in 1,700-char
+    pieces. It is that the window is the wrong shape for this task. Silently
+    degrading to useless chunk sizes is how a turn burns 24 rounds achieving
+    nothing.
+    """
+    return WRITE_CHARS_PER_REPLY_TOKEN * max(reply_cap_tokens, 0) < WRITE_CHARS_FLOOR
+
+
+# What the PROMPT says, as opposed to what the tool enforces. Prose guidance has
+# to be memorable; the tool is what has to be exact. Sixty lines of dense code is
+# ~2,500 chars, comfortably under every cap `max_write_chars` can return, so a
+# model that follows the prompt never reaches the hard refusal. That gap is
+# deliberate belt-and-braces - it is what smallcode does too (their prompt says
+# 60 lines, their enforced cap is 8,000 chars, about 200).
+WRITE_LINES_GUIDANCE = 60
 
 # Substrings Ollama/llama.cpp use when the GPU cannot fit what was asked for.
 _OOM_MARKERS = (
@@ -442,15 +536,20 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "write_file",
             "description": (
-                "Create a NEW file, or replace a small one completely. To change part "
-                "of an existing file, prefer patch_file: it is far faster and cannot "
-                "lose the parts you did not mean to touch."
+                "Create a NEW file, or replace a small one completely. "
+                "LIMIT: 60 lines / 8KB per call - for anything longer, write the first "
+                "60 lines here and append_file the rest. To change part of an existing "
+                "file, prefer patch_file: it is far faster and cannot lose the parts "
+                "you did not mean to touch."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filepath": {"type": "string", "description": "Path relative to the workspace."},
-                    "content": {"type": "string", "description": "The complete file content."},
+                    "content": {
+                        "type": "string",
+                        "description": "The file content. 60 lines / 8KB maximum.",
+                    },
                 },
                 "required": ["filepath", "content"],
             },
@@ -466,7 +565,10 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "filepath": {"type": "string", "description": "Path relative to the workspace."},
                     "old_string": {"type": "string", "description": "The exact text to replace."},
-                    "new_string": {"type": "string", "description": "The text to put in its place."},
+                    "new_string": {
+                        "type": "string",
+                        "description": "The text to put in its place. 60 lines / 8KB maximum.",
+                    },
                 },
                 "required": ["filepath", "old_string", "new_string"],
             },
@@ -617,14 +719,18 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "name": "append_file",
             "description": (
                 "Add content to the END of an existing file. This is how you build a large "
-                "file: write_file the first section, then append_file each one after. Far "
-                "safer than rewriting a whole file, and it cannot be cut off partway."
+                "file: write_file the first section, then append_file each one after. "
+                "LIMIT: 60 lines / 8KB per call. Far safer than rewriting a whole file, "
+                "and it cannot be cut off partway."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filepath": {"type": "string", "description": "Path relative to the workspace."},
-                    "content": {"type": "string", "description": "The text to add at the end."},
+                    "content": {
+                        "type": "string",
+                        "description": "The text to add at the end. 60 lines / 8KB maximum.",
+                    },
                 },
                 "required": ["filepath", "content"],
             },
@@ -694,7 +800,10 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "properties": {
                     "filepath": {"type": "string", "description": "Path relative to the workspace."},
                     "old_string": {"type": "string", "description": "The exact text to replace."},
-                    "new_string": {"type": "string", "description": "The text to put in its place."},
+                    "new_string": {
+                        "type": "string",
+                        "description": "The text to put in its place. 60 lines / 8KB maximum.",
+                    },
                 },
                 "required": ["filepath", "old_string", "new_string"],
             },
@@ -713,7 +822,10 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "filepath": {"type": "string", "description": "Path relative to the workspace."},
-                    "content": {"type": "string", "description": "The complete file content."},
+                    "content": {
+                        "type": "string",
+                        "description": "The file content. 60 lines / 8KB maximum.",
+                    },
                     "command": {"type": "string", "description": "The command to run afterwards."},
                 },
                 "required": ["filepath", "content", "command"],
@@ -1280,6 +1392,8 @@ class SimpleChatLoop:
         request_timeout: float = 600.0,
         log_turns: bool = True,
         feedback: Any | None = None,
+        emit: Any | None = None,
+        source: str = "cli",
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.client = client
@@ -1295,6 +1409,18 @@ class SimpleChatLoop:
         # which is exactly how it was reported.
         self.on_status = on_status
         self.on_trace = on_trace
+        # The ONE seam every surface reads. `on_activity`/`on_status` stay as
+        # thin shims over it so nothing that builds this loop today breaks, but
+        # they cannot carry a turn on their own: a callback that takes a string
+        # cannot say whether the string was a tool call or a heartbeat, and a
+        # renderer that cannot tell those apart is the reason Telegram threw
+        # most of a turn away.
+        self.emit = emit
+        # Which surface started this turn: "cli" | "telegram" | "web". It rides
+        # on every event so a mirror can label a remote turn as remote.
+        self.source = source or "cli"
+        self.turn_id = ""
+        self._event_seq = 0
         self.verify_changes = verify_changes
         self.temperature = temperature
         self.request_timeout = request_timeout
@@ -1366,6 +1492,11 @@ class SimpleChatLoop:
         self._turn_failures: list[tuple[str, str]] = []
         self._truncated_refusals = 0
         self._truncated_target = ""
+        # Files whose last verdict was "still being built" - open blocks and
+        # nothing else wrong. Reported as progress while the model is still
+        # writing, and settled at turn end, when "not finished yet" stops being
+        # a true description of a file the model has walked away from.
+        self._unfinished: dict[str, str] = {}
         # Successful edits per file this turn - repeated blind fixes.
         self._edits_per_file: dict[str, int] = {}
         # How many times each identical read-only call has been made this turn.
@@ -1424,7 +1555,36 @@ class SimpleChatLoop:
         """
         started = time.perf_counter()
         self._turn_failures = []
-        result = await self._run_turn(user_input)
+        # A fresh turn id and a fresh sequence per turn: renderers dedupe and
+        # reorder on `seq`, and a counter that carried across turns would make
+        # "everything after N" mean different things on different surfaces.
+        self.turn_id = f"turn-{uuid.uuid4().hex[:12]}"
+        self._event_seq = 0
+        self._publish("turn.start", user_input, prompt=user_input)
+        try:
+            result = await self._run_turn(user_input)
+        except BaseException as exc:  # noqa: BLE001 - re-raised; the stream must not lie
+            self._publish("error", f"{type(exc).__name__}: {exc}")
+            self._publish(
+                "turn.end",
+                _turn_verdict(time.perf_counter() - started, (), stopped=True),
+                status="error",
+                elapsed=time.perf_counter() - started,
+            )
+            raise
+        elapsed = time.perf_counter() - started
+        if result.error:
+            self._publish("error", result.error)
+        self._publish("assistant", result.final)
+        self._publish(
+            "turn.end",
+            _turn_verdict(elapsed, result.changed_files, stopped=result.stopped),
+            status="stopped" if result.stopped else "done",
+            elapsed=elapsed,
+            rounds=result.rounds,
+            tool_calls=result.tool_calls,
+            changed_files=list(result.changed_files),
+        )
         try:
             await asyncio.to_thread(
                 self._record_evidence, user_input, result, time.perf_counter() - started
@@ -1659,6 +1819,7 @@ class SimpleChatLoop:
                     # finished answer - `done_reason` told us it was not.
                     text = self._out_of_room_message(text)
                     self._activity("reply hit the context limit; labelled it partial")
+                self._settle_unfinished()
                 self.state.append_assistant(text)
                 if self.turn_log:
                     self.turn_log.close_turn(text, round_index + 1, stopped=False)
@@ -2592,6 +2753,15 @@ class SimpleChatLoop:
             if cut_off and index == last and name in WRITING_TOOLS:
                 self._refuse_truncated_write(call, name, arguments, outcome)
                 continue
+            if name in WRITING_TOOLS:
+                oversized = self._oversized_content(name, arguments)
+                if oversized is not None:
+                    self._refuse_oversized_write(call, name, arguments, oversized)
+                    continue
+                cut = self._truncated_content(name, arguments)
+                if cut is not None:
+                    self._refuse_cut_off_content(call, name, arguments, cut)
+                    continue
             signature = _call_signature(name, arguments)
             if (
                 name in WRITING_TOOLS
@@ -2600,8 +2770,15 @@ class SimpleChatLoop:
             ):
                 self._refuse_repeated_failure(call, name, arguments, signature)
                 continue
-            self._activity(f"{name} {_argument_summary(arguments)}")
-            self._trace("simple.tool", f"{name} {_argument_summary(arguments)}", {"tool": name})
+            summary = _argument_summary(arguments)
+            self._activity(
+                f"{name} {summary}",
+                kind="tool.call",
+                tool=name,
+                summary=summary,
+                arguments=_publishable_arguments(arguments),
+            )
+            self._trace("simple.tool", f"{name} {summary}", {"tool": name})
             # A tool can block for as long as its timeout allows - `run_command`
             # defaults to 120s, and a server started in the foreground will use
             # every second of it. Without a tick that is two minutes of silence
@@ -2613,6 +2790,17 @@ class SimpleChatLoop:
                 beat.cancel()
             if self.turn_log:
                 self.turn_log.log_tool_result(name, arguments, result.ok, result.message)
+            # The CLI has never printed this, and at `normal` verbosity no
+            # surface shows it either - it is here so the web UI can build a
+            # collapsible tool card and a diff preview without re-running
+            # anything.
+            self._publish(
+                "tool.result",
+                f"{name} {'ok' if result.ok else 'failed'}",
+                tool=name,
+                ok=bool(result.ok),
+                message=_first_line(result.message),
+            )
             if not result.ok:
                 # Kept for the evidence note. smallcode keeps the error TAIL for
                 # the same reason: the last line says what went wrong, the rest
@@ -2732,6 +2920,190 @@ class SimpleChatLoop:
         self._activity(f"{name} on {named} already failed {seen} times identically; not run")
         self._trace(
             "simple.refused_repeat", f"{name} {named}", {"tool": name, "attempts": seen}
+        )
+        if self.turn_log:
+            self.turn_log.log_tool_result(name, arguments, False, message)
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
+
+    def _max_write_chars(self) -> int:
+        """This session's content cap, from the reply budget that last bound.
+
+        `_last_reply_cap` is the number the last generation actually carried;
+        before the first call there is none, so fall back to the reserve - the
+        floor `_reply_cap` itself can never go below.
+        """
+        return max_write_chars(self._last_reply_cap or output_reserve(self._ceiling()))
+
+    def _content_argument(self, arguments: dict[str, Any]) -> tuple[str, str]:
+        """The payload this call carries, and which argument holds it."""
+        for key in CONTENT_ARGUMENTS:
+            value = arguments.get(key)
+            if isinstance(value, str) and value:
+                return key, value
+        return "", ""
+
+    def _oversized_content(
+        self, name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str, int] | None:
+        """Is this call carrying more than one call may carry?
+
+        Returns `(argument, content, cap)` when it is, `None` otherwise. The
+        check is on the ARGUMENT, before anything is executed: the content was
+        fully generated and is merely rejected at the door, so nothing is lost
+        and the model still holds every character of it. That is the whole
+        point of moving the limit here from the output cap, where hitting it
+        means the remainder never existed.
+        """
+        key, content = self._content_argument(arguments)
+        if not key:
+            return None
+        cap = self._max_write_chars()
+        if len(content) <= cap:
+            return None
+        return key, content, cap
+
+    def _refuse_oversized_write(
+        self,
+        call: Any,
+        name: str,
+        arguments: dict[str, Any],
+        oversized: tuple[str, str, int],
+    ) -> None:
+        """Refuse a payload too large to survive the wire, and NAME THE STRATEGY.
+
+        The error is the whole value here. A refusal that states only the limit
+        converts one unrecoverable failure into one useless round; a refusal
+        that names the next call converts it into a recoverable one, and the
+        model learns the strategy at the moment it needs it. Vague guidance cost
+        674s and a failure on 2026-08-18 where naming the call took 42s.
+        """
+        key, content, cap = oversized
+        target = str(
+            arguments.get("filepath") or arguments.get("path") or arguments.get("file") or ""
+        ).strip()
+        named = target or "that file"
+        lines = content.count(chr(10)) + 1
+        self._repair_attempts += 1
+
+        message = (
+            f"REFUSED - nothing was written and {named} is unchanged on disk."
+            + chr(10) * 2
+            + f"{name}: {key} too large ({lines:,} lines / {len(content) / 1024:.1f}KB). "
+            f"Tool calls larger than {cap / 1024:.1f}KB cannot be parsed reliably, so "
+            "sending this would have been cut off mid-argument rather than written."
+            + chr(10) * 2
+        )
+        if write_budget_is_unworkable(self._last_reply_cap or output_reserve(self._ceiling())):
+            # The floor bound, not either wall. Chunking to 1,700 characters at
+            # a time is not a strategy, it is 24 rounds of nothing.
+            message += (
+                "There is also too little room left in this conversation to write in "
+                "useful pieces. Say `/new` to start a fresh conversation, then ask for "
+                "this file again."
+            )
+        else:
+            message += (
+                f"Strategy: call write_file for {named} with just the first "
+                f"{WRITE_LINES_GUIDANCE} lines - imports and empty stubs are enough - "
+                "then call append_file once per following section, "
+                f"{WRITE_LINES_GUIDANCE} lines at a time. Keep every call under "
+                f"{WRITE_LINES_GUIDANCE} lines. Nothing you generated is lost; resend it "
+                "in pieces."
+            )
+        result = ToolResult(
+            False,
+            message,
+            {
+                "refused": "content_too_large",
+                "tool": name,
+                "argument": key,
+                "chars": len(content),
+                "max_chars": cap,
+            },
+        )
+        self._turn_failures.append((name, _first_line(message)))
+        self._activity(
+            f"{name} carried {len(content):,} chars for {named}; the cap is {cap:,}, refused"
+        )
+        self._trace(
+            "simple.refused_oversized",
+            f"{name} {named}",
+            {"tool": name, "filepath": target, "chars": len(content), "max_chars": cap},
+        )
+        if self.turn_log:
+            self.turn_log.log_tool_result(name, arguments, False, message)
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
+
+    def _truncated_content(
+        self, name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        """Does this payload carry a TRUNCATION SIGNATURE? `(argument, why)`.
+
+        The gate that was missing for a brand-new file: both write-time gates in
+        the tool layer bail out when the target does not already exist, so
+        SHAMSU would refuse to damage a good file and happily create a broken
+        one - and only for Python at that.
+
+        What it must NOT do is test for validity. Under a chunking strategy the
+        first section of a file correctly has unclosed blocks, and a gate that
+        refused those would refuse every legitimate first chunk. So it tests for
+        the shapes a generation cut mid-token leaves behind - an unterminated
+        string, a dangling operator, a bracket opened on the last line and never
+        closed - and lets an unfinished-but-clean section through.
+        """
+        key, content = self._content_argument(arguments)
+        if not key:
+            return None
+        path = str(arguments.get("filepath") or arguments.get("path") or "").strip()
+        why = truncation_signature(content, suffix=Path(path).suffix if path else "")
+        if not why:
+            return None
+        return key, why
+
+    def _refuse_cut_off_content(
+        self,
+        call: Any,
+        name: str,
+        arguments: dict[str, Any],
+        cut: tuple[str, str],
+    ) -> None:
+        """Do not create a file that stops mid-construct.
+
+        Counted into the truncation streak, because that is what this is - the
+        same failure the `done_reason` guard catches, seen from the argument
+        instead of from the response. Sharing the counter means the streak's
+        exit covers both, rather than a model that truncates without Ollama
+        admitting it spinning past a guard that never counts.
+        """
+        key, why = cut
+        target = str(
+            arguments.get("filepath") or arguments.get("path") or arguments.get("file") or ""
+        ).strip()
+        named = target or "that file"
+        self._truncated_refusals += 1
+        self._truncated_target = target
+        self._repair_attempts += 1
+
+        message = (
+            f"REFUSED - nothing was written and {named} is unchanged on disk."
+            + chr(10) * 2
+            + f"The {key} you sent stops part-way through: {why}. Writing it would put a "
+            "file on disk that cannot be parsed."
+            + chr(10) * 2
+            + f"Send {named} in pieces instead: write_file with the first "
+            f"{WRITE_LINES_GUIDANCE} lines, ending on a COMPLETE line, then append_file "
+            "for each following section. An unfinished section is fine - an unfinished "
+            "line is not."
+        )
+        result = ToolResult(
+            False, message, {"refused": "content_truncated", "tool": name, "why": why}
+        )
+        self._turn_failures.append((name, _first_line(message)))
+        self._activity(f"{name} content for {named} {why}; refused rather than writing it")
+        self._trace(
+            "simple.refused_cut_off",
+            f"{name} {named}",
+            {"tool": name, "filepath": target, "why": why},
         )
         if self.turn_log:
             self.turn_log.log_tool_result(name, arguments, False, message)
@@ -3520,12 +3892,19 @@ class SimpleChatLoop:
         no check: it is the signal that told the model the truncated code was
         complete.
 
-        Three outcomes now, and `skipped` is the escape - a `.md` file nobody
-        can parse is reported as unchecked, never as a problem to repair.
+        Four outcomes now. `skipped` is the escape - a `.md` file nobody can
+        parse is reported as unchecked, never as a problem to repair - and
+        `unfinished` is the one chunked writing needs. Once a large file is
+        MEANT to arrive in sections, every intermediate section legitimately
+        fails a bracket count, and reporting that as a fault would send the
+        model repairing a file that is simply not finished yet. An open block on
+        a file this turn just wrote is progress, and saying so turns the
+        verifier into the signal that tells the model what to append next.
         """
         problems: list[str] = []
         checked: list[str] = []
         skipped: list[str] = []
+        unfinished: list[str] = []
         for relative in dict.fromkeys(written):
             path = (self.workspace / relative).resolve()
             if not path.is_file():
@@ -3533,29 +3912,136 @@ class SimpleChatLoop:
                 continue
             verdict = check_file(path)
             if verdict.status == VERIFY_PROBLEM:
+                cut = self._cut_off_on_disk(path, relative)
+                if cut:
+                    problems.append(cut)
+                    continue
+                still_open = self._still_being_built(path)
+                if still_open:
+                    unfinished.append(f"{relative}: {still_open}")
+                    self._unfinished[relative] = verdict.detail or still_open
+                    continue
                 problems.append(f"{relative}: {verdict.detail}")
+                self._unfinished.pop(relative, None)
             elif verdict.status == VERIFY_SKIPPED:
                 skipped.append(f"{relative} ({verdict.detail})")
+                self._unfinished.pop(relative, None)
             else:
                 checked.append(relative)
+                self._unfinished.pop(relative, None)
         if problems:
             return json.dumps(
                 {"ok": False, "message": "Problems in the files just written.",
-                 "data": {"problems": problems, "checked": checked, "skipped": skipped}},
+                 "data": {"problems": problems, "checked": checked,
+                          "skipped": skipped, "unfinished": unfinished}},
                 ensure_ascii=True,
             )
-        if not checked and not skipped:
+        if not checked and not skipped and not unfinished:
             return ""
+        parts: list[str] = []
         if checked:
-            message = f"Checked {', '.join(checked)}: no syntax errors."
-            if skipped:
-                message += f" NOT checked: {', '.join(skipped)}."
-        else:
-            message = f"Nothing was syntax-checked. NOT checked: {', '.join(skipped)}."
+            parts.append(f"Checked {', '.join(checked)}: no syntax errors.")
+        if unfinished:
+            parts.append("Still being built: " + "; ".join(unfinished) + ".")
+        if skipped:
+            parts.append(f"NOT checked: {', '.join(skipped)}.")
+        if not checked and not unfinished:
+            parts.insert(0, "Nothing was syntax-checked.")
         return json.dumps(
-            {"ok": True, "message": message,
-             "data": {"checked": checked, "skipped": skipped}},
+            {"ok": True, "message": " ".join(parts),
+             "data": {"checked": checked, "skipped": skipped,
+                      "unfinished": unfinished}},
             ensure_ascii=True,
+        )
+
+    def _settle_unfinished(self) -> None:
+        """A file still open when the model walks away is not "in progress".
+
+        The other half of reporting open blocks as progress. Mid-turn, "3 blocks
+        still open, continue with append_file" is the right thing to say and
+        carries no verdict - the file has not been finished yet, so there is
+        nothing to pass or fail. At turn end that stops being true: the model
+        declared itself done, and a file it left mid-block is broken.
+
+        Without this the run outcome would read a half-written file as a
+        success, which is the exact defect `_record_verification` was written
+        for pointed the other way.
+        """
+        if self.action_ledger is None or not self._unfinished:
+            return
+        for relative, detail in list(self._unfinished.items()):
+            path = (self.workspace / relative).resolve()
+            if not path.is_file():
+                continue
+            if self._still_being_built(path):
+                self._log_verdict(
+                    False,
+                    relative,
+                    f"{relative}: {detail} - and the turn ended with it still open",
+                )
+        self._unfinished.clear()
+
+    def _still_being_built(self, path: Path) -> str:
+        """"3 blocks still open. Continue with append_file." - or ``""``.
+
+        The tension chunking creates, and the reason it has to be resolved here
+        rather than by not verifying: `append_file` is in `WRITING_TOOLS`
+        precisely so a file built in pieces IS checked after every piece, which
+        was added to kill stale verdicts. Both are right, and what reconciles
+        them is that an unclosed block means two different things depending on
+        whether the file is finished.
+
+        Only for a file whose ONLY complaint is open blocks. A closer with
+        nothing open, a mismatched pair, or a truncation signature is wrong at
+        every stage of writing and stays a problem.
+        """
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        # Python and JSON have real parsers and no block delimiters to count,
+        # so `unfinished_blocks` is empty for them by construction: an
+        # unfinished Python section usually compiles, and one that does not is a
+        # mistake rather than a missing closer.
+        still_open = unfinished_blocks(text, path.suffix)
+        if not still_open:
+            return ""
+        opener, opened_at = still_open[0]
+        count = len(still_open)
+        return (
+            f"{count} block(s) still open, the first a {opener} on line {opened_at}. "
+            "That is expected part-way through - continue with append_file"
+        )
+
+    def _cut_off_on_disk(self, path: Path, relative: str) -> str:
+        """A file that STOPS PART-WAY THROUGH, and the exact call that fixes it.
+
+        The safety net, not the primary path: the pre-write gate refuses cut-off
+        content before it reaches disk, so by the time a file gets here it has
+        usually arrived through a patch or from outside this turn. It exists
+        because the legacy loop had the better answer and simple mode never
+        carried it over - continue-from-the-tail keeps the good 80% and asks
+        only for what is missing, where "send it again in sections" throws away
+        a file the model no longer holds.
+
+        Language-agnostic, unlike the legacy version, which read `.py` only.
+        """
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        why = truncation_signature(text, suffix=path.suffix)
+        if not why:
+            return ""
+        tail = chr(10).join(text.splitlines()[-12:])
+        return (
+            f"{relative}: it STOPS PART-WAY THROUGH - {why}. Do not re-send the whole "
+            f"file (that is what truncated). Call append_file on {relative} with ONLY "
+            "the missing remainder, continuing exactly from where this tail ends, and "
+            "close every open string, bracket and block:" + chr(10)
+            + "--- current end of file ---" + chr(10)
+            + tail + chr(10)
+            + "--- end ---"
         )
 
     # -- helpers ---------------------------------------------------------
@@ -3569,6 +4055,7 @@ class SimpleChatLoop:
         *,
         error: str = "",
     ) -> SimpleChatResult:
+        self._settle_unfinished()
         self.state.append_assistant(message)
         if self.turn_log:
             self.turn_log.close_turn(message, rounds, stopped=True)
@@ -3581,12 +4068,40 @@ class SimpleChatLoop:
             error=error,
         )
 
-    def _activity(self, message: str) -> None:
+    def _publish(self, kind: str, text: str = "", **data: Any) -> None:
+        """Put one event on the turn stream. Never raises, never blocks a turn."""
+        if not self.emit:
+            return
+        self._event_seq += 1
+        event = TurnEvent(
+            seq=self._event_seq,
+            kind=kind,
+            text=text,
+            data=data,
+            turn_id=self.turn_id,
+            session_id=str(getattr(self.session_logger, "session_id", "") or ""),
+            workspace=str(self.workspace),
+            source=self.source,
+        )
+        try:
+            self.emit(event)
+        except Exception:  # noqa: BLE001 - a renderer must never fail a turn
+            pass
+
+    def _activity(self, message: str, *, kind: str = "activity", **data: Any) -> None:
+        """An append-only line. `kind` lets a caller say what KIND of line it is.
+
+        The tool-call line goes out as `tool.call` rather than `activity` so a
+        renderer can collapse it, diff it or hang a button off it - but it is
+        still the same string, emitted once, so the CLI's list and the phone's
+        list stay equal.
+        """
         if self.on_activity:
             try:
                 self.on_activity(message)
             except Exception:
                 pass
+        self._publish(kind, message, **data)
 
     def _status(self, message: str) -> None:
         if self.on_status:
@@ -3594,6 +4109,7 @@ class SimpleChatLoop:
                 self.on_status(message)
             except Exception:
                 pass
+        self._publish("status", message)
 
     async def _heartbeat(self, label: str) -> None:
         """Tick a live status while a model call is in flight, until cancelled."""
@@ -3671,6 +4187,40 @@ def _call_to_message(call: Any) -> dict[str, Any]:
             "arguments": _call_arguments(call),
         }
     }
+
+
+#: An argument value longer than this is summarised rather than published. A
+#: `write_file` carries a whole file, and `activity.jsonl` is UI telemetry - it
+#: must not quietly become a second, unredacted copy of the workspace.
+MAX_PUBLISHED_ARGUMENT_CHARS = 200
+
+
+def _publishable_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    published: dict[str, Any] = {}
+    for key, value in (arguments or {}).items():
+        if isinstance(value, str) and len(value) > MAX_PUBLISHED_ARGUMENT_CHARS:
+            published[key] = f"<{len(value)} chars>"
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            published[key] = value
+        else:
+            published[key] = str(value)[:MAX_PUBLISHED_ARGUMENT_CHARS]
+    return published
+
+
+def _turn_verdict(elapsed: float, changed: tuple[str, ...] | list[str], *, stopped: bool) -> str:
+    """The one line a surface shows where the live footer used to tick.
+
+    ASCII only, deliberately: this string reaches a Windows console and a
+    Telegram HTML body, and a decorative separator has crashed a cp1252
+    terminal here before.
+    """
+    seconds = max(0, int(elapsed))
+    spent = f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
+    verdict = "stopped after" if stopped else "done in"
+    count = len(dict.fromkeys(changed))
+    if not count:
+        return f"{verdict} {spent}"
+    return f"{verdict} {spent} - {count} file{'s' if count != 1 else ''} changed"
 
 
 def _argument_summary(arguments: dict[str, Any]) -> str:

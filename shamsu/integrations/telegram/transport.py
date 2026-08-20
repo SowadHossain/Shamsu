@@ -29,6 +29,12 @@ class TelegramTransport(ABC):
     async def send(self, message: OutboundMessage) -> int:
         ...
 
+    async def chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Show "typing..." in the chat. Concrete, not abstract, on purpose:
+        it is a courtesy signal, and an implementation that cannot send one
+        must not be forced to pretend it can."""
+        return None
+
     async def close(self) -> None:
         return None
 
@@ -84,10 +90,15 @@ class TelegramBotApiTransport(TelegramTransport):
         }
         if message.edit_message_id is not None:
             payload["message_id"] = message.edit_message_id
+        if message.parse_mode:
+            payload["parse_mode"] = message.parse_mode
         if message.reply_markup is not None:
             payload["reply_markup"] = message.reply_markup.to_telegram()
         result = await self._api(method, payload)
         return int((result or {}).get("message_id") or message.edit_message_id or 0)
+
+    async def chat_action(self, chat_id: int, action: str = "typing") -> None:
+        await self._api("sendChatAction", {"chat_id": chat_id, "action": action})
 
     async def _send_document(self, message: OutboundMessage) -> int:
         path = message.document_path
@@ -124,6 +135,7 @@ class FakeTelegramTransport(TelegramTransport):
     def __init__(self) -> None:
         self.inbound: asyncio.Queue[TelegramUpdate] = asyncio.Queue()
         self.sent: list[OutboundMessage] = []
+        self.actions: list[tuple[int, str]] = []
         self.closed = False
 
     async def updates(self) -> AsyncIterator[TelegramUpdate]:
@@ -133,7 +145,15 @@ class FakeTelegramTransport(TelegramTransport):
 
     async def send(self, message: OutboundMessage) -> int:
         self.sent.append(message)
+        # An EDIT keeps the id it was given; only a fresh send mints one. A
+        # fake that renumbered every call would have hidden the live card's
+        # whole point - that it edits one message instead of sending many.
+        if message.edit_message_id is not None:
+            return int(message.edit_message_id)
         return len(self.sent)
+
+    async def chat_action(self, chat_id: int, action: str = "typing") -> None:
+        self.actions.append((int(chat_id), action))
 
     async def close(self) -> None:
         self.closed = True

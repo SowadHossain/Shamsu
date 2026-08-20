@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>SHAMSU</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <header class="rail-head">
+      <span class="mark">SHAMSU</span>
+      <button id="add-workspace" class="icon-btn" title="Add a workspace by path"
+              aria-label="Add a workspace">+</button>
+    </header>
+    <div class="rail-search">
+      <input id="filter" type="search" placeholder="Search threads" autocomplete="off" spellcheck="false">
+    </div>
+    <nav id="tree" aria-label="Workspaces and threads"></nav>
+    <footer class="rail-foot">
+      <button id="open-settings" class="foot-btn" type="button">
+        <span id="rail-model">&mdash;</span>
+        <span class="gear" aria-hidden="true">&#9881;</span>
+      </button>
+    </footer>
+  </aside>
+
+  <main id="main">
+    <header id="thread-head">
+      <!-- The toggle lives HERE, not in the sidebar. Inside the sidebar it
+           vanished along with the thing it was meant to bring back. -->
+      <button id="rail-toggle" class="icon-btn" title="Toggle sidebar"
+              aria-label="Toggle sidebar">&#9776;</button>
+      <div class="head-left">
+        <h1 id="thread-title">SHAMSU</h1>
+        <span id="thread-sub"></span>
+      </div>
+      <div class="head-right">
+        <span id="run-pill" class="pill" hidden>idle</span>
+        <button id="new-thread" class="ghost-btn" type="button" hidden>New thread</button>
+      </div>
+    </header>
+
+    <div id="scroller">
+      <div id="conversation">
+        <div id="welcome" class="welcome">
+          <h2>Pick a thread, or start one</h2>
+          <p>Every workspace SHAMSU has opened is on the left, most recent first.
+             A thread runs the same whether you drive it from here, the terminal,
+             or Telegram. Type <code>/</code> for commands.</p>
+        </div>
+      </div>
+    </div>
+
+    <button id="jump" hidden>&darr; <span id="jump-count">0</span> new</button>
+
+    <div id="composer-wrap">
+      <div id="queue-strip" hidden></div>
+      <div id="palette" hidden role="listbox" aria-label="Commands"></div>
+      <form id="composer" autocomplete="off">
+        <textarea id="prompt" rows="1" placeholder="Ask SHAMSU to do something, or / for commands"
+                  spellcheck="false" disabled></textarea>
+        <button id="send" type="submit" class="send" title="Send" aria-label="Send" disabled>
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+            <path d="M4 12h15M13 6l6 6-6 6" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </button>
+      </form>
+      <p class="composer-hint" id="composer-hint">
+        Enter to send &middot; Shift+Enter for a new line &middot; / for commands
+      </p>
+    </div>
+  </main>
+
+  <div id="drawer" hidden>
+    <div id="drawer-scrim"></div>
+    <section id="drawer-panel" role="dialog" aria-label="Settings">
+      <header class="drawer-head">
+        <h2>Settings</h2>
+        <button id="close-settings" class="icon-btn" aria-label="Close">&times;</button>
+      </header>
+      <div class="drawer-body">
+        <section class="setting">
+          <h3>Model</h3>
+          <p class="value" id="set-model">&mdash;</p>
+        </section>
+
+        <section class="setting">
+          <h3>Context window</h3>
+          <p class="note">Applies everywhere &mdash; terminal, web and Telegram.</p>
+          <div class="row" id="ctx-buttons"></div>
+          <p class="meter"><span id="ctx-meter">no turn yet</span></p>
+          <p class="note" id="ctx-env" hidden>
+            Overridden by <code>SHAMSU_CHAT_MAX_CTX</code> in the environment.
+          </p>
+        </section>
+
+        <section class="setting">
+          <h3>Telegram</h3>
+          <p class="value" id="set-telegram">&mdash;</p>
+          <div class="row">
+            <input id="tg-token" type="password" placeholder="Bot token" autocomplete="off" spellcheck="false">
+            <button id="tg-save" class="btn" type="button">Save</button>
+          </div>
+          <p class="note">Saved to this installation. Never displayed again.</p>
+        </section>
+
+        <section class="setting">
+          <h3>Tools</h3>
+          <ul id="set-tools" class="tools"></ul>
+        </section>
+      </div>
+    </section>
+  </div>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

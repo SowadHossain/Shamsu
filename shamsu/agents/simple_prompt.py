@@ -61,10 +61,21 @@ RECALL_CAPABILITY = (
     + "longer see."
 )
 
+# A NUMBER, because "too big" is not something a 3B model can act on. This said
+# "a file too big to write in one go" and named no limit, so the model decided
+# for itself and decided wrong - one reply, whole file, cut off part-way.
+#
+# The number here is deliberately far stricter than the cap the tool enforces
+# (~8,000 characters, about 200 lines). Prose guidance has to be memorable; the
+# tool is what has to be exact. Sixty lines of dense code is ~2,500 characters,
+# so a model that follows this never reaches the hard refusal at all - the gap
+# is belt-and-braces, and it is what smallcode does too.
 BIG_FILE_CAPABILITY = (
     chr(10) * 2
-    + "For a file too big to write in one go: write_file the first section, "
-    + "then append_file the rest. To change part of one, patch_file."
+    + "Keep every write_file and append_file under 60 lines. For anything "
+    + "larger: write_file the first 60 lines, then append_file each following "
+    + "section, 60 lines at a time. To change part of an existing file, "
+    + "patch_file."
 )
 
 GRAPH_CAPABILITY = (

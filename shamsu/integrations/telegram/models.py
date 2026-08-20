@@ -138,6 +138,11 @@ class OutboundMessage:
     reply_markup: InlineKeyboardMarkup | None = None
     edit_message_id: int | None = None
     document_path: Path | None = None
+    #: `"HTML"` or `"MarkdownV2"`. Empty means plain text, which is what every
+    #: existing caller sends and what stays safest for arbitrary agent output -
+    #: an unescaped `<` in plain mode is a character, in HTML mode it is a
+    #: parse error that Telegram rejects the whole message for.
+    parse_mode: str = ""
 
 
 @dataclass(frozen=True)

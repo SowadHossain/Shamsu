@@ -177,8 +177,14 @@ The bot is driven from the REPL by `/remote_control`
 (`service.py:328`):
 
 1. `SHAMSU_TELEGRAM_BOT_TOKEN`
-2. `<workspace>/.shamsu/telegram.env`
-3. `<workspace>/.env`
+2. `~/.shamsu/telegram.env` — **install-wide, and where `configure` writes.**
+3. `<workspace>/.shamsu/telegram.env` — still read, so pre-P2 setups keep working
+4. `<workspace>/.env`
+
+`/remote_control configure <token>` binds the token to the installation, so
+switching project no longer means configuring it again. `--workspace` pins it to
+one project instead. A pre-P2 workspace token is promoted to the install once, on
+the first `/remote_control` after upgrade; the old file is left in place.
 
 `configure_telegram_bot_token` validates the token's shape before writing it
 (`:373` — numeric id, `:`, ≥20 chars, no whitespace), and both target paths are
@@ -484,15 +490,17 @@ known issue, not a design assumption.
 
 ## 4. Concurrency — bot and SHAMSU on different projects
 
-### 4.1 The workspace is the isolation unit
+### 4.1 The workspace is the isolation unit — for everything except the bot
 
-Everything the integration owns is workspace-scoped:
+Since P2 the split follows what each fact actually describes. The bot and the
+phone belong to the **machine**; everything else belongs to the project:
 
 | State | Location |
 |---|---|
-| Pairings, authorizations, callbacks, audit, metrics, update offset | `<workspace>/.shamsu/telegram/telegram-state.db` |
-| Bot token | `<workspace>/.shamsu/telegram.env` (or `.env`) |
-| Installation id | `meta` row in that workspace's database |
+| Pairings, authorizations, callbacks, metrics, update offset | `~/.shamsu/telegram/telegram-state.db` — **install-wide** |
+| Bot token | `~/.shamsu/telegram.env` (workspace files still read as fallback) |
+| Installation id | `meta` row in the install database |
+| Active session per user, audit trail | same database, scoped by a `workspace` column |
 | Sessions and transcripts | `<workspace>/.shamsu/sessions/` |
 | Run records | `<workspace>/.shamsu/runs/` |
 | Runtime task state | `<workspace>/.shamsu/runtime-state.db` |
@@ -522,8 +530,9 @@ if self._service is None or self._workspace != resolved:
 
 So a single REPL drives exactly one project from Telegram. Moving to another
 project means running `/remote_control connect` from a REPL opened in that
-project, which builds a fresh service against that workspace's state — and
-requires re-pairing, because the pairing database is workspace-scoped.
+project. Since P2 that no longer costs a re-pairing or a second `configure`: the
+token and the pairing are install-wide, so the new service picks both up. What
+changes is which workspace the runs happen in, which is the point.
 
 Meanwhile the local REPL in the *first* project keeps working normally; it simply
 no longer has a phone attached.
@@ -558,8 +567,9 @@ above:
   `getUpdates` consumer on the machine, which resolves reason 1 by construction.
   It must call `runtime/session_registry.py:register_session()`, or the last
   exiting REPL will stop Ollama underneath it (`runtime/ollama.py:209-233`).
-- **Host-level link state** — token at `~/.shamsu/telegram.env` and pairings at
-  `~/.shamsu/runtime/telegram-state.db` — so pairing happens once per machine
+- ~~**Host-level link state**~~ — **done in P2.** The token lives at
+  `~/.shamsu/telegram.env` and the pairings at
+  `~/.shamsu/telegram/telegram-state.db`, so pairing happens once per machine
   rather than once per project.
 - **A workspace registry**, which does not exist anywhere in SHAMSU today
   (`~/.shamsu` is explicitly launcher-only, and everything else is cwd-relative).

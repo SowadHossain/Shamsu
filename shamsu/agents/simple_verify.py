@@ -24,10 +24,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 __all__ = [
+    "BracketScan",
     "CheckResult",
+    "TRUNCATION_ERROR_MARKERS",
     "bracket_problem",
+    "bracket_scan",
     "check_file",
     "checker_name",
+    "unfinished_blocks",
+    "truncation_signature",
 ]
 
 OK = "ok"
@@ -203,6 +208,68 @@ def bracket_problem(
     wrong, which is the same failure as a false "no syntax errors", pointed the
     other way.
     """
+    scan = bracket_scan(
+        text,
+        line_comment=line_comment,
+        block_comments=block_comments,
+        template_strings=template_strings,
+        regex_literals=regex_literals,
+    )
+    if scan.fault:
+        return scan.fault
+    if scan.unterminated == "comment":
+        return f"unterminated /* comment opened on line {scan.unterminated_at}"
+    if scan.open_blocks:
+        opener, opened_at = scan.open_blocks[0]
+        return (
+            f"{len(scan.open_blocks)} unclosed {opener} - the first was opened on line "
+            f"{opened_at} and the file ends without closing it, so it was "
+            "cut off mid-block"
+        )
+    return ""
+
+
+@dataclass(frozen=True)
+class BracketScan:
+    """What one structural pass found, before anyone decided what it means.
+
+    `bracket_problem` used to be the only reader of this, and it collapsed all
+    three fields into one sentence saying *something is wrong*. Two callers now
+    need them apart, and for opposite reasons:
+
+    - the post-write verifier has to tell "this file is still being built" from
+      "this file is broken", and the difference is `open_blocks` with no
+      `fault` and no `unterminated`;
+    - the pre-write gate has to tell "an unfinished section" from "a severed
+      generation", and the difference is `unterminated`.
+
+    Reporting an unfinished chunk as a defect is not a cosmetic problem: it
+    sends the model repairing a file that is simply not finished yet.
+    """
+
+    fault: str = ""
+    open_blocks: tuple[tuple[str, int], ...] = ()
+    unterminated: str = ""
+    unterminated_at: int = 0
+
+
+def bracket_scan(
+    text: str,
+    *,
+    line_comment: str = "//",
+    block_comments: bool = True,
+    template_strings: bool = True,
+    regex_literals: bool = True,
+) -> BracketScan:
+    """One pass over *text*, reporting what it saw rather than a verdict.
+
+    `fault` is a real structural contradiction - a closer with nothing open, a
+    mismatched pair - which is wrong at any stage of writing. `open_blocks` is
+    the opener stack still standing at the end, which is a fault in a finished
+    file and ordinary in an unfinished one. `unterminated` says the scan ran off
+    the end while still inside a string or a comment, which no legitimate
+    section does.
+    """
     stack: list[tuple[str, int]] = []
     line = 1
     index = 0
@@ -223,14 +290,18 @@ def bracket_problem(
         if block_comments and text.startswith("/*", index):
             end = text.find("*/", index + 2)
             if end < 0:
-                return f"unterminated /* comment opened on line {line}"
+                return BracketScan(
+                open_blocks=tuple(stack), unterminated="comment", unterminated_at=line
+            )
             line += text.count("\n", index, end)
             index = end + 2
             continue
         if char in "\"'" or (template_strings and char == "`"):
             index, line, closed = _skip_string(text, index, line, template_strings)
             if not closed:
-                break
+                return BracketScan(
+                    open_blocks=tuple(stack), unterminated="string", unterminated_at=line
+                )
             previous, word = char, ""
             continue
         if regex_literals and char == "/" and _starts_a_regex(previous, word):
@@ -245,12 +316,14 @@ def bracket_problem(
             stack.append((char, line))
         elif char in _CLOSERS:
             if not stack:
-                return f"line {line}: unexpected {char} - nothing was open"
+                return BracketScan(fault=f"line {line}: unexpected {char} - nothing was open")
             opener, opened_at = stack.pop()
             if _PAIRS[opener] != char:
-                return (
-                    f"line {line}: {char} does not close the {opener} "
-                    f"opened on line {opened_at}"
+                return BracketScan(
+                    fault=(
+                        f"line {line}: {char} does not close the {opener} "
+                        f"opened on line {opened_at}"
+                    )
                 )
         if char.isalnum() or char == "_":
             word += char
@@ -260,14 +333,7 @@ def bracket_problem(
             previous = char
         index += 1
 
-    if stack:
-        opener, opened_at = stack[0]
-        return (
-            f"{len(stack)} unclosed {opener} - the first was opened on line "
-            f"{opened_at} and the file ends without closing it, so it was "
-            "cut off mid-block"
-        )
-    return ""
+    return BracketScan(open_blocks=tuple(stack))
 
 
 def _skip_string(text: str, index: int, line: int, template: bool) -> tuple[int, int, bool]:
@@ -324,3 +390,156 @@ def _skip_regex(text: str, index: int, line: int) -> tuple[int, int, bool]:
             return cursor, line, True
         cursor += 1
     return index, line, False
+
+
+# ---------------------------------------------------------------------------
+# Truncation, which is a different question from validity.
+
+# Python syntax errors that mean "the file stops mid-construct" as opposed to
+# an ordinary typo. Lifted from `chat_loop._TRUNCATION_ERROR_MARKERS`, where it
+# was Python-only and lived in the legacy loop that simple mode replaced.
+TRUNCATION_ERROR_MARKERS = (
+    "unterminated string literal",
+    "unterminated triple-quoted string literal",
+    "was never closed",
+    "unexpected eof",
+    "incomplete input",
+)
+
+# Markers that only mean truncation when the content ALSO stops without a
+# newline. `def f():` as the last line of a deliberate 60-line section is
+# legitimate; the same line as the last thing a severed generation emitted is
+# not, and the trailing newline is what tells them apart.
+_TRUNCATION_MARKERS_NEEDING_A_CUT = ("expected an indented block",)
+
+# Characters no line of code can legitimately end on. `:` is absent because
+# Python and CSS both end lines with it; `>` because JSX and HTML do; `/`
+# because `//` is an empty comment. Everything left is a dangling operator or
+# separator with nothing after it, which is what a cut mid-expression leaves.
+_DANGLING_ENDINGS = set(",.=+-*%&|^<!~?" + chr(92))
+
+_SCAN_OPTIONS = {
+    ".css": {"line_comment": "", "template_strings": False, "regex_literals": False},
+    ".scss": {"line_comment": "//", "template_strings": False, "regex_literals": False},
+    ".less": {"line_comment": "//", "template_strings": False, "regex_literals": False},
+    ".json": {
+        "line_comment": "",
+        "block_comments": False,
+        "template_strings": False,
+        "regex_literals": False,
+    },
+}
+_REGEX_SUFFIXES = {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx"}
+
+
+def _scan_options(suffix: str) -> dict:
+    lowered = (suffix or "").lower()
+    if lowered in _SCAN_OPTIONS:
+        return dict(_SCAN_OPTIONS[lowered])
+    return {"line_comment": "//", "regex_literals": lowered in _REGEX_SUFFIXES}
+
+
+def unfinished_blocks(text: str, suffix: str = "") -> tuple[tuple[str, int], ...]:
+    """The openers still standing, when that is the ONLY thing wrong. Else ``()``.
+
+    The question a chunked write needs answered: *is this file merely not
+    finished yet?* An open block on its own is exactly what the first section of
+    a file looks like, and the caller can say so instead of reporting a fault.
+
+    Empty when anything else is wrong - a closer with nothing open, a mismatched
+    pair, a run that ended inside a string - because those are wrong at every
+    stage of writing and must stay problems. Empty too for a language the
+    structural scanner does not read: Python has no block delimiters to count,
+    so an unfinished Python section is invisible here, which is correct rather
+    than a gap - it is also invisible to the model as a problem.
+    """
+    if checker_name(suffix) != "brackets":
+        return ()
+    scan = bracket_scan(text, **_scan_options(suffix))
+    if scan.fault or scan.unterminated:
+        return ()
+    return scan.open_blocks
+
+
+def truncation_signature(text: str, *, suffix: str = "") -> str:
+    """Why *text* looks like a generation that was CUT OFF, or ``""``.
+
+    The distinction this draws is the one thing that makes chunked writing
+    possible. A first section correctly has unclosed blocks, so a gate that
+    tested for *validity* would refuse every legitimate chunk - the fix would
+    create the bug. This tests for the shapes a severed generation leaves and
+    nothing else:
+
+    ==================================================  ==================
+    ends mid-string literal (`render(request, "item`)   always truncation
+    ends inside an unterminated /* comment              always truncation
+    ends on a dangling operator, no trailing newline    truncation
+    ends inside `(` or `[` opened on the last line      truncation
+    ends cleanly on a complete line, blocks still open  a section - allow
+    balanced and parses                                 allow
+    ==================================================  ==================
+
+    Silent for a file type nothing here can read. A truncated `.md` is a short
+    document, not a broken one, and inventing a fault in prose would refuse
+    writes for the sake of a full stop.
+    """
+    if not (text or "").strip():
+        return ""
+    kind = checker_name(suffix)
+    if not kind:
+        return ""
+    ends_cut = not text.endswith(("\n", "\r"))
+
+    if kind == "python":
+        found = _python_truncation(text, ends_cut)
+        if found:
+            return found
+    else:
+        scan = bracket_scan(text, **_scan_options(suffix))
+        if scan.unterminated == "string":
+            return (
+                f"it ends inside a string opened on line {scan.unterminated_at} "
+                "that is never closed"
+            )
+        if scan.unterminated == "comment":
+            return (
+                f"it ends inside a /* comment opened on line {scan.unterminated_at}"
+            )
+        if ends_cut:
+            last_line = text.count(chr(10)) + 1
+            dangling = next(
+                (
+                    (opener, at)
+                    for opener, at in scan.open_blocks
+                    if opener in "([" and at == last_line
+                ),
+                None,
+            )
+            if dangling is not None:
+                return (
+                    f"the last line opens {dangling[0]} and stops before closing it"
+                )
+
+    if ends_cut:
+        tail = text.rstrip(" " + chr(9))
+        if tail and tail[-1] in _DANGLING_ENDINGS:
+            return f"the last line ends on {tail[-1]!r} with nothing after it"
+    return ""
+
+
+def _python_truncation(text: str, ends_cut: bool) -> str:
+    """Python has a real parser, so ask it rather than counting characters."""
+    try:
+        compile(text, "<content>", "exec")
+    except SyntaxError as exc:
+        message = str(getattr(exc, "msg", "") or exc)
+        lowered = message.lower()
+        if any(marker in lowered for marker in TRUNCATION_ERROR_MARKERS):
+            return f"line {exc.lineno}: {message}"
+        if ends_cut and any(
+            marker in lowered for marker in _TRUNCATION_MARKERS_NEEDING_A_CUT
+        ):
+            return f"line {exc.lineno}: {message}"
+    except Exception:  # noqa: BLE001 - a crashed check is not a truncation
+        return ""
+    return ""

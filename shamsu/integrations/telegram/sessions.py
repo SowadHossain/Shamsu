@@ -5,9 +5,10 @@ import asyncio
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from shamsu.action_ledger import store as action_store
 from shamsu.action_ledger.context import clear_current_run, set_current_run
@@ -94,11 +95,23 @@ class LocalShamsuSessionGateway:
         workspace: Path,
         *,
         approval_broker: TelegramApprovalBroker | None = None,
+        send_message: Callable[[OutboundMessage], int] | None = None,
+        typing_action: Callable[[int], None] | None = None,
+        mirror_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.session_manager = SessionManager(self.workspace)
         self.runtime_store = RuntimeStateStore(self.workspace)
         self.approval_broker = approval_broker
+        # A BLOCKING send that hands back Telegram's `message_id`. The live
+        # turn card edits one message rather than sending twelve, and it
+        # cannot edit a message whose id it was never told - which is why
+        # `notify` (fire-and-forget, returns None) is not enough here.
+        self.send_message = send_message
+        self.typing_action = typing_action
+        # Built lazily: the REPL's console arrives via `set_cli_mirror` AFTER
+        # the gateway is constructed.
+        self.mirror_factory = mirror_factory
 
     def list_sessions(self) -> list[TelegramSessionSummary]:
         return [self._summary_for_metadata(item) for item in self.session_manager.list_sessions()]
@@ -255,6 +268,7 @@ class LocalShamsuSessionGateway:
                 telegram_chat_id=metadata.telegram_chat_id,
                 session_id=metadata.session_id,
                 run_id=ledger.run_id,
+                workspace=self.workspace,
             )
         notify = getattr(self.approval_broker, "notify", None)
         progress = TelegramProgressReporter(
@@ -279,7 +293,7 @@ class LocalShamsuSessionGateway:
                 # simple-mode transcript, where the model then imitated calls it
                 # could not make. Observed live 2026-08-18; the desktop side
                 # showed no turn for it, because Telegram writes no chat log.
-                final = self._run_simple(text, logger, tools, ledger, progress)
+                final = self._run_simple(text, logger, tools, ledger, progress, metadata)
             else:
                 loop = AgentChatLoop(
                     self.workspace,
@@ -310,12 +324,32 @@ class LocalShamsuSessionGateway:
         finally:
             clear_current_run()
 
-    def _run_simple(self, text, logger, tools, ledger, progress) -> str:
-        """The same loop the desktop uses, on the same session, same seven tools."""
+    def _run_simple(self, text, logger, tools, ledger, progress, metadata=None) -> str:
+        """The same loop the desktop uses, on the same session, same seven tools.
+
+        And now the same TURN STREAM, which is the point. The desktop showed
+        every line of a turn while the phone showed almost none of them, not
+        because the strings differed - they were always identical - but because
+        each surface had its own wiring and Telegram's dropped anything that
+        arrived within 8 seconds of the last thing it sent. Both surfaces now
+        render the same events, so the parity is a property of the design
+        rather than of two lists that happen to agree.
+        """
         from shamsu.agents.chat_loop import _default_ollama_client
         from shamsu.agents.simple_chat import SimpleChatLoop
         from shamsu.llm.manager import OLLAMA_BASE_URL
         from shamsu.runtime.timeouts import TimeoutConfig
+        from shamsu.runtime.turn_stream import TurnStream
+
+        session_id = str(getattr(logger, "session_id", "") or "")
+        stream = TurnStream(self.workspace, session_id, persist=bool(session_id))
+        card = self._attach_turn_card(stream, text, metadata)
+        if card is not None:
+            # The card carries every step now, so the old one-message-per-step
+            # notifications would be the same information twice. The reporter
+            # keeps LOGGING them - that record is still worth having.
+            progress.live_card = True
+        self._attach_desktop_mirror(stream)
 
         loop = SimpleChatLoop(
             self.workspace,
@@ -323,10 +357,57 @@ class LocalShamsuSessionGateway:
             tools=tools,
             session_logger=logger,
             action_ledger=ledger,
+            emit=stream.publish,
+            source="telegram",
             on_activity=lambda message: progress.step(str(message)),
         )
         result = asyncio.run(loop.run(text))
         return result.final
+
+    def _attach_turn_card(self, stream, prompt: str, metadata) -> Any:
+        """The live card, when there is somewhere to send it."""
+        from shamsu.integrations.telegram.turn_card import TelegramTurnCard
+
+        # `getattr`, not attribute access: a gateway built by `__new__` in a
+        # test has no seams at all, and a renderer is an optional extra rather
+        # than something a turn may fail on.
+        send = getattr(self, "send_message", None)
+        if send is None or metadata is None:
+            return None
+        chat_id = int(getattr(metadata, "telegram_chat_id", 0) or 0)
+        if not chat_id:
+            return None
+        typing = None
+        typing_action = getattr(self, "typing_action", None)
+        if typing_action is not None:
+            typing = lambda: typing_action(chat_id)  # noqa: E731
+        card = TelegramTurnCard(
+            chat_id=chat_id,
+            send=send,
+            prompt=prompt,
+            typing=typing,
+        )
+        stream.add_renderer(card)
+        return card
+
+    def _attach_desktop_mirror(self, stream) -> Any:
+        """Mirror the remote turn onto the desktop, if a REPL is watching.
+
+        The desktop used to see a remote turn as one cyan panel and then
+        nothing at all. It now reads like any other turn there: the prompt
+        echoed as a terminal line, then the same dim activity lines.
+        """
+        factory = getattr(self, "mirror_factory", None)
+        if factory is None:
+            return None
+        try:
+            renderer = factory()
+        except Exception:  # noqa: BLE001 - a mirror must never fail a run
+            return None
+        if renderer is None:
+            return None
+        stream.add_renderer(renderer)
+        return renderer
 
     def _summary_for_metadata(self, metadata) -> TelegramSessionSummary:
         active = active_runs_for_session(metadata.session_id)
@@ -378,11 +459,15 @@ class TelegramProgressReporter(ProgressReporter):
         telegram_chat_id: int,
         session_logger,
         min_interval_seconds: float = 8.0,
+        live_card: bool = False,
     ) -> None:
         super().__init__(session_logger=session_logger, title="SHAMSU")
         self.notify = notify
         self.telegram_chat_id = telegram_chat_id
         self.min_interval_seconds = min_interval_seconds
+        # A live turn card is showing every step already. Sending them again as
+        # separate chat messages is the notification feed the card replaces.
+        self.live_card = live_card
         self._last_sent_at = 0.0
         self._last_sent_message = ""
 
@@ -397,6 +482,16 @@ class TelegramProgressReporter(ProgressReporter):
     def _should_notify(self, kind: str, message: str, payload: dict) -> bool:
         if kind in {"progress.done", "progress.failed", "progress.warning", "progress.command_start"}:
             return True
+        if self.live_card and kind in {
+            "progress.step",
+            "progress.tool_start",
+            "progress.tool_result",
+            "progress.heartbeat",
+        }:
+            # Not a drop: the card is already showing every one of these, in
+            # order, with nothing thrown away. This only stops the same line
+            # arriving twice.
+            return False
         if kind == "progress.tool_start":
             return True
         if kind == "progress.tool_result":

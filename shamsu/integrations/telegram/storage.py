@@ -18,21 +18,40 @@ from shamsu.integrations.telegram.models import (
     TelegramSettings,
     utc_now,
 )
+from shamsu.integrations.telegram import install
 from shamsu.safety.commands import redact
-from shamsu.safety.sandbox import Sandbox
 
-SCHEMA_VERSION = 1
+#: 2 moved the store from the workspace to the install and gave the two
+#: genuinely workspace-shaped tables a `workspace` column.
+SCHEMA_VERSION = 2
 
 
 class TelegramStateStore:
+    """Install-scoped Telegram state, with a workspace column where it matters.
+
+    The pairing, the authorizations, the callback tokens and the `getUpdates`
+    offset describe **the bot**, of which there is one per install - so keeping
+    them per workspace meant switching project logged the phone out and replayed
+    updates. They are now install-global.
+
+    What genuinely is per workspace stays per workspace: which session the phone
+    is attached to, and the audit trail. A session id from another project names
+    a thread that does not exist here.
+    """
+
     def __init__(self, workspace: Path, db_path: Path | None = None) -> None:
         self.workspace = Path(workspace).resolve()
-        self.db_path = Path(db_path) if db_path is not None else self._default_path()
+        # An explicit path still wins: it is the seam every test drives, and
+        # the escape hatch for anyone who wants isolated state.
+        self.db_path = Path(db_path) if db_path is not None else install.install_state_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        if db_path is None:
+            self._import_legacy_workspace_db()
 
-    def _default_path(self) -> Path:
-        return Sandbox(self.workspace).validate(Path(".shamsu") / "telegram" / "telegram-state.db")
+    @property
+    def workspace_key(self) -> str:
+        return str(self.workspace)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -74,9 +93,11 @@ class TelegramStateStore:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS active_sessions (
-                    telegram_user_id INTEGER PRIMARY KEY,
+                    telegram_user_id INTEGER NOT NULL,
+                    workspace TEXT NOT NULL DEFAULT '',
                     session_id TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (telegram_user_id, workspace)
                 )
                 """
             )
@@ -120,6 +141,7 @@ class TelegramStateStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     timestamp TEXT NOT NULL,
                     source TEXT NOT NULL,
+                    workspace TEXT NOT NULL DEFAULT '',
                     telegram_user_id INTEGER NOT NULL,
                     telegram_chat_id INTEGER NOT NULL,
                     telegram_message_id INTEGER NOT NULL,
@@ -139,10 +161,110 @@ class TelegramStateStore:
                 )
                 """
             )
+            self._add_missing_columns(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+
+    @staticmethod
+    def _add_missing_columns(conn: sqlite3.Connection) -> None:
+        """Bring a v1 database up to v2 in place.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op against a table that already
+        exists, so a database written by the previous version keeps its old
+        shape forever unless the columns are added explicitly. Adding them -
+        rather than recreating the tables - is what keeps an existing pairing
+        and an existing audit trail through the upgrade.
+        """
+        for table, column, definition in (
+            ("active_sessions", "workspace", "TEXT NOT NULL DEFAULT ''"),
+            ("audits", "workspace", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            existing = {
+                str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if existing and column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def _import_legacy_workspace_db(self) -> None:
+        """Adopt a pre-upgrade workspace database once, then never again.
+
+        Without this, upgrading logs the phone out: the pairing lived in
+        `<workspace>/.shamsu/telegram/telegram-state.db` and nothing would ever
+        look there again. The old file is left exactly where it is - a
+        downgrade must still find it - and a marker in `meta` makes the import
+        idempotent, so a user who deliberately disconnects does not get
+        silently re-paired on the next start.
+        """
+        legacy_path = install.legacy_state_db_path(self.workspace)
+        if legacy_path == self.db_path or not legacy_path.exists():
+            return
+        marker = f"imported_workspace_db:{self.workspace_key}"
+        if self.get_meta(marker):
+            return
+        try:
+            self._copy_from_legacy(legacy_path)
+        except sqlite3.Error:
+            # A corrupt or half-written legacy file must not stop the bot from
+            # starting; the user can always re-pair.
+            pass
+        self.set_meta(marker, utc_now())
+
+    def _copy_from_legacy(self, legacy_path: Path) -> None:
+        source = sqlite3.connect(legacy_path, timeout=30)
+        source.row_factory = sqlite3.Row
+        try:
+            tables = {
+                str(row["name"])
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            with self._connect() as conn:
+                if "authorized_users" in tables:
+                    for row in source.execute("SELECT * FROM authorized_users"):
+                        self._insert_row(conn, "authorized_users", dict(row))
+                if "settings" in tables:
+                    for row in source.execute("SELECT * FROM settings"):
+                        self._insert_row(conn, "settings", dict(row))
+                if "active_sessions" in tables:
+                    for row in source.execute("SELECT * FROM active_sessions"):
+                        record = dict(row)
+                        # The legacy file WAS the workspace, so its rows belong
+                        # to this one even though they never said so.
+                        record["workspace"] = self.workspace_key
+                        self._insert_row(conn, "active_sessions", record)
+                if "meta" in tables:
+                    for row in source.execute("SELECT * FROM meta"):
+                        record = dict(row)
+                        if str(record.get("key")) == "schema_version":
+                            continue
+                        conn.execute(
+                            "INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)",
+                            (record.get("key"), record.get("value")),
+                        )
+        finally:
+            source.close()
+
+    @staticmethod
+    def _insert_row(conn: sqlite3.Connection, table: str, record: dict[str, Any]) -> None:
+        """Copy one row, keeping only columns this schema still has.
+
+        `INSERT OR IGNORE`, because the install database is the authority: a
+        second workspace importing its own legacy file must not overwrite a
+        pairing the first one already established.
+        """
+        known = {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
+        usable = {key: value for key, value in record.items() if key in known}
+        if not usable:
+            return
+        columns = ", ".join(usable)
+        placeholders = ", ".join("?" for _ in usable)
+        conn.execute(
+            f"INSERT OR IGNORE INTO {table} ({columns}) VALUES ({placeholders})",
+            tuple(usable.values()),
+        )
 
     def create_pairing_code(
         self,
@@ -262,20 +384,31 @@ class TelegramStateStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO active_sessions (telegram_user_id, session_id, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(telegram_user_id) DO UPDATE SET
+                INSERT INTO active_sessions (telegram_user_id, workspace, session_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(telegram_user_id, workspace) DO UPDATE SET
                     session_id=excluded.session_id,
                     updated_at=excluded.updated_at
                 """,
-                (int(telegram_user_id), session_id, utc_now()),
+                (int(telegram_user_id), self.workspace_key, session_id, utc_now()),
             )
 
     def active_session_for(self, telegram_user_id: int) -> str:
+        """Which thread this user is in, HERE.
+
+        The fallback to a row with no workspace is the upgrade path: a v1
+        database recorded one active session and never said where, and dropping
+        it would put the phone back at "no active session" for no good reason.
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT session_id FROM active_sessions WHERE telegram_user_id = ?",
-                (int(telegram_user_id),),
+                """
+                SELECT session_id FROM active_sessions
+                WHERE telegram_user_id = ? AND workspace IN (?, '')
+                ORDER BY workspace DESC
+                LIMIT 1
+                """,
+                (int(telegram_user_id), self.workspace_key),
             ).fetchone()
         return str(row["session_id"]) if row is not None else ""
 
@@ -392,14 +525,15 @@ class TelegramStateStore:
             conn.execute(
                 """
                 INSERT INTO audits (
-                    timestamp, source, telegram_user_id, telegram_chat_id,
+                    timestamp, source, workspace, telegram_user_id, telegram_chat_id,
                     telegram_message_id, shamsu_session_id, run_id, action,
                     result, payload
                 )
-                VALUES (?, 'telegram', ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, 'telegram', ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     utc_now(),
+                    self.workspace_key,
                     int(telegram_user_id),
                     int(telegram_chat_id),
                     int(telegram_message_id),

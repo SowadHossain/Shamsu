@@ -7,6 +7,13 @@ Author: Claude (planning pass, 2026-08-18)
 Scope: `shamsu/agents/simple_chat.py`, `shamsu/integrations/telegram/*`,
 `shamsu/cli/repl.py`, plus one new package `shamsu/webui/`.
 
+> **Companion document 2: [`PRD_REMOTE_UX_TRANSPORT_CLI.md`](PRD_REMOTE_UX_TRANSPORT_CLI.md)**
+> — webhook transport over a zero-config tunnel, the `shamsu serve` daemon, and
+> the CLI. It **replaces long polling** throughout this document (§2.4, §7.3) and
+> supersedes the delivery plan again. It also re-baselines against concurrent
+> repo changes: **mid-run feedback shipped on 2026-08-19**, so that work item is
+> closed.
+>
 > **Companion document: [`PRD_REMOTE_UX_DATA.md`](PRD_REMOTE_UX_DATA.md)** —
 > storage, central catalog and cross-process control plane. It **supersedes §10
 > and §11 below**, and revises §8.2 (the web server's process model). Read it

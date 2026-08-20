@@ -146,6 +146,29 @@ def list_loaded_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
     return names
 
 
+def list_available_models(base_url: str = OLLAMA_BASE_URL) -> list[str]:
+    """Every model pulled on the server (``/api/tags``), newest name order aside.
+
+    Over HTTP rather than the ``ollama list`` subprocess in
+    :func:`list_installed_models`, so it also answers for a server that is not
+    on this machine - and so the settings page never spawns a process to draw a
+    dropdown.
+    """
+    try:
+        with urllib.request.urlopen(
+            f"{base_url.rstrip('/')}/api/tags", timeout=HEALTH_TIMEOUT_SECONDS
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return []
+    names: list[str] = []
+    for entry in payload.get("models", []):
+        name = entry.get("name") or entry.get("model")
+        if name:
+            names.append(str(name))
+    return sorted(set(names))
+
+
 def unload_model(model: str, base_url: str = OLLAMA_BASE_URL) -> bool:
     """Evict a model from RAM immediately by asking Ollama for ``keep_alive=0``."""
     data = json.dumps({"model": model, "keep_alive": 0}).encode("utf-8")

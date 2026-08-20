@@ -299,6 +299,11 @@ SYSTEM_COMMANDS = (
     "/help",
     "/remote_control",
     "/remote_control status",
+    "/web",
+    "/web status",
+    "/web stop",
+    "/approve",
+    "/deny",
     "/remote_control connect",
     "/remote_control configure ",
     "/remote_control disconnect",
@@ -699,6 +704,8 @@ def _print_help(console: Console) -> None:
                     "  /docs <request>           Force README documentation workflow",
                 "  /help                     Show commands",
                 "  /remote_control           Enable Telegram remote control",
+                "  /web                      Open the local web view",
+                "  /approve | /deny          Answer a pending approval",
                     "  /exit                     Quit",
                     "",
                     "File edits are previewed and require approval before applying.",
@@ -4798,17 +4805,33 @@ async def _run_simple_chat(
         # Tools run on a worker thread; the approval prompt must not. See
         # `make_approval_func`.
         main_loop=asyncio.get_running_loop(),
-        # Bind THIS console. Called bare, `ask_approval` builds a fresh
-        # Console(), which knows nothing about the live spinner - so
-        # `_pause_console_live` had nothing to stop and the status kept
-        # repainting over the prompt ("Working> y"), and over the answer.
-        console_approval=lambda request: ask_approval(request, console=console),
+        # Published to the shared store as well as asked here, so the same
+        # question reaches the browser and the phone - and so an answer given
+        # there ends this prompt instead of leaving the turn waiting on a
+        # keystroke nobody owes any more.
+        console_approval=_shared_console_approval(
+            workspace, session_logger, console
+        ),
         session_logger=session_logger,
         action_ledger=action_ledger,
     )
     from shamsu.agents.simple_feedback import FeedbackQueue
+    from shamsu.cli.turn_render import CliTurnRenderer
+    from shamsu.runtime.turn_stream import TurnStream
 
     feedback = FeedbackQueue()
+    session_id = str(getattr(session_logger, "session_id", "") or "")
+    stream = TurnStream(workspace, session_id, persist=bool(session_id))
+    # The CLI is the reference surface, so it renders off the same stream the
+    # phone and the browser read - not off private callbacks nobody else can
+    # see. That is what makes "every line reaches every surface" testable:
+    # `tests/test_turn_stream_parity.py` compares the two lists.
+    #
+    # Same lines, same order, same dim styling as the two lambdas this
+    # replaces. A model call is still silent for as long as it runs, and at the
+    # 600s timeout that is ten minutes that look exactly like a hang - so the
+    # status still ticks the spinner's own text rather than costing a line.
+    stream.add_renderer(CliTurnRenderer(console, status_updater=_status_updater(thinking_status)))
     loop = SimpleChatLoop(
         workspace,
         client=_default_ollama_client(OLLAMA_BASE_URL, timeouts),
@@ -4818,12 +4841,8 @@ async def _run_simple_chat(
         tools=tools,
         session_logger=session_logger,
         action_ledger=action_ledger,
-        on_activity=lambda message: console.print(f"[dim]{message}[/dim]"),
-        # A model call is silent for as long as it runs, and at the 600s
-        # timeout that is ten minutes that look exactly like a hang. Ticking
-        # the spinner's own text says "alive, still thinking, N seconds" and
-        # costs a line nobody has to scroll past.
-        on_status=_status_updater(thinking_status),
+        emit=stream.publish,
+        source="cli",
     )
     with _LiveFeedbackReader(feedback, console):
         result = await loop.run(user_input)
@@ -4889,6 +4908,81 @@ def _status_updater(thinking_status: Any) -> Any:
             thinking_status.update(f"[dim]{message}[/dim]")
 
     return update
+
+
+def _shared_console_approval(
+    workspace: Path, session_logger: Any, console: Console
+) -> Any:
+    """Ask in this terminal, but let any surface answer.
+
+    Falls back to the plain local prompt if the control store cannot be opened.
+    An approval that cannot be shared is still an approval that must be asked -
+    degrading to the old behaviour beats refusing to run.
+    """
+
+    def ask(request: Any) -> bool:
+        try:
+            from shamsu.control.console import ask_here_or_anywhere, render_request
+            from shamsu.control.store import ALLOW, ControlStore
+
+            store = ControlStore()
+            session_id = str(getattr(session_logger, "session_id", "") or "")
+            approval_id = store.raise_approval(
+                workspace=workspace,
+                session_id=session_id,
+                action_type=str(getattr(request, "action_type", "") or ""),
+                description=str(getattr(request, "description", "") or ""),
+                risk_level=str(getattr(request, "risk_level", "") or ""),
+                preview=str(getattr(request, "preview", "") or ""),
+            )
+        except Exception:  # noqa: BLE001 - no shared store, no shared answer
+            return bool(ask_approval(request, console=console))
+
+        from shamsu.safety.approval import _pause_console_live
+
+        render_request(store.approval(approval_id), console)
+        # Stop the live spinner before reading: it repaints over the question
+        # and over what is being typed. The same reason the console is bound
+        # explicitly rather than freshly constructed.
+        _pause_console_live(console)
+        try:
+            decision = asyncio.run(
+                ask_here_or_anywhere(store, approval_id, console)
+            )
+        except Exception:  # noqa: BLE001 - never turn a question into a crash
+            return bool(ask_approval(request, console=console))
+        return decision == ALLOW
+
+    return ask
+
+
+_APPROVAL_WATCHER: Any = None
+
+
+def _approval_watcher(console: Console) -> Any:
+    """One watcher per REPL, started the first time anything needs it.
+
+    It exists so a question raised by a run in ANOTHER process - the web
+    portal, the Telegram bot - still reaches the terminal you happen to be
+    sitting in front of. Without it, "answer from anywhere" quietly excluded
+    the place you were already looking.
+    """
+    global _APPROVAL_WATCHER
+    if _APPROVAL_WATCHER is None:
+        from shamsu.control.console import ApprovalWatcher
+        from shamsu.control.store import ControlStore
+
+        _APPROVAL_WATCHER = ApprovalWatcher(ControlStore(), console)
+        _APPROVAL_WATCHER.start()
+    return _APPROVAL_WATCHER
+
+
+def _handle_approval_command(user_input: str, console: Console) -> None:
+    parts = (user_input or "").split()
+    approved = parts[0].lower() == "approve"
+    approval_id = parts[1] if len(parts) > 1 else ""
+    ok, message = _approval_watcher(console).resolve(approved, approval_id)
+    console.print(f"[{'green' if ok else 'yellow'}]{message}[/]")
 
 
 def _legacy_routing_enabled() -> bool:
@@ -18463,6 +18557,32 @@ def main(argv: list[str] | None = None) -> None:
         if exit_code:
             raise SystemExit(exit_code)
         return
+    if args.command == "web":
+        # Before the REPL banner, the model tier prompt and the session
+        # registration: serving a read-only view of files on disk needs none of
+        # them, and a portal that paused to ask which model to download would
+        # be absurd.
+        from shamsu.webui.cli import DEFAULT_PORT, serve
+
+        web_console = Console()
+        # The workspace is optional here: the portal lists every workspace this
+        # install has used. Passing one only decides which is offered first.
+        web_workspace = None
+        if args.workspace:
+            try:
+                web_workspace = resolve_workspace(args.workspace)
+            except ValueError as exc:
+                web_console.print(f"[red]{exc}[/red]", soft_wrap=True)
+                raise SystemExit(2) from exc
+        exit_code = serve(
+            web_workspace,
+            DEFAULT_PORT if args.port is None else args.port,
+            console=web_console,
+            scan=args.scan,
+        )
+        if exit_code:
+            raise SystemExit(exit_code)
+        return
     console = Console()
     _install_console_status_tracker(console)
 
@@ -18471,6 +18591,18 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
         sys.exit(2)
+
+    # Approvals raised anywhere on this machine surface here from now on.
+    with contextlib.suppress(Exception):
+        _approval_watcher(console)
+
+    # Record it the moment a REPL opens here. This is what makes the web
+    # portal's workspace list real: the REPL knows which projects you work in,
+    # the portal does not, and asking the portal to find out was why its list
+    # was empty until you had already opened it somewhere.
+    from shamsu.runtime.workspaces import remember_workspace
+
+    remember_workspace(workspace)
 
     from shamsu.runtime.state_upgrade import upgrade_workspace_state
 
@@ -18669,6 +18801,16 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input == "remote_control" or lowered_input.startswith("remote_control "):
             handle_remote_control_command(normalized_input, workspace, console)
+            continue
+        if lowered_input == "web" or lowered_input.startswith("web "):
+            from shamsu.webui.local import handle_web_command
+
+            handle_web_command(normalized_input, workspace, console)
+            continue
+        if lowered_input in {"approve", "deny"} or lowered_input.startswith(
+            ("approve ", "deny ")
+        ):
+            _handle_approval_command(normalized_input, console)
             continue
         if lowered_input == "doctor":
             _handle_doctor(workspace, console)

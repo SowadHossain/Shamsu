@@ -6,10 +6,21 @@ import threading
 from pathlib import Path
 
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 
-from shamsu.integrations.telegram.service import TelegramService, configure_telegram_bot_token
+from shamsu.integrations.telegram.service import (
+    TelegramService,
+    configure_telegram_bot_token,
+    promote_workspace_token,
+)
 from shamsu.safety.commands import redact
+
+
+REMOTE_LABEL = "remote-telegram"
+
+#: Pins `configure` to this project instead of the installation.
+WORKSPACE_FLAG = "--workspace"
 
 
 class ConsoleTelegramMirror:
@@ -22,6 +33,31 @@ class ConsoleTelegramMirror:
         with self._lock:
             self.console.print()
             self.console.print(Panel(body, title=title, border_style="cyan"))
+
+    def prompt_echo(self, prompt: str, label: str = REMOTE_LABEL) -> None:
+        """A remote prompt, printed the way a local one looks.
+
+        The panel is right for a status reply or a button press, and wrong for
+        a task: a turn started from the phone should read on the desktop like
+        every other turn in the scrollback, not like a notification about one.
+        """
+        # Escaped: a prompt is arbitrary user text, and rich would read
+        # `[dim]` in it as markup rather than as the characters typed.
+        clean = escape(redact(prompt or "").strip())
+        with self._lock:
+            self.console.print()
+            self.console.print(f"[bold]shamsu ({label})>[/bold] {clean}")
+
+    def turn_renderer(self):
+        """The renderer that paints a remote turn's activity lines here.
+
+        Built per turn rather than held, because it accumulates that turn's
+        lines. `prompt_echo` has already printed the header, so this one does
+        not repeat it.
+        """
+        from shamsu.cli.turn_render import CliTurnRenderer
+
+        return CliTurnRenderer(self.console)
 
 
 class LocalTelegramBridgeManager:
@@ -98,19 +134,30 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
     rest = parts[1].strip() if len(parts) > 1 else ""
     subcommand = rest.lower()
     if subcommand.startswith("configure"):
-        token = rest.partition(" ")[2].strip()
+        argument = rest.partition(" ")[2].strip()
+        # `--workspace` pins the token to this project instead. Parsed from
+        # either side, because a flag after a secret is the natural way to type
+        # it and getting it wrong would write the token to the wrong place.
+        install_scope = True
+        words = [word for word in argument.split() if word]
+        if WORKSPACE_FLAG in words:
+            install_scope = False
+            words = [word for word in words if word != WORKSPACE_FLAG]
+        token = words[0] if words else ""
         if not token:
             console.print(
                 Panel(
-                    "Usage:\n\n/remote_control configure <bot-token>\n\n"
-                    "The token will be saved to .shamsu/telegram.env and will not be displayed.",
+                    "Usage:\n\n/remote_control configure <bot-token> [--workspace]\n\n"
+                    "The token is saved to ~/.shamsu/telegram.env, so it applies to "
+                    "every project, and is never displayed.\n"
+                    "Add --workspace to bind it to this project only.",
                     title="Remote Control",
                     border_style="yellow",
                 )
             )
             return
         try:
-            path = configure_telegram_bot_token(workspace, token)
+            path = configure_telegram_bot_token(workspace, token, install_scope=install_scope)
         except ValueError as exc:
             console.print(Panel(str(exc), title="Remote Control", border_style="red"))
             return
@@ -118,14 +165,20 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
         service = _MANAGER.reload_service(workspace, console)
         _MANAGER.start(workspace, console)
         panel = service.local_panel("status")
+        scope_note = (
+            "It applies to every project until you change it."
+            if install_scope
+            else "It applies to this project only."
+        )
         console.print(
             Panel(
-                f"Telegram bot token saved to {path}.\n\n{panel.message}",
+                f"Telegram bot token saved to {path}.\n{scope_note}\n\n{panel.message}",
                 title="Remote Control",
                 border_style="green",
             )
         )
         return
+    _announce_token_promotion(workspace, console)
     if subcommand == "disconnect":
         panel = _MANAGER.service_for(workspace, console).local_panel("disconnect")
         _MANAGER.stop()
@@ -136,6 +189,27 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
     if subcommand in {"", "connect", "repair"}:
         _MANAGER.start(workspace, console)
     console.print(Panel(panel.message, title="Remote Control"))
+
+
+def _announce_token_promotion(workspace: Path, console: Console) -> None:
+    """Move a pre-upgrade workspace token up to the install, and say so once.
+
+    Said once because `promote_workspace_token` returns a path only on the run
+    that actually promoted something - after that it returns None and this is
+    silent, rather than reminding the user of a migration every time they type
+    `/remote_control`.
+    """
+    promoted = promote_workspace_token(workspace)
+    if promoted is None:
+        return
+    console.print(
+        Panel(
+            f"Bot token promoted to this installation ({promoted}).\n"
+            "It now applies to every project. The old project copy was left in place.",
+            title="Remote Control",
+            border_style="green",
+        )
+    )
 
 
 def redact_remote_control_command(text: str) -> str:
