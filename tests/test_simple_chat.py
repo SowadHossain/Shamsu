@@ -8671,3 +8671,76 @@ def test_a_caller_that_already_decided_is_not_asked_again(tmp_path):
         assert make_approval_func(lambda _r: True)(request) is False, (
             "an override that DENIES must also win - it is not an auto-allow"
         )
+
+
+# --- the reported failure, reproduced from a real transcript -------------------
+
+
+def test_replace_symbol_accepts_a_name_that_carries_its_signature(tmp_path):
+    """Live 2026-08-21 on qwen3.5:9b the model asked for
+    `handlePauseMenuAction(action)` - the heading the outline had just shown
+    it - and the lookup, which matches on the bare name, found nothing."""
+    (tmp_path / "a.js").write_text(
+        "function greet(name) {\n  return name;\n}\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "replace_symbol",
+        {"filepath": "a.js", "symbol": "greet(name)", "content": "function greet(n) {\n  return n;\n}"},
+    )
+
+    assert result.ok, result.message
+    assert "return n;" in (tmp_path / "a.js").read_text(encoding="utf-8")
+
+
+def test_empty_content_deletes_the_symbol_rather_than_being_a_missing_argument(tmp_path):
+    """THE reported failure. The model found three functions defined twice in
+    one file and did the correct thing - replace the duplicate with nothing.
+    It was told twice that it had forgotten an argument, ran out of rounds and
+    changed nothing in 319 seconds.
+
+    There is no other way to remove a function: `patch_file` would need the
+    exact text of a thirty-line body, which is the retyping this tool exists to
+    avoid.
+    """
+    (tmp_path / "a.js").write_text(
+        "function keep() {\n  return 1;\n}\n\n"
+        "function dupe() {\n  return 2;\n}\n\n"
+        "function alsoKeep() {\n  return 3;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("replace_symbol", {"filepath": "a.js", "symbol": "dupe", "content": "\n"})
+
+    assert result.ok, result.message
+    assert "Deleted dupe" in result.message
+    body = (tmp_path / "a.js").read_text(encoding="utf-8")
+    assert "function dupe" not in body
+    assert "function keep" in body and "function alsoKeep" in body
+
+
+def test_a_deletion_that_would_break_the_file_is_still_refused(tmp_path):
+    """Deleting is allowed; deleting something that stops the file parsing is
+    not. The parse guard has to survive the new path."""
+    (tmp_path / "a.py").write_text(
+        "class Thing:\n    def only(self):\n        return 1\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("replace_symbol", {"filepath": "a.py", "symbol": "only", "content": ""})
+
+    assert not result.ok, "a class with no body left does not parse"
+    assert "class Thing" in (tmp_path / "a.py").read_text(encoding="utf-8")
+
+
+def test_a_missing_content_argument_is_still_an_error(tmp_path):
+    """Empty means delete; ABSENT still means the call was malformed."""
+    (tmp_path / "a.js").write_text("function greet() {\n  return 1;\n}\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("replace_symbol", {"filepath": "a.js", "symbol": "greet"})
+
+    assert not result.ok
+    assert "needs a filepath" in result.message

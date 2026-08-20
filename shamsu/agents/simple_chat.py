@@ -4885,11 +4885,31 @@ class SimpleChatLoop:
         """
         path = str(arguments.get("filepath") or "").strip()
         wanted = str(arguments.get("symbol") or arguments.get("name") or "").strip()
+        # A signature is a near-miss, not a mistake. Live 2026-08-21 on
+        # qwen3.5:9b the model asked for `handlePauseMenuAction(action)` - the
+        # heading it had just been shown by the outline - and the lookup, which
+        # matches on the bare name, found nothing. Same class as the argument
+        # aliases: refusing a call that named the right thing in a slightly
+        # different shape costs a whole round and teaches nothing.
+        wanted = wanted.split("(", 1)[0].strip() or wanted
         content = arguments.get("content")
-        if not path or not wanted or not isinstance(content, str) or not content.strip():
+        if not path or not wanted or not isinstance(content, str):
             return ToolResult(
                 False, "replace_symbol needs a filepath, a symbol and content.", {}
             )
+        # EMPTY CONTENT MEANS DELETE THE SYMBOL, and refusing it was the whole
+        # of the reported failure. Live, the model found three functions defined
+        # twice in one file and did the correct thing: replace the duplicate
+        # with nothing. It was told twice that it had forgotten an argument, ran
+        # out of rounds, and changed nothing in 319 seconds.
+        #
+        # There is no other way to remove a function here: `patch_file` would
+        # need the exact text of a thirty-line body, which is the retyping this
+        # tool exists to avoid. A deletion is journaled and undoable like any
+        # other mutation, and a generation cut off before its content is caught
+        # upstream by `_refuse_truncated_write`, so the truncation case cannot
+        # reach this branch.
+        deleting = not content.strip()
         try:
             target = self.tools.sandbox.validate(path)
         except Exception as exc:  # noqa: BLE001 - the sandbox owns this refusal
@@ -4916,10 +4936,20 @@ class SimpleChatLoop:
             )
 
         lines = original.splitlines()
-        replacement, reindented = _match_indentation(
-            lines[found.start - 1], content.rstrip(chr(10))
-        )
-        updated = lines[: found.start - 1] + replacement.split(chr(10)) + lines[found.end :]
+        if deleting:
+            # Drop the range outright rather than replacing it with a blank
+            # line, and take one trailing blank with it so removing a function
+            # does not leave a widening gap where it used to be.
+            after = found.end
+            if after < len(lines) and not lines[after].strip():
+                after += 1
+            updated = lines[: found.start - 1] + lines[after:]
+            reindented = False
+        else:
+            replacement, reindented = _match_indentation(
+                lines[found.start - 1], content.rstrip(chr(10))
+            )
+            updated = lines[: found.start - 1] + replacement.split(chr(10)) + lines[found.end :]
         body = chr(10).join(updated)
         if original.endswith(chr(10)):
             body += chr(10)
@@ -4930,7 +4960,10 @@ class SimpleChatLoop:
                 {"filepath": path, "symbol": found.name, "unchanged": True},
             )
 
-        lost = _members_lost(original, body, suffix, found)
+        # Not asked when the symbol is being deleted: losing its members is the
+        # point, and this guard exists for the opposite mistake - a replacement
+        # that silently drops members it was supposed to keep.
+        lost = [] if deleting else _members_lost(original, body, suffix, found)
         if lost:
             # Live 2026-08-20, qwen2.5-coder:3b replaced the whole 314-line
             # `Player` class with 45 lines: the file still parsed, so the parse
@@ -4968,11 +5001,18 @@ class SimpleChatLoop:
             return ToolResult(False, f"Could not write {path}: {exc}", {"filepath": path})
 
         note = " (re-indented to match the original)" if reindented else ""
-        was, now = found.lines, replacement.count(chr(10)) + 1
+        was = found.lines
+        now = 0 if deleting else replacement.count(chr(10)) + 1
+        message = (
+            f"Deleted {found.name} from {path}: {was} line(s) removed "
+            f"(was lines {found.start}-{found.end})."
+            if deleting
+            else f"Replaced {found.name} in {path}{note}: lines {found.start}-{found.end}, "
+            f"{was} line(s) -> {now}."
+        )
         result = ToolResult(
             True,
-            f"Replaced {found.name} in {path}{note}: lines {found.start}-{found.end}, "
-            f"{was} line(s) -> {now}.",
+            message,
             {
                 "filepath": path,
                 "resolved_filepath": path,
