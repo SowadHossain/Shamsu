@@ -3060,6 +3060,7 @@ class SimpleChatLoop:
         if self.turn_log:
             approx = self._estimate_prompt(messages)
             self.turn_log.log_call(messages, num_ctx, approx)
+        ledger_call_id = self._ledger_model_started(messages, kwargs)
         started = time.perf_counter()
         beat = asyncio.ensure_future(self._heartbeat("thinking..."))
         try:
@@ -3067,14 +3068,82 @@ class SimpleChatLoop:
         except Exception as exc:
             if self.turn_log:
                 self.turn_log.log_error(f"{type(exc).__name__}: {exc}")
+            self._ledger_model_finished(ledger_call_id, None, f"{type(exc).__name__}: {exc}")
             raise
         finally:
             beat.cancel()
             self._activity(f"model responded in {time.perf_counter() - started:.0f}s")
         self._record_usage(raw, self._estimate_prompt(messages))
+        self._ledger_model_finished(ledger_call_id, raw, "")
         if self.turn_log:
             self.turn_log.log_response(raw, time.perf_counter() - started)
         return raw
+
+    # -- mirroring simple mode into the ledger -----------------------------
+    #
+    # The session log (`shamsu/ui/turnlog.py`) is built entirely from the
+    # ActionLedger, on the documented promise that every execution path records
+    # its tools and model calls there. Simple mode is the DEFAULT path and never
+    # honoured it, so a real turn produced a log with approvals and file writes
+    # in it and no sign of what the agent read, ran, or said. These four are
+    # that promise, kept. All best-effort: logging must never break a turn.
+
+    def _ledger_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
+        if self.action_ledger is None:
+            return ""
+        try:
+            return self.action_ledger.log_tool_call(name, arguments)
+        except Exception:
+            return ""
+
+    def _ledger_tool_result(self, call_id: str, name: str, result: ToolResult) -> None:
+        if self.action_ledger is None or not call_id:
+            return
+        try:
+            self.action_ledger.log_tool_result(
+                call_id, name, bool(result.ok), result.message, result.data
+            )
+        except Exception:
+            pass
+
+    def _ledger_model_started(
+        self, messages: list[dict[str, Any]], kwargs: dict[str, Any]
+    ) -> str:
+        if self.action_ledger is None:
+            return ""
+        try:
+            return self.action_ledger.log_model_call_started(
+                "coder",
+                self.model_name,
+                messages=messages,
+                tools=kwargs.get("tools") or [],
+            )
+        except Exception:
+            return ""
+
+    def _ledger_model_finished(self, call_id: str, raw: Any, error: str) -> None:
+        """Record the response and, when the model produced one, its reasoning.
+
+        The reasoning is logged FIRST so the session log can fold it into the
+        response's own entry - it is a sub-panel of that answer, not a step
+        before it."""
+        if self.action_ledger is None or not call_id:
+            return
+        try:
+            # `_response_field` reads a dict or a pydantic object, which is
+            # what the live SDK and the tests respectively hand back.
+            message = _response_field(raw, "message") if raw is not None else None
+            thinking = str(_response_field(message, "thinking") or "")
+            content = str(_response_field(message, "content") or "")
+            if thinking:
+                self.action_ledger.log_model_thinking(
+                    call_id, "coder", self.model_name, thinking
+                )
+            self.action_ledger.log_model_call_finished(
+                "coder", self.model_name, content, call_id=call_id, error=error
+            )
+        except Exception:
+            pass
 
     def _record_usage(self, raw: Any, estimate: int) -> None:
         """Take the real prompt size off the response and learn from it.
@@ -3809,10 +3878,16 @@ class SimpleChatLoop:
             # every second of it. Without a tick that is two minutes of silence
             # immediately AFTER an approval prompt, which reads as a hang.
             beat = asyncio.ensure_future(self._heartbeat(f"running {name}..."))
+            # The session log is built from the ledger, on the documented
+            # promise that every execution path records its tools there. Simple
+            # mode never did, so the default path produced a log of approvals
+            # and file writes with no sign of what the agent actually ran.
+            ledger_call_id = self._ledger_tool_call(name, arguments)
             try:
                 result = await asyncio.to_thread(self._execute, name, arguments)
             finally:
                 beat.cancel()
+            self._ledger_tool_result(ledger_call_id, name, result)
             if self.turn_log:
                 self.turn_log.log_tool_result(name, arguments, result.ok, result.message)
             # The CLI has never printed this, and at `normal` verbosity no

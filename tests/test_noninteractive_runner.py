@@ -117,7 +117,7 @@ async def test_headless_runner_uses_real_dispatch_and_writes_complete_artifacts(
     assert result.artifact_integrity["model_calls"] is True
     assert result.artifact_integrity["mutations"] is True
     assert result.artifact_integrity["context_preview"] is True
-    assert result.artifact_integrity["contexts"] is True
+    assert result.artifact_integrity["attachments"] is True
     assert result.artifact_integrity["final_output"] is True
     assert result.artifact_integrity["summary"] is True
     assert result.run_validation["ok"] is True
@@ -179,7 +179,7 @@ async def test_summary_indexes_route_tools_context_and_output(tmp_path: Path):
     assert summary["route"] == "workspace.location"
     assert summary["tools"] == []
     assert summary["changed_files"] == []
-    assert summary["artifacts"]["contexts"] == ".evidence/contexts/"
+    assert summary["artifacts"]["attachments"] == ".evidence/attachments/"
     assert summary["artifacts"]["final_output"] == ".evidence/final-output.md"
 
 

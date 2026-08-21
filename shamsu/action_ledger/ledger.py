@@ -97,6 +97,7 @@ class ActionLedger:
         config: dict[str, Any] | None = None,
         session_id: str = "",
         turn_id: str = "",
+        source: str = "",
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.sandbox = Sandbox(self.workspace)
@@ -104,6 +105,11 @@ class ActionLedger:
         suffix = self.run_id.removeprefix("run_")
         self.session_id = session_id or f"session_{suffix}"
         self.turn_id = turn_id or f"turn_{suffix}"
+        # Which surface asked for this turn: "cli" | "telegram" | "web". One
+        # scrollback now interleaves all three, and the badge on each row is
+        # the only thing that distinguishes a message steered in from a phone
+        # from the local prompt that started the run.
+        self.source = (source or "cli").strip().lower()
         self.root_operation_id = "op_root"
         self.run_dir = self.sandbox.validate(Path(".shamsu") / "runs" / self.run_id)
         self.config = config or load_config(self.workspace)
@@ -152,36 +158,77 @@ class ActionLedger:
         return self.evidence_dir / "model-calls.jsonl"
 
     @property
+    def attachments_dir(self) -> Path:
+        """One flat folder for every spilled payload.
+
+        This used to be eight: `commands/`, `contexts/`, `diagnostics/`,
+        `mutations/`, `prompts/`, `reasoning/`, `responses/`, `tool-results/`.
+        Sorting by payload type is sorting by the one key nobody searches on -
+        a reader arrives knowing *when* something happened and wants the thing
+        that happened next, which put every answer one folder away from every
+        other part of its own story.
+
+        Flat, with the type in the filename instead, so `ls` shows the whole
+        run in one screen and the sequence numbers still sort. Every path
+        recorded in the JSONL rows stays relative to `run_dir`, so `store.py`
+        and the export path resolve them exactly as before."""
+        return self.evidence_dir / "attachments"
+
+    # The eight names below are what the rest of the codebase already asks for.
+    # They stay as properties rather than becoming a single call site edit
+    # sweep: a spill's *kind* still decides its filename prefix, and keeping the
+    # names means `executor.py` and the tests read unchanged.
+
+    @property
     def commands_dir(self) -> Path:
-        return self.evidence_dir / "commands"
+        return self.attachments_dir
 
     @property
     def diagnostics_dir(self) -> Path:
-        return self.evidence_dir / "diagnostics"
+        return self.attachments_dir
 
     @property
     def tool_results_dir(self) -> Path:
-        return self.evidence_dir / "tool-results"
+        return self.attachments_dir
 
     @property
     def prompts_dir(self) -> Path:
-        return self.evidence_dir / "prompts"
+        return self.attachments_dir
 
     @property
     def cot_dir(self) -> Path:
-        return self.evidence_dir / "reasoning"
+        return self.attachments_dir
 
     @property
     def responses_dir(self) -> Path:
-        return self.evidence_dir / "responses"
+        return self.attachments_dir
 
     @property
-    def narrative_path(self) -> Path:
-        return self.run_dir / "report.md"
+    def session_log_dir(self) -> Path:
+        """Where this turn's readable log lives.
+
+        The session, when there is one - a turn only means something inside the
+        conversation it belongs to. A headless one-shot has no session and would
+        otherwise write its log nowhere, so the run directory is the fallback."""
+        if self.session_id:
+            return self.workspace / ".shamsu" / "sessions" / self.session_id
+        return self.run_dir
+
+    @property
+    def summary_log_path(self) -> Path:
+        return self.session_log_dir / "log-summary.md"
+
+    @property
+    def detail_log_path(self) -> Path:
+        return self.session_log_dir / "log-detailed.md"
+
+    @property
+    def log_attachments_dir(self) -> Path:
+        return self.session_log_dir / "attachments"
 
     @property
     def mutations_dir(self) -> Path:
-        return self.evidence_dir / "mutations"
+        return self.attachments_dir
 
     @property
     def context_preview_path(self) -> Path:
@@ -189,7 +236,11 @@ class ActionLedger:
 
     @property
     def contexts_dir(self) -> Path:
-        return self.evidence_dir / "contexts"
+        return self.attachments_dir
+
+    @property
+    def mutations_path(self) -> Path:
+        return self.attachments_dir / "mutations.jsonl"
 
     @property
     def final_output_path(self) -> Path:
@@ -220,29 +271,13 @@ class ActionLedger:
 
     def _initialize_run_layout(self) -> None:
         """Create the canonical artifact set before any activity is recorded."""
-        directories = [
-            self.commands_dir,
-            self.diagnostics_dir,
-            self.tool_results_dir,
-            self.mutations_dir,
-            self.contexts_dir,
-        ]
-        if self.full_artifacts:
-            directories.extend(
-                [
-                    self.prompts_dir,
-                    self.cot_dir,
-                    self.responses_dir,
-                ]
-            )
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
         for path in (
             self.events_path,
             self.decisions_path,
             self.tool_calls_path,
             self.model_calls_path,
-            self.mutations_dir / "mutations.jsonl",
+            self.mutations_path,
         ):
             if not path.exists():
                 self._write_text(path, "")
@@ -366,14 +401,11 @@ class ActionLedger:
                 "events": ".evidence/events.jsonl",
                 "decisions": ".evidence/decisions.jsonl",
                 "tool_calls": ".evidence/tool-calls.jsonl",
-                "tool_results": ".evidence/tool-results/",
                 "model_calls": ".evidence/model-calls.jsonl",
-                "prompts": ".evidence/prompts/",
-                "reasoning": ".evidence/reasoning/",
-                "responses": ".evidence/responses/",
-                "contexts": ".evidence/contexts/",
-                "mutations": ".evidence/mutations/mutations.jsonl",
-                "report": "report.md",
+                "attachments": ".evidence/attachments/",
+                "mutations": ".evidence/attachments/mutations.jsonl",
+                "summary": f"sessions/{self.session_id}/log-summary.md",
+                "detail": f"sessions/{self.session_id}/log-detailed.md",
                 "final_output": ".evidence/final-output.md",
             },
         }
@@ -611,6 +643,11 @@ class ActionLedger:
         }
         event.update(self._compact(fields))
         self._append_jsonl(self.events_path, event)
+        if event_type.startswith("approval"):
+            # Approvals were previously visible only as a line in events.jsonl,
+            # so a turn that sat four minutes waiting for a human read exactly
+            # like one that spent four minutes thinking. They get their own row.
+            self._narrative("append_approval", event)
         return event
 
     # -- decisions ------------------------------------------------------------
@@ -787,7 +824,7 @@ class ActionLedger:
             "tool_count": len(tools or []),
         }
         if self.full_artifacts:
-            record["prompt_path"] = self._write_artifact(self.prompts_dir, call_id, request_text)
+            record["prompt_path"] = self._write_artifact(self.prompts_dir, call_id, request_text, "prompt")
         friendly_prompt_path = self._write_friendly_model_artifact(call_id, "prompt", request_text)
         self._friendly_model_started[call_id] = {
             "timestamp": record["timestamp"],
@@ -845,7 +882,7 @@ class ActionLedger:
             "meta": self._compact(meta or {}),
         }
         if self.full_artifacts and response:
-            record["response_path"] = self._write_artifact(self.responses_dir, call_id, response)
+            record["response_path"] = self._write_artifact(self.responses_dir, call_id, response, "response")
         friendly_response_path = self._write_friendly_model_artifact(
             call_id,
             "response",
@@ -906,7 +943,7 @@ class ActionLedger:
             return ""
         cot_path = ""
         if self.full_artifacts:
-            cot_path = self._write_artifact(self.cot_dir, call_id or "model_unknown", thinking)
+            cot_path = self._write_artifact(self.cot_dir, call_id or "model_unknown", thinking, "reasoning")
         record = {
             **self._correlation(call_id or self.root_operation_id, self.root_operation_id),
             "model_call_id": call_id,
@@ -1260,18 +1297,22 @@ class ActionLedger:
         verifier_id: str = "",
         command: str = "",
     ) -> None:
-        self.log_event(
-            "repair_attempt_finished",
-            attempt_index=attempt_index,
-            outcome=outcome,
-            kept=bool(kept),
-            files_changed=list(files_changed or []),
-            before_signature=before_signature,
-            after_signature=after_signature,
-            note=note,
-            verifier_id=verifier_id,
-            command=command,
-        )
+        record = {
+            "attempt_index": attempt_index,
+            "outcome": outcome,
+            "kept": bool(kept),
+            "files_changed": list(files_changed or []),
+            "before_signature": before_signature,
+            "after_signature": after_signature,
+            "note": note,
+            "verifier_id": verifier_id,
+            "command": command,
+        }
+        self.log_event("repair_attempt_finished", **record)
+        # The repair loop is the one caller that knows its own attempt number
+        # and whether the result survived, which is what turns two adjacent
+        # rows into one "1 of 2 kept" group.
+        self._narrative("append_repair_attempt", record)
 
     # -- context preview / memory / classification --------------------------
 
@@ -1422,37 +1463,58 @@ class ActionLedger:
         return str(path.relative_to(self.run_dir).as_posix())
 
     def _narrative(self, method: str, *args: Any) -> None:
-        """Mirror one step into this run's readable narrative (tier 2).
+        """Mirror one step into this session's readable log.
 
         Tools are recorded here rather than from the trace because every
         execution path logs them here. Imported lazily so the action_ledger
         package carries no UI dependency at import time; best-effort, because a
-        narrative failure must never break a run."""
+        logging failure must never break a run.
+
+        `writer_for` rather than a bare constructor: two of the rows this
+        produces - a reasoning sub-panel and a grouped retry - need to see more
+        than one call, and a writer built fresh per call cannot."""
         if not self.enabled:
             return
         try:
-            from shamsu.ui.narrative import NarrativeWriter
-
-            session_dir = None
-            if self.session_id:
-                session_dir = self.workspace / ".shamsu" / "sessions" / self.session_id
-            writer = NarrativeWriter(
-                self.run_dir,
-                session_dir,
-                run_id=self.run_id,
-                log_level=self.log_level,
-            )
-            getattr(writer, method)(*args)
+            self._turn_log_writer().__getattribute__(method)(*args)
         except Exception:
             pass
 
-    def _write_artifact(self, directory: Path, call_id: str, text: str) -> str:
+    def _turn_log_writer(self) -> Any:
+        from shamsu.ui.turnlog import writer_for
+
+        session_dir = None
+        if self.session_id:
+            session_dir = self.workspace / ".shamsu" / "sessions" / self.session_id
+        return writer_for(
+            self.run_dir,
+            session_dir,
+            run_id=self.run_id,
+            log_level=self.log_level,
+            turn_id=self.turn_id,
+            source=self.source,
+        )
+
+    def _write_artifact(
+        self, directory: Path, call_id: str, text: str, kind: str = ""
+    ) -> str:
         """Spill one full-fidelity text artifact and return its relative path.
-        Goes through _write_text, so it is redacted like everything else."""
+        Goes through _write_text, so it is redacted like everything else.
+
+        *kind* is what used to be the folder. One model call spills a prompt, a
+        reasoning trace, and a response, all under the same call id - in three
+        separate folders that was three files named `model_0007.txt`, and in one
+        flat folder it would have been a silent overwrite (or, thanks to the
+        de-duplicating loop below, three files whose names no longer said which
+        was which). The kind moves into the filename so a flat folder loses
+        nothing the typed folders carried."""
         if not text:
             return ""
         safe_call_id = "".join(char for char in (call_id or "") if char.isalnum() or char in {"-", "_"})
+        safe_kind = "".join(char for char in (kind or "") if char.isalnum() or char in {"-", "_"})
         stem = safe_call_id or "model_unknown"
+        if safe_kind:
+            stem = f"{stem}.{safe_kind}"
         path = directory / f"{stem}.txt"
         # Callers without a ledger call id (the plain completion path) all land
         # on the same stem, so never let a second trace silently overwrite one.
@@ -1690,7 +1752,7 @@ class ActionLedger:
             self.decisions_path,
             self.tool_calls_path,
             self.model_calls_path,
-            self.mutations_dir / "mutations.jsonl",
+            self.mutations_path,
         ]
         sequences = [
             int(record.get("sequence", 0) or 0)
@@ -1780,7 +1842,7 @@ def _tool_result_text(ok: bool, message: str, data: Any) -> str:
 
 
 def _open_narrative(ledger: ActionLedger, prompt: str) -> None:
-    """Start this run's readable narrative (tier 2 of the log).
+    """Start this turn in the session's readable log.
 
     `start_run` is the single entry point every caller - interactive REPL and
     headless CLI alike - uses to begin a turn, so opening here needs no changes
@@ -1789,17 +1851,9 @@ def _open_narrative(ledger: ActionLedger, prompt: str) -> None:
     if not ledger.enabled:
         return
     try:
-        from shamsu.ui.narrative import NarrativeWriter, write_layout_readme
+        from shamsu.ui.turnlog import write_layout_readme
 
-        session_dir = None
-        if ledger.session_id:
-            session_dir = ledger.workspace / ".shamsu" / "sessions" / ledger.session_id
-        NarrativeWriter(
-            ledger.run_dir,
-            session_dir,
-            run_id=ledger.run_id,
-            log_level=ledger.log_level,
-        ).open_turn(prompt)
+        ledger._turn_log_writer().open_turn(prompt)
         write_layout_readme(ledger.workspace)
     except Exception:
         pass
@@ -1810,6 +1864,7 @@ def start_run(
     prompt: str,
     config: dict[str, Any] | None = None,
     session_logger: "SessionLogger | None" = None,
+    source: str = "",
 ) -> ActionLedger:
     session_id = session_logger.session_id if session_logger is not None else ""
     turn_id = session_logger.current_turn_id if session_logger is not None else ""
@@ -1818,6 +1873,7 @@ def start_run(
         config=config,
         session_id=session_id,
         turn_id=turn_id,
+        source=source,
     )
     ledger.start(prompt)
     _open_narrative(ledger, prompt)

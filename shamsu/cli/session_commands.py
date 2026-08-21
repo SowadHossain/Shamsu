@@ -121,13 +121,25 @@ def _narrative(workspace: Path, run_id: str, console: Console) -> None:
 
 
 def _model_artifacts(workspace: Path, run_id: str, kind: str, console: Console) -> None:
-    """Print a run's captured prompts or chain-of-thought - tier 1 of the log,
-    in model-call order."""
+    """Print a run's captured prompts or chain-of-thought, in model-call order.
+
+    Spilled payloads live in one flat `attachments/` folder, with the kind in
+    the filename (`model_0000.prompt.txt`). Runs recorded before that kept the
+    kind in the folder name instead, and a run on disk is the only record of
+    what happened - so the old folders are searched when the flat one has
+    nothing rather than reporting the artifacts as never captured."""
     evidence = store.runs_dir(workspace) / run_id / ".evidence"
-    directory = evidence / ("prompts" if kind == "prompt" else "reasoning")
-    if not directory.is_dir():
-        directory = store.runs_dir(workspace) / run_id / ("prompts" if kind == "prompt" else "cot")
-    paths = sorted(directory.glob("*.txt")) if directory.is_dir() else []
+    suffix = "prompt" if kind == "prompt" else "reasoning"
+    directory = evidence / "attachments"
+    paths = sorted(directory.glob(f"*.{suffix}.txt")) if directory.is_dir() else []
+    if not paths:
+        for legacy in (
+            evidence / ("prompts" if kind == "prompt" else "reasoning"),
+            store.runs_dir(workspace) / run_id / ("prompts" if kind == "prompt" else "cot"),
+        ):
+            if legacy.is_dir() and (paths := sorted(legacy.glob("*.txt"))):
+                directory = legacy
+                break
     if not paths:
         label = "prompt" if kind == "prompt" else "chain-of-thought"
         console.print(
@@ -177,9 +189,10 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
     lines = [
         f"Logs for this project live in [bold]{root}[/bold]",
         "",
-        "[bold]Human-readable report[/bold]",
-        f"  this request             {run_example / 'report.md'}",
-        f"  whole conversation       {session_example / 'report.md'}",
+        "[bold]Human-readable log[/bold]  two files per conversation",
+        f"  every action, in order   {session_example / 'log-summary.md'}",
+        f"  the same, with payloads  {session_example / 'log-detailed.md'}",
+        f"  anything too big         {session_example / 'attachments'}",
         "",
         "[bold]One-file debug log[/bold]",
         f"  prompts + agent events   {log_example / 'agent-development-log.jsonl'}",
@@ -189,15 +202,15 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
         "",
         f"[bold]Detail level[/bold]  {level}"
         + (
-            "  (detailed readable report + full redacted evidence)"
+            "  (adds the prompt sent and the context payload)"
             if level == "verbose"
-            else "  (concise readable report + compact evidence)"
+            else "  (every action, response and reasoning; no prompts or context)"
         ),
         "  change with            /logs mode essential|verbose",
         f"  process override       {LOG_LEVEL_ENV_VAR}=essential|verbose",
         "",
         "[bold]Read them here[/bold]",
-        "  /run report            the report for the last run",
+        "  /run report            the readable log for the last run",
         "  /run prompt            verbose-mode model prompt evidence",
         "  /run cot               verbose-mode reasoning evidence",
         "  /runs                  list recent runs",

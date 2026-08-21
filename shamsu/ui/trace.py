@@ -149,7 +149,7 @@ EVENT_LABELS = {
     "workflow.finished": "Done",
 }
 
-# Shared with shamsu.ui.narrative so the narrative log and the console use the
+# Shared with shamsu.ui.turnlog so the session log and the console use the
 # same wording for the same event.
 _EVENT_LABELS = EVENT_LABELS
 
@@ -172,14 +172,14 @@ _EVENT_STYLES = {
 
 
 def narrative_for_current_run() -> "Any | None":
-    """Build a NarrativeWriter for the run in flight, or None when there isn't
-    one (no active run, or the ledger is disabled).
+    """The turn-log writer for the run in flight, or None when there isn't one
+    (no active run, or the ledger is disabled).
 
-    Imported lazily: shamsu.ui.narrative imports this module for EVENT_LABELS,
+    Imported lazily: shamsu.ui.turnlog imports this module for EVENT_LABELS,
     so a module-level import here would cycle.
     """
     from shamsu.action_ledger.context import get_current_run
-    from shamsu.ui.narrative import NarrativeWriter
+    from shamsu.ui.turnlog import writer_for
 
     ledger = get_current_run()
     if ledger is None or not getattr(ledger, "enabled", False):
@@ -188,11 +188,13 @@ def narrative_for_current_run() -> "Any | None":
     session_id = str(getattr(ledger, "session_id", "") or "")
     if session_id:
         session_dir = Path(ledger.workspace) / ".shamsu" / "sessions" / session_id
-    return NarrativeWriter(
+    return writer_for(
         ledger.run_dir,
         session_dir,
         run_id=ledger.run_id,
         log_level=getattr(ledger, "log_level", "essential"),
+        turn_id=str(getattr(ledger, "turn_id", "") or ""),
+        source=str(getattr(ledger, "source", "") or ""),
     )
 
 

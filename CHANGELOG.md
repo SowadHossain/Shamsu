@@ -4,6 +4,81 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Changed — the log is two Markdown files per session (2026-08-21)
+
+The readable log was nine places at once: one `report.md` per run, and beside
+it eight typed subfolders under `.evidence/` — `prompts/`, `reasoning/`,
+`responses/`, `tool-results/`, `commands/`, `contexts/`, `diagnostics/`,
+`mutations/`. Eight folders is not eight times the information; it is one story
+cut into eight piles sorted by payload type, which is the one key nobody
+searches on. A session now carries:
+
+    .shamsu/sessions/<session-id>/
+        log-summary.md     every action, one line each, in order
+        log-detailed.md    the same actions, with the payloads, anchored
+        attachments/       flat; only what was too big to inline
+        session.json
+        messages.jsonl
+
+`log-summary.md` is the index you skim — icon, title, surface, outcome,
+duration, and a `detail` link where there is more to see. `log-detailed.md` is
+the same sequence with prompts, diffs, command output and reasoning traces
+attached, each under an anchor the summary links to. Both are appended as the
+turn runs, so a session killed mid-turn keeps everything up to the moment it
+died.
+
+Five things the old report could not show:
+
+- **Reasoning** renders as a collapsed sub-panel *inside* the model's own
+  entry, not a separate file in another folder. A `<think>`, `<thought>` or
+  `<reasoning>` block leaked into the visible answer is pulled out and rendered
+  there too, so the trace reads the same way whichever way the model returned
+  it.
+- **Approvals** are their own row, with the request and its resolution paired
+  into one line and both timestamps in the panel — a run that sat four minutes
+  waiting for a human used to look identical to one that spent four minutes
+  thinking.
+- **Retries** group: consecutive attempts on one file emit as
+  `↺ Write attempts — config.py · 1 of 2 kept`, with the superseded attempt
+  struck through. They were two unrelated rows and the reader had to notice the
+  filename matched.
+- **Surface badges** name where a row's input came from, so a message steered
+  in from a phone is distinguishable from the local prompt that started the run.
+- **Overflow**: a payload over 2,400 characters is written to `attachments/`
+  and linked, with eight lines of head kept inline.
+
+The eight typed subfolders became one flat `.evidence/attachments/`. The kind
+that used to be the folder moved into the filename (`model_0000.prompt.txt`,
+`.reasoning.txt`, `.response.txt`) — all three used to be `model_0000.txt` and
+would otherwise have collided. The JSONL evidence files stay where they are:
+`evidence_outcome()` computes every run's terminal status from them.
+
+`report.md` is gone. `store.report_path()` returns the session's
+`log-summary.md`, falling back to a run's own `report.md` (or the older
+`narrative.md`) when one exists, so `/run report` still works on runs recorded
+before this change. `/run prompt` and `/run cot` read the flat folder first and
+the typed folders second, for the same reason.
+
+`essential` and `verbose` still differ, but the line moved. With one document,
+`essential` had to withhold the model's own words to stay readable; with two,
+the summary stays skimmable on its own, so the response and the reasoning trace
+— the two things you debug a small model with — are kept at both levels.
+`verbose` adds the prompt that was sent and the context payload.
+
+### Fixed — simple mode never recorded its tools or model calls (2026-08-21)
+
+The readable log is built entirely from the ActionLedger, on the documented
+promise that every execution path records its tools there. Simple mode, the
+DEFAULT path, never did: it called `log_event` for verification verdicts and
+nothing else. The first live run of the new log came back with approvals and
+file writes in it and no sign of what the agent read, ran, or said. Tool calls,
+tool results, model calls, and reasoning traces are now recorded from
+`_run_tools` and `_call_model`.
+
+`messages.jsonl` is untouched, so `evals/harness.py::_turn_telemetry` still
+counts rounds and tool calls exactly as before — held down by a test that runs
+a full turn beside a transcript and asserts the counts still come back.
+
 ### Fixed (the reported failure, from a live transcript, 2026-08-21)
 
 Run against the file it was reported on - `test-shamsu/test1/js/main.js`, 582

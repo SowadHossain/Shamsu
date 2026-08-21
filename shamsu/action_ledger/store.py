@@ -30,7 +30,22 @@ def artifact_path(workspace: Path, run_id: str, relative: str | Path) -> Path:
 
 
 def report_path(workspace: Path, run_id: str) -> Path:
+    """Where this run's readable story is.
+
+    The story moved out of the run folder and into the session's
+    `log-summary.md`, because a run is a turn and a turn only makes sense in the
+    conversation it belongs to. Runs recorded before that still have their own
+    `report.md` (or, older still, `narrative.md`), and those are the only copy
+    of what happened - so the run-local files are returned when the session log
+    is absent rather than reported as missing."""
     run_root = runs_dir(workspace) / run_id
+    session_id = str((load_manifest(workspace, run_id) or {}).get("session_id") or "")
+    if session_id:
+        session_log = (
+            Path(workspace) / ".shamsu" / "sessions" / session_id / "log-summary.md"
+        )
+        if session_log.exists():
+            return session_log
     modern = run_root / "report.md"
     legacy = run_root / "narrative.md"
     return modern if modern.exists() or not legacy.exists() else legacy
@@ -130,7 +145,19 @@ def load_model_calls(workspace: Path, run_id: str) -> list[dict[str, Any]]:
 
 
 def load_mutations(workspace: Path, run_id: str) -> list[dict[str, Any]]:
-    return _read_jsonl(artifact_path(workspace, run_id, Path("mutations") / "mutations.jsonl"))
+    return _read_jsonl(mutations_path(workspace, run_id))
+
+
+def mutations_path(workspace: Path, run_id: str) -> Path:
+    """The mutation journal, wherever this run put it.
+
+    Spilled payloads moved out of eight typed subfolders into one flat
+    `attachments/`. Runs recorded before that still have `mutations/`, and a run
+    already on disk is the only copy of what happened - so the old location is
+    read when the new one is absent rather than reported as an empty journal."""
+    modern = artifact_path(workspace, run_id, Path("attachments") / "mutations.jsonl")
+    legacy = artifact_path(workspace, run_id, Path("mutations") / "mutations.jsonl")
+    return modern if modern.exists() or not legacy.exists() else legacy
 
 
 def load_context_preview(workspace: Path, run_id: str) -> dict[str, Any] | None:
@@ -139,7 +166,10 @@ def load_context_preview(workspace: Path, run_id: str) -> dict[str, Any] | None:
 
 def load_context_records(workspace: Path, run_id: str) -> list[dict[str, Any]]:
     """Load every v2 context artifact, falling back to the legacy latest preview."""
-    context_dir = artifact_path(workspace, run_id, "contexts")
+    context_dir = artifact_path(workspace, run_id, "attachments")
+    legacy_dir = artifact_path(workspace, run_id, "contexts")
+    if not any(context_dir.glob("context_*.json")) and legacy_dir.is_dir():
+        context_dir = legacy_dir
     records = [
         record
         for path in sorted(context_dir.glob("context_*.json"))
@@ -184,7 +214,7 @@ def validate_run(workspace: Path, run_id: str) -> dict[str, Any]:
         "decisions": artifact_path(workspace, run_id, "decisions.jsonl"),
         "tools": artifact_path(workspace, run_id, "tool-calls.jsonl"),
         "models": artifact_path(workspace, run_id, "model-calls.jsonl"),
-        "mutations": artifact_path(workspace, run_id, Path("mutations") / "mutations.jsonl"),
+        "mutations": mutations_path(workspace, run_id),
     }
     for name, path in jsonl_paths.items():
         if not path.exists():

@@ -259,7 +259,7 @@ class LocalShamsuSessionGateway:
             "Telegram message routed into SHAMSU session",
             workflow_id="telegram",
         )
-        ledger = start_run(self.workspace, text, session_logger=logger)
+        ledger = start_run(self.workspace, text, session_logger=logger, source="telegram")
         set_current_run(ledger)
         approval_func = None
         if self.approval_broker is not None:

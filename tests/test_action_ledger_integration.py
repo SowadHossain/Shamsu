@@ -489,7 +489,7 @@ async def test_file_write_route_asks_before_unspecified_auth_approach(
     assert pending["source"] == "direct_file_upfront"
     assert "Server sessions" in console.export_text()
     assert "run_needs_input" in [event["type"] for event in _events(ledger)]
-    assert "Which authentication approach" in ledger.narrative_path.read_text(encoding="utf-8")
+    assert "Which authentication approach" in ledger.summary_log_path.read_text(encoding="utf-8")
 
 
 # -- a recovered patch retry must not fail the whole run ----------------------

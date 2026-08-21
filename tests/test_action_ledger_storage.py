@@ -32,15 +32,28 @@ def test_start_run_creates_complete_canonical_artifact_layout(tmp_path: Path):
         ledger.decisions_path,
         ledger.tool_calls_path,
         ledger.model_calls_path,
-        ledger.mutations_dir / "mutations.jsonl",
+        ledger.mutations_path,
         ledger.context_preview_path,
     )
     assert all(path.is_file() for path in expected_files)
-    assert ledger.commands_dir.is_dir()
-    assert ledger.diagnostics_dir.is_dir()
-    assert ledger.contexts_dir.is_dir()
+    # One flat folder for every spilled payload, not eight typed ones.
+    assert ledger.attachments_dir.is_dir()
+    for alias in (
+        ledger.commands_dir,
+        ledger.diagnostics_dir,
+        ledger.contexts_dir,
+        ledger.tool_results_dir,
+        ledger.prompts_dir,
+        ledger.cot_dir,
+        ledger.responses_dir,
+        ledger.mutations_dir,
+    ):
+        assert alias == ledger.attachments_dir
     assert store.load_context_records(tmp_path, ledger.run_id) == []
-    assert {path.name for path in ledger.run_dir.iterdir()} == {"report.md", ".evidence"}
+    assert {path.name for path in ledger.run_dir.iterdir()} == {".evidence"}
+    assert {path.name for path in ledger.evidence_dir.iterdir() if path.is_dir()} == {
+        "attachments"
+    }
 
 
 def test_start_run_writes_manifest_json(tmp_path: Path):
@@ -453,8 +466,8 @@ def test_verbose_command_event_references_separate_output_files(tmp_path: Path, 
     cmd_id = ledger.log_command_start("npm run build", tmp_path)
     event = ledger.log_command_finish(cmd_id, "npm run build", tmp_path, 0, "out", "err")
 
-    assert event["stdout_path"] == f".evidence/commands/{cmd_id}.stdout.log"
-    assert event["stderr_path"] == f".evidence/commands/{cmd_id}.stderr.log"
+    assert event["stdout_path"] == f".evidence/attachments/{cmd_id}.stdout.log"
+    assert event["stderr_path"] == f".evidence/attachments/{cmd_id}.stderr.log"
 
 
 def test_huge_command_output_not_embedded_in_events_jsonl(tmp_path: Path):
@@ -507,7 +520,7 @@ def test_tool_result_token_telemetry_and_artifact_are_saved(tmp_path: Path):
     assert finished["returned_tokens"] == 600
     assert finished["max_tokens"] == 600
     assert finished["truncated"] is True
-    assert finished["artifact_path"] == f".evidence/tool-results/{call_id}.json"
+    assert finished["artifact_path"] == f".evidence/attachments/{call_id}.json"
     assert (ledger.run_dir / finished["artifact_path"]).read_text(encoding="utf-8") == full_result
 
 
@@ -825,7 +838,7 @@ def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path, monke
         "coder", "deepseek-r1:7b", "done" * 3000, call_id=call_id
     )
 
-    prompt_text = (ledger.prompts_dir / f"{call_id}.txt").read_text(encoding="utf-8")
+    prompt_text = (ledger.prompts_dir / f"{call_id}.prompt.txt").read_text(encoding="utf-8")
     assert "===== SYSTEM =====" in prompt_text
     assert "You are SHAMSU." in prompt_text
     assert "add a healthcheck endpoint" in prompt_text
@@ -838,9 +851,9 @@ def test_full_prompt_cot_and_response_are_spilled_to_files(tmp_path: Path, monke
         item["phase"]: item
         for item in store.load_model_calls(tmp_path, ledger.run_id)
     }
-    assert records["started"]["prompt_path"] == f".evidence/prompts/{call_id}.txt"
+    assert records["started"]["prompt_path"] == f".evidence/attachments/{call_id}.prompt.txt"
     assert records["thinking"]["thinking_chars"] == len(long_cot.strip())
-    assert records["finished"]["response_path"] == f".evidence/responses/{call_id}.txt"
+    assert records["finished"]["response_path"] == f".evidence/attachments/{call_id}.response.txt"
     assert (ledger.run_dir / records["finished"]["response_path"]).read_text(
         encoding="utf-8"
     ) == "done" * 3000
@@ -942,9 +955,11 @@ def test_essential_log_level_keeps_previews_and_writes_no_model_artifacts(tmp_pa
     ledger.log_model_thinking(call_id, "coder", "m", "reasoning")
     ledger.log_model_call_finished("coder", "m", "the answer", call_id=call_id)
 
-    assert not ledger.prompts_dir.exists()
-    assert not ledger.cot_dir.exists()
-    assert not ledger.responses_dir.exists()
+    # One flat folder now, so its absence can no longer stand in for "nothing
+    # was captured" - assert on the files themselves, which is what was meant.
+    assert not list(ledger.attachments_dir.glob("*.prompt.txt"))
+    assert not list(ledger.attachments_dir.glob("*.reasoning.txt"))
+    assert not list(ledger.attachments_dir.glob("*.response.txt"))
     started = store.load_model_calls(tmp_path, ledger.run_id)[0]
     assert started["prompt_preview"] == "the prompt"
     assert "prompt_path" not in started
@@ -975,8 +990,8 @@ def test_secrets_are_redacted_in_prompt_and_cot_artifacts(tmp_path: Path, monkey
     )
     ledger.log_model_thinking(call_id, "coder", "m", "I will reuse password=hunter2000 here")
 
-    prompt_text = (ledger.prompts_dir / f"{call_id}.txt").read_text(encoding="utf-8")
-    cot_text = (ledger.cot_dir / f"{call_id}.txt").read_text(encoding="utf-8")
+    prompt_text = (ledger.prompts_dir / f"{call_id}.prompt.txt").read_text(encoding="utf-8")
+    cot_text = (ledger.cot_dir / f"{call_id}.reasoning.txt").read_text(encoding="utf-8")
     assert "sk-livesecret9876" not in prompt_text
     assert "[REDACTED]" in prompt_text
     assert "hunter2000" not in cot_text

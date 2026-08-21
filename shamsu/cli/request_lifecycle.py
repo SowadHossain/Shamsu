@@ -53,30 +53,26 @@ def finish_current_run(workspace: Path, ledger: ActionLedger) -> None:
 
 
 def _close_run_narrative(workspace: Path, ledger: ActionLedger) -> None:
-    """Seal this turn's narrative and fold it into the session roll-up.
+    """Seal this turn in the session log and let go of its writer.
 
     The single close point for both interactive and headless callers, mirroring
-    `start_run`'s single open point. Best-effort: the narrative is observability,
+    `start_run`'s single open point. Best-effort: the log is observability,
     never a reason to fail a finished run."""
     if not ledger.enabled:
         return
     try:
-        from shamsu.ui.narrative import NarrativeWriter
+        from shamsu.ui.turnlog import release_writer
 
         summary = action_ledger_store.load_summary(workspace, ledger.run_id) or {}
         manifest = action_ledger_store.load_manifest(workspace, ledger.run_id) or {}
-        session_dir = None
-        if ledger.session_id:
-            session_dir = Path(workspace) / ".shamsu" / "sessions" / ledger.session_id
-        NarrativeWriter(
-            ledger.run_dir,
-            session_dir,
-            run_id=ledger.run_id,
-            log_level=ledger.log_level,
-        ).close_turn(
+        writer = ledger._turn_log_writer()
+        writer.close_turn(
             final=action_ledger_store.load_final_output(workspace, ledger.run_id),
             status=str(summary.get("status") or manifest.get("status") or "unknown"),
         )
+        # A closed turn is never written to again, and its writer is holding a
+        # buffer the next turn must not inherit.
+        release_writer(writer)
     except Exception:
         pass
 

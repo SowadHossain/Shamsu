@@ -3,6 +3,29 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-21 - Logging: two Markdown files per session, replacing eight typed folders
+Files edited: `shamsu/ui/turnlog.py` (new, replaces `shamsu/ui/narrative.py`),
+`shamsu/action_ledger/{ledger,store}.py`, `shamsu/agents/simple_chat.py`,
+`shamsu/cli/{request_lifecycle,session_commands,noninteractive}.py`,
+`shamsu/ui/trace.py`, `shamsu/integrations/telegram/sessions.py`, tests
+What changed: a session now carries `log-summary.md` (every action, one line
+each), `log-detailed.md` (the same sequence with prompts, diffs, output and
+reasoning attached under anchors the summary links to) and a flat
+`attachments/` for anything too large to inline, beside `session.json` and
+`messages.jsonl`. The eight typed subfolders under `.evidence/` collapsed into
+one flat `attachments/`, with the kind moved into the filename. Five additions
+the old `report.md` could not show: reasoning as a collapsed sub-panel inside
+the model's own entry (including `<think>` blocks leaked into the answer),
+approvals as their own row with request and resolution paired, consecutive
+attempts on one file grouped as "1 of 2 kept", a surface badge per row, and an
+overflow rule at 2,400 chars. The first live run found that SIMPLE MODE - the
+default path - never logged its tools or model calls to the ledger at all, so
+the log came out with approvals and file writes in it and no sign of what the
+agent ran; that is now wired.
+Tests: 38 in `tests/test_trace_output.py` (rewritten from 17), full suite 3507
+passed / 2 skipped. Four live runs on qwen2.5-coder:3b-instruct.
+Log: logs/test-runs/2026-08-21-logging-refactor.log
+
 ### 2026-08-21 - The reported failure, reproduced on the user's own file and fixed
 Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_outline.py`,
 `evals/{harness,diff,cases,__main__}.py`, tests

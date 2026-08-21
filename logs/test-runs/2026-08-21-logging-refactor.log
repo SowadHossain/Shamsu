@@ -1,0 +1,206 @@
+SHAMSU — logging refactor: two Markdown files per session
+=========================================================
+2026-08-21 · branch small-shamsu-new
+Model for the live runs: qwen2.5-coder:3b-instruct (per CLAUDE.md §5)
+Suite: 3507 passed, 2 skipped (was 3486 before this work)
+
+
+WHAT WAS BUILT
+--------------
+`shamsu/ui/turnlog.py` — `TurnLogWriter`, replacing `shamsu/ui/narrative.py`.
+
+    .shamsu/sessions/<session-id>/
+        log-summary.md     every action, one line each, in order
+        log-detailed.md    the same actions, with the payloads, anchored
+        attachments/       flat; only what was too big to inline
+        session.json
+        messages.jsonl
+
+The eight typed subfolders under `.evidence/` (`prompts/`, `reasoning/`,
+`responses/`, `tool-results/`, `commands/`, `contexts/`, `diagnostics/`,
+`mutations/`) collapsed into one flat `.evidence/attachments/`. Filenames carry
+the kind that used to be the folder — `model_0000.prompt.txt`,
+`model_0000.reasoning.txt`, `model_0000.response.txt` — because all three used
+to be `model_0000.txt` in three different folders and would have collided.
+
+
+THE FIRST LIVE RUN FOUND THREE THINGS THE UNIT TESTS COULD NOT
+--------------------------------------------------------------
+Workspace: test-shamsu/logrefactor, prompt "divide() in calc.py crashes on a
+zero divisor. Make it raise ValueError with a clear message instead."
+
+log-summary.md as first written:
+
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **waiting**
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **approved** · approval_callback · once
+    - ✎ **Files changed** — `calc.py` · **applied**
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **waiting**
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **approved** · approval_callback · once
+    - ✎ **Files changed** — `calc.py` · **applied**
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **waiting**
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **approved** · approval_callback · once
+    - ✎ **Files changed** — `calc.py` · **applied**
+
+1. NO TOOL ROWS AND NO MODEL ROWS AT ALL.
+   Not a rendering bug. `shamsu/ui/turnlog.py` is built entirely from the
+   ActionLedger, on the documented promise that "every execution path logs its
+   tools here" — and SIMPLE MODE, THE DEFAULT PATH, NEVER DID. It called
+   `log_event` for verification verdicts and nothing else. The old `report.md`
+   had exactly the same hole; nobody noticed because nobody read it.
+
+   Fixed by `_ledger_tool_call` / `_ledger_tool_result` /
+   `_ledger_model_started` / `_ledger_model_finished` in `simple_chat.py`,
+   wired into `_run_tools` and `_call_model`.
+
+2. EVERY APPROVAL WAS TWO ROWS. `approval.request` then `approval.result` say
+   the same thing twice — "waiting", then "approved". The request is now held
+   until the answer lands and one row carries both, which also makes the wait
+   measurable.
+
+3. THE RESULT LINE DETACHED FROM ITS CALL. An approval fires from inside
+   `patch_file` and lands between the call and its result, so the indented
+   result read as the approval's outcome. A result now gets its own row naming
+   its tool whenever anything came between.
+
+Each has a regression test in `tests/test_trace_output.py`.
+
+
+THE SAME PROMPT AFTER THE FIX
+-----------------------------
+Workspace: test-shamsu/logrefactor2. status=success, calc.py correctly patched.
+
+    ## 06:29:47 · `0c6d6bda38b4` `cli`
+
+    > divide() in calc.py crashes on a zero divisor. Make it raise ValueError with a clear message instead.
+
+    - ◆ **Model responded** · 3.2s · [detail](log-detailed.md#doc-0c6d6bda38b4-model-0001)
+    - ▤ Reading `calc.py` · [detail](log-detailed.md#doc-0c6d6bda38b4-tool-0002)
+        - ok: Read file. · [detail](log-detailed.md#doc-0c6d6bda38b4-result-0003)
+    - ◆ **Model responded** · 475ms · [detail](log-detailed.md#doc-0c6d6bda38b4-model-0004)
+    - ▤ Reading symbol `calc.py` · [detail](log-detailed.md#doc-0c6d6bda38b4-tool-0005)
+        - ok: calc.py lines 5-6, def divide(a, b): return a / b
+    - ◆ **Model responded** · 1.0s
+    - ▤ Patching `calc.py`
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **approved** · approval_callback · once
+    - ▤ `patch_file` → ok: Edited calc.py: +2 -0 lines (lines 5-7, 1 replacement(s)).
+    - ✎ **Files changed** — `calc.py` · **applied**
+    - ◆ **Model responded** · 799ms
+
+    **✓ success**
+
+
+A BAD TURN, WHICH IS THE POINT
+------------------------------
+Workspace: test-shamsu/logrefactor3. Same model, harder prompt. The turn
+FAILED, and the log says exactly how: seven `contract_assert_pass` calls, all
+refused with the same evidence error, interleaved with `contract_assert_fail`.
+
+    - ▤ `contract_assert_pass`
+        - **FAILED**: a01 needs evidence: what did you run, and what did it say? ...
+    - ▤ `contract_assert_fail`
+        - ok: ...
+    [x7]
+    - ▤ Replacing symbol in `calc.py`
+        - ok: Replaced divide in calc.py: lines 5-6, 2 line(s) -> 4.
+    - ▤ Replacing symbol in `calc.py`
+        - **FAILED**: divide in calc.py is already exactly that - nothing changed.
+
+    **✗ failed**
+
+The fix DID land (`replace_symbol`, line 5-6 → 4 lines) and the model then
+lost track of it. Reading that off the old `report.md` was not possible: it had
+no tool rows.
+
+
+OVERFLOW, LIVE
+--------------
+Workspace: test-shamsu/logrefactor5, a 5,178-byte `big.py`.
+
+    _9 lines, 4,771 chars — over the inline threshold._
+    [attachments/00ec602c8307-0003-result-data.json](attachments/...)
+
+    $ ls .shamsu/sessions/*/attachments/
+    -rw-r--r-- 4779 00ec602c8307-0003-result-data.json
+
+Threshold is `OVERFLOW_CHARS = 2400`, measured on the rendered text rather than
+line count: a 900-line log and one 40 KB JSON blob are the same problem. Eight
+lines of head stay inline so the row still says something.
+
+Note: the first attempt at this used a base64 `server.log`, which `read_file`
+refuses as "not a supported text file" — so it never reached the log at all.
+That is the read guard doing its job, not an overflow failure.
+
+
+TEST RESULTS
+------------
+    tests/test_trace_output.py             38 passed   (was 17; rewritten)
+    tests/test_action_ledger_storage.py    ...
+    tests/test_action_ledger_integration.py ...
+    tests/test_action_ledger_cli.py        100 passed combined
+    tests/test_noninteractive_runner.py     12 passed
+    tests/test_simple_chat.py              492 passed
+
+    FULL SUITE: 3507 passed, 2 skipped, 1 warning in 403.03s
+
+New tests worth naming:
+
+    test_summary_links_resolve_to_anchors_that_exist
+        every `detail` link in the summary points at an anchor that exists,
+        and no anchor is reused. A link that lands nowhere is worse than none.
+    test_a_second_turn_is_not_treated_as_already_closed
+        the close marker is per turn. Scanning the whole document for it would
+        make every turn after the first silently skip its own result.
+    test_the_transcript_the_evals_read_is_untouched
+        `evals/harness.py::_turn_telemetry` counts rounds and tool_calls out of
+        `.shamsu/sessions/*/messages.jsonl`. Asserts (2, 2) after a full turn
+        writes the new logs into the same workspace.
+    test_reasoning_is_a_sub_panel_inside_the_model_entry
+        trace renders BEFORE the response, inside <details>, in the same block.
+    test_inline_thought_tags_are_pulled_out_of_the_answer
+        a leaked `<think>` block lands in the panel, not in front of the answer.
+    test_simple_mode_records_its_tools_and_model_calls
+        drives a real SimpleChatLoop with a scripted client and asserts the
+        tool row, the model row, and the reasoning all reach the log. This is
+        finding 1 above, held down.
+
+
+EVAL SAFETY
+-----------
+`messages.jsonl` is untouched by this refactor — no code in it was changed and
+`_turn_telemetry` reads the same file the same way. Covered by
+`test_the_transcript_the_evals_read_is_untouched`, which writes a transcript,
+runs a full turn that produces the new logs beside it, and asserts the counts
+still come back (2, 2).
+
+
+DELIBERATE DEVIATIONS FROM THE BRIEF
+------------------------------------
+1. `.evidence/` KEPT ITS JSONL FILES. The brief said a session should "just"
+   contain the two Markdown files, session.json, messages.jsonl and
+   attachments/. `events.jsonl`, `decisions.jsonl`, `tool-calls.jsonl`,
+   `model-calls.jsonl` and `manifest.json` stayed, because
+   `ActionLedger.evidence_outcome()` computes every run's terminal status from
+   them and `store.py` validates runs against them. Deleting them would have
+   made every run's status wrong. What was fragmented — and what is now one
+   folder — is the eight typed SUBFOLDERS.
+
+2. `essential` vs `verbose` MOVED ITS LINE. With one document, `essential` had
+   to withhold the model's own words to stay readable. With two, the summary
+   stays skimmable on its own, so the response and the reasoning trace are now
+   kept at BOTH levels — they are what you debug a small model with. `verbose`
+   still adds the prompt that was sent and the context payload.
+   See `test_essential_detail_keeps_the_answer_and_drops_the_prompt`.
+
+3. `report.md` IS GONE, not kept alongside. `store.report_path()` now returns
+   the session's `log-summary.md`, falling back to a run's own `report.md` (or
+   the older `narrative.md`) when it exists, so `/run report` and the headless
+   result keep working on runs recorded before today.
+
+
+STILL FRAGMENTED — NOT TOUCHED, NEEDS A DECISION
+------------------------------------------------
+`shamsu/agents/simple_log.py` writes `.shamsu/chat-logs/<session>.md`: a
+FOURTH destination, holding the full prompt and raw response verbatim for
+simple mode. It overlaps `log-detailed.md` almost exactly. Folding it in means
+deleting a working, tested verbatim archive, which is a product call rather
+than a refactor. Left running; both files are written today.

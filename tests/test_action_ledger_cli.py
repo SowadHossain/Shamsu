@@ -184,7 +184,9 @@ def test_logs_command_points_at_human_report_and_the_detail_level(tmp_path: Path
     handle_logs("logs", tmp_path, console)
     output = output.getvalue()
 
-    assert "report.md" in output
+    assert "log-summary.md" in output
+    assert "log-detailed.md" in output
+    assert "attachments" in output
     assert "agent-development-log.jsonl" in output
     assert ".evidence" in output
     assert "essential" in output

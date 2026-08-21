@@ -443,11 +443,9 @@ def _build_result(
         "decisions": ledger_store.artifact_path(workspace, run_id, "decisions.jsonl"),
         "tool_calls": ledger_store.artifact_path(workspace, run_id, "tool-calls.jsonl"),
         "model_calls": ledger_store.artifact_path(workspace, run_id, "model-calls.jsonl"),
-        "mutations": ledger_store.artifact_path(
-            workspace, run_id, Path("mutations") / "mutations.jsonl"
-        ),
+        "mutations": ledger_store.mutations_path(workspace, run_id),
         "context_preview": ledger_store.artifact_path(workspace, run_id, "context-preview.json"),
-        "contexts": ledger_store.artifact_path(workspace, run_id, "contexts"),
+        "attachments": ledger_store.artifact_path(workspace, run_id, "attachments"),
         "final_output": ledger_store.artifact_path(workspace, run_id, "final-output.md"),
         "summary": ledger_store.artifact_path(workspace, run_id, "summary.json"),
     }
