@@ -45,3 +45,8 @@ Shamsu\agent context\PHASE2_PRD_EVAL_ARTIFACTS
 # Third-party sources kept locally for reference only. Never ours to publish:
 # separate projects, separate licences. Read them here, do not vendor them in.
 reference/
+
+# A notify hook writes its signal files using a literal Windows path as the
+# filename, so they land here rather than in ~/.claude/. Zero bytes, recreated
+# constantly, never ours to commit.
+*claude-notify-signals*

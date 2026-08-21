@@ -4,6 +4,63 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Changed - the terminal paints a turn instead of listing it (2026-08-21)
+
+Every action row was `[dim]{text}[/dim]`: one grey for a successful read and a
+failed `run_tests` alike, and a live 3B that called `contract_status` eight
+times was eight identical lines you had to count. The CLI renderer now paints:
+
+- An icon, a verb, the file and a duration per row, with failures in loud red
+  and the reason beside them.
+- A colourised diff snippet under a write, so you can see it did the right
+  thing without opening the file.
+- Reasoning traces dim and italic, indented, so they never compete with the
+  actions.
+- Approvals announced in yellow and answered in green or red.
+- A `SUCCESS` / `FAILED` badge closing the turn. The verdict was previously not
+  printed at all - a turn ended by scrolling off with no statement of whether
+  it had worked.
+- A run of identical calls collapsed to one row plus `x8`, held ACROSS the
+  model replies between them, which is the shape a real contract loop has.
+- A spinner that names the current action and carries the context meter and the
+  round budget: `read_file calc.py | ctx 68% (22.3k/32.8k) | rnd 4/24`. Both
+  numbers already existed and were shown nowhere; you found out you had filled
+  the window by watching the run degrade. The meter goes yellow at 60% and red
+  at 80%.
+
+There is no `rich.Live` layout and no pinned input box. `simple_feedback.py`
+reads raw keystrokes from the same terminal during a turn so a run can be
+steered mid-flight, and a display that owns and repaints the screen from
+another thread fights it. `console.status` coexists because it is transient.
+
+The renderer reads the turn stream, not the ActionLedger. The ledger is a disk
+writer whose every call site swallows exceptions, so a UI built on it turns a
+rendering bug into a blank screen; it also carries no status events, so the
+spinner would have no source. What the request behind that actually wanted -
+the terminal and `log-summary.md` never disagreeing - is now asserted by
+`test_the_terminal_the_phone_and_the_session_log_agree`, which runs one turn
+and checks all three surfaces report the same actions in the same order.
+
+### Added - four things the turn stream never carried (2026-08-21)
+
+You cannot render what nothing emits. `simple_chat.py` gained emit calls only,
+no change to loop logic:
+
+- `tool.result` now carries `duration_ms`, `target` and the unified `diff`.
+- A `reasoning` kind: the thinking channel reached the ledger but never the
+  stream, so no surface could show it.
+- `approval` events: the loop never published one. The question went straight
+  to its own Console from inside a tool, so every surface watching a turn saw a
+  gap where a human was being asked something - and on the terminal that is
+  exactly why the prompt and the spinner used to collide.
+- A status tick at the start of each tool and after each model call. Heartbeats
+  only fire every five seconds, so on a fast model the spinner said
+  "thinking..." straight through a file read and never named what it was doing.
+
+`reasoning` and `approval` are deliberately not body kinds: a trace belongs to
+the response that produced it and an approval to the write it gated, so neither
+is a separate action. The CLI renders both from `data`. Parity is untouched.
+
 ### Changed — the log is two Markdown files per session (2026-08-21)
 
 The readable log was nine places at once: one `report.md` per run, and beside

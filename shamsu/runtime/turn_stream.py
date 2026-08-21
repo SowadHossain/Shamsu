@@ -36,6 +36,7 @@ Kind = Literal[
     "tool.call",
     "tool.result",
     "approval",
+    "reasoning",
     "assistant",
     "turn.end",
     "error",
@@ -49,6 +50,7 @@ KINDS: frozenset[str] = frozenset(
         "tool.call",
         "tool.result",
         "approval",
+        "reasoning",
         "assistant",
         "turn.end",
         "error",
@@ -59,7 +61,16 @@ KINDS: frozenset[str] = frozenset(
 #: the next one replaces it anyway - but a missed `tool.call` or `turn.end`
 #: leaves a surface permanently out of step with what actually happened.
 NEVER_DROPPED: frozenset[str] = frozenset(
-    {"turn.start", "tool.call", "tool.result", "approval", "assistant", "turn.end", "error"}
+    {
+        "turn.start",
+        "tool.call",
+        "tool.result",
+        "approval",
+        "reasoning",
+        "assistant",
+        "turn.end",
+        "error",
+    }
 )
 
 #: What a full queue sheds, in order. Derived from `NEVER_DROPPED` rather than
@@ -79,6 +90,15 @@ def body_kinds(verbosity: str = "normal") -> frozenset[str]:
     the CLI and the phone is only meaningful if both are reading the same rule,
     and a test that compares two lists built from two different rules proves
     nothing.
+
+    A LINE is not the same thing as everything a surface shows. `tool.result`,
+    `approval` and `reasoning` are not body kinds at `normal`, and the CLI
+    renders all three anyway - by reading `data`, which is what `data` is for.
+    They are not lines because they are not separate ACTIONS: a result belongs
+    to the call above it, an approval belongs to the write it gated, and a
+    reasoning trace belongs to the response it produced. Making them lines
+    would print each action twice, which is the mistake `log-summary.md` was
+    already fixed for.
     """
     level = (verbosity or "normal").strip().lower()
     if level == "quiet":

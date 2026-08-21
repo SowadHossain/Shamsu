@@ -3,6 +3,28 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-21 - The CLI paints a turn instead of listing it
+Files edited: `shamsu/cli/turn_render.py` (overhauled), `shamsu/runtime/turn_stream.py`,
+`shamsu/agents/simple_chat.py` (emits only), `shamsu/cli/repl.py`, tests
+What changed: every action row used to be `[dim]{text}[/dim]` - one grey for a
+successful read and a failed `run_tests` alike. Rows now carry an icon, a verb,
+the file, a duration and a loud red FAILED; writes show a colourised diff
+snippet; reasoning renders dim and italic; approvals are announced and answered
+in yellow; the turn ends on a SUCCESS/FAILED badge, which was previously not
+printed at all. A run of identical calls collapses to one row plus `x8`, across
+the model replies between them - the shape a real contract loop has. The
+spinner names the current action and carries `ctx 68% (22.3k/32.8k) | rnd 4/24`,
+both numbers that already existed and were displayed nowhere. Driven from the
+turn stream, NOT the ActionLedger: the ledger swallows exceptions by design and
+has no status events, so a UI on it would go silently blank. The intent behind
+that request is kept as a three-way parity test instead. No `rich.Live`, no
+pinned input - `simple_feedback.py` reads raw keystrokes on the same terminal.
+Five defects were found by painting a turn to a real console, none of them
+visible to a unit test; the worst was that the collapse rule as first written
+would never have fired on the run it was written for.
+Tests: `tests/test_turn_stream_parity.py` 28 -> 44, full suite green.
+Log: logs/test-runs/2026-08-21-cli-rich-renderer.log
+
 ### 2026-08-21 - Logging: two Markdown files per session, replacing eight typed folders
 Files edited: `shamsu/ui/turnlog.py` (new, replaces `shamsu/ui/narrative.py`),
 `shamsu/action_ledger/{ledger,store}.py`, `shamsu/agents/simple_chat.py`,

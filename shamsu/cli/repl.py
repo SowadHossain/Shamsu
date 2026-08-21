@@ -5008,7 +5008,11 @@ def _status_updater(thinking_status: Any) -> Any:
         if prompt_is_active():
             return
         with contextlib.suppress(Exception):
-            thinking_status.update(f"[dim]{message}[/dim]")
+            # Passed through as-is. The renderer composes its own markup now -
+            # the context meter goes yellow at 60% and red at 80% - and
+            # wrapping the whole line in `[dim]` again would mute exactly the
+            # warning it is there to give.
+            thinking_status.update(message)
 
     return update
 

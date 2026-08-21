@@ -2144,6 +2144,9 @@ class SimpleChatLoop:
             # carries on its events.
             source=self.source,
         )
+        # Which round the turn is on, for the live meter. Read by `_status`.
+        self._round_index = 0
+        self._watch_approvals()
         self._num_ctx_floor = 0
         # Lowered from what the GPU will actually accept, once it has refused.
         self._num_ctx_ceiling = 0
@@ -2444,6 +2447,7 @@ class SimpleChatLoop:
         empty_nudges = 0
         promise_nudges = 0
         for round_index in range(self.max_rounds):
+            self._round_index = round_index
             # Before the model is called, never during: a message appended
             # while a tool call is in flight lands between the assistant turn
             # and its own result and orphans the tool_call_id.
@@ -3074,6 +3078,11 @@ class SimpleChatLoop:
             beat.cancel()
             self._activity(f"model responded in {time.perf_counter() - started:.0f}s")
         self._record_usage(raw, self._estimate_prompt(messages))
+        # The usage numbers only exist once a call has come back, and the meter
+        # rides on status events. Without a tick here a fast model never
+        # produces one, and the context meter stays blank on exactly the
+        # machines where a turn is cheap enough to run many rounds.
+        self._status("thinking...")
         self._ledger_model_finished(ledger_call_id, raw, "")
         if self.turn_log:
             self.turn_log.log_response(raw, time.perf_counter() - started)
@@ -3187,6 +3196,10 @@ class SimpleChatLoop:
             thinking = str(_response_field(message, "thinking") or "")
             content = str(_response_field(message, "content") or "")
             if thinking:
+                # Not a body line: a trace belongs to the response it produced,
+                # so a surface renders it inside that entry rather than as its
+                # own step. See `body_kinds`.
+                self._publish("reasoning", _first_line(thinking), text_full=thinking)
                 self.action_ledger.log_model_thinking(
                     call_id, "coder", self.model_name, thinking
                 )
@@ -3924,10 +3937,16 @@ class SimpleChatLoop:
                 arguments=_publishable_arguments(arguments),
             )
             self._trace("simple.tool", f"{name} {summary}", {"tool": name})
+            tool_started = time.perf_counter()
             # A tool can block for as long as its timeout allows - `run_command`
             # defaults to 120s, and a server started in the foreground will use
             # every second of it. Without a tick that is two minutes of silence
             # immediately AFTER an approval prompt, which reads as a hang.
+            # Immediately, not after the first heartbeat. A heartbeat only
+            # ticks every HEARTBEAT_SECONDS, and most tools finish inside that
+            # - so the spinner said "thinking..." right through a file read and
+            # never once named the thing it was doing.
+            self._status(f"{name} {summary}".strip())
             beat = asyncio.ensure_future(self._heartbeat(f"running {name}..."))
             # The session log is built from the ledger, on the documented
             # promise that every execution path records its tools there. Simple
@@ -3951,6 +3970,14 @@ class SimpleChatLoop:
                 tool=name,
                 ok=bool(result.ok),
                 message=_first_line(result.message),
+                # The three fields a terminal needs and could not previously
+                # get: how long it took, what it was pointed at, and - for a
+                # write - what actually changed. Without the diff here the CLI
+                # would have to re-read the file to show one, which is both
+                # slow and a lie, because the file may have moved on.
+                duration_ms=(time.perf_counter() - tool_started) * 1000,
+                target=_argument_summary(arguments),
+                diff=_diff_of(result),
             )
             self._trust.record(name, bool(result.ok))
             if not result.ok:
@@ -6347,12 +6374,87 @@ class SimpleChatLoop:
         self._publish(kind, message, **data)
 
     def _status(self, message: str) -> None:
+        """A transient tick. Carries the meter, because the meter is only ever
+        interesting WHILE something is running.
+
+        `ctx` and `round` ride on every status event rather than being fetched
+        by the renderer: a renderer that reaches back into the loop is a
+        renderer that cannot run on a phone, and these two numbers are the
+        whole reason anyone watches the spinner. Both already existed and were
+        displayed nowhere - you found out you had filled the window by watching
+        the run degrade.
+        """
         if self.on_status:
             try:
                 self.on_status(message)
             except Exception:
                 pass
-        self._publish("status", message)
+        self._publish("status", message, **self._meter_fields())
+
+    def _watch_approvals(self) -> None:
+        """Announce an approval on the turn stream, around the real prompt.
+
+        The loop never emitted `approval` at all - the question went straight
+        to its own Console from deep inside a tool, so every surface watching
+        the turn saw a gap where a human was being asked something. On the
+        terminal that is why the spinner and the prompt fight: nothing told the
+        display to stand down.
+
+        Wrapping rather than threading a callback down through the registry:
+        the decision is made by whatever function the tools were handed, and
+        wrapping it is the only place that sees both the question and the
+        answer without every tool having to cooperate.
+        """
+        original = getattr(self.tools, "approval_func", None)
+        if not callable(original) or getattr(original, "_shamsu_watched", False):
+            return
+
+        def watched(request: Any) -> bool:
+            action = str(getattr(request, "action_type", "") or "action")
+            targets = list(getattr(request, "target_paths", None) or [])
+            self._publish(
+                "approval",
+                f"approval needed: {action}",
+                phase="requested",
+                action_type=action,
+                target=targets[0] if targets else "",
+                risk=str(getattr(request, "risk_level", "") or ""),
+                description=str(getattr(request, "description", "") or ""),
+                preview=str(getattr(request, "preview", "") or ""),
+            )
+            approved = False
+            try:
+                approved = bool(original(request))
+                return approved
+            finally:
+                self._publish(
+                    "approval",
+                    f"approval {'granted' if approved else 'denied'}: {action}",
+                    phase="resolved",
+                    action_type=action,
+                    target=targets[0] if targets else "",
+                    approved=approved,
+                )
+
+        watched._shamsu_watched = True  # type: ignore[attr-defined]
+        try:
+            self.tools.approval_func = watched
+        except Exception:
+            pass
+
+    def _meter_fields(self) -> dict[str, Any]:
+        """The live numbers, best-effort. Never the reason a tick is lost."""
+        fields: dict[str, Any] = {
+            "round": self._round_index + 1,
+            "max_rounds": self.max_rounds,
+        }
+        try:
+            if SESSION_COUNTERS.last_window and SESSION_COUNTERS.last_prompt_tokens:
+                fields["ctx_pct"] = SESSION_COUNTERS.pct
+                fields["ctx_text"] = SESSION_COUNTERS.meter()
+        except Exception:
+            pass
+        return fields
 
     async def _heartbeat(self, label: str) -> None:
         """Tick a live status while a model call is in flight, until cancelled."""
@@ -6705,6 +6807,21 @@ def _strip_line_numbers(arguments: dict[str, Any]) -> dict[str, Any]:
             continue
         cleaned[key] = _NUMBERED_LINE.sub("", value)
     return cleaned
+
+
+def _diff_of(result: ToolResult) -> str:
+    """The unified diff a write produced, or "" - for a terminal to colourize.
+
+    `_with_diff` already builds one and appends it to the message under a
+    "What changed:" heading, so this recovers it rather than diffing again: the
+    file has moved on by now, and a second diff would be of the wrong pair.
+    """
+    message = str(getattr(result, "message", "") or "")
+    marker = "What changed:"
+    if marker not in message:
+        return ""
+    body = message.split(marker, 1)[1].strip("\n")
+    return body if body.strip() else ""
 
 
 def _argument_summary(arguments: dict[str, Any]) -> str:
