@@ -4,6 +4,50 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Fixed - the harness poisoned the model's own patches (2026-08-22)
+
+`_shorten_arguments` shortened long values in the model's past tool calls to 80
+characters plus a ` ...[elided]` marker. A `patch_file` `old_string` is always
+longer than the 100-char threshold, so every past patch was shown back to the
+model as a stub - and the model retried by copying that stub, marker included.
+`patch_file` could only answer "old_string not found", which reads as a stale
+copy, so it retried the same text again. Live on qwen3.5:9b that was the same
+function attempted three times and half of all patch failures in the session.
+
+Content arguments - `old_string`, `new_string`, `content`, `body`, `text` - are
+now dropped rather than trimmed. The keys stay, so a call still reads as
+`patch_file(filepath=js/PlayerShip.js, old_string=<omitted...>)` rather than a
+hole in the history; it is the values that had to go, because a trimmed value
+still reads like the code it came from and a missing one cannot be copied.
+Everything else that is merely long is still trimmed: a path cut mid-way is
+obviously truncated and nobody tries to use it.
+
+`edit_file` also refuses an incoming `old_string` or `new_string` carrying
+either marker - the new one, or the legacy ` ...[elided]` still present in
+transcripts written before this fix - and says to call `read_file` rather than
+returning "not found", because the two answers send the model to different
+places.
+
+### Fixed - context telemetry belonged to the process, not the conversation (2026-08-22)
+
+`SESSION_COUNTERS` was a module-level global. Its own docstring said "per
+session"; it was per process, so `/sessions resume` into a second thread kept
+reporting the first thread's numbers as if they were the new one's - silently.
+It is now keyed by session id, with an explicit active pointer set when a turn
+starts and when the user switches threads, which makes the contamination
+structurally impossible rather than something the REPL has to remember.
+
+`/context meter` on a resumed conversation now estimates from the transcript on
+disk instead of reporting "no model calls yet", which was true about the process
+and useless about the thread. It reports the ratio rather than a percentage: an
+archive larger than the window is normal, and "505% full" would be alarming and
+wrong, while "this thread is 5.1x the window" is the diagnosis.
+
+`/context status` showed a model's own context window - 256k for the 9B - beside
+a turn that was running in 32k and degrading, with nothing explaining the gap.
+It now shows the window actually used, the model's capability beside it, and why
+the cap exists.
+
 ### Security - prompts were written to disk unredacted (2026-08-21)
 
 `shamsu/agents/simple_log.py` wrote the exact prompt, system message included,

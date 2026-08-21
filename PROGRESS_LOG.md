@@ -3,6 +3,28 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-22 - The model was copying our own elision marker into its patches
+Files edited: `shamsu/agents/simple_chat.py`, `shamsu/tools/agent_tools.py`,
+`shamsu/cli/repl.py`, tests
+What changed: diagnosed a reported collapse on qwen3.5:9b. Not context pressure -
+`_shorten_arguments` cut any argument over 100 chars to 80 chars plus
+" ...[elided]", and applied that to the model's own past `patch_file` calls,
+whose `old_string` is always longer than that. The model retried by copying the
+stub out of its own history, marker and all, and the tool could only answer
+"old_string not found" - the same function attempted three times, the third
+carrying our marker as if it were code. Content arguments are now DROPPED rather
+than trimmed (the keys stay, so the call still reads as an action), and
+`edit_file` refuses an incoming argument carrying either marker with a message
+that sends the model to `read_file` instead of to another identical retry.
+Also fixed the telemetry behind the same report: `SESSION_COUNTERS` was a
+module-level global whose docstring claimed "per session", so resuming a thread
+reported the previous thread's numbers as its own. Now keyed by session id with
+an explicit active pointer. `/context meter` estimates from the transcript on a
+cold resume, and `/context status` no longer advertises 256k for a model running
+in a 32k window.
+Tests: +14 in `tests/test_simple_chat.py`, full suite 3546 passed.
+Log: logs/test-runs/2026-08-22-elision-poisoning-and-telemetry.log
+
 ### 2026-08-21 - SECURITY: unredacted prompts on disk; chat-logs/ removed
 Files edited: `shamsu/agents/simple_log.py` (deleted), `shamsu/agents/simple_chat.py`
 (20 call sites), `shamsu/action_ledger/ledger.py`, `shamsu/ui/turnlog.py`,

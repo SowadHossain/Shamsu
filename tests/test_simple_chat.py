@@ -8992,3 +8992,248 @@ def test_the_only_definition_of_a_symbol_cannot_be_deleted_by_name(tmp_path):
 
     assert not result.ok
     assert "function only" in (tmp_path / "a.js").read_text(encoding="utf-8")
+
+
+# -- the elision poisoning, and the guard against it ------------------------
+#
+# Live 2026-08-21, session 20260820-055706-f20c: a 9B lost half its patches to
+# a string-truncation bug. `_shorten_arguments` cut any argument over 100 chars
+# to 80 chars plus " ...[elided]", and it applied that to the model's OWN past
+# `patch_file` calls - whose `old_string` is always over 100 chars. The model
+# retried by copying the stub out of its own history, marker and all, and
+# `patch_file` could only answer "old_string not found".
+
+
+def test_a_content_argument_is_dropped_not_trimmed():
+    """A trimmed value still reads like the code it came from. A missing one
+    cannot be copied at all."""
+    from shamsu.agents.simple_chat import _shorten_arguments
+    from shamsu.tools.agent_tools import ELIDED_VALUE
+
+    call = [
+        {
+            "function": {
+                "name": "patch_file",
+                "arguments": {
+                    "filepath": "js/PlayerShip.js",
+                    "old_string": "function fireWeapon() {\n" + "    // body\n" * 40,
+                    "new_string": "function fireWeapon() {\n" + "    // fixed\n" * 40,
+                },
+            }
+        }
+    ]
+    arguments = _shorten_arguments(call)[0]["function"]["arguments"]
+
+    assert arguments["old_string"] == ELIDED_VALUE
+    assert arguments["new_string"] == ELIDED_VALUE
+    # ...and the call still says what it was, which is why the keys stay.
+    assert arguments["filepath"] == "js/PlayerShip.js"
+    # No fragment of the real text survives to be copied.
+    assert "fireWeapon" not in arguments["old_string"]
+
+
+def test_a_non_content_argument_is_still_only_trimmed():
+    """A path or a command cut mid-way is obviously truncated and nobody tries
+    to run it. Only content keys have to disappear."""
+    from shamsu.agents.simple_chat import _shorten_arguments
+
+    call = [{"function": {"name": "run_command", "arguments": {"command": "npm " + "x" * 300}}}]
+    arguments = _shorten_arguments(call)[0]["function"]["arguments"]
+
+    assert arguments["command"].startswith("npm ")
+    assert len(arguments["command"]) < 300
+
+
+def test_a_short_content_argument_is_left_alone():
+    from shamsu.agents.simple_chat import _shorten_arguments
+
+    call = [{"function": {"name": "patch_file", "arguments": {"old_string": "return 1;"}}}]
+    arguments = _shorten_arguments(call)[0]["function"]["arguments"]
+    assert arguments["old_string"] == "return 1;"
+
+
+def test_patch_file_refuses_the_marker_it_wrote_itself(tmp_path):
+    """The exact string from the reported session, line 2873 of its log."""
+    from shamsu.tools.agent_tools import AgentToolRegistry
+
+    (tmp_path / "ship.js").write_text(
+        "class PlayerShip {\n    fireWeapon() {\n        return true;\n    }\n}\n",
+        encoding="utf-8",
+    )
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+
+    poisoned = (
+        "    /**\n     * Fire weapon - create projectile at ship position "
+        "moving forward\n  ...[elided]"
+    )
+    result = tools.edit_file(
+        filepath="ship.js", old_string=poisoned, new_string="whatever"
+    )
+
+    assert not result.ok
+    assert (result.data or {}).get("elided_argument") == "old_string"
+    # The message has to send it somewhere different from "not found", which it
+    # answered by retrying the same text three times.
+    assert "read_file" in result.message
+    assert "history" in result.message
+    # The file was not touched.
+    assert "return true;" in (tmp_path / "ship.js").read_text(encoding="utf-8")
+
+
+def test_patch_file_refuses_the_new_marker_too(tmp_path):
+    from shamsu.tools.agent_tools import ELIDED_VALUE, AgentToolRegistry
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+
+    result = tools.edit_file(filepath="a.py", old_string="x = 1", new_string=ELIDED_VALUE)
+    assert not result.ok
+    assert (result.data or {}).get("elided_argument") == "new_string"
+
+
+def test_a_genuine_edit_still_applies(tmp_path):
+    """The guard must not cost a correct patch."""
+    from shamsu.tools.agent_tools import AgentToolRegistry
+
+    (tmp_path / "a.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+
+    result = tools.edit_file(
+        filepath="a.py", old_string="    return 1", new_string="    return 2"
+    )
+    assert result.ok, result.message
+    assert "return 2" in (tmp_path / "a.py").read_text(encoding="utf-8")
+
+
+def test_the_round_trip_that_used_to_poison_a_patch(tmp_path):
+    """The whole loop, end to end: a past patch is elided into the history, the
+    model copies it back, and the tool refuses it rather than reporting the
+    unhelpful 'not found' that caused three identical retries."""
+    from shamsu.agents.simple_chat import _shorten_arguments
+    from shamsu.tools.agent_tools import AgentToolRegistry
+
+    (tmp_path / "ship.js").write_text("function fire() {\n  return 1;\n}\n", encoding="utf-8")
+    original = "function fire() {\n" + "  // a long body\n" * 30 + "  return 1;\n}"
+
+    # The model's earlier call, aged out into the history.
+    aged = _shorten_arguments(
+        [{"function": {"name": "patch_file", "arguments": {"old_string": original}}}]
+    )[0]["function"]["arguments"]["old_string"]
+
+    # The model retries with what it can now see.
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+    result = tools.edit_file(filepath="ship.js", old_string=aged, new_string="x")
+
+    assert not result.ok
+    assert "old_string not found" not in result.message
+    assert "read_file" in result.message
+
+
+# -- counters follow the conversation, not the process ----------------------
+
+
+def test_counters_do_not_leak_between_sessions():
+    """Live 2026-08-21: `/sessions resume` into a second thread and the meter
+    kept reporting the first thread's numbers as if they were the new one's."""
+    from shamsu.agents.simple_chat import (
+        SESSION_COUNTERS,
+        counters_for,
+        set_active_session,
+    )
+
+    counters_for("sess-A").calls = 0
+    counters_for("sess-B").calls = 0
+
+    set_active_session("sess-A")
+    SESSION_COUNTERS.calls += 7
+    SESSION_COUNTERS.last_prompt_tokens = 23_300
+    assert SESSION_COUNTERS.calls == 7
+
+    set_active_session("sess-B")
+    assert SESSION_COUNTERS.calls == 0, "session B inherited session A's numbers"
+    assert SESSION_COUNTERS.last_prompt_tokens == 0
+
+    set_active_session("sess-A")
+    assert SESSION_COUNTERS.calls == 7, "session A's numbers were lost"
+
+
+def test_resuming_a_session_repoints_the_counters():
+    from shamsu.agents.simple_chat import active_session_id
+    from shamsu.cli.repl import _point_counters_at
+
+    _point_counters_at("sess-C")
+    assert active_session_id() == "sess-C"
+
+
+def test_the_meter_answers_from_the_transcript_on_a_cold_resume(tmp_path):
+    """A resumed thread has a real answer before it has made a single call: the
+    messages that will be sent already exist on disk."""
+    import json
+
+    from shamsu.agents.simple_chat import set_active_session
+    from shamsu.cli.repl import _resumed_context_estimate
+
+    session = tmp_path / ".shamsu" / "sessions" / "sess-D"
+    session.mkdir(parents=True)
+    (session / "messages.jsonl").write_text(
+        "\n".join(
+            json.dumps({"role": "user", "content": "x" * 4000}) for _ in range(200)
+        ),
+        encoding="utf-8",
+    )
+    set_active_session("sess-D")
+
+    text = _resumed_context_estimate(tmp_path)
+    assert "No model calls yet" in text
+    assert "200 messages" in text
+    # A thread far larger than the window says so, and says what follows from
+    # it - NOT as a percentage, because an archive bigger than the window is
+    # normal and "505% full" would be alarming and wrong.
+    assert "x the window" in text
+    assert "%" not in text
+
+
+def test_the_meter_says_so_when_the_thread_fits(tmp_path):
+    import json
+
+    from shamsu.agents.simple_chat import set_active_session
+    from shamsu.cli.repl import _resumed_context_estimate
+
+    session = tmp_path / ".shamsu" / "sessions" / "sess-E"
+    session.mkdir(parents=True)
+    (session / "messages.jsonl").write_text(
+        json.dumps({"role": "user", "content": "hello"}) + "\n", encoding="utf-8"
+    )
+    set_active_session("sess-E")
+
+    text = _resumed_context_estimate(tmp_path)
+    assert "fits in the window" in text
+    assert "x the window" not in text
+
+
+def test_the_meter_survives_a_session_with_no_transcript(tmp_path):
+    from shamsu.agents.simple_chat import set_active_session
+    from shamsu.cli.repl import _resumed_context_estimate
+
+    set_active_session("sess-missing")
+    assert "no transcript" in _resumed_context_estimate(tmp_path)
+
+    set_active_session("")
+    assert "No conversation open" in _resumed_context_estimate(tmp_path)
+
+
+def test_context_status_shows_the_window_actually_used(tmp_path):
+    """A 9B advertising 'ctx 256k' sat directly above a turn running in 32k and
+    degrading, and nothing on screen explained the gap."""
+    from rich.console import Console
+
+    from shamsu.cli.repl import _handle_context
+
+    console = Console(record=True, width=120)
+    _handle_context("/context status", tmp_path, console)
+    printed = console.export_text()
+
+    assert "capped" in printed
+    assert "32k" in printed
+    assert "256k" in printed, "the model's real capability is still shown"
+    assert "KV cache" in printed, "and why the cap exists"

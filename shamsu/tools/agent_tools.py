@@ -12,6 +12,38 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
+
+# -- the history-elision contract ------------------------------------------
+#
+# An old tool call in the transcript keeps its keys but loses any value that is
+# file content, because a SHORTENED value still reads like the code it came
+# from. Live 2026-08-21 a 9B lost half its patches to exactly that: it retried
+# by copying `old_string` out of its own history, marker and all, and the patch
+# could only answer "old_string not found".
+#
+# Defined here rather than in the chat loop because this is the end that has to
+# refuse. The loop produces these; `patch_file` is what must never accept one.
+
+#: What a dropped content value is replaced with in the history.
+ELIDED_VALUE = "<omitted from history - call read_file for the current text>"
+
+#: The marker the older shortening appended. Still recognised, because
+#: transcripts written before this fix are on disk and still resume.
+LEGACY_ELISION_MARKER = "...[elided]"
+
+
+def looks_elided(value: str) -> bool:
+    """True when *value* is a fragment of history rather than real content.
+
+    Checked on the way IN, not only on the way out. The harness cannot be the
+    only thing that ever produces one of these: a model that has seen the
+    marker often enough writes it itself, and an old transcript still carries
+    the legacy form.
+    """
+    text = str(value or "")
+    return ELIDED_VALUE in text or LEGACY_ELISION_MARKER in text
+
+
 from shamsu.indexer.policy import walk_workspace_files
 from shamsu.mcp.manager import MCPManager, get_shared_mcp_manager, summarize_mcp_result
 from shamsu.patch.transactions import TransactionWorkspace
@@ -2049,6 +2081,20 @@ class AgentToolRegistry:
                 "Missing old_string. Provide the exact text to replace (use write_file to create a new file).",
                 {"filepath": normalized, "candidates": []},
             )
+        for label, value in (("old_string", old_string), ("new_string", new_string)):
+            if looks_elided(value):
+                # Caught here rather than left to fail as "not found". The two
+                # answers send the model to different places: "not found" reads
+                # as a stale copy and it retries with the same text, while this
+                # says the text itself is the problem and re-reading is the fix.
+                return ToolResult(
+                    False,
+                    f"{label} is a fragment of the conversation history, not file "
+                    f"text - it still carries the marker this harness puts in "
+                    f"place of an old payload. Call read_file on {normalized} and "
+                    f"copy the text from the result, not from your earlier message.",
+                    {"filepath": normalized, "candidates": [], "elided_argument": label},
+                )
         try:
             target = self.sandbox.validate(normalized)
         except SecurityError as exc:

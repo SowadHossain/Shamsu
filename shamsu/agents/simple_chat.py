@@ -84,7 +84,13 @@ from shamsu.llm.output import parse_model_turn
 from shamsu.runtime.models import model_for_role, model_is_reasoning
 from shamsu.runtime.turn_stream import TurnEvent
 from shamsu.session.manager import ORIGIN_LOOP, SessionLogger
-from shamsu.tools.agent_tools import MAX_READ_CHARS, AgentToolRegistry
+from shamsu.tools.agent_tools import (
+    ELIDED_VALUE,
+    LEGACY_ELISION_MARKER,
+    MAX_READ_CHARS,
+    AgentToolRegistry,
+    looks_elided,
+)
 from shamsu.types import CommandRisk, ToolResult
 
 # Bounded so a confused model cannot loop forever. Generous, because each round
@@ -226,6 +232,22 @@ MIN_VERBATIM_MESSAGES = 4
 # than a hole where a call used to be.
 MAX_OLD_ARGUMENT_CHARS = 100
 OLD_ARGUMENT_KEEP_CHARS = 80
+
+# Argument keys whose VALUE is file content the model might send back verbatim.
+#
+# These are dropped from an old call rather than shortened. Live 2026-08-21 a
+# 9B lost half its patches to the difference: a truncated `old_string` reads
+# like the text it was, so the model retried by copying it out of its own
+# history - including the ` ...[elided]` the harness had appended - and
+# `patch_file` could only answer "old_string not found". Three attempts at the
+# same function, the third one carrying our own marker as if it were code.
+#
+# A shortened value invites that. A missing one cannot be copied at all.
+CONTENT_ARGUMENT_KEYS = frozenset({"old_string", "new_string", "content", "body", "text"})
+
+#: `ELIDED_VALUE`, `LEGACY_ELISION_MARKER` and `looks_elided` come from
+#: `shamsu.tools.agent_tools`: the loop produces these and `patch_file` refuses
+#: them, and the refusing end owns the definition.
 
 # Tools whose result can be fetched again exactly. Eliding these is lossless:
 # the file is still on disk, the listing can be re-listed, the search re-run.
@@ -1960,9 +1982,70 @@ class ContextCounters:
         )
 
 
-# Process-wide, because a fresh SimpleChatLoop is built per user message while
-# the REPL that reports these numbers lives for the whole session.
-SESSION_COUNTERS = ContextCounters()
+# One set of counters per CONVERSATION, not per process.
+#
+# This was a single module-level object, on the reasoning that a fresh
+# SimpleChatLoop is built per user message while the REPL lives for the whole
+# session. That is an argument against per-LOOP; it is not an argument for
+# per-PROCESS, and per-process is what it meant in practice. Live 2026-08-21:
+# `/sessions resume` into a second conversation and the meter kept reporting
+# the first one's numbers as if they belonged to the new thread. Silently -
+# the object's own docstring says "per session" and it was not.
+#
+# Keyed, so contaminating one session with another's numbers is now structurally
+# impossible rather than something the REPL has to remember not to do.
+_COUNTERS_BY_SESSION: dict[str, ContextCounters] = {}
+
+#: Which conversation the bare readers (`/context meter`, the web status
+#: endpoint) are asking about. Set by the loop when a turn starts, and by the
+#: REPL when the user switches threads - the switch is the moment the old
+#: numbers stop being an answer to the question being asked.
+_ACTIVE_SESSION = ""
+
+
+def counters_for(session_id: str) -> ContextCounters:
+    """The counters for one conversation, created on first use."""
+    key = str(session_id or "")
+    counters = _COUNTERS_BY_SESSION.get(key)
+    if counters is None:
+        counters = ContextCounters()
+        _COUNTERS_BY_SESSION[key] = counters
+    return counters
+
+
+def set_active_session(session_id: str) -> None:
+    """Point the bare readers at *session_id*."""
+    global _ACTIVE_SESSION
+    _ACTIVE_SESSION = str(session_id or "")
+
+
+def active_session_id() -> str:
+    """Which conversation the bare readers are reporting on."""
+    return _ACTIVE_SESSION
+
+
+def active_counters() -> ContextCounters:
+    """The counters for whichever conversation is in front of the user."""
+    return counters_for(_ACTIVE_SESSION)
+
+
+class _ActiveCounters:
+    """`SESSION_COUNTERS.x` reads the ACTIVE session's counters.
+
+    A proxy rather than a rename because three surfaces read this name and none
+    of them have a session id in scope at the point of reading. The proxy keeps
+    those call sites honest without each having to learn how to find the
+    conversation they are already looking at.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(active_counters(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(active_counters(), name, value)
+
+
+SESSION_COUNTERS = _ActiveCounters()
 
 # The most recent per-category split, for `/context meter`. A dict rather than
 # a bare global so the REPL reads whatever the last loop actually built.
@@ -2141,6 +2224,8 @@ class SimpleChatLoop:
         )
         # Which round the turn is on, for the live meter. Read by `_status`.
         self._round_index = 0
+        # Counters follow the conversation, not the process.
+        set_active_session(str(getattr(session_logger, "session_id", "") or ""))
         self._watch_approvals()
         self._num_ctx_floor = 0
         # Lowered from what the GPU will actually accept, once it has refused.
@@ -7342,6 +7427,23 @@ def asks_only_for_words(request: str) -> bool:
     return names(_WORDS_VERBS) and not names(_CHANGE_VERBS)
 
 
+def _shortened_value(key: str, value: Any) -> Any:
+    """One argument value, small enough to keep and safe to keep.
+
+    Content keys are REPLACED, not trimmed. Everything else that is merely long
+    is trimmed as before - a path or a command shortened mid-way is obviously
+    truncated and nobody tries to run it, while a shortened `old_string` looks
+    exactly like the code it came from.
+    """
+    if not isinstance(value, str):
+        return value
+    if key in CONTENT_ARGUMENT_KEYS and len(value) > MAX_OLD_ARGUMENT_CHARS:
+        return ELIDED_VALUE
+    if len(value) > MAX_OLD_ARGUMENT_CHARS:
+        return value[:OLD_ARGUMENT_KEEP_CHARS] + " " + LEGACY_ELISION_MARKER
+    return value
+
+
 def _shorten_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Shrink long argument VALUES in an old tool call, keeping every key.
 
@@ -7349,6 +7451,9 @@ def _shorten_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]
     asked to write - but it does still need to see that it wrote that file.
     Keeping the keys means the call still reads as
     `write_file(filepath=frontend/game.js)` instead of a hole in the history.
+
+    What it must NOT do is leave behind something that still reads as content.
+    See `CONTENT_ARGUMENT_KEYS`.
     """
     shortened: list[dict[str, Any]] = []
     for call in tool_calls:
@@ -7361,12 +7466,7 @@ def _shorten_arguments(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]
                 arguments = {}
         if isinstance(arguments, dict):
             function["arguments"] = {
-                key: (
-                    value[:OLD_ARGUMENT_KEEP_CHARS] + " ...[elided]"
-                    if isinstance(value, str) and len(value) > MAX_OLD_ARGUMENT_CHARS
-                    else value
-                )
-                for key, value in arguments.items()
+                key: _shortened_value(key, value) for key, value in arguments.items()
             }
         updated = dict(call) if isinstance(call, dict) else {}
         updated["function"] = function

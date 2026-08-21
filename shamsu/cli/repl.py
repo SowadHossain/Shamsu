@@ -3722,13 +3722,35 @@ def _handle_context(
     mgr = _get_budget_manager(workspace, console)
 
     if sub == "status":
+        from shamsu.agents.simple_chat import max_ctx
+
         tier = active_tier()
+        cap = max_ctx()
         rows: list[str] = [f"Active tier: {tier.value}", ""]
         for spec in tier_model_specs(tier):
             ctx = MODEL_CONTEXT_WINDOWS.get(spec.name, SAFE_FALLBACK_CTX_WINDOW)
+            # What the MODEL can do, and what it is actually asked for. Showing
+            # only the first read as a promise: a 9B advertising "ctx 256k" sat
+            # directly above a turn that was running in 32k and degrading, and
+            # nothing on screen explained the gap.
+            used = min(ctx, cap)
+            window = f"ctx {used // 1024}k"
+            if used < ctx:
+                window += f" [dim](of {ctx // 1024}k, capped)[/dim]"
             rows.append(
-                f"  {spec.name:<35}  ctx {ctx // 1024}k  roles: {', '.join(spec.roles[:4])}"
+                f"  {spec.name:<35}  {window}  roles: {', '.join(spec.roles[:4])}"
             )
+        rows.append("")
+        rows.append(
+            f"[dim]Chat runs at most {cap // 1024}k however large the model's own window is."
+        )
+        rows.append(
+            "Ollama reserves the KV cache for the WHOLE num_ctx up front, so the window"
+        )
+        rows.append(
+            "is VRAM you have already spent - measured on an 8GB card, 32k fits on the"
+        )
+        rows.append("GPU with a q8_0 cache and f16 does not.[/dim]")
         rows.append("")
         calib = mgr._calibration
         if calib:
@@ -3743,7 +3765,11 @@ def _handle_context(
         from shamsu.agents.simple_chat import SESSION_COUNTERS as counters
 
         if not counters.calls:
-            console.print("[dim]No model calls yet this session.[/dim]")
+            # A resumed conversation has a real answer to this question before
+            # it has made a single call: the transcript that is about to be
+            # sent already exists on disk. Reporting "no calls yet" was true
+            # about the process and useless about the thread.
+            console.print(_resumed_context_estimate(workspace))
             return
         drift = (
             f"{counters.last_prompt_tokens / counters.last_estimate:.2f}x"
@@ -4207,6 +4233,10 @@ def _handle_sessions(
             return current
         if command == "resume" and len(parts) >= 3:
             resumed = manager.resume_session(parts[2])
+            # The moment the thread changes, the old thread's numbers stop
+            # being an answer to "how full is my context?". Before this, they
+            # kept being reported against the new one.
+            _point_counters_at(resumed.session_id)
             console.print(f"[green]Resumed session {resumed.session_id}[/green]")
             return resumed
         if command == "rename" and len(parts) >= 4:
@@ -4993,6 +5023,82 @@ def _pending_plan_instruction(pending_action: dict[str, Any], *, skip: int = 0) 
         f"{lead}\n\nWork through these steps in order, one at a time. After each "
         f"one, check it works and say what you finished:\n{listed}"
     )
+
+
+def _point_counters_at(session_id: str) -> None:
+    """Best-effort: a decorative counter must never break a session switch."""
+    try:
+        from shamsu.agents.simple_chat import set_active_session
+
+        set_active_session(session_id)
+    except Exception:
+        pass
+
+
+def _resumed_context_estimate(workspace: Path) -> str:
+    """What this conversation weighs, measured from the transcript on disk.
+
+    A resumed thread has a real answer to "how full is my context?" before it
+    has made a single call, because the messages that will be sent already
+    exist. Reporting "no model calls yet" was true about the PROCESS and
+    useless about the thread.
+
+    Deliberately NOT rendered as a percentage of the window. The archive is
+    routinely larger than the window and that is normal - `select_for_budget`
+    carries the most recent messages that fit and elides the rest - so a
+    "505% full" gauge would be alarming and wrong. What is worth saying is the
+    ratio: a thread several times the window is one where most of every prompt
+    is spent re-sending history, which is the condition elision fires under.
+    """
+    from shamsu.agents.simple_chat import active_session_id, max_ctx
+
+    # The same pointer the counters follow, so the estimate and the measurement
+    # can never be about different conversations.
+    session_id = active_session_id()
+    if not session_id:
+        return "[dim]No conversation open.[/dim]"
+    path = Path(workspace) / ".shamsu" / "sessions" / session_id / "messages.jsonl"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "[dim]No model calls yet, and no transcript to estimate from.[/dim]"
+    messages = [line for line in text.splitlines() if line.strip()]
+    if not messages:
+        return "[dim]No model calls yet in this conversation.[/dim]"
+    try:
+        from shamsu.context.budget import count_tokens
+
+        tokens = count_tokens("\n".join(messages))
+    except Exception:
+        # ~4 chars per token, the same fallback the budget module uses.
+        tokens = sum(len(line) for line in messages) // 4
+    window = max_ctx()
+    lines = [
+        "[dim]No model calls yet in this process - estimated from the "
+        "transcript rather than measured:[/dim]",
+        "",
+        f"  thread on disk : {len(messages):,} messages, ~{tokens:,} tokens",
+        f"  window         : {window:,} tokens",
+    ]
+    if window and tokens > window:
+        over = tokens / window
+        colour = "red" if over >= 3 else "yellow"
+        lines += [
+            "",
+            f"  [{colour}]This thread is {over:.1f}x the window.[/{colour}] Only the most "
+            "recent messages that fit",
+            "  are sent; the rest are elided every call. A thread several times the",
+            "  window spends most of each prompt re-sending history.",
+            "  [dim]`/new` starts a fresh one and keeps the project memory.[/dim]",
+        ]
+    else:
+        lines += ["", "  [green]The whole thread fits in the window.[/green]"]
+    lines += [
+        "",
+        "[dim]Real numbers replace these after the first model call - only "
+        "Ollama can measure a prompt.[/dim]",
+    ]
+    return "\n".join(lines)
 
 
 def _status_updater(thinking_status: Any) -> Any:
