@@ -353,18 +353,28 @@ def test_verbose_detail_carries_prompt_context_and_command_output(tmp_path: Path
     assert "stderr" in detail and "one failed" in detail
 
 
-def test_essential_detail_keeps_the_answer_and_drops_the_prompt(tmp_path: Path):
-    """The two levels still differ, but the line moved.
+def test_essential_keeps_the_record_and_verbose_adds_the_context_pack(tmp_path: Path):
+    """Where the line between the two levels sits, and why it moved twice.
 
-    With one document, `essential` had to withhold the model's own words to stay
-    readable. With two, the summary stays skimmable on its own, so the response
-    and the reasoning trace - the two things you actually debug a small model
-    with - are kept at both levels. What `essential` still withholds is the
-    bulk: the prompt that was sent, and the context payload."""
+    With one document, `essential` withheld the model's own words to stay
+    readable. With two, the summary is skimmable on its own, so the response
+    and the reasoning trace moved to both levels - they are what you debug a
+    small model with.
+
+    The prompt joined them when `.shamsu/chat-logs/` was deleted. That file had
+    been keeping a full copy at every level, unredacted, and removing it for
+    the leak would otherwise have taken the record with it. So the prompt is
+    kept here, where it goes through the redactor, and the overflow rule keeps
+    a large one out of the document body.
+
+    What `verbose` still adds is the context pack: the single largest payload a
+    turn produces, and the one thing genuinely reconstructable from elsewhere.
+    """
     from shamsu.action_ledger.ledger import start_run
 
     ledger = start_run(tmp_path, "answer concisely")
-    call_id = ledger.log_model_call_started("qa", "m", "private model prompt")
+    call_id = ledger.log_model_call_started("qa", "m", "the prompt that was sent")
+    ledger.log_context_preview({"task_id": "t1", "token_estimate": 99, "snippets": []})
     ledger.log_model_thinking(call_id, "qa", "m", "the reasoning trace")
     ledger.log_model_call_finished("qa", "m", "the model response", call_id=call_id)
     ledger.finish("Public answer.", status="success")
@@ -373,9 +383,12 @@ def test_essential_detail_keeps_the_answer_and_drops_the_prompt(tmp_path: Path):
     detail = ledger.detail_log_path.read_text(encoding="utf-8")
 
     assert "Public answer." in summary
-    assert "private model prompt" not in detail
+    assert "the prompt that was sent" in detail
     assert "the model response" in detail
     assert "the reasoning trace" in detail
+    # The pack itself is verbose-only; the fact that one was built is a row.
+    assert "Building context" in summary
+    assert "Context sent to model" not in detail
 
 
 # -- The five things the flat report could not show -------------------------
@@ -771,7 +784,6 @@ def test_simple_mode_records_its_tools_and_model_calls(tmp_path: Path):
         state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
         model_name="qwen3:8b",
         action_ledger=ledger,
-        log_turns=False,
     )
     asyncio.run(loop.run("look at calc.py"))
 
@@ -979,7 +991,6 @@ def test_a_self_executed_write_reaches_changed_files(tmp_path: Path):
         state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
         model_name="qwen3:8b",
         action_ledger=ledger,
-        log_turns=False,
     )
     asyncio.run(loop.run("guard the divisor"))
     ledger.finish("Guarded.", status="success")
@@ -1035,10 +1046,215 @@ def test_a_registry_write_is_not_journalled_twice(tmp_path: Path):
         state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
         model_name="qwen3:8b",
         action_ledger=ledger,
-        log_turns=False,
     )
     asyncio.run(loop.run("write a file"))
     ledger.finish("Written.", status="success")
 
     summary = store.load_summary(tmp_path, ledger.run_id) or {}
     assert summary.get("changed_files") == ["app.py"], summary.get("changed_files")
+
+
+# -- what `.shamsu/chat-logs/` used to guarantee, now guaranteed here --------
+#
+# `shamsu/agents/simple_log.py` wrote the exact prompt and the raw reply to
+# `.shamsu/chat-logs/<session>.md`. It contained zero calls to `redact`, so it
+# was the one path in the project that put a model prompt on disk without going
+# through the single secret-pattern enforcement point. It was deleted. These
+# are the properties it held that the redacted log has to hold in its place.
+
+
+def _turn_with(tmp_path: Path, prompt: str, reply, thinking: str = ""):
+    """Run one scripted turn and return its ledger."""
+    import asyncio
+
+    from shamsu.action_ledger.ledger import start_run
+    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_chat import SimpleChatLoop
+    from shamsu.agents.simple_prompt import simple_system_prompt
+    from shamsu.tools.agent_tools import AgentToolRegistry
+    from tests.test_simple_chat import FakeClient
+
+    logger = SessionManager(tmp_path).create_session()
+    ledger = start_run(tmp_path, prompt, session_logger=logger)
+    loop = SimpleChatLoop(
+        tmp_path,
+        client=FakeClient([reply]),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
+        session_logger=logger,
+        action_ledger=ledger,
+        model_name="m",
+    )
+    asyncio.run(loop.run(prompt))
+    ledger.finish("done", status="success")
+    return ledger
+
+
+def test_no_secret_in_the_prompt_reaches_any_file_on_disk(tmp_path: Path):
+    """The whole reason `chat-logs/` was deleted, asserted over the WHOLE tree.
+
+    Not against a named file: the leak was found by searching every file under
+    `.shamsu/`, and a test that only checks the files we remembered to name
+    would have missed both the one we knew about and the `model-transcript.csv`
+    we did not.
+    """
+    secret = "sk-livesecret9876"
+    _turn_with(
+        tmp_path,
+        f"deploy with api_key={secret}",
+        {"message": {"content": f"I will use api_key={secret}.", "tool_calls": []}},
+    )
+
+    leaked = []
+    for path in sorted(tmp_path.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            if secret in path.read_text(encoding="utf-8", errors="ignore"):
+                leaked.append(str(path.relative_to(tmp_path)))
+        except OSError:
+            continue
+    assert leaked == [], f"the secret reached disk: {leaked}"
+
+
+def test_the_prompt_as_sent_is_kept_at_every_level(tmp_path: Path):
+    """`chat-logs/` kept the full prompt whatever the log level was, so this
+    has to as well - otherwise deleting it for the leak took the record with
+    it. Redacted, unlike its predecessor."""
+    ledger = _turn_with(
+        tmp_path, "make hello.py",
+        {"message": {"content": "here you go", "tool_calls": []}},
+    )
+    detail = ledger.detail_log_path.read_text(encoding="utf-8")
+
+    assert "You are SHAMSU" in detail, "the system prompt must be visible"
+    assert "make hello.py" in detail
+    assert "here you go" in detail, "the raw response must be visible"
+
+
+def test_a_pydantic_response_is_not_recorded_as_empty(tmp_path: Path):
+    """The client returns a ChatResponse object, not a dict. Reading it with
+    `.get()` logged every response as empty while text was plainly produced -
+    the bug the deleted module was once fixed for."""
+
+    class Message:
+        content = "I created the file."
+        thinking = "first I should write it"
+        tool_calls: list = []
+
+    class ChatResponse:
+        message = Message()
+
+    ledger = _turn_with(tmp_path, "make it", ChatResponse())
+    detail = ledger.detail_log_path.read_text(encoding="utf-8")
+
+    assert "I created the file." in detail
+    assert "first I should write it" in detail, "the thinking channel is where the time goes"
+
+
+def test_a_whole_tool_result_survives_rather_than_being_clipped(tmp_path: Path):
+    """`chat-logs/` set its truncation limit to zero on purpose: a record that
+    clips is not a record. The overflow rule replaces that - the payload leaves
+    the document and keeps every byte in `attachments/`."""
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "read the log")
+    body = "\n".join(f"line {index} of a very long tool result" for index in range(400))
+    call_id = ledger.log_tool_call("read_file", {"filepath": "big.log"})
+    ledger.log_tool_result(call_id, "read_file", True, body)
+    ledger.finish("read", status="success")
+
+    spilled = sorted(ledger.log_attachments_dir.glob("*"))
+    assert spilled, "the oversized result was not kept anywhere"
+    kept = spilled[0].read_text(encoding="utf-8")
+    assert "line 0 of" in kept and "line 399 of" in kept, "the record was clipped"
+
+
+def test_a_broken_log_never_breaks_the_turn(tmp_path: Path):
+    """Held by the deleted module and still required: logging is observability,
+    never a reason to lose a turn."""
+    from shamsu.ui.turnlog import TurnLogWriter
+
+    writer = TurnLogWriter(tmp_path / "gone" / "deeper", run_id="r", turn_id="t")
+    writer.home.mkdir(parents=True, exist_ok=True)
+    writer.summary_path.write_text("", encoding="utf-8")
+    # Make the destination unwritable by turning it into a directory.
+    writer.summary_path.unlink()
+    writer.summary_path.mkdir()
+
+    writer.open_turn("hi")                      # must not raise
+    writer.append_tool_call("read_file", {"filepath": "a.py"})
+    writer.append_tool_result("read_file", True, "ok")
+    writer.close_turn("done", "success")
+
+
+def test_the_legacy_chat_logs_directory_is_no_longer_written(tmp_path: Path):
+    _turn_with(
+        tmp_path, "make hello.py",
+        {"message": {"content": "here you go", "tool_calls": []}},
+    )
+    assert not (tmp_path / ".shamsu" / "chat-logs").exists()
+
+
+def test_a_workspace_with_old_chat_logs_is_warned(tmp_path: Path):
+    from shamsu.ui.turnlog import legacy_chat_logs, legacy_chat_logs_warning
+
+    old = tmp_path / ".shamsu" / "chat-logs"
+    old.mkdir(parents=True)
+    (old / "20260818-1200-a1b2--game.md").write_text("api_key=sk-live", encoding="utf-8")
+
+    assert legacy_chat_logs(tmp_path) == old
+    warning = legacy_chat_logs_warning(tmp_path)
+    assert "chat-logs" in warning
+    assert "did NOT" in warning and "redact" in warning
+    assert "1 file" in warning
+    assert "Delete the folder" in warning
+
+
+def test_a_clean_workspace_is_not_warned(tmp_path: Path):
+    from shamsu.ui.turnlog import legacy_chat_logs, legacy_chat_logs_warning
+
+    assert legacy_chat_logs(tmp_path) is None
+    assert legacy_chat_logs_warning(tmp_path) == ""
+
+    # An empty leftover folder is not a leak and is not worth a panel.
+    (tmp_path / ".shamsu" / "chat-logs").mkdir(parents=True)
+    assert legacy_chat_logs(tmp_path) is None
+    assert legacy_chat_logs_warning(tmp_path) == ""
+
+
+def test_the_warning_never_deletes_anything(tmp_path: Path):
+    """The files may be the only record of sessions someone still wants, and
+    silently removing a user's logs to fix our bug is not ours to decide."""
+    from shamsu.ui.turnlog import legacy_chat_logs_warning
+
+    old = tmp_path / ".shamsu" / "chat-logs"
+    old.mkdir(parents=True)
+    kept = old / "thread.md"
+    kept.write_text("a whole conversation", encoding="utf-8")
+
+    legacy_chat_logs_warning(tmp_path)
+
+    assert kept.is_file()
+    assert kept.read_text(encoding="utf-8") == "a whole conversation"
+
+
+def test_the_startup_banner_shows_the_warning(tmp_path: Path):
+    from rich.console import Console
+
+    from shamsu.cli.repl import _warn_about_legacy_chat_logs
+
+    old = tmp_path / ".shamsu" / "chat-logs"
+    old.mkdir(parents=True)
+    (old / "thread.md").write_text("secrets", encoding="utf-8")
+
+    console = Console(record=True, width=100)
+    _warn_about_legacy_chat_logs(tmp_path, console)
+    printed = console.export_text()
+    assert "Unredacted logs" in printed
+    assert "chat-logs" in printed
+
+    # ...and says nothing at all about a workspace that has none.
+    clean = Console(record=True, width=100)
+    _warn_about_legacy_chat_logs(tmp_path / "elsewhere", clean)
+    assert clean.export_text().strip() == ""

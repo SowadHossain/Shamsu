@@ -3,6 +3,27 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-21 - SECURITY: unredacted prompts on disk; chat-logs/ removed
+Files edited: `shamsu/agents/simple_log.py` (deleted), `shamsu/agents/simple_chat.py`
+(20 call sites), `shamsu/action_ledger/ledger.py`, `shamsu/ui/turnlog.py`,
+`shamsu/cli/repl.py`, tests
+What changed: `simple_log.py` contained no calls to `redact` at all - it wrote
+the exact prompt and raw reply for every turn to `.shamsu/chat-logs/<session>.md`
+at every log level, the one path in the project that put model text on disk
+without going through the shared secret-pattern list. Proven by running a turn
+whose prompt contained a fake key and searching every file under `.shamsu/`;
+that search found a SECOND leak nobody knew about, `model-transcript.csv`, whose
+markdown twin redacts and which wrote its row dict straight out. Both fixed.
+The module is deleted and `log_turns`/`SHAMSU_NO_CHAT_LOG`, which then
+controlled nothing, went with it. `log-detailed.md` now keeps the prompt at
+every level (it was verbose-only) so deleting the leak did not take the record
+with it - redacted, with the overflow rule spilling a large prompt to
+`attachments/`. A startup panel warns any workspace that still has the old
+folder, and deliberately does not delete it.
+Tests: `tests/test_trace_output.py` 47 -> 57, nine removed with the module,
+full suite green.
+Log: logs/test-runs/2026-08-21-chat-logs-redaction-leak.log
+
 ### 2026-08-21 - The CLI paints a turn instead of listing it
 Files edited: `shamsu/cli/turn_render.py` (overhauled), `shamsu/runtime/turn_stream.py`,
 `shamsu/agents/simple_chat.py` (emits only), `shamsu/cli/repl.py`, tests

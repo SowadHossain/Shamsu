@@ -1718,7 +1718,14 @@ class ActionLedger:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             if not exists:
                 writer.writeheader()
-            writer.writerow({field: row.get(field, "") for field in fieldnames})
+            # Redacted here, like every other path that puts text on disk. The
+            # markdown twin has always gone through `_markdown_cell`, which
+            # redacts; this one wrote the row dict straight out. Same data,
+            # same row, and `sk-livesecret9876` appeared in the .csv while the
+            # .md beside it said [REDACTED].
+            writer.writerow(
+                {field: redact_text(str(row.get(field, ""))) for field in fieldnames}
+            )
 
     def _write_json(self, path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -51,7 +51,6 @@ from shamsu.agents.loop_guards import (
 )
 from shamsu.agents.plan_anchor import anchor as plan_anchor
 from shamsu.agents.plan_anchor import ask_for_a_plan
-from shamsu.agents.simple_log import SimpleTurnLog, next_turn_number
 from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_outline import (
     can_outline,
@@ -2087,7 +2086,6 @@ class SimpleChatLoop:
         verify_changes: bool = True,
         temperature: float = 0.2,
         request_timeout: float = 600.0,
-        log_turns: bool = True,
         feedback: Any | None = None,
         emit: Any | None = None,
         source: str = "cli",
@@ -2121,9 +2119,6 @@ class SimpleChatLoop:
         self.verify_changes = verify_changes
         self.temperature = temperature
         self.request_timeout = request_timeout
-        # Off only for tests and embedders; a real session always wants the
-        # transcript, since that is the only record of what the model SAW.
-        self.log_turns = log_turns and not os.environ.get("SHAMSU_NO_CHAT_LOG", "").strip()
         self.state = state or ChatState(
             simple_system_prompt(
                 self.workspace, has_history=_thread_has_history(session_logger)
@@ -2270,7 +2265,6 @@ class SimpleChatLoop:
         # How many times each identical read-only call has been made this turn.
         self._read_signatures: dict[str, int] = {}
         # Readable per-turn transcript of prompt + raw response.
-        self.turn_log: SimpleTurnLog | None = None
         self._files: list[str] = []
         self._brief = ""
         # The user request this turn is about. Memory is recalled AGAINST it -
@@ -2421,22 +2415,6 @@ class SimpleChatLoop:
         # what a file exports does not change between rounds of the same turn.
         self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
         await self._compact_if_needed()
-        if self.log_turns:
-            try:
-                # Scope the log to the SESSION, so a thread is one readable file
-                # instead of a pile of turn-NNN files nobody can tell apart.
-                session_id = getattr(self.session_logger, "session_id", "") or ""
-                title = getattr(getattr(self.session_logger, "metadata", None), "title", "") or ""
-                self.turn_log = SimpleTurnLog(
-                    self.workspace,
-                    next_turn_number(self.workspace, session_id),
-                    self.model_name,
-                    session_id=session_id,
-                    session_title=title,
-                )
-                self.turn_log.open_turn(user_input)
-            except OSError:
-                self.turn_log = None
         changed: list[str] = []
         tool_calls = 0
         prose_nudges = 0
@@ -2505,8 +2483,6 @@ class SimpleChatLoop:
                         # just burns another 30s - so it is used as the answer.
                         self._activity("model only reasoned; using its thinking as the answer")
                         self.state.append_assistant(turn.thinking)
-                        if self.turn_log:
-                            self.turn_log.close_turn(turn.thinking, round_index + 1, stopped=False)
                         return SimpleChatResult(
                             final=turn.thinking,
                             rounds=round_index + 1,
@@ -2662,8 +2638,6 @@ class SimpleChatLoop:
                     self._activity("reply hit the context limit; labelled it partial")
                 self._settle_unfinished()
                 self.state.append_assistant(text)
-                if self.turn_log:
-                    self.turn_log.close_turn(text, round_index + 1, stopped=False)
                 return SimpleChatResult(
                     final=text,
                     rounds=round_index + 1,
@@ -2690,8 +2664,6 @@ class SimpleChatLoop:
                     await self._append_verification(outcome.written)
                 self._settle_unfinished()
                 self.state.append_assistant(outcome.asked)
-                if self.turn_log:
-                    self.turn_log.close_turn(outcome.asked, round_index + 1, stopped=False)
                 self._activity("asked the user a question; waiting for the answer")
                 return SimpleChatResult(
                     final=outcome.asked,
@@ -3061,17 +3033,12 @@ class SimpleChatLoop:
             f"{len(messages)} messages, num_ctx {num_ctx}",
             {"messages": len(messages), "num_ctx": num_ctx},
         )
-        if self.turn_log:
-            approx = self._estimate_prompt(messages)
-            self.turn_log.log_call(messages, num_ctx, approx)
         ledger_call_id = self._ledger_model_started(messages, kwargs)
         started = time.perf_counter()
         beat = asyncio.ensure_future(self._heartbeat("thinking..."))
         try:
             raw = await self._client_chat(kwargs)
         except Exception as exc:
-            if self.turn_log:
-                self.turn_log.log_error(f"{type(exc).__name__}: {exc}")
             self._ledger_model_finished(ledger_call_id, None, f"{type(exc).__name__}: {exc}")
             raise
         finally:
@@ -3084,8 +3051,6 @@ class SimpleChatLoop:
         # machines where a turn is cheap enough to run many rounds.
         self._status("thinking...")
         self._ledger_model_finished(ledger_call_id, raw, "")
-        if self.turn_log:
-            self.turn_log.log_response(raw, time.perf_counter() - started)
         return raw
 
     # -- mirroring simple mode into the ledger -----------------------------
@@ -3958,8 +3923,6 @@ class SimpleChatLoop:
             finally:
                 beat.cancel()
             self._ledger_tool_result(ledger_call_id, name, result)
-            if self.turn_log:
-                self.turn_log.log_tool_result(name, arguments, result.ok, result.message)
             # The CLI has never printed this, and at `normal` verbosity no
             # surface shows it either - it is here so the web UI can build a
             # collapsible tool card and a diff preview without re-running
@@ -4200,8 +4163,6 @@ class SimpleChatLoop:
         self._trace(
             "simple.refused_repeat", f"{name} {named}", {"tool": name, "attempts": seen}
         )
-        if self.turn_log:
-            self.turn_log.log_tool_result(name, arguments, False, message)
         self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
 
     def _max_write_chars(self) -> int:
@@ -4309,8 +4270,6 @@ class SimpleChatLoop:
             f"{name} {named}",
             {"tool": name, "filepath": target, "chars": len(content), "max_chars": cap},
         )
-        if self.turn_log:
-            self.turn_log.log_tool_result(name, arguments, False, message)
         self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
 
     def _truncated_content(
@@ -4388,8 +4347,6 @@ class SimpleChatLoop:
             f"{name} {named}",
             {"tool": name, "filepath": target, "why": why},
         )
-        if self.turn_log:
-            self.turn_log.log_tool_result(name, arguments, False, message)
         self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
 
     def _refuse_truncated_write(
@@ -4454,8 +4411,6 @@ class SimpleChatLoop:
             f"{name} {named}",
             {"tool": name, "filepath": target, "refusals": self._truncated_refusals},
         )
-        if self.turn_log:
-            self.turn_log.log_tool_result(name, arguments, False, message)
         self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
@@ -6327,8 +6282,6 @@ class SimpleChatLoop:
     ) -> SimpleChatResult:
         self._settle_unfinished()
         self.state.append_assistant(message)
-        if self.turn_log:
-            self.turn_log.close_turn(message, rounds, stopped=True)
         return SimpleChatResult(
             final=message,
             rounds=rounds,

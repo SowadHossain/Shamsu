@@ -4,6 +4,41 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Security - prompts were written to disk unredacted (2026-08-21)
+
+`shamsu/agents/simple_log.py` wrote the exact prompt, system message included,
+and the raw model reply for every turn of every session to
+`.shamsu/chat-logs/<session>.md`. The module contained no calls to `redact`.
+Every other path that puts text on disk goes through one shared secret-pattern
+list; that one did not, so any API key, token or password a prompt mentioned
+was stored in clear text, at every log level, with no way to turn it off.
+
+Found by running a turn whose prompt contained a fake key and then searching
+every file under `.shamsu/` for it - rather than checking the files we expected
+to be involved. That search turned up a second leak nobody knew about:
+`.shamsu/logs/<id>/model-transcript.csv`. Its markdown twin has always gone
+through `_markdown_cell`, which redacts; the CSV writer wrote the row dict
+straight out, so the `.md` said `[REDACTED]` while the `.csv` beside it held
+the key. Both are fixed, and the whole-tree search is now a test.
+
+`simple_log.py` is deleted along with its twenty call sites in the agent loop.
+`log_turns` and `SHAMSU_NO_CHAT_LOG` existed only to gate it and now control
+nothing, so they are gone too - a constructor flag named "log turns" that
+silently does not is worse than no flag.
+
+Nothing was lost with it. `chat-logs/` kept the full prompt at every level
+while `log-detailed.md` kept it only at `verbose`, so the prompt is now written
+at both levels, through the redactor, with the overflow rule keeping a large
+one out of the document body. The line between the levels now sits at:
+`essential` keeps the record - prompt, response, reasoning; `verbose` adds the
+context pack.
+
+A workspace that still has the old folder gets one panel at startup saying what
+is in it and that it should be deleted. SHAMSU does not delete it: the files
+may be the only record of sessions someone still wants, and removing a user's
+logs to fix our bug is not ours to decide. An empty leftover folder is not a
+leak and gets no panel.
+
 ### Changed - the terminal paints a turn instead of listing it (2026-08-21)
 
 Every action row was `[dim]{text}[/dim]`: one grey for a successful read and a

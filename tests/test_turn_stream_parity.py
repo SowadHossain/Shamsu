@@ -109,7 +109,6 @@ def _loop(tmp_path: Path, turns, **kwargs) -> SimpleChatLoop:
         tools=tools,
         state=state,
         model_name="qwen3:8b",
-        log_turns=False,
         **kwargs,
     )
 

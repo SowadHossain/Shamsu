@@ -18515,6 +18515,27 @@ def _print_startup_banner(workspace: Path, console: Console) -> None:
     body.append("\nRuntime: ", style="dim")
     body.append(runtime, style="dim")
     console.print(Panel(body, title="SHAMSU", border_style="cyan"))
+    _warn_about_legacy_chat_logs(workspace, console)
+
+
+def _warn_about_legacy_chat_logs(workspace: Path, console: Console) -> None:
+    """Say once, at startup, that an old unredacted log folder is still here.
+
+    At startup rather than per turn: it is a fact about the workspace, not
+    about anything the agent is doing, and a line repeated after every turn is
+    a line nobody reads. Best-effort - a warning must never be the reason a
+    session fails to open.
+    """
+    try:
+        from shamsu.ui.turnlog import legacy_chat_logs_warning
+
+        warning = legacy_chat_logs_warning(workspace)
+    except Exception:
+        return
+    if warning:
+        console.print(
+            Panel(Text(warning), title="Unredacted logs", border_style="yellow")
+        )
 
 
 def _bottom_toolbar(workspace: Path, plan_mode: bool = False) -> str:

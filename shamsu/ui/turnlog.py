@@ -380,10 +380,16 @@ class TurnLogWriter:
     def append_model_call(
         self, call_id: str, role: str, model: str, request_text: str
     ) -> None:
-        """The prompt sent. Only in verbose - in essential mode the prompt is
-        reconstructable from the transcript and costs more than it earns."""
-        if not self.verbose:
-            return
+        """The prompt as sent, at every level.
+
+        It used to be verbose-only, on the reasoning that the prompt is
+        reconstructable from the transcript. That was true and it was also not
+        the whole picture: `.shamsu/chat-logs/` was keeping a full copy at
+        every level anyway, unredacted, and deleting that file for the security
+        leak it was would have taken the record with it. So the record moves
+        here, where it goes through the redactor like everything else, and the
+        overflow rule keeps a 12k prompt out of the document body.
+        """
         self._detail_only(
             f"Prompt sent — `{redact(str(call_id))}`",
             [("Prompt", redact(str(request_text or "")), "text")],
@@ -1066,6 +1072,54 @@ sensitive anyway - they contain your prompts and your source code.
     plans/        saved plans from `plan <task>`
     action_ledger/config.json   logging configuration
 """
+
+
+#: Written by `shamsu/agents/simple_log.py` until 2026-08-21. Deleted, because
+#: it was the one path in the project that put a prompt on disk without going
+#: through the redactor - see `legacy_chat_logs`.
+LEGACY_CHAT_LOGS = "chat-logs"
+
+
+def legacy_chat_logs(workspace: Path) -> Path | None:
+    """The old unredacted transcript folder, if this workspace still has one.
+
+    `.shamsu/chat-logs/` held the exact prompt and the raw reply for every turn
+    of every session, and `simple_log.py` contained no calls to `redact` at
+    all. Every other path that writes text to disk goes through one shared
+    secret-pattern list; that one did not, so any key, token or password a
+    prompt mentioned is sitting in there in clear text.
+
+    SHAMSU does not delete it. The files may be the only record of sessions
+    someone still wants, and silently removing a user's logs to fix our bug is
+    not ours to decide - so the workspace is told, and the choice stays theirs.
+    """
+    directory = Path(workspace) / ".shamsu" / LEGACY_CHAT_LOGS
+    try:
+        if directory.is_dir() and any(directory.iterdir()):
+            return directory
+    except OSError:
+        return None
+    return None
+
+
+def legacy_chat_logs_warning(workspace: Path) -> str:
+    """One paragraph for the console, or "" when there is nothing to say."""
+    directory = legacy_chat_logs(workspace)
+    if directory is None:
+        return ""
+    try:
+        count = len([path for path in directory.glob("*.md") if path.is_file()])
+    except OSError:
+        count = 0
+    files = f"{count} file{'s' if count != 1 else ''}" if count else "files"
+    return (
+        f"Old chat logs found: {directory}\n"
+        f"These {files} were written before 2026-08-21 by a logger that did NOT "
+        "redact secrets, so any API key or password mentioned in a prompt is in "
+        "them in clear text. Nothing writes there any more - the readable log "
+        "now lives in .shamsu/sessions/<id>/ and is redacted. Delete the folder "
+        "when you no longer need the history."
+    )
 
 
 def write_layout_readme(workspace: Path) -> Path | None:
