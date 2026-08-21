@@ -89,6 +89,11 @@ def report_to_dict(report: EvalReport) -> dict[str, object]:
                 "runs": result.runs,
                 "flaky": result.flaky,
                 "duration_s": result.duration_s,
+                # Summed over `runs`; `evals.diff` divides. Cost is a SECONDARY
+                # metric there and never moves the verdict - a change that makes
+                # the agent faster and less correct is not an improvement.
+                "rounds": result.rounds,
+                "tool_calls": result.tool_calls,
                 "tags": list(result.tags),
                 "note": result.note,
                 "error": result.error,

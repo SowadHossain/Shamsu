@@ -461,3 +461,80 @@ DEGENERATE_CASES: tuple[EvalCase, ...] = (
 # Part of the suite, not an optional extra. Held back, they would measure
 # nothing - which is exactly the state the guards were in for three phases.
 SEED_CASES.extend(DEGENERATE_CASES)
+
+
+def _seed_duplicate_definitions(workspace: Path) -> None:
+    """The shape of the file this whole investigation came from.
+
+    `test-shamsu/test1/js/main.js`: 582 lines, four functions defined twice,
+    interleaved with unique ones, and over `MAX_WRITE_CHARS` so a whole-file
+    rewrite is refused and the model has to edit in place. The duplicates are
+    the bug - in JavaScript the later definition silently wins - and a parser
+    cannot see any of it, which is why `node --check` passed on a file nobody
+    could run.
+
+    Reproduced rather than copied: the same properties, none of the user's code.
+    """
+    parts = []
+    for index in range(90):
+        parts.append(
+            f"function unique_{index}(state) {{\n"
+            f"  if (!state.ready) {{\n"
+            f"    return null;\n"
+            f"  }}\n"
+            f"  state.count += {index};\n"
+            f"  return state;\n"
+            f"}}\n\n"
+        )
+    # Three names declared twice, spread through the file rather than adjacent,
+    # so removing one cannot be done by deleting a contiguous tail.
+    duplicated = "function onMove(e) {{\n  return e.{0};\n}}\n\n"
+    parts.insert(8, duplicated.format("x"))
+    parts.insert(70, duplicated.format("clientX"))
+    parts.insert(16, "function onShoot(e) {\n  return fire(e);\n}\n\n")
+    parts.insert(48, "function onShoot(e) {\n  return fireBullet(e);\n}\n\n")
+    parts.insert(24, "function onPause(a) {\n  return pause(a);\n}\n\n")
+    parts.insert(56, "function onPause(action) {\n  return togglePause(action);\n}\n\n")
+    _write(workspace, "app.js", "".join(parts))
+
+
+def _check_duplicates_removed(workspace: Path, final: str) -> bool:
+    """Each duplicated name declared once, and nothing else gone.
+
+    The second half is what a naive check misses, and it cost this project a
+    false alarm AND a real regression on consecutive days: deleting the whole
+    tail of a file also leaves one definition of each, and so does deleting a
+    function nobody mentioned. Counting is by declaration - INDENTED ONES
+    INCLUDED - because a `grep "^function"` reads a nested definition as absent
+    and turns a correct fix into an apparent data loss.
+    """
+    import re
+
+    body = _read(workspace, "app.js")
+    if not body:
+        return False
+    declared = re.findall(r"^[ \t]*function ([A-Za-z0-9_]+)", body, re.MULTILINE)
+    counts = {name: declared.count(name) for name in set(declared)}
+    for name in ("onMove", "onShoot", "onPause"):
+        if counts.get(name) != 1:
+            return False
+    # Every unique function has to survive. Removing a duplicate is the task;
+    # removing anything else is damage that still parses.
+    if any(counts.get(f"unique_{index}") != 1 for index in range(90)):
+        return False
+    return body.count("{") == body.count("}")
+
+
+SEED_CASES.append(
+    EvalCase(
+        name="removes_duplicate_definitions_without_losing_anything",
+        prompt=(
+            "app.js declares onMove, onShoot and onPause twice each. The second "
+            "definition silently overrides the first. Remove the duplicates so "
+            "each is declared once, and change nothing else."
+        ),
+        check=_check_duplicates_removed,
+        seed=_seed_duplicate_definitions,
+        tags=("repair", "duplicates", "degenerate"),
+    )
+)

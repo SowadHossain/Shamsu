@@ -70,6 +70,9 @@ class CaseRun:
     passes: int
     runs: int
     duration_s: float = 0.0
+    #: Cost, summed over `runs`. SECONDARY on purpose - see `render`.
+    rounds: int = 0
+    tool_calls: int = 0
 
     @property
     def rate(self) -> float:
@@ -108,6 +111,24 @@ class RunSummary:
     @property
     def duration_s(self) -> float:
         return sum(c.duration_s for c in self.cases.values())
+
+    @property
+    def rounds_per_attempt(self) -> float:
+        """Model calls per attempt, averaged over every case.
+
+        Per ATTEMPT so the number survives a change of `--samples`, and never
+        part of the verdict: a change that makes the agent cheaper and less
+        correct is not an improvement, and one that costs more rounds while
+        fixing a case is. Cost is a thing to look at once correctness has
+        already answered.
+        """
+        attempts = sum(max(1, c.runs) for c in self.cases.values())
+        return (sum(c.rounds for c in self.cases.values()) / attempts) if attempts else 0.0
+
+    @property
+    def calls_per_attempt(self) -> float:
+        attempts = sum(max(1, c.runs) for c in self.cases.values())
+        return (sum(c.tool_calls for c in self.cases.values()) / attempts) if attempts else 0.0
 
 
 @dataclass(frozen=True)
@@ -168,6 +189,8 @@ def load_run(argument: str) -> RunSummary:
             passes=int(entry.get("passes", 1 if entry.get("passed") else 0)),
             runs=max(runs, 1),
             duration_s=float(entry.get("duration_s") or 0.0),
+            rounds=int(entry.get("rounds") or 0),
+            tool_calls=int(entry.get("tool_calls") or 0),
         )
     if not cases:
         raise DiffError(f"{target}: no named cases in the report")
@@ -365,6 +388,22 @@ def render(
         f"  walltime : {base.duration_s:.0f}s  ->  {feature.duration_s:.0f}s   "
         f"({_signed(feature.duration_s - base.duration_s, 0)}s)"
     )
+    # COST, below the line and never above it. A change that makes the agent
+    # cheaper and less correct is not an improvement, and one that spends more
+    # rounds to fix a case it used to fail is. So these are printed and the
+    # verdict never reads them.
+    if base.rounds_per_attempt or feature.rounds_per_attempt:
+        lines.append(
+            f"  rounds   : {base.rounds_per_attempt:.1f}  ->  "
+            f"{feature.rounds_per_attempt:.1f} per attempt   "
+            f"({_signed(feature.rounds_per_attempt - base.rounds_per_attempt, 1)})"
+        )
+        lines.append(
+            f"  calls    : {base.calls_per_attempt:.1f}  ->  "
+            f"{feature.calls_per_attempt:.1f} per attempt   "
+            f"({_signed(feature.calls_per_attempt - base.calls_per_attempt, 1)})"
+        )
+        lines.append("             [cost only - it does not affect the verdict]")
     lines.append("")
     if moves.regressed:
         lines.append(f"  REGRESSED ({len(moves.regressed)}):")
@@ -409,6 +448,12 @@ def as_dict(
         "baseline": {"path": base.path, "tier": base.tier, "reward": base.reward},
         "feature": {"path": feature.path, "tier": feature.tier, "reward": feature.reward},
         "reliable_delta": delta,
+        "cost": {
+            "baseline_rounds_per_attempt": base.rounds_per_attempt,
+            "feature_rounds_per_attempt": feature.rounds_per_attempt,
+            "baseline_calls_per_attempt": base.calls_per_attempt,
+            "feature_calls_per_attempt": feature.calls_per_attempt,
+        },
         "regressed": [{"name": n, "before": b, "after": a} for n, b, a in moves.regressed],
         "recovered": [{"name": n, "before": b, "after": a} for n, b, a in moves.recovered],
         "unreliable": [{"name": n, "before": b, "after": a} for n, b, a in moves.unreliable],

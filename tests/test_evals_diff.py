@@ -299,3 +299,84 @@ def test_a_small_wobble_at_large_sample_counts_is_still_noise(tmp_path):
     *_, result = compare(base, feat)
 
     assert result == NOISE
+
+
+# --- cost: reported, never decisive -------------------------------------
+
+
+def _report_with_cost(tmp_path: Path, name: str, cases: dict) -> str:
+    """`cases` maps name -> (passes, runs, rounds, tool_calls)."""
+    payload = {
+        "tier": "default",
+        "results": [
+            {
+                "name": case,
+                "passed": p == r,
+                "passes": p,
+                "runs": r,
+                "duration_s": 10.0,
+                "rounds": rounds,
+                "tool_calls": calls,
+            }
+            for case, (p, r, rounds, calls) in cases.items()
+        ],
+    }
+    path = tmp_path / name
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(path)
+
+
+def test_getting_cheaper_while_getting_worse_is_still_a_regression(tmp_path):
+    """THE rule cost has to obey. Halving the rounds while breaking a case that
+    used to pass every time is not an improvement, and a verdict that reads cost
+    would call it one."""
+    base = _report_with_cost(tmp_path, "base.json", {"a": (3, 3, 72, 60), "b": (3, 3, 30, 20)})
+    feat = _report_with_cost(tmp_path, "feat.json", {"a": (0, 3, 12, 6), "b": (3, 3, 30, 20)})
+
+    _b, _f, moves, _delta, result = compare(base, feat)
+
+    assert moves.hard_regressions == ["a"]
+    assert result == REGRESSED
+
+
+def test_getting_more_expensive_while_fixing_a_case_is_still_an_improvement(tmp_path):
+    """The other direction, and the reason cost cannot be a tiebreak: spending
+    more rounds to fix something you used to fail is what progress looks like."""
+    base = _report_with_cost(tmp_path, "base.json", {"a": (0, 3, 30, 20)})
+    feat = _report_with_cost(tmp_path, "feat.json", {"a": (3, 3, 72, 60)})
+
+    *_, result = compare(base, feat)
+
+    assert result == IMPROVED
+
+
+def test_cost_alone_never_moves_the_verdict(tmp_path):
+    """Same correctness, half the rounds: worth seeing, not worth a verdict."""
+    base = _report_with_cost(tmp_path, "base.json", {"a": (3, 3, 72, 60)})
+    feat = _report_with_cost(tmp_path, "feat.json", {"a": (3, 3, 24, 18)})
+
+    *_, result = compare(base, feat)
+
+    assert result == NOISE, "correctness did not move, so nothing did"
+
+
+def test_the_report_shows_cost_per_attempt(tmp_path, capsys):
+    """Per ATTEMPT, so the number survives a change of --samples."""
+    base = _report_with_cost(tmp_path, "base.json", {"a": (3, 3, 72, 60)})
+    feat = _report_with_cost(tmp_path, "feat.json", {"a": (3, 3, 24, 18)})
+
+    main([base, feat])
+    out = capsys.readouterr().out
+
+    assert "rounds   : 24.0  ->  8.0 per attempt" in out
+    assert "does not affect the verdict" in out
+
+
+def test_a_report_without_cost_still_compares(tmp_path):
+    """Every baseline captured before today has no rounds field."""
+    base = _report(tmp_path, "base.json", {"a": (0, 3)})
+    feat = _report(tmp_path, "feat.json", {"a": (3, 3)})
+
+    _b, _f, _m, _d, result = compare(base, feat)
+
+    assert result == IMPROVED

@@ -76,6 +76,15 @@ class EvalResult:
     # these collapse to the old boolean behavior.
     passes: int = 1
     runs: int = 1
+    #: Model calls and tool calls this case cost, summed over `runs`.
+    #:
+    #: Read from the session transcript rather than from anything the driver
+    #: reports, for the same reason every other number here is: this harness
+    #: scores what happened, never what the model said happened. Zero means the
+    #: driver never wrote a transcript - a fake driver in a unit test - not that
+    #: a real run was free.
+    rounds: int = 0
+    tool_calls: int = 0
 
     @property
     def rate(self) -> float:
@@ -94,6 +103,44 @@ class EvalResult:
         if self.runs > 1:
             return f"{label} {self.passes}/{self.runs}"
         return label
+
+
+def _turn_telemetry(workspace: Path) -> tuple[int, int]:
+    """Model calls and tool calls this attempt cost, from its own transcript.
+
+    Read from disk rather than returned by the driver, for the reason every
+    other number in this harness is: it scores what happened, not what anything
+    reported. A round is an assistant turn - one model call - and the tool calls
+    are the ones that turn actually made.
+
+    Cost is what every efficiency question this harness has been asked needed
+    and could not answer. `duration_s` conflates model speed with round count,
+    so "correct in 16 rounds" and "correct in 24" scored identically, and the
+    only way to tell them apart was reading transcripts by hand.
+
+    Silent on anything unreadable: a fake driver in a unit test writes no
+    transcript, and that is not a measurement of zero.
+    """
+    import json as _json
+
+    rounds = tool_calls = 0
+    try:
+        sessions = sorted((workspace / ".shamsu" / "sessions").glob("*/messages.jsonl"))
+    except OSError:
+        return (0, 0)
+    for transcript in sessions:
+        try:
+            for line in transcript.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                message = _json.loads(line)
+                if message.get("role") != "assistant":
+                    continue
+                rounds += 1
+                tool_calls += len(message.get("tool_calls") or [])
+        except (OSError, ValueError):
+            continue
+    return (rounds, tool_calls)
 
 
 @dataclass(frozen=True)
@@ -239,6 +286,8 @@ async def _run_case(
         tags=case.tags,
         passes=passes,
         runs=samples,
+        rounds=sum(attempt.rounds for attempt in attempts),
+        tool_calls=sum(attempt.tool_calls for attempt in attempts),
     )
     _emit_progress(
         progress,
@@ -366,6 +415,7 @@ async def _run_one_in_workspace(
         error = f"{type(exc).__name__}: {exc}"
         note = ""
     duration = time.perf_counter() - started
+    rounds, tool_calls = _turn_telemetry(workspace)
     result = EvalResult(
         name=case.name,
         passed=passed,
@@ -375,6 +425,8 @@ async def _run_one_in_workspace(
         workspace=str(workspace) if keep_workspace else "",
         duration_s=duration,
         tags=case.tags,
+        rounds=rounds,
+        tool_calls=tool_calls,
     )
     _emit_progress(
         progress,
@@ -510,8 +562,10 @@ def render_report(report: EvalReport) -> str:
     if report.artifacts_dir:
         lines.append(f"- **Artifacts:** `{report.artifacts_dir}`")
     lines.append("")
-    lines.append("| Case | Result | Time | Notes |")
-    lines.append("|------|--------|------|-------|")
+    # Rounds and calls are per ATTEMPT, not summed: a total that moves when you
+    # change --samples is not a cost anyone can compare against yesterday.
+    lines.append("| Case | Result | Time | Rounds | Calls | Notes |")
+    lines.append("|------|--------|------|--------|-------|-------|")
     for result in report.results:
         note = result.error or result.note or ("" if result.passed else "check failed")
         if result.flaky:
@@ -519,8 +573,11 @@ def render_report(report: EvalReport) -> str:
             # not answering the same way twice, so neither a PASS nor a FAIL
             # from it means anything on its own.
             note = (note + " " if note else "") + "FLAKY - re-run before trusting"
+        runs = max(1, result.runs)
         lines.append(
-            f"| {result.name} | {result.status} | {result.duration_s:.1f}s | {_escape_cell(note)} |"
+            f"| {result.name} | {result.status} | {result.duration_s:.1f}s | "
+            f"{result.rounds / runs:.1f} | {result.tool_calls / runs:.1f} | "
+            f"{_escape_cell(note)} |"
         )
     lines.append("")
     flaky = [result.name for result in report.results if result.flaky]
