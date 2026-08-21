@@ -4,6 +4,64 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Fixed (the reported failure, from a live transcript, 2026-08-21)
+
+Run against the file it was reported on - `test-shamsu/test1/js/main.js`, 582
+lines, over the write cap - on qwen3.5:9b. The report reproduced exactly: 24
+rounds, 319 seconds, nothing changed. The file's defect was never a syntax
+error; four functions are declared TWICE, and in JavaScript the later
+declaration silently wins, which no parser can see.
+
+The transcript named the cause. The model had diagnosed it correctly and tried
+the right fix - `replace_symbol(symbol="handlePauseMenuAction(action)",
+content="
+")`, delete the duplicate - and was refused twice with
+"replace_symbol needs a filepath, a symbol and content", then ran out of rounds.
+Two defects behind one refusal: the symbol carried the signature the outline had
+just shown it, and empty content read as a missing argument rather than an
+intent. There is no other way to remove a function - `patch_file` would need the
+exact text of a thirty-line body.
+
+- **`replace_symbol` deletes when given empty content**, and accepts a name with
+  its signature. Deleting a DUPLICATE is allowed; deleting the last definition
+  is refused and names the deliberate route, because two legal steps otherwise
+  removed every definition of a function on a live run - a hole opened by this
+  fix, not one it inherited.
+- **The contract tools answer to the names the model uses.** 23 calls, none
+  using `assertion_id`, 17 carrying the right id under `assertion_index`,
+  `contract_id`, `claim`, `claim_id` or `assertion` - the `search_files` defect
+  again. With exactly one assertion open, evidence alone now resolves to it.
+- **Overlapping re-reads are answered from what was already sent.** The old
+  guard compared signatures, so `105-210` twice was caught and `100-215` against
+  `100-250` was not. 90% of the newly requested range, not of the union.
+- **`read_symbol` returns EVERY definition of a name.** A tool that cannot
+  express "show me both" cannot be used to remove a duplicate.
+- **`run_command` is no longer silently denied** to any caller using
+  `approval_override` - the headless runner, `shamsu run`, the eval harness.
+  File writes were auto-approved while every shell command hit a console prompt
+  with no TTY behind it. The benchmark had recorded that as model failure for
+  five days.
+- **`patch_file` cannot delete the last definition of a symbol**, and
+  `read_file` is withdrawn for the turn after three reads of one path come back
+  from cache - announced once, pointing at `replace_symbol`, restored by the
+  first edit that lands.
+
+### Added (efficiency is measurable now, 2026-08-21)
+
+- **`EvalResult` carries `rounds` and `tool_calls`**, read from the session
+  transcript rather than reported by a driver. `duration_s` conflated model
+  speed with round count, so "correct in 16 rounds" and "correct in 24" scored
+  identically and the only way to tell them apart was reading transcripts by
+  hand.
+- **`evals.diff` prints cost per ATTEMPT and below the line.** The verdict never
+  reads it: getting cheaper while breaking a case that used to pass is still
+  REGRESSED, and spending more rounds to fix a case you used to fail is still
+  IMPROVED.
+- **`removes_duplicate_definitions_without_losing_anything`** - the real file's
+  shape, reproduced rather than copied. Its check counts declarations INCLUDING
+  INDENTED ONES: a `grep "^function"` reads a nested definition as absent, which
+  produced a false data-loss alarm on one day and missed a real one on the next.
+
 ### Added (context control and honest context reporting, 2026-08-21)
 
 - **`/context window [tokens]`** - read or set the context window from the chat.

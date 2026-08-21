@@ -3,6 +3,49 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-21 - The reported failure, reproduced on the user's own file and fixed
+Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_outline.py`,
+`evals/{harness,diff,cases,__main__}.py`, tests
+What changed: ran qwen3.5:9b against `test-shamsu/test1/js/main.js` - 582 lines,
+over the write cap - and reproduced the report exactly: 24 rounds, 319s, nothing
+changed. The file's defect was never a syntax error; four functions are declared
+TWICE and in JavaScript the later one silently wins, which no parser can see.
+The transcript named the cause: the model had diagnosed it correctly and tried
+`replace_symbol(symbol='handlePauseMenuAction(action)', content='
+')` - delete
+the duplicate - and was refused twice, because the symbol carried its signature
+and empty content read as a missing argument. Fixed, along with: 17 of 23
+contract failures (the model sends `assertion_index`, the code reads
+`assertion_id`), overlapping re-reads, `read_symbol` returning only the first of
+several definitions, and `run_command` being silently denied to any caller using
+`approval_override`.
+Then a REGRESSION I introduced: allowing deletion by name let two legal steps
+remove every definition of a function. `replace_symbol` was exempt from the
+erasure guard on the assumption `_members_lost` covered it; it does not. Fixed
+in a574b46 and the exact live sequence is now refused at step two.
+Tests: full suite 3319 -> 3425 passing.
+Log: logs/test-runs/2026-08-21-real-file-repair.log
+
+### 2026-08-21 - Efficiency is now measurable, and the read-loop was variance
+Files edited: `evals/harness.py`, `evals/diff.py`, `evals/cases.py`,
+`evals/__main__.py`, `tests/test_evals_diff.py`
+What changed: `EvalResult` carries `rounds` and `tool_calls`, read from the
+session transcript rather than reported by a driver. `evals.diff` prints both
+per ATTEMPT and BELOW the line - the verdict never reads them, so getting
+cheaper while breaking a solid case is still REGRESSED and spending more rounds
+to fix a case you used to fail is still IMPROVED. Added
+`removes_duplicate_definitions_without_losing_anything`, which reproduces the
+real file's shape; its check counts declarations INCLUDING INDENTED ONES.
+THE LESSON, twice over in one day: a `grep "^function"` reads a nested
+definition as absent. That produced a false data-loss alarm on the user's file
+(I told them not to apply a correct fix) and then missed a real one the next
+run. And the "consistent 3-in-3 read-loop leak" - 3, 13, 12 blocked reads - did
+not reproduce at all on the next three runs (8, 1, 3) of the same code against
+the same file. Rounds were 24 in all seven runs taken. Efficiency work off
+3-run samples is chasing variance; that is what this telemetry exists to end.
+First measured run of the new case: PASS, 25 rounds, 23 tool calls.
+Log: logs/test-runs/2026-08-21-real-file-repair.log
+
 ### 2026-08-21 - Context control from the chat, and three commands that were lying
 Files edited: `shamsu/cli/repl.py`, `shamsu/agents/simple_chat.py`,
 `shamsu/agents/simple_prompt.py`, `shamsu/agents/prompts/simple_system.md`,
