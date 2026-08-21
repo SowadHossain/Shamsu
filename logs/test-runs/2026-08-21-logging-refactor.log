@@ -204,3 +204,115 @@ FOURTH destination, holding the full prompt and raw response verbatim for
 simple mode. It overlaps `log-detailed.md` almost exactly. Folding it in means
 deleting a working, tested verbatim archive, which is a product call rather
 than a refactor. Left running; both files are written today.
+
+
+================================================================
+SECOND PASS — aligned to the Turn Log Viewer artifact
+================================================================
+The artifact could not be fetched (shared-with, not owned: "served to you as a
+public (non-member) reader"). The user downloaded it; the saved top-level HTML
+is only the frame shell, and the content is in
+`Turn Log Viewer_files/saved_resource.html`. Transcribed to
+docs/reference/turn-log-mockup.md.
+
+THE RULE I HAD WRONG
+--------------------
+    "log-summary.md is deliberately titles-only — each line is a link, not a
+     description, into the matching section of log-detailed.md."
+
+I was writing TWO lines per tool: the call, then an indented result quoting the
+message. The live run had already shown why that fails:
+
+    - ▤ `contract_assert_fail` · [detail](...)
+        - ok: Contract: Fix divide() in calc.py to raise ValueError on a zero
+          divisor a01 [.....] {'description': 'divide(10, 2) should return 5'}
+          a02 [FAIL] {'descr... [clipped 216 chars] · [detail](...)
+
+A call and its result are ONE action to a reader. They are now one row. The
+tool call is buffered until its result arrives; if something interrupts (an
+approval firing from inside `patch_file`), the call flushes first to keep the
+order honest and the result gets its own row naming its tool.
+
+Kept one word past titles-only: a FAILED marker on the row. A live 3B run
+called `contract_assert_pass` seven times and was refused every time; without
+the marker those are seven identical rows. The message text stays detail-only.
+
+FOUR MORE GAPS CLOSED
+---------------------
+1. "Building context" is a row in the summary at both levels; the pack itself
+   stays verbose-only. It was verbose-only entirely.
+2. System notices ("⚠ context is filling; eliding older tool payloads") are a
+   row type in BOTH files, never a link. `_activity` only ever reached a
+   screen, so the one line that explains why later rows look different was
+   never in the record. New `ledger.log_notice` / `writer.append_notice`.
+3. The verdict carries its one-line reason: "Verdict: success — 2 files
+   changed, checks passed".
+4. Turn header is `## Turn \`<id>\`` + `2026-08-21 07:26:18 · via cli`, and
+   `patch_file` reads as "Editing" — both straight from the mockup.
+
+A THIRD SIMPLE-MODE LEDGER GAP, FOUND BY THE NEXT LIVE RUN
+----------------------------------------------------------
+    ✗ **Verdict: failed** — checks passed
+
+A contradiction. `changed_files` was `[]` while calc.py on disk was correctly
+fixed. Cause: `replace_symbol` and `append_file` are executed by the loop
+itself in `_execute` rather than handed to the registry, and the registry is
+what journals mutations. So a turn whose only edit was a `replace_symbol`
+recorded no mutation at all - which also blinds `evidence_outcome()`, and means
+the retry grouping ("1 of 2 kept") could never fire for it.
+
+Fixed narrowly: `_SELF_EXECUTED_WRITERS = {"replace_symbol", "append_file"}`
+journal an `applied` mutation with `rollback_available=False` (no transaction,
+no backup - promising a rollback would be a lie). Registry writes are untouched,
+so nothing is double-counted; there is a test for each direction.
+
+`verdict_reason` also fixed: it now always states the changed-files fact, so
+"checks passed" can never stand alone next to a failed verdict. The check in
+question was a syntax verdict on a file the turn only READ.
+
+THE SAME PROMPT, FINAL STATE
+----------------------------
+Workspace: test-shamsu/logfinal. calc.py correctly patched.
+
+    ## Turn `3f3ffb21e0c8`
+    2026-08-21 07:26:18 · via cli
+
+    > divide() in calc.py crashes on a zero divisor. Make it raise ValueError...
+
+    - ◆ **Model responded** · 3.4s · [detail](...#doc-3f3ffb21e0c8-model-0001)
+    - ▤ Reading `calc.py` · [detail](...)
+    - ◆ **Model responded** · 514ms · [detail](...)
+    - ▤ Reading symbol `calc.py` · [detail](...)
+    - ◆ **Model responded** · 1.2s · [detail](...)
+    - ▤ Editing `calc.py` · [detail](...)
+    - ⚑ **Approval** — `file_edit` on `calc.py` — **approved** · approval_callback · once
+    - ✎ **Files changed** — `calc.py` · **applied** · [detail](...)
+    - ▤ `patch_file` — result · [detail](...)
+    - ✗ `run_tests` · **FAILED** · [detail](...)
+    - ▤ `contract_create` · [detail](...)
+    - ▤ `contract_status` · [detail](...)          [x8, the 3B thrashing]
+    ...
+    ✗ **Verdict: failed** — 1 file changed, checks passed
+
+    **Agent final output**
+    The model returned an empty reply 3 times. ...
+
+30 rows, readable in one screen. The fix landed, the contract loop thrashed,
+and both facts are visible without opening anything.
+
+TESTS
+-----
+    tests/test_trace_output.py    47 passed (17 before this work)
+    FULL SUITE: 3516 passed, 2 skipped
+
+New in this pass:
+    test_a_call_and_its_result_are_one_row
+    test_a_failed_tool_is_marked_on_its_row
+    test_an_interrupted_call_keeps_the_order_honest
+    test_a_summary_row_never_quotes_the_payload
+    test_building_context_is_a_row_but_the_pack_is_verbose_only
+    test_a_system_notice_is_a_row_in_both_files
+    test_the_verdict_carries_its_one_line_reason
+    test_the_final_output_is_never_behind_a_link
+    test_a_self_executed_write_reaches_changed_files
+    test_a_registry_write_is_not_journalled_twice

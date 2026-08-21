@@ -3088,6 +3088,57 @@ class SimpleChatLoop:
     # in it and no sign of what the agent read, ran, or said. These four are
     # that promise, kept. All best-effort: logging must never break a turn.
 
+    def _notice(self, message: str) -> None:
+        """Say something about the TURN, to the console and to the log.
+
+        `_activity` only ever reached a screen, so "context is filling" - the
+        one line that explains why every row after it looks different - was
+        never in the record anyone reads afterwards."""
+        self._activity(message)
+        if self.action_ledger is None:
+            return
+        try:
+            self.action_ledger.log_notice(message)
+        except Exception:
+            pass
+
+    #: Writing tools this loop executes itself, in `_execute`, instead of
+    #: handing to the registry. The registry journals a mutation for everything
+    #: it runs; these had nobody doing it, so a file they changed never reached
+    #: `summary.json:changed_files` - and a turn whose only edit was a
+    #: `replace_symbol` reported that nothing happened. Live 2026-08-21: calc.py
+    #: was correctly fixed and the run closed "failed" with `changed_files: []`.
+    _SELF_EXECUTED_WRITERS = frozenset({"replace_symbol", "append_file"})
+
+    def _ledger_mutation(
+        self, name: str, arguments: dict[str, Any], result: ToolResult
+    ) -> None:
+        """Journal a write this loop performed itself.
+
+        Deliberately narrow: anything the registry ran has already recorded its
+        own mutation with real hashes and a rollback, and a second record would
+        double-count the file in every changed-files list."""
+        if self.action_ledger is None or name not in self._SELF_EXECUTED_WRITERS:
+            return
+        path = str(
+            (result.data or {}).get("resolved_filepath")
+            or arguments.get("filepath")
+            or ""
+        ).strip()
+        if not path:
+            return
+        try:
+            self.action_ledger.log_mutation_finished(
+                f"txn_{name}_{self._event_seq}",
+                "applied",
+                [path],
+                # No transaction and no backup: this write went straight to
+                # disk, so promising a rollback would be a lie.
+                rollback_available=False,
+            )
+        except Exception:
+            pass
+
     def _ledger_tool_call(self, name: str, arguments: dict[str, Any]) -> str:
         if self.action_ledger is None:
             return ""
@@ -3568,12 +3619,12 @@ class SimpleChatLoop:
             return self._elide_payloads()
         allocation = self.token_allocation()
         if allocation.fattest() != "tool results":
-            self._activity(
+            self._notice(
                 f"context is filling and the largest part is {allocation.fattest()}; "
                 "eliding payloads will not help much here"
             )
             return self._elide_payloads()
-        self._activity("context is filling; eliding older tool payloads")
+        self._notice("context is filling; eliding older tool payloads")
         return self._elide_payloads(
             self._verbatim_tail(VERBATIM_TAIL_FRACTION_UNDER_PRESSURE)
         )
@@ -3944,6 +3995,7 @@ class SimpleChatLoop:
                     self._ranges_sent.clear()
             if name in WRITING_TOOLS:
                 if result.ok:
+                    self._ledger_mutation(name, arguments, result)
                     # The world moved. A patch that could not match before may
                     # match now that this file has actually changed, so its
                     # remembered failures stop being true.

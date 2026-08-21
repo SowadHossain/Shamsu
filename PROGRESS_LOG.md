@@ -22,9 +22,19 @@ overflow rule at 2,400 chars. The first live run found that SIMPLE MODE - the
 default path - never logged its tools or model calls to the ledger at all, so
 the log came out with approvals and file writes in it and no sign of what the
 agent ran; that is now wired.
-Tests: 38 in `tests/test_trace_output.py` (rewritten from 17), full suite 3507
-passed / 2 skipped. Four live runs on qwen2.5-coder:3b-instruct.
+Then aligned to the Turn Log Viewer artifact once it could be read (downloaded;
+the fetch is blocked because it is shared-with rather than owned). Its governing
+rule - "log-summary.md is deliberately titles-only, each line is a link, not a
+description" - meant a tool call and its result became ONE row instead of two,
+plus: "Building context" as a row, system notices in both files, a verdict
+reason, and the mockup's header format. The next live run then exposed a third
+simple-mode ledger gap: `replace_symbol` and `append_file` are executed by the
+loop rather than the registry, so a real edit never reached `changed_files` -
+calc.py was correctly fixed and the run closed `failed` with nothing recorded.
+Tests: 47 in `tests/test_trace_output.py` (17 before), full suite 3516 passed /
+2 skipped. Seven live runs on qwen2.5-coder:3b-instruct.
 Log: logs/test-runs/2026-08-21-logging-refactor.log
+Spec: docs/reference/turn-log-mockup.md (gitignored, local)
 
 ### 2026-08-21 - The reported failure, reproduced on the user's own file and fixed
 Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_outline.py`,

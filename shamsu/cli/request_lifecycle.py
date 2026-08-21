@@ -61,6 +61,7 @@ def _close_run_narrative(workspace: Path, ledger: ActionLedger) -> None:
     if not ledger.enabled:
         return
     try:
+        from shamsu.action_ledger.ledger import verdict_reason
         from shamsu.ui.turnlog import release_writer
 
         summary = action_ledger_store.load_summary(workspace, ledger.run_id) or {}
@@ -69,6 +70,7 @@ def _close_run_narrative(workspace: Path, ledger: ActionLedger) -> None:
         writer.close_turn(
             final=action_ledger_store.load_final_output(workspace, ledger.run_id),
             status=str(summary.get("status") or manifest.get("status") or "unknown"),
+            reason=verdict_reason(summary),
         )
         # A closed turn is never written to again, and its writer is holding a
         # buffer the next turn must not inherit.

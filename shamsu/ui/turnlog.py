@@ -147,7 +147,7 @@ _TOOL_VERBS = {
     "outline": "Outlining",
     "write_file": "Writing",
     "append_file": "Appending to",
-    "patch_file": "Patching",
+    "patch_file": "Editing",
     "replace_symbol": "Replacing symbol in",
     "search_files": "Searching",
     "find_file": "Finding",
@@ -161,8 +161,8 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _clock() -> str:
-    return datetime.now(timezone.utc).strftime("%H:%M:%S")
+def _stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 class TurnLogWriter:
@@ -199,10 +199,6 @@ class TurnLogWriter:
         # per-instance buffer, because the caller builds a fresh writer for
         # every single row - see `writer_for`, which is how a turn keeps one.
         self._pending: list[dict[str, Any]] = []
-        # The tool whose result is still expected on the next line, so an
-        # interleaved row cannot steal its indentation. Survives across calls
-        # for the same reason `_pending` does.
-        self._open_tool = ""
         # Anchors written to `log-detailed.md` so far. None until counted from
         # the file once; see `_anchor_seq`.
         self._anchor_count: int | None = None
@@ -229,34 +225,50 @@ class TurnLogWriter:
     # -- turn lifecycle ----------------------------------------------------
 
     def open_turn(self, prompt: str, route: str = "") -> None:
-        """Start this turn in both documents with the prompt that triggered it."""
+        """Start this turn in both documents with the prompt that triggered it.
+
+        The prompt is the one row that is never collapsed and never a link, in
+        either file: it is the question being answered."""
         self._ensure_headers()
-        badge = f" `{self.source}`" if self.source else ""
-        heading = f"## {_clock()} · `{self.turn_id}`{badge}"
+        via = f" · via {self.source}" if self.source else ""
         text = _clip(redact(str(prompt or "")).strip(), _MAX_PROMPT_CHARS)
-        block = [heading, "", _blockquote(text) if text else "> _(no prompt)_", ""]
+        block = [
+            f"## Turn `{self.turn_id}`",
+            "",
+            f"{_stamp()}{via}",
+            "",
+            _blockquote(text) if text else "> _(no prompt)_",
+            "",
+        ]
         if route:
             block.extend([f"**Route:** {redact(str(route))}", ""])
         self._append_summary("\n".join(block) + "\n")
         self._append_detailed("\n".join(block) + "\n")
 
-    def close_turn(self, final: str = "", status: str = "") -> None:
-        """Finish the turn with its answer. Safe to call more than once - the
-        marker keeps a second call from appending a duplicate result block."""
+    def close_turn(self, final: str = "", status: str = "", reason: str = "") -> None:
+        """Finish the turn: the verdict, then the answer.
+
+        Both are always visible in both documents. The verdict is the pill you
+        look for when scanning a long session; the answer is the reply the user
+        actually read, and a log that makes you click for it is not a log of the
+        conversation. Safe to call more than once - the marker keeps a second
+        call from appending a duplicate."""
         if self._is_closed():
             return
         self._flush_pending()
         answer = _clip(redact(str(final or "")).strip(), _MAX_ANSWER_CHARS)
         verdict = _verdict_icon(status)
-        self._append_summary(
-            f"\n**{verdict} {status or 'unknown'}**\n\n"
-            + (_blockquote(_clip(answer, _MAX_TITLE_CHARS)) if answer else "> _(no answer)_")
-            + f"\n\n{_CLOSED_MARKER}\n\n"
+        note = " ".join(_clip(redact(str(reason or "")), _MAX_TITLE_CHARS).split())
+        headline = f"{verdict} **Verdict: {status or 'unknown'}**" + (
+            f" — {note}" if note else ""
         )
         body = answer or "_(no final answer recorded)_"
+        self._append_summary(
+            f"\n{headline}\n\n**Agent final output**\n\n{body}\n\n{_CLOSED_MARKER}\n\n"
+        )
         link = self._spill_if_large(body, "final", "md")
         self._append_detailed(
-            f"\n### Result — {verdict} {status or 'unknown'}\n\n"
+            f"\n{headline}\n\n**Agent final output**\n\n"
             + (link or body)
             + f"\n\n{_CLOSED_MARKER}\n\n"
         )
@@ -277,62 +289,80 @@ class TurnLogWriter:
         self._row(ICON_NOTE, title, kind="note", detail=payload if self.verbose else None)
 
     def append_tool_call(self, name: str, arguments: dict[str, Any] | None = None) -> None:
-        """A tool being used, and on what.
+        """Hold the call until its result, so the two are one row.
 
         Driven from the ActionLedger rather than the trace, because every
         execution path logs its tools there - the chat loop, the composite
-        runner, the scaffold pipeline."""
-        target = _tool_target(arguments)
-        verb = _TOOL_VERBS.get(str(name))
-        if verb and target:
-            title = f"{verb} `{_clip(target, _MAX_VALUE_CHARS)}`"
-        elif target:
-            title = f"`{redact(str(name))}` — `{_clip(target, _MAX_VALUE_CHARS)}`"
-        else:
-            title = f"`{redact(str(name))}`"
-        self._row(
-            ICON_TOOL,
-            title,
-            kind="tool",
-            sections=[("Arguments", _as_json(arguments), "json")] if arguments else None,
+        runner, the scaffold pipeline.
+
+        Buffered because a call and its result are one ACTION to a reader, and
+        the summary gives one line per action. Nothing is lost if the result
+        never comes: `_flush_pending` emits the call on its own."""
+        self._flush_pending()
+        self._pending.append(
+            {"kind": "tool", "name": str(name), "arguments": dict(arguments or {})}
         )
-        self._open_tool = str(name)
 
     def append_tool_result(
         self, name: str, ok: bool, message: str = "", data: Any = None
     ) -> None:
-        """What the tool actually did, indented under the call it belongs to.
+        """Close the open call, or stand alone if something interrupted it.
 
-        Only indented while that call is still the row above. A tool can be
-        interrupted mid-flight - an approval prompt fires from inside
-        `patch_file` and lands between the call and its result - and an indented
-        line under an approval row reads as the approval's outcome. When
-        anything came between, the result is promoted to a row that names its
-        own tool."""
-        outcome = "ok" if ok else "**FAILED**"
-        # Hard clip: a summary row is one line. `patch_file` answers with a
-        # whole diff, which is worth reading in `log-detailed.md` and worth
-        # exactly one line here.
-        text = " ".join(_clip(redact(str(message or "")), _MAX_TITLE_CHARS).split())
+        A tool can be interrupted mid-flight - an approval prompt fires from
+        inside `patch_file` and lands between the call and its result. That
+        flushes the call as its own row to keep the order honest, so the result
+        arrives with nothing to attach to and names its own tool instead."""
         sections: list[tuple[str, str, str]] = []
         if message:
             sections.append(("Result", redact(str(message)), "text"))
         if data not in (None, {}, [], ""):
             sections.append(("Result data", _as_json(data), "json"))
-        detached = self._open_tool != str(name)
-        self._open_tool = ""
-        if detached:
-            line = f"- {ICON_TOOL} `{redact(str(name))}` → {outcome}{f': {text}' if text else ''}"
-        else:
-            line = f"    - {outcome}{f': {text}' if text else ''}"
-        if sections:
-            anchor = self._anchor("result")
-            self._append_summary(f"{line} · [detail]({DETAILED_FILE}#{anchor})\n")
-            self._write_detail_block(
-                anchor, f"`{redact(str(name))}` — {'ok' if ok else 'FAILED'}", sections
-            )
+        call = self._take_tool(str(name))
+        if call is not None:
+            arguments = call.get("arguments") or {}
+            if arguments:
+                sections.insert(0, ("Arguments", _as_json(arguments), "json"))
+            self._write_tool_row(str(name), arguments, ok=ok, sections=sections)
             return
-        self._append_summary(line + "\n")
+        self._write_tool_row(str(name), {}, ok=ok, sections=sections, detached=True)
+
+    def _write_tool_row(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        ok: bool | None = None,
+        sections: list[tuple[str, str, str]] | None = None,
+        detached: bool = False,
+    ) -> None:
+        """One line for one tool action.
+
+        Titles-only by design: the row says which tool, on what, and whether it
+        failed. It does not quote the result - `patch_file` answers with a whole
+        diff and `contract_assert_pass` with a paragraph, and a summary that
+        pastes those stops being skimmable at about the fourth row. The text is
+        one click away in `log-detailed.md`, which is the point of having two
+        files."""
+        target = _tool_target(arguments)
+        verb = _TOOL_VERBS.get(name)
+        if verb and target:
+            title = f"{verb} `{_clip(target, _MAX_VALUE_CHARS)}`"
+        elif target:
+            title = f"`{redact(name)}` — `{_clip(target, _MAX_VALUE_CHARS)}`"
+        else:
+            title = f"`{redact(name)}`"
+        if detached:
+            title = f"{title} — result"
+        self._row(
+            ICON_TOOL if ok is not False else ICON_FAIL,
+            title,
+            kind="tool",
+            # Only failure earns a marker. Marking every success would put a
+            # word on every row that carries no information, which is how a
+            # summary turns back into a wall.
+            outcome="" if ok is not False else "FAILED",
+            sections=sections,
+        )
 
     def append_decision(self, record: dict[str, Any]) -> None:
         decision = redact(str(record.get("decision", "decision")))
@@ -412,17 +442,38 @@ class TurnLogWriter:
         )
 
     def append_context(self, record: dict[str, Any]) -> None:
-        if not self.verbose:
-            return
+        """Building the pack the model was about to see.
+
+        The row appears at both levels - what was retrieved, and how much of the
+        window it cost, is part of the story of the turn. The pack ITSELF is
+        verbose-only: it is the single largest payload a turn produces and it is
+        reconstructable from the transcript."""
         tokens = record.get("token_estimate", "unknown")
         snippets = len(record.get("snippets") or [])
         self._row(
             ICON_NOTE,
-            f"**Context** `{redact(str(record.get('context_id', 'context')))}` "
-            f"— {tokens} tokens, {snippets} snippet(s)",
+            f"**Building context** — {snippets} snippet(s), ~{tokens} tokens",
             kind="context",
-            sections=[("Context payload", _as_json(record), "json")],
+            sections=(
+                [("Context sent to model", _as_json(record), "json")]
+                if self.verbose
+                else None
+            ),
         )
+
+    def append_notice(self, message: str, level: str = "warning") -> None:
+        """Something that happened to the TURN, not a step the agent took.
+
+        "context is filling; eliding older tool payloads" explains why the rows
+        after it look different, so it is never collapsed and never a link - it
+        is the whole content, and it belongs in both documents."""
+        text = " ".join(_clip(redact(str(message or "")), _MAX_TITLE_CHARS).split())
+        if not text:
+            return
+        self._flush_pending()
+        line = f"- {ICON_FAIL if level == 'error' else '⚠'} _{text}_\n"
+        self._append_summary(line)
+        self._append_detailed(line)
 
     # -- approvals ---------------------------------------------------------
 
@@ -634,7 +685,6 @@ class TurnLogWriter:
         sections: list[tuple[str, str, str]] | None = None,
     ) -> None:
         """One summary line, plus its detail block when there is anything to show."""
-        self._open_tool = ""
         self._flush_pending()
         sections = [pair for pair in (sections or []) if str(pair[1]).strip()]
         if detail not in (None, {}, [], ""):
@@ -720,6 +770,14 @@ class TurnLogWriter:
                 return item
         return None
 
+    def _take_tool(self, name: str) -> dict[str, Any] | None:
+        """Pull out the buffered call this result belongs to, if it is still
+        waiting. Matched by name: a nested tool can finish between them."""
+        for position, item in enumerate(self._pending):
+            if item.get("kind") == "tool" and item.get("name") == name:
+                return self._pending.pop(position)
+        return None
+
     def _take_approval(self) -> dict[str, Any]:
         """Pull out the approval request still waiting for an answer."""
         for position, item in enumerate(self._pending):
@@ -751,6 +809,19 @@ class TurnLogWriter:
                 # Reasoning nobody claimed - the call failed before it finished,
                 # or a bare completion with no ledger call id. Keep it; a
                 # dropped trace is the thing this log exists to stop losing.
+                # A call whose result never arrived, or one an approval
+                # interrupted. Either way the call happened and the row is true.
+                elif item.get("kind") == "tool":
+                    arguments = item.get("arguments") or {}
+                    self._write_tool_row(
+                        str(item.get("name") or ""),
+                        arguments,
+                        sections=(
+                            [("Arguments", _as_json(arguments), "json")]
+                            if arguments
+                            else None
+                        ),
+                    )
                 elif item.get("kind") == "reasoning" and item.get("text"):
                     self._detail_only(
                         f"Reasoning trace — `{item.get('call_id') or 'unattributed'}`",

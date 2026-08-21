@@ -132,9 +132,11 @@ def test_summary_records_prompt_tools_and_answer(tmp_path: Path):
 
     assert "add a healthcheck endpoint" in summary        # the prompt
     assert "app/health.py" in summary                     # what it acted on
-    assert "Wrote 12 lines" in summary                    # what happened
     assert "Added a /health endpoint." in summary         # the answer
     assert "success" in summary
+    # Titles-only: what the tool SAID is a click away, not on the row.
+    assert "Wrote 12 lines" not in summary
+    assert "Wrote 12 lines" in ledger.detail_log_path.read_text(encoding="utf-8")
 
 
 def test_summary_and_detail_are_written_side_by_side(tmp_path: Path):
@@ -291,10 +293,11 @@ def test_tools_are_recorded_from_the_ledger_on_every_path(tmp_path: Path):
     ledger.log_tool_result(failed, "run_command", False, "Command exited with 1.")
 
     summary = ledger.summary_log_path.read_text(encoding="utf-8")
+    detail = ledger.detail_log_path.read_text(encoding="utf-8")
     assert "hello.py" in summary
-    assert "Created hello.py (+1 lines)." in summary
     assert "python hello.py" in summary
-    assert "FAILED" in summary
+    assert "FAILED" in summary                # the failed call is marked
+    assert "Created hello.py (+1 lines)." in detail
 
 
 def test_chat_loop_tools_are_not_recorded_twice(tmp_path: Path):
@@ -321,8 +324,9 @@ def test_chat_loop_tools_are_not_recorded_twice(tmp_path: Path):
         clear_current_run()
 
     summary = ledger.summary_log_path.read_text(encoding="utf-8")
+    # One action, one row - the call and its result are the same line.
     assert summary.count("app.py`") == 1
-    assert summary.count("Wrote app.py") == 1
+    assert ledger.detail_log_path.read_text(encoding="utf-8").count("Wrote app.py") == 1
 
 
 def test_verbose_detail_carries_prompt_context_and_command_output(tmp_path: Path, monkeypatch):
@@ -344,7 +348,7 @@ def test_verbose_detail_carries_prompt_context_and_command_output(tmp_path: Path
     detail = ledger.detail_log_path.read_text(encoding="utf-8")
     assert "Prompt sent" in detail and "inspect app.py" in detail
     assert "Inspect the failing file first." in detail
-    assert "Context payload" in detail
+    assert "Context sent to model" in detail
     assert "stdout" in detail and "one passed" in detail
     assert "stderr" in detail and "one failed" in detail
 
@@ -521,7 +525,7 @@ def test_a_telegram_turn_is_badged_with_its_surface(tmp_path: Path):
     ledger = start_run(tmp_path, "fix it", session_logger=logger, source="telegram")
     ledger.finish("Fixed.", status="success")
 
-    assert "`telegram`" in ledger.summary_log_path.read_text(encoding="utf-8")
+    assert "via telegram" in ledger.summary_log_path.read_text(encoding="utf-8")
 
 
 def test_a_local_turn_is_badged_cli_by_default(tmp_path: Path):
@@ -530,7 +534,7 @@ def test_a_local_turn_is_badged_cli_by_default(tmp_path: Path):
     ledger = start_run(tmp_path, "fix it")
     ledger.finish("Fixed.", status="success")
 
-    assert "`cli`" in ledger.summary_log_path.read_text(encoding="utf-8")
+    assert "via cli" in ledger.summary_log_path.read_text(encoding="utf-8")
 
 
 def test_an_oversized_tool_result_is_linked_not_inlined(tmp_path: Path):
@@ -645,11 +649,50 @@ def test_an_unanswered_approval_still_gets_a_row(tmp_path: Path):
     assert "**waiting**" in summary
 
 
-def test_a_result_split_from_its_call_names_its_own_tool(tmp_path: Path):
-    """Live 2026-08-21: an approval fires from inside `patch_file` and lands
-    between the call and its result, so the indented result line read as the
-    approval's outcome. When anything came between, the result gets a row that
-    says which tool it belongs to."""
+def test_a_call_and_its_result_are_one_row(tmp_path: Path):
+    """`log-summary.md` is titles-only: one line per ACTION, and a call plus its
+    result is one action. Two lines per tool made a 24-round turn a 50-row wall
+    with half the rows quoting diffs."""
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "read it")
+    call_id = ledger.log_tool_call("read_file", {"filepath": "calc.py"})
+    ledger.log_tool_result(call_id, "read_file", True, "Read file.")
+    ledger.finish("Read.", status="success")
+
+    summary = ledger.summary_log_path.read_text(encoding="utf-8")
+    rows = [line for line in summary.splitlines() if "calc.py" in line]
+    assert len(rows) == 1, rows
+    assert rows[0].startswith("- ")            # flush left; nothing is indented
+    assert "Read file." not in summary         # the result text is next door
+    assert "Read file." in ledger.detail_log_path.read_text(encoding="utf-8")
+
+
+def test_a_failed_tool_is_marked_on_its_row(tmp_path: Path):
+    """The one outcome worth a word in a titles-only summary. A live 3B run
+    called `contract_assert_pass` seven times and was refused every time; with
+    no marker those are seven identical rows."""
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "assert it")
+    call_id = ledger.log_tool_call("contract_assert_pass", {"assertion_id": "a01"})
+    ledger.log_tool_result(call_id, "contract_assert_pass", False, "a01 needs evidence")
+    ledger.finish("Stopped.", status="failed")
+
+    row = next(
+        line
+        for line in ledger.summary_log_path.read_text(encoding="utf-8").splitlines()
+        if "contract_assert_pass" in line
+    )
+    assert "FAILED" in row
+    assert "needs evidence" not in row         # marked, not quoted
+
+
+def test_an_interrupted_call_keeps_the_order_honest(tmp_path: Path):
+    """An approval fires from inside `patch_file` and lands between the call and
+    its result. The call is flushed first so the rows stay in the order they
+    happened, and the result then names its own tool rather than looking like
+    the approval's outcome."""
     from shamsu.action_ledger.ledger import start_run
 
     ledger = start_run(tmp_path, "patch it")
@@ -663,30 +706,17 @@ def test_a_result_split_from_its_call_names_its_own_tool(tmp_path: Path):
     ledger.log_tool_result(call_id, "patch_file", True, "Edited calc.py: +2 -0 lines.")
     ledger.finish("Patched.", status="success")
 
-    summary = ledger.summary_log_path.read_text(encoding="utf-8")
-    result_line = next(
-        line for line in summary.splitlines() if "Edited calc.py" in line
-    )
-    assert not result_line.startswith("    "), "still indented under the approval"
-    assert "patch_file" in result_line
+    lines = ledger.summary_log_path.read_text(encoding="utf-8").splitlines()
+    call_at = next(i for i, line in enumerate(lines) if "Editing `calc.py`" in line)
+    approval_at = next(i for i, line in enumerate(lines) if "**Approval**" in line)
+    result_at = next(i for i, line in enumerate(lines) if "result" in line.lower())
+    assert call_at < approval_at < result_at
+    assert not lines[result_at].startswith("    ")
 
 
-def test_an_uninterrupted_result_stays_indented_under_its_call(tmp_path: Path):
-    from shamsu.action_ledger.ledger import start_run
-
-    ledger = start_run(tmp_path, "read it")
-    call_id = ledger.log_tool_call("read_file", {"filepath": "calc.py"})
-    ledger.log_tool_result(call_id, "read_file", True, "Read file.")
-    ledger.finish("Read.", status="success")
-
-    summary = ledger.summary_log_path.read_text(encoding="utf-8")
-    result_line = next(line for line in summary.splitlines() if "Read file." in line)
-    assert result_line.startswith("    - ok")
-
-
-def test_a_summary_row_stays_one_line_however_long_the_result(tmp_path: Path):
+def test_a_summary_row_never_quotes_the_payload(tmp_path: Path):
     """`patch_file` answers with a whole diff. That belongs in the detail file;
-    the summary gets one line of it."""
+    the summary row says which file was edited and nothing else."""
     from shamsu.action_ledger.ledger import start_run
 
     ledger = start_run(tmp_path, "patch it")
@@ -696,9 +726,9 @@ def test_a_summary_row_stays_one_line_however_long_the_result(tmp_path: Path):
     ledger.finish("Patched.", status="success")
 
     summary = ledger.summary_log_path.read_text(encoding="utf-8")
-    row = next(line for line in summary.splitlines() if "Edited calc.py" in line)
-    assert len(row) < 400
-    # ...and the whole diff is still recoverable next door.
+    row = next(line for line in summary.splitlines() if "calc.py" in line)
+    assert len(row) < 200
+    assert "+ line 0" not in summary
     assert "+ line 59" in ledger.detail_log_path.read_text(encoding="utf-8")
 
 
@@ -782,7 +812,7 @@ def test_anchors_stay_unique_across_turns_and_processes(tmp_path: Path):
         tmp_path / ".shamsu" / "sessions" / logger.session_id / "log-detailed.md"
     ).read_text(encoding="utf-8")
     anchors = re.findall(r'<a id="(doc-[a-z0-9_-]+)"></a>', detail)
-    assert len(anchors) >= 12
+    assert len(anchors) >= 6
     assert len(set(anchors)) == len(anchors), "an anchor id was written twice"
 
 
@@ -808,3 +838,207 @@ def test_two_attachments_in_one_block_do_not_collide(tmp_path: Path):
         for name in spilled
     ]
     assert any(body == message for body in bodies)
+
+
+# -- Aligned to the Turn Log Viewer mockup ----------------------------------
+
+
+def test_building_context_is_a_row_but_the_pack_is_verbose_only(tmp_path: Path):
+    """The mockup lists "Building context" in the summary and the pack itself
+    under log-detailed.md only. What was retrieved and what it cost is part of
+    the turn; the pack is the largest payload a turn produces."""
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "why is it slow")
+    ledger.log_context_preview(
+        {"task_id": "t1", "token_estimate": 1180, "snippets": [{"path": "a.py"}]}
+    )
+    ledger.finish("Because of the loop.", status="success")
+
+    summary = ledger.summary_log_path.read_text(encoding="utf-8")
+    detail = ledger.detail_log_path.read_text(encoding="utf-8")
+    assert "Building context" in summary
+    assert "1180 tokens" in summary or "~1180" in summary
+    assert "Context sent to model" not in detail   # essential mode
+
+
+def test_a_system_notice_is_a_row_in_both_files(tmp_path: Path):
+    """"context is filling" explains why the rows after it look different, so
+    it is never collapsed and never a link - it belongs in both documents."""
+    from shamsu.action_ledger.ledger import start_run
+
+    ledger = start_run(tmp_path, "long turn")
+    ledger.log_notice("context is filling; eliding older tool payloads")
+    ledger.finish("Done.", status="success")
+
+    for path in (ledger.summary_log_path, ledger.detail_log_path):
+        text = path.read_text(encoding="utf-8")
+        assert "context is filling; eliding older tool payloads" in text
+        assert "log-detailed.md#" not in text.split("context is filling")[1][:80]
+
+
+def test_the_verdict_carries_its_one_line_reason(tmp_path: Path):
+    """"success" alone does not separate a turn that changed two files and
+    verified them from one that answered a question."""
+    from shamsu.action_ledger.ledger import verdict_reason
+
+    assert verdict_reason({"changed_files": ["a.py", "b.py"]}) == "2 files changed"
+    assert (
+        verdict_reason(
+            {
+                "changed_files": ["a.py"],
+                "verification": [{"type": "verification_passed"}],
+            }
+        )
+        == "1 file changed, checks passed"
+    )
+    assert (
+        verdict_reason(
+            {
+                "changed_files": ["a.py"],
+                "verification": [{"type": "verification_failed"}],
+            }
+        )
+        == "1 file changed, 1 check failed"
+    )
+    assert verdict_reason({"tools": [{"tool": "read_file"}]}) == (
+        "1 tool call, nothing changed"
+    )
+    assert verdict_reason({}) == ""
+    # A turn that wrote nothing does not get to report "checks passed" as its
+    # whole story - live 2026-08-21 that produced "Verdict: failed - checks
+    # passed", where the check was a syntax verdict on a file it only read.
+    assert verdict_reason(
+        {"tools": [{"tool": "read_file"}], "verification": [{"type": "verification_passed"}]}
+    ) == "1 tool call, nothing changed"
+
+
+def test_the_final_output_is_never_behind_a_link(tmp_path: Path):
+    """The mockup marks the prompt, the verdict and the agent's final output as
+    always visible in both files. A log of a conversation that makes you click
+    for the reply is not a log of the conversation."""
+    ledger, _logger = _finished_run(tmp_path)
+
+    for path in (ledger.summary_log_path, ledger.detail_log_path):
+        text = path.read_text(encoding="utf-8")
+        assert "add a healthcheck endpoint" in text      # the prompt
+        assert "Verdict:" in text                        # the verdict
+        assert "Added a /health endpoint." in text       # the reply
+
+
+def test_a_self_executed_write_reaches_changed_files(tmp_path: Path):
+    """`replace_symbol` and `append_file` are run by the loop itself rather than
+    the registry, so nothing journalled the file they changed. Live 2026-08-21:
+    calc.py was correctly fixed and the run closed `failed` with
+    `changed_files: []`, which also blinded `evidence_outcome`."""
+    import asyncio
+
+    from shamsu.action_ledger import store
+    from shamsu.action_ledger.ledger import start_run
+    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_chat import SimpleChatLoop
+    from shamsu.agents.simple_prompt import simple_system_prompt
+    from shamsu.tools.agent_tools import AgentToolRegistry
+    from tests.test_simple_chat import FakeClient, _text
+
+    (tmp_path / "calc.py").write_text(
+        "def divide(a, b):\n    return a / b\n", encoding="utf-8"
+    )
+    logger = SessionManager(tmp_path).create_session()
+    ledger = start_run(tmp_path, "guard the divisor", session_logger=logger)
+    loop = SimpleChatLoop(
+        tmp_path,
+        client=FakeClient(
+            [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "replace_symbol",
+                                    "arguments": {
+                                        "filepath": "calc.py",
+                                        "symbol": "divide",
+                                        "content": (
+                                            "def divide(a, b):\n"
+                                            "    if b == 0:\n"
+                                            "        raise ValueError('no')\n"
+                                            "    return a / b\n"
+                                        ),
+                                    },
+                                }
+                            }
+                        ],
+                    }
+                },
+                _text("Guarded."),
+            ]
+        ),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True),
+        state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
+        model_name="qwen3:8b",
+        action_ledger=ledger,
+        log_turns=False,
+    )
+    asyncio.run(loop.run("guard the divisor"))
+    ledger.finish("Guarded.", status="success")
+
+    assert "ValueError" in (tmp_path / "calc.py").read_text(encoding="utf-8")
+    mutations = store.load_mutations(tmp_path, ledger.run_id)
+    assert [m["status"] for m in mutations] == ["applied"]
+    assert mutations[0]["touched_files"] == ["calc.py"]
+    summary = store.load_summary(tmp_path, ledger.run_id) or {}
+    assert summary.get("changed_files") == ["calc.py"]
+    assert "calc.py" in ledger.summary_log_path.read_text(encoding="utf-8")
+
+
+def test_a_registry_write_is_not_journalled_twice(tmp_path: Path):
+    """The registry already records its own mutation, with real hashes and a
+    rollback. A second record would double-count the file everywhere."""
+    import asyncio
+
+    from shamsu.action_ledger import store
+    from shamsu.action_ledger.ledger import start_run
+    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_chat import SimpleChatLoop
+    from shamsu.agents.simple_prompt import simple_system_prompt
+    from shamsu.tools.agent_tools import AgentToolRegistry
+    from tests.test_simple_chat import FakeClient, _text
+
+    logger = SessionManager(tmp_path).create_session()
+    ledger = start_run(tmp_path, "write a file", session_logger=logger)
+    loop = SimpleChatLoop(
+        tmp_path,
+        client=FakeClient(
+            [
+                {
+                    "message": {
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": {
+                                        "filepath": "app.py",
+                                        "content": "print('hi')\n",
+                                    },
+                                }
+                            }
+                        ],
+                    }
+                },
+                _text("Written."),
+            ]
+        ),
+        tools=AgentToolRegistry(tmp_path, approval_func=lambda _r: True, action_ledger=ledger),
+        state=ChatState(simple_system_prompt(tmp_path), hydrate=False),
+        model_name="qwen3:8b",
+        action_ledger=ledger,
+        log_turns=False,
+    )
+    asyncio.run(loop.run("write a file"))
+    ledger.finish("Written.", status="success")
+
+    summary = store.load_summary(tmp_path, ledger.run_id) or {}
+    assert summary.get("changed_files") == ["app.py"], summary.get("changed_files")

@@ -410,7 +410,7 @@ class ActionLedger:
             },
         }
         self._write_json(self.summary_path, summary)
-        self._narrative("close_turn", final_output, status)
+        self._narrative("close_turn", final_output, status, verdict_reason(summary))
         return summary
 
     def fail(self, error: str) -> dict[str, Any]:
@@ -1355,6 +1355,14 @@ class ActionLedger:
             snippet_count=len(preview.get("snippets") or []),
         )
 
+    def log_notice(self, message: str, level: str = "warning") -> None:
+        """Something that happened TO the turn - an elision, a timeout warning.
+
+        Not a step the agent took, so it gets a row of its own rather than
+        being folded into whatever ran next."""
+        self.log_event("turn_notice", message=message, level=level)
+        self._narrative("append_notice", message, level)
+
     def log_task_classified(self, task_type: str, **meta: Any) -> None:
         self.log_event("task_classified", task_type=task_type, **meta)
 
@@ -1885,6 +1893,35 @@ def start_run(
             workflow_id=ledger.run_id,
         )
     return ledger
+
+
+def verdict_reason(summary: dict[str, Any] | None) -> str:
+    """The one line that goes beside the verdict: what the turn actually did.
+
+    "success" on its own does not distinguish a turn that changed two files and
+    verified them from one that answered a question - and those are the two
+    things you most want to tell apart when scanning a session."""
+    summary = summary or {}
+    tools = summary.get("tools") or []
+    changed = [str(path) for path in (summary.get("changed_files") or [])]
+    parts: list[str] = []
+    if changed:
+        parts.append(f"{len(changed)} file{'s' if len(changed) != 1 else ''} changed")
+    elif tools:
+        # Always say this when it is true. Live 2026-08-21 a failed turn read
+        # "Verdict: failed - checks passed", because the syntax check on a file
+        # it merely READ was the only fact the reason had. "nothing changed" is
+        # the fact that actually explains the verdict.
+        parts.append(f"{len(tools)} tool call{'s' if len(tools) != 1 else ''}, nothing changed")
+    checks = [item for item in (summary.get("verification") or []) if isinstance(item, dict)]
+    failed = [item for item in checks if str(item.get("type", "")).endswith("failed")]
+    if failed:
+        parts.append(f"{len(failed)} check{'s' if len(failed) != 1 else ''} failed")
+    elif checks and changed:
+        # Only a claim about something that moved. "checks passed" on a turn
+        # that wrote nothing says less than it appears to.
+        parts.append("checks passed")
+    return ", ".join(parts)
 
 
 def _context_summary(record: dict[str, Any]) -> str:

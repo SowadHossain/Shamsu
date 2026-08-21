@@ -65,6 +65,40 @@ the summary stays skimmable on its own, so the response and the reasoning trace
 — the two things you debug a small model with — are kept at both levels.
 `verbose` adds the prompt that was sent and the context payload.
 
+### Changed — the summary is titles-only (2026-08-21)
+
+Aligned to the Turn Log Viewer design, whose governing rule is that
+`log-summary.md` is "deliberately titles-only - each line is a link, not a
+description". A tool call and its result are one action to a reader and are now
+one row; they were two, and the second quoted the result, which turned a
+24-round turn into a fifty-row wall half of it pasted diffs. One word survives
+past titles-only: a failed tool is marked on its row, because a live 3B run
+called `contract_assert_pass` seven times and was refused every time, and
+without the marker those are seven identical rows.
+
+Four smaller gaps closed at the same time: "Building context" is a row at both
+levels (the pack itself stays verbose-only); system notices such as "context is
+filling; eliding older tool payloads" are a row type in both files, never a
+link, and now reach the log at all rather than only the console; the verdict
+carries its one-line reason ("2 files changed, checks passed"); and the turn
+header carries the full timestamp and the surface it came from.
+
+### Fixed — a self-executed write never reached `changed_files` (2026-08-21)
+
+`replace_symbol` and `append_file` are run by the chat loop itself rather than
+handed to the tool registry, and the registry is what journals a mutation. So a
+turn whose only edit was a `replace_symbol` recorded no mutation at all: live
+2026-08-21, `calc.py` was correctly fixed and the run closed `failed` with
+`changed_files: []`. That also blinded `evidence_outcome()` and meant the retry
+grouping could never fire for those tools. They now journal an `applied`
+mutation with `rollback_available=False` - there is no transaction and no
+backup, so promising a rollback would be a lie. Registry writes are untouched
+and are not double-counted.
+
+The verdict reason was fixed with it: it now always states the changed-files
+fact, so a failed turn can no longer report "checks passed" as its whole story
+when the check in question was a syntax verdict on a file it only read.
+
 ### Fixed — simple mode never recorded its tools or model calls (2026-08-21)
 
 The readable log is built entirely from the ActionLedger, on the documented
