@@ -8704,10 +8704,16 @@ def test_empty_content_deletes_the_symbol_rather_than_being_a_missing_argument(t
     exact text of a thirty-line body, which is the retyping this tool exists to
     avoid.
     """
+    # TWO definitions of `dupe`, because deletion by name is now scoped to
+    # duplicates - see
+    # `test_deleting_a_duplicate_is_allowed_but_deleting_the_last_one_is_not`.
+    # The behaviour this test names is unchanged: empty content is an INTENT to
+    # delete, not a forgotten argument.
     (tmp_path / "a.js").write_text(
         "function keep() {\n  return 1;\n}\n\n"
         "function dupe() {\n  return 2;\n}\n\n"
-        "function alsoKeep() {\n  return 3;\n}\n",
+        "function alsoKeep() {\n  return 3;\n}\n\n"
+        "function dupe() {\n  return 4;\n}\n",
         encoding="utf-8",
     )
     loop = _loop(tmp_path, [_text("ok")])
@@ -8717,7 +8723,7 @@ def test_empty_content_deletes_the_symbol_rather_than_being_a_missing_argument(t
     assert result.ok, result.message
     assert "Deleted dupe" in result.message
     body = (tmp_path / "a.js").read_text(encoding="utf-8")
-    assert "function dupe" not in body
+    assert body.count("function dupe") == 1, "the duplicate went, one survived"
     assert "function keep" in body and "function alsoKeep" in body
 
 
@@ -9004,3 +9010,143 @@ def test_a_symbol_asked_for_with_its_signature_is_found(tmp_path):
     text = "function greet(name) {\n  return name;\n}\n"
 
     assert len(find_symbols(text, ".js", "greet(name)")) == 1
+
+
+# --- when a note stops working, take the tool ---------------------------------
+
+
+def test_read_file_is_withdrawn_after_three_reads_answered_from_cache(tmp_path):
+    """The overlap guard works perfectly and saves the wrong resource. Measured
+    across three live runs on qwen3.5:9b it suppressed 3, 13 and 12 payloads -
+    real protection for the window - and recovered ZERO rounds, because the
+    model asked again every time with slightly different numbers:
+
+        496-582, 496-570, 490-572, 496-582, 496-582, 496-580, 498-572
+
+    Run 3 failed for exactly that: one patch landed, then nine rounds spent
+    re-requesting a region it had been handed three times. A note is not an
+    action.
+    """
+    (tmp_path / "big.py").write_text(
+        "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+    offered = lambda: {s["function"]["name"] for s in loop._sent_schemas()}
+
+    loop._execute("read_file", {"filepath": "big.py", "start_line": 100, "end_line": 250})
+    assert "read_file" in offered()
+    for span in ((105, 210), (100, 215), (110, 240)):
+        loop._execute(
+            "read_file", {"filepath": "big.py", "start_line": span[0], "end_line": span[1]}
+        )
+
+    assert "read_file" not in offered(), "three ignored notes is enough"
+    assert "read_symbol" in offered(), "one function's source must still be reachable"
+
+
+def test_calling_the_withdrawn_tool_anyway_is_refused_and_points_at_the_exit(tmp_path):
+    """A model that has seen `read_file` for twenty rounds calls it from memory
+    for a round or two after it disappears. Answering with the ordinary cache
+    note would put it straight back in the loop."""
+    (tmp_path / "big.py").write_text(
+        "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._execute("read_file", {"filepath": "big.py", "start_line": 100, "end_line": 250})
+    for span in ((105, 210), (100, 215), (110, 240)):
+        loop._execute(
+            "read_file", {"filepath": "big.py", "start_line": span[0], "end_line": span[1]}
+        )
+
+    result = loop._execute("read_file", {"filepath": "big.py", "start_line": 100, "end_line": 250})
+
+    assert not result.ok
+    assert (result.data or {}).get("read_withdrawn")
+    assert "replace_symbol" in result.message, "it must name a different ACTION"
+
+
+def test_the_withdrawal_is_announced_once_and_not_repeated(tmp_path):
+    """A tool that vanishes without a word costs a round; the same message every
+    round is the nudge spiral this fix exists to end."""
+    (tmp_path / "big.py").write_text(
+        "\n".join(f"line_{i} = {i}" for i in range(400)) + "\n", encoding="utf-8"
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._execute("read_file", {"filepath": "big.py", "start_line": 100, "end_line": 250})
+    for span in ((105, 210), (100, 215), (110, 240)):
+        loop._execute(
+            "read_file", {"filepath": "big.py", "start_line": span[0], "end_line": span[1]}
+        )
+
+    first = loop._announce_withdrawn_reads()
+    second = loop._announce_withdrawn_reads()
+
+    assert "replace_symbol" in first and "read_symbol still works" in first
+    assert second == "", "said once, at the moment it happens"
+
+
+def test_an_edit_that_lands_gives_the_tool_back(tmp_path):
+    """Every guard in this loop needs an exit. The withdrawal is about a model
+    reading INSTEAD of acting - once it acts, the reason is gone."""
+    (tmp_path / "big.py").write_text(
+        "def keep():\n    return 1\n\n\ndef other():\n    return 2\n", encoding="utf-8"
+    )
+    turns = [
+        _tool("read_file", filepath="big.py", start_line=1, end_line=6),
+        _tool("read_file", filepath="big.py", start_line=1, end_line=6),
+        _tool("read_file", filepath="big.py", start_line=1, end_line=5),
+        _tool("read_file", filepath="big.py", start_line=2, end_line=6),
+        _tool("patch_file", filepath="big.py", old_string="return 1", new_string="return 9"),
+        _text("done"),
+    ]
+    loop = _loop(tmp_path, turns, max_rounds=8, verify_changes=False)
+
+    asyncio.run(loop.run("fix big.py"))
+
+    assert loop._read_withdrawn == set()
+    assert "read_file" in {s["function"]["name"] for s in loop._sent_schemas()}
+
+
+def test_deleting_a_duplicate_is_allowed_but_deleting_the_last_one_is_not(tmp_path):
+    """The regression this closes, from a live run on qwen3.5:9b: a patch removed
+    one of two `handleMouseMove` definitions - allowed, one remained - and eleven
+    rounds later `replace_symbol` with empty content removed the other. Two legal
+    steps, and the file lost a function nobody asked to delete.
+
+    `replace_symbol` was exempt from `_erased_a_definition` on the assumption
+    `_members_lost` covered it. It does not: that asks what vanished from INSIDE
+    a replaced symbol, never whether the symbol itself is gone from the file.
+    """
+    (tmp_path / "a.js").write_text(
+        "function dupe() {\n  return 1;\n}\n\n"
+        "function other() {\n  return 9;\n}\n\n"
+        "function dupe() {\n  return 2;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    first = loop._execute("replace_symbol", {"filepath": "a.js", "symbol": "dupe", "content": ""})
+    second = loop._execute("replace_symbol", {"filepath": "a.js", "symbol": "dupe", "content": ""})
+
+    assert first.ok, "removing a duplicate is the whole point of empty content"
+    assert not second.ok, "the last definition is not a duplicate"
+    assert "LAST definition" in second.message
+    assert "patch_file" in second.message, "it must name the deliberate route"
+    body = (tmp_path / "a.js").read_text(encoding="utf-8")
+    assert body.count("function dupe") == 1
+    assert "function other" in body
+
+
+def test_the_only_definition_of_a_symbol_cannot_be_deleted_by_name(tmp_path):
+    """Deleting the sole copy of something should be deliberate. `patch_file` on
+    its exact text still can - that is the right amount of friction."""
+    (tmp_path / "a.js").write_text(
+        "function only() {\n  return 1;\n}\n\nfunction keep() {\n  return 2;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("replace_symbol", {"filepath": "a.js", "symbol": "only", "content": ""})
+
+    assert not result.ok
+    assert "function only" in (tmp_path / "a.js").read_text(encoding="utf-8")

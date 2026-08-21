@@ -2192,6 +2192,14 @@ class SimpleChatLoop:
         # grows within a turn, and is emptied by an elision sweep, because a
         # payload that has been elided is one the model no longer has.
         self._ranges_sent: dict[str, list[tuple[int, int]]] = {}
+        # path -> how many reads of it have been answered from cache, and the
+        # paths `read_file` has been withdrawn for as a result.
+        self._blocked_reads: dict[str, int] = {}
+        self._read_withdrawn: set[str] = set()
+        # Announced once, when it first happens. A tool that vanishes without a
+        # word is a model wondering what it did wrong; the same message every
+        # round is the nudge spiral this whole fix exists to end.
+        self._announced_withdrawal: set[str] = set()
         # Stalls that must OUTLIVE this object. A fresh SimpleChatLoop is built
         # per user message, so anything tracking "the model is repeating itself"
         # has to be keyed by the conversation or it resets whenever the user
@@ -2759,6 +2767,13 @@ class SimpleChatLoop:
                     tool_calls,
                     changed,
                 )
+            announce = self._announce_withdrawn_reads()
+            if announce:
+                # Said once per path, at the moment the tool goes. A model that
+                # watches a tool vanish without a word spends a round working
+                # out what it did wrong; a model told the same thing every round
+                # is the nudge spiral this fix exists to end.
+                self.state.append_user(announce, origin=ORIGIN_LOOP)
             looping = self._read_loop.record(
                 outcome.tool_names,
                 # Producing ANYTHING ends the streak - a file changed, a command
@@ -3549,7 +3564,15 @@ class SimpleChatLoop:
         Never empties the roster: if everything offered has been failing, the
         answer is not to send zero tools.
         """
-        dropped = self._trust.dropped()
+        dropped = set(self._trust.dropped())
+        if self._read_withdrawn:
+            # `read_file` goes for the WHOLE turn, not per path, because a tool
+            # schema has no path to scope to. That is a real cost - another file
+            # cannot be read whole - and it is bounded three ways: `read_symbol`
+            # and `find_and_read` still reach any file, the withdrawal is undone
+            # by the first write that lands (see `_run_tools`), and it only ever
+            # happens after three reads of one path were answered from cache.
+            dropped.add("read_file")
         if not dropped:
             return schemas
         kept = [
@@ -3558,6 +3581,57 @@ class SimpleChatLoop:
             if (schema.get("function") or {}).get("name") not in dropped
         ]
         return kept or schemas
+
+    def _announce_withdrawn_reads(self) -> str:
+        """The one message that says the tool is gone and where the exit is.
+
+        Points at a DIFFERENT ACTION, which is the whole lesson of the three
+        runs this came from. The cache note said "use what you have" - true, and
+        not something a model can do - and was ignored twelve times in one turn.
+        The patch nudge that worked named `replace_symbol`, so this one does
+        too.
+        """
+        fresh = sorted(self._read_withdrawn - self._announced_withdrawal)
+        if not fresh:
+            return ""
+        self._announced_withdrawal.update(fresh)
+        named = ", ".join(fresh)
+        return (
+            f"read_file has been withdrawn for {named}. Every part of it you "
+            "asked for has already been given to you - the last three reads "
+            "returned nothing new, so reading it again cannot move this "
+            f"forward.{chr(10) * 2}"
+            "Make the change now, from what you were already shown:\n"
+            "- replace_symbol to replace a whole function or class by NAME, or "
+            "to DELETE one by passing empty content\n"
+            "- patch_file with text copied out of a result you already have\n\n"
+            "read_symbol still works if you need one function's source again. "
+            "The moment an edit lands, read_file comes back."
+        )
+
+    def _read_is_withdrawn(self, arguments: dict[str, Any]) -> ToolResult | None:
+        """Refuse a read of a path the tool has been taken away for.
+
+        Needed as well as the schema filter: a model that has seen `read_file`
+        for twenty rounds will call it from memory for a round or two after it
+        disappears, and answering that with the ordinary cache note would put
+        it straight back in the loop this exists to break.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        if not path or path.lower() not in self._read_withdrawn:
+            return None
+        self._activity(f"read_file is withdrawn for {path}; refused")
+        return ToolResult(
+            False,
+            f"read_file has been withdrawn for {path}. You have already been "
+            "given every part of it you asked for, three times over, and reading "
+            f"it again cannot tell you anything new.{chr(10) * 2}"
+            "Make the change now: replace_symbol to swap or delete a whole "
+            "function by name, or patch_file with text copied from what you were "
+            "already shown. read_symbol still works if you need one function's "
+            "source again.",
+            {"filepath": path, "read_withdrawn": True},
+        )
 
     def _ceiling(self) -> int:
         """The context window this session asks Ollama for.
@@ -3839,6 +3913,13 @@ class SimpleChatLoop:
                     # hits next, instead of losing it for the rest of the turn
                     # over two mistakes it has already recovered from.
                     self._repair_streak = 0
+                    # The withdrawal was about a model reading instead of
+                    # acting. It has now acted, so the tool comes back - and the
+                    # counter with it, or the next re-read would trip the
+                    # threshold immediately.
+                    self._read_withdrawn.clear()
+                    self._blocked_reads.clear()
+                    self._announced_withdrawal.clear()
                     grew = _added_to_the_file(name, result)
                     self._last_write_grew[path.lower()] = grew
                     if grew:
@@ -4291,6 +4372,9 @@ class SimpleChatLoop:
                 {"unknown_tool": name, "closest": close},
             )
         if name == "read_file":
+            withdrawn = self._read_is_withdrawn(arguments)
+            if withdrawn is not None:
+                return withdrawn
             already = self._already_sent_this_range(arguments)
             if already is not None:
                 return already
@@ -5083,6 +5167,36 @@ class SimpleChatLoop:
                 {"filepath": path, "symbol": found.name, "unchanged": True},
             )
 
+        if deleting:
+            # THE SAME RULE `patch_file` GETS, and it was missing here because
+            # this path was exempted from `_erased_a_definition` on the
+            # assumption `_members_lost` below covered it. It does not:
+            # `_members_lost` asks what vanished from INSIDE a replaced symbol,
+            # never whether the symbol itself is now gone from the file.
+            #
+            # Live 2026-08-21 that cost a function. A patch removed one of two
+            # `handleMouseMove` definitions - allowed, one remained - and eleven
+            # rounds later `replace_symbol` with empty content removed the other.
+            # Two legal steps, and the file lost a function nobody asked to
+            # delete.
+            #
+            # Deleting a DUPLICATE stays allowed, because that is the entire
+            # reason empty content means delete. Deleting the LAST definition is
+            # refused: `patch_file` can still do it deliberately, which is the
+            # right amount of friction for removing a function outright.
+            erased = _symbols_erased(original, body, suffix)
+            if found.name.rsplit(".", 1)[-1] in erased:
+                remaining = len(find_symbols(original, suffix, found.name)) - 1
+                return ToolResult(
+                    False,
+                    f"NOT APPLIED - {path} is unchanged. That would delete the LAST "
+                    f"definition of {found.name}, leaving {remaining} behind.{chr(10) * 2}"
+                    "Empty content removes a DUPLICATE. If you meant to remove "
+                    f"{found.name} from the file entirely, use patch_file on its "
+                    "exact text - deleting the only copy of something should be "
+                    "deliberate.",
+                    {"filepath": path, "symbol": found.name, "would_erase": erased},
+                )
         # Not asked when the symbol is being deleted: losing its members is the
         # point, and this guard exists for the opposite mistake - a replacement
         # that silently drops members it was supposed to keep.
@@ -5572,6 +5686,11 @@ class SimpleChatLoop:
         covered = _covered_fraction((start, end), seen)
         if covered < RANGE_ALREADY_SEEN_FRACTION:
             return None
+        key = path.lower()
+        self._blocked_reads[key] = self._blocked_reads.get(key, 0) + 1
+        if self._blocked_reads[key] >= BLOCKED_READS_BEFORE_WITHDRAWING:
+            # The note has been made and ignored often enough. Take the tool.
+            self._read_withdrawn.add(key)
         listed = ", ".join(f"{low}-{high}" for low, high in sorted(seen)[:6])
         self._activity(f"{path} lines {start}-{end} were already sent; did not re-read")
         return ToolResult(
@@ -6631,6 +6750,25 @@ def _changed_nothing(result: ToolResult) -> bool:
 #: because a genuine scroll - extending the window to see what comes next -
 #: overlaps heavily with what came before and must still be answered.
 RANGE_ALREADY_SEEN_FRACTION = 0.90
+
+#: Reads answered from cache on one path before `read_file` is TAKEN AWAY for it.
+#:
+#: The overlap guard above works perfectly and saves the wrong resource.
+#: Measured across three live runs on qwen3.5:9b it suppressed 3, 13 and 12
+#: payloads - real protection for the window - and recovered zero rounds,
+#: because the model asked again every time, jittering its numbers:
+#:
+#:     496-582, 496-570, 490-572, 496-582, 496-582, 496-580, 496-580, 498-572
+#:
+#: Run 3 failed for exactly that: it landed one patch, then spent its last nine
+#: rounds re-requesting a region it had been handed three times.
+#:
+#: A note is not an action. The patch nudge works because it names a DIFFERENT
+#: tool; "use what you have" names nothing. So at this point the tool goes.
+#:
+#: Three rather than two: a model re-checking a region once after an edit is
+#: doing something reasonable, and the leak is ten-plus reads, not three.
+BLOCKED_READS_BEFORE_WITHDRAWING = 3
 
 
 def _covered_fraction(wanted: tuple[int, int], seen: list[tuple[int, int]]) -> float:
