@@ -3,6 +3,28 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-22 - Old chat-logs replayed into the session log, redacted
+Files edited: `shamsu/ui/chatlog_migrate.py` (new), `shamsu/ui/turnlog.py`,
+`shamsu/cli/session_commands.py`, tests
+What changed: `/logs migrate` reads the unredacted `.shamsu/chat-logs/*.md` left
+behind by the deleted `simple_log.py` and replays them through `TurnLogWriter`,
+so the copy comes out redacted, spilled and identical in shape to a log written
+today. Originals are never touched - they may be the only record of a session
+someone wants, and deleting them is the user's call. Two parser traps: the
+model's own replies contain markdown headings (`## Project Review Summary`),
+so only exact known prefixes are structural and only outside a fence; and the
+old writer grew its fences to survive backticks, so a closer must be at least
+as long as its opener. Three defects found while building it: every tool was
+counted twice (it appears in both `tool calls requested` and its own result
+section), a conversation split across two files had one half silently dropped
+(the old writer opened a new file when a session gained a title - `test1` has
+turn 1 and turn 2 in separate files, and alphabetical order put turn 2 first),
+and a response whose `prompt sent` header was missing dropped the whole round.
+Ran on 24 real files across 13 workspaces: 23 migrated, 36 turns, 1 correctly
+skipped (a session with a live log), 0 errors, 0 secret-pattern hits in 46
+migrated files.
+Tests: +12 in `tests/test_trace_output.py`, full suite 3558 passed.
+
 ### 2026-08-22 - The model was copying our own elision marker into its patches
 Files edited: `shamsu/agents/simple_chat.py`, `shamsu/tools/agent_tools.py`,
 `shamsu/cli/repl.py`, tests

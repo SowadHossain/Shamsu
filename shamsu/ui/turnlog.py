@@ -224,18 +224,23 @@ class TurnLogWriter:
 
     # -- turn lifecycle ----------------------------------------------------
 
-    def open_turn(self, prompt: str, route: str = "") -> None:
+    def open_turn(self, prompt: str, route: str = "", when: str = "") -> None:
         """Start this turn in both documents with the prompt that triggered it.
 
         The prompt is the one row that is never collapsed and never a link, in
-        either file: it is the question being answered."""
+        either file: it is the question being answered.
+
+        *when* overrides the clock, for a turn being replayed from an older
+        record rather than happening now - see `chatlog_migrate`. Stamping a
+        2026-08-19 turn with today's date would make the document lie about the
+        one thing it is ordered by."""
         self._ensure_headers()
         via = f" · via {self.source}" if self.source else ""
         text = _clip(redact(str(prompt or "")).strip(), _MAX_PROMPT_CHARS)
         block = [
             f"## Turn `{self.turn_id}`",
             "",
-            f"{_stamp()}{via}",
+            f"{when or _stamp()}{via}",
             "",
             _blockquote(text) if text else "> _(no prompt)_",
             "",

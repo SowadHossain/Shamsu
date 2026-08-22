@@ -4,6 +4,28 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Added - `/logs migrate` brings the old unredacted chat-logs forward (2026-08-22)
+
+Deleting `simple_log.py` stopped new leaks; it did nothing about the files
+already written, and those files are also the only readable record of every
+session that ran before the session log existed. `/logs migrate` replays them
+through `TurnLogWriter` - not a copy, the same rendering path a live turn uses -
+so the result is redacted, oversized payloads spill to `attachments/`, and the
+output is indistinguishable from a log written today. Original timestamps are
+kept, because a migrated turn stamped with today's date would make the document
+lie about the one thing it is ordered by.
+
+Originals are never touched. They are the unredacted copy, they may be the only
+record of a session someone still wants, and removing them is the user's call.
+A session that already has a live log is skipped rather than clobbered.
+
+Two things the parser has to get right. The model's own replies contain
+markdown headings - the real files hold `## Project Review Summary` and
+`# Original content:` - so only the exact known prefixes are structural, and
+only outside a fence. And the old writer lengthened its fence until the body no
+longer contained it, so a four-backtick block can hold a three-backtick one and
+a closer must be at least as long as its opener.
+
 ### Fixed - the harness poisoned the model's own patches (2026-08-22)
 
 `_shorten_arguments` shortened long values in the model's past tool calls to 80

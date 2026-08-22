@@ -1258,3 +1258,267 @@ def test_the_startup_banner_shows_the_warning(tmp_path: Path):
     clean = Console(record=True, width=100)
     _warn_about_legacy_chat_logs(tmp_path / "elsewhere", clean)
     assert clean.export_text().strip() == ""
+
+
+# -- migrating the unredacted chat-logs forward -----------------------------
+#
+# `.shamsu/chat-logs/` was written by a logger with no calls to `redact`. The
+# writer was deleted; the files were not, and they are also the only readable
+# record of every session that ran before the session log existed. These
+# replay them through TurnLogWriter, which is what makes the copy redacted.
+
+SECRET = "sk-proj1234567890abcdefghijklmnopqrstuvwxyz"
+
+
+def _legacy(body: str) -> str:
+    return (
+        "# Session 20260101-000000\n\n"
+        "**model** `qwen3.5:9b` - started 2026-01-01 00:00:00\n\n"
+        "Every turn of this thread, in order.\n\n---\n\n" + body
+    )
+
+
+def _turn(number: int, when: str, prompt: str, body: str, final: str) -> str:
+    return (
+        f"# Turn {number} - {when}\n\n"
+        f"## What you asked\n\n```\n{prompt}\n```\n\n---\n\n"
+        f"{body}\n"
+        f"## Final answer\n\n```\n{final}\n```\n\n*1 round(s), 0.1s*\n"
+    )
+
+
+def _write_legacy(workspace: Path, name: str, text: str) -> Path:
+    folder = workspace / ".shamsu" / "chat-logs"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_a_heading_inside_the_models_reply_does_not_split_the_turn(tmp_path: Path):
+    """The real files contain `## Project Review Summary`, `# Original content:`
+    and `### **Priority Fixes Needed**` - all written BY the model, inside its
+    own reply. A parser that treats any `#` as structure cuts the turn in half
+    at the model's prose."""
+    from shamsu.ui.chatlog_migrate import parse_chat_log
+
+    reply = (
+        "## Project Review Summary\n\n"
+        "### **Critical Issues Found**\n\n"
+        "# Original content:\n\n"
+        "All three are fine."
+    )
+    text = _legacy(
+        _turn(
+            1, "2026-01-01 00:00:00", "review it",
+            f"## Round 1 - raw response  (1.0s)\n\n**content**\n\n```\n{reply}\n```\n",
+            "reviewed",
+        )
+    )
+    parsed = parse_chat_log(text)
+
+    assert len(parsed.turns) == 1, "the model's own headings split the turn"
+    assert parsed.turns[0].rounds[0].content == reply
+    assert parsed.turns[0].final == "reviewed"
+
+
+def test_a_fence_that_grew_to_survive_backticks_is_read_whole(tmp_path: Path):
+    """The old writer lengthened its fence until the body no longer contained
+    it, so a four-backtick block can hold a three-backtick one."""
+    from shamsu.ui.chatlog_migrate import parse_chat_log
+
+    inner = "here is code:\n```js\nconst x = 1;\n```\ndone"
+    text = _legacy(
+        _turn(
+            1, "2026-01-01 00:00:00", "explain",
+            f"## Round 1 - raw response  (1.0s)\n\n**content**\n\n````\n{inner}\n````\n",
+            "explained",
+        )
+    )
+    parsed = parse_chat_log(text)
+
+    assert parsed.turns[0].rounds[0].content == inner
+    assert "const x = 1;" in parsed.turns[0].rounds[0].content
+
+
+def test_a_tool_is_not_counted_twice(tmp_path: Path):
+    """The same call appears in `tool calls requested` AND in its own result
+    section. Replaying both printed every tool twice."""
+    from shamsu.ui.chatlog_migrate import parse_chat_log
+
+    body = (
+        "## Round 1 - raw response  (1.0s)\n\n"
+        "**content**\n\n```\n*(empty)*\n```\n\n"
+        "**tool calls requested**\n\n```json\n"
+        '[{"function": {"name": "read_file", "arguments": {"filepath": "a.py"}}}]\n```\n\n'
+        "### tool `read_file` -> ok\n\n"
+        '*arguments*\n\n```json\n{"filepath": "a.py"}\n```\n\n'
+        "*result*\n\n```\nx = 1\n```\n"
+    )
+    parsed = parse_chat_log(_legacy(_turn(1, "w", "read it", body, "read")))
+    round_ = parsed.turns[0].rounds[0]
+
+    assert len(round_.tools) == 1
+    assert len(round_.replayable()) == 1
+    assert round_.replayable()[0]["name"] == "read_file"
+
+
+def test_a_call_that_never_returned_is_still_replayed(tmp_path: Path):
+    """A request with no result section is a turn that died mid-round, which is
+    exactly the shape worth keeping."""
+    from shamsu.ui.chatlog_migrate import parse_chat_log
+
+    body = (
+        "## Round 1 - raw response  (1.0s)\n\n"
+        "**tool calls requested**\n\n```json\n"
+        '[{"function": {"name": "patch_file", "arguments": {"filepath": "a.py"}}}]\n```\n'
+    )
+    parsed = parse_chat_log(_legacy(_turn(1, "w", "patch it", body, "")))
+    round_ = parsed.turns[0].rounds[0]
+
+    assert round_.tools == []
+    assert [t["name"] for t in round_.replayable()] == ["patch_file"]
+
+
+def test_the_migrated_log_is_redacted(tmp_path: Path):
+    """The whole point. The source keeps its secret; the copy must not."""
+    from shamsu.ui.chatlog_migrate import migrate_workspace
+
+    body = (
+        "## Round 1 - prompt sent to the model\n\n### [1] user\n\n"
+        f"```\ndeploy with api_key={SECRET}\n```\n\n"
+        "## Round 1 - raw response  (1.0s)\n\n**content**\n\n"
+        f"```\nI will use {SECRET} now.\n```\n\n"
+        "### tool `run_command` -> ok\n\n*result*\n\n"
+        f"```\nexported API_KEY={SECRET}\n```\n"
+    )
+    source = _write_legacy(
+        tmp_path, "20260101-000000.md",
+        _legacy(_turn(1, "2026-01-01 00:00:00", f"deploy with api_key={SECRET}", body, "done")),
+    )
+
+    results = migrate_workspace(tmp_path)
+    assert [r.ok for r in results] == [True]
+
+    leaked = [
+        str(path.relative_to(tmp_path))
+        for path in (tmp_path / ".shamsu" / "sessions").rglob("*")
+        if path.is_file() and SECRET in path.read_text(encoding="utf-8", errors="ignore")
+    ]
+    assert leaked == [], f"the migrated copy still leaks: {leaked}"
+
+    detail = next((tmp_path / ".shamsu" / "sessions").rglob("log-detailed.md"))
+    body_text = detail.read_text(encoding="utf-8")
+    assert "[REDACTED]" in body_text
+    # The surrounding words survive - it is a redaction, not a deletion.
+    assert "I will use" in body_text
+    # ...and the ORIGINAL is untouched, because removing it is the user's call.
+    assert SECRET in source.read_text(encoding="utf-8")
+
+
+def test_one_conversation_split_over_two_files_keeps_both_and_their_order(tmp_path: Path):
+    """The old writer opened a new file when a session gained a title, so
+    `test1` has two files for one session holding turn 1 and turn 2. Migrating
+    them independently dropped one and reversed the other."""
+    from shamsu.ui.chatlog_migrate import migrate_workspace
+
+    # Named so the alphabetical order is the WRONG order.
+    _write_legacy(
+        tmp_path, "20260101-000000--aaa-later-title.md",
+        _legacy(_turn(2, "2026-01-01 01:00:00", "second thing", "", "did the second")),
+    )
+    _write_legacy(
+        tmp_path, "20260101-000000--zzz-untitled-session.md",
+        _legacy(_turn(1, "2026-01-01 00:00:00", "first thing", "", "did the first")),
+    )
+
+    results = migrate_workspace(tmp_path)
+    assert all(r.ok for r in results), [r.skipped or r.error for r in results]
+
+    summary = (
+        tmp_path / ".shamsu" / "sessions" / "20260101-000000" / "log-summary.md"
+    ).read_text(encoding="utf-8")
+    assert "first thing" in summary and "second thing" in summary
+    assert summary.index("first thing") < summary.index("second thing")
+    assert summary.count("<!-- turn-closed -->") == 2
+
+
+def test_the_original_timestamp_is_kept_not_todays_date(tmp_path: Path):
+    """A migrated turn stamped with today's date would make the document lie
+    about the one thing it is ordered by."""
+    from shamsu.ui.chatlog_migrate import migrate_workspace
+
+    _write_legacy(
+        tmp_path, "20260101-000000.md",
+        _legacy(_turn(1, "2026-01-01 00:00:00", "do it", "", "done")),
+    )
+    migrate_workspace(tmp_path)
+
+    summary = (
+        tmp_path / ".shamsu" / "sessions" / "20260101-000000" / "log-summary.md"
+    ).read_text(encoding="utf-8")
+    assert "2026-01-01 00:00:00" in summary
+
+
+def test_a_session_that_already_has_a_log_is_left_alone(tmp_path: Path):
+    """The live log is authoritative. Interleaving a replayed history into a
+    document being appended to would put turns out of order."""
+    from shamsu.ui.chatlog_migrate import migrate_workspace
+
+    session = tmp_path / ".shamsu" / "sessions" / "20260101-000000"
+    session.mkdir(parents=True)
+    (session / "log-summary.md").write_text("# the live log\n", encoding="utf-8")
+    _write_legacy(
+        tmp_path, "20260101-000000.md",
+        _legacy(_turn(1, "w", "do it", "", "done")),
+    )
+
+    results = migrate_workspace(tmp_path)
+    assert results[0].skipped == "already has a session log"
+    assert (session / "log-summary.md").read_text(encoding="utf-8") == "# the live log\n"
+
+
+def test_a_session_with_no_directory_still_gets_one(tmp_path: Path):
+    """14 of the 21 real files are probe runs that never registered a session.
+    The alternative is leaving their only record in the folder we are telling
+    people to delete."""
+    from shamsu.ui.chatlog_migrate import migrate_workspace
+
+    _write_legacy(
+        tmp_path, "20260101-000000.md",
+        _legacy(_turn(1, "w", "probe", "", "done")),
+    )
+    results = migrate_workspace(tmp_path)
+
+    assert results[0].ok
+    assert (tmp_path / ".shamsu" / "sessions" / "20260101-000000" / "log-summary.md").is_file()
+
+
+def test_the_pointer_file_is_not_treated_as_a_transcript(tmp_path: Path):
+    from shamsu.ui.chatlog_migrate import legacy_logs
+
+    _write_legacy(tmp_path, "latest.md", "20260101-000000\n")
+    _write_legacy(tmp_path, "20260101-000000.md", _legacy(_turn(1, "w", "x", "", "y")))
+
+    assert [p.name for p in legacy_logs(tmp_path)] == ["20260101-000000.md"]
+
+
+def test_migration_never_deletes_anything(tmp_path: Path):
+    from shamsu.ui.chatlog_migrate import migrate_workspace
+
+    source = _write_legacy(
+        tmp_path, "20260101-000000.md",
+        _legacy(_turn(1, "w", "do it", "", "done")),
+    )
+    before = source.read_text(encoding="utf-8")
+    migrate_workspace(tmp_path)
+
+    assert source.is_file()
+    assert source.read_text(encoding="utf-8") == before
+
+
+def test_a_workspace_with_nothing_to_migrate_is_quiet(tmp_path: Path):
+    from shamsu.ui.chatlog_migrate import legacy_logs, migrate_workspace
+
+    assert legacy_logs(tmp_path) == []
+    assert migrate_workspace(tmp_path) == []

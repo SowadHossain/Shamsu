@@ -120,6 +120,53 @@ def _narrative(workspace: Path, run_id: str, console: Console) -> None:
     console.print(f"[dim]{path}[/dim]")
 
 
+def _migrate_legacy_chat_logs(workspace: Path, console: Console) -> None:
+    """Replay `.shamsu/chat-logs/` into the session log, redacted.
+
+    Writes only. The originals are the unredacted copy and deleting them is the
+    user's call, not ours - they may be the only record of a session someone
+    still wants, and a migration that silently removed them would be doing the
+    dangerous half of the job on their behalf.
+    """
+    from shamsu.ui.chatlog_migrate import legacy_logs, migrate_workspace
+
+    sources = legacy_logs(workspace)
+    if not sources:
+        console.print("[dim]No old chat-logs/ in this workspace - nothing to migrate.[/dim]")
+        return
+
+    console.print(f"[dim]Replaying {len(sources)} old log(s) through the redactor...[/dim]")
+    results = migrate_workspace(workspace)
+    table = Table(title="chat-logs migration", show_lines=False)
+    table.add_column("source", overflow="fold")
+    table.add_column("session")
+    table.add_column("turns", justify="right")
+    table.add_column("outcome")
+    migrated = turns = 0
+    for result in results:
+        if result.error:
+            outcome = f"[red]{result.error[:40]}[/red]"
+        elif result.skipped:
+            outcome = f"[yellow]skipped - {result.skipped}[/yellow]"
+        else:
+            outcome = "[green]migrated[/green]"
+            migrated += 1
+            turns += result.turns
+        table.add_row(
+            result.source.name[:44], result.session_id, str(result.turns or ""), outcome
+        )
+    console.print(table)
+    console.print(
+        f"[green]{migrated} file(s), {turns} turn(s) migrated.[/green] "
+        "[dim]Redacted, in .shamsu/sessions/<id>/log-summary.md and log-detailed.md.[/dim]"
+    )
+    console.print(
+        "[yellow]The originals were NOT deleted[/yellow][dim] - they are the "
+        "unredacted copy. Check the migrated logs read correctly, then remove "
+        f"{workspace / '.shamsu' / 'chat-logs'} yourself.[/dim]"
+    )
+
+
 def _model_artifacts(workspace: Path, run_id: str, kind: str, console: Console) -> None:
     """Print a run's captured prompts or chain-of-thought, in model-call order.
 
@@ -186,6 +233,10 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
         )
         return
 
+    if subcommand == "migrate":
+        _migrate_legacy_chat_logs(workspace, console)
+        return
+
     lines = [
         f"Logs for this project live in [bold]{root}[/bold]",
         "",
@@ -215,6 +266,7 @@ def handle_logs(user_input: str, workspace: Path, console: Console) -> None:
         "  /run cot               verbose-mode reasoning evidence",
         "  /runs                  list recent runs",
         "  /logs open             show every path",
+        "  /logs migrate          bring old chat-logs/ into the session log",
     ]
     console.print(Panel("\n".join(lines), title="SHAMSU logs"))
 
