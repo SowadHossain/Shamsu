@@ -313,66 +313,175 @@ def render_sidebar(telemetry: Any, width: int = SIDEBAR_WIDTH) -> list[tuple[str
 
     The bottom toolbar had to give up cells as the terminal narrowed - the file
     list first, then the token counts, then the bar. A column has room for all
-    of it at once, which is the whole argument for the split.
+    of it at once, which is the whole argument for the split, and room for the
+    numbers that never fitted anywhere: where the turn's time actually went,
+    how much of the work failed, and whether one tool is being called over and
+    over. A turn that ran 22 minutes and changed nothing reads identically to a
+    productive one until those are on screen.
     """
+    inner = width - 1
     rows: list[tuple[str, str]] = []
 
     def line(style: str, text: str) -> None:
-        rows.append((style, text[: width - 1].ljust(width - 1) + "\n"))
+        rows.append((style, text[:inner].ljust(inner) + "\n"))
+
+    def blank() -> None:
+        line("", "")
 
     def heading(text: str) -> None:
-        line("class:tui.heading", text.upper())
+        line("class:tui.heading", " " + text.upper())
+
+    def stat(key: str, value: str, style: str = "class:tui.val") -> None:
+        """` key        value`, with the values in one column.
+
+        The key column is exactly wide enough for the longest label
+        (`contracts`) and no wider, because the value column is what runs out:
+        `contract_status x8` is 18 characters and it is the most useful string
+        on the panel - truncating it to `contract_status x` throws away the
+        count, which is the entire point of the row.
+        """
+        label = f" {key}".ljust(KEY_WIDTH)[:KEY_WIDTH]
+        rows.append(("class:tui.key", label))
+        room = inner - KEY_WIDTH
+        rows.append((style, value[:room].ljust(room) + "\n"))
 
     active = bool(getattr(telemetry, "active", False))
-    line("class:tui.title", " SHAMSU")
-    line("class:tui.rule", " " + "─" * (width - 3))
+
+    line("class:tui.title", " SHAMSU ")
+    line("class:tui.rule", " " + "─" * (inner - 2))
 
     status = str(getattr(telemetry, "status_text", "") or "")
     if active:
-        line("class:tb.head", f" {telemetry.spinner()} {status}"[: width - 1])
+        rows.append(("class:tui.spin", f" {telemetry.spinner()} "))
+        rows.append(("class:tb.head", status[: inner - 3].ljust(inner - 3) + "\n"))
         line("class:tb.dim", f"   {telemetry.elapsed}")
     else:
-        line("class:tb.dim", " idle")
-        line("", "")
-    line("", "")
+        verdict = str(getattr(telemetry, "verdict", "") or "")
+        if verdict:
+            good = verdict.lower() in {"done", "success", "ok", "complete"}
+            line(
+                "class:tb.ok" if good else "class:tb.alarm",
+                f" {'✓' if good else '✗'} {verdict}",
+            )
+        else:
+            line("class:tb.dim", " idle")
+        line("class:tb.dim", f"   {telemetry.elapsed}" if telemetry.elapsed else "")
+    blank()
 
-    if getattr(telemetry, "max_rounds", 0):
-        heading(" Round budget")
-        line("class:tb.value", f"   {telemetry.round} / {telemetry.max_rounds}")
-        line("", "")
+    # -- progress ---------------------------------------------------------
+    heading("Progress")
+    max_rounds = int(getattr(telemetry, "max_rounds", 0) or 0)
+    if max_rounds:
+        used = int(getattr(telemetry, "round", 0) or 0)
+        stat("rounds", f"{used}/{max_rounds}", _budget_style(used, max_rounds))
+        line(_budget_style(used, max_rounds), "  " + _bar(used / max_rounds, inner - 4))
+    else:
+        stat("rounds", "-", "class:tb.dim")
 
-    heading(" Context window")
     pct = getattr(telemetry, "ctx_pct", None)
     if pct is None:
-        line("class:tb.dim", "   not measured yet")
+        stat("context", "not measured", "class:tb.dim")
     else:
-        line(telemetry.context_style(), f"   {telemetry.context_bar()} {pct}%")
-        used, total = getattr(telemetry, "ctx_used", 0), getattr(telemetry, "ctx_total", 0)
-        if used and total:
-            line("class:tb.dim", f"   {_short(used)} / {_short(total)}")
-    line("", "")
+        stat("context", f"{pct}%", telemetry.context_style())
+        line(telemetry.context_style(), "  " + _bar(pct / 100, inner - 4))
+        used_t, total_t = getattr(telemetry, "ctx_used", 0), getattr(telemetry, "ctx_total", 0)
+        if used_t and total_t:
+            line("class:tb.dim", f"  {_short(used_t)} / {_short(total_t)} tokens")
+    blank()
 
-    heading(" Files modified")
+    # -- where the time went ----------------------------------------------
+    heading("This turn")
+    model_calls = int(getattr(telemetry, "model_calls", 0) or 0)
+    tool_calls = int(getattr(telemetry, "tool_calls", 0) or 0)
+    stat("model", f"{model_calls} · {_clock(getattr(telemetry, 'model_seconds', 0))}")
+    stat("tools", f"{tool_calls} · {_clock(getattr(telemetry, 'tool_seconds', 0))}")
+
+    failures = int(getattr(telemetry, "tool_failures", 0) or 0)
+    stat(
+        "failed",
+        str(failures),
+        "class:tb.alarm" if failures else "class:tb.dim",
+    )
+
+    busiest, count = _busiest(telemetry)
+    if busiest:
+        stat(
+            "repeated",
+            f"{busiest} x{count}",
+            "class:tb.warn" if count >= THRASH_AT else "class:tb.dim",
+        )
+    blank()
+
+    # -- what changed ------------------------------------------------------
     files = list(getattr(telemetry, "files", []) or [])
+    heading(f"Files ({len(files)})" if files else "Files")
     if not files:
-        line("class:tb.dim", "   none")
-    for path in files[:6]:
-        line("class:tb.value", f"   {path}"[: width - 1])
-    if len(files) > 6:
-        line("class:tb.dim", f"   +{len(files) - 6} more")
-    line("", "")
+        line("class:tb.dim", "   none yet")
+    for path in files[:MAX_SIDEBAR_FILES]:
+        line("class:tui.file", f"   {path}")
+    if len(files) > MAX_SIDEBAR_FILES:
+        line("class:tb.dim", f"   +{len(files) - MAX_SIDEBAR_FILES} more")
+    blank()
 
-    heading(" Open contracts")
+    # -- what is outstanding ----------------------------------------------
+    heading("Outstanding")
     contracts = int(getattr(telemetry, "contracts", 0) or 0)
-    line("class:tb.warn" if contracts else "class:tb.value", f"   {contracts}")
-    line("", "")
-
-    heading(" Queues")
+    stat("contracts", str(contracts), "class:tb.warn" if contracts else "class:tb.dim")
     feedback = _depth(getattr(telemetry, "feedback_depth", None))
     tasks = _depth(getattr(telemetry, "tasks_depth", None))
-    line("class:tb.value" if feedback else "class:tb.dim", f"   feedback  {feedback}")
-    line("class:tb.value" if tasks else "class:tb.dim", f"   tasks     {tasks}")
+    stat("feedback", str(feedback), "class:tui.val" if feedback else "class:tb.dim")
+    stat("queued", str(tasks), "class:tui.val" if tasks else "class:tb.dim")
     return rows
+
+
+#: Width of the sidebar's label column. Sized to `contracts`, the longest
+#: label, so the value column keeps every character it can.
+KEY_WIDTH = 11
+
+#: A tool called this many times in one turn is thrashing, not working.
+THRASH_AT = 3
+
+#: Files named in the sidebar before it switches to a count.
+MAX_SIDEBAR_FILES = 6
+
+
+def _busiest(telemetry: Any) -> tuple[str, int]:
+    try:
+        name, count = telemetry.busiest_tool()
+    except Exception:  # noqa: BLE001
+        return ("", 0)
+    return (name, count) if count > 1 else ("", 0)
+
+
+def _budget_style(used: int, total: int) -> str:
+    """Rounds run out too, and running out is how a turn ends with nothing."""
+    if not total:
+        return "class:tb.dim"
+    ratio = used / total
+    if ratio >= 0.8:
+        return "class:tb.alarm"
+    if ratio >= 0.6:
+        return "class:tb.warn"
+    return "class:tb.ok"
+
+
+def _bar(ratio: float, width: int) -> str:
+    width = max(4, width)
+    filled = max(0, min(width, round(max(0.0, min(1.0, ratio)) * width)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _clock(seconds: Any) -> str:
+    """`8m12s`, `44s`, `-`."""
+    try:
+        value = float(seconds or 0)
+    except Exception:  # noqa: BLE001
+        return "-"
+    if value <= 0:
+        return "-"
+    if value < 60:
+        return f"{value:.0f}s"
+    return f"{int(value // 60)}m{int(value % 60):02d}s"
 
 
 def _short(count: int) -> str:
@@ -422,18 +531,37 @@ class PaneWriter:
 
 # -- the application --------------------------------------------------------
 
+#: One palette, used by the sidebar and the statusline.
+#:
+#: The colours are load-bearing, not decoration: green/amber/red mean the same
+#: thing everywhere - fine, getting tight, out of room - and they are the same
+#: thresholds `CliTurnRenderer` uses on the context meter, so one number cannot
+#: read as two different warnings on two parts of the screen. Everything that
+#: is merely a label is grey, so the coloured things are the ones worth looking
+#: at.
 TUI_STYLE = {
-    "tui.title": "bold #d7af5f",
-    "tui.heading": "#7f7f7f",
-    "tui.rule": "#4e4e4e",
-    "tui.status": "bg:#262626 #b2b2b2",
+    # chrome
+    "tui.title": "bold #ffffff bg:#005f87",
+    "tui.heading": "bold #5fafd7",
+    "tui.rule": "#3a3a3a",
     "tui.sidebar": "bg:#1c1c1c",
+    "tui.spin": "bold #5fafd7",
     "tui.caret": "bold #5fd75f",
-    "tb.head": "bold",
-    "tb.label": "#7f7f7f",
+    # sidebar rows
+    "tui.key": "#8a8a8a",
+    "tui.val": "bold #e4e4e4",
+    "tui.file": "#87d7af",
+    # statusline
+    "tui.status": "bg:#005f87 #ffffff",
+    "tui.status.key": "bg:#262626 #9e9e9e",
+    "tui.status.busy": "bg:#875f00 bold #ffffff",
+    "tui.status.idle": "bg:#262626 #87d787",
+    # shared with the bottom toolbar, so the two displays agree
+    "tb.head": "bold #e4e4e4",
+    "tb.label": "#8a8a8a",
     "tb.value": "#d0d0d0",
     "tb.dim": "#6c6c6c",
-    "tb.sep": "#4e4e4e",
+    "tb.sep": "#3a3a3a",
     "tb.ok": "#5fd75f",
     "tb.warn": "#d7af5f",
     "tb.alarm": "bold #ff5f5f",
@@ -559,15 +687,31 @@ class TuiApp:
             return [("class:tb.dim", " telemetry unavailable")]
 
     def _statusline(self) -> list[tuple[str, str]]:
+        """Segments, not one grey strip.
+
+        The left block changes colour with what the session is DOING - amber
+        while a turn runs, green while it waits for you - because that is the
+        one thing you glance down for, and a uniform bar makes you read it.
+        """
         width = self._terminal_width()
-        left = f" {self._prompt_label()}"
-        right = (
-            f"{'mouse' if self._mouse else 'MOUSE OFF'} · "
-            f"{self.pane.scroll_position()} · "
-            "PgUp/PgDn scroll · F2 mouse · ^C stop "
-        )
-        pad = max(1, width - len(left) - len(right))
-        return [("class:tui.status", left + " " * pad + right)]
+        busy = bool(getattr(self.telemetry, "active", False))
+        mode = " RUNNING " if busy else " READY "
+        mode_style = "class:tui.status.busy" if busy else "class:tui.status.idle"
+
+        label = f" {self._prompt_label()} "
+        scroll = f" {self.pane.scroll_position()} "
+        keys = " PgUp/PgDn scroll · F2 mouse · ^C stop · ^D close "
+        if not self._mouse:
+            scroll = f" {self.pane.scroll_position()} · MOUSE OFF "
+
+        used = len(mode) + len(label) + len(scroll) + len(keys)
+        pad = max(1, width - used)
+        return [
+            (mode_style, mode),
+            ("class:tui.status", label + " " * pad),
+            ("class:tui.status", scroll),
+            ("class:tui.status.key", keys),
+        ]
 
     def invalidate(self) -> None:
         with_app = self.app

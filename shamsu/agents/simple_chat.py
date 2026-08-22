@@ -1613,6 +1613,11 @@ def _narrowed_by_request(
 
 MUTATING_TOOLS = frozenset({"write_file", "patch_file", "replace_symbol"})
 
+# Calls that EXERCISE the code rather than describe it. The only kind of tool
+# call that can back a contract assertion, because it is the only kind whose
+# result the harness watched rather than the model narrated.
+RUNNING_TOOLS = frozenset({"run_command", "run_tests", "create_and_run"})
+
 # Every call that puts bytes on disk. Wider than MUTATING_TOOLS on purpose:
 # that set drives the no-op and repeated-edit counters, which only make sense
 # for the two tools that report a diff. THIS set answers a different question -
@@ -2302,6 +2307,12 @@ class SimpleChatLoop:
         # first did not.
         # Tool failures this turn, for the evidence note written at turn end.
         self._turn_failures: list[tuple[str, str]] = []
+        #: What the HARNESS watched happen, as opposed to what the model says
+        #: happened. Deliberately per-SESSION, not per-turn: a contract spans
+        #: turns, and a check run in the turn that wrote the code still backs
+        #: the assertion recorded in the turn after it.
+        self._observed_runs: list[str] = []
+        self._observed_writes: list[str] = []
         self._truncated_refusals = 0
         self._truncated_target = ""
         # Files whose last verdict was "still being built" - open blocks and
@@ -3160,7 +3171,15 @@ class SimpleChatLoop:
             raise
         finally:
             beat.cancel()
-            self._activity(f"model responded in {time.perf_counter() - started:.0f}s")
+            # `model_seconds` rides along so a display does not have to parse
+            # the sentence back into a number. The split between model time and
+            # tool time is the whole diagnosis of a turn that took 22 minutes
+            # and changed nothing.
+            _model_seconds = time.perf_counter() - started
+            self._activity(
+                f"model responded in {_model_seconds:.0f}s",
+                model_seconds=_model_seconds,
+            )
         self._record_usage(raw, self._estimate_prompt(messages))
         # The usage numbers only exist once a call has come back, and the meter
         # rides on status events. Without a tick here a fast model never
@@ -4128,6 +4147,12 @@ class SimpleChatLoop:
                 self._read_signatures[read_signature] = seen
                 if seen >= REPEATED_READS_BEFORE_WARNING:
                     outcome.repeated_read = read_signature
+            if result.ok and name in RUNNING_TOOLS:
+                # What this session can VOUCH for. `contract_assert_pass` reads
+                # it, so an assertion cannot be signed off on a paragraph the
+                # model wrote about its own code.
+                summary = _argument_summary(arguments) or name
+                self._observed_runs.append(f"{name}({summary[:80]}) exited 0")
             if result.ok and name in WRITING_TOOLS:
                 # WRITING_TOOLS, not MUTATING_TOOLS: `append_file` puts bytes on
                 # disk and was not in the narrower set, so nothing verified a
@@ -4139,6 +4164,7 @@ class SimpleChatLoop:
                 path = str(arguments.get("filepath") or "").strip()
                 if path:
                     outcome.written.append(path)
+                    self._observed_writes.append(path)
                     # It changed, so the remembered read is stale.
                     self._read_digests.pop(path.lower(), None)
                     # Progress. The repair streak is about being STUCK, and a
@@ -5329,7 +5355,34 @@ class SimpleChatLoop:
                     "contract exists to stop.",
                     {"assertion": item.id},
                 )
+            # ...and a non-empty string was the ONLY thing this used to require,
+            # which is how seven assertions came to be marked passed on seven
+            # confident paragraphs about a game that drew neither the ship nor a
+            # single asteroid (live 2026-08-22, demo2/test). The
+            # refusal above asks exactly the right question - "what did you run,
+            # and what did it say?" - and then accepted prose that answered
+            # neither. Evidence is what the HARNESS saw.
+            if self._observed_runs:
+                backing, observation = contracts.BY_RUN, self._observed_runs[-1]
+            elif self._observed_writes:
+                backing = contracts.BY_WRITE
+                observation = f"wrote {self._observed_writes[-1]} (not run)"
+            else:
+                return ToolResult(
+                    False,
+                    f"{item.id} cannot be marked passed: nothing has been run and "
+                    "nothing has been written in this session, so there is nothing "
+                    "to back it. Reading the code is not checking it - a model "
+                    "describing what it believes its own code does is the claim "
+                    "this contract exists to stop." + chr(10) * 2
+                    + "Run something that exercises it (run_tests, or run_command "
+                    "with whatever checks this project) and record what it printed. "
+                    f"If it cannot be checked here, use contract_assert_skip on "
+                    f"{item.id} and say why.",
+                    {"assertion": item.id, "refused": "no_observation"},
+                )
             item.state, item.evidence = contracts.PASSED, detail
+            item.verified_by, item.observation = backing, observation
         elif name == "contract_assert_fail":
             item.state, item.evidence = contracts.FAILED, detail or "no detail given"
         elif name == "contract_assert_skip":

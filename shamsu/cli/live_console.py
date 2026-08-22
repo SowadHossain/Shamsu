@@ -208,6 +208,17 @@ class TurnTelemetry:
         self.contracts = 0
         self.started = 0.0
         self._frame = 0
+        #: What the turn actually SPENT. A turn that ran 22 minutes and changed
+        #: nothing looks identical to a productive one until these are on
+        #: screen: where the time went, how much of the work failed, and
+        #: whether the same tool is being called over and over.
+        self.model_calls = 0
+        self.model_seconds = 0.0
+        self.tool_calls = 0
+        self.tool_failures = 0
+        self.tool_seconds = 0.0
+        self.tool_counts: dict[str, int] = {}
+        self.verdict = ""
 
     # -- intake ------------------------------------------------------------
 
@@ -233,17 +244,50 @@ class TurnTelemetry:
         if kind == "turn.end":
             self.active = False
             self.status_text = ""
+            self.verdict = str(data.get("status") or "")
             return
 
         if kind == "status" and text:
             self.status_text = text
         self._absorb_meter(data)
 
-        if kind == "tool.result" and data.get("ok", True):
+        if kind == "activity":
+            seconds = data.get("model_seconds")
+            if isinstance(seconds, (int, float)):
+                self.model_calls += 1
+                self.model_seconds += float(seconds)
+            return
+
+        if kind == "tool.result":
+            self._absorb_tool(data)
+
+    def _absorb_tool(self, data: dict[str, Any]) -> None:
+        tool = str(data.get("tool") or "")
+        ok = bool(data.get("ok", True))
+        self.tool_calls += 1
+        if not ok:
+            self.tool_failures += 1
+        duration = data.get("duration_ms")
+        if isinstance(duration, (int, float)):
+            self.tool_seconds += float(duration) / 1000
+        if tool:
+            self.tool_counts[tool] = self.tool_counts.get(tool, 0) + 1
+        if ok:
             target = str(data.get("target") or "")
-            tool = str(data.get("tool") or "")
             if target and tool in _WRITER_TOOLS and target not in self.files:
                 self.files.append(target)
+
+    def busiest_tool(self) -> tuple[str, int]:
+        """The tool called most this turn, and how often.
+
+        The signature of a stuck run: live 2026-08-21 a 3B called
+        `contract_status` eight times in one turn and the only way to notice
+        was to count the lines.
+        """
+        if not self.tool_counts:
+            return ("", 0)
+        name = max(self.tool_counts, key=lambda key: self.tool_counts[key])
+        return (name, self.tool_counts[name])
 
     def _absorb_meter(self, data: dict[str, Any]) -> None:
         current, total = data.get("round"), data.get("max_rounds")

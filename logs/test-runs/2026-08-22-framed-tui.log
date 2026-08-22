@@ -235,3 +235,118 @@ Worth naming:
     test_a_resize_rewraps_everything
     test_the_scrollback_is_bounded
     test_every_sidebar_row_fits_the_column
+
+
+===========================================================================
+2026-08-23 · SECOND PASS: colour that means something, and stats worth having
+===========================================================================
+
+The frame worked and said almost nothing. Rounds, context, files, contracts and
+two queue depths - all state, no COST. A turn that ran 22 minutes and changed
+nothing looked exactly like a productive one.
+
+    ┌─────────────────────────────────────────────────────────────────────┬─────────────────────────────┐
+    │shamsu (config-fix) cli> the server crashes when REDIS_URL is missing│ SHAMSU                      │
+    │                                                                     │ ─────────────────────────── │
+    │  model responded in 11s                                             │ ⠋ contract_status           │
+    │  ▤ Reading config.py · 14ms                                         │   1m04s                     │
+    │  model responded in 41s                                             │                             │
+    │  ✎ Editing config.py · 38ms                                         │ PROGRESS                    │
+    │    +    if not url:                                                 │ rounds    19/24             │
+    │    +        url = 'redis://localhost:6379'                          │  ████████████████████░░░░░  │
+    │  ✗ run_tests FAILED no test runner configured · 1.8s                │ context   71%               │
+    │  ▤ contract_status x8                                               │  ██████████████████░░░░░░░  │
+    │                                                                     │  23.3k / 32.8k tokens       │
+    │                                                                     │                             │
+    │                                                                     │ THIS TURN                   │
+    │                                                                     │ model     12 · 8m12s        │
+    │                                                                     │ tools     14 · 1s           │
+    │                                                                     │ failed    4                 │
+    │                                                                     │ repeated  contract_status x8│
+    │                                                                     │                             │
+    │                                                                     │ FILES (2)                   │
+    │                                                                     │   config.py                 │
+    │                                                                     │   js/PlayerShip.js          │
+    │                                                                     │                             │
+    │                                                                     │ OUTSTANDING                 │
+    │                                                                     │ contracts 1                 │
+    │                                                                     │ feedback  1                 │
+    │                                                                     │ queued    1                 │
+    ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+    │ RUNNING  shamsu (config-fix) cli>          bot  PgUp/PgDn scroll · F2 mouse · ^C stop · ^D close │
+    │ > fix the tests too                                                                              │
+    └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+THE FOUR NEW NUMBERS, AND WHY THESE FOUR
+----------------------------------------
+Every one is a documented failure mode of this harness, not a statistic someone
+might like.
+
+  model 12 · 8m12s   Where the time WENT. The reported collapse was 51 model
+  tools 14 · 1s      calls and 22.5 minutes against tool calls costing under a
+                     second. Two numbers side by side say "this is not a tool
+                     problem" instantly; neither alone says anything.
+
+  failed 4           How much of the work did not land. Four failed patches in
+                     a turn is the elision-poisoning signature from 2026-08-22,
+                     and it was previously only visible by reading every line.
+
+  repeated           `contract_status x8` is the signature of a stuck run. Live
+    contract_status x8   2026-08-21 a 3B did exactly that, and the only way to
+                     notice was to count rows. Amber from three, because a tool
+                     called three times in one turn is thrashing, not working.
+
+Model duration now rides on the event as `model_seconds` rather than being
+parsed back out of "model responded in 41s" - a display should not be reading
+English to get a number.
+
+
+COLOUR THAT IS LOAD-BEARING
+---------------------------
+Green / amber / red mean one thing everywhere: fine, getting tight, out of
+room. Same 60/80 thresholds `CliTurnRenderer` uses on the context meter, so one
+number cannot read as two different warnings on two parts of the screen.
+
+  rounds     green -> amber at 60% -> red at 80%. Rounds run out too, and
+             running out is how a turn ends with nothing.
+  context    the existing thresholds, now with a bar.
+  failed     red when non-zero, grey at zero. Zero failures should not shout.
+  repeated   amber from three, grey below.
+  verdict    replaces the spinner when the turn ends: green done, red failed.
+
+Everything that is only a label is grey, so the coloured things are the ones
+worth looking at. The statusline became segments rather than one grey strip -
+the left block is amber RUNNING or green READY, because that is the one thing
+you glance down for.
+
+
+A LAYOUT BUG WORTH THE NOTE
+---------------------------
+The first version sized the label column at 12 and truncated values to fit:
+
+    repeated  contract_status x
+
+...which throws away the count, i.e. the only number on the row. The key column
+is now exactly as wide as `contracts`, the longest label, and `KEY_WIDTH`
+carries the reason. `contract_status x8` is 18 characters and now fits exactly.
+
+
+TESTS
+-----
+    tests/test_tui.py             49 passed  (was 40)
+    tests/test_live_console.py    66 passed  (unchanged)
+
+    test_the_time_split_between_model_and_tools_is_counted
+        12 model calls at 8m12s against 12 tool calls under a second.
+    test_failed_tool_calls_are_counted_and_shown_in_red
+    test_no_failures_is_not_flagged
+        zero failures must not shout.
+    test_the_busiest_tool_is_named_with_its_count
+        asserts `contract_status x8` survives whole - the regression for the
+        truncation above.
+    test_a_tool_called_once_is_not_reported_as_repeated
+    test_thrashing_is_amber_and_a_pair_is_not
+    test_the_round_budget_warns_as_it_runs_out
+    test_the_verdict_replaces_the_spinner_when_the_turn_ends
+    test_a_new_turn_resets_the_cost

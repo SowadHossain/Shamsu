@@ -3,6 +3,60 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-23 - The TUI sidebar says what a turn COST, in colour that means something
+Files edited: `shamsu/cli/tui.py`, `shamsu/cli/live_console.py`,
+`shamsu/agents/simple_chat.py`, `tests/test_tui.py`
+What changed: the frame worked and said almost nothing - rounds, context, files,
+contracts, two queue depths, all state and no cost, so a turn that ran 22
+minutes and changed nothing looked like a productive one. `TurnTelemetry` now
+counts model calls and seconds, tool calls and seconds, failures, and the
+busiest tool; the sidebar shows `model 12 / 8m12s` against `tools 14 / 1s`
+(where the time went), `failed 4` (how much did not land) and
+`repeated contract_status x8` (the signature of a stuck run, amber from three).
+Each is a documented failure mode of this harness, not a statistic someone might
+like. Model duration rides on the event as `model_seconds` instead of being
+parsed back out of the sentence "model responded in 41s". Colour is
+load-bearing: green/amber/red mean fine/tight/out-of-room everywhere, on the
+same 60/80 thresholds `CliTurnRenderer` already uses, and the round budget warns
+as it runs out because running out is how a turn ends with nothing. The
+statusline became coloured segments with an amber RUNNING / green READY block.
+One layout bug fixed on the way: a 12-wide label column truncated
+`contract_status x8` to `contract_status x`, throwing away the only number on
+the row.
+Tests: 49 in `tests/test_tui.py` (was 40), 66 in `tests/test_live_console.py`
+still green |
+Log: logs/test-runs/2026-08-22-framed-tui.log
+
+### 2026-08-22 - The contract signed its own homework
+Files edited: `shamsu/agents/simple_contract.py`, `shamsu/agents/simple_chat.py`,
+`tests/test_contract_evidence.py` (new), `tests/test_simple_chat.py`
+What changed: a run in `F:/Work/demo2/test` built a Three.js game, marked all
+seven of its own contract assertions passed, and reported "All requirements
+have been successfully implemented". Loaded in a real browser the game drew
+neither the ship nor a single asteroid - three arithmetic faults, each fatal,
+all of them pixels-used-as-world-units or a property read off the wrong object.
+`contract_assert_pass` required its `evidence` argument to be a NON-EMPTY
+STRING and nothing else, while its own refusal message asks "what did you run,
+and what did it say?" - and the seven paragraphs it accepted were fluent and
+specific, a02's being an accurate description of the exact line that put the
+ship outside the camera frustum. Evidence is now what the HARNESS saw: the loop
+records commands that exited 0 and files it wrote, per session, and an
+assertion may be marked passed only against one of those - recorded as
+`verified_by` RUN or WRITE, since a write proves the text reached the disk and
+not that it is right. The model's paragraph is kept but labelled `you said:`
+beside `backed by:`. `done_guard` no longer stops at `contract.done`: a
+resolved contract whose passes are all writes is told that writing the code is
+not evidence that the code runs. The refusal names `contract_assert_skip` as
+the honest way out, because a guard with no exit is a deadlock. Safe to require
+only because `exit 125` turned out to be `DENIED_EXIT_CODE` - the approval bug
+fixed in f0158c2, not a shell fault as I had said.
+Tests: 12 new in `tests/test_contract_evidence.py`; 4 sites in simple_chat
+seeded with an observation because they test assertion plumbing, not evidence
+policy. Full suite 3743 passed, 2 skipped. Verified by replaying all seven real
+payloads from the session: 0 of 7 now pass, was 7 of 7, and the done claim is
+corrected |
+Log: logs/test-runs/2026-08-22-contract-self-certification.log
+
 ### 2026-08-22 - The approval prompt, and four faults in one question
 Files edited: `shamsu/safety/approval.py`, `shamsu/control/console.py`,
 `shamsu/cli/repl.py`, `tests/test_approval_bug.py` (new),

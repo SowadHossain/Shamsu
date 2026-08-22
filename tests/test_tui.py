@@ -282,19 +282,147 @@ def test_the_sidebar_shows_everything_the_toolbar_had_to_give_up():
     meter.tasks_depth = lambda: 2
     text = "".join(t for _s, t in render_sidebar(meter))
 
-    assert "14 / 24" in text
+    assert "14/24" in text
     assert "71%" in text
     assert "23.3k / 32.8k" in text
     assert "config.py" in text
     assert "feedback  1" in text
-    assert "tasks     2" in text
+    assert "queued    2" in text
+
+
+# -- what the turn actually cost -------------------------------------------
+#
+# A turn that ran 22 minutes and changed nothing reads identically to a
+# productive one until these are on screen. All of them already existed in the
+# runtime and none of them were shown anywhere.
+
+
+def _busy() -> TurnTelemetry:
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start", "fix it"))
+    for _ in range(12):
+        meter.absorb(Event("activity", "model responded in 41s", model_seconds=41.0))
+    for _ in range(8):
+        meter.absorb(
+            Event("tool.result", "ok", tool="contract_status", ok=True, duration_ms=6)
+        )
+    for _ in range(4):
+        meter.absorb(
+            Event("tool.result", "no", tool="patch_file", ok=False, duration_ms=120)
+        )
+    return meter
+
+
+def test_the_time_split_between_model_and_tools_is_counted():
+    """The diagnosis of a slow turn: 12 model calls at 8m12s against 12 tool
+    calls at under a second is not a tool problem."""
+    meter = _busy()
+    assert meter.model_calls == 12
+    assert round(meter.model_seconds) == 492
+    assert meter.tool_calls == 12
+    assert meter.tool_seconds < 1
+
+    text = "".join(t for _s, t in render_sidebar(meter))
+    assert "12 · 8m12s" in text
+
+
+def test_failed_tool_calls_are_counted_and_shown_in_red():
+    meter = _busy()
+    assert meter.tool_failures == 4
+
+    rows = render_sidebar(meter)
+    styles = {style for style, text in rows if "4" in text and "failed" not in text}
+    assert any("alarm" in style for style in styles), "failures were not flagged"
+
+
+def test_no_failures_is_not_flagged():
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+    meter.absorb(Event("tool.result", "ok", tool="read_file", ok=True, duration_ms=5))
+    rows = render_sidebar(meter)
+    failed_row = [
+        style for style, text in rows if text.strip() == "0"
+    ]
+    assert failed_row and all("alarm" not in style for style in failed_row)
+
+
+def test_the_busiest_tool_is_named_with_its_count():
+    """`contract_status x8` is the signature of a stuck run, and the count is
+    the whole point - truncating it to `contract_status x` throws away the
+    only number on the row."""
+    meter = _busy()
+    assert meter.busiest_tool() == ("contract_status", 8)
+
+    text = "".join(t for _s, t in render_sidebar(meter))
+    assert "contract_status x8" in text
+
+
+def test_a_tool_called_once_is_not_reported_as_repeated():
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+    meter.absorb(Event("tool.result", "ok", tool="read_file", ok=True, duration_ms=5))
+    text = "".join(t for _s, t in render_sidebar(meter))
+    assert "repeated" not in text
+
+
+def test_thrashing_is_amber_and_a_pair_is_not():
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+    for _ in range(2):
+        meter.absorb(Event("tool.result", "ok", tool="read_file", ok=True))
+    quiet = [s for s, t in render_sidebar(meter) if "read_file x2" in t]
+    assert quiet and all("warn" not in s for s in quiet)
+
+    meter.absorb(Event("tool.result", "ok", tool="read_file", ok=True))
+    loud = [s for s, t in render_sidebar(meter) if "read_file x3" in t]
+    assert loud and all("warn" in s for s in loud)
+
+
+def test_the_round_budget_warns_as_it_runs_out():
+    """Rounds run out too, and running out is how a turn ends with nothing."""
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+
+    meter.absorb(Event("status", "x", round=2, max_rounds=24))
+    assert any("ok" in s for s, t in render_sidebar(meter) if "2/24" in t)
+
+    meter.absorb(Event("status", "x", round=16, max_rounds=24))
+    assert any("warn" in s for s, t in render_sidebar(meter) if "16/24" in t)
+
+    meter.absorb(Event("status", "x", round=22, max_rounds=24))
+    assert any("alarm" in s for s, t in render_sidebar(meter) if "22/24" in t)
+
+
+def test_the_verdict_replaces_the_spinner_when_the_turn_ends():
+    meter = _busy()
+    meter.absorb(Event("turn.end", "done", status="failed"))
+    rows = render_sidebar(meter)
+    text = "".join(t for _s, t in rows)
+    assert "failed" in text
+    assert any("alarm" in style for style, body in rows if "failed" in body)
+
+    meter.absorb(Event("turn.end", "done", status="done"))
+    ok_rows = render_sidebar(meter)
+    assert any("ok" in style for style, body in ok_rows if "done" in body)
+
+
+def test_a_new_turn_resets_the_cost():
+    """Carrying the last turn's spend into this one would report finished work
+    as if it were still happening."""
+    meter = _busy()
+    meter.absorb(Event("turn.start"))
+    assert meter.model_calls == 0
+    assert meter.tool_calls == 0
+    assert meter.tool_failures == 0
+    assert meter.busiest_tool() == ("", 0)
+    assert meter.verdict == ""
 
 
 def test_the_sidebar_says_when_the_context_is_unmeasured():
     meter = TurnTelemetry(unicode_ui=True)
     meter.absorb(Event("turn.start"))
     text = "".join(t for _s, t in render_sidebar(meter))
-    assert "not measured yet" in text
+    assert "not measured" in text
     assert "0%" not in text
 
 
@@ -450,7 +578,7 @@ async def test_mouse_capture_can_be_turned_off_without_leaving_the_tui():
         await task
 
     assert not app._mouse
-    assert "MOUSE OFF" in app._statusline()[0][1]
+    assert "MOUSE OFF" in "".join(text for _style, text in app._statusline())
 
 
 @pytest.mark.asyncio

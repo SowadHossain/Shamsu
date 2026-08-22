@@ -1,0 +1,177 @@
+SHAMSU — the contract signed its own homework
+==============================================
+2026-08-22 · branch small-shamsu-new
+Source: F:\Work\demo2\test, session 20260822-073448-16a9, qwen3.5:9b-q4_K_M.
+The user asked "is the code correct??" It was not, and the harness had said it
+was.
+
+
+WHAT THE RUN CLAIMED
+--------------------
+    ✅ All requirements have been successfully implemented
+
+    ✅ HTML/CSS/Three.js  ✅ Player Ship  ✅ Shooting System  ✅ Asteroids
+    ✅ Collision Detection  ✅ UI Elements  ✅ Environment
+
+
+WHAT THE CODE DID
+-----------------
+Loaded in a real browser (playwright, 1280x800): zero JavaScript errors, the
+score/level/controls UI painted, the starfield painted, and NO ship and NO
+asteroids. Three faults, each on its own fatal:
+
+  1. `-camera.position.y + window.innerHeight * 0.75` mixes PIXELS with world
+     units: -300 + 600 = 300, exactly the camera's own eye height. Measured:
+     playerShip y=300, camera y=300, camera.lookAt y=-50. Off-screen.
+
+  2. `asteroidSpawnTimer++` counts FRAMES; `asteroidSpawnRate: 2000` is
+     commented "in ms". And `Math.floor((0 - 50) / 10)` is -5, so the threshold
+     is 2000 / 2^-5 = 64,000 frames. Measured: 1,067 seconds to the first
+     asteroid; timer at 91 after 1.5s.
+
+  3. `config.difficultyMultiplier` does not exist - it is on `gameState` - so
+     `velocityY` is NaN, `position.y` becomes NaN, and three.js draws nothing.
+     Measured: first asteroid at [423, nan, 50].
+
+Correcting only those three at runtime: ship visible, 8 asteroids alive, no
+NaN, lasers fire, A/D moves. So the structure was sound and the arithmetic was
+not. NOT FIXED here - the user asked for the harness, not the game.
+
+
+THE HARNESS FAULT
+-----------------
+    if name == "contract_assert_pass":
+        if not detail:
+            return ToolResult(False, "... what did you run, and what did it say?")
+        item.state, item.evidence = contracts.PASSED, detail
+
+A non-empty string was the entire test. The refusal above asks exactly the
+right question and then accepts prose that answers neither half of it.
+
+The seven paragraphs it accepted are worth reading, because they are not lazy:
+
+  a02  "Player ship implemented as 3D cone (lines 170-191): createPlayerShip()
+        uses THREE.ConeGeometry(15,40,8)... Positioned at bottom of screen
+        using camera position calculations"
+
+That is an accurate, confident description of the exact line that puts the ship
+outside the frustum. The model was not lying; it had read the code and could
+not run it, so it described what the code says it does. Fluent, specific, and
+never checked.
+
+`done_guard` then returned "" because `contract.done` was True - every
+assertion resolved - so the completion claim went through unchallenged.
+
+
+THE FIX
+-------
+Evidence is what the HARNESS saw, not what the model says it saw.
+
+a) The loop records what it actually watched happen, per SESSION (a contract
+   spans turns, so a check run in the turn that wrote the code still backs an
+   assertion recorded in the turn after):
+
+       self._observed_runs    - run_command / run_tests / create_and_run, exit 0
+       self._observed_writes  - files the harness itself wrote
+
+b) `contract_assert_pass` consults them:
+
+       runs   -> PASSED, verified_by=BY_RUN
+       writes -> PASSED, verified_by=BY_WRITE     ("wrote X (not run)")
+       neither -> REFUSED
+
+   The model's paragraph is still kept - it is how a person reads the contract
+   back later - but it is labelled `you said:` beside `backed by:`, so the two
+   can never be confused again.
+
+c) `Assertion.is_verified` is PASSED **and** BY_RUN. A write proves the text
+   reached the disk; it does not prove the text is right. `Contract.unproven`
+   lists the passes backed only by a write.
+
+d) `done_guard` no longer stops at `contract.done`. A resolved contract whose
+   passes are all writes now gets:
+
+       "Writing the code is not evidence that the code runs. Run something that
+        exercises them... If it genuinely cannot be run here, say so plainly to
+        the user instead of reporting success."
+
+   And `render()` says the same thing where it used to say "You can report the
+   task finished."
+
+The refusal names the honest way out - `contract_assert_skip` with a reason -
+because a guard with no exit is a deadlock, and some assertions genuinely
+cannot be checked from here.
+
+
+WHY THIS WAS SAFE TO REQUIRE
+-----------------------------
+Because the OTHER half was fixed first. Every `run_command` in this run came
+back `exit 125`, which is `DENIED_EXIT_CODE` in tools/executor.py - the
+approval denial, not a shell error. (I said "a Git Bash path given to a Windows
+shell" in an earlier note; that was wrong.) The cause was `a` reading as Deny,
+fixed in f0158c2. Requiring a command to have run would have deadlocked the
+agent before that landed.
+
+
+VERIFIED against the real session
+----------------------------------
+Replayed all seven real `contract_assert_pass` payloads from the run, against
+the real contract reset to pending, on a loop with the same observations the
+run had (reads only):
+
+    a01..a07  ok=False   "cannot be marked passed: nothing has been run and
+                          nothing has been written in this session"
+
+    passed now: 0 of 7   (was 7 of 7)
+    contract.done: False
+
+    done_guard("All requirements have been successfully implemented!")
+      -> "...the contract '3D Asteroids Survival Game' has 7 assertion(s)
+          nobody has checked"
+
+    and with one real check having run:
+      a01 ok=True  verified_by='run'
+      observation='run_command(node -c index.html) exited 0'
+
+
+TESTS
+-----
+    tests/test_contract_evidence.py   +12 (new)
+
+    the tool
+        test_a_paragraph_alone_no_longer_passes_an_assertion
+        test_a_command_that_exited_zero_backs_it
+        test_a_write_backs_it_but_is_recorded_as_weaker
+        test_the_models_own_words_are_kept_but_labelled
+    the done claim
+        test_a_done_claim_is_corrected_when_every_pass_is_only_a_write
+        test_a_done_claim_is_left_alone_when_something_actually_ran
+        test_an_unresolved_contract_is_still_corrected_the_old_way
+        test_a_sentence_that_is_not_a_done_claim_is_never_touched
+    the render + persistence
+        test_the_render_says_when_a_resolved_contract_proves_nothing
+        test_a_fully_verified_contract_still_says_so
+        test_provenance_survives_a_round_trip_to_disk
+        test_an_old_contract_without_provenance_still_loads
+            contracts written before this are on disk, including the one that
+            found the bug; an unprovenanced pass must not read as verified
+
+    tests/test_simple_chat.py  4 sites seeded, 1 allow-list entry
+        The contract tests there are about assertion PLUMBING - resolving an id
+        the model half-remembered, the done guard, what counts as resolved. Each
+        would otherwise have had to run a command first, testing nothing they
+        are about. `_contracted` seeds the observation instead.
+
+    FULL SUITE: 3743 passed, 2 skipped
+
+
+STILL OPEN
+----------
+  - A turn that changes nothing and runs nothing can still be badged
+    `✓ success` by the ledger's evidence path. The `continue` turn made 17 tool
+    calls - 12 reads and 4 self-certifications - and was badged success. The
+    CLI verdict work (e48c837) covers truncation and the loop's own status; the
+    ledger's `evidence_outcome()` is a separate path and was not touched.
+  - Both real work turns hit the 24-round cap ("I stopped after 24 steps
+    without finishing"). That is Fix 08's target and the baseline for it is
+    clean now.

@@ -2141,9 +2141,12 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
             result = loop._execute(name, probe)
             # memory_forget on a missing id is a legitimate no.
             # memory_forget on a missing id, and read_and_patch whose snippet
-            # is absent, are both legitimate NOs.
+            # is absent, are both legitimate NOs. So is
+            # `contract_assert_pass` on a session where nothing has been run or
+            # written - see tests/test_contract_evidence.py.
             assert result.ok or name in {
                 "memory_forget", "read_and_patch", "run_tests",
+                "contract_assert_pass",
             }, (
                 f"{name} -> {result.message}"
             )
@@ -7457,7 +7460,15 @@ def test_replace_symbol_obeys_the_write_cap(tmp_path):
 
 
 def _contracted(tmp_path, turns, **kwargs):
-    return _loop(tmp_path, turns, verify_changes=False, **kwargs)
+    loop = _loop(tmp_path, turns, verify_changes=False, **kwargs)
+    # These tests are about the assertion PLUMBING - resolving an id the model
+    # half-remembered, the done guard, what counts as resolved. Since
+    # `contract_assert_pass` began requiring the harness to have observed
+    # something, every one of them would also have had to run a command first,
+    # which tests nothing they are about. Seed the observation instead; the
+    # evidence policy has its own file, tests/test_contract_evidence.py.
+    loop._observed_runs.append("run_tests() exited 0")
+    return loop
 
 
 def test_a_contract_records_what_done_means(tmp_path):
@@ -8701,6 +8712,10 @@ def test_evidence_for_the_only_unresolved_assertion_lands_without_an_id(tmp_path
 
     save_contract(tmp_path, new_contract("t", "", ["the duplicates are gone"]))
     loop = _loop(tmp_path, [_text("ok")])
+    # This is about the ARGUMENT NAME, not the evidence policy: seed the
+    # observation `contract_assert_pass` now requires so the two stay separate.
+    # See tests/test_contract_evidence.py.
+    loop._observed_runs.append("run_tests() exited 0")
 
     result = loop._execute(
         "contract_assert_pass", {"evidence": "read_file shows one definition each"}
@@ -8731,6 +8746,10 @@ def test_quoting_the_assertion_instead_of_naming_it_works(tmp_path):
 
     save_contract(tmp_path, new_contract("t", "", ["remove the duplicates", "run the tests"]))
     loop = _loop(tmp_path, [_text("ok")])
+    # This is about the ARGUMENT NAME, not the evidence policy: seed the
+    # observation `contract_assert_pass` now requires so the two stay separate.
+    # See tests/test_contract_evidence.py.
+    loop._observed_runs.append("run_tests() exited 0")
 
     result = loop._execute(
         "contract_assert_pass",
@@ -8765,6 +8784,10 @@ def test_every_name_the_model_reached_for_finds_the_assertion(tmp_path, shape):
 
     save_contract(tmp_path, new_contract("t", "", ["the duplicates are gone", "it parses"]))
     loop = _loop(tmp_path, [_text("ok")])
+    # This is about the ARGUMENT NAME, not the evidence policy: seed the
+    # observation `contract_assert_pass` now requires so the two stay separate.
+    # See tests/test_contract_evidence.py.
+    loop._observed_runs.append("run_tests() exited 0")
 
     result = loop._execute(
         "contract_assert_pass", normalize_arguments("contract_assert_pass", shape)
