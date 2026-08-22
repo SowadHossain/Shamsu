@@ -2142,15 +2142,51 @@ class AgentToolRegistry:
                 count = content.count(old_string)
                 unescaped_escapes = True
         if count == 0:
-            # Exact match missed - retry tolerating trailing-whitespace / line-
-            # ending drift (the most common reason a local model's edit block
-            # doesn't match byte-for-byte) before giving up. On a unique fuzzy
-            # hit, adopt the file's own text as old_string so the replacement
-            # keeps real whitespace; ambiguous/no match still fails safe below.
-            fuzzy = _fuzzy_match_block(content, old_string)
-            if fuzzy is not None and fuzzy != new_string:
-                old_string = fuzzy
-                count = content.count(old_string)
+            # Every remaining repair, tried on the text AS SENT and then on its
+            # decoded form.
+            #
+            # The decoded form used to be discarded unless it matched EXACTLY,
+            # which is the narrowest possible test and threw away the only
+            # usable version of the payload. An escaped `old_string` is a
+            # SINGLE LINE, so every line-based repair below is a no-op on it -
+            # the fuzz ran, found nothing it could even split, and the model
+            # was told "not found" about text it had sent correctly apart from
+            # the escaping. Live 2026-08-22: four patches and two
+            # `replace_symbol` calls on js/main.js, all of them this, and the
+            # turn ended having changed nothing.
+            attempts = [old_string]
+            if decoded != old_string:
+                attempts.append(decoded)
+            for candidate in attempts:
+                # Trailing-whitespace / line-ending drift: the most common
+                # reason a local model's edit block misses byte-for-byte. On a
+                # unique hit, adopt the FILE's text so the surviving context
+                # keeps its real whitespace.
+                fuzzy = _fuzzy_match_block(content, candidate)
+                if fuzzy is not None and fuzzy != new_string:
+                    old_string = fuzzy
+                    if candidate is decoded:
+                        new_string = _decode_literal_escapes(new_string)
+                        unescaped_escapes = True
+                    count = content.count(old_string)
+                    break
+                # Then leading indentation, which the matcher above compares
+                # exactly and must: see `_indent_shifted_match_block`.
+                matched = _indent_shifted_match_block(content, candidate)
+                if matched is not None:
+                    replacement = _realign_replacement(
+                        candidate,
+                        matched,
+                        _decode_literal_escapes(new_string)
+                        if candidate is decoded
+                        else new_string,
+                    )
+                    if matched != replacement:
+                        old_string, new_string = matched, replacement
+                        if candidate is decoded:
+                            unescaped_escapes = True
+                        count = content.count(old_string)
+                        break
         if count == 0:
             hint = _nearby_edit_hint(content, old_string)
             if _mentions_literal_escapes(old_string):
@@ -3974,6 +4010,125 @@ def _fuzzy_match_block(content: str, old_string: str) -> str | None:
         return None
     start = matches[0]
     return "\n".join(file_lines[start:start + span])
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _outdented(line: str, delta: int) -> str:
+    """*line* with *delta* leading spaces taken off (or added, if negative).
+
+    Never cuts into non-whitespace: a line shallower than the delta loses only
+    the indentation it has.
+    """
+    if delta > 0:
+        return line[min(delta, _indent_of(line)):]
+    if delta < 0:
+        return " " * -delta + line
+    return line
+
+
+def _realign_replacement(old_string: str, matched: str, new_string: str) -> str:
+    """Put *new_string* at the FILE's indentation, line by line.
+
+    Matching the block is half the job. Writing the model's own text back at
+    the model's own wrong indentation fixes the match and mis-indents the file,
+    which in Python is not cosmetic.
+
+    Per line, not per block, because the block is a MIXTURE: the lines copied
+    out of a numbered read all carry the gutter's separator space and the lines
+    typed from memory do not. One shift applied to all of them corrects the
+    majority and breaks the rest - the same defect, moved. A single modal shift
+    is also decided by whichever group happens to be larger, which is not a
+    property of the edit.
+
+    So each line of the replacement that also appears in `old_string` is moved
+    by exactly that line's own error, and a line that does NOT appear - one the
+    model changed or added - inherits the last known correction above it. That
+    is the right neighbour to copy: a rewritten line sits in the same block as
+    the ones around it.
+    """
+    deltas: dict[str, int] = {}
+    for old, real in zip(old_string.split("\n"), matched.split("\n")):
+        key = old.strip()
+        if key and key not in deltas:
+            deltas[key] = _indent_of(old) - _indent_of(real)
+    out: list[str] = []
+    carried = 0
+    for line in new_string.split("\n"):
+        key = line.strip()
+        if not key:
+            out.append(line)
+            continue
+        if key in deltas:
+            carried = deltas[key]
+        out.append(_outdented(line, carried))
+    return "\n".join(out)
+
+
+#: Lines an indent-insensitive match needs before it is allowed to fire. One or
+#: two lines matched on their stripped text alone is loose enough to hit the
+#: wrong place; three lines of matching code in a unique position is not.
+MIN_INDENT_FUZZ_LINES = 3
+
+
+def _indent_shifted_match_block(content: str, old_string: str) -> str | None:
+    """`_fuzzy_match_block`, also tolerating a leading-indent shift.
+
+    Returns the file's own text for the block, or None. The caller re-indents
+    the replacement with `_realign_replacement`.
+
+    Kept separate because the function above deliberately compares leading
+    indentation exactly - *"we never silently re-indent code"* - and it is
+    right to, as a default. This is the case where that default costs an edit
+    that was otherwise perfect, and it has a specific cause: `read_file`
+    numbers its output, and the gutter ends in a SPACE::
+
+        74| function createStarField() {
+        75|     const geometry = new THREE.BufferGeometry();
+
+    `_strip_line_numbers` handles the model pasting `74| ` back verbatim. It
+    cannot help when the model strips `74|` ITSELF and keeps the separator,
+    because then no line carries a gutter any more - every copied line is
+    simply one space too deep.
+
+    Live 2026-08-22, session 20260822-090221-f144: four `patch_file` calls and
+    two `replace_symbol` calls failed on `js/main.js`, the model then read the
+    file nine more times, announced the edit three times without making it, and
+    the turn ended having changed nothing. Of the 22 lines of one `old_string`,
+    **18 were exactly one space too deep and 4 were exact** - and the 4 exact
+    ones were the JSDoc header ABOVE the read's first line, which the model had
+    typed from memory instead of copying. Every line it copied carried the
+    space. So the shift is not uniform across the block, which is why this
+    compares stripped text and measures the delta afterwards rather than
+    dedenting by a common prefix.
+
+    Still safe on the three counts that matter: the match must be unique, what
+    comes back is the FILE's own bytes, and it takes at least
+    `MIN_INDENT_FUZZ_LINES` lines to fire.
+    """
+    if not old_string:
+        return None
+    file_lines = content.split("\n")
+    old_lines = old_string.split("\n")
+    span = len(old_lines)
+    if span < MIN_INDENT_FUZZ_LINES or span > len(file_lines):
+        return None
+    target = [line.strip() for line in old_lines]
+    matches = [
+        start
+        for start in range(len(file_lines) - span + 1)
+        if [line.strip() for line in file_lines[start:start + span]] == target
+    ]
+    if len(matches) != 1:
+        return None
+    start = matches[0]
+    window = file_lines[start:start + span]
+    # The MODAL delta, not the mean and not the first line's: the block is a
+    # mixture of copied lines (all shifted by the same amount) and lines the
+    # model typed itself (already right), and the copied ones are the majority.
+    return "\n".join(window)
 
 
 # Lines of real file shown either side of a failed edit's nearest anchor, and

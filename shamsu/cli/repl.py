@@ -201,6 +201,7 @@ from shamsu.safety.approval import (
     ask_approval,
     ask_approval_menu,
     ask_tier_choice,
+    on_prompt_close,
     on_prompt_open,
     prompt_is_active,
 )
@@ -300,6 +301,9 @@ _RUN_SUBCOMMANDS = frozenset(
 
 SYSTEM_COMMANDS = (
     "/help",
+    "/tui",
+    "/tui on",
+    "/tui off",
     "/queue",
     "/queue add ",
     "/queue clear",
@@ -1834,6 +1838,15 @@ class _RequestRunner:
     async def _signal_pump(self) -> None:
         while True:
             await asyncio.sleep(0.15)
+
+    def interrupt(self) -> None:
+        """Stop the running turn, as Ctrl+C does.
+
+        Inside the framed TUI prompt_toolkit owns the keyboard, so the SIGINT
+        handler never fires - the key binding calls this instead, and both
+        routes end up in exactly the same place.
+        """
+        self._on_interrupt(0, None)
 
     def _on_interrupt(self, _signum: int, _frame: Any) -> None:
         now = time.monotonic()
@@ -5013,6 +5026,8 @@ def _build_live_console(
     # the next poll. Two prompt_toolkit applications on one console is the
     # run_in_executor+stdin trap that used to hang turns on Windows.
     on_prompt_open(live.stand_down)
+    on_prompt_close(live.resume)
+    live.history = history
     return live
 
 
@@ -5055,6 +5070,9 @@ def _dispatch_turn(
         ) as thinking:
             return _run_request(turn(thinking))
 
+    if active_frame() is not None:
+        return _frame_turn(turn, live, user_input)
+
     from prompt_toolkit.patch_stdout import patch_stdout
 
     thinking = live.status()
@@ -5070,6 +5088,134 @@ def _dispatch_turn(
             return _run_request(_with_live_input(turn(thinking), live))
     finally:
         live.telemetry.active = False
+
+
+#: The framed TUI while the mode is on, else None. Session-scoped: the first
+#: version built one per turn and tore it down at the end, so it flashed up and
+#: dropped back to the ordinary prompt after every turn, with an empty pane
+#: each time because it was a NEW pane. A frame is a mode, not a decoration on
+#: one turn.
+_FRAME: Any = None
+
+#: The console's real destination, kept so the frame can put it back.
+_FRAME_CONSOLE_STATE: tuple[Any, int] | None = None
+
+
+def active_frame() -> Any:
+    """The framed TUI, or None. Every caller must handle None."""
+    frame = _FRAME
+    if frame is not None and not frame.running:
+        return None
+    return frame
+
+
+def _handle_tui(user_input: str, console: Console) -> None:
+    """`/tui` toggles the framed layout; `/tui on` and `/tui off` are explicit.
+
+    Takes effect immediately, because the frame is where the session lives -
+    arming it for "the next turn" was the bug that made it flash.
+    """
+    argument = ""
+    parts = user_input.split()
+    if len(parts) > 1:
+        argument = parts[1].lower()
+
+    wanted = argument == "on" if argument in {"on", "off"} else active_frame() is None
+    if wanted:
+        _start_frame(console)
+    else:
+        _stop_frame(console)
+
+
+def _start_frame(console: Console) -> bool:
+    """Bring the frame up and point the session's output into it."""
+    global _FRAME, _FRAME_CONSOLE_STATE
+    from shamsu.cli.tui import FrameHost, PaneWriter, TuiApp
+
+    if active_frame() is not None:
+        return True
+    live = active_live_console()
+    if live is None:
+        console.print(
+            "[yellow]The framed TUI needs an interactive terminal - "
+            f"{_LIVE_CONSOLE_OFF_REASON or 'this one cannot host it'}.[/yellow]"
+        )
+        return False
+
+    app = TuiApp(
+        telemetry=live.telemetry,
+        on_submit=lambda text: _FRAME.submit(text) if _FRAME is not None else None,
+        history=getattr(live, "history", None),
+        on_interrupt=_interrupt_current_request,
+        on_exit=lambda: _stop_frame(console),
+    )
+    frame = FrameHost(app)
+    frame.on_route = live.route
+    if not frame.start():
+        console.print("[yellow]The framed TUI could not start; staying on the stream.[/yellow]")
+        return False
+
+    _FRAME = frame
+    live.set_frame(app)
+    live._loop = frame.loop
+    # Everything the SESSION prints now goes into the pane - not just a turn's
+    # output. That is what makes the scrollback the conversation.
+    _FRAME_CONSOLE_STATE = (console.file, console.width)
+    console.file = PaneWriter(app.pane, app.invalidate)
+    console.width = app.output_width()
+    app.echo("SHAMSU - framed mode. PgUp/PgDn or the wheel scrolls this pane,")
+    app.echo("F2 toggles mouse capture, Ctrl+D or /tui off returns to the stream.")
+    app.echo("")
+    return True
+
+
+def _stop_frame(console: Console) -> None:
+    """Take the frame down and give the console its real destination back."""
+    global _FRAME, _FRAME_CONSOLE_STATE
+    frame, _FRAME = _FRAME, None
+    if _FRAME_CONSOLE_STATE is not None:
+        console.file, console.width = _FRAME_CONSOLE_STATE
+        _FRAME_CONSOLE_STATE = None
+    live = active_live_console()
+    if live is not None:
+        live.set_frame(None)
+        live._loop = None
+    if frame is not None:
+        with contextlib.suppress(Exception):
+            frame.stop()
+        console.print("[dim]Framed TUI closed - back to the scrolling log.[/dim]")
+
+
+def _frame_turn(turn: Callable[[Any], Any], live: Any, user_input: str) -> bool:
+    """Run one turn inside the frame that is already up.
+
+    The frame is NOT created or destroyed here. It belongs to the session, and
+    the console is already pointing into its pane, so this only has to mark the
+    turn active - which is what tells the input box that a typed line is now a
+    steer rather than the next prompt.
+    """
+    frame = active_frame()
+    thinking = live.status()
+    live.telemetry.reset()
+    live.telemetry.active = True
+    live.telemetry.started = time.monotonic()
+    thinking.update(_thinking_status_for_input(user_input))
+    frame.turn_active = True
+    try:
+        return _run_request(turn(thinking))
+    finally:
+        frame.turn_active = False
+        live.telemetry.active = False
+        frame.app.invalidate()
+
+
+def _interrupt_current_request() -> None:
+    """Ctrl+C inside the frame cancels the turn, exactly as it does outside."""
+    runner = _REQUEST_RUNNER
+    if runner is None:
+        return
+    with contextlib.suppress(Exception):
+        runner.interrupt()
 
 
 async def _with_live_input(turn: Any, live: Any) -> Any:
@@ -19113,6 +19259,11 @@ def main(argv: list[str] | None = None) -> None:
     global _LIVE_CONSOLE
     _LIVE_CONSOLE = _build_live_console(workspace, console, prompt_history)
     _announce_live_console(console)
+    if _LIVE_CONSOLE is not None:
+        from shamsu.cli.tui import tui_enabled
+
+        if tui_enabled():
+            _start_frame(console)
     # Plan mode: `/plan` with no task arms this, and the NEXT natural prompt is
     # planned instead of executed. Deliberately per-session (not persisted): a
     # mode that silently survives a restart would plan when you meant to build.
@@ -19131,9 +19282,15 @@ def main(argv: list[str] | None = None) -> None:
             # in flight, and delivering it as one made the model abandon what
             # it was doing.
             queued = _next_queued_task()
+            frame = active_frame()
             if queued:
                 console.print(f"[dim]starting queued task:[/dim] {queued}")
                 raw_input_text = queued
+            elif frame is not None:
+                # The frame owns the terminal, so the prompt comes from its
+                # input box. Same box the turn steers through - idle it is the
+                # next request, mid-turn it is a correction.
+                raw_input_text = frame.read_line()
             elif session is None:
                 raw_input_text = input(prompt_label)
             else:
@@ -19405,6 +19562,9 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input == "queue" or lowered_input.startswith("queue "):
             _handle_queue(f"/{normalized_input}", console)
             continue
+        if lowered_input == "tui" or lowered_input.startswith("tui "):
+            _handle_tui(normalized_input, console)
+            continue
         if lowered_input == "tasks" or lowered_input.startswith("tasks "):
             _tasks_tokens = lowered_input.split(maxsplit=2)
             if len(_tasks_tokens) > 1 and _tasks_tokens[1] in {"execute", "continue"}:
@@ -19625,6 +19785,7 @@ def main(argv: list[str] | None = None) -> None:
         _finish_current_run(workspace, ledger)
         clear_current_run()
 
+    _stop_frame(console)
     flush_memory_queues()
     browser_tool.close()
     if _REQUEST_RUNNER is not None:

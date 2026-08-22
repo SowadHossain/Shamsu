@@ -47,6 +47,11 @@ def prompt_is_active() -> bool:
 #: it needs to act on it.
 _ON_PROMPT_OPEN: list = []
 
+#: The matching release. A pinned prompt only needs telling that a question is
+#: coming; a FULL-SCREEN frame has to hand the real terminal over for exactly
+#: as long as the question lasts and then take it back, so it needs both edges.
+_ON_PROMPT_CLOSE: list = []
+
 
 def on_prompt_open(callback):
     """Register `callback`, called just before any prompt takes the terminal.
@@ -60,6 +65,21 @@ def on_prompt_open(callback):
     def release() -> None:
         with contextlib.suppress(ValueError):
             _ON_PROMPT_OPEN.remove(callback)
+
+    return release
+
+
+def on_prompt_close(callback):
+    """Register `callback`, called once a prompt has released the terminal.
+
+    Same thread rules as `on_prompt_open`. Always called, including when the
+    prompt raised - a frame left suspended is a terminal that never comes back.
+    """
+    _ON_PROMPT_CLOSE.append(callback)
+
+    def release() -> None:
+        with contextlib.suppress(ValueError):
+            _ON_PROMPT_CLOSE.remove(callback)
 
     return release
 
@@ -79,6 +99,9 @@ def reading_input():
         yield
     finally:
         _PROMPT_DEPTH = max(0, _PROMPT_DEPTH - 1)
+        for callback in list(_ON_PROMPT_CLOSE):  # noqa: PERF101
+            with contextlib.suppress(Exception):
+                callback()
 
 
 def _action_label(action_type: str) -> str:

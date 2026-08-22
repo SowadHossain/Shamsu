@@ -3,6 +3,33 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-22 - "old_string not found" was the answer to a correct edit
+Files edited: `shamsu/tools/agent_tools.py`, `tests/test_patch_repair.py` (new)
+What changed: the reported turn made four `patch_file` calls and two
+`replace_symbol` calls on `js/main.js`, all refused, then read the file nine
+more times and ended having changed nothing. The payload had two faults at
+once. It was a SINGLE LINE of literal backslash-n - which is also why
+`replace_symbol` reported "2 unclosed {". And every line the model had copied
+out of `read_file` was one space too deep, because the read's line-number
+gutter ends in a space and the model stripped `74|` while keeping the
+separator: 18 of the 22 lines were exactly one space deep and the 4 that were
+exact were the JSDoc header above the read's first line, typed from memory.
+Both repairs already existed and neither could reach it - `_strip_line_numbers`
+correctly requires every line to carry a gutter, and the decoded form was
+tested for an EXACT match and discarded when it missed, so every line-based
+repair then ran on a one-liner with no lines to split. Now: repairs run on the
+sent text and then on the decoded text; a new matcher tolerates a leading
+indent shift (unique match, 3-line minimum, returns the FILE's bytes); and the
+replacement is re-indented PER LINE - each line that appears in `old_string`
+moves by its own measured error and a changed line inherits the correction
+above it. A single modal shift was tried first and silently dedented the lines
+that were already right whenever they outnumbered the shifted ones.
+Tests: 11 new in `tests/test_patch_repair.py`; full suite 3707 passed, 2
+skipped. Verified by replaying all four real payloads through the real tool
+against the real file: 2 now apply and `node --check` passes on both, 2 are
+still refused because the model genuinely mis-typed the text |
+Log: logs/test-runs/2026-08-22-patch-repair-escapes-and-gutter.log
+
 ### 2026-08-22 - A turn that did nothing for 21m52s and reported SUCCESS
 Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/loop_guards.py`,
 `shamsu/cli/turn_render.py`, `tests/test_turn_verdict.py` (new),
@@ -30,6 +57,36 @@ simple_chat, 3 repointed - each had asserted the mechanism rather than the
 property, so each guaranteed the bug it covered; full suite 3661 passed, 2
 skipped |
 Log: logs/test-runs/2026-08-22-harness-verdict-and-ceilings.log
+
+### 2026-08-22 - The framed TUI: output pane, sidebar, and its own scrollback
+Files edited: `shamsu/cli/tui.py` (new), `shamsu/cli/repl.py`,
+`shamsu/cli/live_console.py`, `shamsu/safety/approval.py`,
+`tests/test_tui.py` (new)
+What changed: spec item 01 in full ("a real layout instead of a scrolling log")
+and item 02 (the right sidebar), opt-in via `/tui` or `SHAMSU_TUI=1`. I had
+argued a frame costs the terminal's scrollback; it does, and that is not a
+reason - Neovim and lazygit take the alternate screen and scroll inside the
+application, so `LogPane` does too: bounded, wrapped, wheel/PageUp/PageDown,
+and it does not move when the sidebar or input repaint. The turn's output
+reaches the pane by pointing the REPL's one `rich.Console` at a `PaneWriter`
+for the length of the turn (`Console.file` and `.width` are settable), so
+panels, markdown and diffs all land without a single call site learning a frame
+exists. Three things the spec did not list and all of which bite: an approval
+prompt is a second prompt_toolkit Application and cannot run inside the frame,
+so `reading_input()` gained a matching CLOSE hook and the frame hands the real
+terminal over via `run_in_terminal` for exactly the question's lifetime;
+Ctrl+C never reaches the SIGINT handler in full-screen mode, so
+`_RequestRunner.interrupt()` is a new entry point the key binding uses; and
+mouse capture takes click-drag away from the terminal's own selection, so it is
+toggled with F2 and the statusline says which state you are in. The bug the
+tests caught was the one that mattered: the wheel did nothing, because `scroll`
+applied its delta to an offset last computed for a different window height and
+clamped straight back to the bottom.
+Tests: 35 new in `tests/test_tui.py`, incl. the real Application driven over
+`create_pipe_input()`; 66 in `tests/test_live_console.py` still green. Not
+proven: a real Windows terminal - this session has no TTY, so the alternate
+screen itself is untested |
+Log: logs/test-runs/2026-08-22-framed-tui.log
 
 ### 2026-08-22 - Every structured call returned "", and the live console never turned on
 Files edited: `shamsu/llm/manager.py`, `shamsu/cli/repl.py`,

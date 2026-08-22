@@ -1,0 +1,173 @@
+SHAMSU — why "old_string not found" kept being the answer to a correct edit
+============================================================================
+2026-08-22 · branch small-shamsu-new
+Source: F:\Work\demo2\asteroid-shamsu, session 20260822-090221-f144,
+        qwen3.5:9b-q4_K_M. One turn, pasted by the user.
+
+
+THE TURN
+--------
+    4 x patch_file      -> old_string not found
+    2 x replace_symbol  -> NOT APPLIED, would stop the file parsing
+    9 more reads of js/main.js
+    3 x announced the edit and made no tool call
+    ✗ FAILED  stopped after 8m51s, nothing changed
+
+The new verdict and the read ceiling both worked: the turn was badged FAILED
+rather than SUCCESS, and the ceiling ended it instead of letting it run. They
+were reporting a real failure underneath, and this is it.
+
+
+THE PAYLOAD, FROM messages.jsonl
+---------------------------------
+Message 177's `old_string`, as stored:
+
+    '/**\\n * Create starfield background effect\\n */\\n function createStar...'
+
+Two faults in one string.
+
+1. LITERAL BACKSLASH-N. `"\n" in old_string` is False; `"\\n" in old_string`
+   is True. The whole 729-character payload is ONE LINE. `replace_symbol`
+   failed on the same thing, and its error even described the consequence
+   exactly: "2 unclosed { - the innermost was opened on line 133 and the file
+   ends without closing it" - because a single line of JS with escaped
+   newlines does not balance.
+
+2. THE READ GUTTER. `read_file` numbers its output and the gutter ends in a
+   space:
+
+       74| function createStarField() {
+       75|     const geometry = new THREE.BufferGeometry();
+
+   Strip `74|` and you keep the separator. Line by line against the file, after
+   decoding the escapes:
+
+       4 of 22 lines exact
+      18 of 22 lines exactly ONE SPACE too deep
+
+   And the 4 exact ones are the JSDoc header ABOVE the read's first line, which
+   the model typed from memory instead of copying. Every line it copied carried
+   the space. That is not a coincidence, it is the mechanism.
+
+
+WHY THE EXISTING REPAIRS DID NOT FIRE
+--------------------------------------
+Both were already there. Neither could reach it.
+
+`_strip_line_numbers` handles the model pasting `74| ` back verbatim - and
+correctly requires EVERY non-empty line to carry a gutter, or a markdown table
+would get mangled. Here the model had already stripped `74|` itself, so no line
+carried one. Right contract, wrong failure.
+
+`_decode_literal_escapes` was called, and produced the correct text. Then:
+
+    decoded = _decode_literal_escapes(old_string)
+    if decoded != old_string and content.count(decoded) > 0:
+        old_string = decoded            # <- ONLY if it matches EXACTLY
+
+The decode was tested for an exact match, missed by the gutter space, and was
+DISCARDED. Every line-based repair below then ran on the escaped one-liner,
+which has no lines to split. The one usable version of the payload was computed
+and thrown away, and the model was told "not found" about text it had sent
+correctly apart from the escaping.
+
+`_fuzzy_match_block` tolerates trailing whitespace only, and says why:
+"leading indentation is compared exactly, so we never silently re-indent code."
+That is the right default and it is what cost this edit.
+
+
+THE FIX
+-------
+a) Every repair now runs on the text AS SENT and then on its DECODED form.
+   The decode is no longer required to be exactly right to be worth trying.
+
+b) `_indent_shifted_match_block`: match on stripped lines, require the match to
+   be UNIQUE, require at least MIN_INDENT_FUZZ_LINES (3) lines, and return the
+   FILE's own bytes. Three lines minimum because indentation is the only thing
+   separating two identically-worded lines in different scopes, and matching
+   one or two on stripped text alone is loose enough to land in the wrong
+   place.
+
+c) `_realign_replacement`: put `new_string` at the file's indentation PER LINE.
+   Matching the block is half the job - writing the model's own text back at
+   the model's own wrong indentation fixes the match and mis-indents the file,
+   which in Python is not cosmetic.
+
+   Per line, not per block, and this took two attempts to get right:
+
+     - A common-prefix dedent does nothing here. The block's shared indent is
+       "" both sides, because `/**` sits at column 0 in both.
+     - A single MODAL shift is decided by whichever group is larger, which is
+       not a property of the edit. It worked on the real payload (18 shifted vs
+       4 correct) and produced the wrong answer on a 5-line block (3 correct vs
+       2 shifted), silently dedenting the lines that were already right.
+
+   So: each replacement line that also appears in `old_string` moves by exactly
+   that line's own measured error, and a line that does not appear - one the
+   model changed or added - inherits the last known correction above it. A
+   rewritten line sits in the same block as its neighbours.
+
+
+VERIFIED — the four real payloads replayed through the real tool
+-----------------------------------------------------------------
+Against a scratch copy of the real js/main.js:
+
+    msg 173  refused   (old_string genuinely not in the file - the model
+                        mis-remembered the JSDoc text)
+    msg 177  APPLIED   +14 -7, lines 71-92        node --check: PARSES
+    msg 181  refused   (same - genuinely not in the file)
+    msg 183  APPLIED   +18 -3, lines 130-142      node --check: PARSES
+
+2 recovered, 2 still correctly refused. That split is the point: the repair is
+not a loosening. The two that still fail are the two where the model sent text
+that is not in the file, which is exactly what "not found" is for.
+
+Indentation, on the line whose text the model CHANGED:
+
+    before  ' * Create starfield background effect'
+    after   ' * Create starfield background effect with scrolling for speed sensation'
+
+The leading space survives - it inherited the delta of the `/**` above it
+rather than the shift of the code below it.
+
+
+TESTS
+-----
+    tests/test_patch_repair.py   +11 (new)
+
+    the gutter
+        test_a_block_copied_out_of_the_read_gutter_still_applies
+        test_the_replacement_lands_at_the_files_indentation_not_the_models
+        test_lines_the_model_got_right_are_not_shifted_with_the_rest
+            the 5-line mixture that broke the modal version
+    the escaping
+        test_a_literal_backslash_n_payload_reaches_the_repairs
+            escaped AND one space deep - the reported shape
+        test_the_note_says_the_escaping_was_repaired
+            a silent repair teaches nothing and the model resends the shape
+    it must not get looser
+        test_text_that_is_simply_not_in_the_file_is_still_refused
+        test_an_ambiguous_block_is_refused_rather_than_guessed
+        test_two_lines_are_not_enough_to_ignore_indentation_on
+        test_what_comes_back_is_always_the_files_own_text
+        test_a_normal_exact_edit_is_untouched
+    python
+        test_a_python_block_keeps_its_relative_indentation
+            compiles the result, because here a space is the program
+
+    FULL SUITE: 3707 passed, 2 skipped
+
+
+NOT FIXED HERE
+--------------
+Visible in the same paste and untouched:
+
+  - `RuntimeWarning: coroutine 'Application.run_async' was never awaited`
+    (safety/approval.py:286) and `coroutine 'ask_here_or_anywhere' was never
+    awaited` (cli/repl.py:5329). The known approval bug; pressing `a` still
+    goes down a path that never awaits.
+  - The same approval was drawn THREE times - two panels before the question
+    and a third afterwards naming the workspace.
+  - `run_command` was handed `cd /f/Work/... && node -c js/main.js` and exited
+    125: a Git Bash path given to a Windows shell.
+  - `Approval resolved on .` printed at the idle prompt with an empty subject.

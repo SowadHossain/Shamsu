@@ -72,6 +72,11 @@ REFRESH_SECONDS = 0.2
 #: so it is cheap enough to keep tight. It is one integer comparison.
 STAND_DOWN_POLL_SECONDS = 0.01
 
+#: How long the framed TUI will stay suspended for one approval before taking
+#: the terminal back regardless. A handover that never returned would be a
+#: terminal the user cannot reach, which is worse than a repainted frame.
+HANDOVER_TIMEOUT_SECONDS = 900
+
 #: Bar glyphs for the context meter.
 BAR_FULL = "█"
 BAR_EMPTY = "░"
@@ -560,6 +565,12 @@ class LiveConsole:
         self._prompt_is_active = prompt_is_active
         self._session: Any = None
         self._broken = False
+        #: The framed TUI while one is up, else None. Changes what "stand
+        #: down" has to mean - see `stand_down`.
+        self._frame: Any = None
+        self._handover: Any = None
+        #: Shared with the idle prompt, so Up recalls what you typed mid-turn.
+        self.history: Any = None
         #: The loop the prompt runs on, so `stand_down` can reach it from the
         #: worker thread a tool's approval fires on.
         self._loop: Any = None
@@ -603,6 +614,19 @@ class LiveConsole:
                 self._session = None
         return self._session
 
+    def set_frame(self, frame: Any) -> None:
+        """Record the framed TUI for the length of a turn, or clear it."""
+        self._frame = frame
+        if frame is None:
+            self.resume()
+
+    def resume(self) -> None:
+        """The approval is done; the frame may take the terminal back."""
+        handover, self._handover = self._handover, None
+        if handover is not None:
+            with contextlib.suppress(Exception):
+                handover.set()
+
     def stand_down(self) -> None:
         """Give the terminal up NOW. Safe to call from any thread.
 
@@ -615,6 +639,10 @@ class LiveConsole:
         Tools run on a worker thread, so this must not touch the app directly -
         it hands the work to the loop the prompt is actually running on.
         """
+        if self._frame is not None:
+            self._suspend_frame()
+            return
+
         loop, app = self._loop, getattr(self._session, "app", None)
         if loop is None or app is None:
             return
@@ -626,6 +654,38 @@ class LiveConsole:
 
         with contextlib.suppress(Exception):
             loop.call_soon_threadsafe(close)
+
+    def _suspend_frame(self) -> None:
+        """Hand the real console to an approval for as long as it needs it.
+
+        A frame cannot merely stop painting: it holds the alternate screen, and
+        the approval prompt is a second prompt_toolkit application that needs
+        the actual terminal. `run_in_terminal` is the supported way out, and it
+        takes a callable - so the callable simply waits until `reading_input()`
+        releases, at which point the frame is restored automatically.
+
+        The wait runs in an executor so the event loop keeps turning while a
+        human decides, and it is bounded: a handover that never came back would
+        be a terminal the user cannot reach.
+        """
+        import threading
+
+        loop, frame = self._loop, self._frame
+        if loop is None or frame is None:
+            return
+        waiter = threading.Event()
+        self._handover = waiter
+
+        async def hand_over() -> None:
+            from prompt_toolkit.application.run_in_terminal import run_in_terminal
+
+            with contextlib.suppress(Exception):
+                await run_in_terminal(
+                    lambda: waiter.wait(HANDOVER_TIMEOUT_SECONDS), in_executor=True
+                )
+
+        with contextlib.suppress(Exception):
+            asyncio.run_coroutine_threadsafe(hand_over(), loop)
 
     async def input_loop(self) -> None:
         """Prompt, route, repeat, until the turn ends and this is cancelled."""

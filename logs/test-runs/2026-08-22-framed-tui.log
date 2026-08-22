@@ -1,0 +1,182 @@
+SHAMSU — the framed TUI: output pane, sidebar, pinned input, own scrollback
+===========================================================================
+2026-08-22 · branch small-shamsu-new
+
+Spec item 01 in full ("a real layout instead of a scrolling log") and item 02
+(the right sidebar). The earlier pass delivered item 01's LISTED requirements -
+pinned box, echo, backspace, history, output above - but not its headline, and
+put the telemetry on two bottom rows instead of in a pane. This is the frame.
+
+
+THE OBJECTION, AND WHY IT DOES NOT SURVIVE
+------------------------------------------
+I argued a frame costs the terminal's own scrollback. True, and not a reason:
+Neovim and lazygit take the alternate screen and implement scrolling INSIDE the
+application. `LogPane` is that scrollback - bounded, wrapped, scrollable with
+the wheel, PageUp/PageDown and Ctrl+Home/End - and it does not move when the
+sidebar or the input box repaint.
+
+
+    ┌─────────────────────────────────────────────────────────────────────┬─────────────────────────────┐
+    │shamsu (config-fix) cli> the server crashes when REDIS_URL is missing│ SHAMSU                      │
+    │                                                                     │ ─────────────────────────── │
+    │  model responded in 11s                                             │ ⠋ contract_status           │
+    │  ▤ Reading config.py · 14ms                                         │   1m04s                     │
+    │  model responded in 41s                                             │                             │
+    │  ✎ Editing config.py · 38ms                                         │ ROUND BUDGET                │
+    │    +    if not url:                                                 │   14 / 24                   │
+    │    +        url = 'redis://localhost:6379'                          │                             │
+    │  ✗ run_tests FAILED no test runner configured · 1.8s                │ CONTEXT WINDOW              │
+    │  ▤ contract_status x8                                               │   ███████░░░ 71%            │
+    │                                                                     │   23.3k / 32.8k             │
+    │                                                                     │                             │
+    │                                                                     │ FILES MODIFIED              │
+    │                                                                     │   config.py                 │
+    │                                                                     │   js/PlayerShip.js          │
+    │                                                                     │                             │
+    │                                                                     │ OPEN CONTRACTS              │
+    │                                                                     │   1                         │
+    │                                                                     │                             │
+    │                                                                     │ QUEUES                      │
+    ├──────────────────────────────────────────────────────────────────────────────────────────────────┤
+    │ shamsu (config-fix) cli>                     mouse · bot · PgUp/PgDn scroll · F2 mouse · ^C stop │
+    │ > fix the tests too                                                                              │
+    └──────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+Composited from the real `LogPane.plain()` and `render_sidebar()`. The frame
+itself is asserted by driving the actual `Application` over
+`create_pipe_input()` - see TESTS.
+
+
+HOW THE TURN'S OUTPUT GETS INTO THE PANE
+----------------------------------------
+Not by rewriting call sites. The REPL hands ONE `rich.Console` down through
+every route, and rich exposes `Console.file` and `Console.width` as settable -
+so the frame points that console at a `PaneWriter` for the length of the turn
+and puts it back in `finally`. Panels, markdown, diffs and the turn renderer's
+rows all land in the pane, and nothing had to learn that a frame exists.
+
+`PaneWriter.isatty()` returns True so rich keeps emitting ANSI; `LogPane`
+parses it back into styled fragments. Verified on a real `rich.Panel`.
+
+
+THREE THINGS THE SPEC DID NOT MENTION, ALL OF WHICH BITE
+--------------------------------------------------------
+1. THE APPROVAL PROMPT. Two prompt_toolkit `Application`s cannot run at once,
+   and the approval prompt is one - so inside a frame it cannot simply be
+   called. `reading_input()` in `safety/approval.py` already fired an open
+   hook; it now fires a matching CLOSE hook, and `LiveConsole._suspend_frame`
+   uses the pair to hold `run_in_terminal` for exactly the question's lifetime:
+
+       stand_down()  -> schedule run_in_terminal(waiter.wait, in_executor=True)
+       [ the frame drops the alternate screen; the question is asked normally ]
+       resume()      -> waiter.set(); the frame is restored
+
+   `in_executor=True` so the event loop keeps turning while a human decides,
+   and the wait is bounded at 900s - a handover that never came back would be
+   a terminal the user cannot reach. `set_frame(None)` also releases, so a turn
+   that ends mid-approval cannot park a waiter forever.
+
+2. CTRL+C. In full-screen mode prompt_toolkit owns the keyboard and the SIGINT
+   handler never fires. `_RequestRunner.interrupt()` is a new entry point so
+   the key binding lands exactly where the signal did - graceful cancel, run
+   marked CANCELLED, prompt comes back.
+
+3. MOUSE CAPTURE COSTS TEXT SELECTION. With `mouse_support` on the terminal
+   stops handing click-drag to its own selection. Most terminals still allow it
+   with Shift held; not all do. Bound to F2, and the statusline says which
+   state you are in - `mouse` / `MOUSE OFF`.
+
+
+THE BUG THE TESTS FOUND, WHICH IS THE ONE THAT MATTERED
+-------------------------------------------------------
+The wheel did nothing.
+
+`scroll()` applied its delta to whatever `offset` held. While following the
+tail, `offset` was last set for the height of the PREVIOUS paint - and when the
+window is taller than that, the old offset is already past this height's limit,
+so a scroll up clamped straight back to the bottom and re-armed follow. Net
+effect: the view never moved.
+
+    limit = self.max_offset(height)
+    base  = limit if self.follow else min(self.offset, limit)   # <- the fix
+    self.offset = max(0, min(limit, base + rows))
+    self.follow = self.offset >= limit
+
+Caught by `test_paging_moves_about_a_screen` and
+`test_the_wheel_scrolls_the_log_and_nothing_else`, both of which failed on the
+first run for the same reason.
+
+
+FOLLOW-TAIL
+-----------
+The detail that decides whether the scrollback is usable during a live turn.
+New output must not yank you back to the bottom while you are reading something
+forty rounds up. The pane follows the tail only while it is ALREADY at the
+tail; scroll up once and it stays put until you scroll back to the end, which
+re-arms it. Asserted directly:
+
+    test_scrolling_up_stops_new_output_yanking_you_back
+        scroll up, write ten more lines, assert the visible text is BYTE FOR
+        BYTE what it was.
+
+Eviction is handled in the same place: when a line falls off the top of a full
+scrollback, the offset moves with it, so the content you are reading does not
+drift up a row at a time (`test_eviction_does_not_shift_what_you_are_reading_
+off_by_one`).
+
+
+OPT-IN, AND THE FALLBACK
+------------------------
+`/tui`, `/tui on`, `/tui off`, or `SHAMSU_TUI=1`. Armed per session on purpose:
+a full-screen mode that silently survived a restart would take the terminal on
+a run where you wanted a plain log to copy out of.
+
+Three display modes now, chosen once per turn in `_dispatch_turn`:
+
+    framed TUI      /tui or SHAMSU_TUI=1
+    pinned prompt   the default on a terminal that can host one
+    plain stream    a pipe, a CI runner, a console with no screen buffer
+
+The last is not a degraded path - it is exactly what every turn did before any
+of this work.
+
+Below 90 columns the sidebar is dropped: 30 columns of pane out of 70 leaves
+the log unreadable.
+
+
+WHAT I HAVE NOT PROVEN
+----------------------
+A real Windows terminal. This session has no TTY, so the frame is asserted
+through `create_pipe_input()` + `DummyOutput()` / `PlainTextOutput` rather than
+by looking at one. That covers construction, painting, key handling, mouse
+events, input routing and teardown - a layout that cannot be built or a control
+that raises while painting fails in the suite - but it does not cover how the
+alternate screen behaves on your machine.
+
+
+TESTS
+-----
+    tests/test_tui.py             35 passed  (new)
+    tests/test_live_console.py    66 passed  (unchanged, still green)
+
+Worth naming:
+
+    test_the_frame_runs_and_routes_what_is_typed
+        the real Application over pipe input: construct, paint, type, route,
+        tear down.
+    test_the_wheel_scrolls_the_log_and_nothing_else
+    test_ctrl_c_inside_the_frame_stops_the_turn
+    test_mouse_capture_can_be_turned_off_without_leaving_the_tui
+    test_a_submit_that_raises_does_not_take_the_frame_down
+    test_a_broken_telemetry_object_does_not_kill_the_frame
+        an exception while painting a control tears down the Application.
+    test_an_approval_suspends_the_frame_and_gets_it_back
+    test_clearing_the_frame_releases_a_pending_handover
+    test_a_real_rich_console_lands_in_the_pane_with_colour
+    test_a_rich_panel_lands_whole
+    test_a_chunk_that_does_not_end_in_a_newline_is_held
+        rich writes in pieces that do not respect line boundaries.
+    test_a_resize_rewraps_everything
+    test_the_scrollback_is_bounded
+    test_every_sidebar_row_fits_the_column
