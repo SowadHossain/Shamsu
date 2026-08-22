@@ -81,8 +81,44 @@ def test_each_level_fires_once_not_every_round_after():
     fired = [
         detector.record(["read_file"], produced_something=False) for _ in range(30)
     ]
+    signals = [s for s in fired if s]
 
-    assert len([s for s in fired if s]) == 2
+    # Each WORD is said once. What follows is not another sentence.
+    reasons = [s.reason for s in signals]
+    assert reasons.count("read_loop_warning") == 1
+    assert reasons.count("read_loop") == 1
+    assert reasons[:2] == ["read_loop_warning", "read_loop"]
+
+
+def test_past_the_second_nudge_the_detector_does_not_go_silent():
+    """It used to. Both flags were one-shot and nothing counted past them, so
+    after eight reads there was no ceiling at all - which is how one turn read
+    the same file fifteen times over 21m52s and still reported success.
+
+    Six reads is not enough to reach it: the escalation is a ceiling, not a
+    third nudge, and it must not fire on a model that is merely thorough."""
+    from shamsu.agents.loop_guards import READ_LOOP_EXHAUSTED
+
+    detector = ReadLoopDetector()
+    early = [detector.record(["read_file"], produced_something=False) for _ in range(6)]
+    assert not any(s and s.reason == READ_LOOP_EXHAUSTED for s in early)
+
+    later = [detector.record(["read_file"], produced_something=False) for _ in range(20)]
+    assert any(s and s.reason == READ_LOOP_EXHAUSTED for s in later)
+
+
+def test_producing_something_clears_the_escalation_too():
+    """A model that reads a lot and then WRITES has not lost the thread, and
+    must not carry a ceiling into the rest of the turn."""
+    from shamsu.agents.loop_guards import READ_LOOP_EXHAUSTED
+
+    detector = ReadLoopDetector()
+    for _ in range(12):
+        detector.record(["read_file"], produced_something=False)
+    detector.record(["write_file"], produced_something=True)
+
+    after = [detector.record(["read_file"], produced_something=False) for _ in range(7)]
+    assert not any(s and s.reason == READ_LOOP_EXHAUSTED for s in after)
 
 
 # --- greeting mid-task ---------------------------------------------------

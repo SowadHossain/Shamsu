@@ -203,14 +203,36 @@ def test_a_near_miss_argument_name_does_not_waste_a_round(tmp_path):
     assert '"ok": true' in tool_messages[0]["content"].lower()
 
 
-def test_an_unknown_tool_is_answered_with_the_names_that_exist(tmp_path):
+def test_an_unknown_tool_is_answered_with_somewhere_to_go(tmp_path):
+    """This used to assert the reply contained the whole registry, which is the
+    thing `closest_tool_names` was written to stop: thirty names, already in
+    the prompt the model has just shown it is not reading, handed back at the
+    moment it is confused. A name with no near match now gets the door
+    (`select_category`) instead of every room behind it."""
     loop = _loop(tmp_path, [_tool("delete_everything", filepath="x"), _text("Sorry.")])
 
     asyncio.run(loop.run("go"))
 
     tool_messages = [m for m in loop.client.calls[1]["messages"] if m["role"] == "tool"]
-    assert "no tool called delete_everything" in tool_messages[0]["content"]
-    assert "write_file" in tool_messages[0]["content"]
+    answer = tool_messages[0]["content"]
+    assert "no tool called delete_everything" in answer
+    assert "select_category" in answer
+    assert answer.count("_file") <= 2, "this is the thirty-name dump again"
+
+
+def test_a_tool_the_model_wishes_existed_is_told_what_to_do_instead(tmp_path):
+    """Live 2026-08-22: `✗ plan FAILED There is no tool called plan. Available:
+    append_file, ask_user, contra...`. `plan` is not a misspelling of anything
+    in the registry - no edit distance, no shared word - so the "did you mean"
+    path cannot fire and the model learned nothing from the answer."""
+    loop = _loop(tmp_path, [_tool("plan", filepath="x"), _text("Sorry.")])
+
+    asyncio.run(loop.run("go"))
+
+    tool_messages = [m for m in loop.client.calls[1]["messages"] if m["role"] == "tool"]
+    answer = tool_messages[0]["content"]
+    assert "no tool called plan" in answer
+    assert "write_file" in answer, "it must name what to do instead"
 
 
 def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
@@ -6520,7 +6542,13 @@ def test_the_oversize_refusal_names_the_strategy_not_just_the_limit(tmp_path):
     said = [m.content for m in loop.state.all_messages if m.role == "tool"]
     assert any("REFUSED" in c for c in said)
     assert any("append_file" in c and "60 lines" in c for c in said)
-    assert any("Nothing you generated is lost" in c for c in said)
+    # This used to assert the words "Nothing you generated is lost", which were
+    # true for about four messages: `_shorten_arguments` drops content
+    # arguments and MIN_VERBATIM_MESSAGES is 4. The claim is now backed by a
+    # spill rather than by optimism - see test_a_refused_oversized_write_is
+    # _recoverable in tests/test_turn_verdict.py.
+    assert any(".shamsu/oversized" in c for c in said)
+    assert (tmp_path / ".shamsu" / "oversized").is_dir()
 
 
 def test_the_cap_covers_every_tool_that_carries_content(tmp_path):

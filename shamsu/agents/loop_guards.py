@@ -17,10 +17,17 @@ stay where they are for now: moving working, tested code is pure risk with no
 behaviour to show for it, and it can follow once something needs to change in
 them anyway.
 
-**Every signal is a nudge, never a stop.** These detect a model that has lost
-the thread, not one that has failed - and this project's rule is that a guard
-the model cannot get past is a deadlock waiting for a user to notice. The loop
-owns stopping.
+**Almost every signal is a nudge, never a stop.** These detect a model that has
+lost the thread, not one that has failed - and this project's rule is that a
+guard the model cannot get past is a deadlock waiting for a user to notice. The
+loop owns stopping, and still does: the one signal that ends a turn
+(``READ_LOOP_EXHAUSTED``) is returned like any other and the loop decides.
+
+That exception was bought with evidence. "Nudge, never stop" combined with
+one-shot flags meant that past the second nudge NOTHING was counting, so a
+model that ignored both could read forever - and one did, for 21m52s, changing
+no file and then reporting success. A nudge that cannot escalate is not a
+gentler guard than a ceiling; it is no guard at all after the second sentence.
 """
 from __future__ import annotations
 
@@ -33,6 +40,19 @@ from dataclasses import dataclass, field
 # it was asked for something.
 READS_BEFORE_NUDGE = 5
 READS_BEFORE_INSISTING = 8
+
+#: Reads AFTER the firm word before the loop is told to end the turn.
+#: The detector used to fire twice per turn and then go permanently silent, so
+#: past eight reads there was no ceiling at all. Live 2026-08-22: one turn read
+#: `js/PlayerShip.js` fifteen times, ran 21m52s, changed nothing, and reported
+#: SUCCESS. `read 5 things without producing anything` was the only word said
+#: about it, and it was said once.
+READS_AFTER_INSISTING_BEFORE_STOPPING = 8
+
+#: `Signal.reason` the loop must END the turn on, rather than append and
+#: continue. This is the one signal that is not a nudge - see the note in the
+#: module docstring about who owns stopping.
+READ_LOOP_EXHAUSTED = "read_loop_exhausted"
 
 # Tools that only LOOK. A call to any of these advances the streak; anything
 # else - a write, a command, a memory note - ends it, because the model has
@@ -89,11 +109,16 @@ class ReadLoopDetector:
     streak: int = 0
     nudged: bool = False
     insisted: bool = False
+    #: Reads counted since the firm word. Both flags above are one-shot, and
+    #: with nothing counting past them the detector fell silent exactly when
+    #: the model had proved it was not listening.
+    since_insisting: int = 0
 
     def record(self, tool_names: list[str], produced_something: bool) -> Signal | None:
         """Note one round's tool calls. Returns a nudge, or ``None``."""
         if produced_something:
             self.streak = 0
+            self.since_insisting = 0
             return None
         looked = [name for name in tool_names if name in LOOKING_TOOLS]
         if not looked:
@@ -103,7 +128,27 @@ class ReadLoopDetector:
                 self.streak = 0
             return None
         self.streak += len(looked)
-        if self.streak >= READS_BEFORE_INSISTING and not self.insisted:
+        if self.insisted:
+            # Past the firm word. It was told to stop reading and answer, and
+            # it is still reading, so counting resumes toward a ceiling instead
+            # of toward another sentence it has already ignored.
+            self.since_insisting += len(looked)
+            if self.since_insisting >= READS_AFTER_INSISTING_BEFORE_STOPPING:
+                self.since_insisting = 0
+                return Signal(
+                    READ_LOOP_EXHAUSTED,
+                    f"read {READS_AFTER_INSISTING_BEFORE_STOPPING} more things after "
+                    "being asked to stop; ended the turn",
+                    "I have stopped this turn. After being asked twice to answer, I "
+                    f"made {READS_AFTER_INSISTING_BEFORE_STOPPING} more read calls "
+                    "without writing anything, running anything, or answering.\n\n"
+                    "Everything I read is still in the conversation, so nothing is "
+                    "lost. Ask for one concrete thing - a single function to change, "
+                    "or one question to answer - and I will do that instead of "
+                    "looking for more context.",
+                )
+            return None
+        if self.streak >= READS_BEFORE_INSISTING:
             self.insisted = True
             count = self.streak
             self.streak = 0
@@ -217,6 +262,61 @@ def closest_tool_names(wanted: str, known: list[str], limit: int = 3) -> list[st
     # A model reaching for a Claude-shaped name ("Edit", "Bash") lands nowhere
     # near a SHAMSU one by edit distance, but usually shares a word with it.
     return [name for name in known if bare in name or name in bare][:limit]
+
+
+#: Invented names that describe a CAPABILITY rather than misspell a tool.
+#:
+#: `closest_tool_names` cannot help with these. `plan` is not a near miss for
+#: anything in the registry - no edit-distance match, no shared word - so it
+#: fell through to the branch that answers with all thirty-odd names, which is
+#: exactly what the function above exists to avoid. Observed live 2026-08-22:
+#: `✗ plan FAILED There is no tool called plan. Available: append_file,
+#: ask_user, contra...`, and the model spent the next round no better informed.
+#:
+#: Only `plan` has been seen in a real run here; the rest are the names the
+#: same model families reach for when they were trained against a different
+#: harness, and each one names a real SHAMSU tool as the answer.
+INVENTED_CAPABILITIES: dict[str, str] = {
+    "plan": "There is no planning tool - planning is something you do in your "
+            "answer. Write the plan to a file with write_file, or just say it.",
+    "todo": "There is no todo tool. Keep the list in your answer, or write it "
+            "to a file with write_file.",
+    "todo_write": "There is no todo tool. Keep the list in your answer, or "
+                  "write it to a file with write_file.",
+    "task": "There is no task tool. Do the work yourself with the tools you have.",
+    "think": "There is no think tool - think in your reply, then call a tool "
+             "or answer.",
+    "finish": "There is no completion tool. When you are done, just answer.",
+    "done": "There is no completion tool. When you are done, just answer.",
+    "attempt_completion": "There is no completion tool. When you are done, "
+                          "just answer.",
+    "bash": "Use run_command.",
+    "shell": "Use run_command.",
+    "terminal": "Use run_command.",
+    "exec": "Use run_command.",
+    "grep": "Use search_files.",
+    "rg": "Use search_files.",
+    "ls": "Use list_files.",
+    "dir": "Use list_files.",
+    "cat": "Use read_file.",
+    "view": "Use read_file.",
+    "open": "Use read_file.",
+    "str_replace": "Use patch_file.",
+    "str_replace_editor": "Use patch_file.",
+    "apply_patch": "Use patch_file.",
+}
+
+
+def invented_capability_hint(wanted: str) -> str:
+    """What to do instead of the tool the model wished it had, or "".
+
+    Separate from `closest_tool_names` because it answers a different question.
+    That one handles a name that is nearly right; this one handles a name that
+    is nowhere near anything, which is a model asking for a capability rather
+    than fumbling a spelling. Handing it a list of every tool answers neither.
+    """
+    bare = (wanted or "").strip().lower().rsplit(".", 1)[-1]
+    return INVENTED_CAPABILITIES.get(bare, "")
 
 
 # How far a retry moves the temperature. smallcode's default, and applied as a

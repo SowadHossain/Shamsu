@@ -3,6 +3,34 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-22 - A turn that did nothing for 21m52s and reported SUCCESS
+Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/loop_guards.py`,
+`shamsu/cli/turn_render.py`, `tests/test_turn_verdict.py` (new),
+`tests/test_loop_guards.py`, `tests/test_simple_chat.py`
+What changed: four defects from one reported turn. (1) `status="done"` meant
+"the loop returned without raising" - a claim about the PROCESS that every
+surface read as a claim about the OUTCOME - so a turn that changed nothing,
+failed four tool calls and printed "This answer was cut off." was badged
+`✓ SUCCESS`. `SimpleChatResult.truncated` now exists, status is
+error>stopped>incomplete>done, `error` is actually published, there is a
+yellow `▲ INCOMPLETE` badge, and the verdict line carries the numbers that
+already existed. (2) `ReadLoopDetector`'s two flags are one-shot and nothing
+counted past them, so beyond eight reads there was no ceiling at all - hence
+fifteen reads of one file with one guard line said about it. It now escalates
+to `READ_LOOP_EXHAUSTED` and the loop ends the turn. (3) A hallucinated tool
+name with no near match fell through to a dump of all 37 tools, the exact
+repetition `closest_tool_names` was written to replace; `plan` now gets told
+what to do instead. (4) The oversize-write refusal ended "Nothing you generated
+is lost", which held for four messages before `_shorten_arguments` dropped it -
+the payload now spills to `.shamsu/oversized/` and the refusal names the path.
+The 8,000-char cap is unchanged; one data point is not grounds to reopen a
+documented decision. Also removed six lines of dead duplicated code.
+Tests: 18 new in `tests/test_turn_verdict.py`, 2 new in loop guards, 1 new in
+simple_chat, 3 repointed - each had asserted the mechanism rather than the
+property, so each guaranteed the bug it covered; full suite 3661 passed, 2
+skipped |
+Log: logs/test-runs/2026-08-22-harness-verdict-and-ceilings.log
+
 ### 2026-08-22 - Every structured call returned "", and the live console never turned on
 Files edited: `shamsu/llm/manager.py`, `shamsu/cli/repl.py`,
 `scripts/install.ps1`, `tests/test_structured_generation.py` (new),

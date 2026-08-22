@@ -42,11 +42,13 @@ from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.loop_guards import (
     LOOKING_TOOLS,
+    READ_LOOP_EXHAUSTED,
     adapted_temperature,
     ReadLoopDetector,
     TrustDecay,
     closest_tool_names,
     greeting_regression,
+    invented_capability_hint,
     leaked_tool_call,
 )
 from shamsu.agents.plan_anchor import anchor as plan_anchor
@@ -2128,6 +2130,11 @@ class SimpleChatResult:
     changed_files: tuple[str, ...] = ()
     stopped: bool = False
     error: str = ""
+    #: The answer was cut off - the reply cap or the window stopped it
+    #: mid-sentence. The loop already SAYS so in the text ("This answer was cut
+    #: off."); without this the surfaces above it had no way to know, so a turn
+    #: whose own answer admitted it was incomplete was still badged SUCCESS.
+    truncated: bool = False
 
 
 @dataclass
@@ -2423,13 +2430,35 @@ class SimpleChatLoop:
         if result.error:
             self._publish("error", result.error)
         self._publish("assistant", result.final)
+        # "done" used to mean "the loop returned without raising", which is a
+        # claim about the PROCESS, and every surface above was reading it as a
+        # claim about the OUTCOME. Live 2026-08-22: a turn that changed no file,
+        # failed four tool calls and printed "This answer was cut off." was
+        # badged `✓ SUCCESS  done in 21m52s`. A turn whose own answer says it
+        # is incomplete must not be reported as finished.
+        if result.stopped:
+            status = "stopped"
+        elif result.truncated:
+            status = "incomplete"
+        else:
+            status = "done"
+        failures = len(dict.fromkeys(self._turn_failures))
         self._publish(
             "turn.end",
-            _turn_verdict(elapsed, result.changed_files, stopped=result.stopped),
-            status="stopped" if result.stopped else "done",
+            _turn_verdict(
+                elapsed,
+                result.changed_files,
+                stopped=result.stopped,
+                failures=failures,
+                truncated=result.truncated,
+            ),
+            status=status,
+            error=result.error,
             elapsed=elapsed,
             rounds=result.rounds,
             tool_calls=result.tool_calls,
+            failures=failures,
+            truncated=result.truncated,
             changed_files=list(result.changed_files),
         )
         try:
@@ -2588,12 +2617,7 @@ class SimpleChatLoop:
                             round_index,
                             tool_calls,
                             changed,
-                        )
-                        return self._stop(
-                            self._out_of_room_message(),
-                            round_index,
-                            tool_calls,
-                            changed,
+                            truncated=True,
                         )
                     return self._stop(
                         f"The model returned an empty reply {empty_nudges + 1} times. "
@@ -2715,7 +2739,8 @@ class SimpleChatLoop:
                     self.state.append_user(blocked)
                     self._activity("claimed done with the contract unresolved; asked it to check")
                     continue
-                if self._hit_the_length_limit():
+                cut_off = self._hit_the_length_limit()
+                if cut_off:
                     # The model was still speaking when the window ran out.
                     # Keep what it managed to say, but never present it as a
                     # finished answer - `done_reason` told us it was not.
@@ -2728,6 +2753,7 @@ class SimpleChatLoop:
                     rounds=round_index + 1,
                     tool_calls=tool_calls,
                     changed_files=tuple(dict.fromkeys(changed)),
+                    truncated=cut_off,
                 )
 
             self.state.append_assistant(
@@ -2843,6 +2869,12 @@ class SimpleChatLoop:
                 produced_something=bool(outcome.written)
                 or bool(set(outcome.tool_names) - LOOKING_TOOLS),
             )
+            if looping and looping.reason == READ_LOOP_EXHAUSTED:
+                # The one guard signal that ends a turn. Two nudges were spent
+                # and ignored; a third sentence costs another eight reads and
+                # buys the same nothing.
+                self._activity(looping.activity)
+                return self._stop(looping.correction, round_index, tool_calls, changed)
             if looping:
                 self.state.append_user(looping.correction, origin=ORIGIN_LOOP)
                 self._activity(looping.activity)
@@ -4259,6 +4291,35 @@ class SimpleChatLoop:
         """
         return max_write_chars(self._last_reply_cap or output_reserve(self._ceiling()))
 
+    def _spill_oversized(self, target: str, content: str) -> str:
+        """Save a refused payload where the model can still fetch it.
+
+        The refusal used to end "Nothing you generated is lost; resend it in
+        pieces", and that was true for about four messages. `_shorten_arguments`
+        drops content arguments out of the history and `MIN_VERBATIM_MESSAGES`
+        is 4, so a model that does anything else first comes back to find its
+        own text replaced by `<omitted from history>`. Live 2026-08-22: a
+        10,477-character plan was refused, the model read eight more times, and
+        then rebuilt the document into its reply - where the reply cap cut it
+        off. Two ceilings refused the same deliverable and the second one was
+        only reached because the first had lied about the first one.
+
+        Under `.shamsu/`, not in the tree: a half-written document appearing
+        next to the user's source is worse than the dead end it fixes. Returns
+        the workspace-relative path, or "" - a spill that cannot be written is
+        never a reason to fail a turn, and the caller says something else then.
+        """
+        try:
+            stem = Path(str(target or "content")).name or "content"
+            safe = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in stem)[:60]
+            folder = self.workspace / ".shamsu" / "oversized"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"{self.turn_id or 'turn'}-{safe}"
+            path.write_text(content, encoding="utf-8")
+            return path.relative_to(self.workspace).as_posix()
+        except Exception:  # noqa: BLE001 - observability, never a turn failure
+            return ""
+
     def _content_argument(self, arguments: dict[str, Any]) -> tuple[str, str]:
         """The payload this call carries, and which argument holds it."""
         for key in CONTENT_ARGUMENTS:
@@ -4274,10 +4335,14 @@ class SimpleChatLoop:
 
         Returns `(argument, content, cap)` when it is, `None` otherwise. The
         check is on the ARGUMENT, before anything is executed: the content was
-        fully generated and is merely rejected at the door, so nothing is lost
-        and the model still holds every character of it. That is the whole
-        point of moving the limit here from the output cap, where hitting it
-        means the remainder never existed.
+        fully generated and is merely rejected at the door, rather than never
+        having existed - which is the whole point of moving the limit here from
+        the output cap.
+
+        "The model still holds every character of it" is what this used to say,
+        and it holds for about four messages: `_shorten_arguments` drops content
+        arguments and `MIN_VERBATIM_MESSAGES` is 4. `_spill_oversized` is what
+        actually makes the payload recoverable.
         """
         key, content = self._content_argument(arguments)
         if not key:
@@ -4332,9 +4397,17 @@ class SimpleChatLoop:
                 f"{WRITE_LINES_GUIDANCE} lines - imports and empty stubs are enough - "
                 "then call append_file once per following section, "
                 f"{WRITE_LINES_GUIDANCE} lines at a time. Keep every call under "
-                f"{WRITE_LINES_GUIDANCE} lines. Nothing you generated is lost; resend it "
-                "in pieces."
+                f"{WRITE_LINES_GUIDANCE} lines and under {cap:,} characters."
             )
+            spill = self._spill_oversized(target, content)
+            if spill:
+                message += (
+                    f" Your full text is saved at {spill} - read_file it "
+                    f"{WRITE_LINES_GUIDANCE} lines at a time and send each piece, "
+                    "rather than generating it again."
+                )
+            else:
+                message += " Resend it in pieces from what you just generated."
         result = ToolResult(
             False,
             message,
@@ -4556,10 +4629,21 @@ class SimpleChatLoop:
             # prompt the model has just demonstrated it is not reading - handed
             # back at the exact moment it is confused.
             close = closest_tool_names(name, sorted(SIMPLE_TOOLS))
+            hint = invented_capability_hint(name)
             if close:
                 suggestion = f" Did you mean {' or '.join(close)}?"
+            elif hint:
+                # A name that is nowhere near a real one is a model asking for
+                # a CAPABILITY, not fumbling a spelling, and the list of every
+                # tool answers neither question. Live: `plan`.
+                suggestion = f" {hint}"
             else:
-                suggestion = " Available: " + ", ".join(sorted(SIMPLE_TOOLS))
+                # Still no list of thirty. The categories are how tools are
+                # reached here anyway, and naming the door is shorter than
+                # naming every room behind it.
+                suggestion = (
+                    " Call select_category to see the tools for what you are doing."
+                )
             return ToolResult(
                 False,
                 f"There is no tool called {name}.{suggestion}",
@@ -6364,6 +6448,7 @@ class SimpleChatLoop:
         changed: list[str],
         *,
         error: str = "",
+        truncated: bool = False,
     ) -> SimpleChatResult:
         self._settle_unfinished()
         self.state.append_assistant(message)
@@ -6374,6 +6459,7 @@ class SimpleChatLoop:
             changed_files=tuple(dict.fromkeys(changed)),
             stopped=True,
             error=error,
+            truncated=truncated,
         )
 
     def _publish(self, kind: str, text: str = "", **data: Any) -> None:
@@ -6590,8 +6676,20 @@ def _publishable_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return published
 
 
-def _turn_verdict(elapsed: float, changed: tuple[str, ...] | list[str], *, stopped: bool) -> str:
+def _turn_verdict(
+    elapsed: float,
+    changed: tuple[str, ...] | list[str],
+    *,
+    stopped: bool,
+    failures: int = 0,
+    truncated: bool = False,
+) -> str:
     """The one line a surface shows where the live footer used to tick.
+
+    Says what the turn COST as well as how long it took. `done in 21m52s` was
+    the whole account of a turn that failed four tool calls, wrote nothing and
+    was cut off mid-answer - every one of those numbers already existed and
+    none of them reached the line the user actually reads.
 
     ASCII only, deliberately: this string reaches a Windows console and a
     Telegram HTML body, and a decorative separator has crashed a cp1252
@@ -6600,10 +6698,19 @@ def _turn_verdict(elapsed: float, changed: tuple[str, ...] | list[str], *, stopp
     seconds = max(0, int(elapsed))
     spent = f"{seconds // 60}m{seconds % 60:02d}s" if seconds >= 60 else f"{seconds}s"
     verdict = "stopped after" if stopped else "done in"
+    parts = [f"{verdict} {spent}"]
     count = len(dict.fromkeys(changed))
-    if not count:
-        return f"{verdict} {spent}"
-    return f"{verdict} {spent} - {count} file{'s' if count != 1 else ''} changed"
+    if count:
+        parts.append(f"{count} file{'s' if count != 1 else ''} changed")
+    elif failures or truncated:
+        # Only worth saying alongside something that went wrong. On a plain
+        # question-and-answer turn "no files changed" is not news.
+        parts.append("no files changed")
+    if failures:
+        parts.append(f"{failures} tool call{'s' if failures != 1 else ''} failed")
+    if truncated:
+        parts.append("answer cut off")
+    return " - ".join(parts)
 
 
 def _read_argument_summary(arguments: dict[str, Any]) -> str:

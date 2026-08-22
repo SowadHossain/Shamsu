@@ -232,12 +232,17 @@ class CliTurnRenderer:
         # Absent status is not failure. The loop always sends one; a caller
         # that does not is not making a claim, and painting a red badge on
         # silence would be inventing a verdict.
-        ok = str(data.get("status") or "done") == "done" and not data.get("error")
-        badge = (
-            "[bold black on green] ✓ SUCCESS [/]"
-            if ok
-            else "[bold white on red] ✗ FAILED [/]"
-        )
+        status = str(data.get("status") or "done")
+        if status == "done" and not data.get("error"):
+            badge = "[bold black on green] ✓ SUCCESS [/]"
+        elif status == "incomplete":
+            # Ran to the end, did not finish. Green here was the harness saying
+            # a turn had succeeded directly above its own "This answer was cut
+            # off." - and red would be just as wrong, because the work up to
+            # the cut is real and usually worth continuing from.
+            badge = "[bold black on yellow] ▲ INCOMPLETE [/]"
+        else:
+            badge = "[bold white on red] ✗ FAILED [/]"
         self.console.print(f"\n{badge} [dim]{escape(event.text)}[/dim]\n")
 
     def _on_error(self, event: TurnEvent) -> None:
