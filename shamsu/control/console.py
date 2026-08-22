@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Awaitable
 from typing import Any, Callable
 
 from rich.console import Console
@@ -32,6 +33,70 @@ from rich.panel import Panel
 from shamsu.control.store import ALLOW, DENY, ControlStore
 
 POLL_SECONDS = 0.25
+
+
+def run_coroutine_blocking(factory: Callable[[], Awaitable[Any]]) -> Any:
+    """Run an async call from synchronous code, from ANY thread.
+
+    Takes a FACTORY rather than a coroutine, and that is the whole point.
+    ``asyncio.run(ask_here_or_anywhere(...))`` builds the coroutine first, as
+    an argument, and only then discovers a loop is already running in this
+    thread - so it raises without ever awaiting what it just created. Live
+    2026-08-22, on a user's screen mid-approval::
+
+        RuntimeWarning: coroutine 'ask_here_or_anywhere' was never awaited
+
+    and the `except Exception` around it turned the shared "answer from
+    anywhere" prompt into the plain local one every single time. Nothing is
+    created here until there is somewhere to run it.
+
+    When a loop already owns this thread the coroutine gets a thread of its
+    own. Blocking the caller is correct: it is an approval, the turn is waiting
+    on a human either way, and the alternative - reentering the loop - is what
+    was broken.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())
+
+    done: list[Any] = []
+    failed: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            done.append(asyncio.run(factory()))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            failed.append(exc)
+
+    thread = threading.Thread(target=run, name="shamsu-approval-ask", daemon=True)
+    thread.start()
+    thread.join()
+    if failed:
+        raise failed[0]
+    return done[0]
+
+
+#: Approvals THIS process raised. `ApprovalWatcher` announces what other
+#: processes are asking; without this it also announced our own, so one
+#: `run_command` drew the question twice - once by the code asking it and once
+#: by the watcher noticing it in the store - and then printed a resolution
+#: notice for a question the user had already answered in front of them.
+_RAISED_HERE: set[str] = set()
+
+
+def mark_raised_here(approval_id: str) -> None:
+    """Note that this process raised *approval_id*, so nothing announces it."""
+    if approval_id:
+        _RAISED_HERE.add(str(approval_id))
+
+
+def raised_here(approval_id: str) -> bool:
+    return str(approval_id) in _RAISED_HERE
+
+
+def forget_raised_here(approval_id: str) -> None:
+    _RAISED_HERE.discard(str(approval_id))
 
 _ALLOW_WORDS = {"y", "yes", "a", "allow", "1"}
 _DENY_WORDS = {"n", "no", "d", "deny", "2", ""}
@@ -210,13 +275,19 @@ class ApprovalWatcher:
                 # Answered somewhere else. Say so, or the terminal keeps
                 # showing a question that no longer exists.
                 record = self.store.approval(approval_id)
-                decided = record.decided_by if record else "elsewhere"
+                decided = (record.decided_by if record else "") or "another surface"
                 self._seen.pop(approval_id, None)
                 self.console.print(
                     f"[dim]Approval resolved on {decided}.[/dim]"
                 )
         for approval_id, record in live.items():
             if approval_id in self._seen:
+                continue
+            if raised_here(approval_id):
+                # Asked by this process, in this terminal, and already on
+                # screen. Announcing it again draws the same question a second
+                # time under a "/approve <id>" the user does not need, beside
+                # the prompt that is waiting for their keypress.
                 continue
             self._seen[approval_id] = record
             render_request(record, self.console, origin=_origin(record))

@@ -171,6 +171,8 @@ def ask_approval_menu(
     request: ApprovalRequest,
     offer_remember: bool = False,
     console: Console | None = None,
+    *,
+    render: bool = True,
 ) -> tuple[bool, str]:
     """Prompt for one stable semantic approval decision.
 
@@ -178,9 +180,14 @@ def ask_approval_menu(
     user picks the "don't ask again" option, else "none". `offer_remember`
     should only be True for actions that are actually auto-approvable, so the
     "don't ask again" option never appears for commands/deletes/etc.
+
+    `render=False` when the caller has already drawn the question. The shared
+    "answer from anywhere" prompt draws it, then falls back here when it
+    cannot run - and one `run_command` came out as three panels on screen.
     """
     console = console or Console()
-    _render_request(request, console)
+    if render:
+        _render_request(request, console)
 
     console.print("Do you want to proceed?")
     console.print("  [y] Allow once", markup=False)
@@ -192,26 +199,39 @@ def ask_approval_menu(
         )
     console.print("  [n] Deny", markup=False)
 
-    answer = _read_approval_answer(console)
+    answer = _read_approval_answer(console, offer_remember=offer_remember)
     _resume_console_live(_PAUSED.pop(id(console), []))
     if answer is None:
         return False, "none"
-    if offer_remember and answer in {"a", "always"}:
-        return True, "workspace"
+    if answer in {"a", "always"}:
+        # ALLOW, always - and only "workspace" when that was on offer.
+        #
+        # This used to fall through to the catch-all below whenever
+        # `offer_remember` was False, so `a` meant DENY. The single-key reader
+        # prints "Press y to allow once, a to always allow when offered, or n
+        # to deny" unconditionally and accepts `a` unconditionally, so the user
+        # was told to press a key that silently refused the action: 20 of 22
+        # `node --check` calls denied in one live session, each of them
+        # deliberately allowed by the person sitting there.
+        return True, "workspace" if offer_remember else "none"
     if answer in {"y", "yes"}:
         return True, "none"
     # Anything unrecognized is treated as "no" — the safe default.
     return False, "none"
 
 
-def ask_approval(request: ApprovalRequest, console: Console | None = None) -> bool:
+def ask_approval(
+    request: ApprovalRequest, console: Console | None = None, *, render: bool = True
+) -> bool:
     """Binary approval prompt (numbered menu, no remember option).
 
     Kept as the default `approval_func` signature everywhere; returns just a
     bool. The remember-folding single menu is `ask_approval_menu`, used by the
     interactive REPL via ApprovalManager.
     """
-    approved, _scope = ask_approval_menu(request, offer_remember=False, console=console)
+    approved, _scope = ask_approval_menu(
+        request, offer_remember=False, console=console, render=render
+    )
     return approved
 
 
@@ -302,14 +322,29 @@ def _prompt_toolkit_answer() -> str | None:
     except Exception:
         return None
     try:
-        return ptk_prompt("> ").strip().lower()
+        # `in_thread=True` because this is called from wherever the tool ran.
+        # prompt_toolkit's synchronous `prompt()` ends in `asyncio.run()`, and
+        # from a thread a loop already owns that raises WITHOUT awaiting the
+        # coroutine it built - live 2026-08-22, on a user's screen mid-approval:
+        #     RuntimeWarning: coroutine 'Application.run_async' was never awaited
+        # after which the read fell through to the single-key Windows reader
+        # and the menu it had just printed no longer matched the keys on offer.
+        # Running in a thread of its own is correct from either context.
+        return ptk_prompt("> ", in_thread=True).strip().lower()
     except (EOFError, KeyboardInterrupt):
         return None
+    except TypeError:
+        # A prompt_toolkit too old to know the argument. Better the original
+        # behaviour than no prompt at all.
+        try:
+            return ptk_prompt("> ").strip().lower()
+        except Exception:  # noqa: BLE001
+            return None
     except Exception:
         return None
 
 
-def _read_approval_answer(console: Console) -> str | None:
+def _read_approval_answer(console: Console, *, offer_remember: bool = False) -> str | None:
     """Read a menu answer reliably, without crashing on closed stdin.
 
     On an interactive terminal, read through prompt_toolkit — it drives the
@@ -325,7 +360,9 @@ def _read_approval_answer(console: Console) -> str | None:
             answer = _prompt_toolkit_answer()
             if answer is not None:
                 return answer
-            fallback = _read_windows_console_answer(console)
+            fallback = _read_windows_console_answer(
+                console, offer_remember=offer_remember
+            )
             if fallback is not None:
                 return fallback
 
@@ -336,14 +373,18 @@ def _read_approval_answer(console: Console) -> str | None:
         try:
             return input("> ").strip().lower()
         except EOFError:
-            fallback = _read_windows_console_answer(console)
+            fallback = _read_windows_console_answer(
+                console, offer_remember=offer_remember
+            )
             if fallback is not None:
                 return fallback
             console.print("[yellow]Approval input was closed. Action cancelled.[/yellow]")
             return None
 
 
-def _read_windows_console_answer(console: Console) -> str | None:
+def _read_windows_console_answer(
+    console: Console, *, offer_remember: bool = False
+) -> str | None:
     """Fallback for Windows terminals where prompt-toolkit closes stdin.
 
     After prompt-toolkit has owned the console, built-in ``input()`` can raise
@@ -357,7 +398,12 @@ def _read_windows_console_answer(console: Console) -> str | None:
         import msvcrt
     except ImportError:
         return None
-    console.print("[dim]Press y to allow once, a to always allow when offered, or n to deny.[/dim]")
+    keys = (
+        "Press y to allow once, a to always allow, or n to deny."
+        if offer_remember
+        else "Press y to allow, or n to deny."
+    )
+    console.print(f"[dim]{keys}[/dim]")
     while True:
         try:
             char = msvcrt.getwch()
@@ -382,6 +428,7 @@ def _read_windows_console_answer(console: Console) -> str | None:
         # arrow key, a paste - and a prompt that ignores you without a word is
         # indistinguishable from a hung one. Say so, and keep waiting.
         if char.isprintable() and char.strip():
-            console.print(f"[dim]'{char}' is not an option - press y, a, or n.[/dim]")
+            offered = "y, a, or n" if offer_remember else "y or n"
+            console.print(f"[dim]'{char}' is not an option - press {offered}.[/dim]")
         else:
             console.print("[dim]Press y, a, or n (no Enter needed).[/dim]")

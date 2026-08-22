@@ -3,6 +3,37 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-22 - The approval prompt, and four faults in one question
+Files edited: `shamsu/safety/approval.py`, `shamsu/control/console.py`,
+`shamsu/cli/repl.py`, `tests/test_approval_bug.py` (new),
+`tests/test_permission_manager.py`
+What changed: one `run_command` approval drew THREE panels, leaked two
+coroutines onto the user's screen, and offered a two-key menu under a
+three-key hint in which `a` meant Deny. (1) `asyncio.run(ask_here_or_anywhere(
+...))` builds the coroutine as an argument and then raises if a loop already
+owns the thread, so it was never awaited and the `except Exception` fell back
+to the plain local prompt EVERY time - approve-from-anywhere was dead in the
+REPL. Replaced with `run_coroutine_blocking(factory)`, which creates nothing
+until there is somewhere to run it and gives the coroutine its own thread when
+one is needed; prompt_toolkit's sync `prompt()` has the same shape one layer
+down and now passes `in_thread=True`. (2) The single-key reader prints "press a
+to always allow" and accepts `a` unconditionally, while the menu only looked at
+`a` when `offer_remember` was True - which is False for `run_command` by
+design - so the key the user was told to press silently refused the action: the
+20-of-22 denials carried in memory since 2026-08-20. `a` now always allows and
+only REMEMBERS when that was offered, and the hint names only the keys on
+offer. (3) The fallback re-drew a question already on screen (`render=False`)
+and `ApprovalWatcher`, whose job is announcing OTHER processes' approvals, had
+no filter for its own (`mark_raised_here`). (4) "Approval resolved on ." - the
+empty-field case of `decided_by`. Also wraps the shared prompt in
+`reading_input()`, which it had never used.
+Tests: 10 new in `tests/test_approval_bug.py` incl. one asserting on captured
+RuntimeWarnings after a gc.collect(), 2 repointed in permission_manager - one
+of which asserted `approved is False` for `a`, the bug written down as the
+expectation. That makes five tests this session that guaranteed the defect they
+covered. Full suite 3722 passed, 2 skipped |
+Log: logs/test-runs/2026-08-22-approval-silent-deny.log
+
 ### 2026-08-22 - "old_string not found" was the answer to a correct edit
 Files edited: `shamsu/tools/agent_tools.py`, `tests/test_patch_repair.py` (new)
 What changed: the reported turn made four `patch_file` calls and two
@@ -82,7 +113,13 @@ toggled with F2 and the statusline says which state you are in. The bug the
 tests caught was the one that mattered: the wheel did nothing, because `scroll`
 applied its delta to an offset last computed for a different window height and
 clamped straight back to the bottom.
-Tests: 35 new in `tests/test_tui.py`, incl. the real Application driven over
+First real run found the frame was scoped to a TURN, not the session: it
+flashed up and dropped back to the ordinary prompt after every turn, with an
+empty pane each time because it was a new pane. `FrameHost` now owns the
+application for as long as the mode is on, `main()` reads its prompts from the
+frame's input box, and the console is redirected for the frame's whole life -
+so the scrollback is the conversation.
+Tests: 40 new in `tests/test_tui.py`, incl. the real Application driven over
 `create_pipe_input()`; 66 in `tests/test_live_console.py` still green. Not
 proven: a real Windows terminal - this session has no TTY, so the alternate
 screen itself is untested |

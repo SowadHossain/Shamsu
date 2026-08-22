@@ -504,6 +504,127 @@ async def test_a_submit_that_raises_does_not_take_the_frame_down():
     assert "nope" in app.pane.plain(10)
 
 
+# -- the frame is a MODE, not a decoration on one turn ----------------------
+#
+# Reported live: "why the fuck is it going back to the normal cli after opening
+# the tui, and in tui i don't see the chat history, nothing shows properly".
+# Both symptoms were one mistake - the frame was built inside the turn
+# dispatcher and exited when the turn ended, so it flashed up and dropped back,
+# and the pane was a NEW pane every time so no conversation ever accumulated.
+
+
+def _host():
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.cli.tui import FrameHost
+
+    pipe_cm = create_pipe_input()
+    pipe = pipe_cm.__enter__()
+    session_cm = create_app_session(input=pipe, output=DummyOutput())
+    session_cm.__enter__()
+    app = TuiApp(telemetry=_telemetry(), on_submit=lambda text: host.submit(text))
+    host = FrameHost(app)
+    return host, app, (pipe_cm, session_cm)
+
+
+def test_the_frame_stays_up_across_a_turn():
+    """It used to be torn down when the turn ended, which is what "it goes back
+    to the normal CLI" was."""
+    host, app, cms = _host()
+    try:
+        assert host.start(), "the frame did not come up"
+        assert host.running
+
+        host.turn_active = True
+        host.turn_active = False  # a whole turn, start to finish
+
+        assert host.running, "the turn ending closed the frame"
+        assert app.app.is_running
+    finally:
+        host.stop()
+        for cm in reversed(cms):
+            cm.__exit__(None, None, None)
+
+
+def test_the_pane_keeps_the_whole_conversation():
+    """A new pane per turn is why nothing showed: the scrollback IS the
+    conversation, so it has to outlive the turn that produced it."""
+    from rich.console import Console
+
+    from shamsu.cli.tui import PaneWriter
+
+    host, app, cms = _host()
+    try:
+        host.start()
+        console = Console(force_terminal=True, color_system="truecolor", width=60)
+        console.file = PaneWriter(app.pane, app.invalidate)
+
+        console.print("first answer")
+        host.turn_active = False
+        console.print("second answer")
+
+        text = app.pane.plain(40)
+        assert "first answer" in text, "the earlier turn was lost"
+        assert "second answer" in text
+    finally:
+        host.stop()
+        for cm in reversed(cms):
+            cm.__exit__(None, None, None)
+
+
+def test_an_idle_line_becomes_the_next_prompt():
+    host, app, cms = _host()
+    try:
+        host.start()
+        host.turn_active = False
+        host.submit("fix the tests")
+        assert host.read_line(timeout=2) == "fix the tests"
+        assert "fix the tests" in app.pane.plain(20), "the prompt was not echoed"
+    finally:
+        host.stop()
+        for cm in reversed(cms):
+            cm.__exit__(None, None, None)
+
+
+def test_a_mid_turn_line_steers_instead_of_queueing_a_prompt():
+    """One input box, two meanings. Sending a steer to the prompt queue would
+    make it the NEXT request instead of a correction to this one."""
+    import queue as queue_module
+
+    host, app, cms = _host()
+    routed: list[str] = []
+    host.on_route = routed.append
+    try:
+        host.start()
+        host.turn_active = True
+        host.submit("you are editing the wrong file")
+
+        assert routed == ["you are editing the wrong file"]
+        with pytest.raises(queue_module.Empty):
+            host.read_line(timeout=0.2)
+        assert "wrong file" in app.pane.plain(20)
+    finally:
+        host.stop()
+        for cm in reversed(cms):
+            cm.__exit__(None, None, None)
+
+
+def test_closing_the_frame_unblocks_whoever_is_waiting_for_a_line():
+    """`main()` blocks on `read_line`. A frame that died without saying so
+    would hang the whole REPL."""
+    host, _app, cms = _host()
+    try:
+        host.start()
+        host.stop()
+        with pytest.raises(EOFError):
+            host.read_line(timeout=2)
+    finally:
+        for cm in reversed(cms):
+            cm.__exit__(None, None, None)
+
+
 def test_the_tui_is_off_unless_asked_for(monkeypatch):
     monkeypatch.delenv("SHAMSU_TUI", raising=False)
     assert not tui_enabled()

@@ -52,8 +52,8 @@ HOW THE TURN'S OUTPUT GETS INTO THE PANE
 ----------------------------------------
 Not by rewriting call sites. The REPL hands ONE `rich.Console` down through
 every route, and rich exposes `Console.file` and `Console.width` as settable -
-so the frame points that console at a `PaneWriter` for the length of the turn
-and puts it back in `finally`. Panels, markdown, diffs and the turn renderer's
+so the frame points that console at a `PaneWriter` for as long as the MODE is
+on - not for one turn - and puts it back when the frame closes. Panels, markdown, diffs and the turn renderer's
 rows all land in the pane, and nothing had to learn that a frame exists.
 
 `PaneWriter.isatty()` returns True so rich keeps emitting ANSI; `LogPane`
@@ -126,11 +126,54 @@ drift up a row at a time (`test_eviction_does_not_shift_what_you_are_reading_
 off_by_one`).
 
 
+THE FRAME IS A MODE, NOT A DECORATION ON ONE TURN
+-------------------------------------------------
+Reported on the first real run, and it was one mistake showing as two symptoms:
+
+    "why is it going back to the normal cli after opening the tui, and in tui
+     i don't see the chat history, nothing shows properly"
+
+The first version built the `TuiApp` inside the turn dispatcher and exited it
+in `finally`. So the frame lived exactly as long as one turn: it flashed up,
+the turn ran, and it dropped back to the ordinary prompt. And because the app
+was rebuilt each time, the pane was a NEW pane every turn - there was never any
+conversation in it to see.
+
+`FrameHost` now owns the application for as long as the MODE is on:
+
+    /tui                -> _start_frame: app up, console.file -> the pane
+    prompt, turn, prompt, turn ...   (all in the same frame, same pane)
+    /tui off, Ctrl+D    -> _stop_frame: console.file restored
+
+`main()` reads its prompts from `frame.read_line()` instead of a
+`PromptSession`, so the frame's input box is the session's input box - idle it
+is the next request, mid-turn it is a steer through `live.route`. And the
+console is redirected for the whole life of the frame rather than for a turn,
+so everything the session prints accumulates in one pane. The scrollback IS the
+conversation.
+
+It runs on its own thread because `main()` is synchronous and blocks on reading
+a line, and each turn runs its own `run_until_complete` on the request runner's
+loop - an `Application` needs a loop that keeps turning throughout, including
+while a turn is blocked on the model. `Application.invalidate()` is documented
+thread-safe, which is what makes writing to the pane from the main thread legal.
+
+Verified end to end through the REPL's own functions:
+
+    start: True
+    frame up: True
+    after turn 1, frame up: True
+    after turn 2, frame up: True
+    has turn one : True
+    has turn two : True
+
+
 OPT-IN, AND THE FALLBACK
 ------------------------
-`/tui`, `/tui on`, `/tui off`, or `SHAMSU_TUI=1`. Armed per session on purpose:
-a full-screen mode that silently survived a restart would take the terminal on
-a run where you wanted a plain log to copy out of.
+`/tui`, `/tui on`, `/tui off`, or `SHAMSU_TUI=1`. It takes effect IMMEDIATELY -
+arming it for "the next turn" was half of why it flashed. Per session on
+purpose: a full-screen mode that silently survived a restart would take the
+terminal on a run where you wanted a plain log to copy out of.
 
 Three display modes now, chosen once per turn in `_dispatch_turn`:
 
@@ -157,11 +200,23 @@ alternate screen behaves on your machine.
 
 TESTS
 -----
-    tests/test_tui.py             35 passed  (new)
+    tests/test_tui.py             40 passed  (new)
     tests/test_live_console.py    66 passed  (unchanged, still green)
 
 Worth naming:
 
+    test_the_frame_stays_up_across_a_turn
+        the turn ending used to close it. This is "it goes back to the normal
+        CLI", asserted.
+    test_the_pane_keeps_the_whole_conversation
+        a new pane per turn is why nothing showed.
+    test_an_idle_line_becomes_the_next_prompt
+    test_a_mid_turn_line_steers_instead_of_queueing_a_prompt
+        one box, two meanings: sending a steer to the prompt queue would make
+        it the NEXT request instead of a correction to this one.
+    test_closing_the_frame_unblocks_whoever_is_waiting_for_a_line
+        `main()` blocks on `read_line`; a frame that died quietly would hang
+        the whole REPL.
     test_the_frame_runs_and_routes_what_is_typed
         the real Application over pipe input: construct, paint, type, route,
         tear down.

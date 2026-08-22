@@ -5478,7 +5478,13 @@ def _shared_console_approval(
 
     def ask(request: Any) -> bool:
         try:
-            from shamsu.control.console import ask_here_or_anywhere, render_request
+            from shamsu.control.console import (
+                ask_here_or_anywhere,
+                forget_raised_here,
+                mark_raised_here,
+                render_request,
+                run_coroutine_blocking,
+            )
             from shamsu.control.store import ALLOW, ControlStore
 
             store = ControlStore()
@@ -5491,10 +5497,14 @@ def _shared_console_approval(
                 risk_level=str(getattr(request, "risk_level", "") or ""),
                 preview=str(getattr(request, "preview", "") or ""),
             )
+            # Before anything is drawn: the watcher polls the store on its own
+            # thread and would otherwise announce this question as if another
+            # process had asked it.
+            mark_raised_here(approval_id)
         except Exception:  # noqa: BLE001 - no shared store, no shared answer
             return bool(ask_approval(request, console=console))
 
-        from shamsu.safety.approval import _pause_console_live
+        from shamsu.safety.approval import _pause_console_live, reading_input
 
         render_request(store.approval(approval_id), console)
         # Stop the live spinner before reading: it repaints over the question
@@ -5502,11 +5512,22 @@ def _shared_console_approval(
         # explicitly rather than freshly constructed.
         _pause_console_live(console)
         try:
-            decision = asyncio.run(
-                ask_here_or_anywhere(store, approval_id, console)
-            )
+            # `run_coroutine_blocking`, not `asyncio.run`: this runs on
+            # whichever thread the tool did, and `asyncio.run` from a thread a
+            # loop already owns raises without awaiting the coroutine it was
+            # handed - leaking it, and falling back to the plain local prompt
+            # every time. `reading_input()` hands the terminal over first, so
+            # this is not a second prompt_toolkit Application on a live one.
+            with reading_input():
+                decision = run_coroutine_blocking(
+                    lambda: ask_here_or_anywhere(store, approval_id, console)
+                )
         except Exception:  # noqa: BLE001 - never turn a question into a crash
-            return bool(ask_approval(request, console=console))
+            # The question is already on screen; asking it again would draw a
+            # second panel for the same action.
+            return bool(ask_approval(request, console=console, render=False))
+        finally:
+            forget_raised_here(approval_id)
         return decision == ALLOW
 
     return ask

@@ -248,14 +248,21 @@ def test_ask_approval_menu_numeric_input_is_never_inferred(monkeypatch):
 
 
 def test_ask_approval_menu_a_remembers_only_when_offered(monkeypatch):
+    """`a` REMEMBERS only when remembering was offered - but it always ALLOWS.
+
+    The second half of this used to assert `approved is False`, which is the
+    bug it was guarding written down as the expectation: the single-key reader
+    prints "press a to always allow" and accepts `a` whatever is on offer, so
+    the key the user was told to press silently refused the action. See
+    tests/test_approval_bug.py."""
     console = _menu_console()
     monkeypatch.setattr("builtins.input", lambda _prompt="": "a")
     approved, scope = ask_approval_menu(_request("file_write"), offer_remember=True, console=console)
     assert approved is True
     assert scope == "workspace"
     approved, scope = ask_approval_menu(_request("run_command"), offer_remember=False, console=console)
-    assert approved is False
-    assert scope == "none"
+    assert approved is True
+    assert scope == "none", "nothing was offered, so nothing may be remembered"
     rendered = console.file.getvalue()
     assert "[y] Allow once" in rendered
     assert "[a] Always allow" in rendered
@@ -318,8 +325,11 @@ def test_ask_approval_menu_windows_console_fallback_accepts_key(monkeypatch):
     assert approved is True
     assert scope == "none"
     rendered = out.getvalue()
-    assert "allow once" in rendered
-    assert "deny" in rendered
+    # The hint names what is actually on offer. It used to say "press a to
+    # always allow when offered" under a menu with no `a` in it, and `a` then
+    # meant Deny - see tests/test_approval_bug.py.
+    assert "Press y to allow, or n to deny." in rendered
+    assert "[a]" not in rendered
     assert "Action cancelled" not in rendered
 
 
