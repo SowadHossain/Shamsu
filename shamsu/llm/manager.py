@@ -346,14 +346,31 @@ class LLMManager(ILLMManager):
         # defence (send the router to a non-reasoning model) is gone, so a
         # mechanical role - routing, classification, extraction - must not pay for a
         # chain-of-thought pass just because the shared model is capable of one.
-        want_think = (
-            role_should_think(role, model) if role else model_is_reasoning(model)
-        ) and model not in _THINK_UNSUPPORTED
-        if not want_think:
+        reasoning = model_is_reasoning(model) and model not in _THINK_UNSUPPORTED
+        if not reasoning:
+            # No thinking channel to ask about. Send nothing: `think` is not a
+            # universally accepted key and a model without the channel has
+            # nothing to turn off.
             return await self._stream_once(model, payload, on_token, on_progress)
+
+        wanted = role_should_think(role, model) if role else True
+        # A `format` grammar constrains the `response` channel ONLY. Asked to
+        # think while constrained, the model satisfies the schema inside
+        # `thinking` and returns an EMPTY `response`, so every structured call
+        # came back as "". Measured on qwen3.5:9b-q4_K_M / Ollama 0.31.1 with
+        # the real PLAN_SCHEMA:
+        #     think omitted -> response 0     thinking 624
+        #     think: true   -> response 0     thinking 667
+        #     think: false  -> response 561   thinking 0    (2 steps)
+        # See logs/test-runs/2026-08-22-structured-empty-response.log.
+        want_think = wanted and payload.get("format") is None
+        # ...and the flag is sent EXPLICITLY either way, because omitting it is
+        # not neutral: this model defaults to thinking ON, so "no think key"
+        # and "think: false" are different requests and only the second one
+        # answers. That difference is what emptied the planner.
         try:
             return await self._stream_once(
-                model, {**payload, "think": True}, on_token, on_progress
+                model, {**payload, "think": want_think}, on_token, on_progress
             )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code not in (400, 422):
@@ -394,10 +411,57 @@ class LLMManager(ILLMManager):
         )
         # Capture the reasoning trace (surfaced/logged, kept out of the text).
         self._log_thinking(model, thinking, _ledger_call_id, _role)
+        if json_schema is not None and not text.strip():
+            text = self._salvage_structured(thinking, model, _role) or text
         # Calibrate future token estimates with Ollama's ground-truth count.
         if self.budget_manager and _estimated_tokens > 0 and prompt_eval_count:
             self.budget_manager.calibrate_from_response(model, prompt_eval_count, _estimated_tokens)
         return text
+
+    def _salvage_structured(self, thinking: str, model: str, role: str) -> str:
+        """The schema answer, when the model put it in `thinking` and left
+        `response` empty.
+
+        `think: false` on a constrained call is the actual fix and it makes this
+        rare - but "rare" is per model and per Ollama build, and the failure it
+        guards is total and silent: `generate_structured` returned "", the
+        caller read zero steps, and the user got a plan file whose Steps section
+        said `_No steps were produced._` while the complete plan sat in a
+        channel nobody read. Two of those in one session is what found this.
+
+        Deliberately narrow - a schema was asked for, the response is empty, and
+        the trace parses as JSON. It never touches a call that answered.
+        """
+        trace = (thinking or "").strip()
+        if not trace:
+            return ""
+        candidate = ""
+        try:
+            json.loads(trace)
+            candidate = trace
+        except (json.JSONDecodeError, TypeError, ValueError):
+            try:
+                repaired = repair_json(trace)
+            except Exception:  # noqa: BLE001
+                return ""
+            # `repair_json` answers "" or "{}" for prose with no JSON in it, and
+            # accepting those would turn a clean empty answer into a fake one.
+            if isinstance(repaired, str) and repaired.strip() not in ("", "{}", "[]"):
+                candidate = repaired.strip()
+        if not candidate:
+            return ""
+        if self.session_logger:
+            try:
+                self.session_logger.log(
+                    "llm.structured_salvaged_from_thinking",
+                    {"specialist": role, "model": model, "chars": len(candidate)},
+                    f"{model} returned an empty response and put the JSON in its "
+                    "reasoning channel; recovered it",
+                    workflow_id=f"{role}-structured",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        return candidate
 
     def _log_thinking(
         self, model: str, thinking: str, call_id: str = "", role: str = ""

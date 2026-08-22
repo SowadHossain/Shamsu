@@ -201,6 +201,7 @@ from shamsu.safety.approval import (
     ask_approval,
     ask_approval_menu,
     ask_tier_choice,
+    on_prompt_open,
     prompt_is_active,
 )
 from shamsu.safety.autonomy import is_long_running_enabled, set_long_running_enabled
@@ -299,6 +300,9 @@ _RUN_SUBCOMMANDS = frozenset(
 
 SYSTEM_COMMANDS = (
     "/help",
+    "/queue",
+    "/queue add ",
+    "/queue clear",
     "/remote_control",
     "/remote_control status",
     "/web",
@@ -4818,88 +4822,271 @@ def _simple_build_seed(user_input: str, workspace: Path) -> str:
     return build_instruction(argument)
 
 
-class _LiveFeedbackReader:
-    """Collect what the user types while a turn is running.
+#: Why the live console is off, when it is. Empty when it is on.
+_LIVE_CONSOLE_OFF_REASON = ""
 
-    smallcode gets this for free: its TUI is a raw-stdin event loop, so
-    keystrokes are handled whether or not the agent is mid-turn. SHAMSU blocks
-    on the model instead, so the keyboard has to be watched deliberately.
+#: The live console for this REPL, or None where the terminal cannot host one
+#: (a pipe, a CI runner, a Windows console with no screen buffer). Global for
+#: the same reason `_REQUEST_RUNNER` is: one terminal, one owner of it, and the
+#: turn routes that need it are scattered far from where it is built.
+_LIVE_CONSOLE: Any = None
 
-    Two things it must not do, both learned here the hard way:
 
-    * never read while an approval prompt is waiting. On Windows the whole
-      input stack is main-thread-owned, and a second reader competing for
-      stdin is the run_in_executor+stdin trap that made turns hang.
-    * never raise. A keyboard that cannot be polled - a pipe, a non-tty, a CI
-      runner - must cost nothing at all; the turn simply proceeds as before.
+def active_live_console() -> Any:
+    """The live console, or None when this terminal cannot host one.
+
+    Every caller must handle None. The turn has to run identically on a piped
+    stdin, and a display is never a reason for work not to happen.
     """
+    return _LIVE_CONSOLE
 
-    POLL_SECONDS = 0.15
 
-    def __init__(self, queue: Any, console: Console) -> None:
-        self._queue = queue
-        self._console = console
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+def _midturn_command(text: str, workspace: Path, console: Console) -> None:
+    """Run one read-only slash command WITHOUT it reaching the model.
 
-    def __enter__(self) -> "_LiveFeedbackReader":
-        if self._usable():
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
-        return self
+    The side dispatcher, and the reason it is worth having: every keystroke
+    used to go to the same queue and land in the message array, so asking "how
+    full is my context?" cost context to ask - and the answer arrived a round
+    later, phrased by a 7B that had to be told the number first.
 
-    def __exit__(self, *_exc: Any) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
+    Now it is local Python printing straight to the screen. Zero tokens, no
+    round, and the answer is the runtime's own rather than the model's account
+    of it.
+    """
+    head = text.split()[0].lower()
+    if head == "/context":
+        _handle_context(text, workspace, console)
+    elif head == "/queue":
+        _handle_queue(text, console)
+    else:
+        _print_help(console)
 
-    def _usable(self) -> bool:
-        if os.environ.get("SHAMSU_LIVE_FEEDBACK", "").strip() == "0":
-            return False
-        try:
-            return sys.stdin is not None and sys.stdin.isatty()
-        except Exception:  # noqa: BLE001
-            return False
 
-    def _run(self) -> None:
-        buffer: list[str] = []
-        try:
-            import msvcrt
-        except ImportError:
-            msvcrt = None  # type: ignore[assignment]
-        while not self._stop.is_set():
-            try:
-                if prompt_is_active():
-                    # The approval prompt owns the keyboard. Stay out of it.
-                    self._stop.wait(self.POLL_SECONDS)
-                    continue
-                if msvcrt is not None:
-                    if not msvcrt.kbhit():
-                        self._stop.wait(self.POLL_SECONDS)
-                        continue
-                    char = msvcrt.getwch()
-                    if char in (chr(13), chr(10)):
-                        self._submit("".join(buffer))
-                        buffer.clear()
-                    elif char == chr(8):
-                        if buffer:
-                            buffer.pop()
-                    elif char.isprintable():
-                        buffer.append(char)
-                else:
-                    import select
+def _handle_queue(text: str, console: Console) -> None:
+    """`/queue add <task>`, `/queue`, `/queue clear`.
 
-                    ready, _w, _e = select.select([sys.stdin], [], [], self.POLL_SECONDS)
-                    if ready:
-                        self._submit(sys.stdin.readline())
-            except Exception:  # noqa: BLE001 - a broken keyboard costs nothing
-                return
+    The task queue is the half of the dual-queue split that does NOT interrupt.
+    Plain text typed mid-turn is a correction and is worthless if it arrives
+    late; a task is a new job and is actively harmful if it arrives early,
+    because it lands as an interruption and the model abandons what it was
+    doing. Same keyboard, two intentions, and one queue could only ever serve
+    one of them at the right moment.
+    """
+    live = active_live_console()
+    if live is None:
+        console.print("[yellow]The task queue needs an interactive terminal.[/yellow]")
+        return
+    tasks = live.tasks
+    parts = text.split(None, 2)
+    verb = parts[1].lower() if len(parts) > 1 else "list"
 
-    def _submit(self, text: str) -> None:
-        if self._queue.push(text):
-            self._console.print(
-                "[dim]noted - passing that to the agent at the next step[/dim]"
+    if verb == "add":
+        task = parts[2].strip() if len(parts) > 2 else ""
+        if not task:
+            console.print("[yellow]Give it something to run: /queue add <task>[/yellow]")
+            return
+        if tasks.push(task):
+            console.print(
+                f"[dim]queued - starts when this turn finishes ({len(tasks)} waiting)[/dim]"
             )
+        return
+    if verb == "clear":
+        console.print(f"[dim]Dropped {tasks.clear()} queued task(s).[/dim]")
+        return
+
+    waiting = tasks.peek_all()
+    if not waiting:
+        console.print("[dim]Nothing queued. `/queue add <task>` lines one up.[/dim]")
+        return
+    console.print(f"[bold]{len(waiting)} task(s) waiting[/bold]")
+    for index, task in enumerate(waiting, 1):
+        console.print(f"  [dim]{index}.[/dim] {task}")
+
+
+def _announce_live_console(console: Console) -> None:
+    """Say, at startup, whether the live console is on - and what it gives you.
+
+    Everything the console upgrade changed happens DURING a turn: the pinned
+    input line, the telemetry row, the local answer to a slash command. At an
+    idle prompt the screen is deliberately identical to what it was before, so
+    "is the new interface actually running?" had no answer short of starting a
+    turn and watching. One line at startup is that answer.
+    """
+    live = active_live_console()
+    if live is None:
+        reason = _LIVE_CONSOLE_OFF_REASON or "this terminal cannot host it"
+        console.print(
+            f"[dim]Live console off ({reason}) - turns render as a plain log.[/dim]"
+        )
+        return
+    console.print(
+        "[dim]Live console on - type while the agent works, "
+        "`/context` answers without costing tokens, "
+        "`/queue add <task>` runs after this turn.[/dim]"
+    )
+
+
+def _next_queued_task() -> str:
+    """The next task waiting, or "" - consumed, so it runs exactly once."""
+    live = active_live_console()
+    if live is None:
+        return ""
+    with contextlib.suppress(Exception):
+        return live.tasks.pop()
+    return ""
+
+
+def _terminal_cannot_host_a_prompt(console: Console) -> str:
+    """Why a live prompt cannot run here, or "" when it can.
+
+    NOT `sys.stdin.isatty()`, which is what this used to ask and what turned the
+    live console off for everyone launching SHAMSU the supported way.
+
+    On Windows prompt_toolkit does not read `sys.stdin` at all - it reads the
+    console input buffer through the Win32 API. So a launcher that hands python
+    a redirected stdin leaves `isatty()` False in a process where the
+    interactive prompt works perfectly, and SHAMSU's own `shamsu.ps1` does
+    exactly that: it evaluates `@($input)`, which engages PowerShell's pipeline
+    machinery and gives the native command a redirected stdin. The observed
+    signature is stdin NOT a terminal while stdout IS one - rich painted full
+    box-drawing panels at true console width in the same process that reported
+    "stdin is not a terminal".
+
+    So ask the two questions that actually matter, of the two libraries that
+    have to do the work: can rich paint here, and can prompt_toolkit attach.
+    """
+    if not console.is_terminal:
+        return "output is not a terminal"
+    try:
+        from prompt_toolkit.input.defaults import create_input
+
+        stdin_input = create_input()
+    except Exception as exc:  # noqa: BLE001
+        return f"prompt_toolkit cannot attach to this terminal ({type(exc).__name__})"
+    if getattr(stdin_input, "closed", False):
+        return "the terminal input is closed"
+    # A pipe input is prompt_toolkit's own answer for "there is no console
+    # here" - it builds one when it cannot find a real terminal to read.
+    if "pipe" in type(stdin_input).__name__.lower():
+        return "stdin is a pipe, not a terminal"
+    return ""
+
+
+def _build_live_console(
+    workspace: Path, console: Console, history: Any = None
+) -> Any:
+    """Build the live console, or return None where one cannot run.
+
+    Records WHY on `_LIVE_CONSOLE_OFF_REASON` when it returns None, because
+    "the new interface is not showing up" and "this terminal cannot host it"
+    look identical from the outside. See `_announce_live_console`.
+    """
+    from shamsu.agents.simple_feedback import FeedbackQueue, TaskQueue
+    from shamsu.cli.live_console import LiveConsole
+
+    global _LIVE_CONSOLE_OFF_REASON
+    _LIVE_CONSOLE_OFF_REASON = ""
+
+    if os.environ.get("SHAMSU_LIVE_FEEDBACK", "").strip() == "0":
+        _LIVE_CONSOLE_OFF_REASON = "SHAMSU_LIVE_FEEDBACK=0"
+        return None
+    if os.environ.get("SHAMSU_LIVE_FEEDBACK", "").strip() != "1":
+        blocked = _terminal_cannot_host_a_prompt(console)
+        if blocked:
+            _LIVE_CONSOLE_OFF_REASON = blocked
+            return None
+
+    def notify(message: str) -> None:
+        console.print(f"[dim]{message}[/dim]")
+
+    live = LiveConsole(
+        session_factory=lambda toolbar: _make_prompt_session(
+            workspace, toolbar, history
+        ),
+        feedback=FeedbackQueue(),
+        tasks=TaskQueue(),
+        on_command=lambda text: _midturn_command(text, workspace, console),
+        notify=notify,
+        prompt_is_active=prompt_is_active,
+    )
+    # Hand the terminal over the moment an approval wants it, rather than at
+    # the next poll. Two prompt_toolkit applications on one console is the
+    # run_in_executor+stdin trap that used to hang turns on Windows.
+    on_prompt_open(live.stand_down)
+    return live
+
+
+def _dispatch_turn(
+    dispatch_input: str,
+    workspace: Path,
+    console: Console,
+    web_tool: Any,
+    browser_tool: Any,
+    *,
+    previous_user_prompt: str,
+    session_logger: Any,
+    user_input: str,
+) -> bool:
+    """Run one turn, with the live console where the terminal can host one.
+
+    Two displays, one turn. `console.status` is a rich `Live` and it cannot
+    coexist with a pinned prompt - both want the last row of the terminal - so
+    the choice is made once, here, and the whole turn runs under one of them.
+    The fallback is not a degraded mode: it is exactly what every turn did
+    before this, which is what a piped stdin and a CI runner still need.
+    """
+    live = active_live_console()
+
+    def turn(thinking: Any) -> Any:
+        return _handle_request(
+            dispatch_input,
+            workspace,
+            console,
+            web_tool,
+            browser_tool,
+            previous_user_prompt=previous_user_prompt,
+            session_logger=session_logger,
+            thinking_status=thinking,
+        )
+
+    if live is None:
+        with console.status(
+            _thinking_status_for_input(user_input), spinner="dots"
+        ) as thinking:
+            return _run_request(turn(thinking))
+
+    from prompt_toolkit.patch_stdout import patch_stdout
+
+    thinking = live.status()
+    live.telemetry.reset()
+    live.telemetry.active = True
+    live.telemetry.started = time.monotonic()
+    thinking.update(_thinking_status_for_input(user_input))
+    try:
+        # `patch_stdout` is what lifts the agent's output ABOVE the prompt.
+        # Rich resolves `sys.stdout` at write time, so the console picks up the
+        # patched stream without being rebuilt.
+        with patch_stdout(raw=True):
+            return _run_request(_with_live_input(turn(thinking), live))
+    finally:
+        live.telemetry.active = False
+
+
+async def _with_live_input(turn: Any, live: Any) -> Any:
+    """Run the turn with the input line up alongside it.
+
+    The prompt is a task on the same event loop the turn runs on - not a
+    thread. That is the whole difference from the raw `msvcrt` reader this
+    replaces: one owner of the console, cancelled cleanly when the turn ends,
+    and no second stdin reader to race the approval prompt.
+    """
+    reader = asyncio.ensure_future(live.input_loop())
+    try:
+        return await turn
+    finally:
+        reader.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await reader
 
 
 async def _run_simple_chat(
@@ -4946,7 +5133,11 @@ async def _run_simple_chat(
     from shamsu.cli.turn_render import CliTurnRenderer
     from shamsu.runtime.turn_stream import TurnStream
 
-    feedback = FeedbackQueue()
+    # The queue the live console pushes into, so a steer typed at the pinned
+    # prompt reaches THIS loop. A private queue here would be a prompt that
+    # accepts input and quietly drops it, which is worse than no prompt.
+    live = active_live_console()
+    feedback = live.feedback if live is not None else FeedbackQueue()
     session_id = str(getattr(session_logger, "session_id", "") or "")
     stream = TurnStream(workspace, session_id, persist=bool(session_id))
     # The CLI is the reference surface, so it renders off the same stream the
@@ -4965,6 +5156,13 @@ async def _run_simple_chat(
             verbosity=saved_verbosity(),
         )
     )
+    # The toolbar reads the SAME events, registered right here beside the
+    # renderer rather than fed from the status callback. The callback carries
+    # only the composed text; `data` carries the numbers - rounds, context,
+    # which file a write landed on - and those are the whole point of the
+    # telemetry row.
+    if live is not None:
+        stream.add_renderer(live.absorb)
     loop = SimpleChatLoop(
         workspace,
         client=_default_ollama_client(OLLAMA_BASE_URL, timeouts),
@@ -4977,8 +5175,7 @@ async def _run_simple_chat(
         emit=stream.publish,
         source="cli",
     )
-    with _LiveFeedbackReader(feedback, console):
-        result = await loop.run(user_input)
+    result = await loop.run(user_input)
     body = result.final.strip() or "No response returned."
     console.print(Markdown(body))
     _log_assistant_message(session_logger, body, workflow_id="simple-chat")
@@ -18693,8 +18890,17 @@ def _make_input_key_bindings() -> KeyBindings:
 
 
 def _make_prompt_session(
-    workspace: Path, bottom_toolbar: Callable[[], str] | None = None
+    workspace: Path,
+    bottom_toolbar: Callable[[], str] | None = None,
+    history: InMemoryHistory | None = None,
 ) -> PromptSession | None:
+    """`history` is shared between the idle prompt and the mid-turn one.
+
+    They are two `PromptSession`s - they never run at the same time, but they
+    are still two - and with a history each, something typed while the agent
+    was working could not be recalled with Up at the next prompt. One history
+    makes them read as the single input line they look like.
+    """
     style = Style.from_dict(
         {
             "prompt": "ansigreen bold",
@@ -18704,7 +18910,7 @@ def _make_prompt_session(
     )
     try:
         return PromptSession(
-            history=InMemoryHistory(),
+            history=history if history is not None else InMemoryHistory(),
             style=style,
             completer=SlashCommandCompleter(workspace),
             complete_while_typing=True,
@@ -18894,12 +19100,19 @@ def main(argv: list[str] | None = None) -> None:
         approval_manager=_make_approval_manager(workspace, session_logger, console),
     )
     bottom_toolbar = CachedBottomToolbar(workspace)
-    session = _make_prompt_session(workspace, bottom_toolbar)
+    prompt_history = InMemoryHistory()
+    session = _make_prompt_session(workspace, bottom_toolbar, prompt_history)
     command_router = CommandRouter(SYSTEM_COMMANDS)
     # One event loop for the whole session, so a cancelled request returns to
     # this prompt instead of ending the process (see _RequestRunner).
     global _REQUEST_RUNNER
     _REQUEST_RUNNER = _RequestRunner(console)
+    # The pinned input line, the telemetry toolbar and the side dispatcher.
+    # None on a pipe or a console that cannot host a prompt, and every caller
+    # handles that: the turn runs identically either way.
+    global _LIVE_CONSOLE
+    _LIVE_CONSOLE = _build_live_console(workspace, console, prompt_history)
+    _announce_live_console(console)
     # Plan mode: `/plan` with no task arms this, and the NEXT natural prompt is
     # planned instead of executed. Deliberately per-session (not persisted): a
     # mode that silently survives a restart would plan when you meant to build.
@@ -18912,7 +19125,16 @@ def main(argv: list[str] | None = None) -> None:
             # invisible - and after a restart silently forked a new session it
             # was the difference between "resumed" and "everything is gone".
             prompt_label = _session_prompt_label(session_logger)
-            if session is None:
+            # A task queued mid-turn runs itself, here, instead of waiting for
+            # someone to notice it and retype it. This is the point of the
+            # split: "next, write the tests" was never a correction to the job
+            # in flight, and delivering it as one made the model abandon what
+            # it was doing.
+            queued = _next_queued_task()
+            if queued:
+                console.print(f"[dim]starting queued task:[/dim] {queued}")
+                raw_input_text = queued
+            elif session is None:
                 raw_input_text = input(prompt_label)
             else:
                 raw_input_text = session.prompt([("class:prompt", prompt_label)])
@@ -19180,6 +19402,9 @@ def main(argv: list[str] | None = None) -> None:
         if lowered_input.startswith("context"):
             _handle_context(normalized_input, workspace, console)
             continue
+        if lowered_input == "queue" or lowered_input.startswith("queue "):
+            _handle_queue(f"/{normalized_input}", console)
+            continue
         if lowered_input == "tasks" or lowered_input.startswith("tasks "):
             _tasks_tokens = lowered_input.split(maxsplit=2)
             if len(_tasks_tokens) > 1 and _tasks_tokens[1] in {"execute", "continue"}:
@@ -19377,19 +19602,16 @@ def main(argv: list[str] | None = None) -> None:
         ledger = start_run(workspace, dispatch_input, session_logger=session_logger)
         set_current_run(ledger)
         try:
-            with console.status(_thinking_status_for_input(user_input), spinner="dots") as thinking:
-                completed = _run_request(
-                    _handle_request(
-                        dispatch_input,
-                        workspace,
-                        console,
-                        web_tool,
-                        browser_tool,
-                        previous_user_prompt=previous_user_prompt,
-                        session_logger=session_logger,
-                        thinking_status=thinking,
-                    )
-                )
+            completed = _dispatch_turn(
+                dispatch_input,
+                workspace,
+                console,
+                web_tool,
+                browser_tool,
+                previous_user_prompt=previous_user_prompt,
+                session_logger=session_logger,
+                user_input=user_input,
+            )
         except Exception as exc:
             ledger.fail(str(exc))
             clear_current_run()

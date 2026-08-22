@@ -1,0 +1,185 @@
+SHAMSU — every structured call returned "", and the live console was never on
+==============================================================================
+2026-08-22 · branch small-shamsu-new
+Diagnosed from a live session the user reported:
+  F:\Work\demo2\asteroid-shamsu   session 20260822-090221-f144
+  qwen3.5:9b-q4_K_M   Ollama 0.31.1
+
+
+THE REPORT
+----------
+Two complaints, which turned out to be unrelated:
+
+  1. "why wasn't the CLI UI updated?"  The rich renderer was plainly running -
+     icons, timings, repeat collapse, reasoning blocks, panels, verdict badge -
+     but the pinned input line and the telemetry toolbar never appeared, and
+     startup said:
+
+         Live console off (stdin is not a terminal) - turns render as a plain log.
+
+  2. Two consecutive `/plan` runs wrote a plan file that said:
+
+         ## Steps
+         _No steps were produced._
+
+     while the CLI printed, one line above it:
+
+         Reasoning: { "title": "Fix Movement Math", "steps": [ { "description": ...
+
+
+1. THE PLANNER — `think` unset is not `think: false`
+-----------------------------------------------------
+The plan JSON was never lost. It was in the `thinking` channel, and
+`_generate` returns `text` and throws `thinking` away.
+
+Confirmed from the user's own events.jsonl before touching anything -
+`plan.planner_produced_no_steps` exists precisely so this is not guesswork:
+
+    parse_error : planner returned an empty response
+    top_keys    : []
+    response_chars : 0            <- the response really was ""
+    llm.thinking   : thinking_chars 1167, then 1068
+
+Reproduced against the live model with the REAL PLAN_SCHEMA:
+
+    think omitted -> response    0   thinking  624
+    think: true   -> response    0   thinking  667
+    think: false  -> response  561   thinking    0    (2 steps)
+
+A `format` grammar constrains the `response` channel ONLY. Asked to think while
+constrained, this model satisfies the schema INSIDE `thinking` and emits an
+empty `response`. And omitting the flag is not neutral - the model's default is
+to think - so "no think key" and "think: false" are different requests and only
+the second one answers.
+
+`_stream_completion` sent exactly the two shapes that fail and never the one
+that works:
+
+    if not want_think:
+        return await self._stream_once(model, payload, ...)      # think omitted
+    return await self._stream_once(model, {**payload, "think": True}, ...)
+
+BLAST RADIUS. This is not a planner bug. `_generate` is the single path under
+every `generate_structured` caller, so on the default tier's own anchor the
+following were ALL returning "": planner, router, PRD development plan,
+prd_headings, prd_entities, the strict repair proposer, the scaffold filler.
+The 0-step plan is simply the only one that printed its own emptiness.
+
+A second measurement, to place the boundary exactly:
+
+    format=schema, think unset  -> response     0   thinking   155
+    format=schema, think=False  -> response    22   thinking     0
+    format="json",  think unset -> response     0   thinking  1611
+    no format,      no think    -> response     6   thinking  1175
+
+So unconstrained generation was fine all along, which is why chat worked and
+only the structured paths were mute.
+
+THE FIX — two parts
+  a) Send the flag EXPLICITLY, both ways, and never ask for thinking on a
+     schema-constrained call:
+
+         reasoning = model_is_reasoning(model) and model not in _THINK_UNSUPPORTED
+         if not reasoning:
+             return ...(payload)                     # no channel to turn off
+         want_think = wanted and payload.get("format") is None
+         return ...({**payload, "think": want_think})
+
+     A non-reasoning model is still sent nothing: it has no thinking channel,
+     and `think` is not a key every build accepts. The existing 400/422 retry
+     now covers `think: false` as well as `think: true`.
+
+  b) A salvage net in `_generate`: schema requested, response empty, trace
+     parses as JSON -> use the trace, and log
+     `llm.structured_salvaged_from_thinking`. (a) makes this rare, but "rare"
+     is per model and per Ollama build, and the failure it guards is total and
+     silent. It is deliberately narrow - it never touches a call that answered,
+     and it refuses `repair_json`'s "" / "{}" / "[]" so an honestly empty
+     answer cannot become a fake empty plan.
+
+VERIFIED end to end, the user's exact prompt through the real PlanningWorkflow
+against the real model:
+
+    title : Fix Movement Math and Rendering
+    steps : 5
+      1. Inspect input handling and velocity application in PlayerShip.js ...
+      ...
+    contains '_No steps were produced._': False
+
+
+2. THE LIVE CONSOLE — the gate asked a question the library does not ask
+------------------------------------------------------------------------
+    if sys.stdin is None or not sys.stdin.isatty():
+        _LIVE_CONSOLE_OFF_REASON = "stdin is not a terminal"
+
+On Windows prompt_toolkit does not read `sys.stdin`. It reads the console input
+buffer through the Win32 API. So `isatty()` can be False in a process where the
+prompt works perfectly - and it was: the same session that announced "stdin is
+not a terminal" then rendered box-drawing panels at true console width (rich
+saw a terminal) and wrapped the prompt with continuation alignment
+(prompt_toolkit was reading keys). Both libraries were fine. The gate was not
+asking either of them.
+
+The signature is stdin NOT a terminal while stdout IS one, which is what a
+launcher that redirects only stdin produces. SHAMSU's own launcher does:
+
+    $PipedInput = @($input)          # shamsu.ps1
+
+Evaluating `$input` engages PowerShell's pipeline machinery whether or not
+anything was piped. Measured while testing it: an interactive `@($input)` with
+nothing to read blocked until the 2-minute kill.
+
+FIXED, both halves:
+  - The gate now asks the two libraries that have to do the work - can rich
+    paint (`console.is_terminal`), and can prompt_toolkit attach
+    (`create_input()` succeeding, and not handing back a *PipeInput). The
+    reason string names which one refused.
+  - `SHAMSU_LIVE_FEEDBACK=1` forces it on. The switch had only an off position,
+    and detection being wrong once already is the argument for the other one.
+  - The launcher only enumerates `$input` when `[Console]::IsInputRedirected`
+    says something was actually piped. Fixed in `scripts/install.ps1` (the
+    template) and in the installed `~/.shamsu/bin/shamsu.ps1`, so it takes
+    effect without re-running the installer.
+
+A TEST THAT GUARANTEED THE BUG
+    test_the_off_reason_names_a_pipe patched `sys.stdin.isatty()` to False and
+    asserted the reason was "stdin is not a terminal". It passed for exactly
+    the reason the feature was broken. Repointed to what its name claims: a
+    real pipe, detected the way the gate now detects one.
+
+
+TESTS
+-----
+    tests/test_structured_generation.py   +10  (new)
+        test_a_schema_constrained_call_says_think_false_out_loud
+        test_an_unconstrained_call_still_gets_to_think
+        test_a_mechanical_role_is_told_false_rather_than_left_to_default
+        test_a_non_reasoning_model_is_not_sent_the_flag_at_all
+        test_a_model_that_rejects_the_flag_still_gets_its_answer
+        test_an_empty_structured_response_is_recovered_from_the_thinking_channel
+        test_salvage_never_overrides_an_answer_that_arrived
+        test_salvage_does_not_invent_json_out_of_prose
+        test_salvage_leaves_unstructured_calls_alone
+        test_the_planner_produces_steps_when_the_model_answers_in_its_trace
+
+    tests/test_live_console.py            +6, 1 repointed
+        test_a_redirected_stdin_does_not_turn_the_live_console_off
+        test_output_that_is_not_a_terminal_turns_it_off_and_says_so
+        test_a_pipe_input_is_prompt_toolkits_own_answer_for_no_console
+        test_the_reason_names_prompt_toolkit_when_it_cannot_attach
+        test_it_can_be_forced_on_for_a_terminal_the_check_misjudges
+        test_off_still_wins_over_forced_on
+
+    FULL SUITE: 3640 passed, 2 skipped
+
+
+STILL OPEN, from the same paste — NOT fixed here
+-------------------------------------------------
+  - `✓ SUCCESS  done in 21m52s` on a turn that changed no file and whose answer
+    was cut off mid-sentence. The verdict is not reading the outcome.
+  - `write_file carried 10,477 chars for fix-plan.md; the cap is 8,000, refused`
+    and then the reply hit the 15,071-token cap with the same document in it.
+    Two caps refused the same deliverable and neither offered a way through.
+  - `✗ plan FAILED There is no tool called plan` - a hallucinated tool name.
+  - 15 reads of js/PlayerShip.js in one turn (`x8` on one collapsed row).
+    Fix 08's target, and the baseline for it is now clean.

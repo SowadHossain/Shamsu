@@ -225,7 +225,13 @@ Set-StrictMode -Version Latest
 `$RunScript = '$EscapedRunScript'
 `$Workspace = (Get-Location).Path
 `$ShamsuArgs = `$args
-`$PipedInput = @(`$input)
+# Only ENUMERATE `$input when something was actually piped in. Reading it
+# unconditionally engages PowerShell's pipeline machinery on an interactive
+# run, which hands the child process a redirected stdin - measured: an
+# interactive `@(`$input)` blocked for two minutes with nothing to read.
+# ``IsInputRedirected`` answers the same question without consuming anything.
+`$PipedInput = @()
+if ([Console]::IsInputRedirected) { `$PipedInput = @(`$input) }
 
 if (`$PipedInput.Count -gt 0) {
     & `$RunScript -Workspace `$Workspace -InputObject (`$PipedInput -join [Environment]::NewLine) @ShamsuArgs

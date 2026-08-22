@@ -36,11 +36,45 @@ def prompt_is_active() -> bool:
     return _PROMPT_DEPTH > 0
 
 
+#: Things that must stand down before a prompt is drawn, newest last.
+#:
+#: `prompt_is_active()` alone is a flag someone has to notice, and the live
+#: console noticing it by polling leaves a window - the flag goes up, and until
+#: the next poll two prompt_toolkit applications are live on one terminal,
+#: which is not a thing prompt_toolkit supports. This is the synchronous half:
+#: whoever is holding the console is TOLD, on this thread, before the question
+#: is rendered, and rendering the question then buys the event loop the moment
+#: it needs to act on it.
+_ON_PROMPT_OPEN: list = []
+
+
+def on_prompt_open(callback):
+    """Register `callback`, called just before any prompt takes the terminal.
+
+    Returns a function that unregisters it. The callback may be invoked from a
+    WORKER thread - tools run on one - so it must not touch an event loop
+    directly; see `LiveConsole.stand_down`.
+    """
+    _ON_PROMPT_OPEN.append(callback)
+
+    def release() -> None:
+        with contextlib.suppress(ValueError):
+            _ON_PROMPT_OPEN.remove(callback)
+
+    return release
+
+
 @contextlib.contextmanager
 def reading_input():
     """Mark the window in which nothing else may write to the terminal."""
     global _PROMPT_DEPTH
     _PROMPT_DEPTH += 1
+    # Copied on purpose: a callback that unregisters itself would otherwise
+    # mutate the list mid-iteration.
+    for callback in list(_ON_PROMPT_OPEN):  # noqa: PERF101
+        # A broken observer must never be the reason a human cannot be asked.
+        with contextlib.suppress(Exception):
+            callback()
     try:
         yield
     finally:

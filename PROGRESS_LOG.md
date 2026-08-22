@@ -3,6 +3,70 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-22 - Every structured call returned "", and the live console never turned on
+Files edited: `shamsu/llm/manager.py`, `shamsu/cli/repl.py`,
+`scripts/install.ps1`, `tests/test_structured_generation.py` (new),
+`tests/test_live_console.py`
+What changed: two unrelated bugs from one reported session. (1) `/plan` wrote
+`_No steps were produced._` twice while the CLI printed the model's reasoning
+and the reasoning WAS the plan JSON. A `format` grammar constrains Ollama's
+`response` channel only, and omitting `think` is not neutral - this model
+defaults to thinking ON, so the schema was satisfied inside `thinking` and
+`response` came back empty. Measured on the real PLAN_SCHEMA: think omitted ->
+0 chars, `think: true` -> 0 chars, `think: false` -> 561 chars and a plan.
+SHAMSU sent the two failing shapes and never the third, so on the default
+tier's own anchor EVERY `generate_structured` caller was returning "" - the
+planner, the router, the PRD development plan, the repair proposer, the
+scaffold filler. The flag is now sent explicitly both ways and never asks for
+thinking on a constrained call, plus a narrow salvage that reads the trace when
+a schema call comes back empty. (2) The live console announced "stdin is not a
+terminal" in a process where rich was painting panels at true console width and
+prompt_toolkit was reading keys - on Windows prompt_toolkit reads the console
+buffer through Win32, not `sys.stdin`, so `isatty()` was the wrong question.
+The gate now asks rich and prompt_toolkit directly, `SHAMSU_LIVE_FEEDBACK=1`
+forces it on, and the launcher stops enumerating `$input` (which engaged
+PowerShell's pipeline machinery and redirected the child's stdin) unless
+`[Console]::IsInputRedirected` says something was really piped. One existing
+test had asserted the isatty behaviour by name and so guaranteed the bug;
+repointed to what its name claims.
+Tests: 10 new in `tests/test_structured_generation.py`, 6 new + 1 repointed in
+`tests/test_live_console.py`; full suite 3640 passed, 2 skipped. Verified live:
+the exact prompt that produced 0 steps twice now produces a grounded 5-step
+plan |
+Log: logs/test-runs/2026-08-22-structured-empty-response.log
+
+### 2026-08-22 - A pinned input line, a telemetry toolbar, and a side dispatcher
+Files edited: `shamsu/cli/live_console.py` (new), `shamsu/cli/repl.py`,
+`shamsu/agents/simple_feedback.py`, `shamsu/safety/approval.py`,
+`tests/test_live_console.py` (new)
+What changed: console fixes 01-04 of the "Harness and Console" spec. Deleted
+`_LiveFeedbackReader` - forty lines of raw `msvcrt.getwch()` that echoed
+nothing, backspaced a buffer you could not see, and sent every keystroke to the
+model. The pinned input box was previously ruled out as fatally conflicting
+with that thread on Windows; the thread was the only reason the conflict
+existed, and `prompt_toolkit` already owned every other input surface here
+(idle prompt, approvals, control console). One `PromptSession` on the REPL's
+own loop under `patch_stdout` replaces it, `console.status` retires into
+prompt_toolkit's `bottom_toolbar` so nothing fights for the bottom line, a
+leading `/` now runs locally and never enters the message array, and
+`/queue add` lines up work that waits for the turn instead of interrupting it.
+The toolbar narrows from the LEFT: clipping trimmed the end, where the queue
+depths are, so the first thing to vanish on a narrow terminal was the number
+telling you your steer had been accepted. `reading_input()` in
+`safety/approval.py` gained an observer list so the console is handed over
+SYNCHRONOUSLY before an approval question is drawn - polling `prompt_is_active`
+alone left a window in which two prompt_toolkit applications were live on one
+terminal. Harness fixes 05-08 are not in this change. Live 3B run:
+`/context status` typed mid-turn was answered locally and never reached the
+transcript; the steer did reach the model at a round boundary. Not fixed here,
+but exposed by that run: the turn reported SUCCESS having never written a file.
+A startup line now states whether the live console is on, or names the reason
+it is off: everything here happens DURING a turn, so a fresh REPL was
+indistinguishable from an old one until you sent a prompt.
+Tests: 66 new in `tests/test_live_console.py`, incl. one that drives the real
+`PromptSession` over `create_pipe_input()`; full suite 3624 passed, 2 skipped |
+Log: logs/test-runs/2026-08-22-live-console-tui.log
+
 ### 2026-08-22 - Old chat-logs replayed into the session log, redacted
 Files edited: `shamsu/ui/chatlog_migrate.py` (new), `shamsu/ui/turnlog.py`,
 `shamsu/cli/session_commands.py`, tests

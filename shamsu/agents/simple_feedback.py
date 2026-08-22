@@ -62,9 +62,73 @@ class FeedbackQueue:
             self._items.clear()
         return items
 
+    def __len__(self) -> int:
+        """How much is waiting. The toolbar shows this live, so a steer you
+        typed is visibly queued rather than apparently swallowed."""
+        with self._lock:
+            return len(self._items)
+
     def __bool__(self) -> bool:
         with self._lock:
             return bool(self._items)
+
+
+class TaskQueue:
+    """Work the user lined up while a turn was running, to run after it ends.
+
+    The second half of a distinction the single feedback queue could not make.
+    "Also log a warning" and "next, write the tests" are different requests:
+    the first is a correction to the job in flight and is worthless if it
+    arrives late; the second is a new job and is actively harmful if it arrives
+    early, because it lands mid-task as an interruption and the model abandons
+    what it was doing. One queue serving both intentions means one of them is
+    always delivered at the wrong moment.
+
+    So this one deliberately does NOT interrupt. It waits for the turn to end -
+    and, once history compaction lands, for the window to be reclaimed - and
+    then runs as an ordinary prompt of its own.
+
+    FIFO, and bounded for the same reason the feedback queue is: a queue that
+    grows without limit is a way to discover at 3am that you have scheduled
+    forty tasks.
+    """
+
+    def __init__(self, limit: int = 32) -> None:
+        self._items: deque[str] = deque(maxlen=max(1, limit))
+        self._lock = threading.Lock()
+
+    def push(self, text: str) -> bool:
+        """Line up a task. Returns whether it was kept."""
+        message = " ".join((text or "").split())
+        if not message:
+            return False
+        with self._lock:
+            self._items.append(message)
+        return True
+
+    def pop(self) -> str:
+        """Take the next task, or "" when there is nothing waiting."""
+        with self._lock:
+            return self._items.popleft() if self._items else ""
+
+    def peek_all(self) -> list[str]:
+        """Everything waiting, oldest first, without consuming it."""
+        with self._lock:
+            return list(self._items)
+
+    def clear(self) -> int:
+        """Drop everything waiting. Returns how many were dropped."""
+        with self._lock:
+            count = len(self._items)
+            self._items.clear()
+        return count
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
 
 
 def render_interjection(messages: list[str]) -> str:
