@@ -2261,12 +2261,13 @@ class AgentToolRegistry:
             reason="The agent requested a targeted file edit.",
             target_paths=[normalized],
         )
-        broken = _breaks_working_python(target, new_content)
+        broken = _breaks_a_working_file(target, new_content)
         if broken:
             return ToolResult(
                 False,
                 f"Refusing to edit {normalized}: {broken}, but the file on disk currently does. "
-                "The replacement text is truncated or malformed - the working file has been kept.",
+                "The replacement text is truncated or malformed - the working file has been kept."
+                + _WAY_OUT,
                 {"filepath": normalized, "syntax_regression": True},
             )
         if not self.approval_manager.ask(request):
@@ -2392,13 +2393,14 @@ class AgentToolRegistry:
         separator = "\n" if old_content and not old_content.endswith(("\n", "\r")) and not content.startswith(("\n", "\r")) else ""
         appended_content = f"{separator}{content}"
         new_content = f"{old_content}{appended_content}"
-        broken = _breaks_working_python(target, new_content)
+        broken = _breaks_a_working_file(target, new_content)
         if broken:
             return ToolResult(
                 False,
                 f"Refusing to append to {normalized}: {broken}, but the file on disk currently "
                 "does. The appended text is truncated or malformed - the working file has been "
-                "kept.",
+                "kept."
+                + _WAY_OUT,
                 {"filepath": normalized, "syntax_regression": True},
             )
         request = ApprovalRequest(
@@ -3299,13 +3301,13 @@ class AgentToolRegistry:
         unwrapped = _unwrap_serialized_tool_call(str(content), "write_file")
         if unwrapped is not None:
             content = unwrapped
-        broken = _breaks_working_python(self.workspace_root / normalized, str(content))
+        broken = _breaks_a_working_file(self.workspace_root / normalized, str(content))
         if broken:
             return ToolResult(
                 False,
                 f"Refusing to overwrite {normalized}: {broken}, but the file on disk currently "
                 "does. This is a truncated or malformed generation - the working file has been "
-                "kept. Send the COMPLETE file content.",
+                "kept. Send the COMPLETE file content." + _WAY_OUT,
                 {"filepath": normalized, "syntax_regression": True},
             )
         gutted = _gutting_overwrite(self.workspace_root / normalized, str(content))
@@ -3918,8 +3920,35 @@ def _refuse_impossible_range(
     return None
 
 
-def _breaks_working_python(target: Path, content: str) -> str:
-    """Why this write would replace parsing Python with unparseable Python.
+#: Appended to every syntax-regression refusal. The refusal is correct and the
+#: model still needs somewhere to go. Live 2026-08-23 it tried three times to
+#: delete a duplicate class by replacing its HEADER with a comment - orphaning
+#: the closing brace every time - was refused every time, and then re-read the
+#: same file 27 times, because nothing had named a different move. A refusal
+#: that only says no leaves a model safely stuck, which is better than damage
+#: and worse than progress.
+_WAY_OUT = (
+    " If you are removing or replacing a whole class or function, call"
+    " replace_symbol with its NAME instead of matching its text - it takes the"
+    " whole definition and cannot leave a brace behind."
+)
+
+
+def _breaks_a_working_file(target: Path, content: str) -> str:
+    """Why this write would replace a file that parses with one that does not.
+
+    Was Python-only - `if target.suffix.lower() != ".py": return ""` - while
+    `simple_verify` has understood `.js .mjs .cjs .jsx .ts .tsx .css .json` all
+    along, and shells out to `node --check` where node is present. So the guard
+    that knows about braces was wired into `replace_symbol` and NOT into the
+    two paths that actually write: a JavaScript patch that ate a closing brace
+    landed on disk and was only caught afterwards, by which time the working
+    file was already gone.
+
+    The project's own record is what this is for: "game.js closed 39 of 60
+    braces, player.js 30 of 47". And the session that produced the 2026-08-23
+    post-mortem was a JS project where the model could not repair its own
+    broken exports and escalated to proposing it delete the files.
 
     The gutting guard needs the file to lose every declaration, so a generation
     that stops mid-string slips past it: `return render(request, "item` keeps
@@ -3931,25 +3960,26 @@ def _breaks_working_python(target: Path, content: str) -> str:
     Only files that parsed BEFORE are protected: repairing an already-broken
     file must stay possible.
     """
-    if target.suffix.lower() != ".py":
-        return ""
     try:
         if not target.is_file():
             return ""
         existing = target.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
-    try:
-        compile(existing, str(target), "exec")
-    except (SyntaxError, ValueError):
+
+    from shamsu.agents.simple_verify import PROBLEM, check_text
+
+    suffix = target.suffix.lower()
+    if check_text(existing, suffix).status == PROBLEM:
         return ""  # already broken - let the model fix it
-    try:
-        compile(content, str(target), "exec")
-    except SyntaxError as exc:
-        return f"the replacement does not parse ({exc.msg} at line {exc.lineno})"
-    except ValueError as exc:
-        return f"the replacement does not parse ({exc})"
-    return ""
+    after = check_text(content, suffix)
+    if after.status != PROBLEM:
+        # OK, or SKIPPED because nothing here can parse that file type. A
+        # skipped check is not a pass, but it is not grounds for a refusal
+        # either - the caller is asking "would this BREAK it?", and about a
+        # `.txt` the honest answer is that we cannot tell.
+        return ""
+    return f"the replacement does not parse ({after.detail})"
 
 
 def _gutting_overwrite(target: Path, content: str) -> str:

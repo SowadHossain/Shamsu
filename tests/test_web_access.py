@@ -19,7 +19,12 @@ from shamsu.webui.server import TOKEN_ENV, WebPortal, is_loopback
 
 @pytest.fixture
 def portal():
-    started = WebPortal(Path(tempfile.mkdtemp(prefix="shamsu-web-test-")))
+    # `port=0` so the OS picks a free one. The default is a FIXED 8765, which
+    # is the port a real SHAMSU serves on - so with the portal running these
+    # tests bound nothing, sent their requests to the LIVE instance, and asked
+    # it questions about a workspace it had never heard of. That is a false
+    # failure at best and a test suite driving your running agent at worst.
+    started = WebPortal(Path(tempfile.mkdtemp(prefix="shamsu-web-test-")), port=0)
     started.start()
     try:
         yield started

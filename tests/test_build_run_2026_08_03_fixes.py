@@ -49,8 +49,38 @@ def test_the_write_tool_refuses_it_and_leaves_the_file_alone(tmp_path: Path):
     assert (tmp_path / "views.py").read_text(encoding="utf-8") == SOURCE
 
 
-def test_a_gutted_non_python_file_is_refused_by_the_gutting_guard(tmp_path: Path):
-    """The gutting guard owns the languages the syntax guard cannot parse."""
+def test_a_gutted_file_no_checker_understands_is_refused_by_the_gutting_guard(
+    tmp_path: Path,
+):
+    """The gutting guard owns the languages the syntax guard cannot parse -
+    a set that shrank sharply when the syntax guard stopped being Python-only.
+
+    What is left to it is roughly `.rb` and `.php`: languages whose
+    declarations `_DEFINITION_RE` recognises but for which `simple_verify` has
+    no checker. Everything else it used to cover alone - .js, .ts, .jsx, .go,
+    .rs, .java - is now bracket-checked as well, and the syntax gate reaches
+    those first. This is the guard's own remaining case: caught on SHAPE,
+    because nothing here can judge the grammar.
+    """
+    source = (
+        "class User\n  def name\n    @name\n  end\nend\n\n"
+        "class Order\n  def total\n    @total\n  end\nend\n\n"
+        "class Item\n  def price\n    @price\n  end\nend\n" * 3
+    )
+    (tmp_path / "models.rb").write_text(source, encoding="utf-8")
+    tools = AgentToolRegistry(tmp_path, approval_func=lambda _r: True)
+
+    result = tools.write_file("models.rb", "end", overwrite=True)
+
+    assert result.ok is False
+    assert result.data["gutting_overwrite"] is True
+    assert (tmp_path / "models.rb").read_text(encoding="utf-8") == source
+
+
+def test_a_gutted_javascript_file_is_refused_by_the_syntax_guard_now(tmp_path: Path):
+    """Same file, same protection, a different guard reaching it first. `}`
+    does not parse as JavaScript, so the syntax gate refuses before the
+    gutting guard is consulted."""
     source = (
         "export function home() { return 1; }\n\n"
         "export function detail() { return 2; }\n\n"
@@ -62,7 +92,7 @@ def test_a_gutted_non_python_file_is_refused_by_the_gutting_guard(tmp_path: Path
     result = tools.write_file("views.js", "}", overwrite=True)
 
     assert result.ok is False
-    assert result.data["gutting_overwrite"] is True
+    assert result.data["syntax_regression"] is True
     assert (tmp_path / "views.js").read_text(encoding="utf-8") == source
 
 
@@ -163,31 +193,52 @@ BROKEN_TAIL = 'def home(request):\n    return render(request, "item\n'
 
 
 def test_a_truncated_write_is_refused(tmp_path: Path):
-    from shamsu.tools.agent_tools import _breaks_working_python
+    from shamsu.tools.agent_tools import _breaks_a_working_file
 
     target = tmp_path / "views.py"
     target.write_text(SOURCE, encoding="utf-8")
 
-    assert "does not parse" in _breaks_working_python(target, BROKEN_TAIL)
+    assert "does not parse" in _breaks_a_working_file(target, BROKEN_TAIL)
 
 
 def test_an_already_broken_file_can_still_be_repaired(tmp_path: Path):
     """Only files that parsed BEFORE are protected."""
-    from shamsu.tools.agent_tools import _breaks_working_python
+    from shamsu.tools.agent_tools import _breaks_a_working_file
 
     target = tmp_path / "views.py"
     target.write_text("def x(:\n", encoding="utf-8")
 
-    assert _breaks_working_python(target, "def x(:\n    still broken\n") == ""
+    assert _breaks_a_working_file(target, "def x(:\n    still broken\n") == ""
 
 
-def test_non_python_files_are_not_syntax_checked(tmp_path: Path):
-    from shamsu.tools.agent_tools import _breaks_working_python
+def test_a_file_type_with_no_checker_is_not_syntax_checked(tmp_path: Path):
+    """Renamed from `test_non_python_files_are_not_syntax_checked`, because
+    the guard is no longer Python-only.
+
+    It was `if target.suffix.lower() != ".py": return ""`, while
+    `simple_verify` has understood .js/.ts/.jsx/.css/.json all along - so the
+    check that knows about braces was wired into `replace_symbol` and NOT
+    into the two paths that write, and a JavaScript patch that ate a closing
+    brace landed on disk. What survives of the old rule is narrower and still
+    true: about a file nothing can parse, the honest answer is we cannot tell.
+    """
+    from shamsu.tools.agent_tools import _breaks_a_working_file
 
     target = tmp_path / "notes.txt"
     target.write_text("def a(): pass\n", encoding="utf-8")
 
-    assert _breaks_working_python(target, "def x(:") == ""
+    assert _breaks_a_working_file(target, "def x(:") == ""
+
+
+def test_javascript_is_syntax_checked_now(tmp_path: Path):
+    """The whole point of the widening, and the case that landed on disk."""
+    from shamsu.tools.agent_tools import _breaks_a_working_file
+
+    target = tmp_path / "app.js"
+    target.write_text("function a() {\n  return 1;\n}\n", encoding="utf-8")
+
+    assert _breaks_a_working_file(target, "function a() {\n  return 1;\n") != ""
+    assert _breaks_a_working_file(target, "function a() {\n  return 2;\n}\n") == ""
 
 
 def test_append_cannot_break_a_working_module(tmp_path: Path):

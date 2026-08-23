@@ -9963,3 +9963,237 @@ def test_last_role_reports_the_most_recent_message(tmp_path):
     assert state.last_role() == "user"
     state.append_tool("id", "read_file", "{}")
     assert state.last_role() == "tool"
+
+
+# --- F4: state that must outlive one user message ---------------------------
+#
+# A fresh SimpleChatLoop is built per user message. `SessionStalls` was moved to
+# a session-keyed store for exactly that reason - and the same reasoning was
+# never applied to the four things below, each of whose own docstring claimed
+# session scope while the object holding it was rebuilt on every Enter.
+
+
+def _two_turns(tmp_path):
+    """Two loops over one session, the way repl.py builds them."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    reset_session_stalls("f4-session")
+
+    class _Named:
+        session_id = "f4-session"
+
+    first = _loop(tmp_path, [_text("ok")], session_logger=_Named())
+    second = _loop(tmp_path, [_text("ok")], session_logger=_Named())
+    return first, second
+
+
+def test_the_partial_read_guard_survives_the_user_pressing_enter(tmp_path):
+    """The one that loses data. A truncated read in one turn has to protect the
+    file in the NEXT one, because the truncated copy is still in the rehydrated
+    transcript the model will copy from."""
+    (tmp_path / "big.py").write_text("x = 1\n" * 400, encoding="utf-8")
+    first, second = _two_turns(tmp_path)
+
+    first._partial_reads.add("big.py")
+
+    assert "big.py" in second._partial_reads
+    refused = second._refuse_blind_overwrite({"filepath": "big.py"})
+    assert refused is not None and refused.data.get("partial_read") is True
+
+
+def test_trust_decay_accumulates_across_turns(tmp_path):
+    """`_without_broken_tools` says "failed repeatedly THIS session", and
+    drop_after is 5 CONSECUTIVE failures - unreachable inside one turn, so the
+    whole mechanism was effectively dead."""
+    first, second = _two_turns(tmp_path)
+
+    for _ in range(3):
+        first._trust.record("graph_search", False)
+    for _ in range(2):
+        second._trust.record("graph_search", False)
+
+    assert "graph_search" in second._trust.dropped()
+
+
+def test_a_refused_context_window_is_remembered_for_the_session(tmp_path):
+    """`_shrink_for_oom` says it will "remember the ceiling for the rest of the
+    session". Every user message used to go back to asking for the full window,
+    pay the OOM round trip again, and evict the co-resident model again."""
+    first, second = _two_turns(tmp_path)
+
+    assert first._shrink_for_oom()
+    lowered = first._num_ctx_ceiling
+    assert lowered
+
+    assert second._num_ctx_ceiling == lowered
+    assert second._ceiling() <= lowered
+
+
+def test_the_model_eviction_happens_once_per_session_not_once_per_turn(tmp_path):
+    first, second = _two_turns(tmp_path)
+
+    first._evicted_others = True
+
+    assert second._evicted_others is True
+    assert second._evict_other_models() is False, "it must not evict again"
+
+
+def test_a_new_session_starts_clean(tmp_path):
+    """Session-scoped is not process-scoped. `/new` must forget all of it."""
+    from shamsu.agents.simple_chat import reset_session_stalls
+
+    first, _second = _two_turns(tmp_path)
+    first._partial_reads.add("big.py")
+    first._num_ctx_ceiling = 8192
+
+    reset_session_stalls("f4-session")
+
+    class _Named:
+        session_id = "f4-session"
+
+    fresh = _loop(tmp_path, [_text("ok")], session_logger=_Named())
+    assert fresh._partial_reads == set()
+    assert fresh._num_ctx_ceiling == 0
+    assert fresh._evicted_others is False
+
+
+# --- F7: nothing ever ran the project's own tests ---------------------------
+#
+# `detect_test_command` has resolved a runner for Node, Python, Rust, Go and
+# Make all along and `run_tests` has offered it to the model, which almost never
+# calls it - the same pattern already documented here for memory_load /
+# memory_list / memory_forget, called zero times across seven live sessions. So
+# the only evidence the harness gathered unprompted was "it parses".
+
+
+def _python_project(tmp_path, passing: bool = True):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='p'\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir(exist_ok=True)
+    body = "def test_ok():\n    assert True\n" if passing else "def test_no():\n    assert False\n"
+    (tests / "test_thing.py").write_text(body, encoding="utf-8")
+
+
+def _ran_tests(loop) -> list:
+    return [m for m in loop.state.all_messages if m.name == "run_tests"]
+
+
+def test_the_suite_runs_once_after_a_source_file_changes(tmp_path):
+    _python_project(tmp_path)
+    loop = _loop(
+        tmp_path,
+        [_named_tool("write_file", {"filepath": "mod.py", "content": "x = 1\n"}),
+         _text("Added mod.py.")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("add mod.py"))
+
+    ran = _ran_tests(loop)
+    assert len(ran) == 1, "once per turn, not once per write"
+    assert "auto" in ran[0].content
+
+
+def test_a_readme_change_does_not_earn_a_test_run(tmp_path):
+    """A suite is the most expensive thing the loop can do unasked."""
+    _python_project(tmp_path)
+    loop = _loop(
+        tmp_path,
+        [_named_tool("write_file", {"filepath": "README.md", "content": "# hi\n"}),
+         _text("Updated the README.")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("update the readme"))
+
+    assert not _ran_tests(loop)
+
+
+def test_no_test_run_when_nothing_was_written(tmp_path):
+    _python_project(tmp_path)
+    loop = _loop(tmp_path, [_text("Here is what that function does.")], max_rounds=3)
+
+    asyncio.run(loop.run("what does it do?"))
+
+    assert not _ran_tests(loop)
+
+
+def test_a_project_with_no_detectable_runner_is_left_alone(tmp_path):
+    """Never a guess at a command."""
+    loop = _loop(
+        tmp_path,
+        [_named_tool("write_file", {"filepath": "mod.py", "content": "x = 1\n"}),
+         _text("done")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("add mod.py"))
+
+    assert not _ran_tests(loop)
+
+
+def test_a_failing_suite_lands_in_the_thread_for_the_model_to_see(tmp_path):
+    """The point of the whole thing: a failure is ordinary information the model
+    acts on next round, not a separate repair phase."""
+    _python_project(tmp_path, passing=False)
+    loop = _loop(
+        tmp_path,
+        [_named_tool("write_file", {"filepath": "mod.py", "content": "x = 1\n"}),
+         _text("All done, everything works.")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("add mod.py"))
+
+    ran = _ran_tests(loop)
+    assert ran, "a failing suite must still be reported"
+    assert '"ok": false' in ran[0].content.lower()
+
+
+def test_it_can_be_turned_off(tmp_path, monkeypatch):
+    _python_project(tmp_path)
+    monkeypatch.setenv("SHAMSU_AUTO_TEST", "0")
+    loop = _loop(
+        tmp_path,
+        [_named_tool("write_file", {"filepath": "mod.py", "content": "x = 1\n"}),
+         _text("done")],
+        max_rounds=4,
+    )
+
+    asyncio.run(loop.run("add mod.py"))
+
+    assert not _ran_tests(loop)
+
+
+def test_the_mid_build_note_only_advises_about_unclosed_blocks(tmp_path):
+    """It is advice for ONE error and used to attach to any of them.
+
+    Live 2026-08-23 it landed on the wrong one - `node --check` had found the
+    real defect exactly, three `export default` declarations in one file, and
+    the note then told the model to keep appending sections, which is what
+    produced the duplicates. The harness diagnosed the bug and recommended its
+    cause.
+    """
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._built_up.add("asteroid.js")
+
+    duplicated = tmp_path / "asteroid.js"
+    duplicated.write_text(
+        "export default class A {}\nexport default class A {}\n", encoding="utf-8"
+    )
+    assert loop._mid_build_note("asteroid.js", duplicated) == "", (
+        "a duplicate declaration is not an unfinished section"
+    )
+
+    half_written = tmp_path / "half.js"
+    half_written.write_text("export default class A {\n  go() {\n", encoding="utf-8")
+    loop._built_up.add("half.js")
+    assert "continue the next section" in loop._mid_build_note("half.js", half_written)
+
+
+def test_a_file_this_turn_never_touched_gets_no_note(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+    other = tmp_path / "other.js"
+    other.write_text("class A {\n", encoding="utf-8")
+
+    assert loop._mid_build_note("other.js", other) == ""

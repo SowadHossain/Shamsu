@@ -193,6 +193,29 @@ MAX_EMPTY_NUDGES = 2
 # correction in the conversation.
 MAX_SILENT_RETRIES = 2
 
+# Run the project's own tests once per turn, after the writes have landed and
+# the syntax check has passed.
+#
+# `detect_test_command` has resolved a runner for Node, Python, Rust, Go and
+# Make all along, and `run_tests` has offered it to the model - which almost
+# never calls it. The same pattern is already documented here for
+# `memory_load`, `memory_list` and `memory_forget`: called zero times across
+# seven live sessions. So the only evidence the harness collected on its own
+# was "it parses", which is what let a 314-line class replaced by 45 lines be
+# reported as fine.
+#
+# ONCE per turn, at the end, and never mid-turn: a suite is slow, and a model
+# part-way through building a file should not be handed a failure caused by the
+# half it has not written yet. That is the same mistake the "still being built"
+# exemption exists to avoid.
+SHAMSU_AUTOTEST_ENV = "SHAMSU_AUTO_TEST"
+
+#: Suffixes worth running a suite for. A README or a config change does not
+#: earn the wall-clock cost of the project's test command.
+TESTABLE_SUFFIXES = frozenset(
+    {".py", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".go", ".rs", ".rb", ".java"}
+)
+
 # Consecutive mutations that change nothing before the run gives up. Failed
 # patches and no-op patches both count: either way the file is untouched and
 # repeating is not going to help.
@@ -1627,6 +1650,9 @@ def _narrowed_by_request(
     )
     from shamsu.agents.tool_classifier import categories_for
 
+    schema_names = {
+        str((s.get("function") or {}).get("name") or "") for s in schemas
+    }
     wanted = categories_for(request)
     if not wanted:
         return schemas
@@ -1639,6 +1665,24 @@ def _narrowed_by_request(
     # callable however the request was scored - and `ask_user` is the answer to
     # an ambiguity, which by definition turns up in a category nobody predicted.
     keep.update({"use_skill", *ALWAYS_TOOLS})
+    # And the contract tools, whenever the loop is about to ASK for one.
+    #
+    # `_run_turn` opens a multi-part request by appending `ask_for_a_plan`:
+    # "call contract_create with a short title and one assertion per part... Do
+    # that first, in this turn." The scorer had already read the same request as
+    # `write`, and the write category holds no contract tools - so the harness
+    # was instructing the model, in the imperative, to make a call whose name
+    # was not in the tools array it was handed.
+    #
+    # The cost is not the wasted round. Definition-of-Done is this project's
+    # whole answer to "the model says finished when it is not" - the thing
+    # `_contract_blocks_this_claim` and the plan anchor hang off - and it was
+    # switched off for precisely the multi-part write requests it exists for.
+    #
+    # Scoped to turns that actually ask, so an ordinary "what does this do?"
+    # does not pay ~180 tokens for five tools it will never call.
+    if ask_for_a_plan(request):
+        keep.update(name for name in schema_names if name.startswith("contract_"))
     narrowed = [s for s in schemas if s.get("function", {}).get("name") in keep]
     if not narrowed:
         # Never hand back an empty roster over a scoring accident.
@@ -2142,6 +2186,30 @@ class SessionStalls:
     # Consecutive mutations that changed nothing, ACROSS user turns.
     unproductive: int = 0
 
+    # --- everything else that must outlive one user message --------------
+    #
+    # The reasoning above was applied to the stall counters and to nothing
+    # else, though it is true of all of these. Each one's own docstring claimed
+    # session scope while the object holding it was rebuilt every time the user
+    # pressed Enter.
+    #
+    # `trust`: `_without_broken_tools` says "failed repeatedly THIS session",
+    #   and `TrustDecay.drop_after` is 5 CONSECUTIVE failures - a threshold
+    #   almost nothing reaches inside a single turn, so the whole mechanism was
+    #   effectively dead.
+    # `partial_reads`: the guard that stops a whole-file rewrite of a file the
+    #   model has only partly seen. A truncated read in one turn has to protect
+    #   the file in the NEXT one, because the truncated copy is still sitting in
+    #   the rehydrated transcript the model will copy from. This one loses data.
+    # `num_ctx_ceiling` / `evicted_others`: `_shrink_for_oom` says it will
+    #   "remember the ceiling for the rest of the session". It did not - every
+    #   user message went back to asking for the full window, paid the OOM round
+    #   trip again, and ran `ollama stop` on the co-resident model again.
+    trust: Any = None
+    partial_reads: set[str] = field(default_factory=set)
+    num_ctx_ceiling: int = 0
+    evicted_others: bool = False
+
     def record_failure(self, signature: str, error: str) -> int:
         seen = self.failures.get(signature, 0) + 1
         self.failures[signature] = seen
@@ -2303,9 +2371,6 @@ class SimpleChatLoop:
         set_active_session(str(getattr(session_logger, "session_id", "") or ""))
         self._watch_approvals()
         self._num_ctx_floor = 0
-        # Lowered from what the GPU will actually accept, once it has refused.
-        self._num_ctx_ceiling = 0
-        self._evicted_others = False
         # Paths already refused a whole-file rewrite once. The SECOND attempt
         # is honoured: a full rewrite is sometimes genuinely right, and a guard
         # with no exit is a deadlock waiting for a user. The partial-read guard
@@ -2339,8 +2404,8 @@ class SimpleChatLoop:
         # How many sweeps and how many messages they shrank, for `/status`.
         self.evictions = 0
         self._rewrite_refused: set[str] = set()
-        # Files the model has seen only part of - writing them whole loses data.
-        self._partial_reads: set[str] = set()
+        # Files the model has seen only part of - writing them whole loses
+        # data. Session-scoped: see SessionStalls.
         # Line ranges seen per file, so reading a big file IN PIECES still
         # adds up to having seen it.
         self._seen_ranges: dict[str, list[tuple[int, int]]] = {}
@@ -2433,7 +2498,10 @@ class SimpleChatLoop:
         # The detectors simple mode did not have. See `agents/loop_guards.py`
         # for why they live there and the older eight still live inline.
         self._read_loop = ReadLoopDetector()
-        self._trust = TrustDecay(protected=WRITING_TOOLS | {"run_command", "ask_user"})
+        if self._stalls.trust is None:
+            self._stalls.trust = TrustDecay(
+                protected=WRITING_TOOLS | {"run_command", "ask_user"}
+            )
         # Content hash of the last WHOLE read per file, so a re-read of an
         # unchanged file can say so instead of resending it. Dropped on every
         # elision sweep - see `_note_unchanged_since_last_read`.
@@ -2474,6 +2542,39 @@ class SimpleChatLoop:
         self.tools.clear_phase()
         self.tools.set_allowed_tools(None)
         self.tools.use_logical_tools(False)
+
+    # -- state that outlives one user message -----------------------------
+    #
+    # A fresh SimpleChatLoop is built per user message (repl.py:5312), so these
+    # live on the session-keyed `SessionStalls` and are reached through it.
+    # Properties rather than plain attributes because the ints and the bool are
+    # REASSIGNED (`self._num_ctx_ceiling = smaller[-1]`) - a shared reference
+    # only carries mutations, not rebinding. The set and the TrustDecay are
+    # shared objects and need no indirection.
+
+    @property
+    def _trust(self) -> Any:
+        return self._stalls.trust
+
+    @property
+    def _partial_reads(self) -> set[str]:
+        return self._stalls.partial_reads
+
+    @property
+    def _num_ctx_ceiling(self) -> int:
+        return self._stalls.num_ctx_ceiling
+
+    @_num_ctx_ceiling.setter
+    def _num_ctx_ceiling(self, value: int) -> None:
+        self._stalls.num_ctx_ceiling = int(value)
+
+    @property
+    def _evicted_others(self) -> bool:
+        return self._stalls.evicted_others
+
+    @_evicted_others.setter
+    def _evicted_others(self, value: bool) -> None:
+        self._stalls.evicted_others = bool(value)
 
     # -- public ----------------------------------------------------------
 
@@ -2931,6 +3032,13 @@ class SimpleChatLoop:
                     text = self._out_of_room_message(text)
                     self._activity("reply hit the context limit; labelled it partial")
                 self._settle_unfinished()
+                if changed and self.verify_changes:
+                    # The turn is over and the writes have settled: this is the
+                    # one moment a suite run answers the question the syntax
+                    # check cannot. Before the assistant turn is appended, so a
+                    # failure lands in the thread ahead of the answer that
+                    # claimed success.
+                    await self._run_the_projects_tests(list(dict.fromkeys(changed)))
                 self.state.append_assistant(text)
                 return SimpleChatResult(
                     final=text,
@@ -6572,6 +6680,53 @@ class SimpleChatLoop:
         self._trace("simple.verify", report.splitlines()[0] if report else "", {})
         self._record_verification(report)
 
+    def _auto_test_disabled(self) -> bool:
+        raw = os.environ.get(SHAMSU_AUTOTEST_ENV, "").strip().lower()
+        return raw in {"0", "false", "no", "off"}
+
+    async def _run_the_projects_tests(self, written: list[str]) -> None:
+        """Run the project's own tests once, and put the result in the thread.
+
+        The harness's whole thesis is evidence over claims, and until now the
+        only evidence it gathered without being asked was that the file parsed.
+        Parsing is not passing: this project's own record has a 314-line class
+        replaced by 45 lines, still parsing, 22 methods gone.
+
+        Deliberately narrow, because a test run is the most expensive thing the
+        loop can do on its own initiative:
+          * once per turn, after the writes are done - not per write;
+          * only when a SOURCE file changed, so a README does not trigger it;
+          * only when detection is confident, never a guess at a command;
+          * skipped entirely if the syntax check already failed, because the
+            model has a better error to work from and the suite would only
+            restate it more slowly;
+          * skipped while a file is still mid-build, for the same reason the
+            "still being built" exemption exists.
+
+        The result is appended as an ordinary tool message, like the syntax
+        verdict, so a failure is information the model acts on next round
+        rather than a separate repair phase.
+        """
+        if self._auto_test_disabled() or self._unfinished:
+            return
+        if not any(Path(name).suffix.lower() in TESTABLE_SUFFIXES for name in written):
+            return
+        found = detect_test_command(self.workspace)
+        if not found:
+            return
+        self._activity(f"running the project's tests: {found.command}")
+        result = await asyncio.to_thread(
+            self._execute, "run_command", {"command": found.command}
+        )
+        payload = ToolResult(
+            result.ok,
+            f"Ran `{found.command}` ({found.reason}).{chr(10) * 2}"
+            + _first_line(result.message or ""),
+            {"auto": True, "command": found.command, "ok": bool(result.ok)},
+        )
+        self.state.append_tool("", "run_tests", _budgeted(payload.to_json()))
+        self._trace("simple.autotest", found.command, {"ok": bool(result.ok)})
+
     def _record_evidence(
         self, user_input: str, result: SimpleChatResult, duration: float
     ) -> None:
@@ -6715,7 +6870,9 @@ class SimpleChatLoop:
                     unfinished.append(f"{relative}: {still_open}")
                     self._unfinished[relative] = verdict.detail or still_open
                     continue
-                problems.append(f"{relative}: {verdict.detail}{self._mid_build_note(relative)}")
+                problems.append(
+                    f"{relative}: {verdict.detail}{self._mid_build_note(relative, path)}"
+                )
                 self._unfinished.pop(relative, None)
             elif verdict.status == VERIFY_SKIPPED:
                 skipped.append(f"{relative} ({verdict.detail})")
@@ -6810,7 +6967,7 @@ class SimpleChatLoop:
             f"{opened_at}. That is expected part-way through - continue with append_file"
         )
 
-    def _mid_build_note(self, relative: str) -> str:
+    def _mid_build_note(self, relative: str, path: Path | None = None) -> str:
         """Context for a real failure on a file this turn has been building.
 
         The one place the exemption gate above can raise a false alarm: a patch
@@ -6818,13 +6975,48 @@ class SimpleChatLoop:
         reported as one - that is the whole point of the gate - but a model
         told only "unexpected end of input" may close the open blocks and end
         the file two hundred lines early. So it gets both facts and chooses.
+
+        The note is advice about UNCLOSED BLOCKS and must only appear on that
+        error. It used to attach to any problem on any file this turn had
+        appended to, and live on 2026-08-23 that put it on the wrong one:
+
+            asteroid.js: SyntaxError: Identifier 'AsteroidSpawner' has already
+            been declared (you have been building this file in sections this
+            turn - if it is not finished, continue the next section rather than
+            closing it early)
+
+        `node --check` had found the real defect exactly - three `export
+        default` declarations in one file - and the note then advised the model
+        to keep appending sections, which is what produced the duplicates. The
+        harness diagnosed the bug and recommended its cause. Two turns and 27
+        re-reads of the same file went after that.
         """
         if relative.lower() not in self._built_up:
+            return ""
+        if path is not None and not self._has_open_blocks(path):
+            # Something else is wrong with it. Whatever that is, "continue the
+            # next section" is not the answer, and softening a hard error is
+            # worse than saying nothing.
             return ""
         return (
             " (you have been building this file in sections this turn - if it is not "
             "finished, continue the next section rather than closing it early)"
         )
+
+    def _has_open_blocks(self, path: Path) -> bool:
+        """Is an unclosed block the ONLY thing wrong with this file?
+
+        `unfinished_blocks` answers exactly that and returns () when something
+        else is wrong, which is what makes it the right question for
+        `_mid_build_note` to ask before offering its advice.
+        """
+        from shamsu.agents.simple_verify import unfinished_blocks
+
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return bool(unfinished_blocks(text, path.suffix))
 
     def _cut_off_on_disk(self, path: Path, relative: str) -> str:
         """A file that STOPS PART-WAY THROUGH, and the exact call that fixes it.

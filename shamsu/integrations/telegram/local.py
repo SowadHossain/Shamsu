@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import queue
 import threading
 from pathlib import Path
+from typing import Any
 
 from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
 from shamsu.cli.prompt_label import SURFACE_TELEGRAM, prompt_label
-
 from shamsu.integrations.telegram.service import (
     ALREADY_RUNNING,
     HELD_ELSEWHERE,
@@ -23,7 +24,6 @@ from shamsu.integrations.telegram.service import (
     promote_workspace_token,
 )
 from shamsu.safety.commands import redact
-
 
 #: Pins `configure` to this project instead of the installation.
 WORKSPACE_FLAG = "--workspace"
@@ -64,17 +64,50 @@ class ConsoleTelegramMirror:
             self.console.print(f"[bold]{escape(label)}[/bold] {clean}")
 
     def turn_renderer(self):
-        """The renderer that paints a remote turn's activity lines here.
+        """Everything the desktop shows for a remote turn, as one callable.
 
-        Built per turn rather than held, because it accumulates that turn's
-        lines. `prompt_echo` has already printed the header, so this one does
-        not repeat it.
+        Built per turn rather than held, because the renderer accumulates that
+        turn's lines. `prompt_echo` has already printed the header, so this one
+        does not repeat it.
+
+        THREE renderers, not one. A turn started in this terminal attaches all
+        three (see `repl.py`, where they sit together): the row renderer, the
+        live telemetry, and the spinner's status updater. A Telegram turn used
+        to attach only the first, so its activity rows appeared and the sidebar
+        never moved - live 2026-08-23 the PROGRESS and THIS TURN panels sat on
+        the previous turn's numbers (`rounds 23/24`, `failed 13`) while a new
+        remote turn ran underneath them, and the spinner never said "thinking".
+        The comment beside the CLI's own wiring says why the second one matters:
+        the status callback carries only composed text, while `data` carries
+        the numbers.
+
+        Fans out rather than changing `_attach_desktop_mirror`, so a mirror is
+        still one renderer from the stream's point of view and a failure in any
+        one of them cannot take the others down with it.
         """
+        from shamsu.cli.repl import active_live_console
         from shamsu.cli.turn_render import CliTurnRenderer
-
         from shamsu.runtime.settings import verbosity as saved_verbosity
 
-        return CliTurnRenderer(self.console, verbosity=saved_verbosity())
+        live = active_live_console()
+        rows = CliTurnRenderer(
+            self.console,
+            status_updater=getattr(live, "set_status", None) if live else None,
+            verbosity=saved_verbosity(),
+        )
+        sinks = [rows]
+        absorb = getattr(live, "absorb", None)
+        if callable(absorb):
+            sinks.append(absorb)
+
+        def fan_out(event: Any) -> None:
+            for sink in sinks:
+                # One broken sink must not stop the others: the rows are the
+                # part a person is actually reading.
+                with contextlib.suppress(Exception):
+                    sink(event)
+
+        return fan_out
 
 
 class LocalTelegramBridgeManager:
@@ -196,7 +229,7 @@ class LocalTelegramBridgeManager:
     def _run_loop(
         loop: asyncio.AbstractEventLoop,
         service: TelegramService,
-        outcome: "queue.Queue[PollerStart]",
+        outcome: queue.Queue[PollerStart],
     ) -> None:
         asyncio.set_event_loop(loop)
         try:

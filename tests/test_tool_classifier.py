@@ -263,3 +263,101 @@ def test_asking_about_this_project_never_routes_to_the_web():
     """"search the codebase" must not become a web lookup."""
     for local in ("search this project for parse_config", "what does our code do here"):
         assert classify_request(local).category != "web", local
+
+
+# ---------------------------------------------------------------------------
+# F2 - the classifier stranded common agentic requests
+#
+# Measured 2026-08-23 at a 32k window: "run the tests and fix whatever fails"
+# arrived with 13 tools and neither read_file nor any write tool, for the single
+# most common agentic instruction there is. Three causes, fixed together.
+# ---------------------------------------------------------------------------
+
+
+def _roster(request: str) -> set[str]:
+    from shamsu.agents.simple_chat import active_tool_schemas
+
+    return {s["function"]["name"] for s in active_tool_schemas(32768, "", None, request)}
+
+
+def test_reading_is_offered_for_every_request_that_narrows():
+    """No coding task begins without a read, which makes `read` the one
+    category that can never be the wrong thing to send."""
+    for request in (
+        "run the tests and fix whatever fails",
+        "the build is failing, look into it",
+        "implement the search endpoint",
+        "add a delete button to the todo list",
+        "find where the config is loaded",
+    ):
+        assert "read_file" in _roster(request), request
+
+
+def test_a_change_verb_always_brings_the_write_tools():
+    """The scorer weighs domain NOUNS as heavily as intent verbs: `implement
+    the search endpoint` scored search 3.0 against write 1.0, because "search"
+    both won its own category and subtracted from write."""
+    for request in (
+        "run the tests and fix whatever fails",
+        "implement the search endpoint",
+        "update the README",
+        "rewrite parse_config",
+    ):
+        assert "write_file" in _roster(request), request
+
+
+def test_a_request_that_only_looks_is_still_narrowed():
+    """The point is not to send everything. A search stays a search."""
+    for request in ("find where the config is loaded",
+                    "review the modules and tell me what they do"):
+        roster = _roster(request)
+        assert "read_file" in roster
+        assert "write_file" not in roster, request
+        assert len(roster) < 30, "it must still narrow"
+
+
+def test_a_wrong_narrow_can_no_longer_strand_a_coding_turn():
+    """Raising MIN_CONFIDENCE was tried on 2026-08-23 and reverted.
+
+    The scorer really is a coin flip near the top - 0.167 passes a 0.15 floor -
+    but the harm came from WHAT a wrong narrow dropped, not how often it was
+    wrong. With `read` on every category and a change verb forcing `write`, the
+    two capabilities a coding turn cannot work without survive whichever way it
+    leans. Raising the floor instead broke `plan`, which scores 0.17 and would
+    have been pushed into "send everything" - handing a planning turn the write
+    tools it exists to withhold.
+    """
+    from shamsu.agents.tool_classifier import MIN_CONFIDENCE, classify_request
+
+    assert MIN_CONFIDENCE == 0.15
+    coin_flip = classify_request("run the tests and fix whatever fails")
+    assert coin_flip.confidence < 0.6, "this is the near-tie in question"
+
+    roster = _roster("run the tests and fix whatever fails")
+    assert {"read_file", "write_file", "run_command"} <= roster, (
+        "a narrow that keeps read and write cannot strand the turn"
+    )
+
+
+def test_investigating_a_failure_can_read_and_run():
+    """'the build is failing, look into it' has no change verb, so it stays a
+    read-and-run turn - which is what it is."""
+    roster = _roster("the build is failing, look into it")
+
+    assert "read_file" in roster
+    assert {"run_command", "run_tests"} & roster
+
+
+def test_contract_tools_arrive_when_the_loop_asks_for_a_plan():
+    """F1: `_run_turn` tells the model to call contract_create for a multi-part
+    request; the write category holds no contract tools, so the harness was
+    instructing it to call something it had not been given."""
+    from shamsu.agents.plan_anchor import ask_for_a_plan
+
+    multi = "add a delete button to the todo list and then update the tests"
+    assert ask_for_a_plan(multi)
+    assert "contract_create" in _roster(multi)
+
+    simple = "fix the login bug"
+    assert not ask_for_a_plan(simple)
+    assert "contract_create" not in _roster(simple), "not worth the tokens otherwise"

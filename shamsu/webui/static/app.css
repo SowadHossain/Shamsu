@@ -612,3 +612,42 @@ button, input, textarea { font: inherit; color: inherit; }
 
 /* A turn that ended without an answer shows its verdict instead of nothing. */
 .msg .body.quiet { color: var(--ink-dim); font-style: italic; }
+
+
+/* --- what a turn did, folded under its own answer ---------------------- */
+
+.steps {
+  margin-top: 0.5rem;
+  font-size: 0.82rem;
+}
+.steps > summary {
+  cursor: pointer;
+  opacity: 0.62;
+  user-select: none;
+}
+.steps > summary:hover { opacity: 0.9; }
+.step-list {
+  margin: 0.4rem 0 0;
+  padding: 0 0 0 0.2rem;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+.step {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  opacity: 0.78;
+  font-variant-numeric: tabular-nums;
+}
+.step.note {
+  display: block;
+  opacity: 0.55;
+  font-style: italic;
+}
+.step-tool { font-weight: 600; }
+.step-target { opacity: 0.8; word-break: break-all; }
+.step-ms { opacity: 0.5; margin-left: auto; }
+.step.failed .step-tool { text-decoration: line-through; }
+.step-why { opacity: 0.7; flex-basis: 100%; }

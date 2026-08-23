@@ -350,7 +350,65 @@ function bubble(role, content, meta) {
     tag.textContent = marks.join(" · ");
     block.append(tag);
   }
+  const steps = Array.isArray(info.steps) ? info.steps : [];
+  if (steps.length) block.append(stepList(steps));
   return block;
+}
+
+// What the turn actually did, folded away.
+//
+// Collapsed by default and attached to its own answer, which is the whole
+// design: the first attempt at showing activity in this pane put every event
+// in the thread as a top-level row, so a finished conversation was followed by
+// the entire log again - every read_file, every "context is filling". A turn's
+// working belongs INSIDE that turn, and closed until asked for.
+function stepList(steps) {
+  const box = document.createElement("details");
+  box.className = "steps";
+  const head = document.createElement("summary");
+  const tools = steps.filter((step) => step.kind === "tool");
+  const failed = tools.filter((step) => !step.ok).length;
+  head.textContent = failed
+    ? `${tools.length} tool call${tools.length === 1 ? "" : "s"}, ${failed} failed`
+    : `${tools.length} tool call${tools.length === 1 ? "" : "s"}`;
+  box.append(head);
+
+  const list = document.createElement("ol");
+  list.className = "step-list";
+  for (const step of steps) {
+    const row = document.createElement("li");
+    if (step.kind === "tool") {
+      row.className = step.ok ? "step tool" : "step tool failed";
+      const name = document.createElement("span");
+      name.className = "step-tool";
+      name.textContent = step.tool || "tool";
+      row.append(name);
+      if (step.target) {
+        const target = document.createElement("span");
+        target.className = "step-target";
+        target.textContent = step.target;
+        row.append(target);
+      }
+      if (step.ms) {
+        const took = document.createElement("span");
+        took.className = "step-ms";
+        took.textContent = step.ms >= 1000 ? `${(step.ms / 1000).toFixed(1)}s` : `${step.ms}ms`;
+        row.append(took);
+      }
+      if (!step.ok && step.detail) {
+        const why = document.createElement("span");
+        why.className = "step-why";
+        why.textContent = step.detail;
+        row.append(why);
+      }
+    } else {
+      row.className = "step note";
+      row.textContent = step.text || "";
+    }
+    list.append(row);
+  }
+  box.append(list);
+  return box;
 }
 
 /* --- the live turn ------------------------------------------------------ */
@@ -1330,10 +1388,20 @@ async function boot() {
     }
   });
 
-  if (!state.token) {
-    el("thread-title").textContent = "Open the link SHAMSU printed";
-    return;
-  }
+  // The token gate goes AFTER the first call, not before it.
+  //
+  // On a loopback bind the server sets `requires_token` false and answers
+  // every route without one - proven by curl: no header and a garbage header
+  // both return 200. The CLI says so too when it prints the link: "Loopback
+  // only, so the plain link is the whole thing - no token, nothing to
+  // re-copy." But this gate ran first and bailed whenever `?t=` was absent,
+  // so opening the plain bookmarked URL - exactly what the CLI tells you to
+  // do - rendered the empty shell: no workspaces, no threads, nothing. And it
+  // THREW nothing, so the console was clean and the page just sat there.
+  //
+  // `/api/health` is the right probe because it needs no auth to answer. If
+  // the bind really does demand a token, it comes back 401 and the message
+  // below is correct; if it does not, we were never missing anything.
   try {
     const health = await api("/api/health");
     el("rail-model").textContent = health.model || "no model";
@@ -1345,7 +1413,10 @@ async function boot() {
     el("send").disabled = false;
     el("new-thread").hidden = false;
   } catch (error) {
-    el("thread-title").textContent = `Could not load: ${error.message}`;
+    const needsToken = /HTTP 401|token/i.test(error.message || "");
+    el("thread-title").textContent = needsToken
+      ? "Open the link SHAMSU printed"
+      : `Could not load: ${error.message}`;
     return;
   }
   setInterval(refreshQueue, QUEUE_POLL_MS);

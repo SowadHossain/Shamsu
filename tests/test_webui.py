@@ -278,6 +278,23 @@ def test_the_stream_replays_the_turn_then_tails_it_live(portal):
 
     reader = threading.Thread(target=read_stream, daemon=True)
     reader.start()
+    # Wait for the OPENING event to arrive before publishing the rest.
+    #
+    # Without this the test races its own reader: it published `turn.end`
+    # before the HTTP request had been made, so by the time the stream opened
+    # the turn was already closed. A fresh subscriber resumes from the start of
+    # the turn still in flight and from the END of the file when every turn has
+    # finished - see `sse.resume_line` - so a closed turn is correctly not
+    # replayed, and the test was asserting a replay that must not happen.
+    #
+    # It passed before only because the stream used to replay the ENTIRE log to
+    # every new reader, which is the duplication this pair of behaviours
+    # exists to stop.
+    for _ in range(150):
+        if received:
+            break
+        time.sleep(0.05)
+    assert received, "the in-flight turn's opening event was not replayed"
     for index, (kind, text) in enumerate([("activity", "working"), ("turn.end", "done")], 2):
         stream.publish(TurnEvent(seq=index, kind=kind, text=text, turn_id="t1"))
     assert done.wait(timeout=15), f"stream delivered only {received}"

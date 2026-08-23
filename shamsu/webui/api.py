@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -171,6 +172,41 @@ def session_messages(workspace: Path, session_id: str, after: int = 0) -> dict[s
 #: browser renders separately and which must not become chat bubbles.
 _CONVERSATION_KINDS = ("turn.start", "assistant", "turn.end")
 
+#: What a turn DID, as opposed to how it ended. `tool.result` rather than
+#: `tool.call` because only the result knows whether it worked and how long it
+#: took; `activity` because the loop's own notices - "patching is not working;
+#: asked it to change approach", "context is filling" - are often the most
+#: informative line in a failed turn.
+#:
+#: `status` is excluded on purpose: 1,088 of the 1,831 events in one live
+#: session were spinner ticks, and they say nothing a reader wants afterwards.
+_STEP_KINDS = ("tool.result", "activity")
+
+#: Steps kept per turn. A 24-round turn can carry 150 of them; past a point a
+#: reader is scrolling, not reading, and the payload stops being free.
+MAX_STEPS = 60
+
+
+def _steps_payload(events: list[Any]) -> list[dict[str, Any]]:
+    """One turn's activity, small enough to ship with the conversation."""
+    steps: list[dict[str, Any]] = []
+    for event in events[:MAX_STEPS]:
+        data = event.data or {}
+        if event.kind == "tool.result":
+            steps.append(
+                {
+                    "kind": "tool",
+                    "tool": str(data.get("tool") or ""),
+                    "target": redact(str(data.get("target") or "")),
+                    "ok": bool(data.get("ok", True)),
+                    "ms": int(data.get("duration_ms") or 0),
+                    "detail": redact(str(data.get("message") or ""))[:200],
+                }
+            )
+        else:
+            steps.append({"kind": "note", "text": redact(str(event.text or ""))[:200]})
+    return steps
+
 
 def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str, Any]] | None:
     """Prompts and answers, in order, from `activity.jsonl`.
@@ -188,13 +224,19 @@ def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str,
     turns: dict[str, dict[str, Any]] = {}
     order: list[str] = []
     for event in events:
-        if event.kind not in _CONVERSATION_KINDS:
+        if event.kind not in _CONVERSATION_KINDS and event.kind not in _STEP_KINDS:
             continue
         turn = turns.get(event.turn_id)
         if turn is None:
             # All three start as None, not "": these hold EVENTS, and an empty
             # string here read as "present" against `is not None`.
-            turn = {"source": event.source, "prompt": None, "answer": None, "verdict": None}
+            turn = {
+                "source": event.source,
+                "prompt": None,
+                "answer": None,
+                "verdict": None,
+                "steps": [],
+            }
             turns[event.turn_id] = turn
             order.append(event.turn_id)
         if event.kind == "turn.start":
@@ -202,8 +244,14 @@ def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str,
             turn["source"] = event.source or turn["source"]
         elif event.kind == "assistant":
             turn["answer"] = event
-        else:
+        elif event.kind == "turn.end":
             turn["verdict"] = event
+        else:
+            # What the turn DID, in order. The terminal shows this and the web
+            # view did not, so a thread here read as a row of verdicts with no
+            # account of the work behind them - "stopped after 10m41s, 3 files
+            # changed" and no way to see WHICH files or what was tried.
+            turn.setdefault("steps", []).append(event)
 
     if not any(turns[turn_id]["prompt"] is not None for turn_id in order):
         return None
@@ -224,6 +272,7 @@ def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str,
                 # three-minute run that changed nothing reads as a quick reply.
                 row["verdict"] = redact(str(end.text or ""))
                 row["changed_files"] = list((end.data or {}).get("changed_files") or [])
+            row["steps"] = _steps_payload(turn.get("steps") or [])
             rows.append(row)
         elif end is not None and end.text:
             # A turn that ended without an answer - stopped, failed, cancelled.
@@ -231,8 +280,127 @@ def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str,
             row = _row("assistant", end, source, turn_id)
             row["content"] = ""
             row["verdict"] = redact(str(end.text or ""))
+            row["steps"] = _steps_payload(turn.get("steps") or [])
+            rows.append(row)
+        elif prompt is not None and prompt.text:
+            # A turn with a prompt and NO outcome in the stream: no answer, no
+            # `turn.end`. `run()` publishes `turn.end` even when the turn
+            # raises, so the only way to reach here is the process being killed
+            # mid-turn - a Ctrl+C, a crash, a restart.
+            #
+            # It used to fall through both branches and produce no row at all,
+            # so the prompt sat alone and the NEXT prompt rendered directly
+            # beneath it. Live 2026-08-23 three interrupted turns in one thread
+            # put three user bubbles in a row, which is exactly the "it
+            # swallowed my question" this section exists to prevent, arrived at
+            # from the other side.
+            #
+            # And a bare "no reply recorded" is the wrong repair, because it is
+            # not true: one of those three turns wrote a 197-line PLAN.md, ran
+            # the verifier and called contract_status before it was killed. The
+            # stream lost the OUTCOME; `messages.jsonl` still holds everything
+            # the turn did, with timestamps. So say what it did.
+            row = _row("assistant", prompt, source, turn_id)
+            row["content"] = ""
+            row["verdict"] = _interrupted_verdict(
+                _transcript_window(workspace, session_id, prompt, order, turns, turn_id)
+            )
+            row["steps"] = _steps_payload(turn.get("steps") or [])
             rows.append(row)
     return rows
+
+
+#: Tool names whose success means the turn changed something on disk.
+_MUTATIONS = frozenset(
+    {"write_file", "patch_file", "append_file", "replace_symbol", "read_and_patch",
+     "create_and_run", "move_file", "delete_file"}
+)
+
+
+def _transcript_window(
+    workspace: Path,
+    session_id: str,
+    prompt: Any,
+    order: list[str],
+    turns: dict[str, dict[str, Any]],
+    turn_id: str,
+) -> list[dict[str, Any]]:
+    """The transcript records belonging to one turn, found by TIME.
+
+    `messages.jsonl` carries no `turn_id` - that is the structural gap here,
+    and stamping one on at write time is the real repair. Until then both logs
+    do carry timestamps, so a turn's records are the ones between its own
+    `turn.start` and the next one's.
+    """
+    started = float(getattr(prompt, "ts", 0.0) or 0.0)
+    if not started:
+        return []
+    index = order.index(turn_id)
+    ends_at = float("inf")
+    for later in order[index + 1:]:
+        nxt = turns[later].get("prompt")
+        after = float(getattr(nxt, "ts", 0.0) or 0.0)
+        if after > started:
+            ends_at = after
+            break
+    try:
+        manager = SessionManager(Path(workspace).resolve())
+        records = manager.logger_for(session_id).read_messages()
+    except Exception:  # noqa: BLE001 - a summary is never worth failing a thread
+        return []
+    window: list[dict[str, Any]] = []
+    for record in records:
+        stamp = _epoch(str(record.get("timestamp") or ""))
+        if stamp is None:
+            continue
+        if started <= stamp < ends_at:
+            window.append(record)
+    return window
+
+
+def _epoch(iso: str) -> float | None:
+    try:
+        moment = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def _interrupted_verdict(window: list[dict[str, Any]]) -> str:
+    """What an interrupted turn managed, from its own transcript records."""
+    changed: list[str] = []
+    tools = 0
+    for record in window:
+        if record.get("role") != "tool":
+            continue
+        tools += 1
+        if record.get("name") not in _MUTATIONS:
+            continue
+        try:
+            payload = json.loads(str(record.get("content") or ""))
+        except (TypeError, ValueError):
+            continue
+        if not payload.get("ok"):
+            continue
+        data = payload.get("data") or {}
+        path = data.get("filepath") or data.get("resolved_filepath")
+        if path and path not in changed:
+            changed.append(str(path))
+    if changed:
+        listed = ", ".join(changed[:4])
+        more = f" (+{len(changed) - 4} more)" if len(changed) > 4 else ""
+        return (
+            f"Interrupted - SHAMSU stopped before this turn finished. "
+            f"It had already changed {listed}{more}."
+        )
+    if tools:
+        return (
+            f"Interrupted - SHAMSU stopped before this turn finished. "
+            f"It ran {tools} tool call(s) and changed no files."
+        )
+    return "Interrupted - SHAMSU stopped before this turn finished."
 
 
 def _row(role: str, event: Any, source: str, turn_id: str) -> dict[str, Any]:
@@ -245,6 +413,7 @@ def _row(role: str, event: Any, source: str, turn_id: str) -> dict[str, Any]:
         "turn_id": turn_id,
         "verdict": "",
         "changed_files": [],
+        "steps": [],
     }
 
 

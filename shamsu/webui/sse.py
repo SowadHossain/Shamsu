@@ -36,33 +36,77 @@ def keepalive() -> bytes:
     return b": keepalive\n\n"
 
 
+def resume_line(path: Path) -> int:
+    """Where a FRESH subscriber should start reading.
+
+    Not the end of the file, and not the start of it. Both are wrong:
+
+    * From line 0, the browser is sent the entire activity log - and it has
+      already fetched the conversation from `/api/.../messages` before opening
+      this stream, so the whole thread arrives a second time in raw form, every
+      `read_file` and "context is filling" underneath the finished chat. Live
+      2026-08-23 that was 1,831 records replayed onto 24 chat rows.
+    * From the end, a turn that is ALREADY RUNNING when the page loads has its
+      opening events skipped - `turn.start` has been written and `turn.end` has
+      not, so `/messages` does not carry it either and it is lost from both.
+
+    So: the start of the last turn that has not ended yet, or the end of the
+    file when every turn is complete. The in-flight turn arrives whole, and
+    nothing a reader already has is repeated.
+    """
+    records, total = _read_from(path, 0)
+    if not records:
+        return 0
+    open_at: int | None = None
+    for index, record in enumerate(records):
+        kind = str(record.get("kind") or "")
+        if kind == "turn.start":
+            open_at = index
+        elif kind == "turn.end":
+            open_at = None
+    return total if open_at is None else open_at
+
+
 def tail_events(
     path: Path,
     *,
-    since_seq: int = -1,
+    since_line: int = 0,
     should_stop=lambda: False,
     poll_seconds: float = POLL_SECONDS,
     keepalive_seconds: float = KEEPALIVE_SECONDS,
 ) -> Iterator[bytes]:
-    """Yield SSE frames for every event after `since_seq`, then follow the file.
+    """Yield SSE frames for every event after line `since_line`, then follow.
 
     Reads by line offset rather than holding a handle open: the file is only
     ever appended to, and reopening each pass means a portal survives the
     session being archived or the file being rotated underneath it.
+
+    The cursor is the LINE NUMBER, and that is the fix rather than the detail.
+    It used to be the event's own `seq`, deduped with `if seq <= delivered`,
+    on the assumption that `seq` rises for the length of a session. It does
+    not: `SimpleChatLoop.run` resets `_event_seq` to 0 for every turn, on
+    purpose - "a counter that carried across turns would make 'everything
+    after N' mean different things on different surfaces".
+
+    Measured on one live session 2026-08-23: 1,831 records, max seq 270, and
+    **11 resets**. So once a long turn pushed `delivered` up to 270, every
+    event of every later turn arrived numbered 1, 2, 3... and was silently
+    dropped as already-seen. Live updates stopped after the first long turn,
+    and `Last-Event-ID` resumed to a position that meant nothing.
+
+    A line number in an append-only file is monotonic by construction, which
+    is the property this needs and `seq` never had.
     """
-    delivered = int(since_seq)
-    consumed_lines = 0
+    consumed_lines = max(0, int(since_line))
     last_beat = time.monotonic()
     while not should_stop():
         records, consumed_lines = _read_from(path, consumed_lines)
         sent_any = False
         for record in records:
-            seq = int(record.get("seq") or 0)
-            if seq <= delivered:
-                continue
-            delivered = seq
             sent_any = True
-            yield frame(seq, record)
+            # The id a browser echoes back as `Last-Event-ID`, so it must be
+            # the same cursor this function resumes from.
+            yield frame(consumed_lines - len(records) + records.index(record) + 1, record)
         now = time.monotonic()
         if sent_any:
             last_beat = now

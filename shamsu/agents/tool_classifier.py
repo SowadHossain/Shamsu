@@ -48,6 +48,24 @@ LONG_MESSAGE_CHARS = 300
 
 # Below this margin between the top two categories, the winner is not a winner.
 # Send everything rather than guess.
+#
+# Left at 0.15 deliberately, and the reason is worth writing down because
+# raising it was tried and reverted on 2026-08-23.
+#
+# It reads far too permissive: `(top - runner_up) / max(top, 3.0)` means a 6.0
+# beating a 5.0 scores 0.167 and passes, which is a coin flip. But the harm a
+# wrong narrow used to do came from WHAT it dropped, not from how often it was
+# wrong - "run the tests and fix whatever fails" arrived with 13 tools and
+# neither read_file nor any write tool. `read` now rides with every category
+# and an unambiguous change verb forces `write` in, so the two capabilities a
+# coding turn cannot work without are present whichever way the scorer leans,
+# and a near-tie costs the model nothing.
+#
+# Raising it to 0.35 broke something real instead: `plan` scores 0.17 on
+# "plan how to add authentication", so the floor pushed it into "send
+# everything" and handed a PLANNING turn the write tools - destroying the one
+# category whose value is the absence of them. See
+# `test_asking_for_a_plan_withholds_the_write_tools`.
 MIN_CONFIDENCE = 0.15
 
 # Words that mean a short message is still a task. "run it", "fix it", "ls".
@@ -207,6 +225,28 @@ def classify_request(message: str) -> Classification:
     return Classification(top_name, confidence, scores)
 
 
+#: Verbs that mean WORK whatever else the sentence contains. Matched on word
+#: boundaries, and used to force `write` into the roster rather than to pick a
+#: winner - the scorer stays in charge of ranking.
+#:
+#: The failure this closes: the scorer weighs domain NOUNS as heavily as intent
+#: verbs. "implement the search endpoint" scored `search` 3.0 against `write`
+#: 1.0 - the noun "search" both won its own category and subtracted 1.5 from
+#: write - so a request to build an endpoint arrived with every read tool and
+#: no way to write one. Same shape as "run the tests and fix whatever fails",
+#: where `run` 6.0 beat `write` 3.0 and `fix` was in the sentence.
+#:
+#: PRIORITY above already records why this direction is the safe one: a
+#: write-shaped request handed read tools cannot act at all, while a read-shaped
+#: request handed write tools simply does not use them.
+_UNAMBIGUOUS_CHANGE = re.compile(
+    r"\b(implement|fix|fixes|fixed|rewrite|refactor|rename|patch|replace|"
+    r"create|delete|remove|append|insert|"
+    r"add|adds|update|updates|write|writes)\b",
+    re.IGNORECASE,
+)
+
+
 def categories_for(message: str) -> tuple[str, ...]:
     """The categories worth sending for this request, widest-first.
 
@@ -219,12 +259,21 @@ def categories_for(message: str) -> tuple[str, ...]:
     verdict = classify_request(message)
     if not verdict.certain_enough:
         return ()
+    # `read` rides along with EVERY category, not just some.
+    #
+    # It used to be paired only where someone had thought to pair it, so
+    # "run the tests and fix whatever fails" and "the build is failing, look
+    # into it" both scored `run` and arrived with no way to open a file -
+    # measured 2026-08-23, 13 tools between them and not one that reads. No
+    # coding task begins without a read, which makes `read` the one category
+    # that can never be the wrong thing to send, and the escape hatch it used
+    # to depend on costs a whole round to reach.
     companions = {
         "write": ("write", "read"),
         "read": ("read", "search"),
         "search": ("search", "read"),
-        "run": ("run", "verify"),
-        "verify": ("verify", "run"),
+        "run": ("run", "verify", "read"),
+        "verify": ("verify", "run", "read"),
         "recall": ("recall", "read"),
         # Planning reads and writes the plan down; it never edits code. Pairing
         # it with `read` rather than `write` is what makes the category mean
@@ -234,4 +283,17 @@ def categories_for(message: str) -> tuple[str, ...]:
         # Paired with `read` so a lookup can still open the file it is about.
         "web": ("web", "read"),
     }
-    return companions.get(verdict.category, (verdict.category,))
+    chosen = companions.get(verdict.category, (verdict.category, "read"))
+    if (
+        "write" not in chosen
+        # `plan` is exempt, and that exemption is the category's whole point.
+        # smallcode's planner.md is a strong planner because its frontmatter
+        # lists no write tools, so it CANNOT skip to implementing; here that is
+        # a category with the write tools left out. "plan how to ADD
+        # authentication" names a change verb and must still be unable to make
+        # the change - see test_asking_for_a_plan_withholds_the_write_tools.
+        and verdict.category != "plan"
+        and _UNAMBIGUOUS_CHANGE.search(message or "")
+    ):
+        chosen = (*chosen, "write")
+    return chosen

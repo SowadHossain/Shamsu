@@ -831,3 +831,95 @@ def test_ordinary_ranges_are_untouched(tmp_path: Path) -> None:
 
     whole = registry.read_file("player.js")
     assert whole.ok and whole.data["total_lines"] == 151
+
+
+# ---------------------------------------------------------------------------
+# F6 - the write gate understood Python and nothing else
+#
+# `_breaks_working_python` opened with `if suffix.lower() != ".py": return ""`,
+# while `simple_verify` has understood .js/.ts/.jsx/.css/.json all along and
+# shells to `node --check`. So the guard that knows about braces was wired into
+# `replace_symbol` and NOT into the two paths that write. A JavaScript patch
+# that ate a closing brace landed on disk.
+# ---------------------------------------------------------------------------
+
+
+def test_a_patch_that_breaks_javascript_is_refused(tmp_path: Path) -> None:
+    _write(tmp_path, "app.js", "function a() {\n  return 1;\n}\n")
+
+    result = _registry(tmp_path).edit_file("app.js", "function a() {", "function a() {{{")
+
+    assert not result.ok
+    assert result.data.get("syntax_regression") is True
+    assert "function a() {\n  return 1;\n}" in _read_file(tmp_path, "app.js")
+
+
+def test_a_write_that_breaks_javascript_is_refused(tmp_path: Path) -> None:
+    _write(tmp_path, "app.js", "function a() {\n  return 1;\n}\n")
+
+    result = _registry(tmp_path).write_file("app.js", "function a() {\n", overwrite=True)
+
+    assert not result.ok
+    assert "return 1" in _read_file(tmp_path, "app.js"), "the working file is kept"
+
+
+def test_a_legitimate_javascript_edit_still_lands(tmp_path: Path) -> None:
+    _write(tmp_path, "app.js", "function a() {\n  return 1;\n}\n")
+
+    assert _registry(tmp_path).edit_file("app.js", "return 1;", "return 2;").ok
+    assert "return 2;" in _read_file(tmp_path, "app.js")
+
+
+def test_python_is_still_guarded(tmp_path: Path) -> None:
+    _write(tmp_path, "app.py", "def a():\n    return 1\n")
+
+    assert not _registry(tmp_path).write_file("app.py", "def a(\n", overwrite=True).ok
+
+
+def test_an_already_broken_file_can_still_be_repaired(tmp_path: Path) -> None:
+    """Only files that PARSED before are protected, or the guard would lock the
+    model out of the one job it was asked to do."""
+    _write(tmp_path, "broken.js", "function a() {\n  return 1;\n")
+
+    result = _registry(tmp_path).write_file(
+        "broken.js", "function a() {\n  return 1;\n}\n", overwrite=True
+    )
+
+    assert result.ok
+
+
+def test_a_file_type_with_no_checker_is_not_refused(tmp_path: Path) -> None:
+    """A skipped check is not a pass, but it is not grounds for refusal either -
+    about a .txt the honest answer is that we cannot tell."""
+    _write(tmp_path, "notes.txt", "hello\n")
+
+    assert _registry(tmp_path).write_file("notes.txt", "{{{ unbalanced\n", overwrite=True).ok
+
+
+def _read_file(tmp_path: Path, rel: str) -> str:
+    return (tmp_path / rel).read_text(encoding="utf-8")
+
+
+def test_a_refused_edit_names_the_tool_that_would_work(tmp_path: Path) -> None:
+    """Live 2026-08-23: the model tried three times to delete a duplicate class
+    by replacing its HEADER with a comment - orphaning the closing brace every
+    time - was refused every time, then re-read the same file 27 times because
+    nothing had named a different move."""
+    _write(tmp_path, "a.js", "function a() {\n  return 1;\n}\n")
+
+    result = _registry(tmp_path).edit_file("a.js", "function a() {", "// gone")
+
+    assert not result.ok
+    assert "replace_symbol" in result.message
+    assert "cannot leave a brace behind" in result.message
+
+
+def test_the_way_out_is_on_every_syntax_refusal(tmp_path: Path) -> None:
+    _write(tmp_path, "a.js", "function a() {\n  return 1;\n}\n")
+    registry = _registry(tmp_path)
+
+    overwrite = registry.write_file("a.js", "function a() {\n", overwrite=True)
+    appended = registry.append_file("a.js", "function b() {\n")
+
+    assert "replace_symbol" in overwrite.message
+    assert not appended.ok and "replace_symbol" in appended.message

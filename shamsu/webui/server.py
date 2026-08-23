@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,6 +48,32 @@ STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 256 * 1024
 
 
+class _QuietHTTPServer(ThreadingHTTPServer):
+    """A server that does not report a client hanging up as a crash.
+
+    `socketserver` calls `handle_error` for anything raised out of a request
+    thread, and the default implementation prints a full traceback to stderr -
+    which on this project is the user's own terminal, mid-session.
+
+    A browser closing a tab, refreshing, or navigating away kills the socket at
+    whatever point the server happens to be at, and there are several: inside
+    the SSE write loop, inside `_error` trying to report the first failure, and
+    - the one that is unreachable from any handler - inside
+    `http.server.handle_one_request`, reading the next request line off a
+    keep-alive connection before `do_GET` is ever entered.
+    """
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address) -> None:  # noqa: D102
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            # Guarding the handlers one at a time could never be complete: this
+            # fires wherever the disconnect lands, including before any of our
+            # code runs. Everything else still reports as loudly as before.
+            return
+        super().handle_error(request, client_address)
+
+
 class WebPortal:
     """A loopback web view over the sessions and turn streams on this machine."""
 
@@ -67,7 +94,7 @@ class WebPortal:
         # 32 bytes, minted per start. The URL is the credential, so it must not
         # be guessable and must not outlive the process that printed it.
         self.token = secrets.token_urlsafe(32)
-        self._server: ThreadingHTTPServer | None = None
+        self._server: _QuietHTTPServer | None = None
         self._thread: threading.Thread | None = None
         # The port actually bound, remembered across `stop()`. With `port=0`
         # the OS picks one, and reverting to the request afterwards would make
@@ -87,7 +114,7 @@ class WebPortal:
         if self._server is not None:
             return self.base_url
         handler = _build_handler(self)
-        self._server = ThreadingHTTPServer((self.host, self.requested_port), handler)
+        self._server = _QuietHTTPServer((self.host, self.requested_port), handler)
         self._server.daemon_threads = True
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -194,7 +221,14 @@ def _build_handler(portal: WebPortal):
             self._send(status, api.dumps(payload), "application/json; charset=utf-8")
 
         def _error(self, status: int, message: str) -> None:
-            self._json({"error": message}, status=status)
+            try:
+                self._json({"error": message}, status=status)
+            except ConnectionError:
+                # The last line of defence. `do_GET` calls this from its own
+                # `except`, so a failure here escapes the handler completely
+                # and socketserver prints the traceback to the console. A
+                # client that has already hung up cannot be told anything.
+                return
 
         def _origin_is_local(self) -> bool:
             """DNS-rebinding defence.
@@ -251,8 +285,9 @@ def _build_handler(portal: WebPortal):
                 self._route_api(path, query)
             except api.NotFound as exc:
                 self._error(404, str(exc))
-            except BrokenPipeError:
-                # The browser navigated away mid-stream. Not an error.
+            except ConnectionError:
+                # The browser navigated away mid-stream. Not an error, and
+                # there is nothing left to send a status code TO.
                 return
             except Exception as exc:  # noqa: BLE001 - never take the portal down
                 self._error(500, f"{type(exc).__name__}: {exc}")
@@ -279,6 +314,9 @@ def _build_handler(portal: WebPortal):
                 self._error(404, str(exc))
             except ValueError as exc:
                 self._error(400, str(exc))
+            except ConnectionError:
+                # Same as do_GET: a client that hung up gets no status code.
+                return
             except Exception as exc:  # noqa: BLE001 - never take the portal down
                 self._error(500, f"{type(exc).__name__}: {exc}")
 
@@ -473,6 +511,24 @@ def _build_handler(portal: WebPortal):
         def _stream(self, workspace: Path, session_id: str) -> None:
             path = api.activity_file(workspace, session_id)
             since = _last_event_id(self.headers.get("Last-Event-ID"))
+            if since < 0:
+                # A FIRST connection, not a reconnect. `Last-Event-ID` is how a
+                # browser says "I have everything up to here"; its absence used
+                # to mean `since_seq=-1`, which `tail_events` reads as "send
+                # every record from the beginning of the log".
+                #
+                # But the page has already fetched the conversation from
+                # `/api/.../messages` before it opens this stream, so replaying
+                # the history appended the whole thread a SECOND time - and in
+                # its raw form, tool rows and activity lines included. Live
+                # 2026-08-23 that rendered the prompt twice, then every
+                # `write_file` / `read_file` / "context is filling" line
+                # underneath the finished chat.
+                #
+                # A new subscriber starts at the beginning of whatever turn is
+                # still running - see `sse.resume_line`. A reconnect resumes
+                # exactly where it left off, which is what the header is for.
+                since = sse.resume_line(path)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -482,12 +538,21 @@ def _build_handler(portal: WebPortal):
             try:
                 for chunk in sse.tail_events(
                     path,
-                    since_seq=since,
+                    since_line=since,
                     should_stop=lambda: portal._server is None,
                 ):
                     self.wfile.write(chunk)
                     self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError, ValueError):
+            except (ConnectionError, ValueError):
+                # A reader that goes away is the NORMAL end of an SSE stream -
+                # closing the tab, navigating, refreshing. `ConnectionError`
+                # rather than the two subclasses that were named: Windows
+                # raises ConnectionAbortedError (WinError 10053) for the same
+                # event, which was not in the tuple, so on Windows a browser
+                # refresh escaped this handler, reached `do_GET`, and tried to
+                # send a 500 down the socket that had just died - raising a
+                # SECOND time, out of the handler entirely, and printing a
+                # two-page traceback into the user's terminal.
                 return
 
         # -- static ------------------------------------------------------
