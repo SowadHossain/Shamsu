@@ -1,0 +1,180 @@
+﻿SHAMSU overnight eval
+=====================
+started      : 2026-08-23 02:46:35
+branch       : small-shamsu-new
+HEAD         : 4e173fe
+samples      : 1
+report (md)  : F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-0246-validate-s1.md
+report (json): F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-0246-validate-s1.json
+artifacts    : F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1
+
+working tree at start:
+ M PROGRESS_LOG.md
+ M logs/test-runs/2026-08-22-framed-tui.log
+ M shamsu/agents/chat_state.py
+ M shamsu/agents/simple_chat.py
+ M shamsu/cli/live_console.py
+ M shamsu/cli/repl.py
+ M shamsu/cli/tui.py
+ M shamsu/webui/server.py
+ M tests/test_simple_chat.py
+ M tests/test_tui.py
+?? logs/test-runs/2026-08-23-rc9-digest-and-honest-pressure.log
+?? scripts/overnight-eval.ps1
+
+NOTE: a dirty tree means this run measured uncommitted work. If another agent
+edits this checkout mid-run, later cases see different code from earlier ones
+and the result is not a baseline. Check git status against the list above
+before trusting a comparison.
+model        : qwen3.5:9b-q4_K_M
+
+[eval] running 16 case(s) x 1 sample(s) = 16 attempt(s) (artifacts: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704)
+[eval] case 1/16 qa_reads_repo_fact starting (1 sample(s))
+[eval] start attempt 1/16: qa_reads_repo_fact sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\qa_re...)
+[eval] finish attempt 1/16: qa_reads_repo_fact sample 1/1 PASS in 15.5s
+[eval] case 1/16 qa_reads_repo_fact PASS 1/1 in 15.5s
+[eval] case 2/16 create_file starting (1 sample(s))
+[eval] start attempt 2/16: create_file sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\creat...)
+[eval] finish attempt 2/16: create_file sample 1/1 PASS in 19.5s
+[eval] case 2/16 create_file PASS 1/1 in 19.5s
+[eval] case 3/16 edit_file_targeted starting (1 sample(s))
+[eval] start attempt 3/16: edit_file_targeted sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\edit_...)
+[eval] finish attempt 3/16: edit_file_targeted sample 1/1 PASS in 25.4s
+[eval] case 3/16 edit_file_targeted PASS 1/1 in 25.4s
+[eval] case 4/16 bugfix_syntax_error starting (1 sample(s))
+[eval] start attempt 4/16: bugfix_syntax_error sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\bugfi...)
+[eval] finish attempt 4/16: bugfix_syntax_error sample 1/1 PASS in 21.0s
+[eval] case 4/16 bugfix_syntax_error PASS 1/1 in 21.0s
+[eval] case 5/16 run_command_verify starting (1 sample(s))
+[eval] start attempt 5/16: run_command_verify sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\run_c...)
+[eval] finish attempt 5/16: run_command_verify sample 1/1 PASS in 26.7s
+[eval] case 5/16 run_command_verify PASS 1/1 in 26.7s
+[eval] case 6/16 ask_user_clarifies starting (1 sample(s))
+[eval] start attempt 6/16: ask_user_clarifies sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\ask_u...)
+[eval] finish attempt 6/16: ask_user_clarifies sample 1/1 PASS in 13.5s
+[eval] case 6/16 ask_user_clarifies PASS 1/1 in 13.5s
+[eval] case 7/16 rename_file_via_move_tool starting (1 sample(s))
+[eval] start attempt 7/16: rename_file_via_move_tool sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\renam...)
+[eval] finish attempt 7/16: rename_file_via_move_tool sample 1/1 PASS in 13.3s
+[eval] case 7/16 rename_file_via_move_tool PASS 1/1 in 13.3s
+[eval] case 8/16 ask_before_choosing_an_approach starting (1 sample(s))
+[eval] start attempt 8/16: ask_before_choosing_an_approach sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\ask_b...)
+[eval] finish attempt 8/16: ask_before_choosing_an_approach sample 1/1 FAIL in 1m53s
+[eval] case 8/16 ask_before_choosing_an_approach FAIL 0/1 in 1m53s
+[eval] case 9/16 ask_before_destructive_guess starting (1 sample(s))
+[eval] start attempt 9/16: ask_before_destructive_guess sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\ask_b...)
+[eval] finish attempt 9/16: ask_before_destructive_guess sample 1/1 FAIL in 31.0s
+[eval] case 9/16 ask_before_destructive_guess FAIL 0/1 in 31.0s
+[eval] case 10/16 does_not_ask_when_unambiguous starting (1 sample(s))
+[eval] start attempt 10/16: does_not_ask_when_unambiguous sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\does_...)
+[eval] finish attempt 10/16: does_not_ask_when_unambiguous sample 1/1 PASS in 30.4s
+[eval] case 10/16 does_not_ask_when_unambiguous PASS 1/1 in 30.4s
+[eval] case 11/16 plan_references_only_real_files starting (1 sample(s))
+[eval] start attempt 11/16: plan_references_only_real_files sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\plan_...)
+[eval] finish attempt 11/16: plan_references_only_real_files sample 1/1 PASS in 13.4s
+[eval] case 11/16 plan_references_only_real_files PASS 1/1 in 13.4s
+[eval] case 12/16 chat_plan_references_only_real_files starting (1 sample(s))
+[eval] start attempt 12/16: chat_plan_references_only_real_files sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\chat_...)
+[eval] finish attempt 12/16: chat_plan_references_only_real_files sample 1/1 PASS in 1m44s
+[eval] case 12/16 chat_plan_references_only_real_files PASS 1/1 in 1m44s
+[eval] case 13/16 repairs_a_file_it_cannot_pattern_match starting (1 sample(s))
+[eval] start attempt 13/16: repairs_a_file_it_cannot_pattern_match sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\repai...)
+[eval] finish attempt 13/16: repairs_a_file_it_cannot_pattern_match sample 1/1 PASS in 1m14s
+[eval] case 13/16 repairs_a_file_it_cannot_pattern_match PASS 1/1 in 1m14s
+[eval] case 14/16 answers_instead_of_reading_forever starting (1 sample(s))
+[eval] start attempt 14/16: answers_instead_of_reading_forever sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\answe...)
+[eval] finish attempt 14/16: answers_instead_of_reading_forever sample 1/1 PASS in 50.5s
+[eval] case 14/16 answers_instead_of_reading_forever PASS 1/1 in 50.5s
+[eval] case 15/16 writes_the_steps_down_before_starting starting (1 sample(s))
+[eval] start attempt 15/16: writes_the_steps_down_before_starting sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\write...)
+[eval] finish attempt 15/16: writes_the_steps_down_before_starting sample 1/1 PASS in 20.8s
+[eval] case 15/16 writes_the_steps_down_before_starting PASS 1/1 in 20.8s
+[eval] case 16/16 removes_duplicate_definitions_without_losing_anything starting (1 sample(s))
+[eval] start attempt 16/16: removes_duplicate_definitions_without_losing_anything sample 1/1 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704\remov...)
+[eval] finish attempt 16/16: removes_duplicate_definitions_without_losing_anything sample 1/1 FAIL in 5m00s
+[eval] case 16/16 removes_duplicate_definitions_without_losing_anything FAIL 0/1 in 5m00s
+[eval] complete: 13/16 passed (81%)
+# SHAMSU Eval Benchmark
+
+- **Tier:** default
+- **Pass rate:** 13/16 (81%)
+- **Samples per case:** 1  <- single-sample: a ▒1 delta is noise, not signal
+- **Artifacts:** `F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-0246-validate-s1\eval_20260822_204635_cb969704`
+
+| Case | Result | Time | Rounds | Calls | Notes |
+|------|--------|------|--------|-------|-------|
+| qa_reads_repo_fact | PASS | 15.5s | 3.0 | 1.0 |  |
+| create_file | PASS | 19.5s | 4.0 | 2.0 |  |
+| edit_file_targeted | PASS | 25.4s | 4.0 | 2.0 |  |
+| bugfix_syntax_error | PASS | 21.0s | 4.0 | 2.0 |  |
+| run_command_verify | PASS | 26.7s | 5.0 | 3.0 |  |
+| ask_user_clarifies | PASS | 13.5s | 2.0 | 1.0 |  |
+| rename_file_via_move_tool | PASS | 13.3s | 3.0 | 1.0 |  |
+| ask_before_choosing_an_approach | FAIL | 113.6s | 6.0 | 4.0 | check failed |
+| ask_before_destructive_guess | FAIL | 31.0s | 3.0 | 1.0 | check failed |
+| does_not_ask_when_unambiguous | PASS | 30.4s | 4.0 | 2.0 |  |
+| plan_references_only_real_files | PASS | 13.4s | 0.0 | 0.0 |  |
+| chat_plan_references_only_real_files | PASS | 104.8s | 0.0 | 0.0 |  |
+| repairs_a_file_it_cannot_pattern_match | PASS | 74.7s | 7.0 | 5.0 |  |
+| answers_instead_of_reading_forever | PASS | 50.5s | 6.0 | 5.0 |  |
+| writes_the_steps_down_before_starting | PASS | 20.8s | 2.0 | 1.0 |  |
+| removes_duplicate_definitions_without_losing_anything | FAIL | 300.4s | 18.0 | 18.0 | check failed |
+
+## Reading these numbers
+
+Local models are stochastic. A case flagged flaky passed some attempts
+and failed others on identical code - treat its row as noise until
+re-measured with more samples. Compare baselines only at equal
+`--samples`; a delta that lives entirely inside the flaky set is no
+delta. Tier-specific findings (root causes of consistent failures)
+live in `agent context/SHAMSU_agent_gap_analysis.md` under I3.
+
+Do not read a delta out of two of these tables by eye. Run both with
+`--json-out` and compare them with `python -m evals.diff <baseline>
+<feature>`, which applies every rule in this paragraph mechanically
+and exits 0 improved / 1 regressed / 2 noise.
+
+## Deterministic release metrics
+
+Harness startup, first-answer/task time, peak memory, log growth, and Python/Django/Node/React/mixed dogfood results are recorded separately in `RELEASE_VALIDATION.md` so model variance is not mixed with runtime reliability.
+
+
+Wrote F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-0246-validate-s1.md
+Wrote F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-0246-validate-s1.json
+
+finished     : 2026-08-23 03:01:11
+elapsed      : 14.6 min
+exit code    : 1   (0 = every case passed; 1 = at least one did not)
+
+working tree at END:
+ M PROGRESS_LOG.md
+ M logs/test-runs/2026-08-22-framed-tui.log
+ M shamsu/agents/chat_state.py
+ M shamsu/agents/simple_chat.py
+ M shamsu/cli/live_console.py
+ M shamsu/cli/repl.py
+ M shamsu/cli/tui.py
+ M shamsu/control/runner.py
+ M shamsu/runtime/turn_stream.py
+ M shamsu/webui/api.py
+ M shamsu/webui/cli.py
+ M shamsu/webui/local.py
+ M shamsu/webui/server.py
+ M shamsu/webui/static/app.css
+ M shamsu/webui/static/app.js
+ M tests/test_simple_chat.py
+ M tests/test_tui.py
+ M tests/test_webui.py
+?? logs/evals/
+?? logs/test-runs/2026-08-23-rc9-digest-and-honest-pressure.log
+?? logs/test-runs/2026-08-23-web-portal-phases.log
+?? scripts/overnight-eval.ps1
+?? tests/test_web_access.py
+HEAD at END  : 4e173fe
+
+In the morning:
+  compare mechanically, never by eye -
+    F:\Work\PROJECTS\shamsu\Shamsu\.venv\Scripts\python.exe -m evals.diff <older>.json F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-0246-validate-s1.json
+  exit 0 improved / 1 regressed / 2 noise.
+  This is the first JSON baseline in the repo, so the first comparison it can
+  serve is the NEXT run's.

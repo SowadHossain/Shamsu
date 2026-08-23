@@ -167,8 +167,9 @@ class QueuedRunner:
                 try:
                     self._run_one(workspace, session_id, item)
                     self.store.finish(item.queue_id, DONE)
-                except Exception:  # noqa: BLE001 - one bad turn is not the queue
+                except Exception as exc:  # noqa: BLE001 - one bad turn is not the queue
                     self.store.finish(item.queue_id, CANCELLED)
+                    self._announce_failure(workspace, session_id, exc)
                     if on_event is not None:
                         with_suppressed(on_event, f"run failed: {item.text[:80]}")
         finally:
@@ -177,6 +178,40 @@ class QueuedRunner:
             self.store.release_lease(MACHINE_WORKSPACE, MACHINE_SESSION)
             with self._lock:
                 self._workers.pop((str(workspace), session_id), None)
+
+    def _announce_failure(
+        self, workspace: Path, session_id: str, exc: BaseException
+    ) -> None:
+        """Put a failed turn ON THE STREAM, so every surface stops waiting.
+
+        The queue row was marked cancelled and nothing else was said. Surfaces
+        render from the turn stream, so the browser saw `turn.start` and then
+        silence for ever - a bubble that never resolves, which is what "the
+        chat is out of sync" looks like from the outside. A turn that dies has
+        to end as visibly as one that succeeds.
+        """
+        from shamsu.runtime.turn_stream import TurnEvent, TurnStream
+
+        try:
+            stream = TurnStream(workspace, session_id)
+            detail = f"{type(exc).__name__}: {exc}"[:400]
+            common = {
+                "session_id": session_id,
+                "workspace": str(workspace),
+                "source": self.surface,
+            }
+            stream.publish(TurnEvent(seq=1, kind="error", text=detail, **common))
+            stream.publish(
+                TurnEvent(
+                    seq=2,
+                    kind="turn.end",
+                    text="failed",
+                    data={"status": "failed"},
+                    **common,
+                )
+            )
+        except Exception:  # noqa: BLE001 - saying so must not be a second failure
+            return
 
     def _run_one(self, workspace: Path, session_id: str, item: QueuedPrompt) -> str:
         from shamsu.agents.chat_loop import _default_ollama_client

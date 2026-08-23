@@ -18,14 +18,16 @@ the model's memory.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from shamsu.safety.commands import redact
 
@@ -240,6 +242,10 @@ class Subscription:
         self._ready.set()
 
 
+#: Watchers of every stream in this process. See `TurnStream.add_observer`.
+_OBSERVERS: list = []
+
+
 class TurnStream:
     """Per-session fan-out: the durable file, then every live renderer.
 
@@ -270,6 +276,31 @@ class TurnStream:
         self._write_lock = threading.Lock()
 
     # -- wiring ----------------------------------------------------------
+
+    @staticmethod
+    def add_observer(observer: Callable[[TurnEvent], None]) -> Callable[[], None]:
+        """Watch EVERY stream in this process. Returns the detach function.
+
+        A renderer is attached to one stream by whoever built it. That works
+        for a turn the terminal started and not at all for one it did not: the
+        web portal runs inside this same process, builds its own `TurnStream`,
+        and the CLI had no way to know it existed - so a prompt sent from the
+        browser ran to completion with the terminal showing nothing at all. The
+        surfaces were not out of sync; they were not connected.
+
+        Process-wide rather than passed down because the alternative is
+        threading a display through `QueuedRunner`, the Telegram bridge and
+        every future entry point, each of which would then have to remember.
+        An observer that raises is dropped from the notification, never from
+        the turn.
+        """
+        _OBSERVERS.append(observer)
+
+        def remove() -> None:
+            with contextlib.suppress(ValueError):
+                _OBSERVERS.remove(observer)
+
+        return remove
 
     def add_renderer(self, renderer: Callable[[TurnEvent], None]) -> Callable[[], None]:
         """Attach a synchronous sink. Returns the function that detaches it."""
@@ -328,7 +359,7 @@ class TurnStream:
             self._write(event)
             renderers = list(self._renderers)
             subscriptions = list(self._subscriptions)
-        for renderer in renderers:
+        for renderer in [*renderers, *_OBSERVERS]:
             try:
                 renderer(event)
             except Exception:  # noqa: BLE001 - a renderer must never fail a turn

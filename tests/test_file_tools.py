@@ -758,3 +758,76 @@ async def test_empty_anchor_edit_recovers_with_append_file(tmp_path: Path):
     assert change["action"] == "append"
     assert change["filepath"] == "calculator.py"
     assert change["transaction_id"]
+
+
+# ---------------------------------------------------------------------------
+# R6 - an impossible line range must REFUSE, not quietly read something else
+#
+# `end = min(total_lines, max(end, start))` made every malformed range legal.
+# Live 2026-08-23 in F:\Work\demo2\test2, `read_file(player.js, 145, 20)` came
+# back ok:true / "Read file." / one line, with end_line silently rewritten to
+# 145 - and the model sent that identical payload five times. 8 of 47 ranged
+# reads in that session were impossible; all 8 were answered with a success.
+# ---------------------------------------------------------------------------
+
+
+def _numbered(tmp_path: Path, rel: str, lines: int) -> Path:
+    return _write(tmp_path, rel, "\n".join(f"line {i}" for i in range(1, lines + 1)))
+
+
+def test_end_line_before_start_line_is_refused(tmp_path: Path) -> None:
+    _numbered(tmp_path, "player.js", 151)
+
+    result = _registry(tmp_path).read_file("player.js", start_line=145, end_line=20)
+
+    assert not result.ok, "an empty range must not report success"
+    assert result.data.get("impossible_range") is True
+    assert "NOT read" in result.message
+    # It must not hand back a clamped range pretending to be what was asked for.
+    assert "content" not in result.data
+
+
+def test_the_refusal_names_the_call_that_was_probably_meant(tmp_path: Path) -> None:
+    """A refusal a model cannot act on costs the same as a silent success."""
+    _numbered(tmp_path, "player.js", 151)
+
+    result = _registry(tmp_path).read_file("player.js", start_line=145, end_line=20)
+
+    assert "end_line is a line NUMBER, not a count" in result.message
+    assert "start_line=145" in result.message and "end_line=164" in result.message
+
+
+def test_start_line_past_the_end_is_refused_rather_than_read_as_empty(tmp_path: Path) -> None:
+    """`lines[start-1:end]` past EOF is [], which used to come back as a
+    successful read with no content at all."""
+    _numbered(tmp_path, "player.js", 151)
+
+    result = _registry(tmp_path).read_file("player.js", start_line=200, end_line=210)
+
+    assert not result.ok
+    assert result.data.get("past_end") is True
+    assert "151" in result.message
+
+
+def test_a_range_running_past_the_end_still_reads(tmp_path: Path) -> None:
+    """Only the IMPOSSIBLE cases are refused. Asking for more than is left is a
+    perfectly ordinary way to say 'from here to the end'."""
+    _numbered(tmp_path, "player.js", 151)
+
+    result = _registry(tmp_path).read_file("player.js", start_line=145, end_line=400)
+
+    assert result.ok
+    assert result.data["start_line"] == 145
+    assert result.data["end_line"] == 151
+    assert "line 151" in result.data["content"]
+
+
+def test_ordinary_ranges_are_untouched(tmp_path: Path) -> None:
+    _numbered(tmp_path, "player.js", 151)
+    registry = _registry(tmp_path)
+
+    result = registry.read_file("player.js", start_line=148, end_line=153)
+    assert result.ok and result.data["start_line"] == 148
+
+    whole = registry.read_file("player.js")
+    assert whole.ok and whole.data["total_lines"] == 151

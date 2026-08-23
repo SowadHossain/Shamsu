@@ -96,10 +96,18 @@ def serve(
         Panel(
             f"[bold]{portal.url}[/bold]\n\n"
             f"{_watching(portal)}\n"
-            "Loopback only. The link carries a one-time token for this run.\n\n"
-            "Read-only: it follows runs started from the REPL or Telegram - "
-            "including ones running in another terminal right now - but cannot "
-            "start or stop them.\n\n"
+            + (
+                "Loopback only, so the plain link is the whole thing - no "
+                "token, nothing to re-copy.\n\n"
+                if not portal.requires_token
+                else "This bind is reachable beyond this machine, so the link "
+                "carries a one-time token for this run.\n\n"
+            )
+            # It was never read-only. `POST .../prompt` has always started a
+            # turn, and saying otherwise made the portal look safer than it is.
+            + "It follows runs started from the REPL or Telegram - including "
+            "ones running in another terminal right now - and can start one "
+            "of its own.\n\n"
             "Ctrl-C to stop.",
             title="SHAMSU Web View",
             border_style="green",

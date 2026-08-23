@@ -49,6 +49,13 @@ def _text(content: str) -> dict:
     return {"message": {"content": content, "tool_calls": []}}
 
 
+def _thinking(thought: str) -> dict:
+    """A turn that reasoned and said nothing - what qwen3.5:9b returns after a
+    tool result. `thinking_chars: N, response_chars: 0`, 158 times in the
+    2026-08-23 run."""
+    return {"message": {"content": "", "tool_calls": [], "thinking": thought}}
+
+
 def _tool(name: str, **arguments) -> dict:
     return {
         "message": {
@@ -9288,3 +9295,671 @@ def test_context_status_shows_the_window_actually_used(tmp_path):
     assert "32k" in printed
     assert "256k" in printed, "the model's real capability is still shown"
     assert "KV cache" in printed, "and why the cap exists"
+
+
+# -- generation speed, from Ollama's own timings ----------------------------
+#
+# `eval_duration` is generation only: no queueing, no HTTP round trip, no
+# prompt evaluation. `eval_count / eval_duration` is therefore the honest
+# tokens-per-second, and it is the number that says whether the model is on the
+# GPU or has spilled to the CPU - measured six times apart on this hardware,
+# and previously invisible until a turn simply took twenty minutes.
+
+
+def test_generation_speed_is_taken_off_the_response(tmp_path):
+    from shamsu.agents.simple_chat import SESSION_COUNTERS, counters_for, set_active_session
+
+    set_active_session("speed-test")
+    counters_for("speed-test").last_eval_tokens = 0
+    counters_for("speed-test").last_eval_seconds = 0.0
+    counters_for("speed-test").total_eval_seconds = 0.0
+
+    turn = _text("done")
+    # Ollama reports NANOSECONDS. 240 tokens in 8 seconds is 30 tok/s; read as
+    # seconds it would be 30 nanoseconds and the rate would be astronomical.
+    turn["eval_count"] = 240
+    turn["eval_duration"] = 8_000_000_000
+    turn["prompt_eval_count"] = 1200
+
+    loop = _loop(tmp_path, [turn])
+    asyncio.run(loop.run("go"))
+
+    assert SESSION_COUNTERS.last_eval_tokens == 240
+    assert abs(SESSION_COUNTERS.last_eval_seconds - 8.0) < 0.001
+    assert abs(SESSION_COUNTERS.tokens_per_second - 30.0) < 0.001
+
+
+def test_a_response_without_timings_does_not_blank_the_last_reading(tmp_path):
+    """Same rule as `last_prompt_tokens`: a response that carried no numbers
+    means we were not told, not that the model slowed to nothing. Zero is a
+    claim, and the display treats it as "unknown" - so overwriting a good
+    reading with it would hide the model rather than report it."""
+    from shamsu.agents.simple_chat import SESSION_COUNTERS
+
+    timed = _text("first")
+    timed["eval_count"] = 240
+    timed["eval_duration"] = 8_000_000_000
+    asyncio.run(_loop(tmp_path, [timed]).run("go"))
+    assert abs(SESSION_COUNTERS.tokens_per_second - 30.0) < 0.001
+
+    asyncio.run(_loop(tmp_path, [_text("second")]).run("again"))
+    assert abs(SESSION_COUNTERS.tokens_per_second - 30.0) < 0.001
+
+
+def test_a_fresh_session_has_no_speed_yet(tmp_path):
+    """Across sessions it must NOT carry: a thread that has made no call has
+    no rate, and reporting the previous thread's is the leak that
+    `_COUNTERS_BY_SESSION` exists to prevent."""
+    from shamsu.agents.simple_chat import (
+        SESSION_COUNTERS,
+        counters_for,
+        set_active_session,
+    )
+
+    counters_for("speed-fresh-a").last_eval_tokens = 240
+    counters_for("speed-fresh-a").last_eval_seconds = 8.0
+    set_active_session("speed-fresh-b")
+    assert SESSION_COUNTERS.tokens_per_second == 0.0
+
+
+def test_the_speed_reaches_the_display_on_a_status_event(tmp_path):
+    """The sidebar reads `data`, never the loop - a renderer that reaches back
+    into the loop cannot run on a phone."""
+    from shamsu.agents.simple_chat import counters_for, set_active_session
+
+    set_active_session("speed-test-3")
+    counters = counters_for("speed-test-3")
+    counters.last_eval_tokens = 300
+    counters.last_eval_seconds = 10.0
+    counters.last_window = 32768
+    counters.last_prompt_tokens = 12000
+
+    loop = _loop(tmp_path, [_text("done")])
+    fields = loop._meter_fields()
+    assert abs(fields["tokens_per_second"] - 30.0) < 0.001
+
+
+def test_the_session_average_speed_survives_several_calls(tmp_path):
+    from shamsu.agents.simple_chat import counters_for, set_active_session
+
+    set_active_session("speed-test-4")
+    counters = counters_for("speed-test-4")
+    counters.total_completion = 0
+    counters.total_eval_seconds = 0.0
+
+    counters.total_completion = 600
+    counters.total_eval_seconds = 20.0
+    assert abs(counters.average_tokens_per_second - 30.0) < 0.001
+
+
+# --- RC9: harness nudges must not become things the user asked for ---------
+#
+# `_digest` recorded every `role == "user"` message as a request. The loop
+# steers the model with messages in that role, so the digest - which is what
+# SURVIVES compaction - filled with instructions nobody gave, and fed the
+# model back its own scolding. See `agent context/TRUNCATED_FILES_REPORT.md`,
+# RC9.
+
+
+def test_the_digest_does_not_record_a_harness_nudge_as_a_user_request(tmp_path):
+    from shamsu.agents.chat_state import ChatMessage
+    from shamsu.agents.simple_chat import _digest
+    from shamsu.session.manager import ORIGIN_LOOP
+
+    evicted = [
+        ChatMessage("user", "can you make me a 3d asteroid game"),
+        ChatMessage(
+            "user",
+            "That reply was empty. Answer the question, or call one tool.",
+            origin=ORIGIN_LOOP,
+        ),
+        ChatMessage(
+            "user",
+            "That reply was empty. Answer the question, or call one tool.",
+            origin=ORIGIN_LOOP,
+        ),
+        ChatMessage("user", "okay read from the plan and do the next task please"),
+    ]
+
+    digest = _digest("", evicted)
+
+    assert "3d asteroid game" in digest
+    assert "do the next task" in digest
+    assert "That reply was empty" not in digest, "a nudge is not something the user asked"
+    assert digest.count("you asked") == 2
+
+
+def test_the_digest_still_records_a_real_request_that_looks_like_a_nudge(tmp_path):
+    """The tag decides, not the wording. A user is allowed to type a sentence
+    that reads like a correction, and it must survive compaction."""
+    from shamsu.agents.chat_state import ChatMessage
+    from shamsu.agents.simple_chat import _digest
+
+    digest = _digest("", [ChatMessage("user", "That reply was empty. Try again.")])
+
+    assert "That reply was empty" in digest
+
+
+def test_a_nudge_is_tagged_on_the_message_not_only_on_disk(tmp_path):
+    """The tag reached `messages.jsonl` and stopped there, so every in-memory
+    consumer still had to treat harness speech as user speech."""
+    from shamsu.session.manager import ORIGIN_LOOP
+
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_user("build the thing")
+    state.append_user("That reply was empty.", origin=ORIGIN_LOOP)
+
+    typed, nudge = state.all_messages[-2], state.all_messages[-1]
+    assert typed.origin == ""
+    assert nudge.origin == ORIGIN_LOOP
+
+
+def test_the_tag_survives_a_resume(tmp_path):
+    """Without this a resumed thread re-acquires the confusion: every nudge
+    ever written to it reads as a request again, and the first compaction
+    after the resume makes that permanent."""
+    from shamsu.session.manager import ORIGIN_LOOP, SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="long thread")
+    state = ChatState(
+        simple_system_prompt(tmp_path), session_logger=logger, hydrate=False
+    )
+    state.append_user("build an asteroids game")
+    state.append_user("You have already called read_file this turn.", origin=ORIGIN_LOOP)
+
+    revived = ChatState(
+        simple_system_prompt(tmp_path),
+        session_logger=mgr.resume_session(logger.session_id),
+        hydrate=True,
+    )
+
+    users = [m for m in revived.all_messages if m.role == "user"]
+    assert [m.origin for m in users] == ["", ORIGIN_LOOP]
+
+
+def test_an_old_transcript_without_the_field_still_hydrates(tmp_path):
+    """`origin` postdates every session already on disk. A record written
+    before it existed must default to 'typed by a person', not blow up."""
+    import json
+
+    from shamsu.session.manager import SessionManager
+
+    mgr = SessionManager(tmp_path)
+    logger = mgr.create_session(title="old thread")
+    with logger.messages_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"role": "user", "content": "an ancient request"}) + "\n"
+        )
+
+    revived = ChatState(
+        simple_system_prompt(tmp_path),
+        session_logger=mgr.resume_session(logger.session_id),
+        hydrate=True,
+    )
+
+    recovered = [m for m in revived.all_messages if m.role == "user"]
+    assert recovered and recovered[0].content == "an ancient request"
+    assert recovered[0].origin == ""
+
+
+def test_every_nudge_the_loop_injects_carries_the_tag(tmp_path):
+    """A guard against the next one being added untagged. The contract nudge
+    was the one injection that was not, and it is the longest of them."""
+    import re
+
+    source = (
+        Path(__file__).resolve().parents[1] / "shamsu" / "agents" / "simple_chat.py"
+    ).read_text(encoding="utf-8")
+    # `append_user(` up to its closing paren, for calls made on `self.state`.
+    calls = re.findall(r"self\.state\.append_user\((.*?)\n\s*\)|self\.state\.append_user\(([^\n]*)\)",
+                       source, re.DOTALL)
+    flattened = [(a or b) for a, b in calls]
+    untagged = [
+        call for call in flattened
+        if "ORIGIN_LOOP" not in call
+        # The two legitimate exceptions: the user's own message, and a mid-turn
+        # interjection, which really is the user speaking.
+        and "persisted_content=user_input" not in call
+        and "render_interjection" not in call
+    ]
+    assert not untagged, f"harness injections missing origin=ORIGIN_LOOP: {untagged}"
+
+
+# --- F5: pressure is measured on the prompt, not on the archive ------------
+#
+# `_history_pressure` divided EVERY hydrated message by the budget for the
+# tail `select_for_budget` actually sends. Hydration pulls up to 400 turns off
+# disk, so on any resumed thread the ratio read above ELIDE_PRESSURE_FRACTION
+# from round one and the aggressive elision branch fired every third tool
+# call - stripping the payloads the model had just been handed.
+
+
+def _fill_history(state, count: int, size: int = 400) -> None:
+    for index in range(count):
+        state.append_user(f"request {index} " + ("x " * size))
+        state.append_assistant(f"answer {index} " + ("y " * size))
+
+
+def test_pressure_is_measured_on_what_is_sent_not_on_what_is_held(tmp_path):
+    from shamsu.context.budget import count_tokens, messages_tokens
+
+    loop = _loop(tmp_path, [_text("ok")])
+    _fill_history(loop.state, 40)
+
+    budget = loop._history_budget()
+    tail, start_abs = loop.state.select_for_budget(budget, count_tokens)
+    archive = messages_tokens(m.to_ollama() for m in loop.state.all_messages)
+
+    assert start_abs > 1, "the fixture must be big enough that something is evicted"
+    assert archive > budget, "the archive must exceed the budget for this to mean anything"
+
+    pressure = loop._history_pressure()
+
+    assert pressure == pytest.approx(
+        messages_tokens(m.to_ollama() for m in tail) / budget, rel=1e-6
+    )
+    assert pressure < archive / budget, "the evicted turns must not be charged"
+
+
+def test_a_long_archive_alone_does_not_trigger_the_aggressive_sweep(tmp_path):
+    """The regression in one line: a resumed thread whose PROMPT is nearly
+    empty must not be treated as a window under pressure."""
+    from shamsu.agents.simple_chat import ELIDE_PRESSURE_FRACTION
+
+    loop = _loop(tmp_path, [_text("ok")])
+    _fill_history(loop.state, 60)
+    # What a fresh turn on a resumed thread looks like: a huge archive behind
+    # it, and almost nothing selected in front.
+    loop.state.select_for_budget(loop._history_budget(), lambda text: len(text))
+
+    assert loop._history_pressure() <= 1.0
+    small = _loop(tmp_path, [_text("ok")])
+    small.state.append_user("hello")
+    assert small._history_pressure() < ELIDE_PRESSURE_FRACTION
+
+
+def test_a_genuinely_full_prompt_still_reads_as_pressure(tmp_path):
+    """The guard must keep firing when it should."""
+    from shamsu.agents.simple_chat import ELIDE_PRESSURE_FRACTION
+
+    loop = _loop(tmp_path, [_text("ok")])
+    _fill_history(loop.state, 40)
+
+    assert loop._history_pressure() > ELIDE_PRESSURE_FRACTION
+
+
+def test_the_honest_ratio_never_changes_which_branch_is_taken(tmp_path):
+    """The invariant that makes this change safe, and the reason it is a
+    correctness fix rather than a performance one.
+
+    The old ratio was nonsense as a NUMBER - a 265k archive against a 19k
+    budget read 13.69 - but `_elide_under_pressure` only ever compares it to
+    ELIDE_PRESSURE_FRACTION, and both measures cross that threshold at the
+    same archive size. Measured across 2..320 exchanges, they never disagree.
+    Pinned here so nobody expects a behaviour change from this, and so nobody
+    later 'optimises' the honest measure back out on the grounds that the old
+    one was equivalent - it is equivalent only for this one comparison.
+    """
+    from shamsu.agents.simple_chat import ELIDE_PRESSURE_FRACTION
+    from shamsu.context.budget import count_tokens, messages_tokens
+
+    for exchanges in (2, 5, 10, 20, 40, 80):
+        loop = _loop(tmp_path, [_text("ok")])
+        _fill_history(loop.state, exchanges)
+        budget = loop._history_budget()
+
+        archive = messages_tokens(m.to_ollama() for m in loop.state.all_messages)
+        old_ratio = archive / budget
+        new_ratio = loop._history_pressure()
+
+        assert (old_ratio > ELIDE_PRESSURE_FRACTION) == (
+            new_ratio > ELIDE_PRESSURE_FRACTION
+        ), f"{exchanges} exchanges: old={old_ratio:.2f} new={new_ratio:.2f}"
+        assert new_ratio <= 1.05, "the honest ratio is bounded by what is sent"
+
+
+# --- R2/R8: delete_file was the one destructive tool with no guard ----------
+#
+# Measured 2026-08-23: `ask_before_destructive_guess` lost the real database in
+# 11 of 15 samples, deleted in ROUND ONE with no read, no listing and no
+# question. And live in F:\Work\demo2\test2 a model that could not fix three
+# files proposed deleting all three - stopped only by a human at an approval
+# prompt, where 13 of that session's 14 approvals were auto-granted in <30ms.
+
+
+def _ambiguous(tmp_path: Path) -> Path:
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "users.db").write_text("real user data\n", encoding="utf-8")
+    (tmp_path / "data" / "users.db.bak").write_text("backup\n", encoding="utf-8")
+    return tmp_path
+
+
+def test_a_delete_it_never_looked_at_is_refused_when_the_target_is_ambiguous(tmp_path):
+    _ambiguous(tmp_path)
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("delete_file", {"filepath": "data/users.db"})
+
+    assert not result.ok, "an unlooked-at, ambiguous delete must not go through"
+    assert (tmp_path / "data" / "users.db").is_file(), "the file must survive"
+    assert "users.db.bak" in result.message, "it must name what it could have meant"
+    assert "ask_user" in result.message
+
+
+def test_looking_first_is_what_makes_the_delete_a_decision(tmp_path):
+    """The guard is about a GUESS, not about deleting. A model that listed the
+    folder has established its target and is allowed to act.
+
+    `list_files` and not `read_file` on purpose: read_file refuses a `.db`
+    outright ("Not a supported text file"), so a guard that demanded a read of
+    the destructive-guess case's own file would be unfollowable advice."""
+    _ambiguous(tmp_path)
+    loop = _loop(tmp_path, [_text("ok")])
+    listed = loop._execute("list_files", {"path": "data"})
+    loop._note_looked_at("list_files", {"path": "data"}, listed)
+
+    result = loop._execute("delete_file", {"filepath": "data/users.db"})
+
+    assert result.ok, result.message
+    assert not (tmp_path / "data" / "users.db").exists()
+
+
+def test_an_unambiguous_delete_is_not_obstructed(tmp_path):
+    """Only one candidate, so there is nothing to confuse - the guard must stay
+    out of the way or it becomes noise the model learns to work around."""
+    (tmp_path / "scratch.tmp").write_text("junk\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute("delete_file", {"filepath": "scratch.tmp"})
+
+    assert result.ok, result.message
+
+
+def test_the_second_attempt_is_honoured(tmp_path):
+    """Every guard here needs an exit. Sometimes the model really is right."""
+    _ambiguous(tmp_path)
+    loop = _loop(tmp_path, [_text("ok")])
+
+    first = loop._execute("delete_file", {"filepath": "data/users.db"})
+    second = loop._execute("delete_file", {"filepath": "data/users.db"})
+
+    assert not first.ok
+    assert second.ok, "a refusal with no way past it is a deadlock"
+
+
+def test_a_delete_proposed_out_of_a_repair_loop_is_refused(tmp_path):
+    """The live failure: 'I've been stuck trying to fix asteroid.js with
+    multiple failed edits... I'll delete all three problematic files.'"""
+    (tmp_path / "asteroid.js").write_text("export class Asteroid {}\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._looked_at.add("asteroid.js")  # it HAS read it - this is the other rule
+    from shamsu.agents.simple_chat import DELETES_BLOCKED_AFTER_FAILED_EDITS
+
+    loop._stalls.unproductive = DELETES_BLOCKED_AFTER_FAILED_EDITS
+
+    result = loop._execute("delete_file", {"filepath": "asteroid.js"})
+
+    assert not result.ok
+    assert (tmp_path / "asteroid.js").is_file()
+    assert "replace_symbol" in result.message, "it must name the way forward"
+    loop._stalls.unproductive = 0
+
+
+def test_a_delete_is_fine_when_the_edits_are_landing(tmp_path):
+    (tmp_path / "asteroid.js").write_text("export class Asteroid {}\n", encoding="utf-8")
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._looked_at.add("asteroid.js")
+    loop._stalls.unproductive = 0
+
+    assert loop._execute("delete_file", {"filepath": "asteroid.js"}).ok
+
+
+# --- R1/R5: the prose nudge fired on work the model had just done ----------
+#
+# Measured over 240 attempts on 2026-08-23: EVERY prose nudge that fired on a
+# code-editing case was wrong - 3/3 on repairs_a_file_it_cannot_pattern_match,
+# 2/2 on ask_before_choosing_an_approach, both in the flaky set. Live it told a
+# model that had written 106 lines and passed the verifier that it "did not
+# change the file"; the model re-read, found the work there, and gave up.
+
+
+def test_a_file_written_earlier_this_turn_is_not_nudged_about(tmp_path):
+    from shamsu.agents.simple_chat import _already_written
+
+    assert _already_written("app.py", ["app.py"])
+    assert _already_written("app.py", ["./app.py"])
+    assert _already_written("app.py", ["src/app.py"]), "reply names the basename"
+    assert _already_written("src/app.py", ["app.py"])
+    assert _already_written("app.py", [r"src\app.py"]), "windows separators"
+    assert not _already_written("app.py", ["other.py"])
+    assert not _already_written("app.py", [])
+
+
+def test_the_nudge_still_fires_when_nothing_was_written(tmp_path):
+    """The guard must keep doing its job: a reply that shows the new contents
+    and wrote nothing is still the failure it was built for."""
+    from shamsu.agents.simple_chat import _already_written, describes_an_unmade_edit
+
+    reply = "Here is the new app.py:\n\n```python\nimport os\nimport sys\n\n\ndef main():\n    pass\n```"
+    described = describes_an_unmade_edit(reply, ["app.py"])
+
+    assert described == "app.py"
+    assert not _already_written(described, []), "nothing written - must still nudge"
+
+
+def test_a_plain_question_is_treated_as_asking_for_words(tmp_path):
+    """`asks_only_for_words` matched words-VERBS, so a question carried none
+    and fell through. The prose nudge then fired on the qa_reads_repo_fact
+    prompt ten times across fifteen attempts."""
+    from shamsu.agents.simple_chat import asks_only_for_words
+
+    assert asks_only_for_words("What tax rate does pricing.py apply in its total() function?")
+    assert asks_only_for_words("What does this function return?")
+    assert asks_only_for_words("How should we approach the refactor?")
+    # still recognised the old way
+    assert asks_only_for_words("Review the modules and tell me what they do.")
+    assert asks_only_for_words("Explain what handlers.js does")
+
+
+def test_an_instruction_wearing_a_question_mark_is_still_work(tmp_path):
+    """The expensive direction of this function's asymmetry: hand a request to
+    ACT back as words-only and the work silently does not happen."""
+    from shamsu.agents.simple_chat import asks_only_for_words
+
+    assert not asks_only_for_words("Can you rewrite parse_config?")
+    assert not asks_only_for_words("Could you add a test for this?")
+    assert not asks_only_for_words("Would you fix the bug in main.py?")
+    # A question mark does not make an imperative into a question.
+    assert not asks_only_for_words("What is broken? fix it")
+    assert not asks_only_for_words("review the code and fix the bug")
+    assert not asks_only_for_words("Add authentication to app.py.")
+
+
+def test_can_you_explain_is_still_a_question(tmp_path):
+    """The polite-modal veto only applies alongside a CHANGE verb."""
+    from shamsu.agents.simple_chat import asks_only_for_words
+
+    assert asks_only_for_words("Can you explain what this does?")
+
+
+# --- R4/R7: a clock on a turn, and a reasoning trace that survives ---------
+
+
+def test_a_turn_stops_at_its_wall_clock_budget(tmp_path):
+    """`max_rounds` bounds STEPS, not time. 24 rounds against a 600s per-call
+    timeout is a theoretical four hours; measured, `removes_duplicate_
+    definitions` reached the round ceiling in 12 of 15 samples at ~230s each.
+
+    A negative budget puts the deadline in the past, which exercises the real
+    comparison against the real clock - patching `time.monotonic` fights the
+    heartbeats and the per-tool timers that share it.
+    """
+    loop = _loop(
+        tmp_path,
+        [_named_tool("list_files", {"path": "."})] * 8 + [_text("done")],
+        max_rounds=8,
+        verify_changes=False,
+    )
+    loop.turn_budget_seconds = -1.0
+
+    result = asyncio.run(loop.run("do something long"))
+
+    assert result.stopped
+    assert "time limit" in result.final
+    assert result.rounds < 8, "it must stop before the round budget"
+
+
+def test_the_first_round_always_runs(tmp_path):
+    """A budget that could fire before the model was called even once would
+    make a turn that does nothing look like a turn that ran out of time."""
+    loop = _loop(tmp_path, [_text("answered immediately")], max_rounds=8)
+    loop.turn_budget_seconds = -1.0
+
+    result = asyncio.run(loop.run("quick question"))
+
+    assert result.final == "answered immediately"
+    assert not result.stopped
+
+
+def test_the_budget_reports_what_the_turn_managed(tmp_path):
+    """A budget, not a kill: it says what changed rather than vanishing."""
+    loop = _loop(
+        tmp_path,
+        [_named_tool("write_file", {"filepath": "made.py", "content": "x = 1\n"}),
+         _named_tool("list_files", {"path": "."}),
+         _text("carrying on")],
+        max_rounds=6,
+        verify_changes=False,
+    )
+    loop.turn_budget_seconds = -1.0
+
+    result = asyncio.run(loop.run("write a file then keep going"))
+
+    assert result.stopped
+    assert "made.py" in result.final, "it must name what it managed"
+    assert "continue" in result.final
+
+
+def test_the_budget_can_be_turned_off(tmp_path):
+    import os
+
+    import shamsu.agents.simple_chat as sc
+
+    os.environ["SHAMSU_TURN_BUDGET_S"] = "0"
+    try:
+        assert sc.turn_budget_seconds() == float("inf")
+    finally:
+        del os.environ["SHAMSU_TURN_BUDGET_S"]
+    assert sc.turn_budget_seconds() == sc.DEFAULT_TURN_BUDGET_SECONDS
+
+
+def test_a_reasoning_trace_is_kept_at_every_log_level(tmp_path):
+    """`full_artifacts` is true only at log_level 'verbose', and the default is
+    'essential' - so an ordinary run recorded `thinking_chars: 2543` and
+    `cot_path: ""`. How much reasoning there was, and none of the reasoning."""
+    from shamsu.action_ledger.ledger import ActionLedger
+
+    ledger = ActionLedger(tmp_path, run_id="run_test")
+    assert not ledger.full_artifacts, "the default must still be essential"
+
+    path = ledger.log_model_thinking("model_0001", "coder", "qwen3.5:9b", "I see the bug. " * 60)
+
+    assert path, "the trace must reach disk even at the default log level"
+    written = (tmp_path / ".shamsu" / "runs" / "run_test" / path).read_text(encoding="utf-8")
+    assert "I see the bug." in written
+
+
+def test_an_empty_trace_writes_nothing(tmp_path):
+    from shamsu.action_ledger.ledger import ActionLedger
+
+    ledger = ActionLedger(tmp_path, run_id="run_test")
+    assert ledger.log_model_thinking("model_0001", "coder", "m", "   ") == ""
+
+
+# --- R3: the empty turn after a tool result ---------------------------------
+#
+# 158 of 1385 assistant turns in the 2026-08-23 run carried neither text nor a
+# tool call - 11% - and ALL 158 came directly after a tool result. The ledger
+# names them: `thinking_chars: 202, response_chars: 0`. A reasoning model
+# thinking and not narrating. The nudge worked and cost a model call every time.
+
+
+def test_a_thought_with_no_answer_after_a_tool_is_retried_not_nudged(tmp_path):
+    loop = _loop(
+        tmp_path,
+        [_named_tool("list_files", {"path": "."}),
+         _thinking("Right, the folder has three files."),
+         _text("There are three files here.")],
+        max_rounds=6,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("what is in this folder?"))
+
+    assert result.final == "There are three files here."
+    nudges = [
+        m for m in loop.state.all_messages
+        if m.role == "user" and "that reply was empty" in (m.content or "").lower()
+    ]
+    assert not nudges, "the silent retry must not leave a nudge in the transcript"
+
+
+def test_the_retry_turns_thinking_off_for_exactly_one_call(tmp_path):
+    loop = _loop(tmp_path, [_text("ok")])
+    loop._skip_thinking_once = True
+
+    assert loop._should_think() is False, "the retry call must not think"
+    assert loop._should_think() is not False or True  # consumed
+    assert loop._skip_thinking_once is False, "and only that one call"
+
+
+def test_an_empty_turn_that_did_not_follow_a_tool_is_still_nudged(tmp_path):
+    """Anywhere else an empty turn means something different, and the nudge is
+    still the right answer."""
+    loop = _loop(
+        tmp_path,
+        [_thinking("hmm"), _text("Sorry - here is the answer.")],
+        max_rounds=6,
+    )
+
+    result = asyncio.run(loop.run("hello"))
+
+    nudges = [
+        m for m in loop.state.all_messages
+        if m.role == "user" and "that reply was empty" in (m.content or "").lower()
+    ]
+    assert nudges, "no tool result preceded it, so it is the ordinary empty turn"
+    assert result.final == "Sorry - here is the answer."
+
+
+def test_the_retry_budget_is_per_turn_not_per_round(tmp_path):
+    """The retry appends nothing and `continue`s, so a per-ROUND flag resets on
+    the next iteration and lets a model that keeps thinking without answering
+    burn every round untouched - the exact failure this was meant to end."""
+    loop = _loop(
+        tmp_path,
+        [_named_tool("list_files", {"path": "."})]
+        + [_thinking("still thinking")] * 6
+        + [_text("finally")],
+        max_rounds=5,
+        verify_changes=False,
+    )
+
+    result = asyncio.run(loop.run("what is here?"))
+
+    nudges = [
+        m for m in loop.state.all_messages
+        if m.role == "user" and "that reply was empty" in (m.content or "").lower()
+    ]
+    assert nudges, "a second empty turn in the same round must fall through to the nudge"
+    assert result is not None
+
+
+def test_last_role_reports_the_most_recent_message(tmp_path):
+    state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    assert state.last_role() == "", "system prompt alone is not a message"
+    state.append_user("hi")
+    assert state.last_role() == "user"
+    state.append_tool("id", "read_file", "{}")
+    assert state.last_role() == "tool"

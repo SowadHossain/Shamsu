@@ -1,0 +1,314 @@
+SHAMSU test run - 2026-08-23 (afternoon)
+Task: R6, R2+R8, R1, R5 - the four surgical fixes from the 240-attempt
+      post-mortem and the F:\Work\demo2\test2 session logs.
+Branch: small-shamsu-new   HEAD: 4e173fe
+Model in the loop: none required. All four are deterministic (argument
+      validation, a set membership, a string comparison, a regex). The
+      model-in-the-loop evidence is the 15-sample baseline they are measured
+      against: logs/evals/2026-08-23-1200-baseline-s15.json.
+
+================================================================================
+R6 - an impossible read range returned ok:true and one line
+================================================================================
+shamsu/tools/agent_tools.py - _refuse_impossible_range()
+
+The defect, from F:\Work\demo2\test2 session 20260822-183305-4975:
+
+    read_file(player.js, start_line=145, end_line=20)
+      ok          : True
+      message     : Read file.
+      content     : '145|   getBoundingBox() {'
+      end_line    : 145        <- silently rewritten from 20
+      truncated   : True
+
+`end = min(total_lines, max(end, start))` made every malformed range legal.
+8 of 47 ranged reads in that session carried end_line < start_line; all 8 came
+back as one line and a success. That exact payload went out FIVE times. Two
+turns ended on "I stopped after 24 steps without finishing", and 47 of the
+session's 90 tool results were reads.
+
+After:
+    {'start_line': 145, 'end_line': 20}   ok=False
+       end_line (20) is before start_line (145), so that range is empty and
+       player.js was NOT read. end_line is a line NUMBER, not a count. For the
+       20 lines starting at 145, call read_file with start_line=145 and
+       end_line=164.
+    {'start_line': 200, 'end_line': 210}  ok=False   (past EOF - was ok:true,
+                                                      empty content)
+    {'start_line': 145, 'end_line': 165}  ok=True    (unchanged)
+    {'start_line': 148, 'end_line': 153}  ok=True    (unchanged)
+
+Second silent failure closed with it: start_line past EOF made
+`lines[start-1:end]` an empty list, which came back as a successful read with
+no content at all.
+
+Tests: tests/test_file_tools.py
+  test_end_line_before_start_line_is_refused
+  test_the_refusal_names_the_call_that_was_probably_meant
+  test_start_line_past_the_end_is_refused_rather_than_read_as_empty
+  test_a_range_running_past_the_end_still_reads        (only IMPOSSIBLE refused)
+  test_ordinary_ranges_are_untouched
+
+================================================================================
+R2 + R8 - delete_file was the one destructive tool with no guard
+================================================================================
+shamsu/agents/simple_chat.py - _refuse_blind_delete(), _delete_candidates(),
+_note_looked_at(), DELETES_BLOCKED_AFTER_FAILED_EDITS
+
+Two refusals from two measured failures:
+
+  THE GUESS. ask_before_destructive_guess lost the real data/users.db in 11 of
+  15 samples, deleted in round one with no read, no listing, no question.
+  Now: a delete of a path the turn has not looked at, where a sibling shares
+  the stem, is refused and the candidates are named.
+
+  THE ESCAPE. Live: "I've been stuck trying to fix asteroid.js with multiple
+  failed edits... I'll delete all three problematic files and rewrite them
+  cleanly." Stopped only by a human - 13 of that session's 14 approvals were
+  auto-granted in under 30ms. Now: a delete proposed with
+  _stalls.unproductive >= 2 is refused and pointed at replace_symbol.
+
+One design correction found by the tests: read_file REFUSES a .db outright
+("Not a supported text file"), so requiring a READ of the destructive-guess
+case's own file would have been unfollowable advice. A listing of the parent
+directory counts, which is the path a model can actually take.
+
+Both refusals honour a second attempt, like _prefer_patch_over_rewrite.
+
+Tests: tests/test_simple_chat.py
+  test_a_delete_it_never_looked_at_is_refused_when_the_target_is_ambiguous
+  test_looking_first_is_what_makes_the_delete_a_decision
+  test_an_unambiguous_delete_is_not_obstructed
+  test_the_second_attempt_is_honoured
+  test_a_delete_proposed_out_of_a_repair_loop_is_refused
+  test_a_delete_is_fine_when_the_edits_are_landing
+
+================================================================================
+R1 - the prose nudge fired on work the model had just done
+================================================================================
+shamsu/agents/simple_chat.py - _already_written(), used at the nudge site
+
+Every prose nudge that fired on a code-editing case in the 240-attempt run was
+false: 3/3 on repairs_a_file_it_cannot_pattern_match, 2/2 on
+ask_before_choosing_an_approach - both in the flaky set. The live shape:
+
+    [tool/write_file]  ok: Overwrote app.py (+106 -1 lines, 108 total)
+    [tool/verify]      ok: Checked app.py: no syntax errors
+    [assistant]        I've added comprehensive authentication support...
+    [user]             You showed the new contents of app.py but did NOT
+                       change the file. Apply it now: ...
+    [assistant]        The file already has authentication implemented with:
+                       - Password hashing  - Session management ...
+
+`describes_an_unmade_edit(text, self._files)` was never told what the turn had
+written. `changed` was in scope two lines above the call site all along.
+
+================================================================================
+R5 - "What tax rate does pricing.py apply?" was not recognised as a question
+================================================================================
+shamsu/agents/simple_chat.py - _OPENS_WITH_A_QUESTION, _POLITE_REQUEST,
+asks_only_for_words() reordered
+
+The prose nudge fired on the qa_reads_repo_fact prompt 10 times across 15
+attempts, telling a turn whose whole deliverable was an answer to start
+writing files.
+
+Two things the tests caught while fixing it:
+  * The question test has to run BEFORE the change-verb veto. The tax-rate
+    sentence contains `apply`, which IS a change-verb, so the veto rejected the
+    clearest question in the suite. Requiring an interrogative opener AND a
+    closing "?" is what makes running it first safe.
+  * "Can you rewrite parse_config?" is an instruction wearing a question mark
+    and must NOT become words-only - that is the expensive direction. Hence
+    _POLITE_REQUEST. It also exposed a pre-existing gap: `rewrite` and
+    `replace` were missing from _CHANGE_VERBS entirely (matched on word
+    boundaries, so `write` never covered `rewrite`).
+
+    True   'What tax rate does pricing.py apply in its total() function?'
+    True   'What does this function return?'
+    True   'How should we approach the refactor?'
+    True   'Can you explain what this does?'
+    True   'Review the modules and tell me what they do.'
+    False  'Can you rewrite parse_config?'
+    False  'Could you add a test for this?'
+    False  'What is broken? fix it'
+    False  'review the code and fix the bug'
+    False  'Add authentication to app.py.'
+
+Tests: tests/test_simple_chat.py
+  test_a_file_written_earlier_this_turn_is_not_nudged_about
+  test_the_nudge_still_fires_when_nothing_was_written
+  test_a_plain_question_is_treated_as_asking_for_words
+  test_an_instruction_wearing_a_question_mark_is_still_work
+  test_can_you_explain_is_still_a_question
+
+================================================================================
+Suite
+================================================================================
+$ .venv/Scripts/python.exe -m pytest tests -q
+3826 passed, 2 skipped, 1 warning in 416.56s (0:06:56)
+
+Baseline this morning after the RC9 work was 3709 passed / 2 skipped / 0 failed
+(plus test_tui.py's 84, which now collects in the same run). +16 tests from
+this task; the rest is the other agent's web-portal work landing in the same
+tree.
+
+================================================================================
+Not done, and why
+================================================================================
+R3 (empty turn after every tool result, 158 turns / ~9% of run time) - a
+    behaviour change, not a bug fix. It wants its own before/after at 15
+    samples rather than being folded in with four fixes whose effect is
+    already hard to separate.
+R7 (reasoning clipped to 400 chars on screen, cot_path empty so the trace is
+    discarded) - touches the ledger and the renderer, both of which the other
+    agent is actively editing.
+R9 (approval tears the TUI down) - same, tui.py is being rebuilt right now.
+R4 (no wall-clock budget on a turn) - cheap, but changes when turns end, so it
+    would confound the next measurement.
+
+Next measurement: re-run at 15 samples and
+  python -m evals.diff logs/evals/2026-08-23-1200-baseline-s15.json <new>.json
+R1 predicts movement on repairs_a_file_it_cannot_pattern_match and
+ask_before_choosing_an_approach; R2 predicts ask_before_destructive_guess
+moves off 4/15. Nothing else should move, and anything that does is noise
+until re-measured.
+
+================================================================================
+SECOND BATCH - R7, R4, R3 (same day, evening)
+================================================================================
+
+R7 - reasoning clipped on screen and discarded on disk
+  shamsu/action_ledger/ledger.py  - log_model_thinking now writes the trace at
+      EVERY log level, bounded by MAX_REASONING_ARTIFACT_CHARS (64k).
+  shamsu/cli/turn_render.py       - MAX_REASONING_CHARS 400 -> 1400, and _clip
+      now cuts at a sentence/line/word boundary via _cut_at_a_boundary().
+
+  *** A POLICY CHANGE, NOT A STALE TEST ***
+  test_essential_log_level_keeps_previews_and_writes_no_model_artifacts failed,
+  and it was RIGHT to: it encodes a deliberate rule that at `essential` level no
+  model text reaches disk. R7 narrows that rule rather than fixing a bug in it.
+
+  The argument for narrowing: `essential` exists to keep VOLUME down. A prompt
+  is 15KB+, a response can be larger, a reasoning trace is 200-4000 chars. The
+  trace is also the only artifact that cannot be reconstructed from anything
+  else, and it is what you need when a session gets stuck. Live 2026-08-23 the
+  ledger held `thinking_chars: 2543, cot_path: ""` while the screen clipped the
+  same trace at 400 chars - the user saw "Let me: 1. Delete ..." and could not
+  recover the sentence naming the three source files about to be deleted.
+  Redaction is unchanged (test_secrets_are_redacted_in_prompt_and_cot_artifacts).
+
+  The test is now split in two so the narrowed rule is explicit and reversible:
+    test_essential_log_level_keeps_previews_and_writes_no_prompt_or_response
+    test_reasoning_is_the_one_artifact_kept_at_every_log_level
+  If that trade is not wanted, reverting is one `if self.full_artifacts:`.
+
+R4 - no wall-clock budget on a turn
+  DEFAULT_TURN_BUDGET_SECONDS = 1200, turn_budget_seconds(), checked between
+  rounds in _run_turn. SHAMSU_TURN_BUDGET_S overrides; 0 disables.
+  Checked BETWEEN rounds, never on the call: cancelling a generation mid-flight
+  loses the work it was doing. Round 0 always runs, so a turn can never report
+  a timeout without having called the model once.
+
+R3 - the empty turn after every tool result (158 of 1385, ~9% of run time)
+  A thought-with-no-answer that directly follows a TOOL RESULT is now re-asked
+  once with `think: False` instead of being nudged. Same cost in calls, nothing
+  added to history, and the prompt is byte-identical so the KV prefix is reused.
+
+  *** MY FIRST ATTEMPT WAS WRONG AND A TEST CAUGHT IT ***
+  I made the retry a per-ROUND flag. The retry `continue`s, which starts a new
+  iteration and resets the flag - so a model that kept thinking without
+  answering would have spent every round on silent retries and never been
+  nudged. That is the original failure reintroduced one level up. It is now a
+  per-TURN budget, MAX_SILENT_RETRIES = 2, matching MAX_EMPTY_NUDGES.
+  Pinned by test_the_retry_budget_is_per_turn_not_per_round.
+
+Tests added this batch: 11
+  test_a_turn_stops_at_its_wall_clock_budget
+  test_the_first_round_always_runs
+  test_the_budget_reports_what_the_turn_managed
+  test_the_budget_can_be_turned_off
+  test_a_reasoning_trace_is_kept_at_every_log_level
+  test_an_empty_trace_writes_nothing
+  test_a_thought_with_no_answer_after_a_tool_is_retried_not_nudged
+  test_the_retry_turns_thinking_off_for_exactly_one_call
+  test_an_empty_turn_that_did_not_follow_a_tool_is_still_nudged
+  test_the_retry_budget_is_per_turn_not_per_round
+  test_last_role_reports_the_most_recent_message
+  + test_reasoning_is_the_one_artifact_kept_at_every_log_level
+
+NOT DONE:
+R9 (approval tears down the TUI) - the real fix is a modal float inside the
+   prompt_toolkit frame. That is a rework of tui.py while another agent is
+   rebuilding it, the handover path has 4 test references in the whole suite,
+   and the failure mode is a terminal you cannot use. It needs an interactive
+   session, not a blind edit. The cheap half (announce the handover before the
+   frame drops) was considered and rejected: it is cosmetic and would make the
+   real problem look handled.
+R10 (47 of 90 tool calls were re-reads) - downstream of R6. The read-loop
+   guards were firing CORRECTLY; what drove the loop was R6 answering a
+   malformed call with a success. Re-measure before touching any detector.
+
+================================================================================
+Suite, both batches
+================================================================================
+$ .venv/Scripts/python.exe -m pytest tests -q
+3838 passed, 2 skipped, 1 warning in 402.10s (0:06:42)
+
+Session baseline this morning: 3709 passed / 1 failed.
+After batch 1 (R6, R2+R8, R1, R5): 3826 passed / 0 failed.
+After batch 2 (R7, R4, R3):        3838 passed / 0 failed.
+27 tests added across both batches.
+
+================================================================================
+THIRD BATCH - R9 (fixed), R10 (investigated, no independent defect)
+================================================================================
+
+R9 - the approval handover across NESTED prompts
+  shamsu/cli/live_console.py - _handover_depth, depth-counted resume()
+
+  I went looking for a wiring bug first and did NOT find one. Both edges are
+  registered (repl.py:5028-5029, on_prompt_open(live.stand_down) /
+  on_prompt_close(live.resume)), and reading_input() fires both, including on
+  the exception path. The mechanism is sound, exactly as the post-mortem said.
+
+  What IS wrong: `reading_input()` keeps a `_PROMPT_DEPTH` because one prompt
+  can open inside another. The handover did not. With a nested prompt:
+    * `_suspend_frame` overwrote `self._handover` with the inner waiter, so the
+      OUTER waiter was never set and its `run_in_terminal` callable waited the
+      full HANDOVER_TIMEOUT_SECONDS - 900s of a frame that does not come back.
+    * the inner prompt closing released the frame while the OUTER question was
+      still on screen, repainting the alternate screen over it.
+  First suspend hands over, last resume takes it back. `set_frame(None)` forces
+  a release at turn end so an unbalanced open cannot strand the terminal.
+
+  NOT done: rendering the approval as a modal float inside the frame. That is
+  the UX redesign the post-mortem describes and it still wants an interactive
+  session; this fixes a correctness bug in what is already there.
+
+R10 - half of all tool calls were re-reads. NO INDEPENDENT DEFECT FOUND.
+  Three hypotheses tested against session 20260822-183305-4975, all refuted:
+
+  1. "the dedup guard is broken"
+     It fired 22 times in that session. `_already_sent_this_range` works.
+
+  2. "elision wrongly clears _ranges_sent"
+     Correct as written. The guard returns a NOTE saying "you already have
+     lines X-Y"; once the payload is elided the model genuinely does not have
+     it, so re-reading is legitimate and the clear is right.
+
+  3. "MAX_PROTECTED_READ_PATHS = 4 is below the working set"
+     Exactly 4 distinct files were read (asteroid.js 34, player.js 15,
+     main.js 2, collision.js 2). The cap never bound.
+
+  What the data shows is R6: 8 of 47 ranged reads were impossible, each
+  answered with ok:true and one line. The read guards were firing correctly
+  against a cause they could not address. Re-measure after R6 before touching
+  any detector - tuning one now would tune it against a cause that is gone.
+
+================================================================================
+Suite, all three batches
+================================================================================
+3843 passed, 2 skipped, 1 warning in 408.19s (0:06:48)
+Session baseline this morning: 3709 passed / 1 failed.
+32 tests added across the day.

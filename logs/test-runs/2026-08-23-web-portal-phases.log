@@ -1,0 +1,153 @@
+SHAMSU — the web portal: the link, the black hole, the disconnection
+====================================================================
+2026-08-23 · branch small-shamsu-new
+
+Reported: "the web is not working as it should, the chat is all crooked and out
+of sync, and when i give a prompt from the web the thing didnt send the cli or
+the system, and had an error. also we dont have to verify the web session with
+tokens, it should be directly accessible with the simple link."
+
+Diagnosed by driving the portal exactly as a browser does, against the real
+session `20260822-183305-4975`:
+
+    0 user      turn-775 src=cli | Act as an expert game developer. Scaffold...
+    1 assistant turn-775 src=cli | The model did not respond within 600s.
+    2 user      turn-fe7 src=web | okay can you wirte the plan in an md file?
+    3 user      turn-a26 src=web | say hi
+
+Two web turns, both accepted, NEITHER ANSWERED. That is the report, in the data.
+
+ONE THING I SUSPECTED AND WAS WRONG ABOUT: I thought the message ordering was
+scrambled, because the tail of the list read assistant-then-user-then-user. It
+is correct - turn 775 timed out, and the two web turns simply never produced an
+answer to interleave. Checked before saying so.
+
+
+PHASE 1 — the link is the whole thing
+--------------------------------------
+The shell (`GET /`) was served WITHOUT a token, because it has to be: the
+browser has nowhere to put one before the page loads. Every `/api/*` demanded
+one. So `http://127.0.0.1:8765/` - the address anyone would type or bookmark -
+rendered a complete-looking application that then failed every single request
+with a 401, silently. A link that half-works is worse than one that refuses.
+
+`WebPortal.requires_token` is now False on a loopback bind, and `url` is the
+bare address.
+
+WHAT STILL GUARDS IT: the portal binds 127.0.0.1 and is unreachable from
+anywhere else on the network, and `_origin_is_local` refuses a foreign Origin -
+the DNS-rebinding attack the token was never the answer to. Both were already
+there and both were doing the actual work.
+
+WHAT IT DOES NOT GUARD, stated plainly: another program on this machine can now
+drive the agent, which writes files and runs commands. That is the trade.
+
+The token comes straight back when the bind is not loopback, because at that
+point anything on the LAN could do the same. `SHAMSU_WEB_TOKEN=1` demands it
+anyway.
+
+Also corrected while in there: three panels described the portal as
+"read-only ... cannot start or stop a run". It was never read-only -
+`POST .../prompt` has always started a turn - and saying otherwise made it look
+safer than it is.
+
+
+PHASE 2 — a prompt cannot vanish
+---------------------------------
+`_looks_like_id` only rejects path-shaped strings:
+
+    'None'      -> True
+    'undefined' -> True
+
+So `POST /api/workspaces/{id}/sessions/undefined/prompt` returned
+**202 accepted, queue_id 3**, and the turn then ran against a thread nobody
+could open: no answer, no error, no trace. Demonstrated, not theorised.
+
+`api.session_exists` now gates the route; an unknown id is a 404 where it is
+sent.
+
+The second half: a worker that raised marked its queue row CANCELLED and said
+nothing else. Surfaces render from the turn stream, so the browser saw
+`turn.start` and then silence for ever - a bubble that never resolves, which is
+exactly what "out of sync" looks like from the outside.
+`QueuedRunner._announce_failure` publishes `error` + `turn.end status=failed`,
+so a turn that dies ends as visibly as one that succeeds.
+
+
+PHASE 3 — the surfaces were not out of sync, they were not connected
+---------------------------------------------------------------------
+The important one, and the answer to "it didn't send to the cli".
+
+`WebPortal.runner` builds its own `QueuedRunner(surface="web")`, which
+constructs a SEPARATE `SimpleChatLoop` with a SEPARATE `TurnStream`. A renderer
+is attached to one stream by whoever built it - so the CLI, which only ever
+attached to streams it built itself, had no way to know the web's existed. A
+prompt sent from the browser ran to completion in the same process with the
+terminal showing nothing at all.
+
+`TurnStream.add_observer` watches EVERY stream in this process. Process-wide
+rather than passed down, because the alternative is threading a display through
+`QueuedRunner`, the Telegram bridge and every future entry point, each of which
+would then have to remember.
+
+The framed TUI registers one and now shows, in the surface's own colour:
+
+    ◈ write the plan to an md file        <- a prompt from the browser
+    ◆ Wrote PLAN.md with 5 steps.         <- its answer
+    · web turn failed                     <- or how it died
+
+Deliberately NOT the tool rows: a foreign turn's forty action lines interleaved
+with this terminal's own would make both unreadable, and the browser is already
+showing them to whoever is watching there.
+
+
+PHASE 4 — the browser stops flying blind
+-----------------------------------------
+`case "status": setFooter(event.text)` - the text was rendered and `event.data`
+was dropped on the floor. Every number was already riding in on the event and
+none were shown, so a run 19 rounds deep at 84% of its window with the model at
+3 tok/s looked exactly like a healthy one until it failed.
+
+    thinking... 50s · rnd 14/24 · ctx 71% · 34 tok/s
+
+And `turn.end` now colours the footer red when the verdict is `failed`, because
+a turn that died must not read as one that worked.
+
+
+TESTS
+-----
+    tests/test_web_access.py    12 passed  (new)
+    tests/test_webui.py         ...
+    tests/test_web_conversation.py, test_web_in_loop.py, test_webui_settings.py
+                               116 passed combined
+    tests/test_tui.py          131 passed with test_turn_stream_parity.py
+
+Four existing tests in `test_webui.py` asserted the OLD token behaviour and now
+assert the policy instead - a loopback request is served, and `SHAMSU_WEB_TOKEN=1`
+brings the 401 back. Two more asserted the "read-only" wording that was never
+true. Changed deliberately, and each says so in place.
+
+Worth naming:
+
+    test_the_plain_link_drives_the_whole_api
+    test_a_bind_beyond_this_machine_still_demands_the_token
+    test_a_foreign_origin_is_still_refused
+        the DNS-rebinding defence is what actually guards a loopback portal and
+        must not have gone away with the token.
+    test_a_prompt_for_a_session_that_does_not_exist_is_refused
+        parametrised over `undefined`, `None` and a well-formed id that is not
+        there.
+    test_a_failed_turn_ends_visibly_on_the_stream
+    test_a_turn_the_terminal_never_started_still_shows_up
+        publishes on a stream the CLI never built, asserts the prompt, the
+        answer and the failure all land - then detaches and asserts silence.
+    test_a_foreign_turns_tool_rows_do_not_flood_this_terminal
+    test_an_observer_that_raises_never_fails_the_turn
+
+
+NOT DONE
+--------
+The 600s timeout itself. Both web turns in the reported session died on it, and
+that is a model/context problem rather than a portal one - the portal's fault
+was only that it never said so. Phases 2 and 4 make it visible; making it
+rarer is Fix 08 territory.

@@ -7,9 +7,11 @@ sharing the live run state means sharing the process. When the control plane
 lands, the portal can move out into `shamsu serve` and this becomes the
 fallback rather than the only option.
 
-The token is printed exactly once, as part of the URL, and never again - not in
-`/web status`, not in a log. A URL that has scrolled off is recovered by
-restarting the portal, which mints a new one.
+On a loopback bind there is no token at all: the plain address is the whole
+link, so it can be bookmarked and typed from memory. See
+`WebPortal.requires_token` for why, and for what still guards it. A bind that
+is reachable beyond this machine keeps the token, printed once as part of the
+URL and never again.
 """
 from __future__ import annotations
 
@@ -53,6 +55,22 @@ class WebPortalManager:
 _MANAGER = WebPortalManager()
 
 
+def _running_panel(portal: object) -> str:
+    """What `/web status` says about a portal that is up."""
+    if not getattr(portal, "requires_token", True):
+        return (
+            f"Running at {portal.url}\n\n"
+            "Loopback only, so the plain link is the whole thing - no token to "
+            "carry, nothing to re-copy. Bookmark it."
+        )
+    return (
+        f"Running at {portal.base_url}\n\n"
+        "This bind is reachable beyond this machine, so an access token is "
+        "required and is only shown at startup. Run `/web stop` then `/web` "
+        "for a fresh link."
+    )
+
+
 def handle_web_command(user_input: str, workspace: Path, console: Console) -> None:
     parts = (user_input or "").split()
     subcommand = parts[1].lower() if len(parts) > 1 else "start"
@@ -72,9 +90,7 @@ def handle_web_command(user_input: str, workspace: Path, console: Console) -> No
         portal = _MANAGER.running
         console.print(
             Panel(
-                f"Running at {portal.base_url}\n\n"
-                "The access token is only shown when the portal starts. "
-                "Run `/web stop` then `/web` to get a fresh link."
+                _running_panel(portal)
                 if portal
                 else "Not running. Start it with `/web`.",
                 title="Web View",
@@ -121,10 +137,15 @@ def handle_web_command(user_input: str, workspace: Path, console: Console) -> No
     console.print(
         Panel(
             f"Web view: {portal.url}\n\n"
-            "Loopback only, and the link above carries a one-time access token "
-            "for this run.\n"
-            "It is read-only: it follows runs started from the CLI or Telegram, "
-            "and cannot start or stop one.",
+            + (
+                "Loopback only, so the plain link is the whole thing - no "
+                "token, nothing to re-copy. Bookmark it.\n"
+                if not portal.requires_token
+                else "This bind is reachable beyond this machine, so the link "
+                "carries a one-time access token for this run.\n"
+            )
+            + "It follows runs started from the CLI or Telegram, and can start "
+            "one of its own.",
             title="Web View",
             border_style="green",
         )

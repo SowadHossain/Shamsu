@@ -100,6 +100,23 @@ def sessions_payload(workspace: Path) -> dict[str, Any]:
     }
 
 
+def session_exists(workspace: Path, session_id: str) -> bool:
+    """Whether this workspace really has that thread.
+
+    Cheap and total: `SessionManager.resolve` raises for an unknown id, and
+    everything else here treats an unreadable session as absent rather than as
+    a reason to fail. Used before work is queued, so a prompt for a thread that
+    does not exist is refused where it is sent instead of disappearing.
+    """
+    if not str(session_id or "").strip():
+        return False
+    try:
+        SessionManager(Path(workspace).resolve()).logger_for(session_id)
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
 def session_messages(workspace: Path, session_id: str, after: int = 0) -> dict[str, Any]:
     """The conversation, as a person had it.
 

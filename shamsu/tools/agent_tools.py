@@ -1852,7 +1852,10 @@ class AgentToolRegistry:
         if start is not None or end is not None:
             start = max(1, start if start is not None else 1)
             end = end if end is not None else total_lines
-            end = min(total_lines, max(end, start))
+            refused = _refuse_impossible_range(asked, start, end, total_lines)
+            if refused is not None:
+                return refused
+            end = min(total_lines, end)
             selected = lines[start - 1 : end]
             content = "\n".join(selected)
             if len(content) > MAX_READ_CHARS:
@@ -3854,6 +3857,65 @@ def _unwrap_serialized_tool_call(content: str, tool: str) -> str | None:
         return None
     inner = arguments.get("content")
     return inner if isinstance(inner, str) and inner.strip() else None
+
+
+def _refuse_impossible_range(
+    asked: str, start: int, end: int, total_lines: int
+) -> ToolResult | None:
+    """Say a line range cannot be read, rather than quietly reading something else.
+
+    `end = min(total_lines, max(end, start))` used to make every malformed range
+    legal. `read_file(player.js, start_line=145, end_line=20)` came back
+    `ok: true`, `"Read file."`, one line of content and `end_line: 145` - the
+    argument silently rewritten to something the model never asked for.
+
+    Live 2026-08-23 in `F:\\Work\\demo2\\test2`: 8 of 47 ranged reads carried
+    `end_line < start_line`, every one answered with a single line and a
+    success, and that exact payload went out FIVE times. The read-loop guards
+    fired and could not help - a model has no reason to change a call it was
+    told worked. Half of all 90 tool results in that session were reads, and
+    two turns ended on "I stopped after 24 steps without finishing."
+
+    So: name the mistake, and give the call that was probably meant. A refusal
+    the model can act on costs one round; a success it cannot learn from costs
+    the rest of the turn.
+    """
+    if end < start:
+        # The overwhelmingly likely intent - it wanted a WINDOW and put the
+        # size where the end goes, or transposed the two.
+        suggested = start + max(end, 1) - 1 if end >= 1 else start + 19
+        return ToolResult(
+            False,
+            f"end_line ({end}) is before start_line ({start}), so that range is empty "
+            f"and {asked} was NOT read.\n\n"
+            f"end_line is a line NUMBER, not a count. For the {max(end, 1)} lines "
+            f"starting at {start}, call read_file with start_line={start} and "
+            f"end_line={suggested}. To read to the end of the file, leave end_line out.",
+            {
+                "filepath": asked,
+                "total_lines": total_lines,
+                "start_line": start,
+                "end_line": end,
+                "impossible_range": True,
+            },
+        )
+    if start > total_lines:
+        # The other silent empty: `lines[start-1:end]` is [] past EOF, and that
+        # came back as ok with no content at all.
+        return ToolResult(
+            False,
+            f"start_line {start} is past the end of {asked}, which has "
+            f"{total_lines} line(s), so nothing was read.\n\n"
+            f"Ask for a line within the file, or leave start_line and end_line "
+            "out to read the whole thing.",
+            {
+                "filepath": asked,
+                "total_lines": total_lines,
+                "start_line": start,
+                "past_end": True,
+            },
+        )
+    return None
 
 
 def _breaks_working_python(target: Path, content: str) -> str:

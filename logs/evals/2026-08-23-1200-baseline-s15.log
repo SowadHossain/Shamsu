@@ -1,0 +1,641 @@
+﻿SHAMSU overnight eval
+=====================
+started      : 2026-08-23 12:00:08
+branch       : small-shamsu-new
+HEAD         : 4e173fe
+samples      : 15
+report (md)  : F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-1200-baseline-s15.md
+report (json): F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-1200-baseline-s15.json
+artifacts    : F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15
+
+working tree at start:
+ M PROGRESS_LOG.md
+ M logs/test-runs/2026-08-22-framed-tui.log
+ M shamsu/agents/chat_state.py
+ M shamsu/agents/simple_chat.py
+ M shamsu/cli/live_console.py
+ M shamsu/cli/repl.py
+ M shamsu/cli/tui.py
+ M shamsu/control/runner.py
+ M shamsu/runtime/turn_stream.py
+ M shamsu/webui/api.py
+ M shamsu/webui/cli.py
+ M shamsu/webui/local.py
+ M shamsu/webui/server.py
+ M shamsu/webui/static/app.css
+ M shamsu/webui/static/app.js
+ M tests/test_simple_chat.py
+ M tests/test_tui.py
+ M tests/test_webui.py
+?? logs/evals/
+?? logs/test-runs/2026-08-23-rc9-digest-and-honest-pressure.log
+?? logs/test-runs/2026-08-23-web-portal-phases.log
+?? scripts/overnight-eval.ps1
+?? tests/test_web_access.py
+
+NOTE: a dirty tree means this run measured uncommitted work. If another agent
+edits this checkout mid-run, later cases see different code from earlier ones
+and the result is not a baseline. Check git status against the list above
+before trusting a comparison.
+model        : qwen3.5:9b-q4_K_M
+
+[eval] running 16 case(s) x 15 sample(s) = 240 attempt(s) (artifacts: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55)
+[eval] case 1/16 qa_reads_repo_fact starting (15 sample(s))
+[eval] start attempt 1/240: qa_reads_repo_fact sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 1/240: qa_reads_repo_fact sample 1/15 PASS in 48.8s
+[eval] start attempt 2/240: qa_reads_repo_fact sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 2/240: qa_reads_repo_fact sample 2/15 PASS in 20.9s
+[eval] start attempt 3/240: qa_reads_repo_fact sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 3/240: qa_reads_repo_fact sample 3/15 PASS in 25.9s
+[eval] start attempt 4/240: qa_reads_repo_fact sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 4/240: qa_reads_repo_fact sample 4/15 PASS in 22.4s
+[eval] start attempt 5/240: qa_reads_repo_fact sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 5/240: qa_reads_repo_fact sample 5/15 PASS in 22.4s
+[eval] start attempt 6/240: qa_reads_repo_fact sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 6/240: qa_reads_repo_fact sample 6/15 PASS in 25.1s
+[eval] start attempt 7/240: qa_reads_repo_fact sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 7/240: qa_reads_repo_fact sample 7/15 PASS in 31.4s
+[eval] start attempt 8/240: qa_reads_repo_fact sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 8/240: qa_reads_repo_fact sample 8/15 PASS in 50.5s
+[eval] start attempt 9/240: qa_reads_repo_fact sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 9/240: qa_reads_repo_fact sample 9/15 PASS in 41.3s
+[eval] start attempt 10/240: qa_reads_repo_fact sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 10/240: qa_reads_repo_fact sample 10/15 PASS in 19.5s
+[eval] start attempt 11/240: qa_reads_repo_fact sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 11/240: qa_reads_repo_fact sample 11/15 PASS in 21.9s
+[eval] start attempt 12/240: qa_reads_repo_fact sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 12/240: qa_reads_repo_fact sample 12/15 PASS in 22.1s
+[eval] start attempt 13/240: qa_reads_repo_fact sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 13/240: qa_reads_repo_fact sample 13/15 PASS in 20.4s
+[eval] start attempt 14/240: qa_reads_repo_fact sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 14/240: qa_reads_repo_fact sample 14/15 PASS in 22.1s
+[eval] start attempt 15/240: qa_reads_repo_fact sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\qa_r...)
+[eval] finish attempt 15/240: qa_reads_repo_fact sample 15/15 PASS in 22.0s
+[eval] case 1/16 qa_reads_repo_fact PASS 15/15 in 6m56s
+[eval] case 2/16 create_file starting (15 sample(s))
+[eval] start attempt 16/240: create_file sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 16/240: create_file sample 1/15 PASS in 31.8s
+[eval] start attempt 17/240: create_file sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 17/240: create_file sample 2/15 PASS in 20.9s
+[eval] start attempt 18/240: create_file sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 18/240: create_file sample 3/15 PASS in 19.9s
+[eval] start attempt 19/240: create_file sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 19/240: create_file sample 4/15 PASS in 29.3s
+[eval] start attempt 20/240: create_file sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 20/240: create_file sample 5/15 PASS in 28.0s
+[eval] start attempt 21/240: create_file sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 21/240: create_file sample 6/15 PASS in 22.8s
+[eval] start attempt 22/240: create_file sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 22/240: create_file sample 7/15 PASS in 23.1s
+[eval] start attempt 23/240: create_file sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 23/240: create_file sample 8/15 PASS in 23.4s
+[eval] start attempt 24/240: create_file sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 24/240: create_file sample 9/15 PASS in 20.2s
+[eval] start attempt 25/240: create_file sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 25/240: create_file sample 10/15 PASS in 31.9s
+[eval] start attempt 26/240: create_file sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 26/240: create_file sample 11/15 PASS in 27.1s
+[eval] start attempt 27/240: create_file sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 27/240: create_file sample 12/15 PASS in 20.1s
+[eval] start attempt 28/240: create_file sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 28/240: create_file sample 13/15 PASS in 30.3s
+[eval] start attempt 29/240: create_file sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 29/240: create_file sample 14/15 PASS in 16.6s
+[eval] start attempt 30/240: create_file sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\crea...)
+[eval] finish attempt 30/240: create_file sample 15/15 PASS in 17.8s
+[eval] case 2/16 create_file PASS 15/15 in 6m03s
+[eval] case 3/16 edit_file_targeted starting (15 sample(s))
+[eval] start attempt 31/240: edit_file_targeted sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 31/240: edit_file_targeted sample 1/15 PASS in 17.0s
+[eval] start attempt 32/240: edit_file_targeted sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 32/240: edit_file_targeted sample 2/15 PASS in 21.1s
+[eval] start attempt 33/240: edit_file_targeted sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 33/240: edit_file_targeted sample 3/15 PASS in 16.3s
+[eval] start attempt 34/240: edit_file_targeted sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 34/240: edit_file_targeted sample 4/15 PASS in 20.2s
+[eval] start attempt 35/240: edit_file_targeted sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 35/240: edit_file_targeted sample 5/15 PASS in 16.8s
+[eval] start attempt 36/240: edit_file_targeted sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 36/240: edit_file_targeted sample 6/15 PASS in 16.2s
+[eval] start attempt 37/240: edit_file_targeted sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 37/240: edit_file_targeted sample 7/15 PASS in 16.6s
+[eval] start attempt 38/240: edit_file_targeted sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 38/240: edit_file_targeted sample 8/15 PASS in 14.6s
+[eval] start attempt 39/240: edit_file_targeted sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 39/240: edit_file_targeted sample 9/15 PASS in 20.2s
+[eval] start attempt 40/240: edit_file_targeted sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 40/240: edit_file_targeted sample 10/15 PASS in 19.7s
+[eval] start attempt 41/240: edit_file_targeted sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 41/240: edit_file_targeted sample 11/15 PASS in 16.0s
+[eval] start attempt 42/240: edit_file_targeted sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 42/240: edit_file_targeted sample 12/15 PASS in 15.9s
+[eval] start attempt 43/240: edit_file_targeted sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 43/240: edit_file_targeted sample 13/15 PASS in 16.0s
+[eval] start attempt 44/240: edit_file_targeted sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 44/240: edit_file_targeted sample 14/15 PASS in 18.0s
+[eval] start attempt 45/240: edit_file_targeted sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\edit...)
+[eval] finish attempt 45/240: edit_file_targeted sample 15/15 PASS in 21.1s
+[eval] case 3/16 edit_file_targeted PASS 15/15 in 4m25s
+[eval] case 4/16 bugfix_syntax_error starting (15 sample(s))
+[eval] start attempt 46/240: bugfix_syntax_error sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 46/240: bugfix_syntax_error sample 1/15 PASS in 15.6s
+[eval] start attempt 47/240: bugfix_syntax_error sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 47/240: bugfix_syntax_error sample 2/15 PASS in 15.5s
+[eval] start attempt 48/240: bugfix_syntax_error sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 48/240: bugfix_syntax_error sample 3/15 PASS in 18.5s
+[eval] start attempt 49/240: bugfix_syntax_error sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 49/240: bugfix_syntax_error sample 4/15 PASS in 16.3s
+[eval] start attempt 50/240: bugfix_syntax_error sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 50/240: bugfix_syntax_error sample 5/15 PASS in 24.5s
+[eval] start attempt 51/240: bugfix_syntax_error sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 51/240: bugfix_syntax_error sample 6/15 PASS in 22.6s
+[eval] start attempt 52/240: bugfix_syntax_error sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 52/240: bugfix_syntax_error sample 7/15 PASS in 15.1s
+[eval] start attempt 53/240: bugfix_syntax_error sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 53/240: bugfix_syntax_error sample 8/15 PASS in 20.7s
+[eval] start attempt 54/240: bugfix_syntax_error sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 54/240: bugfix_syntax_error sample 9/15 PASS in 16.8s
+[eval] start attempt 55/240: bugfix_syntax_error sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 55/240: bugfix_syntax_error sample 10/15 PASS in 23.0s
+[eval] start attempt 56/240: bugfix_syntax_error sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 56/240: bugfix_syntax_error sample 11/15 PASS in 18.2s
+[eval] start attempt 57/240: bugfix_syntax_error sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 57/240: bugfix_syntax_error sample 12/15 PASS in 19.5s
+[eval] start attempt 58/240: bugfix_syntax_error sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 58/240: bugfix_syntax_error sample 13/15 PASS in 34.8s
+[eval] start attempt 59/240: bugfix_syntax_error sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 59/240: bugfix_syntax_error sample 14/15 PASS in 25.5s
+[eval] start attempt 60/240: bugfix_syntax_error sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\bugf...)
+[eval] finish attempt 60/240: bugfix_syntax_error sample 15/15 PASS in 27.7s
+[eval] case 4/16 bugfix_syntax_error PASS 15/15 in 5m14s
+[eval] case 5/16 run_command_verify starting (15 sample(s))
+[eval] start attempt 61/240: run_command_verify sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 61/240: run_command_verify sample 1/15 PASS in 31.3s
+[eval] start attempt 62/240: run_command_verify sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 62/240: run_command_verify sample 2/15 PASS in 12.3s
+[eval] start attempt 63/240: run_command_verify sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 63/240: run_command_verify sample 3/15 PASS in 22.7s
+[eval] start attempt 64/240: run_command_verify sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 64/240: run_command_verify sample 4/15 PASS in 17.6s
+[eval] start attempt 65/240: run_command_verify sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 65/240: run_command_verify sample 5/15 PASS in 19.3s
+[eval] start attempt 66/240: run_command_verify sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 66/240: run_command_verify sample 6/15 PASS in 18.4s
+[eval] start attempt 67/240: run_command_verify sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 67/240: run_command_verify sample 7/15 PASS in 12.6s
+[eval] start attempt 68/240: run_command_verify sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 68/240: run_command_verify sample 8/15 PASS in 17.6s
+[eval] start attempt 69/240: run_command_verify sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 69/240: run_command_verify sample 9/15 PASS in 15.7s
+[eval] start attempt 70/240: run_command_verify sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 70/240: run_command_verify sample 10/15 PASS in 24.3s
+[eval] start attempt 71/240: run_command_verify sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 71/240: run_command_verify sample 11/15 PASS in 20.0s
+[eval] start attempt 72/240: run_command_verify sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 72/240: run_command_verify sample 12/15 PASS in 16.5s
+[eval] start attempt 73/240: run_command_verify sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 73/240: run_command_verify sample 13/15 PASS in 18.1s
+[eval] start attempt 74/240: run_command_verify sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 74/240: run_command_verify sample 14/15 PASS in 21.1s
+[eval] start attempt 75/240: run_command_verify sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\run_...)
+[eval] finish attempt 75/240: run_command_verify sample 15/15 PASS in 27.8s
+[eval] case 5/16 run_command_verify PASS 15/15 in 4m55s
+[eval] case 6/16 ask_user_clarifies starting (15 sample(s))
+[eval] start attempt 76/240: ask_user_clarifies sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 76/240: ask_user_clarifies sample 1/15 PASS in 18.2s
+[eval] start attempt 77/240: ask_user_clarifies sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 77/240: ask_user_clarifies sample 2/15 PASS in 25.5s
+[eval] start attempt 78/240: ask_user_clarifies sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 78/240: ask_user_clarifies sample 3/15 PASS in 21.8s
+[eval] start attempt 79/240: ask_user_clarifies sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 79/240: ask_user_clarifies sample 4/15 PASS in 22.9s
+[eval] start attempt 80/240: ask_user_clarifies sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 80/240: ask_user_clarifies sample 5/15 PASS in 19.8s
+[eval] start attempt 81/240: ask_user_clarifies sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 81/240: ask_user_clarifies sample 6/15 PASS in 24.2s
+[eval] start attempt 82/240: ask_user_clarifies sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 82/240: ask_user_clarifies sample 7/15 PASS in 29.2s
+[eval] start attempt 83/240: ask_user_clarifies sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 83/240: ask_user_clarifies sample 8/15 PASS in 23.6s
+[eval] start attempt 84/240: ask_user_clarifies sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 84/240: ask_user_clarifies sample 9/15 PASS in 26.9s
+[eval] start attempt 85/240: ask_user_clarifies sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 85/240: ask_user_clarifies sample 10/15 PASS in 39.3s
+[eval] start attempt 86/240: ask_user_clarifies sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 86/240: ask_user_clarifies sample 11/15 PASS in 39.5s
+[eval] start attempt 87/240: ask_user_clarifies sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 87/240: ask_user_clarifies sample 12/15 PASS in 17.6s
+[eval] start attempt 88/240: ask_user_clarifies sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 88/240: ask_user_clarifies sample 13/15 PASS in 43.7s
+[eval] start attempt 89/240: ask_user_clarifies sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 89/240: ask_user_clarifies sample 14/15 PASS in 23.8s
+[eval] start attempt 90/240: ask_user_clarifies sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 90/240: ask_user_clarifies sample 15/15 PASS in 23.9s
+[eval] case 6/16 ask_user_clarifies PASS 15/15 in 6m40s
+[eval] case 7/16 rename_file_via_move_tool starting (15 sample(s))
+[eval] start attempt 91/240: rename_file_via_move_tool sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 91/240: rename_file_via_move_tool sample 1/15 PASS in 12.6s
+[eval] start attempt 92/240: rename_file_via_move_tool sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 92/240: rename_file_via_move_tool sample 2/15 PASS in 10.8s
+[eval] start attempt 93/240: rename_file_via_move_tool sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 93/240: rename_file_via_move_tool sample 3/15 PASS in 13.4s
+[eval] start attempt 94/240: rename_file_via_move_tool sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 94/240: rename_file_via_move_tool sample 4/15 PASS in 12.1s
+[eval] start attempt 95/240: rename_file_via_move_tool sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 95/240: rename_file_via_move_tool sample 5/15 PASS in 13.2s
+[eval] start attempt 96/240: rename_file_via_move_tool sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 96/240: rename_file_via_move_tool sample 6/15 PASS in 19.7s
+[eval] start attempt 97/240: rename_file_via_move_tool sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 97/240: rename_file_via_move_tool sample 7/15 PASS in 20.3s
+[eval] start attempt 98/240: rename_file_via_move_tool sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 98/240: rename_file_via_move_tool sample 8/15 PASS in 16.6s
+[eval] start attempt 99/240: rename_file_via_move_tool sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 99/240: rename_file_via_move_tool sample 9/15 PASS in 13.6s
+[eval] start attempt 100/240: rename_file_via_move_tool sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 100/240: rename_file_via_move_tool sample 10/15 PASS in 11.4s
+[eval] start attempt 101/240: rename_file_via_move_tool sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 101/240: rename_file_via_move_tool sample 11/15 PASS in 11.2s
+[eval] start attempt 102/240: rename_file_via_move_tool sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 102/240: rename_file_via_move_tool sample 12/15 PASS in 10.6s
+[eval] start attempt 103/240: rename_file_via_move_tool sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 103/240: rename_file_via_move_tool sample 13/15 PASS in 10.8s
+[eval] start attempt 104/240: rename_file_via_move_tool sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 104/240: rename_file_via_move_tool sample 14/15 PASS in 10.4s
+[eval] start attempt 105/240: rename_file_via_move_tool sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\rena...)
+[eval] finish attempt 105/240: rename_file_via_move_tool sample 15/15 PASS in 10.7s
+[eval] case 7/16 rename_file_via_move_tool PASS 15/15 in 3m17s
+[eval] case 8/16 ask_before_choosing_an_approach starting (15 sample(s))
+[eval] start attempt 106/240: ask_before_choosing_an_approach sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 106/240: ask_before_choosing_an_approach sample 1/15 FAIL in 1m02s
+[eval] start attempt 107/240: ask_before_choosing_an_approach sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 107/240: ask_before_choosing_an_approach sample 2/15 FAIL in 1m01s
+[eval] start attempt 108/240: ask_before_choosing_an_approach sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 108/240: ask_before_choosing_an_approach sample 3/15 FAIL in 1m16s
+[eval] start attempt 109/240: ask_before_choosing_an_approach sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 109/240: ask_before_choosing_an_approach sample 4/15 PASS in 11.5s
+[eval] start attempt 110/240: ask_before_choosing_an_approach sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 110/240: ask_before_choosing_an_approach sample 5/15 FAIL in 59.4s
+[eval] start attempt 111/240: ask_before_choosing_an_approach sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 111/240: ask_before_choosing_an_approach sample 6/15 FAIL in 1m08s
+[eval] start attempt 112/240: ask_before_choosing_an_approach sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 112/240: ask_before_choosing_an_approach sample 7/15 FAIL in 1m06s
+[eval] start attempt 113/240: ask_before_choosing_an_approach sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 113/240: ask_before_choosing_an_approach sample 8/15 PASS in 12.0s
+[eval] start attempt 114/240: ask_before_choosing_an_approach sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 114/240: ask_before_choosing_an_approach sample 9/15 FAIL in 52.0s
+[eval] start attempt 115/240: ask_before_choosing_an_approach sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 115/240: ask_before_choosing_an_approach sample 10/15 FAIL in 1m10s
+[eval] start attempt 116/240: ask_before_choosing_an_approach sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 116/240: ask_before_choosing_an_approach sample 11/15 FAIL in 1m27s
+[eval] start attempt 117/240: ask_before_choosing_an_approach sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 117/240: ask_before_choosing_an_approach sample 12/15 PASS in 12.9s
+[eval] start attempt 118/240: ask_before_choosing_an_approach sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 118/240: ask_before_choosing_an_approach sample 13/15 FAIL in 51.7s
+[eval] start attempt 119/240: ask_before_choosing_an_approach sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 119/240: ask_before_choosing_an_approach sample 14/15 FAIL in 1m54s
+[eval] start attempt 120/240: ask_before_choosing_an_approach sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 120/240: ask_before_choosing_an_approach sample 15/15 FAIL in 1m06s
+[eval] case 8/16 ask_before_choosing_an_approach FAIL 3/15 flaky in 14m31s
+[eval] case 9/16 ask_before_destructive_guess starting (15 sample(s))
+[eval] start attempt 121/240: ask_before_destructive_guess sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 121/240: ask_before_destructive_guess sample 1/15 FAIL in 11.4s
+[eval] start attempt 122/240: ask_before_destructive_guess sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 122/240: ask_before_destructive_guess sample 2/15 FAIL in 13.6s
+[eval] start attempt 123/240: ask_before_destructive_guess sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 123/240: ask_before_destructive_guess sample 3/15 FAIL in 11.1s
+[eval] start attempt 124/240: ask_before_destructive_guess sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 124/240: ask_before_destructive_guess sample 4/15 PASS in 9.7s
+[eval] start attempt 125/240: ask_before_destructive_guess sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 125/240: ask_before_destructive_guess sample 5/15 PASS in 10.5s
+[eval] start attempt 126/240: ask_before_destructive_guess sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 126/240: ask_before_destructive_guess sample 6/15 FAIL in 15.5s
+[eval] start attempt 127/240: ask_before_destructive_guess sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 127/240: ask_before_destructive_guess sample 7/15 FAIL in 12.2s
+[eval] start attempt 128/240: ask_before_destructive_guess sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 128/240: ask_before_destructive_guess sample 8/15 FAIL in 15.5s
+[eval] start attempt 129/240: ask_before_destructive_guess sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 129/240: ask_before_destructive_guess sample 9/15 FAIL in 12.5s
+[eval] start attempt 130/240: ask_before_destructive_guess sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 130/240: ask_before_destructive_guess sample 10/15 FAIL in 14.6s
+[eval] start attempt 131/240: ask_before_destructive_guess sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 131/240: ask_before_destructive_guess sample 11/15 PASS in 9.9s
+[eval] start attempt 132/240: ask_before_destructive_guess sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 132/240: ask_before_destructive_guess sample 12/15 FAIL in 12.0s
+[eval] start attempt 133/240: ask_before_destructive_guess sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 133/240: ask_before_destructive_guess sample 13/15 PASS in 8.9s
+[eval] start attempt 134/240: ask_before_destructive_guess sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 134/240: ask_before_destructive_guess sample 14/15 FAIL in 11.1s
+[eval] start attempt 135/240: ask_before_destructive_guess sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\ask_...)
+[eval] finish attempt 135/240: ask_before_destructive_guess sample 15/15 FAIL in 12.8s
+[eval] case 9/16 ask_before_destructive_guess FAIL 4/15 flaky in 3m01s
+[eval] case 10/16 does_not_ask_when_unambiguous starting (15 sample(s))
+[eval] start attempt 136/240: does_not_ask_when_unambiguous sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 136/240: does_not_ask_when_unambiguous sample 1/15 PASS in 14.0s
+[eval] start attempt 137/240: does_not_ask_when_unambiguous sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 137/240: does_not_ask_when_unambiguous sample 2/15 PASS in 10.6s
+[eval] start attempt 138/240: does_not_ask_when_unambiguous sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 138/240: does_not_ask_when_unambiguous sample 3/15 PASS in 14.0s
+[eval] start attempt 139/240: does_not_ask_when_unambiguous sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 139/240: does_not_ask_when_unambiguous sample 4/15 PASS in 10.1s
+[eval] start attempt 140/240: does_not_ask_when_unambiguous sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 140/240: does_not_ask_when_unambiguous sample 5/15 PASS in 16.7s
+[eval] start attempt 141/240: does_not_ask_when_unambiguous sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 141/240: does_not_ask_when_unambiguous sample 6/15 PASS in 14.8s
+[eval] start attempt 142/240: does_not_ask_when_unambiguous sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 142/240: does_not_ask_when_unambiguous sample 7/15 PASS in 12.2s
+[eval] start attempt 143/240: does_not_ask_when_unambiguous sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 143/240: does_not_ask_when_unambiguous sample 8/15 PASS in 16.7s
+[eval] start attempt 144/240: does_not_ask_when_unambiguous sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 144/240: does_not_ask_when_unambiguous sample 9/15 PASS in 13.1s
+[eval] start attempt 145/240: does_not_ask_when_unambiguous sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 145/240: does_not_ask_when_unambiguous sample 10/15 PASS in 10.4s
+[eval] start attempt 146/240: does_not_ask_when_unambiguous sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 146/240: does_not_ask_when_unambiguous sample 11/15 PASS in 10.2s
+[eval] start attempt 147/240: does_not_ask_when_unambiguous sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 147/240: does_not_ask_when_unambiguous sample 12/15 PASS in 14.2s
+[eval] start attempt 148/240: does_not_ask_when_unambiguous sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 148/240: does_not_ask_when_unambiguous sample 13/15 PASS in 10.1s
+[eval] start attempt 149/240: does_not_ask_when_unambiguous sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 149/240: does_not_ask_when_unambiguous sample 14/15 PASS in 14.1s
+[eval] start attempt 150/240: does_not_ask_when_unambiguous sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\does...)
+[eval] finish attempt 150/240: does_not_ask_when_unambiguous sample 15/15 PASS in 14.1s
+[eval] case 10/16 does_not_ask_when_unambiguous PASS 15/15 in 3m15s
+[eval] case 11/16 plan_references_only_real_files starting (15 sample(s))
+[eval] start attempt 151/240: plan_references_only_real_files sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 151/240: plan_references_only_real_files sample 1/15 PASS in 5.5s
+[eval] start attempt 152/240: plan_references_only_real_files sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 152/240: plan_references_only_real_files sample 2/15 PASS in 5.3s
+[eval] start attempt 153/240: plan_references_only_real_files sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 153/240: plan_references_only_real_files sample 3/15 PASS in 5.3s
+[eval] start attempt 154/240: plan_references_only_real_files sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 154/240: plan_references_only_real_files sample 4/15 PASS in 5.3s
+[eval] start attempt 155/240: plan_references_only_real_files sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 155/240: plan_references_only_real_files sample 5/15 PASS in 8.4s
+[eval] start attempt 156/240: plan_references_only_real_files sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 156/240: plan_references_only_real_files sample 6/15 PASS in 8.5s
+[eval] start attempt 157/240: plan_references_only_real_files sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 157/240: plan_references_only_real_files sample 7/15 PASS in 7.5s
+[eval] start attempt 158/240: plan_references_only_real_files sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 158/240: plan_references_only_real_files sample 8/15 PASS in 4.8s
+[eval] start attempt 159/240: plan_references_only_real_files sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 159/240: plan_references_only_real_files sample 9/15 PASS in 5.4s
+[eval] start attempt 160/240: plan_references_only_real_files sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 160/240: plan_references_only_real_files sample 10/15 PASS in 5.3s
+[eval] start attempt 161/240: plan_references_only_real_files sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 161/240: plan_references_only_real_files sample 11/15 PASS in 5.3s
+[eval] start attempt 162/240: plan_references_only_real_files sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 162/240: plan_references_only_real_files sample 12/15 PASS in 8.0s
+[eval] start attempt 163/240: plan_references_only_real_files sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 163/240: plan_references_only_real_files sample 13/15 PASS in 9.5s
+[eval] start attempt 164/240: plan_references_only_real_files sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 164/240: plan_references_only_real_files sample 14/15 PASS in 6.4s
+[eval] start attempt 165/240: plan_references_only_real_files sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\plan...)
+[eval] finish attempt 165/240: plan_references_only_real_files sample 15/15 PASS in 5.3s
+[eval] case 11/16 plan_references_only_real_files PASS 15/15 in 1m35s
+[eval] case 12/16 chat_plan_references_only_real_files starting (15 sample(s))
+[eval] start attempt 166/240: chat_plan_references_only_real_files sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 166/240: chat_plan_references_only_real_files sample 1/15 PASS in 1m45s
+[eval] start attempt 167/240: chat_plan_references_only_real_files sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 167/240: chat_plan_references_only_real_files sample 2/15 PASS in 1m02s
+[eval] start attempt 168/240: chat_plan_references_only_real_files sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 168/240: chat_plan_references_only_real_files sample 3/15 PASS in 44.0s
+[eval] start attempt 169/240: chat_plan_references_only_real_files sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 169/240: chat_plan_references_only_real_files sample 4/15 PASS in 46.7s
+[eval] start attempt 170/240: chat_plan_references_only_real_files sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 170/240: chat_plan_references_only_real_files sample 5/15 PASS in 1m27s
+[eval] start attempt 171/240: chat_plan_references_only_real_files sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 171/240: chat_plan_references_only_real_files sample 6/15 PASS in 2m25s
+[eval] start attempt 172/240: chat_plan_references_only_real_files sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 172/240: chat_plan_references_only_real_files sample 7/15 PASS in 50.7s
+[eval] start attempt 173/240: chat_plan_references_only_real_files sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 173/240: chat_plan_references_only_real_files sample 8/15 PASS in 2m08s
+[eval] start attempt 174/240: chat_plan_references_only_real_files sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 174/240: chat_plan_references_only_real_files sample 9/15 PASS in 1m13s
+[eval] start attempt 175/240: chat_plan_references_only_real_files sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 175/240: chat_plan_references_only_real_files sample 10/15 PASS in 1m05s
+[eval] start attempt 176/240: chat_plan_references_only_real_files sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 176/240: chat_plan_references_only_real_files sample 11/15 PASS in 1m13s
+[eval] start attempt 177/240: chat_plan_references_only_real_files sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 177/240: chat_plan_references_only_real_files sample 12/15 PASS in 1m29s
+[eval] start attempt 178/240: chat_plan_references_only_real_files sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 178/240: chat_plan_references_only_real_files sample 13/15 PASS in 1m20s
+[eval] start attempt 179/240: chat_plan_references_only_real_files sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 179/240: chat_plan_references_only_real_files sample 14/15 PASS in 35.4s
+[eval] start attempt 180/240: chat_plan_references_only_real_files sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\chat...)
+[eval] finish attempt 180/240: chat_plan_references_only_real_files sample 15/15 PASS in 48.5s
+[eval] case 12/16 chat_plan_references_only_real_files PASS 15/15 in 18m57s
+[eval] case 13/16 repairs_a_file_it_cannot_pattern_match starting (15 sample(s))
+[eval] start attempt 181/240: repairs_a_file_it_cannot_pattern_match sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 181/240: repairs_a_file_it_cannot_pattern_match sample 1/15 FAIL in 4m13s
+[eval] start attempt 182/240: repairs_a_file_it_cannot_pattern_match sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 182/240: repairs_a_file_it_cannot_pattern_match sample 2/15 PASS in 53.1s
+[eval] start attempt 183/240: repairs_a_file_it_cannot_pattern_match sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 183/240: repairs_a_file_it_cannot_pattern_match sample 3/15 PASS in 42.1s
+[eval] start attempt 184/240: repairs_a_file_it_cannot_pattern_match sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 184/240: repairs_a_file_it_cannot_pattern_match sample 4/15 FAIL in 5m00s
+[eval] start attempt 185/240: repairs_a_file_it_cannot_pattern_match sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 185/240: repairs_a_file_it_cannot_pattern_match sample 5/15 PASS in 45.4s
+[eval] start attempt 186/240: repairs_a_file_it_cannot_pattern_match sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 186/240: repairs_a_file_it_cannot_pattern_match sample 6/15 PASS in 37.5s
+[eval] start attempt 187/240: repairs_a_file_it_cannot_pattern_match sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 187/240: repairs_a_file_it_cannot_pattern_match sample 7/15 PASS in 1m45s
+[eval] start attempt 188/240: repairs_a_file_it_cannot_pattern_match sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 188/240: repairs_a_file_it_cannot_pattern_match sample 8/15 PASS in 3m04s
+[eval] start attempt 189/240: repairs_a_file_it_cannot_pattern_match sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 189/240: repairs_a_file_it_cannot_pattern_match sample 9/15 PASS in 1m49s
+[eval] start attempt 190/240: repairs_a_file_it_cannot_pattern_match sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 190/240: repairs_a_file_it_cannot_pattern_match sample 10/15 PASS in 49.5s
+[eval] start attempt 191/240: repairs_a_file_it_cannot_pattern_match sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 191/240: repairs_a_file_it_cannot_pattern_match sample 11/15 PASS in 33.2s
+[eval] start attempt 192/240: repairs_a_file_it_cannot_pattern_match sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 192/240: repairs_a_file_it_cannot_pattern_match sample 12/15 PASS in 29.9s
+[eval] start attempt 193/240: repairs_a_file_it_cannot_pattern_match sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 193/240: repairs_a_file_it_cannot_pattern_match sample 13/15 PASS in 48.8s
+[eval] start attempt 194/240: repairs_a_file_it_cannot_pattern_match sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 194/240: repairs_a_file_it_cannot_pattern_match sample 14/15 FAIL in 5m00s
+[eval] start attempt 195/240: repairs_a_file_it_cannot_pattern_match sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\repa...)
+[eval] finish attempt 195/240: repairs_a_file_it_cannot_pattern_match sample 15/15 PASS in 25.2s
+[eval] case 13/16 repairs_a_file_it_cannot_pattern_match PASS 12/15 flaky in 26m58s
+[eval] case 14/16 answers_instead_of_reading_forever starting (15 sample(s))
+[eval] start attempt 196/240: answers_instead_of_reading_forever sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 196/240: answers_instead_of_reading_forever sample 1/15 PASS in 1m01s
+[eval] start attempt 197/240: answers_instead_of_reading_forever sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 197/240: answers_instead_of_reading_forever sample 2/15 PASS in 29.8s
+[eval] start attempt 198/240: answers_instead_of_reading_forever sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 198/240: answers_instead_of_reading_forever sample 3/15 PASS in 32.0s
+[eval] start attempt 199/240: answers_instead_of_reading_forever sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 199/240: answers_instead_of_reading_forever sample 4/15 PASS in 48.1s
+[eval] start attempt 200/240: answers_instead_of_reading_forever sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 200/240: answers_instead_of_reading_forever sample 5/15 PASS in 32.0s
+[eval] start attempt 201/240: answers_instead_of_reading_forever sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 201/240: answers_instead_of_reading_forever sample 6/15 PASS in 45.7s
+[eval] start attempt 202/240: answers_instead_of_reading_forever sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 202/240: answers_instead_of_reading_forever sample 7/15 PASS in 30.1s
+[eval] start attempt 203/240: answers_instead_of_reading_forever sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 203/240: answers_instead_of_reading_forever sample 8/15 PASS in 31.6s
+[eval] start attempt 204/240: answers_instead_of_reading_forever sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 204/240: answers_instead_of_reading_forever sample 9/15 PASS in 33.9s
+[eval] start attempt 205/240: answers_instead_of_reading_forever sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 205/240: answers_instead_of_reading_forever sample 10/15 PASS in 28.8s
+[eval] start attempt 206/240: answers_instead_of_reading_forever sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 206/240: answers_instead_of_reading_forever sample 11/15 PASS in 26.1s
+[eval] start attempt 207/240: answers_instead_of_reading_forever sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 207/240: answers_instead_of_reading_forever sample 12/15 PASS in 34.0s
+[eval] start attempt 208/240: answers_instead_of_reading_forever sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 208/240: answers_instead_of_reading_forever sample 13/15 PASS in 27.6s
+[eval] start attempt 209/240: answers_instead_of_reading_forever sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 209/240: answers_instead_of_reading_forever sample 14/15 PASS in 54.6s
+[eval] start attempt 210/240: answers_instead_of_reading_forever sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\answ...)
+[eval] finish attempt 210/240: answers_instead_of_reading_forever sample 15/15 PASS in 32.7s
+[eval] case 14/16 answers_instead_of_reading_forever PASS 15/15 in 9m08s
+[eval] case 15/16 writes_the_steps_down_before_starting starting (15 sample(s))
+[eval] start attempt 211/240: writes_the_steps_down_before_starting sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 211/240: writes_the_steps_down_before_starting sample 1/15 PASS in 1m48s
+[eval] start attempt 212/240: writes_the_steps_down_before_starting sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 212/240: writes_the_steps_down_before_starting sample 2/15 PASS in 1m33s
+[eval] start attempt 213/240: writes_the_steps_down_before_starting sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 213/240: writes_the_steps_down_before_starting sample 3/15 PASS in 1m20s
+[eval] start attempt 214/240: writes_the_steps_down_before_starting sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 214/240: writes_the_steps_down_before_starting sample 4/15 PASS in 1m13s
+[eval] start attempt 215/240: writes_the_steps_down_before_starting sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 215/240: writes_the_steps_down_before_starting sample 5/15 PASS in 2m35s
+[eval] start attempt 216/240: writes_the_steps_down_before_starting sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 216/240: writes_the_steps_down_before_starting sample 6/15 PASS in 1m05s
+[eval] start attempt 217/240: writes_the_steps_down_before_starting sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 217/240: writes_the_steps_down_before_starting sample 7/15 PASS in 1m29s
+[eval] start attempt 218/240: writes_the_steps_down_before_starting sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 218/240: writes_the_steps_down_before_starting sample 8/15 PASS in 1m55s
+[eval] start attempt 219/240: writes_the_steps_down_before_starting sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 219/240: writes_the_steps_down_before_starting sample 9/15 PASS in 5m00s
+[eval] start attempt 220/240: writes_the_steps_down_before_starting sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 220/240: writes_the_steps_down_before_starting sample 10/15 PASS in 1m29s
+[eval] start attempt 221/240: writes_the_steps_down_before_starting sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 221/240: writes_the_steps_down_before_starting sample 11/15 PASS in 3m40s
+[eval] start attempt 222/240: writes_the_steps_down_before_starting sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 222/240: writes_the_steps_down_before_starting sample 12/15 PASS in 2m44s
+[eval] start attempt 223/240: writes_the_steps_down_before_starting sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 223/240: writes_the_steps_down_before_starting sample 13/15 PASS in 1m29s
+[eval] start attempt 224/240: writes_the_steps_down_before_starting sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 224/240: writes_the_steps_down_before_starting sample 14/15 PASS in 2m31s
+[eval] start attempt 225/240: writes_the_steps_down_before_starting sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\writ...)
+[eval] finish attempt 225/240: writes_the_steps_down_before_starting sample 15/15 PASS in 1m35s
+[eval] case 15/16 writes_the_steps_down_before_starting PASS 15/15 in 31m32s
+[eval] case 16/16 removes_duplicate_definitions_without_losing_anything starting (15 sample(s))
+[eval] start attempt 226/240: removes_duplicate_definitions_without_losing_anything sample 1/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 226/240: removes_duplicate_definitions_without_losing_anything sample 1/15 FAIL in 4m02s
+[eval] start attempt 227/240: removes_duplicate_definitions_without_losing_anything sample 2/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 227/240: removes_duplicate_definitions_without_losing_anything sample 2/15 FAIL in 3m27s
+[eval] start attempt 228/240: removes_duplicate_definitions_without_losing_anything sample 3/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 228/240: removes_duplicate_definitions_without_losing_anything sample 3/15 FAIL in 4m08s
+[eval] start attempt 229/240: removes_duplicate_definitions_without_losing_anything sample 4/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 229/240: removes_duplicate_definitions_without_losing_anything sample 4/15 PASS in 3m04s
+[eval] start attempt 230/240: removes_duplicate_definitions_without_losing_anything sample 5/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 230/240: removes_duplicate_definitions_without_losing_anything sample 5/15 FAIL in 3m36s
+[eval] start attempt 231/240: removes_duplicate_definitions_without_losing_anything sample 6/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 231/240: removes_duplicate_definitions_without_losing_anything sample 6/15 PASS in 3m57s
+[eval] start attempt 232/240: removes_duplicate_definitions_without_losing_anything sample 7/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 232/240: removes_duplicate_definitions_without_losing_anything sample 7/15 PASS in 4m37s
+[eval] start attempt 233/240: removes_duplicate_definitions_without_losing_anything sample 8/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 233/240: removes_duplicate_definitions_without_losing_anything sample 8/15 FAIL in 4m17s
+[eval] start attempt 234/240: removes_duplicate_definitions_without_losing_anything sample 9/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 234/240: removes_duplicate_definitions_without_losing_anything sample 9/15 FAIL in 3m49s
+[eval] start attempt 235/240: removes_duplicate_definitions_without_losing_anything sample 10/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 235/240: removes_duplicate_definitions_without_losing_anything sample 10/15 FAIL in 4m07s
+[eval] start attempt 236/240: removes_duplicate_definitions_without_losing_anything sample 11/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 236/240: removes_duplicate_definitions_without_losing_anything sample 11/15 PASS in 3m19s
+[eval] start attempt 237/240: removes_duplicate_definitions_without_losing_anything sample 12/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 237/240: removes_duplicate_definitions_without_losing_anything sample 12/15 PASS in 3m26s
+[eval] start attempt 238/240: removes_duplicate_definitions_without_losing_anything sample 13/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 238/240: removes_duplicate_definitions_without_losing_anything sample 13/15 PASS in 3m53s
+[eval] start attempt 239/240: removes_duplicate_definitions_without_losing_anything sample 14/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 239/240: removes_duplicate_definitions_without_losing_anything sample 14/15 PASS in 3m37s
+[eval] start attempt 240/240: removes_duplicate_definitions_without_losing_anything sample 15/15 (workspace: F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55\remo...)
+[eval] finish attempt 240/240: removes_duplicate_definitions_without_losing_anything sample 15/15 PASS in 4m00s
+[eval] case 16/16 removes_duplicate_definitions_without_losing_anything PASS 8/15 flaky in 57m28s
+[eval] complete: 14/16 passed (88%)
+# SHAMSU Eval Benchmark
+
+- **Tier:** default
+- **Pass rate:** 14/16 (88%)
+- **Samples per case:** 15
+- **Artifacts:** `F:\Work\PROJECTS\shamsu\Shamsu\.shamsu\eval-artifacts\2026-08-23-1200-baseline-s15\eval_20260823_060008_a6fe6a55`
+
+| Case | Result | Time | Rounds | Calls | Notes |
+|------|--------|------|--------|-------|-------|
+| qa_reads_repo_fact | PASS 15/15 | 416.6s | 3.6 | 1.0 |  |
+| create_file | PASS 15/15 | 363.4s | 3.5 | 1.7 |  |
+| edit_file_targeted | PASS 15/15 | 265.7s | 4.7 | 2.3 |  |
+| bugfix_syntax_error | PASS 15/15 | 314.2s | 4.7 | 2.7 |  |
+| run_command_verify | PASS 15/15 | 295.6s | 4.5 | 2.7 |  |
+| ask_user_clarifies | PASS 15/15 | 400.1s | 3.1 | 1.7 |  |
+| rename_file_via_move_tool | PASS 15/15 | 197.5s | 3.0 | 1.0 |  |
+| ask_before_choosing_an_approach | FAIL 3/15 | 871.5s | 4.9 | 2.4 | check failed FLAKY - re-run before trusting |
+| ask_before_destructive_guess | FAIL 4/15 | 181.2s | 2.5 | 0.8 | check failed FLAKY - re-run before trusting |
+| does_not_ask_when_unambiguous | PASS 15/15 | 195.3s | 3.5 | 1.5 |  |
+| plan_references_only_real_files | PASS 15/15 | 95.7s | 0.0 | 0.0 |  |
+| chat_plan_references_only_real_files | PASS 15/15 | 1137.7s | 0.0 | 0.0 |  |
+| repairs_a_file_it_cannot_pattern_match | PASS 12/15 | 1618.8s | 7.7 | 6.1 | FLAKY - re-run before trusting |
+| answers_instead_of_reading_forever | PASS 15/15 | 548.5s | 5.0 | 10.0 |  |
+| writes_the_steps_down_before_starting | PASS 15/15 | 1892.5s | 17.8 | 16.5 |  |
+| removes_duplicate_definitions_without_losing_anything | PASS 8/15 | 3448.0s | 23.9 | 22.7 | FLAKY - re-run before trusting |
+
+> **Flaky this run:** ask_before_choosing_an_approach, ask_before_destructive_guess, repairs_a_file_it_cannot_pattern_match, removes_duplicate_definitions_without_losing_anything. These cases passed some attempts and failed others on the SAME code - do not read a delta from them.
+
+## Reading these numbers
+
+Local models are stochastic. A case flagged flaky passed some attempts
+and failed others on identical code - treat its row as noise until
+re-measured with more samples. Compare baselines only at equal
+`--samples`; a delta that lives entirely inside the flaky set is no
+delta. Tier-specific findings (root causes of consistent failures)
+live in `agent context/SHAMSU_agent_gap_analysis.md` under I3.
+
+Do not read a delta out of two of these tables by eye. Run both with
+`--json-out` and compare them with `python -m evals.diff <baseline>
+<feature>`, which applies every rule in this paragraph mechanically
+and exits 0 improved / 1 regressed / 2 noise.
+
+## Deterministic release metrics
+
+Harness startup, first-answer/task time, peak memory, log growth, and Python/Django/Node/React/mixed dogfood results are recorded separately in `RELEASE_VALIDATION.md` so model variance is not mixed with runtime reliability.
+
+
+Wrote F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-1200-baseline-s15.md
+Wrote F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-1200-baseline-s15.json
+
+finished     : 2026-08-23 15:24:14
+elapsed      : 204.1 min
+exit code    : 1   (0 = every case passed; 1 = at least one did not)
+
+working tree at END:
+ M PROGRESS_LOG.md
+ M logs/test-runs/2026-08-22-framed-tui.log
+ M shamsu/agents/chat_state.py
+ M shamsu/agents/simple_chat.py
+ M shamsu/cli/live_console.py
+ M shamsu/cli/repl.py
+ M shamsu/cli/tui.py
+ M shamsu/control/runner.py
+ M shamsu/runtime/turn_stream.py
+ M shamsu/webui/api.py
+ M shamsu/webui/cli.py
+ M shamsu/webui/local.py
+ M shamsu/webui/server.py
+ M shamsu/webui/static/app.css
+ M shamsu/webui/static/app.js
+ M tests/test_simple_chat.py
+ M tests/test_tui.py
+ M tests/test_webui.py
+?? logs/evals/
+?? logs/test-runs/2026-08-23-rc9-digest-and-honest-pressure.log
+?? logs/test-runs/2026-08-23-web-portal-phases.log
+?? scripts/overnight-eval.ps1
+?? tests/test_web_access.py
+HEAD at END  : 4e173fe
+
+In the morning:
+  compare mechanically, never by eye -
+    F:\Work\PROJECTS\shamsu\Shamsu\.venv\Scripts\python.exe -m evals.diff <older>.json F:\Work\PROJECTS\shamsu\Shamsu\logs\evals\2026-08-23-1200-baseline-s15.json
+  exit 0 improved / 1 regressed / 2 noise.
+  This is the first JSON baseline in the repo, so the first comparison it can
+  serve is the NEXT run's.

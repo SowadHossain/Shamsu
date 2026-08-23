@@ -3,6 +3,172 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-23 - The web portal: the plain link, the black hole, the disconnection
+Files edited: `shamsu/webui/server.py`, `shamsu/webui/api.py`,
+`shamsu/webui/local.py`, `shamsu/webui/cli.py`, `shamsu/webui/static/app.js`,
+`shamsu/webui/static/app.css`, `shamsu/control/runner.py`,
+`shamsu/runtime/turn_stream.py`, `shamsu/cli/tui.py`, `shamsu/cli/repl.py`,
+`tests/test_web_access.py` (new), `tests/test_webui.py`, `tests/test_tui.py`
+What changed: four reported faults, all reproduced before being fixed.
+(1) The shell was served without a token - it has to be, the browser has
+nowhere to put one before the page loads - while every `/api/*` demanded one,
+so the bare `http://127.0.0.1:8765/` rendered a complete-looking app that then
+401'd on every request. `requires_token` is now False on a loopback bind and
+the link is the bare address; the token returns for any non-loopback bind, or
+with `SHAMSU_WEB_TOKEN=1`. What still guards it: loopback, and the existing
+foreign-Origin refusal. What it no longer guards: another program on this
+machine can drive the agent - deliberate, and stated in the docstring.
+(2) `_looks_like_id` only rejected path-shaped strings, so a prompt for session
+`undefined` came back `202 accepted` with a queue id and then ran against a
+thread nobody could open - no answer, no error, no trace. `session_exists` now
+gates the route. A worker that raised also said nothing to the stream, leaving
+the browser on `turn.start` for ever; it now publishes `error` + `turn.end
+status=failed`.
+(3) The real one behind "it didn't send to the cli": the portal builds its own
+`QueuedRunner` with its own `TurnStream`, and a renderer is attached to one
+stream by whoever built it - so the CLI had no way to know the web's existed.
+The surfaces were not out of sync, they were not connected.
+`TurnStream.add_observer` watches every stream in the process; the framed TUI
+registers one and shows a web or Telegram turn's prompt, answer and verdict in
+that surface's colour - not its tool rows, which would make both logs
+unreadable.
+(4) The browser rendered `status.text` and dropped `event.data`, so the footer
+now carries `rnd 14/24 · ctx 71% · 34 tok/s`, and a failed `turn.end` goes red.
+Also corrected: three panels called the portal "read-only", which it never was.
+Tests: 12 new in `tests/test_web_access.py`, 116 across the web suites, 131
+with the TUI and parity suites. Six existing tests asserted the old token
+behaviour or the read-only wording and were repointed, each saying so in place.
+Not done: the 600s timeout both reported web turns died on - a model/context
+problem, now merely visible rather than silent |
+Log: logs/test-runs/2026-08-23-web-portal-phases.log
+
+### 2026-08-23 - The approval handover could strand the terminal for 15 minutes
+Files edited: `shamsu/cli/live_console.py`, `tests/test_tui.py`
+What changed: `reading_input()` is re-entrant and keeps a `_PROMPT_DEPTH`
+because one prompt can open inside another; the frame handover did not. With a
+nested prompt `_suspend_frame` overwrote `self._handover` with the inner
+waiter, so the outer one was never set and its `run_in_terminal` callable sat
+on the full `HANDOVER_TIMEOUT_SECONDS` - 900 seconds of a frame that does not
+come back, which is the terminal-you-cannot-reach this was built to prevent.
+The other direction was just as wrong: the inner prompt closing released the
+frame while the outer question was still on screen. Now depth-counted - first
+suspend hands over, last resume takes it back - and `set_frame(None)` forces a
+release at turn end so an unbalanced open cannot strand it. Not the modal-float
+redesign; that is still open and wants an interactive session. Also
+investigated R10 (47 of 90 tool calls were re-reads) and found no independent
+defect: the dedup guard fired 22 times, elision clearing `_ranges_sent` is
+correct, and exactly 4 distinct files were read against a cap of 4. It is
+downstream of the impossible-range fix.
+Tests: 5 added. Suite 3843 passed / 2 skipped / 0 failed. | Log:
+logs/test-runs/2026-08-23-r6-r2-r8-r1-r5-fixes.log
+
+### 2026-08-23 - A clock on a turn, a reasoning trace that survives, and the empty turn
+Files edited: `shamsu/action_ledger/ledger.py`, `shamsu/cli/turn_render.py`,
+`shamsu/agents/simple_chat.py`, `shamsu/agents/chat_state.py`,
+`tests/test_simple_chat.py`, `tests/test_action_ledger_storage.py`
+What changed: (R7) the ledger recorded `thinking_chars: 2543, cot_path: ""` -
+how much reasoning there was and none of it - because `full_artifacts` is true
+only at `log_level: verbose` and the default is `essential`. Meanwhile the
+screen clipped the same trace at 400 chars, so the user saw "Let me: 1. Delete
+..." and could not recover the sentence naming the three files it was about to
+delete. The trace is now written at every log level (bounded, redacted as
+before), the display budget is 1400, and `_clip` cuts at a sentence, line or
+word boundary instead of a fixed byte. THIS NARROWS A DELIBERATE POLICY - the
+failing test was right, and is now split in two so the narrowing is explicit;
+reverting is one `if self.full_artifacts:`. (R4) A turn had a round ceiling and
+no clock: 24 rounds against a 600s per-call timeout, and
+`removes_duplicate_definitions` reached the ceiling in 12 of 15 samples.
+`DEFAULT_TURN_BUDGET_SECONDS = 1200`, checked between rounds so a generation is
+never cancelled mid-flight, reporting what the turn managed.
+`SHAMSU_TURN_BUDGET_S` overrides, 0 disables. (R3) 158 of 1385 assistant turns
+in the baseline run were empty of both text and tool calls - 11%, ~9% of wall
+time - and all 158 came directly after a tool result: a reasoning model
+thinking and not narrating. Those are now re-asked once with `think: False`
+rather than nudged. My first attempt made that a per-round flag, which the
+retry's own `continue` reset - a test caught it before it shipped; it is a
+per-turn budget now.
+Tests: 12 added. Suite 3838 passed / 2 skipped / 0 failed. | Log:
+logs/test-runs/2026-08-23-r6-r2-r8-r1-r5-fixes.log
+
+### 2026-08-23 - Four defects the 240-attempt run and the demo2 logs found
+Files edited: `shamsu/tools/agent_tools.py`, `shamsu/agents/simple_chat.py`,
+`tests/test_file_tools.py`, `tests/test_simple_chat.py`
+What changed: (R6) `read_file` clamped an impossible line range instead of
+refusing it - `read_file(player.js, 145, 20)` returned `ok: true`, "Read file."
+and ONE line, with `end_line` silently rewritten to 145. 8 of 47 ranged reads
+in the F:\Work\demo2	est2 session were impossible and every one was answered
+with a success; that payload went out five times and two turns ended on "I
+stopped after 24 steps". It now refuses and names the call that was meant, and
+the sibling case - `start_line` past EOF returning an empty successful read -
+went with it. (R2/R8) `delete_file` was the only destructive tool with no
+guard at all: 11 of 15 eval samples destroyed the real database in round one,
+and live the model proposed deleting three source files to escape a repair
+loop, stopped only by a human at an approval prompt. `_refuse_blind_delete`
+now refuses an unlooked-at ambiguous target and any delete proposed while the
+repair counters are hot. (R1) The prose nudge fired on files the turn had
+already written - 5/5 false on edit cases; `changed` was in scope at the call
+site all along. (R5) `asks_only_for_words` matched verbs, not questions, so
+the nudge fired ten times on a pure Q&A prompt; the question test now runs
+before the change-verb veto, with a polite-imperative veto so "Can you rewrite
+X?" stays work. That last one exposed `rewrite` and `replace` missing from
+`_CHANGE_VERBS` entirely.
+Tests: 16 added (5 R6, 6 R2/R8, 5 R1/R5). Suite 3826 passed / 2 skipped / 0
+failed. | Log: logs/test-runs/2026-08-23-r6-r2-r8-r1-r5-fixes.log
+
+### 2026-08-23 - Harness nudges stop becoming things the user asked for
+Files edited: `shamsu/agents/chat_state.py`, `shamsu/agents/simple_chat.py`,
+`tests/test_simple_chat.py`, `scripts/overnight-eval.ps1`
+What changed: RC9. `origin=ORIGIN_LOOP` was already set at the injection sites
+and already written to `messages.jsonl`, but `ChatMessage` had no `origin`
+field and `_hydrate_records` never read one - so `_digest`, which iterates
+those objects, could not tell a nudge from a request and recorded every
+`role: user` message as "you asked". The digest is what survives compaction, so
+a long session's permanent record filled with instructions nobody gave. The
+field now rides on the message and off disk, `_digest` skips loop-authored
+turns, and `simple_chat.py:2777` (the contract nudge) - the one injection site
+with no tag at all - is tagged. Second, smaller: `_history_pressure` measured
+every hydrated message against the budget for the tail that is actually sent.
+That ratio was nonsense as a number (13.69 on a 265k archive) but INERT - its
+only consumer thresholds it at 0.6 and both measures cross 0.6 together, proven
+over 2..320 exchanges. Kept as a correctness fix, explicitly not a performance
+one; expect no eval delta from it.
+Tests: 10 added (6 for RC9 incl. a source-level guard that fails if a future
+nudge is added untagged, and a resume/old-transcript pair; 4 for the pressure
+measure incl. the equivalence pin). Full suite 3709 passed / 2 skipped / 0
+failed, plus tests/test_tui.py 84 passed. | Log:
+logs/test-runs/2026-08-23-rc9-digest-and-honest-pressure.log
+
+### 2026-08-23 - Four TUI bugs from one screenshot, and prompts coloured by surface
+Files edited: `shamsu/cli/tui.py`, `shamsu/cli/repl.py`, `tests/test_tui.py`
+What changed: (1) `console.status` is a rich Live that redraws by emitting
+`\r` and the line again ~12x/sec, and `LogPane` split on newlines only - so
+every spinner frame became a row and thousands of `Working...^M` filled the
+pane. The pane honours `\r` as a line overwrite now, which also fixes npm, pip
+and pytest progress output. (2) The serious one: `ANSI()` consumes the SGR
+codes it knows and passes the rest through AS TEXT, and prompt_toolkit writes
+fragment text verbatim - so a `\x1b[1A` in the pane physically moved the real
+cursor and scrambled the sidebar. Private-mode CSI is stripped before parsing
+(`ANSI()` renders `ESC [ ? 25 l` as the literal text `25l`) and every remaining
+C0 control character after. (3) The input box was one line, which is useless
+for the PRD or traceback that actually starts a turn: multiline now, Enter
+submits, Alt+Enter opens a line, grows to 8 rows. (4) A SERVICES panel - model,
+Telegram poller, web portal - sampled on a 5s TTL rather than polled, because
+the sidebar repaints 5x/sec and those answers come from a SQLite lease table;
+anything unreachable reads a grey `unknown` rather than raising inside a
+renderer and taking the frame down. Kept out of `TurnTelemetry` on purpose:
+that is fed by the turn stream and belongs to one turn, these outlive turns and
+belong to other processes. (5) Prompts, logs and answers are now distinct: a
+prompt is coloured by WHERE IT CAME FROM (cli green, web blue, telegram
+magenta, unknown amber) with a gutter mark per surface, the answer is white
+with its own mark, and logs keep whatever colour rich gave them so they stay
+the neutral background. Both channels differ per surface because colour alone
+is not a distinction. `TurnEvent.source` already carried the surface; a turn
+begun elsewhere is echoed into this pane through `absorb_for_display`.
+Tests: 72 in `tests/test_tui.py` (was 49), 227 across the neighbouring suites.
+Full suite not run - a concurrent session's contract-evidence work has 10
+unrelated reds in `test_simple_chat.py` |
+Log: logs/test-runs/2026-08-22-framed-tui.log
+
 ### 2026-08-23 - The TUI sidebar says what a turn COST, in colour that means something
 Files edited: `shamsu/cli/tui.py`, `shamsu/cli/live_console.py`,
 `shamsu/agents/simple_chat.py`, `tests/test_tui.py`

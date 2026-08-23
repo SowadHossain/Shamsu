@@ -70,16 +70,31 @@ def test_the_portal_binds_loopback_only(portal):
     assert portal.base_url.startswith("http://127.0.0.1:")
 
 
-def test_a_request_without_the_token_is_refused(portal):
-    with pytest.raises(urllib.error.HTTPError) as caught:
-        _get(portal, "/api/workspaces", token=None)
-    assert caught.value.code == 401
+def test_a_request_without_a_token_is_served_on_loopback(portal):
+    """Changed deliberately 2026-08-23. The shell has to be served without a
+    token - the browser has nowhere to put one before the page loads - so an
+    API that demanded one gave a complete-looking application that then failed
+    every request with a 401. See `WebPortal.requires_token` for what still
+    guards a loopback bind, and `tests/test_web_access.py` for the policy."""
+    assert not portal.requires_token
+    assert _get(portal, "/api/workspaces", token=None)
 
 
-def test_a_request_with_the_wrong_token_is_refused(portal):
-    with pytest.raises(urllib.error.HTTPError) as caught:
-        _get(portal, "/api/workspaces", token="not-the-token")
-    assert caught.value.code == 401
+def test_a_wrong_token_is_ignored_rather_than_refused_on_loopback(portal):
+    """Nothing is being checked, so a wrong one is not a failure - it is a
+    query parameter nobody read."""
+    assert _get(portal, "/api/workspaces", token="not-the-token")
+
+
+def test_the_token_comes_back_when_it_is_demanded(portal, monkeypatch):
+    from shamsu.webui.server import TOKEN_ENV
+
+    monkeypatch.setenv(TOKEN_ENV, "1")
+    for wrong in (None, "not-the-token"):
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            _get(portal, "/api/workspaces", token=wrong)
+        assert caught.value.code == 401
+    assert _get(portal, "/api/workspaces", token=portal.token)
 
 
 def test_the_token_is_long_enough_to_be_worth_having(portal):
@@ -371,7 +386,10 @@ def test_the_web_command_starts_prints_a_link_and_stops(tmp_path, monkeypatch):
         portal = local._MANAGER.running
         assert portal is not None
         assert portal.url in console.text
-        assert "read-only" in console.text
+        # NOT "read-only": `POST .../prompt` has always started a turn, and
+        # the panel said otherwise until 2026-08-23.
+        assert "can start one of its own" in console.text
+        assert "no token" in console.text
     finally:
         assert local.stop_web_portal() is True
 
@@ -481,7 +499,7 @@ def test_serving_prints_the_link_and_stops_cleanly(tmp_path, monkeypatch):
 
     assert exit_code == 0
     assert captured["portal"].url in console.text
-    assert "read-only" in console.text.lower()
+    assert "can start one" in console.text.lower()
     assert "Ctrl-C" in console.text
     # And the server really is down afterwards.
     assert captured["portal"]._server is None
@@ -753,8 +771,20 @@ def test_an_empty_prompt_is_refused(chat_portal):
     assert caught.value.code == 400
 
 
-def test_a_prompt_without_a_token_is_refused(chat_portal):
+def test_a_prompt_without_a_token_is_accepted_on_loopback(chat_portal):
+    """The plain link has to be able to send one; that is the whole point of
+    dropping the token. The foreign-Origin refusal below is what stops a page
+    on another site doing the same thing."""
     portal, session_id, _client, _store, _runner = chat_portal
+    base = f"/api/workspaces/{_wsid(portal)}/sessions/{session_id}"
+    assert _post(portal, f"{base}/prompt", {"text": "hi"}, token=None)
+
+
+def test_a_prompt_is_refused_when_the_token_is_demanded(chat_portal, monkeypatch):
+    from shamsu.webui.server import TOKEN_ENV
+
+    portal, session_id, _client, _store, _runner = chat_portal
+    monkeypatch.setenv(TOKEN_ENV, "1")
     base = f"/api/workspaces/{_wsid(portal)}/sessions/{session_id}"
     with pytest.raises(urllib.error.HTTPError) as caught:
         _post(portal, f"{base}/prompt", {"text": "hi"}, token=None)

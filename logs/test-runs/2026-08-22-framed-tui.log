@@ -350,3 +350,279 @@ TESTS
     test_the_round_budget_warns_as_it_runs_out
     test_the_verdict_replaces_the_spinner_when_the_turn_ends
     test_a_new_turn_resets_the_cost
+
+
+===========================================================================
+2026-08-23 · THIRD PASS: four bugs from one screenshot, and line kinds
+===========================================================================
+
+Reported with a screenshot of the real thing, which found in one look what a
+suite with no terminal could not find at all.
+
+
+1. THE `Working...^M` FLOOD
+---------------------------
+`console.status` is a rich Live. It redraws by emitting `\r\x1b[2K` and the
+line again, about twelve times a second. `LogPane` split on `\n` only, so
+EVERY SPINNER FRAME BECAME A ROW - thousands of them, pushing the session off
+the screen.
+
+The pane now honours `\r` the way a terminal does: it replaces the line being
+built. Verified against the exact bytes rich emits - 200 frames collapse to one
+row. npm, pip and pytest progress output all redraw the same way and are fixed
+by the same change.
+
+
+2. THE SCRAMBLED SIDEBAR - the serious one
+------------------------------------------
+Sidebar labels came out as `Mcontext`, `MPROGRESS`, `Midle`, and the frame was
+mangled around them.
+
+`ANSI()` consumes the SGR codes it understands and PASSES THE REST THROUGH AS
+TEXT. prompt_toolkit writes fragment text verbatim. So a `\x1b[1A` sitting in
+the pane was physically moving the real cursor, and everything drawn after it
+landed in the wrong place - sidebar included.
+
+    'p\x1b[1Aq'   -> 'pq'      (consumed, harmless)
+    'z\x1b[?25lw' -> 'z25lw'   <- literal garbage: ANSI does not know `?`
+    'a\rb'        -> 'a\rb'    <- raw CR, reaches the terminal
+
+Two guards: private-mode CSI (`ESC [ ? ... `) is stripped BEFORE `ANSI()` sees
+it, and every remaining C0 control character is dropped after. Nothing that can
+steer a cursor is ever stored.
+
+
+3. A ONE-LINE INPUT BOX
+-----------------------
+Fine for "fix the tests", useless for what actually starts a real turn - a PRD,
+a traceback, a spec with eight bullets. The buffer is multiline now: Enter
+submits, Alt+Enter opens a line (the same contract as the idle prompt, so the
+two boxes behave alike), and the box grows to `INPUT_MAX_ROWS` = 8 before it
+scrolls internally.
+
+
+4. SERVICES IN THE SIDEBAR
+--------------------------
+    SERVICES
+    model     qwen3.5:9b
+    telegram  configured
+    web       off
+
+Real readings: `poller_status()` for the bot (running / configured / not set
+up), the web portal manager for its URL, the tier for the model. SAMPLED, not
+polled - the sidebar repaints five times a second and these come from a SQLite
+lease table; a query per 200ms for something that changes when you type a
+command would be absurd. `SERVICES_TTL_SECONDS = 5`. Anything unreachable reads
+a grey `unknown`: an exception raised inside a renderer takes the frame down.
+
+Deliberately NOT in `TurnTelemetry` - everything there is fed by the turn
+stream and belongs to one turn, while these outlive turns and come from state
+other PROCESSES own. Mixing them would make the telemetry reach into a
+database, which is exactly what a renderer must not do.
+
+
+5. TELLING A PROMPT, A LOG AND AN ANSWER APART
+----------------------------------------------
+Three different kinds of thing arriving as one undifferentiated wall.
+
+    › the server crashes when REDIS_URL is missing        <- prompt, cli
+      model responded in 11s                              <- log
+      Reading config.py - 14ms                            <- log
+    ◆ Fixed - config.py falls back to redis://localhost   <- the answer
+    ✈ also log a warning when it falls back               <- prompt, telegram
+    ◈ now run the tests                                   <- prompt, web
+
+A prompt is coloured by WHERE IT CAME FROM. The same session takes work from
+this terminal, the web portal and Telegram, and "who asked for this?" was
+otherwise unanswerable from the log. `TurnEvent.source` already carried it.
+
+  cli       green    ›
+  web       blue     ◈
+  telegram  magenta  ✈
+  unknown   amber    ?
+  answer    white    ◆
+  log       whatever rich sent - the neutral background the others stand out
+            against, which only works because the others are the minority.
+
+Every surface differs in BOTH channels. Colour alone is not a distinction:
+palettes vary, some are unreadable, and some people cannot tell the green from
+the amber - so the mark sits in the same column on every row and the shape of
+the conversation survives a screenshot with the colour stripped out.
+
+`decorate_as` is a context manager rather than an argument on `write`, because
+the writes it has to cover are `console.print` calls made by code that has
+never heard of a pane. It closes any half-written line on the way in, or a
+chunk still open would inherit a mark belonging to the next thing.
+
+A turn begun on another surface is echoed here through
+`TuiApp.absorb_for_display`, registered on the same stream as the telemetry.
+The CLI's own prompt is skipped there because `FrameHost.submit` echoed it at
+the moment it was typed.
+
+
+TESTS
+-----
+    tests/test_tui.py             72 passed  (was 49)
+    tests/test_live_console.py    66 passed  (unchanged)
+    neighbouring suites          227 passed
+
+    test_a_spinner_redraw_replaces_its_line_instead_of_adding_one
+        200 rich status frames must be one row.
+    test_no_control_character_is_ever_stored
+    test_a_private_mode_escape_does_not_become_literal_text
+    test_colour_survives_a_carriage_return_redraw
+    test_the_input_box_takes_more_than_one_line
+        Alt+Enter opens a line, Enter submits, both asserted through the real
+        Application over pipe input.
+    test_services_are_sampled_not_polled
+        twenty repaints, one reading.
+    test_a_service_that_cannot_be_reached_reads_unknown
+    test_each_surface_gets_its_own_colour_and_its_own_mark
+        and that no two surfaces share either channel.
+    test_the_answer_is_distinct_from_the_log_above_it
+    test_ordinary_log_output_keeps_the_colour_rich_gave_it
+    test_a_decoration_does_not_leak_past_its_block
+    test_a_half_written_line_is_closed_before_the_kind_changes
+    test_a_turn_started_elsewhere_shows_whose_it_was
+    test_this_terminals_own_prompt_is_not_echoed_twice
+
+
+---------------------------------------------------------------------------
+2026-08-23 · No completions and no suggestions in the box
+---------------------------------------------------------------------------
+
+Reported: the framed box offered neither. Two independent causes, and either
+alone was enough.
+
+1. THE COMPLETER WAS NEVER PASSED. `_dispatch_turn_framed` had built the app
+   with `completer=SlashCommandCompleter(workspace)`; when that was replaced by
+   the session-scoped `_start_frame`, the argument did not come with it. The
+   buffer therefore had `complete_while_typing=False` and no completer at all.
+
+2. THERE WAS NOWHERE TO DRAW ONE. `PromptSession` builds the completions menu
+   for you - a `Float` anchored to the cursor. A hand-made `Layout` does not.
+   So even with a completer the completions would have been computed and had
+   no home. `FloatContainer` + `CompletionsMenu(max_height=12)` now wraps the
+   HSplit.
+
+Both are the same underlying mistake: a `PromptSession` is not just a `Buffer`,
+and hand-rolling the layout means hand-rolling what it gave you for free. The
+box also had no history suggestions for the same reason, so
+`AutoSuggestFromHistory` went on at the same time.
+
+Keys, matching the idle prompt so the two boxes behave alike:
+
+    Tab / Shift-Tab   next / previous completion, opening the menu if closed
+    Enter             accept the highlighted completion, else submit
+    Right             accept the ghost suggestion at end-of-line, else move
+    Alt-Enter         new line
+
+Verified against the real Application over pipe input:
+
+    typed "/qu"  -> ['/queue', '/queue add ', '/queue clear']
+    Tab          -> '/queue' selected
+    history "fix the failing tests", typed "fix the"
+                 -> suggestion " failing tests", Right accepts it
+
+    tests/test_tui.py   75 passed  (was 72)
+
+    test_the_box_completes_slash_commands
+    test_the_layout_has_somewhere_to_draw_completions
+        asserts the FloatContainer and the CompletionsMenu exist - cause 2 on
+        its own is invisible to a test that only checks the completer.
+    test_the_box_suggests_from_what_you_typed_before
+
+
+---------------------------------------------------------------------------
+2026-08-23 · Speed, VRAM and memory - what the run is COSTING the machine
+---------------------------------------------------------------------------
+
+    THIS TURN                       SERVICES
+    model     12 · 8m12s            model     qwen3.5:9b
+    speed     34 tok/s              vram      6.2G · 32k
+    tools     13 · 1s               ram       56 MB
+    failed    4                     telegram  configured
+    repeated  contract_status x8    web       off
+
+All three were already measurable and none were shown anywhere.
+
+
+TOKENS PER SECOND, FROM OLLAMA'S OWN TIMINGS
+--------------------------------------------
+Not a stopwatch around the call. `eval_duration` is GENERATION ONLY - no
+queueing, no HTTP round trip, no prompt evaluation - so `eval_count /
+eval_duration` is the honest rate. `_record_usage` already read `eval_count`
+and threw the durations away.
+
+    eval_duration is in NANOSECONDS.
+
+240 tokens in 8_000_000_000 ns is 30 tok/s. Read as seconds it would be 30
+nanoseconds and the rate would be astronomical, which is the kind of unit bug
+that ships looking plausible - so it has its own test with the arithmetic
+written out.
+
+Coloured, because the number exists to catch one specific fall:
+
+    < 8 tok/s    red      the model has almost certainly spilled to the CPU
+    < 20 tok/s   amber
+    >= 20        green
+
+A 7-9B at q4 on this hardware runs in the tens on the card and in low single
+digits off it. That gap was previously invisible until a turn simply took
+twenty minutes.
+
+An untimed response does NOT blank the last reading - same rule as
+`last_prompt_tokens`: being told nothing is not the same as being told zero,
+and the display reads zero as "unknown". Across SESSIONS it does not carry,
+because that is the leak `_COUNTERS_BY_SESSION` exists to prevent.
+
+
+VRAM, FROM /api/ps
+------------------
+The most consequential number on this machine and the one nobody could see.
+Ollama reserves the KV cache for the WHOLE context window up front, so a window
+that does not fit spills to the CPU and the same turn takes six times as long.
+
+    {"size_vram": 6207559433, "context_length": 32768}   ->  6.2G · 32k
+
+    loaded          green
+    size_vram = 0   RED - it is resident but running on the CPU
+    no models       grey "nothing loaded"
+    unreachable     grey "unknown"
+
+"Loaded, 6.2G" and "not loaded" are different worlds and the log said neither.
+
+
+MEMORY
+------
+`psutil.Process().memory_info().rss` - SHAMSU's own footprint, not Ollama's.
+`psutil>=5.9` is already a declared dependency.
+
+
+WHY THESE ARE IN `Services` AND NOT IN `TurnTelemetry`
+------------------------------------------------------
+Everything in `TurnTelemetry` is fed by the turn stream and belongs to ONE
+TURN. VRAM and RSS outlive turns and come from state other processes own, so
+they are sampled on the 5-second TTL with the rest of the services. Speed is
+the exception and lives with the turn, because it is a property of the calls
+this turn made - and it arrives the way every other turn number does, on the
+status event, so the sidebar never reaches back into the loop.
+
+
+TESTS
+-----
+    tests/test_tui.py           84 passed  (was 75)
+    tests/test_simple_chat.py   +4
+
+    test_generation_speed_is_taken_off_the_response
+        the nanosecond arithmetic, written out.
+    test_a_response_without_timings_does_not_blank_the_last_reading
+    test_a_fresh_session_has_no_speed_yet
+    test_the_speed_reaches_the_display_on_a_status_event
+    test_a_model_that_has_fallen_off_the_gpu_is_flagged_red
+    test_an_unmeasured_speed_is_not_reported_as_zero
+    test_what_ollama_is_holding_is_read_from_api_ps
+    test_a_model_running_on_the_cpu_is_an_alarm
+    test_nothing_loaded_is_said_plainly
+    test_an_unreachable_ollama_does_not_raise_into_the_renderer
+    test_this_processes_own_memory_is_reported

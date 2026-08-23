@@ -948,7 +948,10 @@ def test_session_agent_development_log_is_single_prompt_and_verbose_evidence_fil
     )
 
 
-def test_essential_log_level_keeps_previews_and_writes_no_model_artifacts(tmp_path: Path, monkeypatch):
+def test_essential_log_level_keeps_previews_and_writes_no_prompt_or_response(tmp_path: Path, monkeypatch):
+    """At `essential`, the two BULKY artifacts stay off disk. Reasoning does not
+    - see the test below, and `log_model_thinking` for why.
+    """
     monkeypatch.setenv("SHAMSU_LOG_LEVEL", "compact")
     ledger = start_run(tmp_path, "add a healthcheck endpoint")
     call_id = ledger.log_model_call_started("coder", "m", "the prompt")
@@ -958,11 +961,37 @@ def test_essential_log_level_keeps_previews_and_writes_no_model_artifacts(tmp_pa
     # One flat folder now, so its absence can no longer stand in for "nothing
     # was captured" - assert on the files themselves, which is what was meant.
     assert not list(ledger.attachments_dir.glob("*.prompt.txt"))
-    assert not list(ledger.attachments_dir.glob("*.reasoning.txt"))
     assert not list(ledger.attachments_dir.glob("*.response.txt"))
     started = store.load_model_calls(tmp_path, ledger.run_id)[0]
     assert started["prompt_preview"] == "the prompt"
     assert "prompt_path" not in started
+
+
+def test_reasoning_is_the_one_artifact_kept_at_every_log_level(tmp_path: Path, monkeypatch):
+    """A deliberate narrowing of the essential-level policy, not an accident.
+
+    `essential` exists to keep VOLUME down: a prompt is 15KB+ and a response
+    can be larger, so neither is spilled. A reasoning trace is 200-4000 chars -
+    negligible next to those - and it is the one artifact that cannot be
+    reconstructed afterwards from anything else.
+
+    What that cost, live on 2026-08-23: the ledger recorded
+    `thinking_chars: 2543, cot_path: ""` - how much reasoning there was and
+    none of the reasoning - while the screen clipped the same trace at 400
+    characters. The user saw "Let me: 1. Delete ..." and could not recover the
+    sentence naming the three source files it was about to delete.
+
+    It is redacted like every other artifact; see
+    `test_secrets_are_redacted_in_prompt_and_cot_artifacts`.
+    """
+    monkeypatch.setenv("SHAMSU_LOG_LEVEL", "compact")
+    ledger = start_run(tmp_path, "fix the exports")
+    assert not ledger.full_artifacts, "the default must still be essential"
+
+    path = ledger.log_model_thinking("model_0001", "coder", "m", "I see duplicate exports.")
+
+    assert path, "the trace must reach disk even at the default log level"
+    assert (ledger.run_dir / path).read_text(encoding="utf-8") == "I see duplicate exports."
 
 
 def test_untitled_thinking_traces_do_not_overwrite_each_other(tmp_path: Path, monkeypatch):

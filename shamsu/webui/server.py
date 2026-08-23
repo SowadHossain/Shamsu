@@ -15,6 +15,7 @@ is on disk - and the control store is what made the rest of it safe.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,16 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 TOKEN_HEADER = "X-Shamsu-Token"
 TOKEN_QUERY = "t"
+
+#: Addresses that only this machine can reach.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+#: Set to "1" to demand the token even on a loopback bind.
+TOKEN_ENV = "SHAMSU_WEB_TOKEN"
+
+
+def is_loopback(host: str) -> bool:
+    return (host or "").strip().lower() in LOOPBACK_HOSTS
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -107,8 +118,37 @@ class WebPortal:
         return f"http://{self.host}:{self.port}"
 
     @property
+    def requires_token(self) -> bool:
+        """Whether a caller must present the token.
+
+        False on a loopback bind, which is the only bind SHAMSU makes by
+        default. The token was buying very little there and costing a great
+        deal: the shell is served WITHOUT it - it has to be, because the
+        browser has nowhere to put one before the page loads - while every
+        `/api/*` call demands it. So the bare `http://127.0.0.1:8765/` that
+        anyone would type or bookmark rendered a complete-looking application
+        that then failed every single request with a 401, silently. A link that
+        half-works is worse than one that refuses.
+
+        What still guards a loopback portal: it is unreachable from anywhere
+        else on the network, and `_origin_is_local` refuses a foreign Origin,
+        which is the DNS-rebinding attack the token was never the answer to.
+        What it does NOT guard: another program on this same machine can drive
+        the agent. That is the trade, it is deliberate, and it is why the token
+        comes straight back the moment the bind is not loopback - at that point
+        anything on the LAN could write files and run commands here.
+
+        `SHAMSU_WEB_TOKEN=1` demands it anyway.
+        """
+        if os.environ.get(TOKEN_ENV, "").strip() == "1":
+            return True
+        return not is_loopback(self.host)
+
+    @property
     def url(self) -> str:
-        """What to actually open: the shell plus the token it needs."""
+        """What to actually open. Just the address, unless a token is needed."""
+        if not self.requires_token:
+            return self.base_url
         return f"{self.base_url}/?{TOKEN_QUERY}={self.token}"
 
     # -- what the handler asks -------------------------------------------
@@ -171,6 +211,8 @@ def _build_handler(portal: WebPortal):
             return origin in allowed
 
         def _authorized(self, query: dict) -> bool:
+            if not portal.requires_token:
+                return True
             supplied = self.headers.get(TOKEN_HEADER) or ""
             if not supplied:
                 supplied = (query.get(TOKEN_QUERY) or [""])[0]
@@ -324,6 +366,18 @@ def _build_handler(portal: WebPortal):
                     raise ValueError("malformed session id")
                 if leaf == "prompt":
                     text = str(body.get("text") or "")
+                    # The session must EXIST before work is queued against it.
+                    #
+                    # `_looks_like_id` only rejects path-shaped strings, so
+                    # `None` and `undefined` - the two things a JavaScript bug
+                    # produces - sailed through, and the prompt came back
+                    # `202 accepted` with a queue id. It then ran against a
+                    # thread nobody could open: no answer, no error, no trace.
+                    # A prompt that cannot be delivered has to say so at the
+                    # moment it is refused.
+                    if not api.session_exists(workspace, session_id):
+                        self._error(404, f"unknown session: {session_id}")
+                        return
                     outcome = portal.runner.submit(workspace, session_id, text)
                     if not outcome.accepted:
                         raise ValueError(outcome.reason or "prompt refused")

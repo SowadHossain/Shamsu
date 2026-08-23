@@ -87,6 +87,17 @@ class ChatMessage:
     # on-disk transcript still holds the original; this flag only stops the
     # elision doing the same work again every round.
     elided: bool = False
+    # WHO WROTE IT - `ORIGIN_LOOP` for a correction the harness injected, empty
+    # for what a person actually typed. A `role: user` message is not evidence
+    # that a user said anything: the loop steers the model in that role because
+    # that is the role the model must read it in.
+    #
+    # This used to be written to `messages.jsonl` and nowhere else, so every
+    # in-memory consumer had to treat harness speech as user speech. `_digest`
+    # did exactly that, and a compacted session's permanent record filled with
+    # instructions the user never gave (RC9). Carried on the message so a
+    # reader has the same answer the transcript does.
+    origin: str = ""
 
     def to_ollama(self) -> dict[str, Any]:
         message: dict[str, Any] = {"role": self.role, "content": self.content}
@@ -156,7 +167,7 @@ class ChatState:
         so a transcript reader can tell them from what a person typed.
         """
         self._append(
-            ChatMessage("user", content),
+            ChatMessage("user", content, origin=origin),
             persist=True,
             persisted_content=(
                 _clean_user_content_for_persistence(persisted_content)
@@ -165,6 +176,16 @@ class ChatState:
             ),
             origin=origin,
         )
+
+    def last_role(self) -> str:
+        """The role of the most recent message, or "" when there is none.
+
+        Asked by the empty-turn branch, which treats a model that says nothing
+        straight after a TOOL RESULT differently from one that says nothing at
+        any other point: the first is a reasoning model that has thought and
+        not narrated, the second is a model that has lost the thread.
+        """
+        return self._messages[-1].role if len(self._messages) > 1 else ""
 
     def append_assistant(self, content: str, tool_calls: list[dict[str, Any]] | None = None) -> None:
         self._append(ChatMessage("assistant", content, tool_calls=tool_calls or []), persist=True)
@@ -509,6 +530,14 @@ class ChatState:
                         tool_call_id=str(payload.get("tool_call_id", "")),
                         name=str(payload.get("name", "")),
                         tool_calls=tool_calls,
+                        # Carried back off disk, or a resumed session would
+                        # re-acquire the very confusion the tag exists to end:
+                        # every harness correction ever written to this thread
+                        # would read as something the user asked for, and the
+                        # first compaction after the resume would make that
+                        # permanent. Records written before the field existed
+                        # simply do not carry it and default to "".
+                        origin=str(payload.get("origin", "")),
                     ),
                     persist=False,
                 )

@@ -398,14 +398,14 @@ function handleEvent(event) {
       addLine(event.text, "err");
       break;
     case "status":
-      setFooter(event.text, false);
+      setFooter(event.text, false, event.data);
       break;
     case "assistant":
       if (event.text) el("conversation").append(bubble("assistant", event.text));
       break;
     case "turn.end":
       setRunning(false);
-      setFooter(event.text, true);
+      setFooter(event.text, true, event.data);
       refreshQueue();
       break;
     default:
@@ -460,7 +460,22 @@ function addLine(value, variant) {
   liveTurn().querySelector(".log").append(line);
 }
 
-function setFooter(value, done) {
+/* Every number here already rode in on the status event and none of them were
+   shown: the browser read `text` and dropped `data`, so a turn was a spinner
+   and a sentence. A run that is 19 rounds in at 84% of its window with the
+   model at 3 tok/s looks exactly like a healthy one until it fails. */
+function meterText(data) {
+  if (!data) return "";
+  const parts = [];
+  if (data.round && data.max_rounds) parts.push(`rnd ${data.round}/${data.max_rounds}`);
+  if (typeof data.ctx_pct === "number") parts.push(`ctx ${data.ctx_pct}%`);
+  if (typeof data.tokens_per_second === "number" && data.tokens_per_second > 0) {
+    parts.push(`${Math.round(data.tokens_per_second)} tok/s`);
+  }
+  return parts.join(" · ");
+}
+
+function setFooter(value, done, data) {
   const foot = liveTurn().querySelector(".foot");
   foot.replaceChildren();
   if (!done) {
@@ -469,7 +484,19 @@ function setFooter(value, done) {
     foot.append(spinner);
   }
   foot.append(document.createTextNode(value || ""));
+
+  const meter = meterText(data);
+  if (meter) {
+    const span = document.createElement("span");
+    span.className = "meter";
+    span.textContent = ` · ${meter}`;
+    foot.append(span);
+  }
+
   foot.classList.toggle("done", Boolean(done));
+  // A failed turn must not read as a finished one. `turn.end` carries the
+  // verdict; without this a run that died looked identical to one that worked.
+  foot.classList.toggle("failed", Boolean(done) && (data || {}).status === "failed");
   if (done) document.getElementById("live-turn")?.removeAttribute("id");
 }
 

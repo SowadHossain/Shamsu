@@ -5100,6 +5100,9 @@ _FRAME: Any = None
 #: The console's real destination, kept so the frame can put it back.
 _FRAME_CONSOLE_STATE: tuple[Any, int] | None = None
 
+#: Detaches the frame from the process-wide turn-stream observer list.
+_FRAME_OBSERVER: Any = None
+
 
 def active_frame() -> Any:
     """The framed TUI, or None. Every caller must handle None."""
@@ -5109,7 +5112,9 @@ def active_frame() -> Any:
     return frame
 
 
-def _handle_tui(user_input: str, console: Console) -> None:
+def _handle_tui(
+    user_input: str, console: Console, workspace: Path | None = None
+) -> None:
     """`/tui` toggles the framed layout; `/tui on` and `/tui off` are explicit.
 
     Takes effect immediately, because the frame is where the session lives -
@@ -5122,15 +5127,18 @@ def _handle_tui(user_input: str, console: Console) -> None:
 
     wanted = argument == "on" if argument in {"on", "off"} else active_frame() is None
     if wanted:
-        _start_frame(console)
+        _start_frame(console, workspace)
     else:
         _stop_frame(console)
 
 
-def _start_frame(console: Console) -> bool:
+def _start_frame(console: Console, workspace: Path | None = None) -> bool:
     """Bring the frame up and point the session's output into it."""
     global _FRAME, _FRAME_CONSOLE_STATE
     from shamsu.cli.tui import FrameHost, PaneWriter, TuiApp
+    from shamsu.runtime.turn_stream import TurnStream
+
+    live_workspace = workspace if workspace is not None else Path.cwd()
 
     if active_frame() is not None:
         return True
@@ -5146,8 +5154,13 @@ def _start_frame(console: Console) -> bool:
         telemetry=live.telemetry,
         on_submit=lambda text: _FRAME.submit(text) if _FRAME is not None else None,
         history=getattr(live, "history", None),
+        # The same completer the idle prompt uses. It was simply not passed:
+        # the frame's box had no completions and no history suggestions, which
+        # made it a downgrade from the prompt it replaced.
+        completer=SlashCommandCompleter(live_workspace),
         on_interrupt=_interrupt_current_request,
         on_exit=lambda: _stop_frame(console),
+        workspace=live_workspace,
     )
     frame = FrameHost(app)
     frame.on_route = live.route
@@ -5158,6 +5171,12 @@ def _start_frame(console: Console) -> bool:
     _FRAME = frame
     live.set_frame(app)
     live._loop = frame.loop
+    # Watch EVERY stream in this process, not just the ones the REPL builds.
+    # The web portal runs in here too and makes its own; without this a prompt
+    # sent from the browser ran to completion with the terminal showing
+    # nothing at all.
+    global _FRAME_OBSERVER
+    _FRAME_OBSERVER = TurnStream.add_observer(app.absorb_for_display)
     # Everything the SESSION prints now goes into the pane - not just a turn's
     # output. That is what makes the scrollback the conversation.
     _FRAME_CONSOLE_STATE = (console.file, console.width)
@@ -5171,8 +5190,12 @@ def _start_frame(console: Console) -> bool:
 
 def _stop_frame(console: Console) -> None:
     """Take the frame down and give the console its real destination back."""
-    global _FRAME, _FRAME_CONSOLE_STATE
+    global _FRAME, _FRAME_CONSOLE_STATE, _FRAME_OBSERVER
     frame, _FRAME = _FRAME, None
+    if _FRAME_OBSERVER is not None:
+        with contextlib.suppress(Exception):
+            _FRAME_OBSERVER()
+        _FRAME_OBSERVER = None
     if _FRAME_CONSOLE_STATE is not None:
         console.file, console.width = _FRAME_CONSOLE_STATE
         _FRAME_CONSOLE_STATE = None
@@ -5283,6 +5306,7 @@ async def _run_simple_chat(
     # prompt reaches THIS loop. A private queue here would be a prompt that
     # accepts input and quietly drops it, which is worse than no prompt.
     live = active_live_console()
+    frame = active_frame()
     feedback = live.feedback if live is not None else FeedbackQueue()
     session_id = str(getattr(session_logger, "session_id", "") or "")
     stream = TurnStream(workspace, session_id, persist=bool(session_id))
@@ -5309,6 +5333,11 @@ async def _run_simple_chat(
     # telemetry row.
     if live is not None:
         stream.add_renderer(live.absorb)
+    # A turn begun in the web portal or on Telegram is still this session's
+    # work, and the terminal is where someone is watching it - so its prompt is
+    # echoed here too, in that surface's own colour.
+    if frame is not None:
+        stream.add_renderer(frame.app.absorb_for_display)
     loop = SimpleChatLoop(
         workspace,
         client=_default_ollama_client(OLLAMA_BASE_URL, timeouts),
@@ -5323,7 +5352,14 @@ async def _run_simple_chat(
     )
     result = await loop.run(user_input)
     body = result.final.strip() or "No response returned."
-    console.print(Markdown(body))
+    # The answer is the thing you scroll back to find, and in a pane of forty
+    # action rows it was indistinguishable from them.
+    frame = active_frame()
+    if frame is not None:
+        with frame.app.answering():
+            console.print(Markdown(body))
+    else:
+        console.print(Markdown(body))
     _log_assistant_message(session_logger, body, workflow_id="simple-chat")
 
 
@@ -19284,7 +19320,7 @@ def main(argv: list[str] | None = None) -> None:
         from shamsu.cli.tui import tui_enabled
 
         if tui_enabled():
-            _start_frame(console)
+            _start_frame(console, workspace)
     # Plan mode: `/plan` with no task arms this, and the NEXT natural prompt is
     # planned instead of executed. Deliberately per-session (not persisted): a
     # mode that silently survives a restart would plan when you meant to build.
@@ -19584,7 +19620,7 @@ def main(argv: list[str] | None = None) -> None:
             _handle_queue(f"/{normalized_input}", console)
             continue
         if lowered_input == "tui" or lowered_input.startswith("tui "):
-            _handle_tui(normalized_input, console)
+            _handle_tui(normalized_input, console, workspace)
             continue
         if lowered_input == "tasks" or lowered_input.startswith("tasks "):
             _tasks_tokens = lowered_input.split(maxsplit=2)

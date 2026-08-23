@@ -60,6 +60,12 @@ if TYPE_CHECKING:
 
 PREVIEW_CHARS = 800
 MAX_LIST_ITEMS = 20
+
+# A reasoning trace is kept at every log level, so it needs its own ceiling
+# rather than riding on `full_artifacts`. Generous on purpose: the traces this
+# exists for run 2-4KB, and the failure being diagnosed is usually a model that
+# reasoned at length and then did the wrong thing. Only a runaway is cut.
+MAX_REASONING_ARTIFACT_CHARS = 64_000
 TOOL_RESULT_ARTIFACT_TOKEN_THRESHOLD = 1000
 COMMAND_INLINE_CHARS = 4000
 SCHEMA_VERSION = 2
@@ -941,9 +947,28 @@ class ActionLedger:
         thinking = (thinking or "").strip()
         if not thinking:
             return ""
-        cot_path = ""
-        if self.full_artifacts:
-            cot_path = self._write_artifact(self.cot_dir, call_id or "model_unknown", thinking, "reasoning")
+        # Written at EVERY log level, unlike the prompt and the response.
+        #
+        # `full_artifacts` is true only at `log_level: verbose`, and the default
+        # is `essential` - so on every ordinary run this recorded
+        # `thinking_chars: 2543, cot_path: ""`: how much reasoning there was,
+        # and none of the reasoning. Live 2026-08-23 that is exactly what a user
+        # hit. The screen clips the trace (MAX_REASONING_CHARS is 400), so the
+        # part that was hidden was the part that mattered - "Let me: 1. Delete
+        # ..." - and with nothing on disk it could not be recovered afterwards
+        # either. Diagnosing a stuck session with the model's own reasoning
+        # deleted is the hardest version of that job, and it is the version
+        # every non-verbose run was leaving behind.
+        #
+        # Cheap enough to stop gating: a trace is a few KB where a prompt is
+        # tens and a response can be hundreds, and it is bounded below anyway.
+        # `_write_text` redacts it like every other artifact.
+        cot_path = self._write_artifact(
+            self.cot_dir,
+            call_id or "model_unknown",
+            thinking[:MAX_REASONING_ARTIFACT_CHARS],
+            "reasoning",
+        )
         record = {
             **self._correlation(call_id or self.root_operation_id, self.root_operation_id),
             "model_call_id": call_id,

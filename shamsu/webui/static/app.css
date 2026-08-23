@@ -294,6 +294,11 @@ button, input, textarea { font: inherit; color: inherit; }
   display: flex; align-items: center; gap: 7px;
 }
 .turn .foot.done { color: var(--ok); }
+/* A turn that died must not read as one that worked. */
+.turn .foot.failed { color: var(--danger); }
+/* Rounds, context and tokens-per-second - present on every status event and
+   previously dropped on the floor. Quieter than the status text itself. */
+.turn .foot .meter { color: var(--ink-dim); font-variant-numeric: tabular-nums; }
 
 .spinner {
   width: 8px; height: 8px; border-radius: 50%;

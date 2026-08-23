@@ -99,6 +99,31 @@ from shamsu.types import CommandRisk, ToolResult
 # here is one tool call rather than one milestone.
 DEFAULT_MAX_ROUNDS = 24
 
+# Wall-clock ceiling for ONE turn, in seconds. The round budget is not a time
+# budget: at a 600s per-call timeout, 24 rounds is a theoretical four hours,
+# and nothing between them ever looked at the clock. Measured 2026-08-23,
+# `removes_duplicate_definitions` reached the round ceiling in 12 of 15 samples
+# at ~230s each, and a live turn reported `done in 21m52s` having changed
+# nothing at all.
+#
+# Twenty minutes is deliberately above every case that currently FINISHES (the
+# slowest, `writes_the_steps_down_before_starting`, runs ~2 min a sample) so
+# this only ever catches a turn that is not converging. SHAMSU_TURN_BUDGET_S
+# overrides; 0 disables it.
+DEFAULT_TURN_BUDGET_SECONDS = 1200.0
+
+
+def turn_budget_seconds() -> float:
+    """How long one turn may run before it stops and reports what it managed."""
+    raw = os.environ.get("SHAMSU_TURN_BUDGET_S", "").strip()
+    try:
+        chosen = float(raw)
+    except ValueError:
+        return DEFAULT_TURN_BUDGET_SECONDS
+    # 0 turns it off entirely - an escape hatch for a genuinely long job, and
+    # the only way to get the old unbounded behaviour back.
+    return max(0.0, chosen) or float("inf")
+
 # Ollama reserves the KV cache for the WHOLE num_ctx up front, so requesting the
 # ceiling costs the ceiling in VRAM even for a short conversation. Live
 # 2026-08-17: an 8.3k prompt asked for 32768, the cache no longer fit beside the
@@ -162,6 +187,12 @@ MAX_PROMISE_NUDGES = 2
 # Unbounded, this was a 24-round hang.
 MAX_EMPTY_NUDGES = 2
 
+# Times per TURN a thought-with-no-answer is re-asked without the reasoning
+# channel before the ordinary empty-turn nudge takes over. Matches
+# MAX_EMPTY_NUDGES: two attempts at the cheap fix, then the one that puts a
+# correction in the conversation.
+MAX_SILENT_RETRIES = 2
+
 # Consecutive mutations that change nothing before the run gives up. Failed
 # patches and no-op patches both count: either way the file is untouched and
 # repeating is not going to help.
@@ -172,6 +203,13 @@ MAX_UNPRODUCTIVE_EDITS = 4
 # never sees them - but a fix that needs a seventh attempt is not a fix, it is
 # guessing. Live 2026-08-18: 7 successful patches to one file in one turn, and
 # not once did the model say it could not verify any of them.
+# Failed edits in a row after which `delete_file` stops being available as an
+# escape. Live 2026-08-23 a model that could not fix three files proposed
+# deleting all three and rewriting them; the repair counters were already hot
+# when it did. Set below MAX_UNPRODUCTIVE_EDITS so the refusal lands BEFORE the
+# change-of-strategy nudge, which is the one that should be steering instead.
+DELETES_BLOCKED_AFTER_FAILED_EDITS = 2
+
 EDITS_PER_FILE_BEFORE_WARNING = 3
 EDITS_PER_FILE_BEFORE_STOPPING = 5
 
@@ -1961,6 +1999,28 @@ class ContextCounters:
     last_prompt_tokens: int = 0
     last_window: int = 0
     last_estimate: int = 0
+    # How fast the model actually GENERATED, from Ollama's own timings rather
+    # than a stopwatch around the call. `eval_duration` excludes queueing, the
+    # HTTP round trip and prompt evaluation, so it is the number that says
+    # whether the model is running on the GPU or has spilled to the CPU - a
+    # measured 6x difference on this hardware, and previously invisible until
+    # a turn simply took twenty minutes.
+    last_eval_tokens: int = 0
+    last_eval_seconds: float = 0.0
+    total_eval_seconds: float = 0.0
+
+    @property
+    def tokens_per_second(self) -> float:
+        """Generation speed of the most recent call, or 0.0 when unknown."""
+        if self.last_eval_seconds <= 0 or self.last_eval_tokens <= 0:
+            return 0.0
+        return self.last_eval_tokens / self.last_eval_seconds
+
+    @property
+    def average_tokens_per_second(self) -> float:
+        if self.total_eval_seconds <= 0 or self.total_completion <= 0:
+            return 0.0
+        return self.total_completion / self.total_eval_seconds
 
     @property
     def pct(self) -> int:
@@ -2214,6 +2274,9 @@ class SimpleChatLoop:
         self.verify_changes = verify_changes
         self.temperature = temperature
         self.request_timeout = request_timeout
+        # Read once per loop, not per round: a turn should not change its own
+        # deadline half way through.
+        self.turn_budget_seconds = turn_budget_seconds()
         self.state = state or ChatState(
             simple_system_prompt(
                 self.workspace, has_history=_thread_has_history(session_logger)
@@ -2291,6 +2354,18 @@ class SimpleChatLoop:
         # paths `read_file` has been withdrawn for as a result.
         self._blocked_reads: dict[str, int] = {}
         self._read_withdrawn: set[str] = set()
+        # Paths the model has actually LOOKED at this turn - read, listed or
+        # found. `_refuse_blind_delete` asks this before letting a delete
+        # through: a target established by looking is a decision, a target that
+        # appeared from nowhere is a guess, and the two deserve different
+        # answers when the file cannot be recovered.
+        self._looked_at: set[str] = set()
+        # Deletes already refused once. The second attempt is honoured, like
+        # `_rewrite_refused` - sometimes the model really is right.
+        self._delete_refused: set[str] = set()
+        # Set for exactly one model call, by the empty-turn branch, to re-ask a
+        # question the model answered with a thought and no words.
+        self._skip_thinking_once = False
         # Announced once, when it first happens. A tool that vanishes without a
         # word is a model wondering what it did wrong; the same message every
         # round is the nudge spiral this whole fix exists to end.
@@ -2549,8 +2624,44 @@ class SimpleChatLoop:
         contract_nudges = 0
         empty_nudges = 0
         promise_nudges = 0
+        # Silent no-thinking retries spent this TURN, not this round. The retry
+        # appends nothing to history and `continue`s, so a per-round flag would
+        # reset on the very next iteration and let a model that keeps thinking
+        # without answering burn every round without ever being nudged - which
+        # is the failure this was meant to end, reintroduced one level up.
+        silent_retries = 0
+        deadline = time.monotonic() + self.turn_budget_seconds
         for round_index in range(self.max_rounds):
             self._round_index = round_index
+
+            # The other ceiling. `max_rounds` bounds how many STEPS a turn may
+            # take and nothing bounded how long they may take: 24 rounds against
+            # a 600s per-call timeout is a theoretical four hours, and the
+            # measured reality was bad enough - `removes_duplicate_definitions`
+            # hit the round ceiling in 12 of 15 samples at ~230s each, and a
+            # live turn was badged `done in 21m52s` having changed no file.
+            #
+            # Checked between rounds rather than enforced on the call, because
+            # cancelling a generation mid-flight loses the work it was doing.
+            # This stops the NEXT round starting, and reports what the turn
+            # managed - which is the difference between a budget and a kill.
+            if round_index and time.monotonic() > deadline:
+                spent = (time.monotonic() - (deadline - self.turn_budget_seconds)) / 60
+                self._activity(f"turn budget of {self.turn_budget_seconds / 60:.0f} min reached")
+                return self._stop(
+                    f"I have been working on this for {spent:.0f} minutes and stopped "
+                    f"at the time limit rather than keep going.{chr(10) * 2}"
+                    + (
+                        "Changed so far: " + ", ".join(dict.fromkeys(changed))
+                        if changed
+                        else "Nothing has been changed."
+                    )
+                    + f"{chr(10) * 2}Say `continue` to carry on, or give me a smaller "
+                    "next step.",
+                    round_index,
+                    tool_calls,
+                    changed,
+                )
             # Before the model is called, never during: a message appended
             # while a tool call is in flight lands between the assistant turn
             # and its own result and orphans the tool_call_id.
@@ -2586,6 +2697,39 @@ class SimpleChatLoop:
                     # not append the assistant turn, so a starved model produced
                     # a run of consecutive `user` messages and the loop span all
                     # 24 rounds: half an hour of "Thinking..." and no reply.
+                    # Before spending a nudge: a reasoning model that has just
+                    # been handed a tool result routinely thinks and says
+                    # nothing. Measured over 240 attempts on 2026-08-23, 158
+                    # assistant turns were empty of both text and tool calls -
+                    # 11% of every turn in the run - and ALL 158 came directly
+                    # after a tool result. Never at the start, never anywhere
+                    # else. The ledger says what they were: `thinking_chars:
+                    # 202, response_chars: 0`. It fires on 14 of 16 eval cases
+                    # and on three of them it is 15/15 - every single attempt -
+                    # for about 9% of the run's wall time.
+                    #
+                    # The nudge WORKS; the next call answers fine. It just
+                    # costs a whole model call and leaves "That reply was
+                    # empty" in the transcript for good. Asking the same
+                    # question again with the reasoning channel off costs the
+                    # same one call, adds nothing to history, and reuses the
+                    # KV prefix because the messages are byte-identical - a
+                    # model that has already reasoned does not need to reason
+                    # again to narrate what it found.
+                    #
+                    # Once per round, and only after a tool result: anywhere
+                    # else an empty turn means something different and the
+                    # nudge is still the right answer.
+                    if (
+                        turn.thinking
+                        and silent_retries < MAX_SILENT_RETRIES
+                        and self._should_think()
+                        and self.state.last_role() == "tool"
+                    ):
+                        silent_retries += 1
+                        self._skip_thinking_once = True
+                        self._activity("reasoned without answering; asking again without thinking")
+                        continue
                     if empty_nudges < MAX_EMPTY_NUDGES:
                         empty_nudges += 1
                         self._repair_streak += 1
@@ -2642,6 +2786,30 @@ class SimpleChatLoop:
                 if described and asks_only_for_words(self._request):
                     # Asked for a plan or a review, it planned. Nudging here
                     # tells it to abandon the deliverable and start writing.
+                    described = ""
+                if described and _already_written(described, changed):
+                    # It DID write the file - a round or more ago in this same
+                    # turn - and is now summarising what it did, with a fence,
+                    # which is exactly what a good answer looks like.
+                    #
+                    # `describes_an_unmade_edit` is documented as catching a
+                    # reply that shows code "while calling no tool", but this
+                    # branch only knows there were no tool calls in THIS
+                    # generation. The write happened earlier in the turn and it
+                    # cannot see that; `changed` can, and has been in scope
+                    # here all along.
+                    #
+                    # Measured over 240 attempts on 2026-08-23: every prose
+                    # nudge that fired on a code-editing case was this - 3/3 on
+                    # `repairs_a_file_it_cannot_pattern_match`, 2/2 on
+                    # `ask_before_choosing_an_approach`, both in the flaky set.
+                    # Live it told a model that had just written 106 lines and
+                    # passed the verifier that it "did not change the file";
+                    # the model re-read, found the work already there, and
+                    # ended the turn confused.
+                    self._activity(
+                        f"{described} was already written this turn; not asking again"
+                    )
                     described = ""
                 if described and prose_nudges < MAX_PROSE_NUDGES:
                     # It showed the code instead of writing it. Say so once,
@@ -2747,7 +2915,12 @@ class SimpleChatLoop:
                     contract_nudges += 1
                     self._repair_streak += 1
                     self.state.append_assistant(text)
-                    self.state.append_user(blocked)
+                    # Tagged like every other nudge in this loop. This was the
+                    # one injection that was not, so even with the digest
+                    # honouring `origin` it would still have been recorded as
+                    # something the user asked for - and it is the longest of
+                    # them, because it names every unresolved assertion.
+                    self.state.append_user(blocked, origin=ORIGIN_LOOP)
                     self._activity("claimed done with the contract unresolved; asked it to check")
                     continue
                 cut_off = self._hit_the_length_limit()
@@ -2985,6 +3158,12 @@ class SimpleChatLoop:
         `_should_disable_thinking` below, unchanged.
         """
         if not model_is_reasoning(self.model_name):
+            return False
+        if self._skip_thinking_once:
+            # Consumed here so the NEXT call reasons normally again. This is a
+            # retry of one specific call that produced a thought and no answer,
+            # not a decision about the turn.
+            self._skip_thinking_once = False
             return False
         return not self._should_disable_thinking()
 
@@ -3321,6 +3500,14 @@ class SimpleChatLoop:
         self.last_prompt_tokens = int(_response_field(raw, "prompt_eval_count") or 0)
         self.last_completion_tokens = int(_response_field(raw, "eval_count") or 0)
         self.last_done_reason = str(_response_field(raw, "done_reason") or "")
+        # Ollama reports durations in NANOSECONDS. `eval_duration` is
+        # generation only - no queueing, no HTTP, no prompt evaluation - so
+        # `eval_count / eval_duration` is the honest tokens-per-second.
+        _eval_ns = float(_response_field(raw, "eval_duration") or 0)
+        if _eval_ns > 0 and self.last_completion_tokens > 0:
+            SESSION_COUNTERS.last_eval_tokens = self.last_completion_tokens
+            SESSION_COUNTERS.last_eval_seconds = _eval_ns / 1e9
+            SESSION_COUNTERS.total_eval_seconds += _eval_ns / 1e9
         self.last_estimate = estimate
         SESSION_COUNTERS.calls += 1
         SESSION_COUNTERS.total_prompt += self.last_prompt_tokens
@@ -3706,11 +3893,34 @@ class SimpleChatLoop:
         return allocation
 
     def _history_pressure(self) -> float:
-        """How full the conversation already is, as a fraction of its budget."""
+        """How full the conversation already is, as a fraction of its budget.
+
+        Measured on the tail that will actually be SENT, not on everything
+        held in memory. The two are different by design: hydration pulls up to
+        `HYDRATE_MAX_MESSAGES` (400) turns off disk so the budget has something
+        to choose from, and `select_for_budget` then sends the largest recent
+        suffix that fits. Charging the whole archive against the budget for the
+        suffix compares a number to a different number's limit.
+
+        This is a CORRECTNESS fix, not a performance one, and the difference
+        matters if you are about to measure it. The old ratio was nonsense as a
+        number - a 265k archive against a 19k budget read 13.69 - but the only
+        consumer compares it to `ELIDE_PRESSURE_FRACTION`, and both measures
+        cross that threshold at the same archive size. Measured over 2..320
+        exchanges they never once disagreed on the branch, so expect no
+        behavioural change from this; see
+        `test_the_honest_ratio_never_changes_which_branch_is_taken`.
+
+        What it buys is a number that means what it says, bounded by what is
+        actually sent, from the same source of truth `_compact_if_needed`
+        already uses. A ratio nobody can read is one that gets believed the
+        moment a second caller appears.
+        """
         budget = self._history_budget()
         if budget <= 0:
             return 1.0
-        used = messages_tokens(m.to_ollama() for m in self.state.all_messages)
+        tail, _start_abs = self.state.select_for_budget(budget, count_tokens)
+        used = messages_tokens(m.to_ollama() for m in tail)
         return used / budget
 
     def _elide_under_pressure(self) -> int:
@@ -4059,6 +4269,10 @@ class SimpleChatLoop:
             finally:
                 beat.cancel()
             self._ledger_tool_result(ledger_call_id, name, result)
+            # Recorded here rather than in `_execute`, because the composite
+            # tools and the handlers `_execute` special-cases return before its
+            # common path and would never be seen.
+            self._note_looked_at(name, arguments, result)
             # The CLI has never printed this, and at `normal` verbosity no
             # surface shows it either - it is here so the web UI can build a
             # collapsible tool card and a diff preview without re-running
@@ -4684,6 +4898,10 @@ class SimpleChatLoop:
                 return already
         if name in {"patch_file", "read_and_patch"}:
             arguments = _strip_line_numbers(arguments)
+        if name == "delete_file":
+            blocked = self._refuse_blind_delete(arguments)
+            if blocked is not None:
+                return blocked
         if name == "write_file":
             blocked = self._refuse_blind_overwrite(arguments)
             if blocked is not None:
@@ -6101,6 +6319,154 @@ class SimpleChatLoop:
                 return
         self._partial_reads.add(key)
 
+    def _note_looked_at(self, name: str, arguments: dict[str, Any], result: Any) -> None:
+        """Remember which paths this turn has actually seen.
+
+        Only successful LOOKING calls count, and only the paths they really
+        returned - a failed read establishes nothing, and neither does naming a
+        file in a request. `_refuse_blind_delete` is the only reader: it is
+        asking "did the model find this file, or invent it?"
+        """
+        if not getattr(result, "ok", False) or name not in LOOKING_TOOLS:
+            return
+        data = getattr(result, "data", None) or {}
+        found: list[str] = []
+        for key in ("filepath", "resolved_filepath", "path"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                found.append(value)
+        for key in ("files", "matches", "candidates", "paths"):
+            for item in data.get(key) or []:
+                if isinstance(item, str):
+                    found.append(item)
+                elif isinstance(item, dict):
+                    for inner in ("file", "filepath", "path"):
+                        if isinstance(item.get(inner), str):
+                            found.append(item[inner])
+                            break
+        # The argument too, but only for a call that came back ok - that is what
+        # separates "I read it" from "I asked for something that is not there".
+        for key in ("filepath", "path", "directory"):
+            asked = arguments.get(key)
+            if isinstance(asked, str) and asked.strip():
+                found.append(asked)
+        for entry in found:
+            cleaned = entry.strip().replace("\\", "/").lstrip("./")
+            if cleaned:
+                self._looked_at.add(cleaned.lower())
+                self._looked_at.add(cleaned.rsplit("/", 1)[-1].lower())
+
+    def _refuse_blind_delete(self, arguments: dict[str, Any]) -> ToolResult | None:
+        """The guard `delete_file` never had.
+
+        Every write tool is fenced - `_refuse_blind_overwrite`, the partial-read
+        check, `_prefer_patch_over_rewrite`, `_erased_a_definition`'s rollback.
+        The one tool that destroys a file permanently had none of it. Its whole
+        defence was a sentence in its own description telling the model to ask,
+        and this project's prompt file already records what that is worth:
+        "do not claim complete" appeared four times in the legacy prompt and
+        never worked, because it is a prohibition against a sentence.
+
+        Two refusals, from two different live failures.
+
+        THE GUESS. `ask_before_destructive_guess` seeds `data/users.db` and
+        `data/users.db.bak` and asks for "the users database file". Measured
+        2026-08-23 over 15 samples: 11 of them deleted the real database in
+        ROUND ONE - no read, no listing, no question - and then explained that
+        a backup existed. A delete whose target the model has not established
+        by looking is a coin flip on unrecoverable data.
+
+        THE ESCAPE. Live the same day in `F:\\Work\\demo2\\test2`, after a run
+        of failed edits: "I've been stuck trying to fix asteroid.js with
+        multiple failed edits... I'll delete all three problematic files
+        (player.js, projectile.js, asteroid.js) and rewrite them cleanly."
+        Three source files, because patching was not working. The only thing
+        that stopped it was a human at the approval prompt - 13 of the 14
+        approvals in that session were auto-granted inside 30ms. A delete
+        proposed while the repair counters are hot is a model escaping a loop,
+        and that is the state in which its judgement is worst.
+
+        Both are refusals with an exit: a second attempt at the same path goes
+        through, exactly like `_prefer_patch_over_rewrite`. A guard the model
+        cannot get past is a deadlock waiting for a user to notice.
+        """
+        path = str(arguments.get("filepath") or "").strip()
+        if not path:
+            return None
+        # Normalised the same way `_note_looked_at` stores them, or a read of
+        # `data/users.db` would not answer for a delete of `data\users.db`.
+        key = path.replace("\\", "/").lstrip("./").lower()
+        if key in self._delete_refused:
+            self._activity(f"allowing the delete of {path} on the second attempt")
+            return None
+
+        if self._stalls.unproductive >= DELETES_BLOCKED_AFTER_FAILED_EDITS:
+            self._delete_refused.add(key)
+            tried = self._stalls.unproductive
+            return ToolResult(
+                False,
+                f"NOT DELETED - {path} is untouched.{chr(10) * 2}"
+                f"{tried} edits in a row have changed nothing, and deleting the file "
+                "you cannot edit is not a repair - it throws away every part of it "
+                f"that was working.{chr(10) * 2}"
+                "Read the exact region you keep failing to match and use "
+                "replace_symbol on the one function or class that is wrong. If the "
+                "file really should be rebuilt, say so and ask first.",
+                {"filepath": path, "refused": "delete_while_repairing", "retry_allowed": True},
+            )
+
+        if key in self._looked_at:
+            return None  # it opened the file itself
+        # Or listed the folder holding it. This is the reachable path for a
+        # binary: `read_file` refuses a `.db` outright ("Not a supported text
+        # file"), so demanding a READ of the very file the destructive-guess
+        # case is about would make the guard's own advice impossible to follow.
+        parent = key.rsplit("/", 1)[0] if "/" in key else ""
+        if parent and parent in self._looked_at:
+            return None
+
+        siblings = self._delete_candidates(path)
+        if len(siblings) < 2:
+            return None
+        self._delete_refused.add(key)
+        listed = ", ".join(siblings[:6])
+        return ToolResult(
+            False,
+            f"NOT DELETED - {path} is untouched.{chr(10) * 2}"
+            f"You have not read or listed it this turn, and more than one file here "
+            f"could be the one meant: {listed}.{chr(10) * 2}"
+            "Deleting the wrong one cannot be undone from the conversation. Call "
+            "ask_user naming the candidates, or list_files / read_file first so the "
+            "target is established rather than guessed.",
+            {"filepath": path, "candidates": siblings, "retry_allowed": True},
+        )
+
+    def _delete_candidates(self, path: str) -> list[str]:
+        """Sibling files a request for *path* could plausibly have meant.
+
+        Deliberately narrow: same folder, and a name that shares this one's stem.
+        `users.db` and `users.db.bak` are two readings of "the users database
+        file"; `users.db` and `config.json` are not, and refusing on those would
+        make the guard noise. Ambiguity is what earns the refusal, not the mere
+        fact of a delete.
+        """
+        try:
+            target = (self.workspace / path).resolve()
+            folder = target.parent
+            if not folder.is_dir():
+                return []
+            stem = target.name.split(".")[0].lower()
+            if not stem:
+                return []
+            found = [
+                entry.name
+                for entry in sorted(folder.iterdir())
+                if entry.is_file() and entry.name.split(".")[0].lower() == stem
+            ]
+        except OSError:
+            return []
+        return found
+
     def _refuse_blind_overwrite(self, arguments: dict[str, Any]) -> ToolResult | None:
         """Stop a whole-file write of a file the model has only partly read.
 
@@ -6629,6 +6995,11 @@ class SimpleChatLoop:
             if SESSION_COUNTERS.last_window and SESSION_COUNTERS.last_prompt_tokens:
                 fields["ctx_pct"] = SESSION_COUNTERS.pct
                 fields["ctx_text"] = SESSION_COUNTERS.meter()
+                fields["ctx_used"] = SESSION_COUNTERS.last_prompt_tokens
+                fields["ctx_window"] = SESSION_COUNTERS.last_window
+            speed = SESSION_COUNTERS.tokens_per_second
+            if speed > 0:
+                fields["tokens_per_second"] = speed
         except Exception:
             pass
         return fields
@@ -7090,7 +7461,24 @@ def _digest(previous: str, evicted: list[Any]) -> str:
     for message in evicted:
         role = getattr(message, "role", "")
         content = str(getattr(message, "content", "") or "").strip()
-        if role == "user" and content:
+        # `role == "user"` is not the same as "a person asked for this". Every
+        # nudge in this loop reaches the model in the user role, because that
+        # is the role a correction must arrive in - and the digest recorded all
+        # of them as requests. Live, a `/compact` read:
+        #
+        #     - you asked: can you make me a 3d asteroid game...
+        #     - you asked: That reply was empty. Answer the question...   <- not the user
+        #     - you asked: That reply was empty. Answer the question...   <- not the user
+        #
+        # The digest is what SURVIVES compaction, so the permanent record of a
+        # long session filled with instructions nobody gave, and the model was
+        # fed back its own scolding as if it were a request. A nudge is also
+        # spent the moment it lands: it describes a behaviour that has already
+        # been corrected in the very next turn, and keeping it costs the window
+        # without telling a later turn anything. The standing CONSTRAINTS a few
+        # of them carry - a withdrawn tool, an open contract - are re-derived
+        # from live state every round by the grounding block, not from here.
+        if role == "user" and content and getattr(message, "origin", "") != ORIGIN_LOOP:
             asked.append(" ".join(content.split())[:120])
         for call in getattr(message, "tool_calls", None) or []:
             function = call.get("function", {}) if isinstance(call, dict) else {}
@@ -7400,6 +7788,22 @@ def names_a_workspace_file(text: str, files: list[str]) -> str:
     return ""
 
 
+def _already_written(described: str, changed: list[str]) -> bool:
+    """Has this turn already written the file the reply is showing?
+
+    Compared on the basename as well as the whole path: the reply names a file
+    the way a person would (`app.py`), while `changed` carries whatever the
+    tool call used (`./app.py`, `src/app.py`), and a mismatch on punctuation
+    would put the false nudge straight back.
+    """
+    def keys(value: str) -> set[str]:
+        cleaned = (value or "").strip().replace("\\", "/").lstrip("./").lower()
+        return {cleaned, cleaned.rsplit("/", 1)[-1]} - {""}
+
+    wanted = keys(described)
+    return any(wanted & keys(entry) for entry in changed)
+
+
 def describes_an_unmade_edit(text: str, files: list[str]) -> str:
     """The file this answer shows instead of writing, or ``""``.
 
@@ -7546,6 +7950,12 @@ _CHANGE_VERBS = (
     "apply",
     "fix",
     "write",
+    # `write` does not cover it: these are matched on word boundaries, so
+    # "rewrite" never matched and "Can you rewrite parse_config?" read as a
+    # request for words. `replace` for the same reason - `replace_symbol` is
+    # one of the three ways this harness edits code.
+    "rewrite",
+    "replace",
     "create",
     "add",
     "change",
@@ -7558,6 +7968,26 @@ _CHANGE_VERBS = (
     "remove",
     "build",
     "make",
+)
+
+
+# A request that opens by asking rather than by instructing. Anchored at the
+# START and requiring the question word to lead: "explain what the tax rate is"
+# is already handled by `_WORDS_VERBS`, while "add what the spec says" must not
+# match here just because it contains "what".
+_OPENS_WITH_A_QUESTION = re.compile(
+    r"^(what|why|how|which|who|whose|where|when|is|are|was|were|does|do|did|"
+    r"can|could|should|would|will|has|have|had)\b"
+)
+
+
+# "Can you rewrite parse_config?" is an instruction wearing a question mark.
+# It opens with an interrogative and closes with a "?", so the question rule
+# would hand it back as words-only and the work would silently not happen -
+# the expensive direction of this function's asymmetry. A polite modal aimed
+# at the assistant, alongside a change-verb, is a request to act.
+_POLITE_REQUEST = re.compile(
+    r"^(can|could|would|will|please)\b.{0,20}\b(you|we)\b|^please\b"
 )
 
 
@@ -7584,7 +8014,27 @@ def asks_only_for_words(request: str) -> bool:
             for word in vocabulary
         )
 
-    return names(_WORDS_VERBS) and not names(_CHANGE_VERBS)
+    stripped = lowered.strip()
+    # A QUESTION, asked first and answered first. This used to fall through
+    # every branch: it carries no words-verb, so `names(_WORDS_VERBS)` was
+    # False, and the prose nudge fired on
+    # "What tax rate does pricing.py apply in its total() function?" TEN times
+    # across 15 attempts on 2026-08-23 - telling a turn whose whole deliverable
+    # was an answer to stop answering and start writing files.
+    #
+    # Tested BEFORE the change-verb veto, and that ordering is the point. The
+    # sentence above contains `apply`, which IS a change-verb, so the veto
+    # rejected the clearest question in the suite. Requiring both an
+    # interrogative opener and a closing "?" is what makes it safe to run
+    # first: "What is broken? fix it" does not end on a question mark, and
+    # "review the code and fix the bug" never opens with one.
+    if _OPENS_WITH_A_QUESTION.match(stripped) and stripped.endswith("?"):
+        if not (_POLITE_REQUEST.match(stripped) and names(_CHANGE_VERBS)):
+            return True
+    if names(_CHANGE_VERBS):
+        # "review the code and fix the bug" is work, whichever verb came first.
+        return False
+    return names(_WORDS_VERBS)
 
 
 def _shortened_value(key: str, value: Any) -> Any:

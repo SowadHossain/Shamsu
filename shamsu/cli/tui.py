@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import re
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -58,11 +60,57 @@ MAX_SCROLLBACK_LINES = 5000
 #: what every scrolling application uses.
 WHEEL_ROWS = 3
 
+#: How tall the input box may grow before it scrolls internally. Eight lines
+#: holds a pasted traceback or a short spec without swallowing the log.
+INPUT_MAX_ROWS = 8
+
 #: The sidebar's fixed width. Below `MIN_WIDTH_FOR_SIDEBAR` it is dropped
 #: entirely and the telemetry falls back to the bottom toolbar, because a
 #: 28-column pane out of 70 leaves the log unreadable.
 SIDEBAR_WIDTH = 30
 MIN_WIDTH_FOR_SIDEBAR = 90
+
+
+#: The three things in the pane, and how to tell them apart at a glance.
+#:
+#: A log is what the agent DID, an answer is what it SAID, and a prompt is what
+#: a human asked for - three different kinds of thing that all arrived as
+#: undifferentiated grey text, so a scrollback of a long session read as one
+#: undifferentiated wall.
+#:
+#: Each carries a gutter mark as well as a colour. Colour alone is not a
+#: distinction: terminal palettes vary, some are unreadable, and some people
+#: cannot see the difference between the green and the amber. The mark is in
+#: the same column on every row, so the shape of the conversation is legible in
+#: a screenshot with the colour stripped out.
+KIND_LOG = "log"
+KIND_ANSWER = "answer"
+KIND_NOTICE = "notice"
+
+#: `surface -> (gutter, gutter style, text style)`. A prompt is coloured by
+#: WHERE IT CAME FROM: the same session takes work from this terminal, the web
+#: portal and Telegram, and "who asked for this?" is otherwise unanswerable
+#: from the log.
+PROMPT_SURFACES: dict[str, tuple[str, str, str]] = {
+    "cli": ("› ", "class:kind.cli.mark", "class:kind.cli"),
+    "web": ("◈ ", "class:kind.web.mark", "class:kind.web"),
+    "telegram": ("✈ ", "class:kind.telegram.mark", "class:kind.telegram"),
+}
+UNKNOWN_SURFACE = ("? ", "class:kind.other.mark", "class:kind.other")
+
+#: The non-prompt kinds. `log` is deliberately blank - it is the default, it
+#: arrives already coloured by rich, and marking every action row would put a
+#: gutter on 95% of the pane.
+LINE_KINDS: dict[str, tuple[str, str, str]] = {
+    KIND_LOG: ("", "", ""),
+    KIND_ANSWER: ("◆ ", "class:kind.answer.mark", "class:kind.answer"),
+    KIND_NOTICE: ("· ", "class:kind.notice", "class:kind.notice"),
+}
+
+
+def prompt_decoration(surface: str) -> tuple[str, str, str]:
+    """How a prompt from `surface` is drawn."""
+    return PROMPT_SURFACES.get((surface or "").strip().lower(), UNKNOWN_SURFACE)
 
 
 def tui_enabled() -> bool:
@@ -90,9 +138,55 @@ def coalesce(fragments: Iterable[tuple]) -> list[tuple[str, str]]:
     return out
 
 
+#: Private-mode CSI sequences (`ESC [ ? 25 l` - hide cursor, and friends).
+#:
+#: These MUST go before `ANSI()` sees them: it does not recognise the `?`
+#: form and renders it as the literal text `25l`. Live 2026-08-23 that was
+#: visible as garbage in the pane.
+_PRIVATE_CSI = re.compile(r"\x1b\[\?[0-9;]*[a-zA-Z]")
+
+#: Anything else that would reach the real terminal as a control character.
+#: `ANSI()` consumes the SGR codes it understands and passes the rest through
+#: as TEXT - and prompt_toolkit writes fragment text verbatim, so a stray
+#: `\x1b[1A` in the pane physically moves the cursor and scrambles the frame,
+#: sidebar and all. Nothing that steers a cursor may be stored.
+_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 def parse_ansi(text: str) -> list[tuple[str, str]]:
-    """ANSI escapes to styled fragments, coalesced."""
-    return coalesce(to_formatted_text(ANSI(text)))
+    """ANSI escapes to styled fragments, coalesced and made safe to store.
+
+    `\\r` is deliberately KEPT here - `LogPane.write` needs to see it to know a
+    line is being overwritten. Everything else that could steer a cursor is
+    dropped.
+    """
+    cleaned = _PRIVATE_CSI.sub("", text)
+    fragments = to_formatted_text(ANSI(cleaned))
+    safe: list[tuple[str, str]] = []
+    for style, body in ((f[0], f[1]) for f in fragments):
+        stripped = _CONTROL_CHARS.sub("", body)
+        if stripped:
+            safe.append((style, stripped))
+    return coalesce(safe)
+
+
+def parse_ansi_lines(
+    text: str,
+) -> list[list[tuple[list[tuple[str, str]], bool]]]:
+    """Parse a chunk into lines, and within each line into carriage-return runs.
+
+    Returns one entry per NEWLINE-separated line; each entry is a list of
+    `(fragments, overwrite)` pieces, where `overwrite` says this piece followed
+    a `\\r` and therefore replaces what came before it on that line.
+    """
+    lines: list[list[tuple[list[tuple[str, str]], bool]]] = [[]]
+    for style, body in parse_ansi(text):
+        for line_index, line_part in enumerate(body.split("\n")):
+            if line_index:
+                lines.append([])
+            for run_index, run in enumerate(line_part.split("\r")):
+                lines[-1].append(([(style, run)] if run else [], run_index > 0))
+    return lines
 
 
 def split_lines(fragments: Iterable[tuple[str, str]]) -> list[list[tuple[str, str]]]:
@@ -144,6 +238,32 @@ def wrap_line(
     return rows
 
 
+class _Decorated:
+    """Sets the pane's line decoration for the length of a `with` block."""
+
+    def __init__(self, pane: Any, gutter: str, gutter_style: str, style: str) -> None:
+        self._pane = pane
+        self._new = (gutter, gutter_style, style)
+        self._old = ("", "", "")
+
+    def __enter__(self) -> Any:
+        pane = self._pane
+        self._old = (pane._gutter, pane._gutter_style, pane._style)
+        # Close whatever half-line is open first, or it inherits the new mark.
+        if pane._partial:
+            pane._append_logical(pane._partial)
+            pane._partial = []
+        pane._gutter, pane._gutter_style, pane._style = self._new
+        return pane
+
+    def __exit__(self, *_exc: object) -> None:
+        pane = self._pane
+        if pane._partial:
+            pane._append_logical(pane._partial)
+            pane._partial = []
+        pane._gutter, pane._gutter_style, pane._style = self._old
+
+
 class LogPane:
     """The scrollback. Bounded, wrapped, and scrolled from inside the app.
 
@@ -165,22 +285,53 @@ class LogPane:
         #: The tail of a chunk that did not end in a newline. Rich writes in
         #: pieces that do not respect line boundaries.
         self._partial: list[tuple[str, str]] = []
+        #: How lines written right now are marked. See `decorate_as`.
+        self._gutter = ""
+        self._gutter_style = ""
+        self._style = ""
 
     # -- intake ------------------------------------------------------------
 
     def write(self, text: str) -> None:
-        """Append output. Accepts ANSI; partial lines are held until closed."""
+        """Append output. Accepts ANSI; partial lines are held until closed.
+
+        A carriage return REPLACES the line being built, as it does on a real
+        terminal. Everything that draws a spinner or a progress bar - rich's
+        `console.status`, npm, pip, pytest - redraws by emitting `\\r` and the
+        line again. Treating that as ordinary text appends a line per frame:
+        live 2026-08-23 a single status spinner filled the pane with thousands
+        of `Working...` rows and pushed everything else off the screen.
+        """
         if not text:
             return
-        lines = split_lines(parse_ansi(text))
-        lines[0] = self._partial + lines[0]
-        self._partial = lines.pop()
-        for line in lines:
-            self._append_logical(line)
+        for index, chunk in enumerate(parse_ansi_lines(text)):
+            if index:
+                self._append_logical(self._partial)
+                self._partial = []
+            for piece, overwrite in chunk:
+                self._partial = piece if overwrite else self._partial + piece
         if self.follow:
             self.to_end()
 
+    def decorate_as(self, gutter: str, gutter_style: str, style: str) -> Any:
+        """Mark every line written inside this block as one KIND.
+
+        A context manager rather than an argument on `write`, because the
+        writes it has to cover are `console.print` calls made by code that has
+        never heard of a pane - the whole point of redirecting the console was
+        that a hundred call sites did not have to learn about the frame.
+        """
+        return _Decorated(self, gutter, gutter_style, style)
+
+    def _decorate(self, line: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        if self._style:
+            line = [(style or self._style, text) for style, text in line]
+        if self._gutter:
+            line = [(self._gutter_style, self._gutter), *line]
+        return line
+
     def _append_logical(self, line: list[tuple[str, str]]) -> None:
+        line = self._decorate(line)
         evicted = self._rowcount[0] if len(self._logical) == self.max_lines else 0
         self._logical.append(line)
         rows = wrap_line(line, self.width) if self.width else [line]
@@ -204,6 +355,18 @@ class LogPane:
             self._rowcount.append(len(rows))
             self._rows.extend(rows)
         self.to_end() if self.follow else self._clamp(0)
+
+    def write_as(self, text: str, kind: str) -> None:
+        """Write a block already known to be one kind - a prompt, an answer."""
+        gutter, gutter_style, style = LINE_KINDS.get(kind, LINE_KINDS[KIND_LOG])
+        with self.decorate_as(gutter, gutter_style, style):
+            self.write(text if text.endswith(chr(10)) else text + chr(10))
+
+    def write_prompt(self, text: str, surface: str) -> None:
+        """Write a human's request, coloured by where it came from."""
+        gutter, gutter_style, style = prompt_decoration(surface)
+        with self.decorate_as(gutter, gutter_style, style):
+            self.write(text if text.endswith(chr(10)) else text + chr(10))
 
     def clear(self) -> None:
         self._logical.clear()
@@ -308,7 +471,9 @@ class LogPane:
 # -- the sidebar ------------------------------------------------------------
 
 
-def render_sidebar(telemetry: Any, width: int = SIDEBAR_WIDTH) -> list[tuple[str, str]]:
+def render_sidebar(
+    telemetry: Any, width: int = SIDEBAR_WIDTH, services: Any = None
+) -> list[tuple[str, str]]:
     """`TurnTelemetry` laid out vertically, which is what it was always for.
 
     The bottom toolbar had to give up cells as the terminal narrowed - the file
@@ -394,6 +559,9 @@ def render_sidebar(telemetry: Any, width: int = SIDEBAR_WIDTH) -> list[tuple[str
     model_calls = int(getattr(telemetry, "model_calls", 0) or 0)
     tool_calls = int(getattr(telemetry, "tool_calls", 0) or 0)
     stat("model", f"{model_calls} · {_clock(getattr(telemetry, 'model_seconds', 0))}")
+    speed = float(getattr(telemetry, "tokens_per_second", 0) or 0)
+    if speed > 0:
+        stat("speed", f"{speed:.0f} tok/s", _speed_style(speed))
     stat("tools", f"{tool_calls} · {_clock(getattr(telemetry, 'tool_seconds', 0))}")
 
     failures = int(getattr(telemetry, "tool_failures", 0) or 0)
@@ -431,12 +599,133 @@ def render_sidebar(telemetry: Any, width: int = SIDEBAR_WIDTH) -> list[tuple[str
     tasks = _depth(getattr(telemetry, "tasks_depth", None))
     stat("feedback", str(feedback), "class:tui.val" if feedback else "class:tb.dim")
     stat("queued", str(tasks), "class:tui.val" if tasks else "class:tb.dim")
+
+    # -- what is running around this session -------------------------------
+    if services is not None:
+        blank()
+        heading("Services")
+        for label, (value, style) in services.read().items():
+            stat(label, value, style)
     return rows
 
 
 #: Width of the sidebar's label column. Sized to `contracts`, the longest
 #: label, so the value column keeps every character it can.
 KEY_WIDTH = 11
+
+#: How long a services reading is reused before it is taken again.
+#:
+#: The toolbar repaints five times a second and these answers come from a
+#: SQLite lease table and a state DB - asking every frame would be a database
+#: query per 200ms for a number that changes when you type a command. Five
+#: seconds is far below "I turned the bot on and it still says off".
+SERVICES_TTL_SECONDS = 5.0
+
+
+class Services:
+    """What is running around this session, sampled rather than polled.
+
+    Deliberately outside `TurnTelemetry`: everything in there is fed by the
+    turn stream and belongs to one turn, whereas these outlive turns and come
+    from durable state that other PROCESSES own - the bot's machine lease, the
+    web portal's manager, the model tier. Mixing them would make the telemetry
+    reach out to a database, which is exactly what a renderer must not do.
+    """
+
+    def __init__(self, workspace: Any = None) -> None:
+        self.workspace = workspace
+        self._taken = 0.0
+        self._values: dict[str, tuple[str, str]] = {}
+
+    def read(self) -> dict[str, tuple[str, str]]:
+        """`{label: (value, style)}`, at most one real reading per TTL."""
+        now = time.monotonic()
+        if self._values and now - self._taken < SERVICES_TTL_SECONDS:
+            return self._values
+        self._taken = now
+        self._values = {
+            "model": self._model(),
+            "vram": self._vram(),
+            "ram": self._ram(),
+            "telegram": self._telegram(),
+            "web": self._web(),
+        }
+        return self._values
+
+    def _vram(self) -> tuple[str, str]:
+        """What Ollama is actually holding, from `/api/ps`.
+
+        The most consequential number on this machine and the one nobody could
+        see: Ollama reserves the KV cache for the WHOLE context window up
+        front, so a window that does not fit spills to the CPU and the same
+        turn takes six times as long. "Loaded, 6.2G" and "not loaded" are
+        different worlds and the log said neither.
+        """
+        try:
+            import httpx
+
+            from shamsu.llm.manager import OLLAMA_BASE_URL
+
+            response = httpx.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=1.5)
+            models = response.json().get("models") or []
+        except Exception:  # noqa: BLE001
+            return ("unknown", "class:tb.dim")
+        if not models:
+            return ("nothing loaded", "class:tb.dim")
+        entry = models[0]
+        vram = int(entry.get("size_vram") or 0)
+        window = int(entry.get("context_length") or 0)
+        if not vram:
+            return ("on cpu", "class:tb.alarm")
+        label = f"{vram / 1e9:.1f}G"
+        if window:
+            label += f" · {window // 1024}k"
+        return (label, "class:tb.ok")
+
+    def _ram(self) -> tuple[str, str]:
+        """This process's resident set. SHAMSU's own footprint, not Ollama's."""
+        try:
+            import psutil
+
+            rss = psutil.Process().memory_info().rss
+        except Exception:  # noqa: BLE001
+            return ("unknown", "class:tb.dim")
+        return (f"{rss / 1e6:.0f} MB", "class:tui.val")
+
+    def _model(self) -> tuple[str, str]:
+        try:
+            from shamsu.runtime.models import model_for_role
+
+            name = str(model_for_role("coder") or "")
+        except Exception:  # noqa: BLE001
+            return ("unknown", "class:tb.dim")
+        # The tag is the useful half; the quantisation suffix is not worth a
+        # column that has to fit `qwen2.5-coder:7b-instruct-q4_K_M`.
+        return (name.split("-q4")[0][:18] or "unknown", "class:tui.val")
+
+    def _telegram(self) -> tuple[str, str]:
+        try:
+            from shamsu.integrations.telegram.service import poller_status
+
+            status = poller_status(self.workspace)
+        except Exception:  # noqa: BLE001
+            return ("unknown", "class:tb.dim")
+        if status.get("running"):
+            return ("running", "class:tb.ok")
+        if status.get("configured"):
+            return ("configured", "class:tb.warn")
+        return ("not set up", "class:tb.dim")
+
+    def _web(self) -> tuple[str, str]:
+        try:
+            from shamsu.webui.local import _MANAGER
+
+            portal = _MANAGER.running
+        except Exception:  # noqa: BLE001
+            return ("unknown", "class:tb.dim")
+        if portal is None:
+            return ("off", "class:tb.dim")
+        return (str(getattr(portal, "base_url", "running"))[-18:], "class:tb.ok")
 
 #: A tool called this many times in one turn is thrashing, not working.
 THRASH_AT = 3
@@ -451,6 +740,22 @@ def _busiest(telemetry: Any) -> tuple[str, int]:
     except Exception:  # noqa: BLE001
         return ("", 0)
     return (name, count) if count > 1 else ("", 0)
+
+
+#: Generation speed below which the model has almost certainly spilled off the
+#: GPU. A 7-9B at q4 on this hardware runs in the tens of tokens a second on
+#: the card and in low single digits on the CPU - the gap is not subtle, and
+#: the whole point of showing the number is to catch the fall.
+SLOW_TOKENS_PER_SECOND = 8.0
+HEALTHY_TOKENS_PER_SECOND = 20.0
+
+
+def _speed_style(speed: float) -> str:
+    if speed < SLOW_TOKENS_PER_SECOND:
+        return "class:tb.alarm"
+    if speed < HEALTHY_TOKENS_PER_SECOND:
+        return "class:tb.warn"
+    return "class:tb.ok"
 
 
 def _budget_style(used: int, total: int) -> str:
@@ -547,6 +852,22 @@ TUI_STYLE = {
     "tui.sidebar": "bg:#1c1c1c",
     "tui.spin": "bold #5fafd7",
     "tui.caret": "bold #5fd75f",
+    "tui.input": "bg:#121212",
+    # -- the three kinds of line, one colour family each -------------------
+    # A prompt is coloured by WHERE IT CAME FROM. Logs keep whatever rich sent
+    # them as, so they stay the neutral background the other two stand out
+    # against - which only works because the other two are the minority.
+    "kind.cli": "bold #5fd75f",
+    "kind.cli.mark": "bold #5fd75f",
+    "kind.web": "bold #5fafd7",
+    "kind.web.mark": "bold #5fafd7",
+    "kind.telegram": "bold #d787d7",
+    "kind.telegram.mark": "bold #d787d7",
+    "kind.other": "bold #d7af5f",
+    "kind.other.mark": "bold #d7af5f",
+    "kind.answer": "#ffffff",
+    "kind.answer.mark": "bold #5fafd7",
+    "kind.notice": "#6c6c6c",
     # sidebar rows
     "tui.key": "#8a8a8a",
     "tui.val": "bold #e4e4e4",
@@ -586,18 +907,27 @@ class TuiApp:
         prompt_label: Callable[[], str] = lambda: "shamsu> ",
         on_interrupt: Callable[[], None] | None = None,
         on_exit: Callable[[], None] | None = None,
+        workspace: Any = None,
         mouse_support: bool = True,
     ) -> None:
         from prompt_toolkit.application import Application
+        from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
         from prompt_toolkit.buffer import Buffer
         from prompt_toolkit.filters import Condition
         from prompt_toolkit.layout import HSplit, Layout, VSplit, Window
-        from prompt_toolkit.layout.containers import ConditionalContainer
+        from prompt_toolkit.layout.containers import (
+            ConditionalContainer,
+            Float,
+            FloatContainer,
+        )
         from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
         from prompt_toolkit.layout.dimension import Dimension
+        from prompt_toolkit.layout.menus import CompletionsMenu
+        from prompt_toolkit.layout.processors import BeforeInput
         from prompt_toolkit.styles import Style
 
         self.telemetry = telemetry
+        self.services = Services(workspace)
         self.pane = LogPane()
         self._on_submit = on_submit
         self._on_interrupt = on_interrupt
@@ -606,11 +936,22 @@ class TuiApp:
         self._mouse = mouse_support
         self.app: Any = None
 
+        # Multiline on purpose. A one-line box is fine for "fix the tests" and
+        # useless for the thing people actually paste - a PRD, a traceback, a
+        # spec with eight bullet points - which is most of what starts a real
+        # turn. Enter submits, Alt+Enter opens a new line, and the box grows to
+        # `INPUT_MAX_ROWS` before it starts scrolling, so a long prompt is
+        # visible while it is being written rather than a single sliding line.
         self.buffer = Buffer(
             history=history,
             completer=completer,
             complete_while_typing=bool(completer),
-            multiline=False,
+            # Ghost text from what you have typed before. The idle prompt has
+            # had history for as long as it has existed; the frame's box had
+            # neither this nor a completion menu, so it felt like a downgrade
+            # from the thing it replaced.
+            auto_suggest=AutoSuggestFromHistory(),
+            multiline=True,
             accept_handler=self._accept,
         )
 
@@ -629,19 +970,38 @@ class TuiApp:
             ),
             filter=Condition(self._sidebar_fits),
         )
+        # A `PromptSession` builds the completion menu for you. A hand-made
+        # `Layout` does not - so the completer ran, produced completions, and
+        # had nowhere to draw them. It needs a float anchored to the cursor,
+        # which is the only reason `FloatContainer` is here.
         self.layout = Layout(
-            HSplit(
-                [
-                    VSplit([output, sidebar]),
-                    Window(height=1, content=FormattedTextControl(self._statusline)),
-                    Window(
-                        height=1,
-                        content=BufferControl(
-                            buffer=self.buffer,
-                            input_processors=[],
+            FloatContainer(
+                content=HSplit(
+                    [
+                        VSplit([output, sidebar]),
+                        Window(
+                            height=1, content=FormattedTextControl(self._statusline)
                         ),
-                    ),
-                ]
+                        Window(
+                            height=Dimension(min=1, max=INPUT_MAX_ROWS),
+                            content=BufferControl(
+                                buffer=self.buffer,
+                                input_processors=[
+                                    BeforeInput("› ", style="class:tui.caret")
+                                ],
+                            ),
+                            wrap_lines=True,
+                            style="class:tui.input",
+                        ),
+                    ]
+                ),
+                floats=[
+                    Float(
+                        xcursor=True,
+                        ycursor=True,
+                        content=CompletionsMenu(max_height=12, scroll_offset=1),
+                    )
+                ],
             ),
             focused_element=self.buffer,
         )
@@ -682,7 +1042,7 @@ class TuiApp:
     def _sidebar_fragments(self) -> list[tuple[str, str]]:
         try:
             self.telemetry.tick()
-            return render_sidebar(self.telemetry)
+            return render_sidebar(self.telemetry, services=self.services)
         except Exception:  # noqa: BLE001 - a sidebar that raises kills the frame
             return [("class:tb.dim", " telemetry unavailable")]
 
@@ -776,6 +1136,47 @@ class TuiApp:
         def _(_event) -> None:
             self.pane.to_start()
 
+        @keys.add("enter")
+        def _(event) -> None:
+            # Enter submits even though the buffer is multiline; Alt+Enter is
+            # how you get a new line. Same contract as the idle prompt in
+            # `_make_input_key_bindings`, so the two boxes behave alike.
+            buffer = event.current_buffer
+            state = buffer.complete_state
+            if state is not None and state.current_completion is not None:
+                buffer.apply_completion(state.current_completion)
+                return
+            buffer.validate_and_handle()
+
+        @keys.add("escape", "enter")
+        def _(event) -> None:
+            event.current_buffer.insert_text("\n")
+
+        @keys.add("tab")
+        def _(event) -> None:
+            buffer = event.current_buffer
+            if buffer.complete_state is not None:
+                buffer.complete_next()
+            else:
+                buffer.start_completion(select_first=False)
+
+        @keys.add("s-tab")
+        def _(event) -> None:
+            buffer = event.current_buffer
+            if buffer.complete_state is not None:
+                buffer.complete_previous()
+
+        @keys.add("right")
+        def _(event) -> None:
+            # Accept the ghost suggestion when the cursor is at the end and
+            # there is one; otherwise this is an ordinary cursor move.
+            buffer = event.current_buffer
+            suggestion = buffer.suggestion
+            if suggestion and buffer.cursor_position == len(buffer.text):
+                buffer.insert_text(suggestion.text)
+            else:
+                buffer.cursor_right()
+
         @keys.add("f2")
         def _(_event) -> None:
             # Mouse capture takes click-drag away from the terminal's own
@@ -797,10 +1198,62 @@ class TuiApp:
 
     # -- handing the terminal back -----------------------------------------
 
-    def echo(self, text: str, style: str = "") -> None:
+    def echo(self, text: str, kind: str = KIND_NOTICE) -> None:
         """Put a line into the pane directly, without going through rich."""
-        self.pane.write(text if text.endswith("\n") else text + "\n")
+        self.pane.write_as(text, kind)
         self.invalidate()
+
+    def echo_prompt(self, text: str, surface: str = "cli") -> None:
+        """A human's request, coloured by the surface it arrived from."""
+        self.pane.write_prompt(text, surface)
+        self.invalidate()
+
+    def answering(self) -> Any:
+        """Mark everything written inside as the agent's ANSWER.
+
+        Wraps the one `console.print(Markdown(body))` that ends a turn. The
+        answer is the thing you scroll back to find, and it used to be
+        indistinguishable from the forty action rows above it.
+        """
+        gutter, gutter_style, style = LINE_KINDS[KIND_ANSWER]
+        return self.pane.decorate_as(gutter, gutter_style, style)
+
+    def absorb_for_display(self, event: Any) -> None:
+        """Show a turn that started somewhere ELSE in this pane.
+
+        Registered as a process-wide observer, so it sees the web portal's own
+        `TurnStream` - which the terminal previously had no way to know
+        existed. A prompt sent from the browser ran to completion with nothing
+        on screen here; the surfaces were not out of sync, they were not
+        connected.
+
+        Only the shape of the turn is echoed - the prompt, the answer, and how
+        it ended. Not the tool rows: a foreign turn's forty action lines
+        interleaved with this terminal's own would make both unreadable, and
+        the browser is already showing them to whoever is watching there.
+
+        The CLI's own turns are skipped, because `FrameHost.submit` echoed the
+        prompt when it was typed and the loop is already rendering the rest.
+        """
+        try:
+            kind = str(getattr(event, "kind", ""))
+            surface = str(getattr(event, "source", "") or "cli")
+            text = str(getattr(event, "text", "") or "")
+            if surface == "cli":
+                return
+            if kind == "turn.start" and text:
+                self.echo_prompt(text, surface)
+            elif kind == "assistant" and text:
+                self.pane.write_as(text, KIND_ANSWER)
+                self.invalidate()
+            elif kind == "error" and text:
+                self.echo(f"{surface}: {text}", KIND_NOTICE)
+            elif kind == "turn.end":
+                status = str((getattr(event, "data", None) or {}).get("status") or "")
+                if status and status != "done":
+                    self.echo(f"{surface} turn {status}", KIND_NOTICE)
+        except Exception:  # noqa: BLE001
+            return
 
     async def suspended(self, func: Callable[[], Any]) -> Any:
         """Run `func` on the REAL console, with the frame torn down.
@@ -917,12 +1370,12 @@ class FrameHost:
         accepting either way - that is the point of pinning it.
         """
         if self.turn_active:
-            self.app.echo(f"» {text}")
+            self.app.echo_prompt(text, "cli")
             if self.on_route is not None:
                 self.on_route(text)
             return
-        self.app.echo("")
-        self.app.echo(f"› {text}")
+        self.app.echo("", KIND_LOG)
+        self.app.echo_prompt(text, "cli")
         self._queue.put(text)
 
     #: Set by the REPL: where a mid-turn line goes.

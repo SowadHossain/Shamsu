@@ -219,6 +219,11 @@ class TurnTelemetry:
         self.tool_seconds = 0.0
         self.tool_counts: dict[str, int] = {}
         self.verdict = ""
+        #: Generation speed of the most recent call, from Ollama's own
+        #: `eval_duration`. The number that says whether the model is on the
+        #: GPU or has spilled to the CPU - measured 6x apart on this hardware,
+        #: and previously invisible until a turn simply took twenty minutes.
+        self.tokens_per_second = 0.0
 
     # -- intake ------------------------------------------------------------
 
@@ -303,6 +308,9 @@ class TurnTelemetry:
             self.ctx_used = used
         if isinstance(window, int) and window > 0:
             self.ctx_total = window
+        speed = data.get("tokens_per_second")
+        if isinstance(speed, (int, float)) and speed > 0:
+            self.tokens_per_second = float(speed)
         contracts = data.get("contracts_open")
         if isinstance(contracts, int) and contracts >= 0:
             self.contracts = contracts
@@ -613,6 +621,9 @@ class LiveConsole:
         #: down" has to mean - see `stand_down`.
         self._frame: Any = None
         self._handover: Any = None
+        #: How many prompts are currently holding the terminal. The frame is
+        #: handed over on the first and taken back on the last.
+        self._handover_depth = 0
         #: Shared with the idle prompt, so Up recalls what you typed mid-turn.
         self.history: Any = None
         #: The loop the prompt runs on, so `stand_down` can reach it from the
@@ -662,10 +673,38 @@ class LiveConsole:
         """Record the framed TUI for the length of a turn, or clear it."""
         self._frame = frame
         if frame is None:
+            # FORCED, not depth-counted. The turn is over; whatever the counter
+            # says, nothing is going to release it now. An unbalanced open -
+            # a prompt that raised past its own `finally`, a callback that was
+            # unregistered mid-question - would otherwise leave the depth above
+            # zero forever and strand the terminal, which is the failure the
+            # depth counting exists to prevent rather than to cause.
+            self._handover_depth = 0
             self.resume()
 
     def resume(self) -> None:
-        """The approval is done; the frame may take the terminal back."""
+        """The approval is done; the frame may take the terminal back.
+
+        Depth-counted, because `reading_input()` is re-entrant - it keeps a
+        `_PROMPT_DEPTH` precisely because one prompt may open inside another.
+        A flat release got that pair wrong in both directions:
+
+          * `_suspend_frame` overwrote `self._handover` with the inner prompt's
+            waiter, so the OUTER one was never set and its `run_in_terminal`
+            callable sat on the full HANDOVER_TIMEOUT_SECONDS - 15 minutes of a
+            frame that does not come back, which is a terminal the user cannot
+            reach and exactly what this was built to prevent.
+          * the inner prompt closing released the frame while the outer prompt
+            was still on screen, repainting the alternate screen on top of a
+            question waiting for an answer.
+
+        So: the first suspend hands over, the last resume takes it back, and
+        anything nested in between changes nothing.
+        """
+        if self._handover_depth > 0:
+            self._handover_depth -= 1
+        if self._handover_depth > 0:
+            return
         handover, self._handover = self._handover, None
         if handover is not None:
             with contextlib.suppress(Exception):
@@ -716,6 +755,11 @@ class LiveConsole:
 
         loop, frame = self._loop, self._frame
         if loop is None or frame is None:
+            return
+        self._handover_depth += 1
+        if self._handover is not None:
+            # Already handed over. A prompt opening inside another needs no
+            # second handover, and taking one would strand the first.
             return
         waiter = threading.Event()
         self._handover = waiter

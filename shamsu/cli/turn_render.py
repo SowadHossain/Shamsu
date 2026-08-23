@@ -82,9 +82,17 @@ _WRITERS = frozenset(
 #: `log-detailed.md`; this is the glance that tells you it did the right thing.
 MAX_DIFF_LINES = 8
 
-#: Reasoning shown inline. A trace runs to thousands of characters and the
-#: terminal is not where you read it - `log-detailed.md` keeps all of it.
-MAX_REASONING_CHARS = 400
+#: How much of a reasoning trace reaches the screen.
+#
+# Was 400, which is under a fifth of a typical trace on qwen3.5:9b (measured
+# 2026-08-23: median 221 chars for a short one, 2543 for the kind that
+# precedes a bad decision). At 400 the screen showed the model's plan cut at
+# "Let me: 1. Delete ..." - the sentence naming the three files it was about
+# to delete was the part removed, which is the opposite of what a reader
+# needs. The full trace now always reaches `cot/<call_id>.reasoning.txt`, so
+# this is a display budget rather than a data-retention decision, and it can
+# afford to be generous.
+MAX_REASONING_CHARS = 1400
 
 
 class CliTurnRenderer:
@@ -463,4 +471,36 @@ def _clip(text: str, limit: int, *, one_line: bool = False) -> str:
     text = " ".join((text or "").split()) if one_line else (text or "")
     if len(text) <= limit:
         return text
-    return f"{text[:limit]}..."
+    cut = _cut_at_a_boundary(text, limit)
+    # "...syntax errors." + "..." reads as four dots and looks like a bug.
+    return cut + (".." if cut.endswith((".", "?", "!")) else "...")
+
+
+#: How far back `_cut_at_a_boundary` will look for somewhere sensible to stop.
+#: A quarter of the limit: far enough to clear a long sentence, near enough
+#: that the clip never loses a visible fraction of what it was given.
+BOUNDARY_SEARCH_FRACTION = 0.25
+
+
+def _cut_at_a_boundary(text: str, limit: int) -> str:
+    """Cut at the last sentence, line or word break before *limit*.
+
+    A fixed byte cut lands wherever it lands, and where it landed live on
+    2026-08-23 was the middle of the model's plan: the screen read
+    "Let me: 1. Delete ...", so the one thing the user needed to see - what it
+    was about to delete - was the thing removed. Ending on a real boundary
+    costs a few characters and makes the difference between a clipped thought
+    and a truncated one.
+    """
+    window = text[:limit]
+    floor = limit - int(limit * BOUNDARY_SEARCH_FRACTION)
+    # Sentence end first, then a line break, then a word break. Anything
+    # earlier than `floor` is not worth the characters it would cost.
+    for candidate in (
+        max(window.rfind(". "), window.rfind("? "), window.rfind("! ")),
+        window.rfind("\n"),
+        window.rfind(" "),
+    ):
+        if candidate >= floor:
+            return window[: candidate + 1].rstrip()
+    return window

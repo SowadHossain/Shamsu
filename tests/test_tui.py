@@ -8,6 +8,8 @@ scrollback that jumps to the bottom while you are reading it is not one.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -140,6 +142,69 @@ def test_a_chunk_that_does_not_end_in_a_newline_is_held():
     assert pane.plain(5) == "half a line\nand another"
 
 
+# -- control characters must never reach the terminal ----------------------
+#
+# Live 2026-08-23, from a screenshot: the pane was thousands of rows of
+# `Working...^M`, the sidebar labels were prefixed with stray `M`s, and the
+# whole frame was scrambled. `ANSI()` consumes the SGR codes it understands and
+# passes the rest through AS TEXT - and prompt_toolkit writes fragment text
+# verbatim, so a `\x1b[1A` sitting in the pane physically moves the real
+# cursor. Nothing that steers a cursor may be stored.
+
+
+RICH_STATUS_FRAME = "\x1b[?25l\x1b[32m⠋\x1b[0m Working...\r\x1b[2K"
+
+
+def test_a_spinner_redraw_replaces_its_line_instead_of_adding_one():
+    """Everything that draws a spinner or a progress bar - rich's
+    `console.status`, npm, pip, pytest - redraws by emitting `\\r` and the line
+    again. Treated as ordinary text that is one row PER FRAME."""
+    pane = _pane()
+    for _ in range(200):
+        pane.write(RICH_STATUS_FRAME)
+    pane.write("\x1b[32m⠋\x1b[0m Working...\ndone\n")
+
+    assert pane.total_rows == 2, "each spinner frame became its own row"
+    assert pane.plain(10) == "⠋ Working...\ndone"
+
+
+def test_no_control_character_is_ever_stored():
+    pane = _pane()
+    pane.write("a\x1b[1Ab\x1b[2Kc\x07d\x00e\n")
+    text = pane.plain(5)
+    for forbidden in ("\x1b", "\r", "\x07", "\x00"):
+        assert forbidden not in text, repr(forbidden)
+
+
+def test_a_private_mode_escape_does_not_become_literal_text():
+    """`ANSI()` does not recognise the `ESC [ ? 25 l` form and renders it as
+    the text `25l`, which is what put garbage in the pane."""
+    pane = _pane()
+    pane.write("\x1b[?25lhello\x1b[?25h\n")
+    assert pane.plain(5) == "hello"
+
+
+def test_carriage_returns_inside_one_write_all_collapse():
+    pane = _pane()
+    pane.write("first\rsecond\rthird\n")
+    assert pane.plain(5) == "third"
+
+
+def test_a_carriage_return_does_not_eat_the_line_before_it():
+    pane = _pane()
+    pane.write("kept\n")
+    pane.write("scratch\rfinal\n")
+    assert pane.plain(5) == "kept\nfinal"
+
+
+def test_colour_survives_a_carriage_return_redraw():
+    pane = _pane()
+    pane.write("\x1b[31mold\x1b[0m\r\x1b[32mnew\x1b[0m\n")
+    fragments = pane.visible(5)
+    assert "".join(f[1] for f in fragments) == "new"
+    assert any("green" in str(style) for style, *_rest in fragments)
+
+
 def test_colour_survives_the_round_trip():
     pane = _pane()
     pane.write("plain \x1b[31mred\x1b[0m\n")
@@ -217,6 +282,252 @@ def test_clearing_empties_it():
     pane.clear()
     assert pane.total_rows == 0
     assert pane.follow
+
+
+# -- telling a prompt, a log and an answer apart ---------------------------
+#
+# Three different kinds of thing that all arrived as undifferentiated text, so
+# a long session's scrollback read as one wall. A prompt is coloured by WHERE
+# IT CAME FROM, because the same session takes work from this terminal, the web
+# portal and Telegram, and "who asked for this?" was otherwise unanswerable.
+
+
+def _styles_for(pane: LogPane, needle: str) -> set[str]:
+    return {
+        str(style)
+        for style, *rest in pane.visible(40)
+        if needle in (rest[0] if rest else "")
+    }
+
+
+def test_each_surface_gets_its_own_colour_and_its_own_mark():
+    from shamsu.cli.tui import PROMPT_SURFACES
+
+    pane = _pane(width=60)
+    pane.write_prompt("from the terminal", "cli")
+    pane.write_prompt("from the phone", "telegram")
+    pane.write_prompt("from the browser", "web")
+
+    assert _styles_for(pane, "from the terminal") == {"class:kind.cli"}
+    assert _styles_for(pane, "from the phone") == {"class:kind.telegram"}
+    assert _styles_for(pane, "from the browser") == {"class:kind.web"}
+
+    # Every surface must be distinguishable from every other, by BOTH channels.
+    marks = {mark for mark, _ms, _s in PROMPT_SURFACES.values()}
+    colours = {style for _m, _ms, style in PROMPT_SURFACES.values()}
+    assert len(marks) == len(PROMPT_SURFACES)
+    assert len(colours) == len(PROMPT_SURFACES)
+
+
+def test_a_prompt_is_marked_as_well_as_coloured():
+    """Colour alone is not a distinction: palettes vary, some are unreadable,
+    and some people cannot tell the green from the amber."""
+    pane = _pane(width=60)
+    pane.write_prompt("do the thing", "cli")
+    assert pane.plain(5).startswith("› ")
+
+
+def test_an_unknown_surface_is_still_visibly_a_prompt():
+    pane = _pane(width=60)
+    pane.write_prompt("from somewhere new", "carrier-pigeon")
+    assert _styles_for(pane, "from somewhere new") == {"class:kind.other"}
+    assert pane.plain(5).startswith("? ")
+
+
+def test_the_answer_is_distinct_from_the_log_above_it():
+    """The answer is the thing you scroll back to find, and it was
+    indistinguishable from the forty action rows above it."""
+    from shamsu.cli.tui import KIND_ANSWER
+
+    pane = _pane(width=60)
+    pane.write("  Reading config.py\n")
+    pane.write_as("Fixed - it falls back to localhost now.", KIND_ANSWER)
+
+    assert _styles_for(pane, "Reading config.py") == {""}
+    assert _styles_for(pane, "Fixed -") == {"class:kind.answer"}
+    assert "◆ " in pane.plain(10)
+
+
+def test_ordinary_log_output_keeps_the_colour_rich_gave_it():
+    """Logs are the neutral background the other two stand out against, which
+    only works if nothing repaints them."""
+    pane = _pane(width=60)
+    pane.write("\x1b[31mFAILED\x1b[0m to patch\n")
+    assert "ansired" in _styles_for(pane, "FAILED")
+
+
+def test_a_decoration_does_not_leak_past_its_block():
+    from shamsu.cli.tui import KIND_ANSWER, LINE_KINDS
+
+    pane = _pane(width=60)
+    with pane.decorate_as(*LINE_KINDS[KIND_ANSWER]):
+        pane.write("the answer\n")
+    pane.write("an ordinary log line\n")
+
+    assert _styles_for(pane, "an ordinary log line") == {""}
+    assert "◆ an ordinary" not in pane.plain(10)
+
+
+def test_a_half_written_line_is_closed_before_the_kind_changes():
+    """Rich writes in pieces; a chunk still open when the block opens would
+    inherit a mark that belongs to the next thing."""
+    from shamsu.cli.tui import KIND_ANSWER, LINE_KINDS
+
+    pane = _pane(width=60)
+    pane.write("half a log line")
+    with pane.decorate_as(*LINE_KINDS[KIND_ANSWER]):
+        pane.write("the answer\n")
+
+    text = pane.plain(10)
+    assert "half a log line" in text
+    assert "◆ half a log line" not in text
+
+
+def test_a_multi_line_answer_is_marked_on_its_first_row():
+    from shamsu.cli.tui import KIND_ANSWER
+
+    pane = _pane(width=60)
+    pane.write_as("first line\nsecond line", KIND_ANSWER)
+    assert _styles_for(pane, "second line") == {"class:kind.answer"}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_started_elsewhere_shows_whose_it_was():
+    """A turn begun in the web portal is still this session's work, and the
+    terminal is where someone is watching it."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    class Remote:
+        kind = "turn.start"
+        text = "deploy the thing"
+        source = "telegram"
+        data: ClassVar[dict] = {}
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        app.absorb_for_display(Remote())
+
+    assert "✈ deploy the thing" in app.pane.plain(10)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_the_terminal_never_started_still_shows_up():
+    """The web portal runs in this same process and builds its own
+    `TurnStream`, which the CLI had no way to know existed - so a prompt sent
+    from the browser ran to completion with the terminal showing nothing. The
+    surfaces were not out of sync; they were not connected."""
+    import tempfile
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.runtime.turn_stream import TurnEvent, TurnStream
+
+    workspace = Path(tempfile.mkdtemp())
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        detach = TurnStream.add_observer(app.absorb_for_display)
+
+        stream = TurnStream(workspace, "sess-web")
+        common = {
+            "session_id": "sess-web",
+            "workspace": str(workspace),
+            "source": "web",
+        }
+        stream.publish(TurnEvent(seq=1, kind="turn.start", text="write the plan", **common))
+        stream.publish(TurnEvent(seq=2, kind="assistant", text="Wrote PLAN.md.", **common))
+        stream.publish(
+            TurnEvent(
+                seq=3, kind="turn.end", text="failed", data={"status": "failed"}, **common
+            )
+        )
+
+        text = app.pane.plain(20)
+        assert "◈ write the plan" in text, "the prompt never reached the terminal"
+        assert "◆ Wrote PLAN.md." in text, "the answer never reached the terminal"
+        assert "web turn failed" in text, "the failure was silent"
+
+        detach()
+        stream.publish(TurnEvent(seq=4, kind="turn.start", text="after detach", **common))
+        assert "after detach" not in app.pane.plain(20)
+
+
+@pytest.mark.asyncio
+async def test_a_foreign_turns_tool_rows_do_not_flood_this_terminal():
+    """Forty action lines from another surface interleaved with this one's
+    would make both unreadable, and the browser is already showing them."""
+    import tempfile
+
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.runtime.turn_stream import TurnEvent, TurnStream
+
+    workspace = Path(tempfile.mkdtemp())
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        detach = TurnStream.add_observer(app.absorb_for_display)
+        stream = TurnStream(workspace, "sess-web")
+        common = {"session_id": "sess-web", "workspace": str(workspace), "source": "web"}
+        for seq in range(40):
+            stream.publish(
+                TurnEvent(seq=seq, kind="tool.call", text="Reading a.py", **common)
+            )
+            stream.publish(
+                TurnEvent(seq=seq, kind="status", text="thinking...", **common)
+            )
+        detach()
+
+    assert "Reading a.py" not in app.pane.plain(60)
+    assert "thinking..." not in app.pane.plain(60)
+
+
+def test_an_observer_that_raises_never_fails_the_turn():
+    import tempfile
+
+    from shamsu.runtime.turn_stream import TurnEvent, TurnStream
+
+    workspace = Path(tempfile.mkdtemp())
+    detach = TurnStream.add_observer(
+        lambda _event: (_ for _ in ()).throw(RuntimeError("nope"))
+    )
+    try:
+        stream = TurnStream(workspace, "sess")
+        stream.publish(TurnEvent(seq=1, kind="turn.start", text="go"))
+    finally:
+        detach()
+
+
+@pytest.mark.asyncio
+async def test_this_terminals_own_prompt_is_not_echoed_twice():
+    """`FrameHost.submit` already echoed it at the moment it was typed."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    class Local:
+        kind = "turn.start"
+        text = "fix the tests"
+        source = "cli"
+        data: ClassVar[dict] = {}
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        app.absorb_for_display(Local())
+
+    assert "fix the tests" not in app.pane.plain(10)
 
 
 # -- the bridge rich writes through ----------------------------------------
@@ -324,6 +635,48 @@ def test_the_time_split_between_model_and_tools_is_counted():
 
     text = "".join(t for _s, t in render_sidebar(meter))
     assert "12 · 8m12s" in text
+
+
+def test_generation_speed_rides_in_on_the_status_event():
+    """From Ollama's own `eval_duration`, not a stopwatch around the call - so
+    it excludes queueing, the HTTP round trip and prompt evaluation."""
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+    meter.absorb(Event("status", "thinking", tokens_per_second=34.2))
+
+    assert round(meter.tokens_per_second, 1) == 34.2
+    assert "34 tok/s" in "".join(t for _s, t in render_sidebar(meter))
+
+
+def test_a_model_that_has_fallen_off_the_gpu_is_flagged_red():
+    """A 7-9B at q4 runs in the tens of tokens a second on the card and in low
+    single digits on the CPU. The gap is not subtle, and catching the fall is
+    the whole reason to show the number."""
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+
+    meter.absorb(Event("status", "x", tokens_per_second=3.0))
+    assert any("alarm" in s for s, t in render_sidebar(meter) if "3 tok/s" in t)
+
+    meter.absorb(Event("status", "x", tokens_per_second=14.0))
+    assert any("warn" in s for s, t in render_sidebar(meter) if "14 tok/s" in t)
+
+    meter.absorb(Event("status", "x", tokens_per_second=41.0))
+    assert any("ok" in s for s, t in render_sidebar(meter) if "41 tok/s" in t)
+
+
+def test_an_unmeasured_speed_is_not_reported_as_zero():
+    """A model that has not answered yet has no speed; `0 tok/s` is a claim."""
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("turn.start"))
+    assert "tok/s" not in "".join(t for _s, t in render_sidebar(meter))
+
+
+def test_speed_is_forgotten_with_the_rest_of_the_turn():
+    meter = TurnTelemetry(unicode_ui=True)
+    meter.absorb(Event("status", "x", tokens_per_second=34.0))
+    meter.absorb(Event("turn.start"))
+    assert meter.tokens_per_second == 0.0
 
 
 def test_failed_tool_calls_are_counted_and_shown_in_red():
@@ -753,6 +1106,270 @@ def test_closing_the_frame_unblocks_whoever_is_waiting_for_a_line():
             cm.__exit__(None, None, None)
 
 
+# -- the input box ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_input_box_takes_more_than_one_line():
+    """A one-line box is fine for "fix the tests" and useless for the thing
+    people actually paste - a PRD, a traceback, a spec with eight bullets."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    submitted: list[str] = []
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=submitted.append)
+        assert app.buffer.multiline(), "the box is still one line"
+
+        task = asyncio.ensure_future(app.app.run_async())
+        await asyncio.sleep(0.05)
+        pipe.send_text("first line")
+        pipe.send_text("\x1b\r")  # Alt+Enter: a new line, NOT a submit
+        await asyncio.sleep(0.05)
+        assert submitted == [], "Alt+Enter submitted instead of opening a line"
+        pipe.send_text("second line\r")  # Enter: submit
+        await asyncio.sleep(0.05)
+        app.app.exit()
+        await task
+
+    assert submitted == ["first line\nsecond line"]
+
+
+@pytest.mark.asyncio
+async def test_the_box_completes_slash_commands():
+    """The completer was simply never passed, AND a hand-made `Layout` has no
+    completions menu - `PromptSession` builds one for you and this does not, so
+    completions were computed and had nowhere to be drawn."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.cli.repl import SlashCommandCompleter
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            completer=SlashCommandCompleter(Path(".")),
+        )
+        task = asyncio.ensure_future(app.app.run_async())
+        await asyncio.sleep(0.05)
+        pipe.send_text("/qu")
+        await asyncio.sleep(0.3)
+
+        state = app.buffer.complete_state
+        assert state is not None, "nothing completed"
+        offered = [completion.text for completion in state.completions]
+        assert "/queue" in offered
+
+        pipe.send_text("\t")
+        await asyncio.sleep(0.2)
+        chosen = app.buffer.complete_state
+        assert chosen is not None and chosen.current_completion is not None
+        app.app.exit()
+        await task
+
+
+def test_the_layout_has_somewhere_to_draw_completions():
+    """Without a float anchored to the cursor the menu exists nowhere."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.layout.containers import FloatContainer
+    from prompt_toolkit.layout.menus import CompletionsMenu
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+
+    container = app.layout.container
+    assert isinstance(container, FloatContainer)
+    assert any(
+        isinstance(float_.content, CompletionsMenu) for float_ in container.floats
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_box_suggests_from_what_you_typed_before():
+    """Ghost text. The idle prompt has had history for as long as it has
+    existed; the frame's box had neither this nor a menu."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.history import InMemoryHistory
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    history = InMemoryHistory()
+    history.append_string("fix the failing tests")
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(), on_submit=lambda _t: None, history=history
+        )
+        task = asyncio.ensure_future(app.app.run_async())
+        await asyncio.sleep(0.05)
+        pipe.send_text("fix the")
+        await asyncio.sleep(0.3)
+
+        suggestion = app.buffer.suggestion
+        assert suggestion is not None, "no suggestion from history"
+        assert suggestion.text == " failing tests"
+
+        pipe.send_text("\x1b[C")  # right arrow accepts it
+        await asyncio.sleep(0.2)
+        assert app.buffer.text == "fix the failing tests"
+        app.app.exit()
+        await task
+
+
+def test_the_input_box_grows_but_is_bounded():
+    """It has to hold a pasted traceback without swallowing the log."""
+    from shamsu.cli.tui import INPUT_MAX_ROWS
+
+    assert 1 < INPUT_MAX_ROWS <= 12
+
+
+# -- what is running around the session ------------------------------------
+
+
+def test_services_are_sampled_not_polled(tmp_path):
+    """The toolbar repaints five times a second and these answers come from a
+    SQLite lease table - one query per 200ms for a number that changes when you
+    type a command would be absurd."""
+    from shamsu.cli.tui import Services
+
+    services = Services(tmp_path)
+    taken: list[int] = []
+
+    def counted() -> tuple[str, str]:
+        taken.append(1)
+        return ("running", "class:tb.ok")
+
+    services._telegram = counted
+    for _ in range(20):
+        services.read()
+    assert len(taken) == 1, "the sidebar hit the database on every repaint"
+
+
+def test_services_refresh_once_the_reading_is_stale(tmp_path, monkeypatch):
+    from shamsu.cli import tui
+    from shamsu.cli.tui import Services
+
+    services = Services(tmp_path)
+    services.read()
+    monkeypatch.setattr(
+        tui.time, "monotonic", lambda: services._taken + tui.SERVICES_TTL_SECONDS + 1
+    )
+    taken: list[int] = []
+    services._web = lambda: (taken.append(1), ("off", "class:tb.dim"))[1]
+    services.read()
+    assert taken == [1]
+
+
+def test_what_ollama_is_holding_is_read_from_api_ps(tmp_path, monkeypatch):
+    """Ollama reserves the KV cache for the WHOLE window up front, so a window
+    that does not fit spills to the CPU and the same turn takes six times as
+    long. "Loaded, 6.2G" and "not loaded" are different worlds."""
+    from shamsu.cli.tui import Services
+
+    class Response:
+        @staticmethod
+        def json():
+            return {
+                "models": [
+                    {"size_vram": 6_207_559_433, "context_length": 32768}
+                ]
+            }
+
+    monkeypatch.setattr("httpx.get", lambda *_a, **_k: Response())
+    assert Services(tmp_path)._vram() == ("6.2G · 32k", "class:tb.ok")
+
+
+def test_a_model_running_on_the_cpu_is_an_alarm(tmp_path, monkeypatch):
+    from shamsu.cli.tui import Services
+
+    class Response:
+        @staticmethod
+        def json():
+            return {"models": [{"size_vram": 0, "context_length": 32768}]}
+
+    monkeypatch.setattr("httpx.get", lambda *_a, **_k: Response())
+    value, style = Services(tmp_path)._vram()
+    assert value == "on cpu"
+    assert "alarm" in style
+
+
+def test_nothing_loaded_is_said_plainly(tmp_path, monkeypatch):
+    from shamsu.cli.tui import Services
+
+    class Response:
+        @staticmethod
+        def json():
+            return {"models": []}
+
+    monkeypatch.setattr("httpx.get", lambda *_a, **_k: Response())
+    assert Services(tmp_path)._vram()[0] == "nothing loaded"
+
+
+def test_an_unreachable_ollama_does_not_raise_into_the_renderer(tmp_path, monkeypatch):
+    from shamsu.cli.tui import Services
+
+    def refuse(*_a, **_k):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("httpx.get", refuse)
+    assert Services(tmp_path)._vram() == ("unknown", "class:tb.dim")
+
+
+def test_this_processes_own_memory_is_reported(tmp_path):
+    from shamsu.cli.tui import Services
+
+    value, _style = Services(tmp_path)._ram()
+    assert value.endswith(" MB")
+    assert float(value.removesuffix(" MB")) > 0
+
+
+def test_a_service_that_cannot_be_reached_reads_unknown(tmp_path, monkeypatch):
+    """An unreadable control DB must be a grey word, not a crash in a renderer
+    that would take the frame down."""
+    from shamsu.cli.tui import Services
+
+    services = Services(tmp_path)
+    monkeypatch.setattr(
+        "shamsu.integrations.telegram.service.poller_status",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("no db")),
+    )
+    assert services._telegram() == ("unknown", "class:tb.dim")
+
+
+def test_the_sidebar_shows_the_services_when_it_is_given_them(tmp_path):
+    from shamsu.cli.tui import Services
+
+    services = Services(tmp_path)
+    services._telegram = lambda: ("running", "class:tb.ok")
+    services._web = lambda: ("off", "class:tb.dim")
+    services._model = lambda: ("qwen3.5:9b", "class:tui.val")
+
+    text = "".join(t for _s, t in render_sidebar(_telemetry(), services=services))
+    assert "SERVICES" in text
+    assert "telegram" in text and "running" in text
+    assert "qwen3.5:9b" in text
+
+
+def test_the_sidebar_is_unchanged_when_no_services_are_given():
+    """The panel is optional - a test or a surface without a workspace should
+    not be forced to construct one."""
+    text = "".join(t for _s, t in render_sidebar(_telemetry()))
+    assert "SERVICES" not in text
+
+
 def test_the_tui_is_off_unless_asked_for(monkeypatch):
     monkeypatch.delenv("SHAMSU_TUI", raising=False)
     assert not tui_enabled()
@@ -830,3 +1447,99 @@ def test_the_sidebar_is_dropped_on_a_terminal_too_narrow_for_it(monkeypatch):
     from shamsu.cli import tui
 
     assert MIN_WIDTH_FOR_SIDEBAR > tui.SIDEBAR_WIDTH * 2
+
+
+# --- R9: the approval handover across NESTED prompts -------------------------
+#
+# `reading_input()` keeps a `_PROMPT_DEPTH` because one prompt may open inside
+# another. The handover did not: `_suspend_frame` overwrote `self._handover`
+# with the inner waiter, so the outer one was never set and its
+# `run_in_terminal` callable sat on the full 900s - a frame that does not come
+# back is a terminal the user cannot reach.
+
+
+def _console_with_frame(with_loop: bool = True):
+    """A LiveConsole with just the handover fields, and no event loop running.
+
+    `_suspend_frame` hands its coroutine to `asyncio.run_coroutine_threadsafe`
+    inside `contextlib.suppress(Exception)`, so a dummy loop object exercises
+    every line of the bookkeeping without needing a real one.
+    """
+    from shamsu.cli.live_console import LiveConsole
+
+    live = LiveConsole.__new__(LiveConsole)
+    live._handover = None
+    live._handover_depth = 0
+    live._frame = object()
+    live._loop = object() if with_loop else None
+    return live
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_a_nested_prompt_does_not_strand_the_outer_handover():
+    live = _console_with_frame()
+
+    live._suspend_frame()                       # the outer prompt opens
+    outer = live._handover
+    assert outer is not None and live._handover_depth == 1
+
+    live._suspend_frame()                       # a prompt opens inside it
+    assert live._handover is outer, "the inner prompt must not replace the waiter"
+    assert live._handover_depth == 2
+
+    live.resume()                               # inner closes
+    assert not outer.is_set(), "the frame must not return while a prompt is up"
+    assert live._handover_depth == 1
+
+    live.resume()                               # outer closes
+    assert outer.is_set(), "the last release hands the terminal back"
+    assert live._handover is None
+
+
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
+def test_one_prompt_hands_over_and_takes_back_as_before():
+    """The ordinary, unnested case must be untouched by the depth counting."""
+    live = _console_with_frame()
+
+    live._suspend_frame()
+    waiter = live._handover
+    assert waiter is not None and not waiter.is_set()
+
+    live.resume()
+
+    assert waiter.is_set()
+    assert live._handover_depth == 0
+
+
+def test_no_handover_is_attempted_without_a_loop_to_run_it_on():
+    live = _console_with_frame(with_loop=False)
+
+    live._suspend_frame()
+
+    assert live._handover is None
+    assert live._handover_depth == 0
+
+
+def test_resume_without_a_suspend_is_harmless():
+    """`resume` is registered as an unconditional on_prompt_close callback, so
+    it fires for prompts that never suspended a frame at all."""
+    live = _console_with_frame()
+
+    live.resume()
+    live.resume()
+
+    assert live._handover_depth == 0
+
+
+def test_tearing_the_frame_down_releases_whatever_is_outstanding():
+    import threading
+
+    live = _console_with_frame()
+    stuck = threading.Event()
+    live._handover = stuck
+    live._handover_depth = 3  # an unbalanced open - a prompt that raised
+
+    live.set_frame(None)
+
+    assert stuck.is_set(), "the turn is over; nothing else will release it"
+    assert live._handover_depth == 0
