@@ -244,4 +244,8 @@ def test_a_resolution_with_no_surface_still_reads_as_a_sentence():
 
     printed = console.export_text()
     assert "Approval resolved on ." not in printed
-    assert "another surface" in printed
+    # And it no longer INVENTS one either. This row has no decision and no
+    # surface: it fell off the pending list unanswered, and "resolved on
+    # another surface" claimed a person who does not exist.
+    assert "another surface" not in printed
+    assert "unanswered" in printed

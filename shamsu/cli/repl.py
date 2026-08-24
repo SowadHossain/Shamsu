@@ -5545,29 +5545,38 @@ def _status_updater(thinking_status: Any) -> Any:
 def _shared_console_approval(
     workspace: Path, session_logger: Any, console: Console
 ) -> Any:
-    """Ask in this terminal, but let any surface answer.
+    """Ask wherever the human actually IS, and close the store row either way.
 
-    Falls back to the plain local prompt if the control store cannot be opened.
-    An approval that cannot be shared is still an approval that must be asked -
-    degrading to the old behaviour beats refusing to run.
+    Three surfaces can answer one question - this terminal, the browser, the
+    phone - and the row in the control store is what they race over. Two rules
+    follow from that, and both were broken:
+
+    **The row must close on every exit.** `resolve_approval` used to be
+    reachable only down the happy path, so the fallback prompt and a Ctrl+C
+    both left the row at `decision = ''` for ever. Live 2026-08-24: 131 of 176
+    rows in one install were orphans. Fifteen minutes later each fell off the
+    pending list unstamped, and the watcher announced it as somebody's answer -
+    `Approval resolved on another surface.` in a terminal whose user had
+    touched nothing. The resolve is in a `finally` now, and it catches
+    `BaseException`, because `CancelledError` is the exit that was leaking.
+
+    **The frame must not be torn down to ask.** Handing the raw terminal to a
+    second prompt_toolkit application ejects the user from the TUI into the
+    plain CLI mid-turn, and writes the question into the pane it just took
+    away. Inside a frame the card is drawn in the pane and answered by a key
+    the frame already owns - no handover, no second application.
     """
 
     def ask(request: Any) -> bool:
+        from shamsu.control.store import ALLOW, DENY, ControlStore
+
         try:
-            from shamsu.control.console import (
-                ask_here_or_anywhere,
-                forget_raised_here,
-                mark_raised_here,
-                render_request,
-                run_coroutine_blocking,
-            )
-            from shamsu.control.store import ALLOW, ControlStore
+            from shamsu.control.console import forget_raised_here, mark_raised_here
 
             store = ControlStore()
-            session_id = str(getattr(session_logger, "session_id", "") or "")
             approval_id = store.raise_approval(
                 workspace=workspace,
-                session_id=session_id,
+                session_id=str(getattr(session_logger, "session_id", "") or ""),
                 action_type=str(getattr(request, "action_type", "") or ""),
                 description=str(getattr(request, "description", "") or ""),
                 risk_level=str(getattr(request, "risk_level", "") or ""),
@@ -5580,33 +5589,90 @@ def _shared_console_approval(
         except Exception:  # noqa: BLE001 - no shared store, no shared answer
             return bool(ask_approval(request, console=console))
 
-        from shamsu.safety.approval import _pause_console_live, reading_input
-
-        render_request(store.approval(approval_id), console)
-        # Stop the live spinner before reading: it repaints over the question
-        # and over what is being typed. The same reason the console is bound
-        # explicitly rather than freshly constructed.
-        _pause_console_live(console)
+        decision = DENY
         try:
-            # `run_coroutine_blocking`, not `asyncio.run`: this runs on
-            # whichever thread the tool did, and `asyncio.run` from a thread a
-            # loop already owns raises without awaiting the coroutine it was
-            # handed - leaking it, and falling back to the plain local prompt
-            # every time. `reading_input()` hands the terminal over first, so
-            # this is not a second prompt_toolkit Application on a live one.
-            with reading_input():
-                decision = run_coroutine_blocking(
-                    lambda: ask_here_or_anywhere(store, approval_id, console)
-                )
-        except Exception:  # noqa: BLE001 - never turn a question into a crash
-            # The question is already on screen; asking it again would draw a
-            # second panel for the same action.
-            return bool(ask_approval(request, console=console, render=False))
+            decision = _ask_approval_somewhere(store, approval_id, request, console)
+            return decision == ALLOW
         finally:
-            forget_raised_here(approval_id)
-        return decision == ALLOW
+            # Closes here or nowhere. Whatever happened above - answered, fell
+            # back to the local menu, raised, or was cancelled out from under
+            # us - the store must not keep holding a question with nobody left
+            # waiting on it. A losing write is a no-op, so this cannot
+            # overwrite an answer that came from the phone.
+            with contextlib.suppress(Exception):
+                store.resolve_approval(approval_id, decision, "cli")
+            with contextlib.suppress(Exception):
+                forget_raised_here(approval_id)
 
     return ask
+
+
+def _ask_approval_somewhere(
+    store: Any, approval_id: str, request: Any, console: Console
+) -> str:
+    """Put one question in front of the user, on whichever surface they have.
+
+    Returns the decision that actually won, which may have come from the web
+    or Telegram rather than from here.
+    """
+    from shamsu.control.console import (
+        ask_here_or_anywhere,
+        render_request,
+        run_coroutine_blocking,
+    )
+    from shamsu.control.store import ALLOW, DENY
+    from shamsu.safety.approval import (
+        _pause_console_live,
+        _resume_console_live,
+        reading_input,
+    )
+
+    record = store.approval(approval_id)
+    frame = active_frame()
+
+    if frame is not None:
+        app = frame.app
+        app.open_approval(record)
+        try:
+            # No `reading_input()` on this path, and that is the whole point:
+            # it is what fires `LiveConsole.stand_down`, which suspends the
+            # frame and drops the user into the bare terminal. Nothing needs
+            # to stand down when the asker is the frame itself.
+            return run_coroutine_blocking(
+                lambda: ask_here_or_anywhere(
+                    store,
+                    approval_id,
+                    console,
+                    read_line=lambda: asyncio.to_thread(app.await_approval),
+                )
+            )
+        except Exception:  # noqa: BLE001 - never turn a question into a crash
+            return DENY
+        finally:
+            # Also wakes the reader thread when a remote surface won the race.
+            with contextlib.suppress(Exception):
+                app.close_approval()
+
+    render_request(record, console)
+    # Stop the live spinner before reading: it repaints over the question and
+    # over what is being typed. The return value is KEPT - dropping it left
+    # the status stopped for the rest of the turn, which is the "is it stuck?"
+    # the pause exists to prevent, moved later.
+    paused = _pause_console_live(console)
+    try:
+        # `run_coroutine_blocking`, not `asyncio.run`: this runs on whichever
+        # thread the tool did, and `asyncio.run` from a thread a loop already
+        # owns raises without awaiting the coroutine it was handed.
+        with reading_input():
+            return run_coroutine_blocking(
+                lambda: ask_here_or_anywhere(store, approval_id, console)
+            )
+    except Exception:  # noqa: BLE001 - never turn a question into a crash
+        # The question is already on screen; asking it again would draw a
+        # second panel for the same action.
+        return ALLOW if ask_approval(request, console=console, render=False) else DENY
+    finally:
+        _resume_console_live(paused)
 
 
 _APPROVAL_WATCHER: Any = None

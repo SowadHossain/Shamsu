@@ -23,6 +23,7 @@ degrades to today's behaviour instead of pretending.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 from collections.abc import Awaitable
 from typing import Any, Callable
@@ -159,7 +160,10 @@ async def ask_here_or_anywhere(
         if not store.resolve_approval(approval_id, answer, "cli"):
             record = store.approval(approval_id)
             if record is not None and record.decision:
-                console.print(f"[dim]Already answered on {record.decided_by}[/dim]")
+                where = record.decided_by or "a surface that did not name itself"
+                if record.decided_by == "timeout":
+                    where = "timeout - it expired while the question was open"
+                console.print(f"[dim]Already answered on {where}[/dim]")
                 return record.decision
         return answer
     finally:
@@ -241,6 +245,12 @@ class ApprovalWatcher:
         self.console = console
         self.poll_seconds = poll_seconds
         self._seen: dict[str, Any] = {}
+        #: Approvals that were ALREADY waiting when this watcher opened. They
+        #: belong to some earlier run, very often a process that is no longer
+        #: alive, and drawing a full panel for each is noise carrying an
+        #: `/approve` the user has no reason to trust. Counted once instead.
+        self._inherited: set[str] = set()
+        self._primed = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -269,17 +279,32 @@ class ApprovalWatcher:
                 pass
 
     def _sweep(self) -> None:
+        # Overdue rows first, so an approval nobody answered is STAMPED as a
+        # timeout instead of quietly falling off the pending list underneath
+        # us. Without this the disappearance below cannot be told apart from
+        # an answer, and the watcher says a human decided when none did.
+        with contextlib.suppress(Exception):
+            self.store.expire_approvals()
+
         live = {item.approval_id: item for item in self.store.pending_approvals()}
+
+        if not self._primed:
+            # Everything already waiting when this watcher opened was asked by
+            # an earlier run - often one that is no longer alive. It is still
+            # shown, because a browser question raised a second before you
+            # opened this terminal is real, but it is LABELLED: three fresh
+            # cards for a session that closed twenty minutes ago read as
+            # something waiting on you right now, and each carries an
+            # `/approve` for a process that will never see the answer.
+            self._primed = True
+            self._inherited = set(live)
+
         for approval_id in list(self._seen):
             if approval_id not in live:
-                # Answered somewhere else. Say so, or the terminal keeps
-                # showing a question that no longer exists.
-                record = self.store.approval(approval_id)
-                decided = (record.decided_by if record else "") or "another surface"
                 self._seen.pop(approval_id, None)
-                self.console.print(
-                    f"[dim]Approval resolved on {decided}.[/dim]"
-                )
+                self.console.print(f"[dim]{self._closing_note(approval_id)}[/dim]")
+        self._inherited &= set(live)
+
         for approval_id, record in live.items():
             if approval_id in self._seen:
                 continue
@@ -291,9 +316,39 @@ class ApprovalWatcher:
                 continue
             self._seen[approval_id] = record
             render_request(record, self.console, origin=_origin(record))
+            if approval_id in self._inherited:
+                self.console.print(
+                    "[dim]Raised before this session opened - the run that asked "
+                    "may already be gone. It expires on its own.[/dim]"
+                )
             self.console.print(
                 f"[dim]/approve {approval_id[:20]}  or  /deny {approval_id[:20]}[/dim]"
             )
+
+    def _closing_note(self, approval_id: str) -> str:
+        """Why an approval left the pending list. The three cases differ.
+
+        Saying "resolved on another surface" for all three was a claim the
+        user could catch being false: an approval nobody ever answered timed
+        out, its row kept `decided_by = ''`, and the terminal announced a
+        decision made by a person who did not exist. A watcher that cannot
+        tell "answered" from "expired" should say which one it does not know,
+        not pick the reassuring one.
+        """
+        record = self.store.approval(approval_id)
+        short = approval_id[:20]
+        if record is None:
+            return f"Approval {short} is no longer on record."
+        decision = str(getattr(record, "decision", "") or "")
+        decided_by = str(getattr(record, "decided_by", "") or "")
+        verdict = {ALLOW: "allowed", DENY: "denied"}.get(decision, decision)
+        if not decision:
+            return f"Approval {short} is gone from the queue, unanswered."
+        if decided_by == "timeout":
+            return f"Approval {short} expired unanswered - denied."
+        if not decided_by:
+            return f"Approval {short} was {verdict}; the surface is not recorded."
+        return f"Approval {short} {verdict} on {decided_by}."
 
     def resolve(self, approved: bool, approval_id: str = "") -> tuple[bool, str]:
         """Answer the named approval, or the only one waiting."""
@@ -317,8 +372,7 @@ class ApprovalWatcher:
         won = self.store.resolve_approval(target, ALLOW if approved else DENY, "cli")
         self._seen.pop(target, None)
         if not won:
-            record = self.store.approval(target)
-            return False, f"Already answered on {record.decided_by if record else 'another surface'}."
+            return False, self._closing_note(target)
         return True, f"{'Allowed' if approved else 'Denied'}."
 
 

@@ -669,7 +669,9 @@ def test_the_watcher_retracts_what_was_answered_elsewhere(store):
     store.resolve_approval(approval_id, ALLOW, "web")
     watcher._sweep()
 
-    assert "resolved on web" in console.text
+    # Names the approval AND the decision. "resolved on web" was true but
+    # uselessly vague once more than one card had been on screen.
+    assert "allowed on web" in console.text
     assert watcher.pending() == []
 
 

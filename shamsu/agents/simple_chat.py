@@ -356,7 +356,15 @@ KEEP_VERBATIM_UNDER_PRESSURE = 8
 # Bounded at four paths because this is the one thing elision may not reclaim,
 # and superseded reads of the SAME path are still elided: fifteen stubs for one
 # file is pure loss either way.
-MAX_PROTECTED_READ_PATHS = 4
+#
+# Four was measured against a task that touched four files. The snake-game run
+# of 2026-08-24 touched TEN - eight JS modules plus the HTML and the CSS - so
+# six paths were permanently outside protection no matter how often they were
+# needed. The count is not the real bound anyway: `PROTECTED_READS_MAX_FRACTION`
+# below stops this growing the prompt, and it stops it at the same place
+# whether this says 4 or 8. What the low count did was force ROTATION, and
+# rotation is what the re-read loop feeds on.
+MAX_PROTECTED_READ_PATHS = 8
 
 # And bounded by size as well as by count. The most recent read is always kept -
 # it is the file the model is working on, and dropping it is the whole defect -
@@ -3944,7 +3952,8 @@ class SimpleChatLoop:
 
         if keep_recent is None:
             keep_recent = self._verbatim_tail()
-        protected = self._current_file_reads()
+        rereads = self._read_counts()
+        protected = self._current_file_reads(rereads)
 
         def make_elide(spare: set[int]):
             def elide(message: Any) -> tuple[str, list[dict[str, Any]]] | None:
@@ -3957,7 +3966,14 @@ class SimpleChatLoop:
                     return message.content, _shorten_arguments(message.tool_calls)
                 if message.role == "tool":
                     name = canonical_tool_name(message.name or "")
-                    return elide_tool_result(name, message.content), message.tool_calls
+                    return (
+                        elide_tool_result(
+                            name,
+                            message.content,
+                            rereads.get(_any_read_path(message.content), 0),
+                        ),
+                        message.tool_calls,
+                    )
                 return None
 
             return elide
@@ -3986,36 +4002,70 @@ class SimpleChatLoop:
             )
         return changed
 
-    def _current_file_reads(self) -> set[int]:
+    def _read_counts(self) -> dict[str, int]:
+        """How many times each path has been read in this history.
+
+        Stubs count. A stub IS a read - one whose body was thrown away - and
+        the whole point of the number is to notice a file going round the
+        drop-and-refetch loop.
+        """
+        counts: dict[str, int] = {}
+        for message in self.state.all_messages:
+            if message.role != "tool":
+                continue
+            path = _any_read_path(message.content)
+            if path:
+                counts[path] = counts.get(path, 0) + 1
+        return counts
+
+    def _current_file_reads(self, rereads: dict[str, int] | None = None) -> set[int]:
         """The messages holding what each file ACTUALLY says right now.
 
         One per path, newest first, capped. Everything older for the same path
         is superseded and elides normally - fifteen stubs of one file carry no
         information, and neither did the fifteen full copies.
 
+        Ordered by how often a path has been RE-READ, then by recency, and
+        that ordering is the fix rather than a refinement. Newest-first alone
+        protects four paths on a ten-file project, so six are always elidable;
+        the model re-reads one, its fresh copy becomes the newest and pushes
+        another path out of the protected four, and that one is elided with a
+        stub saying "call read_file". The set of four rotates and the loop
+        never closes. Pinning the files that keep coming back stops the
+        rotation at the file that is actually thrashing.
+
         Identity rather than index: `elide_old_payloads` walks its own slice of
         the history, and an index computed here would silently point at the
         wrong message the moment that slice changed.
         """
-        protected: set[int] = set()
-        seen: set[str] = set()
-        allowance = int(self._history_budget() * PROTECTED_READS_MAX_FRACTION)
-        spent = 0
-        for message in reversed(self.state.all_messages):
-            if len(seen) >= MAX_PROTECTED_READ_PATHS:
-                break
+        rereads = rereads if rereads is not None else self._read_counts()
+        newest: dict[str, Any] = {}
+        order: dict[str, int] = {}
+        for position, message in enumerate(self.state.all_messages):
             if message.role != "tool" or message.elided:
                 continue
             path = _read_result_path(message.content)
-            if not path or path in seen:
+            if not path:
                 continue
+            newest[path] = message
+            order[path] = position
+
+        candidates = sorted(
+            newest,
+            key=lambda path: (-rereads.get(path, 0), -order[path]),
+        )
+
+        protected: set[int] = set()
+        allowance = int(self._history_budget() * PROTECTED_READS_MAX_FRACTION)
+        spent = 0
+        for path in candidates[:MAX_PROTECTED_READ_PATHS]:
+            message = newest[path]
             cost = message_tokens(message.to_ollama())
             if protected and spent + cost > allowance:
-                # The most recent read is kept whatever it costs - it is the
-                # file being worked on. Everything after it is a nice-to-have
-                # and stops at the allowance.
+                # The first one is kept whatever it costs - it is the file
+                # being worked on, or the one that will otherwise be fetched
+                # again in thirty seconds. The rest stop at the allowance.
                 break
-            seen.add(path)
             spent += cost
             protected.add(id(message))
         return protected
@@ -8683,6 +8733,26 @@ def _evidence_title(task: str, changed: list[str]) -> str:
     return head
 
 
+def _any_read_path(payload: str) -> str:
+    """The file a read result refers to, elided stub INCLUDED.
+
+    `_read_result_path` deliberately ignores a stub, because a stub is not
+    evidence and so cannot be protected. Counting how often a path has been
+    read needs the opposite: a stub is exactly the trace of a read that was
+    thrown away, and those are the reads worth counting.
+    """
+    if '"resolved_filepath"' not in payload:
+        return ""
+    try:
+        parsed = json.loads(payload)
+    except (ValueError, TypeError):
+        return ""
+    data = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("resolved_filepath") or "").strip().lower()
+
+
 def _read_result_path(payload: str) -> str:
     """The file whose CONTENTS this tool result carries, or ``""``.
 
@@ -8709,7 +8779,19 @@ def _read_result_path(payload: str) -> str:
     return str(data.get("resolved_filepath") or "").strip().lower()
 
 
-def elide_tool_result(name: str, payload: str) -> str:
+#: How many times one path may be read before the elision stub stops telling
+#: the model to read it again. Two is a real revision; three is a loop.
+#:
+#: Live 2026-08-24: one prompt carried 32 stubs all saying "call read_file for
+#: the current contents". The harness deleted the file bodies and then, thirty
+#: two times in the same breath, instructed the model to fetch them back. Each
+#: re-read is a fresh multi-KB result, which raises the pressure that triggers
+#: the next sweep. `read_file` became 21 of the run's 64 tool calls and the
+#: model said so itself: "I've been re-reading files without making progress."
+RE_READ_LIMIT = 2
+
+
+def elide_tool_result(name: str, payload: str, rereads: int = 0) -> str:
     """What an old tool result is worth keeping as.
 
     A `read_file` body and a `write_file` echo have both served their purpose
@@ -8748,7 +8830,13 @@ def elide_tool_result(name: str, payload: str) -> str:
             for key in ("resolved_filepath", "total_lines", "diff_lines", "matches")
             if key in data
         }
-        summary["elided"] = "call read_file for the current contents"
+        summary["elided"] = (
+            f"body dropped to save context; you have already read this "
+            f"{rereads} times and re-reading has not moved the task on - "
+            "work from what you have, or edit the file"
+            if rereads >= RE_READ_LIMIT
+            else "call read_file for the current contents"
+        )
         kept["data"] = summary
     return json.dumps(kept, ensure_ascii=True)
 

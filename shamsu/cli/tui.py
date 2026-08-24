@@ -86,6 +86,7 @@ MIN_WIDTH_FOR_SIDEBAR = 90
 KIND_LOG = "log"
 KIND_ANSWER = "answer"
 KIND_NOTICE = "notice"
+KIND_APPROVAL = "approval"
 
 #: `surface -> (gutter, gutter style, text style)`. A prompt is coloured by
 #: WHERE IT CAME FROM: the same session takes work from this terminal, the web
@@ -105,6 +106,7 @@ LINE_KINDS: dict[str, tuple[str, str, str]] = {
     KIND_LOG: ("", "", ""),
     KIND_ANSWER: ("◆ ", "class:kind.answer.mark", "class:kind.answer"),
     KIND_NOTICE: ("· ", "class:kind.notice", "class:kind.notice"),
+    KIND_APPROVAL: ("┃ ", "class:kind.approval.mark", "class:kind.approval"),
 }
 
 
@@ -868,6 +870,8 @@ TUI_STYLE = {
     "kind.answer": "#ffffff",
     "kind.answer.mark": "bold #5fafd7",
     "kind.notice": "#6c6c6c",
+    "kind.approval": "bold #ffd75f",
+    "kind.approval.mark": "bold #ff5f5f",
     # sidebar rows
     "tui.key": "#8a8a8a",
     "tui.val": "bold #e4e4e4",
@@ -877,6 +881,7 @@ TUI_STYLE = {
     "tui.status.key": "bg:#262626 #9e9e9e",
     "tui.status.busy": "bg:#875f00 bold #ffffff",
     "tui.status.idle": "bg:#262626 #87d787",
+    "tui.status.ask": "bg:#870000 bold #ffffff",
     # shared with the bottom toolbar, so the two displays agree
     "tb.head": "bold #e4e4e4",
     "tb.label": "#8a8a8a",
@@ -887,6 +892,34 @@ TUI_STYLE = {
     "tb.warn": "#d7af5f",
     "tb.alarm": "bold #ff5f5f",
 }
+
+
+def approval_lines(record: Any, *, offer_remember: bool = False) -> str:
+    """The approval card, as pane text.
+
+    Deliberately the same fields the terminal panel shows. Two renderers for
+    one question is how a single `run_command` came out as a thin card from
+    `control/console.py` and a fat one from `safety/approval.py`, sometimes
+    both, for the same action.
+    """
+    rows = ["", "APPROVAL REQUIRED"]
+    action = str(getattr(record, "action_type", "") or "")
+    if action:
+        rows.append(f"  action : {action}")
+    risk = str(getattr(record, "risk_level", "") or "")
+    if risk:
+        rows.append(f"  risk   : {risk}")
+    rows.append(f"  what   : {getattr(record, 'description', '') or 'an action'}")
+    preview = str(getattr(record, "preview", "") or "").strip()
+    if preview:
+        rows.extend(f"  | {row}" for row in preview[:600].splitlines())
+    rows.append(
+        "  [y] allow   [a] always allow   [n] deny"
+        if offer_remember
+        else "  [y] allow   [n] deny"
+    )
+    rows.append("")
+    return chr(10).join(rows)
 
 
 class TuiApp:
@@ -935,6 +968,11 @@ class TuiApp:
         self._prompt_label = prompt_label
         self._mouse = mouse_support
         self.app: Any = None
+
+        #: `None`, or the question this frame is currently holding. While it
+        #: is set the input box stops taking text and single keys answer
+        #: instead - see `open_approval` for why the frame asks at all.
+        self._approval: dict[str, Any] | None = None
 
         # Multiline on purpose. A one-line box is fine for "fix the tests" and
         # useless for the thing people actually paste - a PRD, a traceback, a
@@ -1064,6 +1102,21 @@ class TuiApp:
         if not self._mouse:
             scroll = f" {self.pane.scroll_position()} · MOUSE OFF "
 
+        pending = self._approval
+        if pending is not None:
+            # The turn is stopped on a human. Nothing else on this bar matters
+            # until it moves, and the keys named here are the ones actually
+            # bound right now - the hint and the bindings are built from the
+            # same flag on purpose, because the last time they were written in
+            # two places they drifted and `a` came to mean deny.
+            mode, mode_style = " APPROVAL NEEDED ", "class:tui.status.ask"
+            keys = (
+                " y allow · a always · n deny · ^C stop "
+                if pending.get("offer_remember")
+                else " y allow · n deny · ^C stop "
+            )
+            scroll = ""
+
         used = len(mode) + len(label) + len(scroll) + len(keys)
         pad = max(1, width - used)
         return [
@@ -1095,6 +1148,76 @@ class TuiApp:
                 self.pane.write(f"that failed: {exc}\n")
         return False
 
+    # -- approvals ---------------------------------------------------------
+
+    def approval_pending(self) -> bool:
+        return self._approval is not None
+
+    def open_approval(self, record: Any, *, offer_remember: bool = False) -> None:
+        """Put the question in the pane and take the keyboard for the answer.
+
+        The old path handed the REAL terminal to a second prompt_toolkit
+        application through `run_in_terminal`, which drops the alternate
+        screen: mid-turn the user was ejected from the TUI into the plain CLI
+        to answer, and the question itself was written to the pane they had
+        just been taken away from. Two applications cannot share a terminal,
+        so the fix is not to start a second one - the frame already owns a
+        keyboard and a place to draw, and only ever needed to be asked.
+        """
+        import threading
+
+        self.close_approval()
+        self._approval = {
+            "answer": "",
+            "answered": threading.Event(),
+            "offer_remember": bool(offer_remember),
+        }
+        self.pane.write_as(approval_lines(record, offer_remember=offer_remember), KIND_APPROVAL)
+        self.pane.to_end()
+        self.invalidate()
+
+    def await_approval(self, timeout: float | None = None) -> str:
+        """Block until a key answers, or `close_approval` releases this.
+
+        Returns the raw key - `y`, `a`, `n`, or `""` when the frame let go
+        without an answer. Interpreting it is the caller's job, so this stays
+        the only place the frame knows about approvals at all.
+        """
+        pending = self._approval
+        if pending is None:
+            return ""
+        pending["answered"].wait(timeout)
+        return str(pending.get("answer") or "")
+
+    def close_approval(self, note: str = "") -> None:
+        """Give the keyboard back. ALWAYS releases whoever is waiting.
+
+        Called from the asking side's `finally`, including when a phone or a
+        browser answered first - so the waiter has to be woken even though no
+        key was pressed here, or the thread parked in `await_approval` never
+        returns and the turn hangs on a question that is already settled.
+        """
+        pending, self._approval = self._approval, None
+        if pending is None:
+            return
+        if note:
+            self.pane.write_as(f"  {note}", KIND_APPROVAL)
+        pending["answered"].set()
+        self.invalidate()
+
+    def _answer_approval(self, choice: str) -> None:
+        pending = self._approval
+        if pending is None:
+            return
+        pending["answer"] = choice
+        self._approval = None
+        self.pane.write_as(
+            "  -> " + {"y": "allowed", "a": "allowed, and remembered"}.get(choice, "denied"),
+            KIND_APPROVAL,
+        )
+        pending["answered"].set()
+        self.invalidate()
+
     def _wheel(self, event: Any) -> None:
         from prompt_toolkit.mouse_events import MouseEventType
 
@@ -1108,9 +1231,47 @@ class TuiApp:
         self.invalidate()
 
     def _bindings(self) -> Any:
+        from prompt_toolkit.filters import Condition
         from prompt_toolkit.key_binding import KeyBindings
 
         keys = KeyBindings()
+
+        # -- while a question is on screen ---------------------------------
+        #
+        # `eager` because these have to beat the buffer's own self-insert: the
+        # answer is a keypress, not a line, and a `y` that landed in the input
+        # box would be submitted as a prompt the moment the frame came back.
+        # `asking` and the statusline hint are read off the SAME flag, so the
+        # keys named on the bar are exactly the keys that are bound.
+        asking = Condition(lambda: self._approval is not None)
+        remembering = Condition(
+            lambda: bool((self._approval or {}).get("offer_remember"))
+        )
+
+        @keys.add("y", filter=asking, eager=True)
+        @keys.add("Y", filter=asking, eager=True)
+        def _(_event) -> None:
+            self._answer_approval("y")
+
+        @keys.add("a", filter=remembering, eager=True)
+        @keys.add("A", filter=remembering, eager=True)
+        def _(_event) -> None:
+            self._answer_approval("a")
+
+        @keys.add("n", filter=asking, eager=True)
+        @keys.add("N", filter=asking, eager=True)
+        @keys.add("enter", filter=asking, eager=True)
+        @keys.add("escape", filter=asking, eager=True)
+        def _(_event) -> None:
+            # Enter and Escape deny. Anything that is not clearly a yes is a
+            # no, the same rule `_decision_from` applies in the terminal.
+            self._answer_approval("n")
+
+        @keys.add("<any>", filter=asking, eager=True)
+        def _(_event) -> None:
+            # Swallowed. `a` when remembering was not offered lands here too,
+            # rather than being typed into a box nobody is reading.
+            return
 
         @keys.add("pageup")
         def _(_event) -> None:

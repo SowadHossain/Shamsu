@@ -523,9 +523,29 @@ class ControlStore:
         return DENY
 
     def expire_approvals(self) -> int:
+        """Stamp every overdue unanswered approval as a timeout denial.
+
+        `pending_approvals()` cannot be the source here, and that WAS the bug:
+        it filters expired rows out before returning, so the loop that walked
+        it could never find one to expire. Nothing else called this either, so
+        an approval nobody answered kept `decision = ''` for ever - and every
+        surface that reads "gone from the pending list" as "somebody answered"
+        then reported a decision that no human ever made. Live 2026-08-24:
+        131 of 176 rows in one install were orphans, and three of them
+        announced themselves as `Approval resolved on another surface.` in a
+        terminal whose user had touched nothing.
+
+        Fails CLOSED, like every other unanswered path: a timeout is a denial.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM approvals WHERE decision = ''"
+            ).fetchall()
         expired = 0
-        for record in self.pending_approvals():
-            if _expired(record) and self.resolve_approval(record.approval_id, DENY, "timeout"):
+        for record in map(_approval, rows):
+            if _expired(record) and self.resolve_approval(
+                record.approval_id, DENY, "timeout"
+            ):
                 expired += 1
         return expired
 
