@@ -30,7 +30,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 from prompt_toolkit import PromptSession
-from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.completion import Completer, Completion, ThreadedCompleter
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
@@ -238,7 +238,11 @@ from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 from shamsu.tools.django import DjangoSetupResult, DjangoSetupRunner, DjangoTestRunner
 from shamsu.tools.executor import CommandRunner
 from shamsu.tools.git import GitTool
-from shamsu.tools.workspace import DOCUMENT_EXTENSIONS, MentionResolver, WorkspaceTool
+from shamsu.tools.workspace import (
+    DOCUMENT_EXTENSIONS,
+    MentionResolver,
+    mention_suggestions_cached,
+)
 from shamsu.ui.progress import ProgressReporter
 from shamsu.ui.trace import emit_trace, read_trace_mode, write_trace_mode
 from shamsu.agents.clarification import classify_reply, format_question, resolve_answer
@@ -500,6 +504,8 @@ SYSTEM_COMMANDS = (
 )
 
 _MODEL_COMPLETION_CACHE: tuple[float, tuple[str, ...]] = (0.0, ())
+_MODEL_COMPLETION_LOCK = threading.Lock()
+_MODEL_COMPLETION_REFRESHING = False
 
 
 class SlashCommandCompleter(Completer):
@@ -511,7 +517,10 @@ class SlashCommandCompleter(Completer):
         token = text.rsplit(maxsplit=1)[-1] if text.strip() else text
         if token.startswith("@") and self.workspace is not None:
             prefix = token[1:]
-            for suggestion in WorkspaceTool(self.workspace).mention_suggestions(prefix):
+            # `mention_suggestions_cached`, never `WorkspaceTool` directly: the
+            # latter walks and sorts the whole workspace, and this runs once per
+            # keystroke.
+            for suggestion in mention_suggestions_cached(self.workspace, prefix):
                 yield Completion(suggestion, start_position=-len(token))
             return
         if not text.startswith("/"):
@@ -533,19 +542,50 @@ class SlashCommandCompleter(Completer):
                 yield Completion(command, start_position=-len(text))
 
 
-def _installed_model_completion_names() -> tuple[str, ...]:
-    global _MODEL_COMPLETION_CACHE
-    now = time.monotonic()
-    cached_at, cached = _MODEL_COMPLETION_CACHE
-    if now - cached_at < 5.0:
-        return cached
+def _refresh_installed_model_names() -> None:
+    """Re-probe the server off the completion path, and never raise into it."""
+    global _MODEL_COMPLETION_CACHE, _MODEL_COMPLETION_REFRESHING
     try:
         status = collect_status()
-    except Exception:
-        return cached
-    models = tuple(status.installed_models if status.server_running else ())
-    _MODEL_COMPLETION_CACHE = (now, models)
-    return models
+        models = tuple(status.installed_models if status.server_running else ())
+    except Exception:  # noqa: BLE001 - a dead server must not cost a keystroke
+        # Keep whatever was last known and re-stamp it, so a server that is down
+        # is retried once per TTL rather than on every key.
+        models = _MODEL_COMPLETION_CACHE[1]
+    with _MODEL_COMPLETION_LOCK:
+        _MODEL_COMPLETION_CACHE = (time.monotonic(), models)
+        _MODEL_COMPLETION_REFRESHING = False
+
+
+def _installed_model_completion_names() -> tuple[str, ...]:
+    """Whatever model names are known RIGHT NOW - refreshed in the background.
+
+    This used to call `collect_status()` inline, which pings the Ollama server:
+    measured at ~2.1 s, on the event loop thread, on a keystroke, and cached for
+    only five seconds - so typing a model name froze, ran, then froze again
+    mid-word. A completer has no business doing network I/O at all.
+
+    Stale names are the right trade. The worst case is a model installed seconds
+    ago missing from the dropdown until the next refresh lands; the name can
+    still be typed in full, and `/models use` validates it properly either way.
+    """
+    global _MODEL_COMPLETION_REFRESHING
+    with _MODEL_COMPLETION_LOCK:
+        cached_at, cached = _MODEL_COMPLETION_CACHE
+        # One refresh in flight at a time: `complete_while_typing` would
+        # otherwise start a thread per keystroke against a slow server.
+        start = (
+            time.monotonic() - cached_at >= 5.0 and not _MODEL_COMPLETION_REFRESHING
+        )
+        if start:
+            _MODEL_COMPLETION_REFRESHING = True
+    if start:
+        threading.Thread(
+            target=_refresh_installed_model_names,
+            name="shamsu-model-completion-refresh",
+            daemon=True,
+        ).start()
+    return cached
 
 
 def resolve_workspace(workspace_arg: str | None) -> Path:
@@ -19115,7 +19155,12 @@ def _make_prompt_session(
         return PromptSession(
             history=history if history is not None else InMemoryHistory(),
             style=style,
-            completer=SlashCommandCompleter(workspace),
+            # THREADED, and this is the load-bearing part. A plain `Completer`
+            # runs on the event loop thread, so for as long as it works nothing
+            # reads the keyboard or repaints - keystrokes queue in the OS buffer
+            # and arrive in a burst, which is what "the TUI lags" was. Wrapping
+            # it means a slow completion delays only the dropdown.
+            completer=ThreadedCompleter(SlashCommandCompleter(workspace)),
             complete_while_typing=True,
             bottom_toolbar=bottom_toolbar or CachedBottomToolbar(workspace),
             multiline=True,

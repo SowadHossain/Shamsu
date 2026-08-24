@@ -247,7 +247,18 @@ def test_models_use_tier_clears_model_override(monkeypatch, tmp_path):
 
 
 def test_models_use_completion_suggests_installed_models(monkeypatch):
+    """The names still arrive - just not on the keystroke that asked for them.
+
+    `collect_status()` pings the Ollama server (~2.1 s measured), and this ran
+    on the event loop thread once per keypress, so the completer now serves
+    whatever it already knows and re-probes on a background thread.
+    """
+    import time as _time
+
+    from prompt_toolkit.document import Document
+
     monkeypatch.setattr(repl, "_MODEL_COMPLETION_CACHE", (0.0, ()))
+    monkeypatch.setattr(repl, "_MODEL_COMPLETION_REFRESHING", False)
     monkeypatch.setattr(
         repl,
         "collect_status",
@@ -257,8 +268,43 @@ def test_models_use_completion_suggests_installed_models(monkeypatch):
             installed_models=["llama3.1:8b", "qwen3:8b"],
         ),
     )
+    completer = repl.SlashCommandCompleter()
+
+    def suggested() -> list[str]:
+        document = Document("/models use l")
+        return [item.text for item in completer.get_completions(document, None)]
+
+    # Nothing known yet, and asking must not block on the probe.
+    assert suggested() == []
+
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if suggested() == ["llama3.1:8b"]:
+            break
+        _time.sleep(0.02)
+    else:  # pragma: no cover - only on a genuinely broken refresh
+        raise AssertionError("background refresh never populated the model names")
+
+
+def test_models_use_completion_never_blocks_on_a_slow_server(monkeypatch):
+    """A hung server used to freeze the prompt; now it costs a dropdown, not a key."""
+    import time as _time
+
     from prompt_toolkit.document import Document
 
-    completions = list(repl.SlashCommandCompleter().get_completions(Document("/models use l"), None))
+    def slow_status(*args, **kwargs):
+        _time.sleep(2.0)
+        raise AssertionError("unreachable in this test")
 
-    assert [item.text for item in completions] == ["llama3.1:8b"]
+    monkeypatch.setattr(repl, "_MODEL_COMPLETION_CACHE", (0.0, ()))
+    monkeypatch.setattr(repl, "_MODEL_COMPLETION_REFRESHING", False)
+    monkeypatch.setattr(repl, "collect_status", slow_status)
+    completer = repl.SlashCommandCompleter()
+
+    started = _time.perf_counter()
+    for fragment in ("q", "qw", "qwe"):
+        document = Document(f"/models use {fragment}")
+        list(completer.get_completions(document, None))
+    elapsed = _time.perf_counter() - started
+
+    assert elapsed < 0.5, f"completion blocked on the server probe: {elapsed:.2f}s"

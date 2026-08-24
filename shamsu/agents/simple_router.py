@@ -95,6 +95,7 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
             "graph_search",
             "explain_symbol",
             "contract_create",
+            "contract_from_plan",
             "contract_status",
         ],
     },
@@ -102,6 +103,7 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
         "description": "Write down what done means, and check it off",
         "tools": [
             "contract_create",
+            "contract_from_plan",
             "contract_status",
             "contract_assert_pass",
             "contract_assert_fail",

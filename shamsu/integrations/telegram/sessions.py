@@ -295,6 +295,34 @@ class LocalShamsuSessionGateway:
                 # showed no turn for it, because Telegram writes no chat log.
                 final = self._run_simple(text, logger, tools, ledger, progress, metadata)
             else:
+                from shamsu.runtime.turn_stream import TurnEvent, TurnStream
+
+                session_id = str(getattr(logger, "session_id", "") or "")
+                stream = TurnStream(self.workspace, session_id, persist=bool(session_id))
+                card = self._attach_turn_card(stream, text, metadata)
+                if card is not None:
+                    progress.live_card = True
+                self._attach_desktop_mirror(stream)
+                event_seq = 0
+
+                def publish(kind: str, body: str = "", **data: Any) -> None:
+                    nonlocal event_seq
+                    event_seq += 1
+                    stream.publish(
+                        TurnEvent(
+                            seq=event_seq,
+                            kind=kind,
+                            text=body,
+                            data=data,
+                            turn_id=ledger.run_id,
+                            session_id=session_id,
+                            workspace=str(self.workspace),
+                            source="telegram",
+                        )
+                    )
+
+                publish("turn.start", text, prompt=text)
+
                 loop = AgentChatLoop(
                     self.workspace,
                     session_logger=logger,
@@ -303,10 +331,14 @@ class LocalShamsuSessionGateway:
                     run_id=ledger.run_id,
                     original_user_request=text,
                     progress=progress,
+                    on_activity=lambda message: publish("activity", str(message)),
                     max_runtime_seconds=_telegram_task_timeout_seconds(self.approval_broker),
                 )
                 result: AgentLoopResult = asyncio.run(loop.run(text))
                 final = result.final
+                publish("assistant", final)
+                status = getattr(result.status, "value", None) or str(result.status or "done")
+                publish("turn.end", status, status=status)
             ledger.record_final_response(final)
             finish_current_run(self.workspace, ledger)
             progress.done("SHAMSU finished the task.")
@@ -361,7 +393,43 @@ class LocalShamsuSessionGateway:
             source="telegram",
             on_activity=lambda message: progress.step(str(message)),
         )
-        result = asyncio.run(loop.run(text))
+        # Register the turn so a SECOND message arriving mid-turn can see it.
+        #
+        # `route_user_message` already asks `active_runs_for_session` whether
+        # something is in flight and merges the new message in as feedback if so
+        # - but nothing on the simple-mode path had ever registered, because
+        # `register_run` is reached only through `RunController`, which belongs
+        # to the legacy engine. So the check asked an empty registry and every
+        # Telegram message started a concurrent turn on the same workspace.
+        #
+        # Live 2026-08-24, `demo-3/asteroid`: turn 6 started at 03:23:17 while
+        # turn 5 was still running (03:21:40 -> 03:32:31). Nine minutes of
+        # overlap, both editing `src/main.js`, and all three
+        # `old_string not found in src/main.js. The file was NOT changed`
+        # failures that session were one turn patching a file the other had
+        # moved underneath it.
+        from shamsu.runtime.run_control import (
+            RunStatus,
+            complete_run,
+            register_run,
+        )
+
+        # A ledger is the usual source of the id, but `_run_simple` is also
+        # called directly with none, and a turn with no ledger still has to be
+        # visible to the next message.
+        run_id = str(getattr(ledger, "run_id", "") or "") or (
+            f"turn-{session_id or 'session'}-{int(time.time() * 1000)}"
+        )
+        register_run(run_id, session_logger=logger, action_ledger=ledger)
+        try:
+            result = asyncio.run(loop.run(text))
+        except BaseException:
+            # Including KeyboardInterrupt and the cancellation a /stop raises: a
+            # turn that stays registered blocks every later message on this
+            # session as "feedback" to a run that is not there any more.
+            complete_run(run_id, RunStatus.FAILED, "Turn ended without finishing.")
+            raise
+        complete_run(run_id, RunStatus.COMPLETED, "Turn finished.")
         return result.final
 
     def _attach_turn_card(self, stream, prompt: str, metadata) -> Any:

@@ -1,0 +1,28 @@
+ 0 ok        want=False got=False | I apologize for the confusion - I was waiting for your approval but didn't execu
+ 1 ok        want=False got=False | I stopped after 24 steps without finishing. Say `continue` to keep going.
+ 2 ok        want=True  got=True  | Perfect! All contract assertions are now resolved. Here's the summary: ## ✅ Cont
+ 3 ok        want=True  got=True  | Perfect! ✅ **Phase 2 Complete - Development Server Running!** ## What Happened: 
+ 4 ok        want=True  got=True  | Perfect! ✅ **The game is now running with proper lighting!** ## What I Fixed: **
+ 5 ok        want=True  got=True  | Great! The development server is now running on **http://localhost:3001** (it mo
+ 6 ok        want=True  got=True  | Perfect! ✅ **I've fixed the rendering issue!** Here's what I did: ## 🔧 Fixes App
+ 7 ok        want=True  got=True  | Perfect! ✅ **The development server is running!** ## 🎮 Game Should Now Be Visibl
+ 8 ok        want=True  got=True  | Perfect! ✅ **I've made critical fixes to get the game rendering!** ## 🔧 What I F
+ 9 ok        want=False got=False | Perfect! I've created a simple WebGL test page. ## 🧪 **TEST WEBGL FIRST!** Pleas
+10 ok        want=True  got=True  | Perfect! ✅ **Bug fixed!** ## 🎯 **What Was Wrong:** The game code was defined but
+11 ok        want=True  got=True  | Perfect! ✅ **The game server is running!** ## 🎮 **Game is Ready at:** http://loc
+12 ok        want=True  got=True  | Perfect! ✅ **All 4 bugs fixed!** ## 🎯 **Summary of All Fixes:** ### ✅ **Bug #1 &
+13 ok        want=True  got=True  | Perfect! ✅ **All bugs fixed!** ## 🎯 **Summary of All Fixes Applied:** ### ✅ **Bu
+14 ok        want=True  got=True  | Perfect! ✅ **All bugs fixed!** ## 🎯 **Summary of All Fixes Applied:** ### ✅ **Bu
+
+caught 12/12 | false positives 0 | missed 0
+
+-- regression checks from the existing suite --
+ok   want=False got=False | Shall I mark the task complete?
+ok   want=True  got=True  | The task is complete.
+ok   want=False got=False | Next I will add the asteroids.
+ok   want=True  got=True  | All done!
+ok   want=False got=False | Do you want me to mark this complete?
+ok   want=False got=False | I could not fix the bug.
+ok   want=False got=False | Should I say all bugs fixed?
+.....................                                                    [100%]
+21 passed in 1.90s

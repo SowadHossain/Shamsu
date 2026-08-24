@@ -56,7 +56,6 @@ from shamsu.agents.plan_anchor import ask_for_a_plan
 from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
 from shamsu.agents.simple_outline import (
     can_outline,
-    find_symbol,
     find_symbols,
     outline,
     render_outline,
@@ -717,6 +716,7 @@ SIMPLE_TOOLS: dict[str, str] = {
     # PROSE and into STATE: "done" stops being a sentence to believe and becomes
     # a set of assertions that are resolved or are not.
     "contract_create": "contract_create",
+    "contract_from_plan": "contract_from_plan",
     "contract_status": "contract_status",
     "contract_assert_pass": "contract_assert_pass",
     "contract_assert_fail": "contract_assert_fail",
@@ -971,6 +971,28 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "contract_from_plan",
+            "description": (
+                "Make one phase of the plan document the contract, with its own items "
+                "as the assertions. Use this instead of contract_create when there is "
+                "a PLAN.md - it keeps the phase numbers meaning what the plan says "
+                "they mean. One phase at a time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "phase": {
+                        "type": "string",
+                        "description": "Which phase: its number, or words from its heading.",
+                    },
+                },
+                "required": ["phase"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "contract_create",
             "description": (
                 "Write down what DONE means for this task, as a list of checkable "
@@ -1067,7 +1089,9 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "description": (
                 "Replace ONE whole function or class with new source, by name. Use this "
                 "instead of patch_file when you are rewriting a whole function - you do "
-                "not have to match the old text, only name it."
+                "not have to match the old text, only name it. If read_symbol says the "
+                "name is duplicated, pass occurrence or start_line/end_line to target "
+                "the exact definition."
             ),
             "parameters": {
                 "type": "object",
@@ -1082,6 +1106,27 @@ SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "description": (
                             "The complete new source for it, including its signature line. "
                             "60 lines / 8KB maximum."
+                        ),
+                    },
+                    "occurrence": {
+                        "type": "integer",
+                        "description": (
+                            "Optional 1-based duplicate number from read_symbol, e.g. 2 "
+                            "to replace/delete the second definition."
+                        ),
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": (
+                            "Optional exact start line from read_symbol when a name is "
+                            "duplicated."
+                        ),
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": (
+                            "Optional exact end line from read_symbol when a name is "
+                            "duplicated."
                         ),
                     },
                 },
@@ -1852,6 +1897,12 @@ for _contract_tool_name in (
 ):
     _TOOL_ARG_ALIASES[_contract_tool_name] = dict(_ASSERTION_ID_ALIASES)
 
+# NOT `contract_from_plan`: it takes a PHASE, and aliasing `number`/`index` to
+# `assertion_id` there would rename the one argument it actually reads.
+_TOOL_ARG_ALIASES["contract_from_plan"] = {
+    name: "phase" for name in ("number", "index", "phase_number", "step", "name")
+}
+
 
 def normalize_arguments(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Accept the near-miss argument names small models produce.
@@ -2277,6 +2328,9 @@ class _Round:
     repeated_edit: int = 0
     repeated_path: str = ""
     repeated_read: str = ""
+    #: Every read signature this round, so the read-loop guard can tell a model
+    #: opening a project from a model circling one file.
+    read_targets: list[str] = field(default_factory=list)
     # A write arrived cut off mid-argument and was refused rather than
     # committed. The loop reads this to know the turn made no progress for a
     # reason it must eventually stop on.
@@ -2707,8 +2761,13 @@ class SimpleChatLoop:
         # think to call it never does; this is the ask. Skipped when a contract
         # already exists, because the anchor is already showing it and asking
         # again would start a second plan for the same job.
-        if not self._standing_plan():
-            wanted = ask_for_a_plan(user_input)
+        #
+        # The CONTRACT specifically, not `_standing_plan` - that also covers a
+        # PLAN.md, and a markdown file has no assertions and no evidence gate.
+        # Letting one stand in here would suppress this ask on exactly the
+        # projects that have plans, and lose the done-guard with it.
+        if not self._standing_contract():
+            wanted = ask_for_a_plan(user_input, self.workspace)
             if wanted:
                 self.state.append_user(wanted, origin=ORIGIN_LOOP)
                 self._activity("this has several parts; asked it to write them down first")
@@ -3160,6 +3219,7 @@ class SimpleChatLoop:
                 # too, and this guard is about a turn with nothing to show.
                 produced_something=bool(outcome.written)
                 or bool(set(outcome.tool_names) - LOOKING_TOOLS),
+                targets=outcome.read_targets,
             )
             if looping and looping.reason == READ_LOOP_EXHAUSTED:
                 # The one guard signal that ends a turn. Two nudges were spent
@@ -4465,6 +4525,7 @@ class SimpleChatLoop:
                     self._stalls.unproductive = 0
             else:
                 read_signature = f"{name}({_read_argument_summary(arguments)})"
+                outcome.read_targets.append(read_signature)
                 seen = self._read_signatures.get(read_signature, 0) + 1
                 self._read_signatures[read_signature] = seen
                 if seen >= REPEATED_READS_BEFORE_WARNING:
@@ -5407,6 +5468,47 @@ class SimpleChatLoop:
         Read from disk rather than cached on the loop, because a fresh
         `SimpleChatLoop` is built per user message and the plan has to survive
         that - which is the whole point of anchoring it.
+
+        Two plans, not one. The contract is what SHAMSU means by a plan; a
+        PLAN.md the user asked for is what the USER means, and it used to reach
+        no prompt at all. Both are shown, because in `demo-3/asteroid` the
+        contract was created fresh each turn with assertions that matched
+        nothing in the document sitting beside it.
+        """
+        return "\n\n".join(
+            part for part in (self._plan_document(), self._standing_contract()) if part
+        )
+
+    def _plan_document(self) -> str:
+        """A PLAN.md in the workspace, with what happened to each phase.
+
+        `phase_progress` when the phases have contracts to report on, and the
+        bare step names otherwise - the point either way is that "phase 2" has
+        somewhere true to resolve against, rather than against a rolling summary
+        that invented its own decomposition.
+        """
+        try:
+            from shamsu.agents.plan_anchor import (
+                document_anchor,
+                phase_progress,
+                plan_document_steps,
+            )
+
+            return phase_progress(self.workspace) or document_anchor(
+                plan_document_steps(self.workspace)
+            )
+        except Exception:  # noqa: BLE001 - an anchor must never fail a turn
+            return ""
+
+    def _standing_contract(self) -> str:
+        """The active contract as this turn's plan, or ``""``.
+
+        Separate from `_plan_document` because the two answer different
+        questions, and one caller needs only this half: a PLAN.md is context,
+        while a contract is the thing with assertions and an evidence gate.
+        Letting a markdown file stand in for a contract would suppress
+        `ask_for_a_plan` on exactly the projects that have plans - and take the
+        done-guard with it.
         """
         try:
             from shamsu.agents.simple_contract import contract_disabled, load_contract
@@ -5414,7 +5516,7 @@ class SimpleChatLoop:
             if contract_disabled():
                 return ""
             contract = load_contract(self.workspace)
-        except Exception:  # noqa: BLE001 - an anchor must never fail a turn
+        except Exception:  # noqa: BLE001
             return ""
         if contract is None or contract.done:
             # A finished contract is not a plan, it is history. Re-showing it
@@ -5618,6 +5720,9 @@ class SimpleChatLoop:
             self._activity(f"contract set: {contract.title} ({len(contract.assertions)} assertions)")
             return ToolResult(True, contract.render(), {"assertions": len(contract.assertions)})
 
+        if name == "contract_from_plan":
+            return self._contract_from_plan(arguments)
+
         contract = contracts.load_contract(self.workspace)
         if contract is None:
             return ToolResult(
@@ -5707,6 +5812,58 @@ class SimpleChatLoop:
                     f"{item.id} and say why.",
                     {"assertion": item.id, "refused": "no_observation"},
                 )
+            if backing == contracts.BY_WRITE and contract.requires_run:
+                # Derived from a plan, so the provenance decides rather than the
+                # wording. A plan's items are written as WORK - "Implement
+                # requestAnimationFrame game loop with delta time tracking" -
+                # and read as sentences none of them claim anything about a
+                # running program: 0 of the 8 phase headings in the real
+                # demo-3 PLAN.md tripped `claims_runtime_behaviour`. But a phase
+                # of a build plan means working software, so all of it needs a
+                # run.
+                return ToolResult(
+                    False,
+                    f"{item.id} came from {contract.source or 'the plan'}, so it means "
+                    "that part of the plan WORKS - not that a file describing it "
+                    f"exists. Writing {self._observed_writes[-1]} is not that."
+                    + chr(10) * 2
+                    + "Run something that exercises it and quote what it printed: "
+                    "run_tests, or run_command with whatever starts or checks this "
+                    "project. A server counts - it stays up, so you can request a "
+                    "page off it." + chr(10) * 2
+                    + f"If this part genuinely cannot be checked yet, "
+                    f"contract_assert_skip on {item.id} and say why - the user is "
+                    "told which ones those were.",
+                    {"assertion": item.id, "refused": "plan_phase_needs_a_run"},
+                )
+            if backing == contracts.BY_WRITE and contracts.claims_runtime_behaviour(
+                item.text
+            ):
+                # A write proves the text reached the disk. This assertion is
+                # about what happens when the code RUNS, and those are different
+                # claims - which is the entire distinction this contract exists
+                # to draw. `done_guard` complained about it at the end; by then
+                # the contract had rendered it PASS for the whole turn.
+                #
+                # Live 2026-08-24, a03 in `demo-3/asteroid`: "game renders
+                # without setElement error on page load", passed, verified_by
+                # write, observation "wrote src/main.js (not run)", and evidence
+                # quoting browser console output that was never produced.
+                return ToolResult(
+                    False,
+                    f"{item.id} says what the code does when it RUNS, and the only "
+                    "thing backing it is that a file was written. Writing "
+                    f"{self._observed_writes[-1]} does not show that it renders, "
+                    "loads, or responds - only that the text is on disk." + chr(10) * 2
+                    + "Run something that exercises it and record what it printed: "
+                    "run_tests, or run_command with whatever starts or checks this "
+                    "project. A server is fine - it stays up, so you can request a "
+                    "page off it and quote what came back." + chr(10) * 2
+                    + f"If it truly cannot be checked here, contract_assert_skip on "
+                    f"{item.id} and say plainly that it is unverified - the user "
+                    "will be told which assertions those were.",
+                    {"assertion": item.id, "refused": "write_cannot_prove_runtime"},
+                )
             item.state, item.evidence = contracts.PASSED, detail
             item.verified_by, item.observation = backing, observation
         elif name == "contract_assert_fail":
@@ -5722,6 +5879,84 @@ class SimpleChatLoop:
         contracts.save_contract(self.workspace, contract)
         self._activity(f"{item.id} {item.state}: {item.text[:60]}")
         return ToolResult(True, contract.render(), {"assertion": item.id, "state": item.state})
+
+    def _contract_from_plan(self, arguments: dict[str, Any]) -> ToolResult:
+        """Make one phase of PLAN.md the active contract.
+
+        The phases become contracts one at a time rather than all at once: a
+        phase's own items are 3-5 checkable-ish claims, where the phase HEADINGS
+        are 8 units of work that no evidence rule can gate (0 of the 8 in the
+        real demo-3 PLAN.md read as claims about a running program).
+        """
+        from shamsu.agents import simple_contract as contracts
+        from shamsu.agents.plan_anchor import (
+            contract_from_phase,
+            plan_phases,
+            phase_progress,
+        )
+
+        phases = plan_phases(self.workspace)
+        if not phases:
+            return ToolResult(
+                False,
+                "There is no plan document with phases in this workspace. Write one "
+                "first, or use contract_create to say what done means directly.",
+                {"phases": 0},
+            )
+        wanted = str(
+            arguments.get("phase")
+            or arguments.get("number")
+            or arguments.get("name")
+            or ""
+        ).strip()
+        if not wanted:
+            return ToolResult(
+                False,
+                "Which phase? Send its number." + chr(10) * 2 + phase_progress(self.workspace),
+                {"phases": len(phases)},
+            )
+        matched = [phase for phase in phases if phase.matches(wanted)]
+        if len(matched) != 1:
+            return ToolResult(
+                False,
+                f"{wanted!r} does not name exactly one phase."
+                + chr(10) * 2
+                + phase_progress(self.workspace),
+                {"phases": len(phases), "matched": len(matched)},
+            )
+        phase = matched[0]
+
+        # Never silently replace an unfinished phase - the open one is where the
+        # evidence lives, and overwriting `contract.json` is how the demo-3
+        # session created five contracts and kept one.
+        current = contracts.load_contract(self.workspace)
+        if current is not None and current.slug != phase.slug and not current.done:
+            # Any open contract, not just a slugged one. A hand-made
+            # `contract_create` contract has no archive file, so overwriting it
+            # does not lose its place in a sequence - it loses the contract.
+            return ToolResult(
+                False,
+                f"{current.title} is still open - {len(current.blockers)} of "
+                f"{len(current.assertions)} unresolved. Finish or skip those before "
+                f"starting {phase.heading}, or say plainly to the user that you are "
+                "leaving it unfinished." + chr(10) * 2 + current.render(),
+                {"blocked_by": current.slug or "contract.json"},
+            )
+
+        existing = contracts.load_phase_contract(self.workspace, phase.slug)
+        if existing is not None:
+            # Resuming. Keep every recorded state - re-deriving would erase the
+            # evidence already gathered for this phase.
+            contracts.save_contract(self.workspace, existing)
+            self._activity(f"resumed {phase.slug}: {phase.heading[:48]}")
+            return ToolResult(True, existing.render(), {"phase": phase.slug, "resumed": True})
+
+        contract = contract_from_phase(phase)
+        contracts.save_contract(self.workspace, contract)
+        self._activity(
+            f"{phase.slug} is now the contract: {len(contract.assertions)} assertions from PLAN.md"
+        )
+        return ToolResult(True, contract.render(), {"phase": phase.slug, "resumed": False})
 
     def _replace_symbol(self, arguments: dict[str, Any]) -> ToolResult:
         """Swap one whole function or class for new source, by name.
@@ -5788,8 +6023,8 @@ class SimpleChatLoop:
             return ToolResult(False, f"Could not read {path}: {exc}", {"filepath": path})
 
         suffix = target.suffix
-        found = find_symbol(original, suffix, wanted)
-        if found is None:
+        matches = find_symbols(original, suffix, wanted)
+        if not matches:
             names = [symbol.name for symbol in outline(original, suffix)]
             return ToolResult(
                 False,
@@ -5798,6 +6033,9 @@ class SimpleChatLoop:
                 "function or class.",
                 {"filepath": path, "symbol": wanted, "available": names[:60]},
             )
+        found = _select_symbol_definition(matches, arguments)
+        if isinstance(found, ToolResult):
+            return found
 
         lines = original.splitlines()
         if deleting:
@@ -5913,6 +6151,8 @@ class SimpleChatLoop:
                 "symbol": found.name,
                 "start_line": found.start,
                 "end_line": found.end,
+                "occurrence": matches.index(found) + 1,
+                "definition_count": len(matches),
                 "reindented": reindented,
             },
         )
@@ -6306,8 +6546,9 @@ class SimpleChatLoop:
             f"dead - which is usually the bug.{chr(10) * 2}"
             + (chr(10) * 2).join(blocks)
             + f"{chr(10) * 2}To remove one, call replace_symbol on {path} with "
-            "empty content - it deletes the first definition. To change one, "
-            "patch_file against the exact text above.",
+            "empty content plus occurrence (for example occurrence=2) or the "
+            "start_line/end_line shown above. To change one, call replace_symbol "
+            "with the same occurrence or line range.",
             {
                 "filepath": path,
                 "resolved_filepath": path,
@@ -7440,6 +7681,110 @@ def _no_such_symbol(path: str, wanted: str, names: list[str]) -> str:
     listed = ", ".join(names[:24])
     more = f" (+{len(names) - 24} more)" if len(names) > 24 else ""
     return message + f" It defines: {listed}{more}."
+
+
+def _positive_symbol_target(
+    arguments: dict[str, Any], *names: str
+) -> tuple[int | None, str | None]:
+    from decimal import Decimal, InvalidOperation
+
+    for name in names:
+        value = arguments.get(name)
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            return None, f"{name} must be a positive integer."
+        try:
+            parsed = Decimal(str(value).strip())
+        except (InvalidOperation, ValueError):
+            return None, f"{name} must be a positive integer."
+        if not parsed.is_finite() or parsed != parsed.to_integral_value():
+            return None, f"{name} must be a positive integer."
+        number = int(parsed)
+        if number < 1:
+            return None, f"{name} must be a positive integer."
+        return number, None
+    return None, None
+
+
+def _symbol_definition_choices(matches: list[Any]) -> list[dict[str, int | str]]:
+    return [
+        {
+            "occurrence": index,
+            "symbol": symbol.name,
+            "start_line": symbol.start,
+            "end_line": symbol.end,
+        }
+        for index, symbol in enumerate(matches, start=1)
+    ]
+
+
+def _select_symbol_definition(matches: list[Any], arguments: dict[str, Any]) -> Any | ToolResult:
+    """Pick the definition replace_symbol should edit."""
+    data = {"definitions": _symbol_definition_choices(matches)}
+    occurrence, error = _positive_symbol_target(
+        arguments, "occurrence", "definition", "definition_index"
+    )
+    if error:
+        return ToolResult(False, f"replace_symbol {error}", data)
+    start_line, error = _positive_symbol_target(arguments, "start_line")
+    if error:
+        return ToolResult(False, f"replace_symbol {error}", data)
+    end_line, error = _positive_symbol_target(arguments, "end_line")
+    if error:
+        return ToolResult(False, f"replace_symbol {error}", data)
+
+    if occurrence is not None:
+        if occurrence > len(matches):
+            listed = ", ".join(
+                f"{choice['occurrence']}=lines {choice['start_line']}-{choice['end_line']}"
+                for choice in data["definitions"]
+            )
+            return ToolResult(
+                False,
+                f"replace_symbol cannot target occurrence {occurrence}; "
+                f"{matches[0].name} has {len(matches)} definition(s): {listed}. "
+                "Run read_symbol again if the file changed.",
+                data,
+            )
+        selected = matches[occurrence - 1]
+        if (
+            (start_line is not None and selected.start != start_line)
+            or (end_line is not None and selected.end != end_line)
+        ):
+            return ToolResult(
+                False,
+                f"replace_symbol target disagrees: occurrence {occurrence} is lines "
+                f"{selected.start}-{selected.end}, not "
+                f"{start_line or '?'}-{end_line or '?'}. "
+                "Run read_symbol again for the current ranges.",
+                data,
+            )
+        return selected
+
+    if start_line is None and end_line is None:
+        return matches[0]
+
+    narrowed = [
+        symbol
+        for symbol in matches
+        if (start_line is None or symbol.start == start_line)
+        and (end_line is None or symbol.end == end_line)
+    ]
+    if len(narrowed) == 1:
+        return narrowed[0]
+    listed = ", ".join(
+        f"{choice['occurrence']}=lines {choice['start_line']}-{choice['end_line']}"
+        for choice in data["definitions"]
+    )
+    target = f"{start_line or '?'}-{end_line or '?'}"
+    return ToolResult(
+        False,
+        f"replace_symbol could not find exactly one {matches[0].name} definition "
+        f"at lines {target}. Available definitions: {listed}. Run read_symbol again "
+        "if the file changed.",
+        data,
+    )
 
 
 def _match_indentation(original_line: str, content: str) -> tuple[str, bool]:

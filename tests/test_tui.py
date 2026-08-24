@@ -415,6 +415,46 @@ async def test_a_turn_started_elsewhere_shows_whose_it_was():
 
 
 @pytest.mark.asyncio
+async def test_a_telegram_turn_started_elsewhere_streams_live_rows():
+    """Telegram turns are watched from the desktop too, so their live rows
+    should not wait for the final answer before appearing in the frame."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.runtime.turn_stream import TurnEvent
+
+    common = {"source": "telegram", "session_id": "sess-tg", "workspace": "w"}
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=TurnTelemetry(unicode_ui=True), on_submit=lambda _t: None)
+        app.absorb_for_display(TurnEvent(seq=1, kind="turn.start", text="fix login", **common))
+        app.absorb_for_display(
+            TurnEvent(
+                seq=2,
+                kind="status",
+                text="reading auth.py",
+                data={"round": 2, "max_rounds": 10},
+                **common,
+            )
+        )
+        app.absorb_for_display(
+            TurnEvent(seq=3, kind="activity", text="model responded in 4s", **common)
+        )
+        app.absorb_for_display(
+            TurnEvent(seq=4, kind="tool.call", text="read_file auth.py", **common)
+        )
+
+    text = app.pane.plain(20)
+    assert "fix login" in text
+    assert "model responded in 4s" in text
+    assert "read_file auth.py" in text
+    assert app.telemetry.round == 2
+    assert app.telemetry.max_rounds == 10
+
+
+@pytest.mark.asyncio
 async def test_a_turn_the_terminal_never_started_still_shows_up():
     """The web portal runs in this same process and builds its own
     `TurnStream`, which the CLI had no way to know existed - so a prompt sent

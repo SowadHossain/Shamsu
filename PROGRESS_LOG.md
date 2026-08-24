@@ -3,6 +3,219 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-24 - One contract per phase, derived from PLAN.md
+Files edited: `shamsu/agents/plan_anchor.py`, `shamsu/agents/simple_contract.py`,
+`shamsu/agents/simple_chat.py`, `shamsu/agents/simple_router.py`,
+`shamsu/agents/loop_guards.py`, `tests/test_phase_contracts_from_plan.py` (new),
+`tests/test_simple_chat.py`
+What changed: `contract_create` asks the model to write a list, so in demo-3 it
+wrote PLAN.md with eight phases and then wrote contracts matching nothing in it -
+five across the session, each overwriting the last - and "phase 2" came to mean
+whatever the rolling summary last said. New `contract_from_plan(phase=N)` makes
+ONE PHASE of the plan the contract, its own numbered items as the assertions,
+verbatim.
+
+The obvious shape - one contract, one assertion per phase - was built, measured
+and thrown away: the eight phase HEADINGS produce 0 assertions that trip
+`claims_runtime_behaviour`, because a heading is a unit of WORK, so every one
+would have passed on a file write. That is the failure this machinery exists to
+stop, rebuilt out of its own fix. It also rendered at 2,019 chars against a
+900-char anchor cap. A phase's own items are 3-5 near-claims and render at
+~500.
+
+What actually holds the line is `Contract.requires_run`: derived from a plan,
+PROVENANCE gates it rather than wording, because a plan's items are written as
+work ("Implement requestAnimationFrame game loop") and no sentence rule will
+ever catch them. Nothing plan-derived passes on a write. Items go in verbatim -
+rewording them is the model re-describing its own plan, which is the drift being
+removed. Phases keep their own files (`.shamsu/contracts/phase-NN.json`), so
+starting phase 3 no longer erases phase 2; switching away from an OPEN contract
+is refused rather than overwritten (any open one, not just a slugged one - a
+hand-made contract has no archive, so overwriting it loses the contract, not its
+place); returning to a phase resumes it with its evidence rather than
+re-deriving. `phase_progress` puts per-phase status in every prompt, and
+`ask_for_a_plan` points at this tool instead of `contract_create` when a plan
+document exists.
+Tests: 21 new in `tests/test_phase_contracts_from_plan.py`. Four existing tests
+went red on the new tool and all four were real wiring gaps, not test noise:
+unreachable under two-stage routing (added to two router categories); not in
+`_NON_REGISTRY_TOOLS` so the schema probe hit the wrong dispatcher; the `plan`
+capability hint still read "There is no planning tool", which had become false;
+and the OOM step-down test sat on a boundary that one more tool schema crossed -
+every tool offered is tokens on every call. Full suite 3976 passed, 2 skipped |
+Log: logs/test-runs/2026-08-24-phase-contracts.log
+
+### 2026-08-24 - Review pass on the five fixes above
+Files edited: `shamsu/tools/executor.py`, `shamsu/agents/simple_contract.py`,
+`shamsu/agents/simple_chat.py`, `shamsu/integrations/telegram/sessions.py`,
+`tests/test_plan_document_anchor.py`, `tests/test_contract_evidence.py`
+What changed: five faults found by reviewing the above, three of them mine and
+real. (1) `_run_command_detached` never closed the parent's write handle on the
+still-running path - one leaked handle per detached server, and a server is
+started to be LEFT running, so nothing would ever close it. The child holds its
+own duplicate; ours now closes right after `Popen`. (2) Folding the PLAN.md
+anchor into `_standing_plan` silently suppressed `ask_for_a_plan` on every
+workspace with a plan file, because that ask is gated on the same call - which
+would have taken `contract_create`, the evidence rule and the done-guard with
+it, on exactly the projects most likely to need them. Split into
+`_plan_document` and `_standing_contract`; the ask now tests the contract half.
+(3) `_RUNTIME_CLAIM`'s leading lookbehinds used a literal space under `(?x)`,
+which strips it - so `(?<!a )` became `(?<!a)` and matched nothing, and "a
+**run** script" / "a **render** function" were being called runtime claims.
+Rebuilt against a 30-assertion corpus: 15/15 runtime caught, 0 false positives,
+was 13/15 and 2/15. Also `error` does not match inside `ReferenceError`, so
+the most specific runtime claim there is slipped through - found by replaying
+the contract that session had written by 10:15, whose three assertions all
+passed on writes. (4) `done_guard` told a skips-only contract that "writing the
+code is not evidence", with no writes in it. (5) Swapped the private
+`_cleanup_run` for the public `complete_run`, which also logs the finish, and
+widened the telegram guard to `BaseException` so a cancelled turn cannot leave
+the session registered forever. `_DETACHED` now forgets exited processes rather
+than growing for the life of the session.
+Tests: 3 new (named exceptions, the error-type false positive, the
+contract/document split); ruff clean on all three new test files. Full suite
+3954 passed, 2 skipped | Log: logs/test-runs/2026-08-24-review-pass.log
+
+### 2026-08-24 - The plan was on disk the whole time, and a write signed off a browser
+Files edited: `shamsu/agents/plan_anchor.py`, `shamsu/agents/simple_chat.py`,
+`shamsu/agents/simple_contract.py`, `tests/test_plan_document_anchor.py` (new),
+`tests/test_contract_evidence.py`
+What changed: two faults from `demo-3/asteroid`, both about a claim outliving
+the thing that was supposed to check it.
+
+(1) `plan_anchor.anchor` re-injects the CONTRACT every turn, which is what SHAMSU
+means by a plan. It is not what the user meant. Asked to "outline your approach
+in a PLAN.md file", the model wrote one in turn 1 and it reached no prompt ever
+again: its real headings (`### Phase 3: Player Ship Module (player.js)`) appear
+in ZERO of the 24 surviving prompts. What the model saw instead was the rolling
+summary, which had invented a different decomposition and stamped it done -
+"Phase 1 complete ... created and validated", "Phase 2 complete ... scaffolded" -
+where PLAN.md says Phase 1 is "Project Setup & Scaffolding" and Phase 2 is "Core
+Game Loop & Scene Setup". Neither matches, and "validated" never happened (three
+commands succeeded all session). So "lets proceed with phase 2" resolved against
+the summary and the model improvised. New `plan_document_steps` /
+`document_anchor` re-show a root PLAN.md's step headings by their real names
+every turn, and `_standing_plan` now shows both plans - the document even when
+there is no contract, which is the state turns 2-4 were in.
+
+(2) `contract_assert_pass` accepted a WRITE as backing for an assertion about
+runtime behaviour. The contract it wrote at 09:15: a03 "game renders without
+setElement error on page load", passed, `verified_by: write`, `observation:
+"wrote src/main.js (not run)"`, and evidence quoting browser console output that
+was never produced. `done_guard` did complain - at the end, only on a done claim,
+and `render()` showed it as PASS the whole way there. New
+`claims_runtime_behaviour` refuses the pass at the tool boundary and says what
+would count, naming the now-detached server as a way to actually check a page.
+A claim about what the code SAYS still passes on a write.
+Tests: 6 new in `tests/test_plan_document_anchor.py` (incl. the real PLAN.md
+shape), 4 new in `test_contract_evidence.py` incl. a replay of the real a03; two
+existing write-provenance tests repointed to a static assertion, since
+`_contract()`'s own two are both runtime claims. Full suite 3954 passed, 2
+skipped | Log: logs/test-runs/2026-08-24-plan-anchor-and-runtime-claims.log
+
+### 2026-08-24 - Told to stop reading before it had opened the file with the bug
+Files edited: `shamsu/agents/loop_guards.py`, `shamsu/agents/simple_chat.py`,
+`tests/test_loop_guards.py`, `tests/test_simple_chat.py`
+What changed: in `demo-3/asteroid` the defect spanned seven source files -
+`initGame()` never called in one, no default export in two more against a
+`{ default: X }` import, a dead `let scene;` in four - and the read guard
+interrupted at five reads, 17 times across the session, with "You probably have
+enough ... do not keep reading". It did not have enough, and it obeyed: every fix
+it shipped was scoped to whichever file it had read by the time it was told to
+stop. Raising the ceiling was the WRONG correction and was tried first - nine
+different files read to no purpose is exactly the open-ended "review X" this
+detector exists for, and `test_eight_reads_without_producing_anything_is_interrupted`
+went red saying so. No count separates the two cases. The instruction was what
+was wrong. `ReadLoopDetector` now tracks the distinct things read (`targets`,
+threaded through `_Round.read_targets` from the read signature simple_chat
+already computed) and branches the WORDING, not the thresholds: a model
+re-reading what it has is still told to stop reading; a model opening files it
+has never seen is asked to say what it is looking for and read only that. Same
+for the firm word at eight, which had been claiming "You have enough to go on" -
+a statement about the code that this detector is in no position to make. The
+turn-ending ceiling is untouched.
+Tests: 6 rewritten in `tests/test_loop_guards.py`; the simple_chat test that
+asserted the literal "Stop reading" repointed to the new instruction, with the
+reason in the test. Full suite 3954 passed, 2 skipped | Log: logs/test-runs/2026-08-24-read-guard-wording.log
+
+### 2026-08-24 - Two Telegram turns editing one file for nine minutes
+Files edited: `shamsu/integrations/telegram/sessions.py`,
+`tests/test_telegram_turn_overlap.py` (new)
+What changed: `demo-3/asteroid` ran turn 6 (03:23:17) while turn 5 was still
+going (03:21:40 -> 03:32:31). Nine minutes of overlap, both editing
+`src/main.js`, and all three `old_string not found in src/main.js. The file was
+NOT changed` failures that session were one turn patching a file the other had
+moved underneath it. The guard already existed - `route_user_message` asks
+`active_runs_for_session` whether something is in flight and merges a new message
+in as feedback if so - and it was asking an empty registry: `register_run` is
+reached only through `RunController`, which belongs to the legacy engine, so a
+simple-mode turn (the default since 2026-08-18, and what that session ran)
+registered nowhere. `_run_simple` now registers for the length of the turn and
+releases in a `finally`, so a crashed turn cannot block the session either.
+Note `QueuedRunner` in `shamsu/control/runner.py` does all of this properly with
+leases - it is wired to the web portal only, and Telegram never went through it.
+Tests: 3 new in `tests/test_telegram_turn_overlap.py`, incl. one asserting the
+registry is non-empty from INSIDE the running turn. They have to opt out of
+conftest's `SHAMSU_LEGACY_ROUTING` pin, which exempts one file by basename and
+so hides every simple-mode path from the suite by default. Full suite 3954
+passed, 2 skipped | Log: logs/test-runs/2026-08-24-telegram-turn-overlap.log
+
+### 2026-08-24 - Eight `npm run dev` timeouts, and a translator called from nowhere
+Files edited: `shamsu/tools/executor.py`,
+`tests/test_server_commands_and_shell.py` (new)
+What changed: in `demo-3/asteroid`, 13 commands ran across a two-hour session and
+EIGHT were `npm run dev` - each burning the full 120s to exit 124, sixteen minutes
+of wall clock, for a command that printed `VITE ready in 421 ms` and its URL
+inside half a second and served the whole time. The agent therefore never saw the
+page it spent sixteen turns fixing; its only working evidence channel was
+`npm run build`, which exits 0 here because none of the bugs are build-time
+errors. A server-shaped command now runs DETACHED: output to
+`.shamsu/processes/<id>.log`, returns as soon as it announces itself or 3s after
+it is still alive, stays up, and is reaped at exit. Measured on `python -m
+http.server`: 120s+failure became 3.0s+exit 0, and `curl | head` against it now
+returns the page. A trailing `&` is honoured as the background request it was -
+cmd.exe read it as a separator and ran the thing in the foreground.
+`_platform_command` turned out to be defined and called from NOWHERE in the
+package, so the `python3` shim in its docstring had never run; it is now wired in
+and also translates `mkdir -p` (which created a directory named `-p`, still in
+that workspace), `head`/`tail` in a pipe ('head' is not recognized), and `which`.
+NOT `rm`: translating first made `rm -rf /` reach the classifier as
+`rmdir /s /q /`, which stopped matching the blocklist and turned a refused
+command into one that ran. Four existing safety tests caught it. Translation now
+happens downstream of `classify_command` and approval, and the `rm` rule is gone.
+Tests: 33 new in `tests/test_server_commands_and_shell.py`, incl. one that starts
+a real server and fetches a file off it, and two on the destructive-command path.
+Full suite 3954 passed, 2 skipped | Log: logs/test-runs/2026-08-24-detached-servers-and-shell.log
+
+### 2026-08-24 - The done-guard fired on 1 of 15, and skip was the door
+Files edited: `shamsu/agents/simple_contract.py`, `tests/test_contract_evidence.py`
+What changed: replaying all 15 assistant replies from
+`F:/Work/shamsu test - 24aug/demo-3/asteroid` through `looks_like_a_done_claim`,
+the guard fired on ONE - across a session that claimed success 16 times on a
+game whose `initGame()` had never once been called. Three holes. (1) The phrase
+list was fitted to an earlier run's prose and missed the shapes this model uses:
+"All bugs fixed!", "Contract Complete", "Phase 2 Complete", "the game is now
+running", "I've fixed the rendering issue" - now covered by `_DONE_PATTERNS`.
+(2) `body.endswith("?")` exempted the WHOLE reply, so a message headed "Phase 2
+Complete" that closed with a next-steps menu ending "Something else?" was waved
+through on one character; the exemption is now scoped to the sentence that IS
+the question. (3) Skip was pass with the evidence check removed - and the
+pass-refusal message points the model straight at it. Live, `contract_assert_pass`
+was refused for want of an observation and the next call was
+`contract_assert_skip` on the same assertion, then five more, six of ten in three
+minutes, ending "Contract Complete"; a10's skip REASON was "npm install completed
+successfully - evidenced by existence of package-lock.json", a pass justification
+posted through the skip door. `unproven` only ever looked at PASSED, so skips were
+invisible to the guard and an all-skipped contract returned "" outright. New
+`Contract.skipped`; `render()` no longer tells a skipped contract it can report
+the task finished; `done_guard` names skips beside writes and quotes a skip reason
+back when it reads like evidence. Skip still resolves - a guard with no exit is a
+deadlock - it just stopped being silent.
+Tests: 11 new in `tests/test_contract_evidence.py` incl. the 10 real phrasings and
+the trailing-question case, both replayed from the session. Detector measured on
+the real corpus: 12/12 caught, 0 false positives, was 1/12. Full suite 3954 passed,
+2 skipped | Log: logs/test-runs/2026-08-24-done-guard-and-skip-door.log
+
 ### 2026-08-23 - The web portal: the plain link, the black hole, the disconnection
 Files edited: `shamsu/webui/server.py`, `shamsu/webui/api.py`,
 `shamsu/webui/local.py`, `shamsu/webui/cli.py`, `shamsu/webui/static/app.js`,

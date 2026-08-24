@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pytest
 
+from shamsu.agents import loop_guards
 from shamsu.agents.loop_guards import (
     READS_BEFORE_INSISTING,
     READS_BEFORE_NUDGE,
@@ -263,3 +264,98 @@ def test_a_tool_call_MENTIONED_in_prose_is_left_alone():
     assert leaked_tool_call('I would call {"name": "read_file", "arguments": {}} to see it.') == ""
     assert leaked_tool_call("Done! I created hello.py.") == ""
     assert leaked_tool_call("") == ""
+
+
+# -- reading a project is not reading in circles -----------------------------
+#
+# Live 2026-08-24, `demo-3/asteroid`. The defect spanned seven source files:
+# `initGame()` was never called in main.js, two more modules had no default
+# export against a `{ default: X }` import, and four ended with a `let scene;`
+# that ES modules cannot share. This guard interrupted at five reads - 17 times
+# across the session - with "You probably have enough ... do not keep reading."
+#
+# It did not have enough, and it obeyed: every fix it shipped that session was
+# scoped to whichever file it had read by the time it was told to stop.
+#
+# Raising the ceiling would have been the wrong correction. Nine different files
+# read to no purpose is exactly the open-ended "review X" this detector exists
+# for, and no count separates that from the eight above. What was wrong was the
+# INSTRUCTION.
+
+
+def _read(detector, name):
+    return detector.record(["read_file"], False, targets=[f"read_file({name})"])
+
+
+def test_opening_new_files_is_not_told_it_already_has_enough():
+    detector = loop_guards.ReadLoopDetector()
+
+    signal = None
+    for name in ["main.js", "player.js", "projectile.js", "asteroid.js", "collision.js"]:
+        signal = _read(detector, name) or signal
+
+    assert signal is not None, "the guard still fires - the cadence has not moved"
+    assert "probably have enough" not in signal.correction
+    assert "WHAT you are looking for" in signal.correction
+    assert "make the change now" in signal.correction
+
+
+def test_circling_one_file_is_still_told_to_stop_reading():
+    """The fault this detector was built for keeps its original wording."""
+    detector = loop_guards.ReadLoopDetector()
+
+    signal = None
+    for _ in range(5):
+        signal = _read(detector, "PlayerShip.js") or signal
+
+    assert signal is not None
+    assert "probably have enough" in signal.correction
+    assert "do not keep reading" in signal.correction
+    assert "re-reading what you already have" in signal.correction
+
+
+def test_the_firm_word_also_stops_claiming_it_has_enough():
+    detector = loop_guards.ReadLoopDetector()
+
+    signals = [_read(detector, f"f{n}.js") for n in range(8)]
+    firm = [s for s in signals if s and s.reason == "read_loop"]
+
+    assert firm, "eight reads must still escalate"
+    assert "have enough to go on" not in firm[0].correction
+    assert "what is still missing" in firm[0].correction
+
+
+def test_the_ceiling_that_ends_a_turn_is_untouched():
+    """Breadth buys better wording, never a way past the ceiling."""
+    detector = loop_guards.ReadLoopDetector()
+
+    reasons = [
+        signal.reason
+        for signal in (_read(detector, f"f{n}.js") for n in range(40))
+        if signal
+    ]
+
+    assert loop_guards.READ_LOOP_EXHAUSTED in reasons
+
+
+def test_producing_something_forgets_what_was_read():
+    detector = loop_guards.ReadLoopDetector()
+    for name in ["a.js", "b.js", "c.js"]:
+        _read(detector, name)
+
+    detector.record(["write_file"], True, targets=[])
+
+    assert not detector.seen
+    assert detector.streak == 0
+
+
+def test_a_caller_that_sends_no_targets_behaves_exactly_as_before():
+    """The parameter is optional, and it reads as re-reading when absent -
+    which is the conservative half."""
+    detector = loop_guards.ReadLoopDetector()
+
+    signals = [detector.record(["read_file"], False) for _ in range(5)]
+
+    assert signals[-1] is not None
+    assert signals[-1].reason == "read_loop_warning"
+    assert "probably have enough" in signals[-1].correction

@@ -1241,8 +1241,20 @@ class TuiApp:
             text = str(getattr(event, "text", "") or "")
             if surface == "cli":
                 return
+            absorb = getattr(self.telemetry, "absorb", None)
+            if callable(absorb):
+                absorb(event)
             if kind == "turn.start" and text:
                 self.echo_prompt(text, surface)
+            elif surface == "telegram" and kind in _remote_live_body_kinds() and text:
+                self.pane.write_as(f"  {text}", KIND_LOG)
+                self.invalidate()
+            elif surface == "telegram" and kind == "tool.result":
+                data = dict(getattr(event, "data", None) or {})
+                if data.get("ok") is False and text:
+                    self.echo(f"telegram: {text}", KIND_NOTICE)
+            elif surface == "telegram" and kind == "approval" and text:
+                self.echo(f"telegram: {text}", KIND_NOTICE)
             elif kind == "assistant" and text:
                 self.pane.write_as(text, KIND_ANSWER)
                 self.invalidate()
@@ -1270,6 +1282,17 @@ class TuiApp:
 
 #: Pushed onto the input queue to mean "the user closed the frame".
 CLOSED = object()
+
+
+def _remote_live_body_kinds() -> frozenset[str]:
+    """Visible live rows for a Telegram turn mirrored into the frame."""
+    try:
+        from shamsu.runtime.settings import verbosity as saved_verbosity
+        from shamsu.runtime.turn_stream import body_kinds
+
+        return body_kinds(saved_verbosity())
+    except Exception:  # noqa: BLE001
+        return frozenset({"activity", "tool.call"})
 
 
 class FrameHost:

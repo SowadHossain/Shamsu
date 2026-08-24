@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -174,13 +176,13 @@ class WorkspaceTool:
         return text
 
     def find_files(self, query: str, limit: int = 20) -> list[Path]:
-        query = query.strip().lower().lstrip("@")
+        query = _mention_query(query)
         if not query:
             return []
         matches: list[Path] = []
         for path in self._walk_files_and_dirs():
             rel = path.relative_to(self.workspace_root).as_posix()
-            if query in rel.lower() or query == path.name.lower():
+            if _mention_match(rel.lower(), path.name.lower(), query):
                 matches.append(path)
                 if len(matches) >= limit:
                     break
@@ -201,9 +203,7 @@ class WorkspaceTool:
         suggestions: list[str] = []
         for path in self.find_files(prefix, limit=limit):
             rel = path.relative_to(self.workspace_root).as_posix()
-            # Quote paths with spaces so the mention regex (which stops at the
-            # first space for unquoted paths) still captures the whole name.
-            suggestions.append(f'@"{rel}"' if " " in rel else f"@{rel}")
+            suggestions.append(_mention_label(rel))
         return suggestions
 
     def names_in_text(self, text: str, limit: int = 10) -> list[Path]:
@@ -226,6 +226,137 @@ class WorkspaceTool:
     def _walk_files_and_dirs(self) -> list[Path]:
         results = walk_workspace_paths(self.workspace_root)
         return sorted(results, key=lambda item: item.relative_to(self.workspace_root).as_posix().lower())
+
+
+def _mention_query(prefix: str) -> str:
+    return str(prefix or "").strip().lower().lstrip("@")
+
+
+def _mention_match(rel_lower: str, name_lower: str, query: str) -> bool:
+    return query in rel_lower or query == name_lower
+
+
+def _mention_label(rel: str) -> str:
+    # Quote paths with spaces so the mention regex (which stops at the first
+    # space for unquoted paths) still captures the whole name.
+    return f'@"{rel}"' if " " in rel else f"@{rel}"
+
+
+#: Completion-only cache of the workspace walk: root -> (taken_at, entries).
+#:
+#: `walk_workspace_paths` is a full `os.walk` plus a sort of every path, and the
+#: completer builds a fresh `WorkspaceTool` on EVERY keystroke. Measured at
+#: ~780 ms per key on a 2,700-path workspace, run on the event loop thread -
+#: which is precisely why typing an @mention dropped characters.
+#:
+#: Deliberately NOT applied to `WorkspaceTool` itself. The agent writes a file
+#: and then looks for it in the same turn, and a stale walk there would bring
+#: back the "provide the full path" dead end that a to-be-created file used to
+#: hit. Completion is the one caller where being a few seconds out of date
+#: costs nothing: the worst case is a just-created file missing from a dropdown
+#: for one TTL, and the name can still be typed out in full.
+_MENTION_INDEX_TTL_SECONDS = 5.0
+_MENTION_INDEX_CACHE: dict[str, tuple[float, tuple[tuple[str, str, str], ...]]] = {}
+_MENTION_INDEX_LOCK = threading.Lock()
+_MENTION_INDEX_REFRESHING: set[str] = set()
+
+
+def _build_mention_index(root: Path) -> tuple[tuple[str, str, str], ...]:
+    entries: list[tuple[str, str, str]] = []
+    for path in walk_workspace_paths(root):
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:  # pragma: no cover - walk yields paths under root
+            continue
+        entries.append((rel, rel.lower(), path.name.lower()))
+    # Sorted the way `_walk_files_and_dirs` sorts, so the cached path offers the
+    # same suggestions in the same order as the uncached one.
+    entries.sort(key=lambda entry: entry[1])
+    return tuple(entries)
+
+
+def _refresh_mention_index(root: Path, key: str) -> None:
+    try:
+        index = _build_mention_index(root)
+    except Exception:  # noqa: BLE001 - a completion must not die on a bad walk
+        with _MENTION_INDEX_LOCK:
+            _MENTION_INDEX_REFRESHING.discard(key)
+        return
+    with _MENTION_INDEX_LOCK:
+        _MENTION_INDEX_CACHE[key] = (time.monotonic(), index)
+        _MENTION_INDEX_REFRESHING.discard(key)
+
+
+def _mention_index(workspace_root: Path) -> tuple[tuple[str, str, str], ...]:
+    """`(rel, rel_lower, name_lower)` for the workspace, cached for a few seconds.
+
+    The lowercased forms are precomputed because the alternative is lowercasing
+    every path on every keystroke, which is the second-largest cost here once
+    the walk itself stops happening per key.
+
+    A STALE index is served immediately and refreshed on a background thread.
+    Blocking on expiry instead would hand one keystroke in every TTL the full
+    ~600 ms walk, which is the visible jank this exists to remove - and the
+    caller that wants a guaranteed-fresh answer is `WorkspaceTool`, which never
+    comes here.
+    """
+    root = Path(workspace_root).resolve()
+    key = str(root)
+    now = time.monotonic()
+    with _MENTION_INDEX_LOCK:
+        cached = _MENTION_INDEX_CACHE.get(key)
+        if cached is not None:
+            fresh = now - cached[0] < _MENTION_INDEX_TTL_SECONDS
+            # One walk in flight per workspace: `complete_while_typing` would
+            # otherwise start a thread per keystroke.
+            start = not fresh and key not in _MENTION_INDEX_REFRESHING
+            if start:
+                _MENTION_INDEX_REFRESHING.add(key)
+        else:
+            fresh, start = False, False
+    if cached is not None:
+        if start:
+            threading.Thread(
+                target=_refresh_mention_index,
+                args=(root, key),
+                name="shamsu-mention-index-refresh",
+                daemon=True,
+            ).start()
+        return cached[1]
+    # Nothing cached at all: walk now rather than offer an empty dropdown. This
+    # is the one blocking call left, it happens once per workspace, and the
+    # completer is wrapped in a `ThreadedCompleter` so it is off the event loop.
+    index = _build_mention_index(root)
+    with _MENTION_INDEX_LOCK:
+        _MENTION_INDEX_CACHE[key] = (time.monotonic(), index)
+    return index
+
+
+def mention_suggestions_cached(
+    workspace_root: Path, prefix: str, limit: int = 30
+) -> list[str]:
+    """`WorkspaceTool.mention_suggestions`, for callers that must not block.
+
+    Same matching, same ordering, same labels - the only difference is that the
+    directory walk behind it may be up to `_MENTION_INDEX_TTL_SECONDS` old.
+    """
+    query = _mention_query(prefix)
+    if not query:
+        return []
+    suggestions: list[str] = []
+    for rel, rel_lower, name_lower in _mention_index(workspace_root):
+        if _mention_match(rel_lower, name_lower, query):
+            suggestions.append(_mention_label(rel))
+            if len(suggestions) >= limit:
+                break
+    return suggestions
+
+
+def clear_mention_index_cache() -> None:
+    """Drop the completion cache - for tests, and for `/new`-style resets."""
+    with _MENTION_INDEX_LOCK:
+        _MENTION_INDEX_CACHE.clear()
+        _MENTION_INDEX_REFRESHING.clear()
 
 
 class MentionResolver:

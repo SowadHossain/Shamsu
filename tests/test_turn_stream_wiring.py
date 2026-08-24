@@ -244,6 +244,25 @@ def test_a_routed_prompt_is_echoed_on_the_desktop_as_a_terminal_line():
     assert "model responded in 9s" in printed
 
 
+def test_the_console_mirror_stands_down_when_the_frame_is_active(monkeypatch):
+    """The framed TUI observes the turn stream directly; the old console mirror
+    would duplicate every Telegram row if it also wrote into the pane."""
+    from shamsu.integrations.telegram.local import ConsoleTelegramMirror
+
+    import shamsu.cli.repl as repl
+
+    monkeypatch.setattr(repl, "active_frame", lambda: object())
+    buffer = io.StringIO()
+    mirror = ConsoleTelegramMirror(
+        Console(file=buffer, width=200, no_color=True, highlight=False)
+    )
+
+    mirror.prompt_echo("build it", "asteroids")
+
+    assert mirror.turn_renderer() is None
+    assert buffer.getvalue() == ""
+
+
 def test_the_service_prefers_the_prompt_echo_for_a_routed_task(tmp_path):
     echoed: list[str] = []
     panels: list[tuple[str, str]] = []

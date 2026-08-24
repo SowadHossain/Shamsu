@@ -55,6 +55,8 @@ class ConsoleTelegramMirror:
         turn typed here differ by one word - `telegram>` instead of `cli>` -
         rather than by shape.
         """
+        if _frame_is_active():
+            return
         # Escaped: a prompt is arbitrary user text, and rich would read
         # `[dim]` in it as markup rather than as the characters typed.
         clean = escape(redact(prompt or "").strip())
@@ -85,6 +87,8 @@ class ConsoleTelegramMirror:
         still one renderer from the stream's point of view and a failure in any
         one of them cannot take the others down with it.
         """
+        if _frame_is_active():
+            return None
         from shamsu.cli.repl import active_live_console
         from shamsu.cli.turn_render import CliTurnRenderer
         from shamsu.runtime.settings import verbosity as saved_verbosity
@@ -108,6 +112,15 @@ class ConsoleTelegramMirror:
                     sink(event)
 
         return fan_out
+
+
+def _frame_is_active() -> bool:
+    try:
+        from shamsu.cli.repl import active_frame
+
+        return active_frame() is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class LocalTelegramBridgeManager:

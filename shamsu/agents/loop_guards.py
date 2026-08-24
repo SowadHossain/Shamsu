@@ -41,6 +41,24 @@ from dataclasses import dataclass, field
 READS_BEFORE_NUDGE = 5
 READS_BEFORE_INSISTING = 8
 
+#: Whether the reads were all of DIFFERENT things changes what to say, not when
+#: to say it.
+#:
+#: Live 2026-08-24, `demo-3/asteroid`: the defect spanned seven source files -
+#: `initGame()` never called in one, no default export in two more, a dead
+#: `let scene;` in four - and this guard interrupted at five reads, 17 times
+#: across the session, with "You probably have enough ... do not keep reading."
+#: It did not have enough; it had not yet opened every file the bug lived in.
+#: And it obeyed: every fix it shipped that session was scoped to whichever
+#: file it happened to have read by the time it was told to stop.
+#:
+#: Raising the ceiling was the wrong correction - nine different files read to
+#: no purpose is exactly the open-ended "review X" this detector exists for, and
+#: no count separates that from the eight files above. What was wrong was the
+#: INSTRUCTION. A model circling one file should stop reading. A model opening
+#: files it has never seen should be asked what it is looking for, not told it
+#: already has the answer.
+
 #: Reads AFTER the firm word before the loop is told to end the turn.
 #: The detector used to fire twice per turn and then go permanently silent, so
 #: past eight reads there was no ceiling at all. Live 2026-08-22: one turn read
@@ -113,13 +131,32 @@ class ReadLoopDetector:
     #: with nothing counting past them the detector fell silent exactly when
     #: the model had proved it was not listening.
     since_insisting: int = 0
+    #: Distinct things read this turn. What separates a model opening a
+    #: seven-file project from a model reading one file seven times.
+    seen: set[str] = field(default_factory=set)
 
-    def record(self, tool_names: list[str], produced_something: bool) -> Signal | None:
+    @property
+    def exploring(self) -> bool:
+        """Was every read a thing it had not read before?
+
+        Then it is looking, not circling, and telling it that it "probably has
+        enough" is telling it something false.
+        """
+        return bool(self.seen) and len(self.seen) >= self.streak
+
+    def record(
+        self,
+        tool_names: list[str],
+        produced_something: bool,
+        targets: list[str] | None = None,
+    ) -> Signal | None:
         """Note one round's tool calls. Returns a nudge, or ``None``."""
         if produced_something:
             self.streak = 0
             self.since_insisting = 0
+            self.seen.clear()
             return None
+        self.seen.update(target for target in (targets or []) if target)
         looked = [name for name in tool_names if name in LOOKING_TOOLS]
         if not looked:
             # Something that was not a read. Whatever it was, it was not this
@@ -151,25 +188,54 @@ class ReadLoopDetector:
         if self.streak >= READS_BEFORE_INSISTING:
             self.insisted = True
             count = self.streak
+            exploring = self.exploring
             self.streak = 0
+            if exploring:
+                # "You have enough to go on" is a claim about the code, and it
+                # is not one this detector is in any position to make. Said to a
+                # model eight files into a bug spread across seven of them, it
+                # is simply false - and it was believed.
+                return Signal(
+                    "read_loop",
+                    f"read {count} different things without producing anything; "
+                    "asked it to say what it is after",
+                    f"You have now opened {count} different files in this turn and "
+                    "produced nothing - no answer, no file changed, no command run."
+                    "\n\nWrite down what you have found so far and what is still "
+                    "missing, in the reply, before reading anything else. If what "
+                    "is missing is one specific thing, fetch exactly that and then "
+                    "answer. If you already know the cause, make the change now.",
+                )
             return Signal(
                 "read_loop",
                 f"read {count} things without producing anything; asked it to answer",
                 f"You have now made {count} read or search calls in this turn and "
-                "produced nothing - no answer, no file changed, no command run. You "
-                "have enough to go on.\n\n"
+                "produced nothing - no answer, no file changed, no command run, and "
+                "you are re-reading things you already have.\n\n"
                 "Stop reading. Write your answer, or make the change you were asked "
                 "for, in this turn. If one specific thing is genuinely still missing, "
                 "fetch exactly that one thing and then answer immediately.",
             )
         if self.streak >= READS_BEFORE_NUDGE and not self.nudged:
             self.nudged = True
+            if self.exploring:
+                return Signal(
+                    "read_loop_warning",
+                    f"read {self.streak} different things without producing anything",
+                    f"You have opened {self.streak} different files and produced "
+                    "nothing yet - no answer, no change, nothing run.\n\n"
+                    "If you already know what is wrong, make the change now. If you "
+                    "are still looking, say in one line WHAT you are looking for "
+                    "before your next read, and read only the thing that would "
+                    "settle it. Do not open more files to see what is in them.",
+                )
             return Signal(
                 "read_loop_warning",
                 f"read {self.streak} things without producing anything",
-                f"You have read {self.streak} things and produced nothing yet. You "
-                "probably have enough. After your next call, write the answer or "
-                "make the change - do not keep reading.",
+                f"You have read {self.streak} things and produced nothing yet, and "
+                "you are re-reading what you already have. You probably have "
+                "enough. After your next call, write the answer or make the change "
+                "- do not keep reading.",
             )
         return None
 
@@ -277,8 +343,12 @@ def closest_tool_names(wanted: str, known: list[str], limit: int = 3) -> list[st
 #: same model families reach for when they were trained against a different
 #: harness, and each one names a real SHAMSU tool as the answer.
 INVENTED_CAPABILITIES: dict[str, str] = {
-    "plan": "There is no planning tool - planning is something you do in your "
-            "answer. Write the plan to a file with write_file, or just say it.",
+    # Reached only when `closest_tool_names` finds nothing, which since
+    # `contract_from_plan` shipped it does - it shares the word. Kept correct
+    # anyway: this text used to say "There is no planning tool", and there is.
+    "plan": "To start a phase of a plan document, call contract_from_plan with "
+            "its number. To write down what done means directly, contract_create. "
+            "To save the plan as a file, write_file.",
     "todo": "There is no todo tool. Keep the list in your answer, or write it "
             "to a file with write_file.",
     "todo_write": "There is no todo tool. Keep the list in your answer, or "

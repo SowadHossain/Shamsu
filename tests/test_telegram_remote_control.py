@@ -359,13 +359,20 @@ def test_local_gateway_free_text_closes_action_ledger_without_false_failure(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    import json
+
+    from shamsu.runtime.turn_stream import activity_path
+
+    monkeypatch.setenv("SHAMSU_LEGACY_ROUTING", "1")
     logger = SessionManager(tmp_path).create_session("remote")
 
     class FakeAgentChatLoop:
-        def __init__(self, *_args, action_ledger=None, **_kwargs) -> None:
+        def __init__(self, *_args, action_ledger=None, on_activity=None, **_kwargs) -> None:
             self.action_ledger = action_ledger
+            self.on_activity = on_activity
 
         async def run(self, text: str) -> AgentLoopResult:
+            self.on_activity("legacy loop is live")
             return AgentLoopResult(
                 final=f"Echo: {text}",
                 run_id=self.action_ledger.run_id,
@@ -394,6 +401,20 @@ def test_local_gateway_free_text_closes_action_ledger_without_false_failure(
     manifest = action_store.load_manifest(tmp_path, result.run_id)
     assert manifest is not None
     assert manifest["status"] == "success"
+    events = [
+        json.loads(line)
+        for line in activity_path(tmp_path, logger.session_id)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [event["kind"] for event in events] == [
+        "turn.start",
+        "activity",
+        "assistant",
+        "turn.end",
+    ]
+    assert events[1]["text"] == "legacy loop is live"
     reloaded = SessionManager(tmp_path).resolve(logger.session_id)
     assert reloaded.last_user_prompt == "Hi"
 
@@ -402,6 +423,7 @@ def test_local_gateway_sends_telegram_progress_notifications(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("SHAMSU_LEGACY_ROUTING", "1")
     logger = SessionManager(tmp_path).create_session("remote")
     sent = []
 
@@ -417,7 +439,14 @@ def test_local_gateway_sends_telegram_progress_notifications(
     class FakeAgentChatLoop:
         timeout_seen = 0.0
 
-        def __init__(self, *_args, progress=None, max_runtime_seconds=None, action_ledger=None, **_kwargs) -> None:
+        def __init__(
+            self,
+            *_args,
+            progress=None,
+            max_runtime_seconds=None,
+            action_ledger=None,
+            **_kwargs,
+        ) -> None:
             self.progress = progress
             self.action_ledger = action_ledger
             FakeAgentChatLoop.timeout_seen = float(max_runtime_seconds or 0)

@@ -100,7 +100,7 @@ _NON_REGISTRY_TOOLS = frozenset({
     "graph_search", "explain_symbol", "history_search", "append_file",
     "find_files", "read_symbol", "run_tests", "use_skill", "replace_symbol",
     "contract_create", "contract_status", "contract_assert_pass",
-    "contract_assert_fail", "contract_assert_skip",
+    "contract_assert_fail", "contract_assert_skip", "contract_from_plan",
     "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
 })
 
@@ -229,17 +229,35 @@ def test_an_unknown_tool_is_answered_with_somewhere_to_go(tmp_path):
 
 def test_a_tool_the_model_wishes_existed_is_told_what_to_do_instead(tmp_path):
     """Live 2026-08-22: `✗ plan FAILED There is no tool called plan. Available:
-    append_file, ask_user, contra...`. `plan` is not a misspelling of anything
-    in the registry - no edit distance, no shared word - so the "did you mean"
-    path cannot fire and the model learned nothing from the answer."""
-    loop = _loop(tmp_path, [_tool("plan", filepath="x"), _text("Sorry.")])
+    append_file, ask_user, contra...`. A name that is not a misspelling of
+    anything in the registry - no edit distance, no shared word - cannot fire
+    the "did you mean" path, and the model learned nothing from the answer.
+
+    The original probe here WAS `plan`, and stopped being one when
+    `contract_from_plan` shipped on 2026-08-24: they share a word, so
+    `closest_tool_names` answers first - correctly, which is what the test
+    below pins. `todo` still reaches the hint.
+    """
+    loop = _loop(tmp_path, [_tool("todo", filepath="x"), _text("Sorry.")])
 
     asyncio.run(loop.run("go"))
 
     tool_messages = [m for m in loop.client.calls[1]["messages"] if m["role"] == "tool"]
     answer = tool_messages[0]["content"]
-    assert "no tool called plan" in answer
+    assert "no tool called todo" in answer
     assert "write_file" in answer, "it must name what to do instead"
+
+
+def test_a_model_reaching_for_plan_is_pointed_at_the_phase_tool(tmp_path):
+    """`plan` is what a model calls when it wants to write down what it is about
+    to do. Since 2026-08-24 there is a tool for exactly that."""
+    loop = _loop(tmp_path, [_tool("plan", filepath="x"), _text("Sorry.")])
+
+    asyncio.run(loop.run("go"))
+
+    tool_messages = [m for m in loop.client.calls[1]["messages"] if m["role"] == "tool"]
+
+    assert "contract_from_plan" in tool_messages[0]["content"]
 
 
 def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
@@ -1028,7 +1046,13 @@ def test_the_loop_retries_smaller_instead_of_dying_on_oom(tmp_path):
 
     # A long prompt so the first attempt is above the smallest bucket - there
     # has to be somewhere to step DOWN to for this to prove anything.
-    result = asyncio.run(loop.run("x " * 20000))
+    #
+    # And not so long that the content ITSELF needs the ceiling, or the retry
+    # correctly cannot shrink and this asserts nothing. `x * 20000` sat right on
+    # that boundary and crossed it when `contract_from_plan` added a schema on
+    # 2026-08-24 - every tool offered is tokens on every call, and that is the
+    # cost showing up. Measured: 2k/5k/10k step 32768 -> 16384, 20k cannot.
+    result = asyncio.run(loop.run("x " * 10000))
 
     assert result.final == "recovered"
     assert not result.stopped
@@ -2132,6 +2156,10 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 # Ordered so the contract exists before anything asserts on it -
                 # `SIMPLE_TOOL_SCHEMAS` lists create first.
                 "contract_create": {"title": "probe", "assertions": ["it runs"]},
+                # There is no plan document in this workspace, so this one is a
+                # legitimate NO - see the allowed set below. The probe is here
+                # to prove `phase` reaches the implementation.
+                "contract_from_plan": {"phase": "1"},
                 "contract_status": {},
                 "contract_assert_pass": {"assertion_id": "a01", "evidence": "ran it"},
                 "contract_assert_fail": {"assertion_id": "a01", "evidence": "broke"},
@@ -2154,6 +2182,8 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
             assert result.ok or name in {
                 "memory_forget", "read_and_patch", "run_tests",
                 "contract_assert_pass",
+                # No PLAN.md in this tmp_path, which is the honest answer.
+                "contract_from_plan",
             }, (
                 f"{name} -> {result.message}"
             )
@@ -8199,7 +8229,13 @@ def test_eight_reads_without_producing_anything_is_interrupted(tmp_path):
         if m.role == "user" and "produced nothing" in m.content
     ]
     assert nudges, "it read nine files and was never asked to produce anything"
-    assert any("Stop reading" in n for n in nudges)
+    # It is still interrupted at the same counts. What it is TOLD changed on
+    # 2026-08-24: nine files it has never opened is not a model that "has enough
+    # to go on", and saying so to a model tracking a bug across seven files was
+    # both false and obeyed - see the note in `loop_guards`. "Stop reading" is
+    # now reserved for a model re-reading what it already has.
+    assert any("read only the thing that would settle it" in n for n in nudges)
+    assert not any("probably have enough" in n for n in nudges)
 
 
 def test_reading_then_writing_is_never_interrupted(tmp_path):
@@ -8886,6 +8922,130 @@ def test_read_symbol_returns_every_definition_of_a_duplicated_name(tmp_path):
     assert "defined 2 times" in result.message
     ranges = [(d["start_line"], d["end_line"]) for d in result.data["definitions"]]
     assert len(ranges) == 2 and ranges[0][0] < ranges[1][0]
+
+
+def test_replace_symbol_can_delete_a_later_duplicate_by_occurrence(tmp_path):
+    """The case from the live failure: read_symbol can show the second class,
+    so replace_symbol needs to edit that second class instead of trying exact
+    patch text in a long, elided transcript."""
+    (tmp_path / "asteroid.js").write_text(
+        "export default class AsteroidSpawner {\n"
+        "  spawn() {\n"
+        "    return 'first';\n"
+        "  }\n"
+        "}\n\n"
+        "export default class AsteroidSpawner {\n"
+        "  spawn() {\n"
+        "    return 'second';\n"
+        "  }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "replace_symbol",
+        {
+            "filepath": "asteroid.js",
+            "symbol": "AsteroidSpawner",
+            "occurrence": 2.0,
+            "content": "",
+        },
+    )
+
+    assert result.ok, result.message
+    body = (tmp_path / "asteroid.js").read_text(encoding="utf-8")
+    assert body.count("export default class AsteroidSpawner") == 1
+    assert "return 'first';" in body
+    assert "return 'second';" not in body
+    assert (result.data or {}).get("occurrence") == 2
+
+
+@pytest.mark.parametrize(
+    "bad_occurrence",
+    [2.7, "2.7", "1.0000000000000001", "NaN", "Infinity", 0, -1, True],
+)
+def test_replace_symbol_rejects_non_integer_or_non_positive_occurrence(
+    tmp_path, bad_occurrence
+):
+    (tmp_path / "a.js").write_text(
+        "function dupe() {\n  return 1;\n}\n\n"
+        "function dupe() {\n  return 2;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "replace_symbol",
+        {
+            "filepath": "a.js",
+            "symbol": "dupe",
+            "occurrence": bad_occurrence,
+            "content": "",
+        },
+    )
+
+    assert not result.ok
+    assert "positive integer" in result.message
+    assert (tmp_path / "a.js").read_text(encoding="utf-8").count("function dupe") == 2
+
+
+def test_replace_symbol_can_target_a_duplicate_by_line_range(tmp_path):
+    """read_symbol returns line ranges; they must be actionable, not just
+    informational."""
+    (tmp_path / "a.js").write_text(
+        "function dupe() {\n  return 1;\n}\n\n"
+        "function other() {\n  return 9;\n}\n\n"
+        "function dupe() {\n  return 2;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+    read = loop._execute("read_symbol", {"filepath": "a.js", "symbol": "dupe"})
+    second = read.data["definitions"][1]
+
+    result = loop._execute(
+        "replace_symbol",
+        {
+            "filepath": "a.js",
+            "symbol": "dupe",
+            "start_line": second["start_line"],
+            "end_line": second["end_line"],
+            "content": "",
+        },
+    )
+
+    assert result.ok, result.message
+    body = (tmp_path / "a.js").read_text(encoding="utf-8")
+    assert body.count("function dupe") == 1
+    assert "return 1;" in body
+    assert "return 2;" not in body
+
+
+def test_replace_symbol_disagreement_message_keeps_the_requested_range(tmp_path):
+    """A bad range should report the range the model sent, not a stitched
+    together range that cannot exist."""
+    (tmp_path / "a.js").write_text(
+        "function dupe() {\n  return 1;\n}\n\n"
+        "function other() {\n  return 9;\n}\n\n"
+        "function dupe() {\n  return 2;\n}\n",
+        encoding="utf-8",
+    )
+    loop = _loop(tmp_path, [_text("ok")])
+
+    result = loop._execute(
+        "replace_symbol",
+        {
+            "filepath": "a.js",
+            "symbol": "dupe",
+            "occurrence": 1,
+            "start_line": 5,
+            "content": "function dupe() {\n  return 3;\n}\n",
+        },
+    )
+
+    assert not result.ok
+    assert "occurrence 1 is lines 1-3, not 5-?" in result.message
+    assert "not 5-3" not in result.message
 
 
 def test_a_name_declared_once_still_returns_just_its_body(tmp_path):
