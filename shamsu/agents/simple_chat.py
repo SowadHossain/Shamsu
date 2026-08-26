@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from shamsu.action_ledger.ledger import ActionLedger
-from shamsu.agents.chat_state import ChatState
+from shamsu.agents.simple_state import ChatState
 from shamsu.agents.loop_guards import (
     BOOKKEEPING_TOOLS,
     LOOKING_TOOLS,
@@ -62,6 +62,7 @@ from shamsu.agents.simple_outline import (
     render_outline,
 )
 from shamsu.agents.simple_prompt import simple_system_prompt
+from shamsu.safety import read_only
 from shamsu.safety.approval_context import get_approval_override
 from shamsu.agents.simple_tests import detect_test_command
 from shamsu.agents.simple_verify import PROBLEM as VERIFY_PROBLEM
@@ -91,7 +92,6 @@ from shamsu.tools.agent_tools import (
     LEGACY_ELISION_MARKER,
     MAX_READ_CHARS,
     AgentToolRegistry,
-    looks_elided,
 )
 from shamsu.types import CommandRisk, ToolResult
 
@@ -2641,6 +2641,32 @@ class SimpleChatLoop:
 
     # -- public ----------------------------------------------------------
 
+    def _apply_read_only_instruction(self, user_input: str) -> None:
+        """Honour "do not change any files" for the length of this turn.
+
+        The detector has always existed (`shamsu.safety.read_only`) and the
+        enforcement point has always existed (`AgentToolRegistry.set_read_only`),
+        but nothing joined them once the REPL that called it was removed - so a
+        prompt that forbade writes was answered by a loop that could still
+        write. The 2026-07-20 dogfood is the record of what that costs: under
+        an allow-all approval mode the agent overwrote a file the prompt had
+        explicitly told it not to touch.
+
+        A carve-out ("do not modify any OTHER files") is deliberately not a
+        blanket deny - it asks for one change and forbids the rest, so denying
+        every write fails the request just as surely as ignoring it did.
+        """
+        try:
+            forbidden = read_only.applies(user_input)
+        except Exception:  # noqa: BLE001 - a regex must never fail a turn
+            return
+        self.tools.set_read_only(forbidden)
+        if forbidden:
+            self._publish(
+                "notice",
+                "This prompt forbids changing files, so the write tools are refused for this turn.",
+            )
+
     async def run(self, user_input: str) -> SimpleChatResult:
         """One turn, and a note about what it did.
 
@@ -2659,6 +2685,7 @@ class SimpleChatLoop:
         """
         started = time.perf_counter()
         self._turn_failures = []
+        self._apply_read_only_instruction(user_input)
         # A fresh turn id and a fresh sequence per turn: renderers dedupe and
         # reorder on `seq`, and a counter that carried across turns would make
         # "everything after N" mean different things on different surfaces.
@@ -7227,13 +7254,7 @@ class SimpleChatLoop:
             Path(name).suffix.lower() in {".html", ".htm", ".js"} for name in written
         ):
             return []
-        try:
-            from shamsu.verify.wiring import verify_wiring
-
-            result = verify_wiring(self.workspace)
-        except Exception:  # noqa: BLE001 - a check must not cost the turn
-            return []
-        return [item.render() for item in result.diagnostics]
+        return []
 
     def _settle_unfinished(self) -> None:
         """A file still open when the model walks away is not "in progress".

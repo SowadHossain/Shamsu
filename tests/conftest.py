@@ -1,11 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import os
 from typing import Any
 
 import pytest
 
-from shamsu.abstract.types import GateResult
 from shamsu.memory.types import MemoryGate
 
 
@@ -15,39 +14,6 @@ def _memory_queue_cleanup():
 
     yield
     reset_memory_queues(timeout=0.2)
-
-
-@pytest.fixture(autouse=True)
-def _pin_legacy_routing(monkeypatch, request):
-    """Existing tests drive `_handle_request` to assert ROUTER behaviour.
-
-    Simple mode is now the production default and short-circuits that router
-    before it runs, so without this those tests would silently stop testing what
-    they were written for - and worse, they would reach a real Ollama and hang,
-    because the simple loop builds a live client.
-
-    The router still ships behind SHAMSU_LEGACY_ROUTING, so pinning it here is
-    what those tests actually mean. `tests/test_simple_chat.py` owns the new
-    default and opts out.
-    """
-    if request.node.fspath.basename == "test_simple_chat.py":
-        yield
-        return
-    monkeypatch.setenv("SHAMSU_LEGACY_ROUTING", "1")
-    yield
-
-
-class _AlwaysOpenAbstractService:
-    """Stand-in used only for AgentOrchestrator's default (no explicit
-    abstract_service passed). Tests that construct their own AbstractService
-    and pass it explicitly are unaffected - see tests/test_abstract_*.py."""
-
-    def __init__(self, *_args, **_kwargs) -> None:
-        pass
-
-    def ensure_ready(self, auto_build: bool = True) -> GateResult:
-        return GateResult(allowed=True)
-
 
 
 class _AlwaysOpenMemoryService:
@@ -65,24 +31,14 @@ class _AlwaysOpenMemoryService:
 
 
 @pytest.fixture(autouse=True)
-def _graphiti_memory_gate_open(monkeypatch):
-    from shamsu.agents import orchestrator as orchestrator_module
-    from shamsu.agents import chat_loop as chat_loop_module
+def _memory_gate_open(monkeypatch):
+    """The small harness never builds a real Graphiti/Ollama-backed memory in
+    tests. Only `shamsu.llm.manager` still constructs one, so that is the only
+    name left to replace - the orchestrator and legacy chat loop it also used
+    to patch are gone with the legacy routing layer."""
     from shamsu.llm import manager as manager_module
 
-    monkeypatch.setattr(orchestrator_module, "MemoryService", _AlwaysOpenMemoryService)
-    monkeypatch.setattr(chat_loop_module, "MemoryService", _AlwaysOpenMemoryService)
     monkeypatch.setattr(manager_module, "MemoryService", _AlwaysOpenMemoryService)
-@pytest.fixture(autouse=True)
-def _codebase_memory_gate_open(monkeypatch):
-    """Default the Codebase-Memory MCP startup gate to open for the existing
-    test suite, which predates this requirement and doesn't install the real
-    upstream binary. Only replaces the name AgentOrchestrator falls back to
-    when no abstract_service is injected; tests that specifically cover gate
-    behaviour construct and pass their own AbstractService/fake adapter."""
-    from shamsu.agents import orchestrator as orchestrator_module
-
-    monkeypatch.setattr(orchestrator_module, "AbstractService", _AlwaysOpenAbstractService)
 
 
 ALLOW_LIVE_OLLAMA_ENV = "SHAMSU_TESTS_ALLOW_LIVE_OLLAMA"

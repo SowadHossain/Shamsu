@@ -5,16 +5,17 @@ import hashlib
 import json
 import os
 import re
+import zipfile
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 from urllib.parse import urlparse
 
 from shamsu.context.budget import count_tokens
 from shamsu.context.manager import ContextBudgetManager
-from shamsu.prd.document import NUMBERED_HEADING_RE, normalize_pdf_pages
 from shamsu.retriever.semantic import EMBED_MODEL, _cosine, _ollama_embed
 
 DOCUMENT_SOURCE_SUFFIXES = frozenset({".md", ".markdown", ".txt", ".pdf", ".docx"})
@@ -28,6 +29,7 @@ _MIN_SEMANTIC_SCORE = 0.3
 
 _WORD_RE = re.compile(r"[a-z0-9][a-z0-9_.:/+-]*", re.IGNORECASE)
 _MARKDOWN_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
+NUMBERED_HEADING_RE = re.compile(r"^\s*(?:\d+(?:\.\d+)*|[A-Z])[\).:-]\s+\S")
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _STOPWORDS = frozenset(
     {
@@ -78,8 +80,80 @@ class _LazyPdfPlumber:
 pdfplumber = _LazyPdfPlumber()
 
 
+@dataclass(frozen=True)
+class NormalizedPdfLine:
+    text: str
+    page: int
+
+
+@dataclass(frozen=True)
+class NormalizedPdfText:
+    text: str
+    lines: tuple[NormalizedPdfLine, ...]
+    warnings: tuple[str, ...] = ()
+
+
+def normalize_pdf_pages(pages: Iterable[str]) -> NormalizedPdfText:
+    """Return readable PDF text with page numbers preserved."""
+    text_chunks: list[str] = []
+    lines: list[NormalizedPdfLine] = []
+    warnings: list[str] = []
+    for page_number, page in enumerate(pages, start=1):
+        page_lines = [line.rstrip() for line in str(page or "").splitlines()]
+        page_text = "\n".join(line for line in page_lines if line.strip()).strip()
+        if not page_text:
+            warnings.append(f"page {page_number} had no extractable text")
+            continue
+        text_chunks.append(page_text)
+        lines.extend(
+            NormalizedPdfLine(text=line, page=page_number)
+            for line in page_text.splitlines()
+            if line.strip()
+        )
+    return NormalizedPdfText("\n\n".join(text_chunks), tuple(lines), tuple(warnings))
+
+
 class DocumentError(ValueError):
     """A source could not be converted into a registered document."""
+
+
+def extract_document_text(path: Path) -> str:
+    """Extract readable text from a text, PDF, or DOCX document."""
+    target = Path(path)
+    suffix = target.suffix.lower()
+    if suffix == ".pdf":
+        try:
+            with pdfplumber.open(target) as pdf:
+                pages = [(page.extract_text() or "").strip() for page in pdf.pages]
+        except Exception as exc:
+            raise DocumentError(f"Could not read PDF document: {exc}") from exc
+        text = normalize_pdf_pages(pages).text
+    elif suffix == ".docx":
+        text = _extract_docx_text(target)
+    else:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    if not re.search(r"\w", text or ""):
+        raise DocumentError("Document source is empty.")
+    return text
+
+
+def _extract_docx_text(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml = archive.read("word/document.xml")
+    except Exception as exc:
+        raise DocumentError(f"Could not read DOCX document: {exc}") from exc
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError as exc:
+        raise DocumentError(f"Could not parse DOCX document: {exc}") from exc
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs: list[str] = []
+    for paragraph in root.iter(f"{namespace}p"):
+        text = "".join(node.text or "" for node in paragraph.iter(f"{namespace}t")).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
 
 
 @dataclass(frozen=True)

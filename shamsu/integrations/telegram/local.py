@@ -73,8 +73,8 @@ class ConsoleTelegramMirror:
         does not repeat it.
 
         THREE renderers, not one. A turn started in this terminal attaches all
-        three (see `repl.py`, where they sit together): the row renderer, the
-        live telemetry, and the spinner's status updater. A Telegram turn used
+        three (see `cli/app.py`, where they sit together): the row renderer,
+        the live telemetry, and the spinner's status updater. A Telegram turn used
         to attach only the first, so its activity rows appeared and the sidebar
         never moved - live 2026-08-23 the PROGRESS and THIS TURN panels sat on
         the previous turn's numbers (`rounds 23/24`, `failed 13`) while a new
@@ -89,11 +89,11 @@ class ConsoleTelegramMirror:
         """
         if _frame_is_active():
             return None
-        from shamsu.cli.repl import active_live_console
+        from shamsu.cli.app import active_telemetry
         from shamsu.cli.turn_render import CliTurnRenderer
         from shamsu.runtime.settings import verbosity as saved_verbosity
 
-        live = active_live_console()
+        live = active_telemetry()
         rows = CliTurnRenderer(
             self.console,
             status_updater=getattr(live, "set_status", None) if live else None,
@@ -115,12 +115,15 @@ class ConsoleTelegramMirror:
 
 
 def _frame_is_active() -> bool:
-    try:
-        from shamsu.cli.repl import active_frame
+    """Is a framed TUI painting this terminal right now?
 
-        return active_frame() is not None
-    except Exception:  # noqa: BLE001
-        return False
+    If it is, a remote turn must not also write to the console: the frame owns
+    the screen and mirrors the stream itself. The import stays local because
+    the Telegram service can run in a process with no terminal app at all.
+    """
+    from shamsu.cli.app import active_frame
+
+    return active_frame() is not None
 
 
 class LocalTelegramBridgeManager:

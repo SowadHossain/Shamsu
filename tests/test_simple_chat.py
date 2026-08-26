@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from shamsu.agents.chat_state import ChatState
+from shamsu.agents.simple_state import ChatState
 from shamsu.agents.simple_chat import (
     CTX_BUCKETS,
     SIMPLE_TOOL_SCHEMAS,
@@ -787,7 +787,7 @@ def test_the_nudge_gives_up_rather_than_looping_forever(tmp_path):
 
 
 def test_a_long_session_is_not_truncated_to_five_turns(tmp_path):
-    from shamsu.agents.chat_state import HYDRATE_MAX_MESSAGES as LEGACY_CAP
+    from shamsu.agents.simple_state import HYDRATE_MAX_MESSAGES as LEGACY_CAP
     from shamsu.agents.simple_chat import HYDRATE_MAX_MESSAGES as SIMPLE_CAP
 
     assert LEGACY_CAP == 24, "the legacy default is unchanged"
@@ -801,7 +801,7 @@ def test_the_hydration_horizon_is_configurable_not_hardcoded(tmp_path):
     """It was a module constant read directly, so no caller could widen it."""
     import inspect
 
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
 
     assert "hydrate_max_messages" in inspect.signature(ChatState.__init__).parameters
 
@@ -819,7 +819,7 @@ def test_simple_mode_asks_for_the_wide_horizon(tmp_path):
 def test_evicted_turns_survive_as_a_digest_instead_of_vanishing(tmp_path):
     """`select_for_budget` was called but `update_rolling_summary` never was, so
     anything that stopped fitting was hard-dropped."""
-    from shamsu.agents.chat_state import ChatMessage
+    from shamsu.agents.simple_state import ChatMessage
     from shamsu.agents.simple_chat import _digest
 
     evicted = [
@@ -840,7 +840,7 @@ def test_evicted_turns_survive_as_a_digest_instead_of_vanishing(tmp_path):
 
 
 def test_the_digest_accumulates_rather_than_replacing(tmp_path):
-    from shamsu.agents.chat_state import ChatMessage
+    from shamsu.agents.simple_state import ChatMessage
     from shamsu.agents.simple_chat import _digest
 
     first = _digest("", [ChatMessage("user", "milestone one")])
@@ -2510,7 +2510,7 @@ def test_the_harnesss_stop_messages_are_not_replayed_as_the_models_answers():
     Live 2026-08-18 a session carried "The model did not respond within 600s."
     forward into every later turn as an assistant message.
     """
-    from shamsu.agents.chat_state import _should_hydrate_chat_message
+    from shamsu.agents.simple_state import _should_hydrate_chat_message
 
     for stop in (
         "The model did not respond within 600s.",
@@ -2540,7 +2540,7 @@ def test_the_harnesss_stop_messages_are_not_replayed_as_the_models_answers():
 
 def test_ordinary_prose_that_merely_starts_the_same_way_is_kept():
     """"I tried..." and "I stopped..." are perfectly normal things to say."""
-    from shamsu.agents.chat_state import _should_hydrate_chat_message
+    from shamsu.agents.simple_state import _should_hydrate_chat_message
 
     for kept in (
         "I tried a different approach and it worked.",
@@ -2558,7 +2558,7 @@ def test_ordinary_prose_that_merely_starts_the_same_way_is_kept():
 
 def test_a_stopped_turn_does_not_teach_the_next_one_to_stop(tmp_path):
     """End to end: the stop is persisted for the user, but not replayed."""
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
 
     records = [
         {"role": "user", "content": "review the prd"},
@@ -5450,7 +5450,7 @@ def test_the_promise_guard_has_an_exit(tmp_path):
 def test_the_promise_stop_never_becomes_conversation(tmp_path):
     """RC3's lesson: a harness notice replayed into later prompts teaches the
     model that this is how a turn ends. It said so 54 times."""
-    from shamsu.agents.chat_state import _should_hydrate_chat_message
+    from shamsu.agents.simple_state import _should_hydrate_chat_message
 
     loop = _loop(tmp_path, [_text("Let me fix that:")] * 12, max_rounds=12)
     result = asyncio.run(loop.run("fix a.js"))
@@ -5841,7 +5841,7 @@ def test_the_message_names_the_cap_the_call_actually_carried(tmp_path):
 def test_the_cut_off_notice_never_becomes_conversation(tmp_path):
     """One frozen copy was replayed 54 times, teaching the model that "I ran out
     of room" is how a turn ends."""
-    from shamsu.agents.chat_state import _should_hydrate_chat_message
+    from shamsu.agents.simple_state import _should_hydrate_chat_message
 
     window = _cut_loop(tmp_path, 30_000, 8_192)._out_of_room_message()
     capped = _cut_loop(tmp_path, 2_270, 16_384)._out_of_room_message()
@@ -5852,7 +5852,7 @@ def test_the_cut_off_notice_never_becomes_conversation(tmp_path):
 
 def test_a_partial_answer_with_real_content_is_still_kept(tmp_path):
     """The filter must not swallow what the model actually managed to say."""
-    from shamsu.agents.chat_state import _should_hydrate_chat_message
+    from shamsu.agents.simple_state import _should_hydrate_chat_message
 
     loop = _cut_loop(tmp_path, 2_270, 16_384)
     message = loop._out_of_room_message("Here is the first half of the file.")
@@ -9562,7 +9562,7 @@ def test_the_session_average_speed_survives_several_calls(tmp_path):
 
 
 def test_the_digest_does_not_record_a_harness_nudge_as_a_user_request(tmp_path):
-    from shamsu.agents.chat_state import ChatMessage
+    from shamsu.agents.simple_state import ChatMessage
     from shamsu.agents.simple_chat import _digest
     from shamsu.session.manager import ORIGIN_LOOP
 
@@ -9592,7 +9592,7 @@ def test_the_digest_does_not_record_a_harness_nudge_as_a_user_request(tmp_path):
 def test_the_digest_still_records_a_real_request_that_looks_like_a_nudge(tmp_path):
     """The tag decides, not the wording. A user is allowed to type a sentence
     that reads like a correction, and it must survive compaction."""
-    from shamsu.agents.chat_state import ChatMessage
+    from shamsu.agents.simple_state import ChatMessage
     from shamsu.agents.simple_chat import _digest
 
     digest = _digest("", [ChatMessage("user", "That reply was empty. Try again.")])

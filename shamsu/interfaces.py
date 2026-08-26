@@ -1,11 +1,5 @@
-"""
-shamsu/interfaces.py
+"""Abstract contracts shared by the small SHAMSU harness."""
 
-Abstract contracts. Each dev implements these in their own module.
-Anyone who needs a not-yet-built dependency imports the interface and
-writes a Stub* class against it (see shamsu/retriever/search.py for the
-canonical example) — never block waiting for someone else's PR to merge.
-"""
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -13,14 +7,15 @@ from pathlib import Path
 from typing import Optional
 
 from shamsu.types import (
-    SearchResult, ContextPack, LLMResponse, RoutingDecision,
-    ApprovalRequest, CommandRisk, ParsedPRD, TestRunResult,
+    ApprovalRequest,
+    CommandRisk,
+    ContextPack,
+    LLMResponse,
+    RoutingDecision,
+    SearchResult,
+    TestRunResult,
 )
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Dev A owns: indexer/, retriever/, patch/, storage/
-# ─────────────────────────────────────────────────────────────────────────
 
 class ISearchAgent(ABC):
     @abstractmethod
@@ -44,15 +39,15 @@ class IPatchEngine(ABC):
     def rollback(self, file_path: Path) -> bool: ...
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Dev B owns: llm/, agents/, context/, core/
-# ─────────────────────────────────────────────────────────────────────────
-
 class IContextBuilder(ABC):
     @abstractmethod
     def pack(
-        self, results: list[SearchResult], request: str,
-        task_id: str, step_id: int, specialist: str,
+        self,
+        results: list[SearchResult],
+        request: str,
+        task_id: str,
+        step_id: int,
+        specialist: str,
         budget_tokens: int = 6554,
     ) -> ContextPack: ...
 
@@ -64,10 +59,6 @@ class ILLMManager(ABC):
     @abstractmethod
     async def run_specialist(self, specialist: str, pack: ContextPack) -> LLMResponse: ...
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Dev C owns: cli/, safety/, prd/, tools/
-# ─────────────────────────────────────────────────────────────────────────
 
 class ISafetyManager(ABC):
     @abstractmethod
@@ -81,11 +72,6 @@ class ISafetyManager(ABC):
 
     @abstractmethod
     def ask_approval(self, request: ApprovalRequest) -> bool: ...
-
-
-class IPRDParser(ABC):
-    @abstractmethod
-    def parse(self, file_path: Path) -> ParsedPRD: ...
 
 
 class ICommandRunner(ABC):

@@ -75,17 +75,14 @@ MENTION_RE = re.compile(
 )
 MAX_FILE_CHARS = 6000
 # Documents SHAMSU can extract text from rather than read as plain text.
-# Sourced from the PRD parser so a newly supported document format is readable
-# by every tool at once, not just by the PRD pipeline.
 DOCUMENT_EXTENSIONS = {".pdf", ".docx"}
 
 
 def extract_document_text(path: Path) -> str:
     """Plain text of a document SHAMSU knows how to parse (PDF, DOCX)."""
-    # Lazy: pdf extraction (via pdfplumber) is heavy and rarely needed.
-    from shamsu.prd.input import parse_prd_file
+    from shamsu.retriever.documents import extract_document_text as extract
 
-    return parse_prd_file(path).raw_text
+    return extract(path)
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -163,10 +160,6 @@ class WorkspaceTool:
         if not target.is_file():
             raise ValueError(f"Not a file: {path_text}")
         if target.suffix.lower() in DOCUMENT_EXTENSIONS:
-            # SHAMSU already extracts these for @-mentions and PRD builds, so
-            # refusing them here stranded any turn told to "read the PRD": live
-            # 2026-08-02 the plan route asked the user what `canvas lite.pdf`
-            # was rather than reading the document sitting in the workspace.
             return _truncate(extract_document_text(target), max_chars)
         if not is_readable_text_file(target):
             raise ValueError(f"Not a supported text file: {path_text}")
@@ -189,11 +182,9 @@ class WorkspaceTool:
         return matches
 
     def find_prds(self, limit: int = 20) -> list[Path]:
-        from shamsu.prd.input import is_prd_filename
-
         candidates = []
         for path in self._walk_files_and_dirs():
-            if path.is_file() and is_prd_filename(path.name):
+            if path.is_file() and _looks_like_spec_filename(path.name):
                 candidates.append(path.relative_to(self.workspace_root))
                 if len(candidates) >= limit:
                     break
@@ -240,6 +231,14 @@ def _mention_label(rel: str) -> str:
     # Quote paths with spaces so the mention regex (which stops at the first
     # space for unquoted paths) still captures the whole name.
     return f'@"{rel}"' if " " in rel else f"@{rel}"
+
+
+def _looks_like_spec_filename(name: str) -> bool:
+    lowered = name.lower()
+    return (
+        lowered.endswith((".md", ".txt", ".pdf", ".docx"))
+        and any(token in lowered for token in ("prd", "spec", "requirements", "brief"))
+    )
 
 
 #: Completion-only cache of the workspace walk: root -> (taken_at, entries).

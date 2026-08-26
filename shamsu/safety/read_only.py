@@ -1,8 +1,7 @@
 """The user's "do not change files" instruction, as a first-class signal.
 
-Before this module the phrase existed as two near-identical regexes (one in
-`cli/repl.py`, one in `routing/operations.py`) that only ever produced a
-boolean nobody enforced. The 2026-07-20 dogfood showed what that cost:
+Before this module the phrase existed as two near-identical regexes in the
+old REPL and its router, which only ever produced a boolean nobody enforced. The 2026-07-20 dogfood showed what that cost:
 
 * "Use web search ... **Do not modify files.**" routed to `file.write`, because
   the route detector saw the verb `modify` and the noun `files` and never

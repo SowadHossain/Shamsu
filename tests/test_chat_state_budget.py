@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from shamsu.session.manager import SessionManager
-from shamsu.agents.chat_state import ChatMessage, ChatState
+from shamsu.agents.simple_state import ChatMessage, ChatState
 
 
 def _wc(text: str) -> int:

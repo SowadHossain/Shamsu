@@ -71,23 +71,13 @@ class TelegramFormatter:
     def status(self, status: TelegramRuntimeStatus) -> str:
         session = status.session.display_name if status.session else "No active session"
         task = status.task or "Idle"
-        phase = status.phase or "-"
-        plan = (
-            f"{status.plan_completed} / {status.plan_total} steps complete"
-            if status.plan_total
-            else "No active plan"
-        )
         return "\n".join(
             [
                 f"SHAMSU - {status.status.title()}",
                 "",
                 f"Session: {session}",
                 f"Task: {task}",
-                f"Phase: {phase}",
-                f"Plan: {plan}",
-                f"Current step: {status.current_step or '-'}",
                 f"Actions: {status.actions} / {status.max_actions}",
-                f"Last action: {status.last_action or '-'}",
                 f"Updated: {status.updated_at or '-'}",
             ]
         )

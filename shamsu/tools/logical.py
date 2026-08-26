@@ -6,12 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from shamsu.artifacts.code import (
-    artifact_brief,
-    ensure_repository_artifacts,
-    retrieve_structural_context,
-    search_artifacts,
-)
 from shamsu.runtime.phase_contracts import (
     ExecutionPhase,
     evaluate_phase_tool_policy,
@@ -358,18 +352,6 @@ class LogicalToolLayer:
         files = self.backend.list_files(path)
         data: dict[str, Any] = {"files": _compact_result(files)}
         ok = bool(getattr(files, "ok", False))
-        try:
-            artifacts = ensure_repository_artifacts(self.backend.workspace_root)
-            data["code_artifacts"] = {
-                "root": str(artifacts.root),
-                "manifest_hash": artifacts.manifest_hash,
-                "files_indexed": artifacts.files_indexed,
-                "modules": artifacts.modules,
-                "symbols": artifacts.symbols,
-                "brief": artifact_brief(self.backend.workspace_root, files=[]),
-            }
-        except Exception as exc:
-            data["code_artifacts"] = {"ok": False, "message": str(exc)}
         if include_git:
             status = self.backend.git_tool.status()
             branch = self.backend.git_tool.branch()
@@ -396,8 +378,6 @@ class LogicalToolLayer:
         files = self.backend.find_file(query, limit)
         data = {
             "query": query,
-            "structural": retrieve_structural_context(self.backend.workspace_root, query, limit=limit),
-            "artifacts": search_artifacts(self.backend.workspace_root, query, limit=limit),
             "grep": _compact_result(grep),
             "files": _compact_result(files),
         }

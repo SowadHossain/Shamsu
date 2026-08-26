@@ -1,4 +1,4 @@
-"""Gateway from Telegram UI events to SHAMSU's existing sessions and runtime."""
+"""Gateway from Telegram UI events to SHAMSU sessions and the small harness."""
 from __future__ import annotations
 
 import asyncio
@@ -13,9 +13,9 @@ from typing import Any, Protocol
 from shamsu.action_ledger import store as action_store
 from shamsu.action_ledger.context import clear_current_run, set_current_run
 from shamsu.action_ledger.ledger import start_run
-from shamsu.agents.chat_loop import AgentChatLoop, AgentLoopResult
-from shamsu.agents.simple_chat import simple_mode_enabled
+from shamsu.agents.simple_chat import SimpleChatLoop
 from shamsu.cli.request_lifecycle import finish_current_run
+from shamsu.llm.ollama_client import default_ollama_client
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
 from shamsu.integrations.telegram.models import (
     OutboundMessage,
@@ -24,13 +24,16 @@ from shamsu.integrations.telegram.models import (
     TelegramSessionSummary,
 )
 from shamsu.runtime.run_control import (
+    RunStatus,
     active_runs_for_session,
     add_feedback,
     cancel_run,
+    complete_run,
     pause_run,
+    register_run,
     resume_run,
 )
-from shamsu.runtime.task_state import PlanStepStatus, RuntimeStateStore
+from shamsu.runtime.timeouts import TimeoutConfig
 from shamsu.session.manager import SessionManager
 from shamsu.tools.agent_tools import AgentToolRegistry
 from shamsu.ui.progress import ProgressReporter
@@ -101,7 +104,6 @@ class LocalShamsuSessionGateway:
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.session_manager = SessionManager(self.workspace)
-        self.runtime_store = RuntimeStateStore(self.workspace)
         self.approval_broker = approval_broker
         # A BLOCKING send that hands back Telegram's `message_id`. The live
         # turn card edits one message rather than sending twelve, and it
@@ -132,26 +134,17 @@ class LocalShamsuSessionGateway:
         session = self.switch_session(session_id)
         active = active_runs_for_session(session_id)
         if active:
+            # The plan/phase columns used to be read from the orchestrator's
+            # runtime task store. The small harness has no orchestrator and
+            # never wrote a row there, so every one of them resolved to the
+            # `else` branch below - what the live run itself reports is the
+            # only thing left that is true.
             run = active[-1]
-            task = self.runtime_store.load_task(f"task-{run.run_id}")
-            plan = self.runtime_store.load_task_plan(task.task_id) if task else None
-            active_step = (
-                next((step for step in plan.steps if step.status == PlanStepStatus.ACTIVE), None)
-                if plan
-                else None
-            )
-            completed = len([step for step in plan.steps if step.status == PlanStepStatus.COMPLETED]) if plan else 0
-            total = len(plan.steps) if plan else 0
             return TelegramRuntimeStatus(
                 session=session,
                 status=run.status.value,
-                task=task.user_request if task else run.last_message,
-                phase=task.current_phase if task else "",
-                plan_completed=completed,
-                plan_total=total,
-                current_step=active_step.title if active_step else "",
-                actions=task.action_count if task else run.iterations,
-                last_action=str((task.last_tool_call or {}).get("name") or "") if task else "",
+                task=run.last_message,
+                actions=run.iterations,
                 updated_at=run.updated_at,
                 run_id=run.run_id,
             )
@@ -284,61 +277,7 @@ class LocalShamsuSessionGateway:
                 session_logger=logger,
                 action_ledger=ledger,
             )
-            if simple_mode_enabled():
-                # Telegram resumes the LATEST session in the workspace, which is
-                # normally the one the desktop REPL is in. Running the legacy
-                # loop here therefore wrote ITS tool vocabulary -
-                # `project.inspect`, `file.read`, `code.search`, and a `test.run`
-                # denied by an AUTHOR phase contract - straight into a
-                # simple-mode transcript, where the model then imitated calls it
-                # could not make. Observed live 2026-08-18; the desktop side
-                # showed no turn for it, because Telegram writes no chat log.
-                final = self._run_simple(text, logger, tools, ledger, progress, metadata)
-            else:
-                from shamsu.runtime.turn_stream import TurnEvent, TurnStream
-
-                session_id = str(getattr(logger, "session_id", "") or "")
-                stream = TurnStream(self.workspace, session_id, persist=bool(session_id))
-                card = self._attach_turn_card(stream, text, metadata)
-                if card is not None:
-                    progress.live_card = True
-                self._attach_desktop_mirror(stream)
-                event_seq = 0
-
-                def publish(kind: str, body: str = "", **data: Any) -> None:
-                    nonlocal event_seq
-                    event_seq += 1
-                    stream.publish(
-                        TurnEvent(
-                            seq=event_seq,
-                            kind=kind,
-                            text=body,
-                            data=data,
-                            turn_id=ledger.run_id,
-                            session_id=session_id,
-                            workspace=str(self.workspace),
-                            source="telegram",
-                        )
-                    )
-
-                publish("turn.start", text, prompt=text)
-
-                loop = AgentChatLoop(
-                    self.workspace,
-                    session_logger=logger,
-                    tools=tools,
-                    action_ledger=ledger,
-                    run_id=ledger.run_id,
-                    original_user_request=text,
-                    progress=progress,
-                    on_activity=lambda message: publish("activity", str(message)),
-                    max_runtime_seconds=_telegram_task_timeout_seconds(self.approval_broker),
-                )
-                result: AgentLoopResult = asyncio.run(loop.run(text))
-                final = result.final
-                publish("assistant", final)
-                status = getattr(result.status, "value", None) or str(result.status or "done")
-                publish("turn.end", status, status=status)
+            final = self._run_simple(text, logger, tools, ledger, progress, metadata)
             ledger.record_final_response(final)
             finish_current_run(self.workspace, ledger)
             progress.done("SHAMSU finished the task.")
@@ -367,10 +306,6 @@ class LocalShamsuSessionGateway:
         render the same events, so the parity is a property of the design
         rather than of two lists that happen to agree.
         """
-        from shamsu.agents.chat_loop import _default_ollama_client
-        from shamsu.agents.simple_chat import SimpleChatLoop
-        from shamsu.llm.manager import OLLAMA_BASE_URL
-        from shamsu.runtime.timeouts import TimeoutConfig
         from shamsu.runtime.turn_stream import TurnStream
 
         session_id = str(getattr(logger, "session_id", "") or "")
@@ -385,7 +320,7 @@ class LocalShamsuSessionGateway:
 
         loop = SimpleChatLoop(
             self.workspace,
-            client=_default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig()),
+            client=default_ollama_client(timeout_config=TimeoutConfig.from_env()),
             tools=tools,
             session_logger=logger,
             action_ledger=ledger,
@@ -408,15 +343,6 @@ class LocalShamsuSessionGateway:
         # `old_string not found in src/main.js. The file was NOT changed`
         # failures that session were one turn patching a file the other had
         # moved underneath it.
-        from shamsu.runtime.run_control import (
-            RunStatus,
-            complete_run,
-            register_run,
-        )
-
-        # A ledger is the usual source of the id, but `_run_simple` is also
-        # called directly with none, and a turn with no ledger still has to be
-        # visible to the next message.
         run_id = str(getattr(ledger, "run_id", "") or "") or (
             f"turn-{session_id or 'session'}-{int(time.time() * 1000)}"
         )

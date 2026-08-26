@@ -16,7 +16,6 @@ from shamsu.skills.types import SelectedSkill, SkillCatalog, SkillPackage, Skill
 DEFAULT_MAX_SKILLS = 5
 DEFAULT_SKILL_BUDGET_TOKENS = 1800
 _CODING_INTENTS = {"code_edit", "bug_fix", "test_gen", "doc_gen", "generate"}
-_PRD_RE = re.compile(r"\b(prd|product requirements?|acceptance|build the complete project)\b", re.I)
 _REACT_RE = re.compile(r"\b(react|vite|tsx|jsx|frontend|spa|dashboard)\b", re.I)
 _UI_RE = re.compile(r"\b(ui|ux|design|responsive|mobile|browser|screen|layout|dashboard)\b", re.I)
 _SQLITE_RE = re.compile(r"\b(sqlite|database|persistence|persist|seed|migration|schema)\b", re.I)
@@ -59,8 +58,6 @@ def select_skills_for_task(
 
     if intent in _CODING_INTENTS or _looks_like_coding_request(text):
         _add(candidates, "developer", 100.0, "default for coding work")
-    if _PRD_RE.search(text):
-        _add(candidates, "prd-planner", 85.0, "PRD or acceptance evidence requested")
     if _REACT_RE.search(framework_text) or _workspace_has_any(
         workspace, ("package.json", "vite.config.ts")
     ):

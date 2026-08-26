@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 from rich.console import Console
 
-from shamsu.agents.chat_state import ChatState
+from shamsu.agents.simple_state import ChatState
 from shamsu.agents.simple_chat import SimpleChatLoop
 from shamsu.agents.simple_prompt import simple_system_prompt
 from shamsu.cli.turn_render import CliTurnRenderer

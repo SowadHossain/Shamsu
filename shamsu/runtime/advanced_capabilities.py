@@ -12,7 +12,6 @@ class AdvancedCapability(str, Enum):
     PACKAGE_INSTALLATION = "package_installation"
     DOCKER = "docker"
     DATABASES = "databases"
-    PRD_WORKFLOWS = "prd_workflows"
     LARGER_PROJECT_AUTONOMY = "larger_project_autonomy"
 
 
@@ -115,22 +114,9 @@ ADVANCED_CAPABILITY_CONTRACTS: dict[AdvancedCapability, AdvancedCapabilityContra
             r"\bmanage\.py\s+migrate\b",
         ),
     ),
-    AdvancedCapability.PRD_WORKFLOWS: AdvancedCapabilityContract(
-        capability=AdvancedCapability.PRD_WORKFLOWS,
-        order=5,
-        phase_rules=("PLAN owns PRD extraction, ambiguity surfacing, architecture proposals, and backlog shaping.",),
-        risk_policy="Planning-only until acceptance criteria and approvals are explicit.",
-        evidence_types=("requirements_extracted", "ambiguities_recorded", "acceptance_criteria_defined"),
-        verification_strategy=(
-            "Extract structured requirements.",
-            "Reject unverifiable milestones.",
-            "Tie backlog items to acceptance criteria.",
-        ),
-        task_evaluations=("prd_requirement_extraction", "prd_ambiguity_detection", "vertical_slice_quality"),
-    ),
     AdvancedCapability.LARGER_PROJECT_AUTONOMY: AdvancedCapabilityContract(
         capability=AdvancedCapability.LARGER_PROJECT_AUTONOMY,
-        order=6,
+        order=5,
         phase_rules=("All phases participate through bounded plan steps and checkpoints.",),
         risk_policy="Requires proven checkpoint/resume, repair, and verification performance.",
         evidence_types=("multi_step_verified", "checkpoint_recovered", "bounded_autonomy_verified"),

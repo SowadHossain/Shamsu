@@ -1,10 +1,8 @@
 """Local SQLite project memory - the authoritative SHAMSU memory store.
 
-Runtime state lives in ``shamsu.runtime.task_state`` and code intelligence lives
-under ``shamsu.artifacts``. This module stores durable project memory: facts,
-decisions, task history, failure lessons, constraints, environment notes,
-checkpoints, and evidence references. Graphiti can mirror this data, but it is
-not required for normal operation.
+Durable project memory: facts, decisions, task history, failure lessons,
+constraints, environment notes, checkpoints, and evidence references. Graphiti
+can mirror this data, but it is not required for normal operation.
 """
 from __future__ import annotations
 

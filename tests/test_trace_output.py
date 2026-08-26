@@ -753,7 +753,7 @@ def test_simple_mode_records_its_tools_and_model_calls(tmp_path: Path):
     import asyncio
 
     from shamsu.action_ledger.ledger import start_run
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
     from shamsu.agents.simple_chat import SimpleChatLoop
     from shamsu.agents.simple_prompt import simple_system_prompt
     from shamsu.tools.agent_tools import AgentToolRegistry
@@ -947,7 +947,7 @@ def test_a_self_executed_write_reaches_changed_files(tmp_path: Path):
 
     from shamsu.action_ledger import store
     from shamsu.action_ledger.ledger import start_run
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
     from shamsu.agents.simple_chat import SimpleChatLoop
     from shamsu.agents.simple_prompt import simple_system_prompt
     from shamsu.tools.agent_tools import AgentToolRegistry
@@ -1011,7 +1011,7 @@ def test_a_registry_write_is_not_journalled_twice(tmp_path: Path):
 
     from shamsu.action_ledger import store
     from shamsu.action_ledger.ledger import start_run
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
     from shamsu.agents.simple_chat import SimpleChatLoop
     from shamsu.agents.simple_prompt import simple_system_prompt
     from shamsu.tools.agent_tools import AgentToolRegistry
@@ -1068,7 +1068,7 @@ def _turn_with(tmp_path: Path, prompt: str, reply, thinking: str = ""):
     import asyncio
 
     from shamsu.action_ledger.ledger import start_run
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
     from shamsu.agents.simple_chat import SimpleChatLoop
     from shamsu.agents.simple_prompt import simple_system_prompt
     from shamsu.tools.agent_tools import AgentToolRegistry

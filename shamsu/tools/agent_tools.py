@@ -61,7 +61,6 @@ from shamsu.tools.policy import (
     phase_allowed_tools,
 )
 from shamsu.runtime.advanced_capabilities import AdvancedCapability, normalize_advanced_capabilities
-from shamsu.runtime.task_state import current_task_context
 from shamsu.safety.approval import ask_approval
 from shamsu.safety.approval_manager import ApprovalManager
 from shamsu.safety.commands import command_may_write_workspace, redact
@@ -459,20 +458,20 @@ class AgentToolRegistry:
         self._task_risk = "medium"
 
     def _effective_phase(self) -> ExecutionPhase:
+        """The phase this registry is gating on.
+
+        It used to fall back to a phase read out of the orchestrator's runtime
+        task store. That orchestrator is gone, and its context variable was
+        never set by anything else, so the fallback could only ever return
+        AUTHOR - it is now stated directly instead of computed through a store
+        that is always empty.
+        """
         if self._current_phase is not None:
             return self._current_phase
-        context = current_task_context()
-        if context is not None:
-            try:
-                state = context.store.load_task(context.task_id)
-                if state is not None:
-                    return normalize_phase(state.current_phase)
-            except Exception:
-                pass
         return ExecutionPhase.AUTHOR
 
     def _phase_context_active(self) -> bool:
-        return self._current_phase is not None or current_task_context() is not None
+        return self._current_phase is not None
 
     def _tool_is_allowed(self, name: str) -> bool:
         allowed = self._allowed_tool_names
@@ -1804,9 +1803,9 @@ class AgentToolRegistry:
             if candidates:
                 message += f" Candidates: {_format_path_candidates(candidates)}"
             return ToolResult(False, message, {"filepath": normalized, "candidates": candidates})
-        from shamsu.prd.input import parse_prd_file
+        from shamsu.retriever.documents import extract_document_text
 
-        content = parse_prd_file(target).raw_text
+        content = extract_document_text(target)
         if len(content) > MAX_READ_CHARS:
             content = f"{content[:MAX_READ_CHARS]}\n... [truncated {len(content) - MAX_READ_CHARS} chars]"
         return ToolResult(
@@ -3537,12 +3536,9 @@ class AgentToolRegistry:
             data["outcome_classification"] = "environment_condition"
             data["actionable"] = False
 
-        # DiagnosticDigest already parsed this command's output into a compact
-        # ErrorPacket (see CommandRunner._run_diagnostics) - surface that to
-        # the model on failure instead of leaving it unread on the command
-        # runner, per pipeline.md: "parse errors before giving logs to model."
-        if code != 0 and self.command_runner.last_error_packet is not None:
-            data["diagnostics"] = self.command_runner.last_error_packet.to_model_context()
+        error_packet = getattr(self.command_runner, "last_error_packet", None)
+        if code != 0 and error_packet is not None:
+            data["diagnostics"] = error_packet.to_model_context()
 
         return ToolResult(code == 0, f"Command exited with {code}.", data)
 

@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from shamsu.agents.chat_loop import AgentChatLoop
-from shamsu.agents.chat_state import ChatMessage
+from shamsu.agents.simple_state import ChatMessage
 from shamsu.context.budget import RESERVE_OUTPUT_TOKENS, SAFETY_MARGIN_TOKENS, count_tokens
 from shamsu.tools.agent_tools import AgentToolRegistry
 

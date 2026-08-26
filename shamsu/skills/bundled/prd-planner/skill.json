@@ -1,8 +1,0 @@
-{
-  "version": "0.1.0",
-  "tags": ["prd", "requirements", "acceptance", "milestones"],
-  "triggers": ["prd", "acceptance", "requirements", "build the complete project"],
-  "applies_to": ["generate", "code_edit"],
-  "dependencies": ["developer"],
-  "context_budget_tokens": 1000
-}

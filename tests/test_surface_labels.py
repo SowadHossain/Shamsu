@@ -246,7 +246,7 @@ def test_the_chat_loop_stamps_its_surface_onto_the_transcript(
     tmp_path: Path, surface: str
 ) -> None:
     """The value the turn stream already carries, now also on the message."""
-    from shamsu.agents.chat_state import ChatState
+    from shamsu.agents.simple_state import ChatState
     from shamsu.session.manager import SessionManager
 
     project = workspace(tmp_path)

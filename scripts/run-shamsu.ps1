@@ -61,9 +61,9 @@ antivirus is quarantining files under $RepoRoot\.venv.
     & $VenvPython -m shamsu.runtime.ollama status
 
     if ($PipedInput.Count -gt 0) {
-        $PipedInput -join [Environment]::NewLine | & $VenvPython -m shamsu.cli.repl --workspace $ResolvedWorkspace @ShamsuArgs
+        $PipedInput -join [Environment]::NewLine | & $VenvPython -m shamsu.cli.app --workspace $ResolvedWorkspace @ShamsuArgs
     }
     else {
-        & $VenvPython -m shamsu.cli.repl --workspace $ResolvedWorkspace @ShamsuArgs
+        & $VenvPython -m shamsu.cli.app --workspace $ResolvedWorkspace @ShamsuArgs
     }
 }

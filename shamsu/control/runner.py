@@ -214,9 +214,8 @@ class QueuedRunner:
             return
 
     def _run_one(self, workspace: Path, session_id: str, item: QueuedPrompt) -> str:
-        from shamsu.agents.chat_loop import _default_ollama_client
         from shamsu.agents.simple_chat import SimpleChatLoop, build_simple_tools
-        from shamsu.llm.manager import OLLAMA_BASE_URL
+        from shamsu.llm.ollama_client import default_ollama_client
         from shamsu.runtime.timeouts import TimeoutConfig
         from shamsu.runtime.turn_stream import TurnStream
         from shamsu.session.manager import SessionManager
@@ -237,7 +236,7 @@ class QueuedRunner:
         )
         loop = SimpleChatLoop(
             workspace,
-            client=_default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig()),
+            client=default_ollama_client(timeout_config=TimeoutConfig.from_env()),
             tools=tools,
             session_logger=logger,
             emit=stream.publish,

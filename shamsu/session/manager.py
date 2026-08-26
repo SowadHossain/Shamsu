@@ -1447,7 +1447,6 @@ def _build_summary_markdown(logger: "SessionLogger", events: list[dict[str, Any]
     files_changed: list[str] = []
     commands: list[str] = []
     workflows: list[str] = []
-    prd_build_state = _prd_build_state_from_linked_runs(logger, events)
     last_assistant = ""
     for event in events:
         event_type = event.get("event_type", "")
@@ -1504,9 +1503,6 @@ def _build_summary_markdown(logger: "SessionLogger", events: list[dict[str, Any]
         "## Recent workflows",
         *bullets(workflows[-5:]),
         "",
-        "## PRD build state",
-        *(prd_build_state or ["- none recorded"]),
-        "",
         "## Files changed",
         *bullets(files_changed[-15:]),
         "",
@@ -1524,97 +1520,6 @@ def _build_summary_markdown(logger: "SessionLogger", events: list[dict[str, Any]
         "",
     ]
     return "\n".join(lines)
-
-
-def _prd_build_state_from_linked_runs(
-    logger: "SessionLogger", events: list[dict[str, Any]], *, limit: int = 12
-) -> list[str]:
-    """Summarize durable PRD milestone facts from linked ActionLedger runs.
-
-    PRD milestone execution deliberately writes its detailed state to the run
-    ledger and disables chat-history hydration for focused subturns. Session
-    compaction therefore needs to follow the `run.linked` pointer, or a resumed
-    session only remembers generic workflow prose while the actual milestone
-    checkpoint state sits unused under `.shamsu/runs`.
-    """
-    run_ids = [
-        str((event.get("payload") or {}).get("run_id") or "").strip()
-        for event in events
-        if event.get("event_type") == "run.linked"
-    ]
-    lines: list[str] = []
-    seen: set[str] = set()
-    for run_id in reversed(run_ids):
-        if not run_id or run_id in seen:
-            continue
-        seen.add(run_id)
-        run_lines = _prd_build_state_for_run(logger.manager.workspace, run_id, limit=limit)
-        if run_lines:
-            lines.extend(run_lines)
-        if len(lines) >= limit:
-            break
-    return lines[:limit]
-
-
-def _prd_build_state_for_run(workspace: Path, run_id: str, *, limit: int) -> list[str]:
-    events_path = workspace / ".shamsu" / "runs" / run_id / ".evidence" / "events.jsonl"
-    if not events_path.exists():
-        return []
-    try:
-        records = [
-            json.loads(line)
-            for line in events_path.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-    except (OSError, json.JSONDecodeError):
-        return []
-
-    lines: list[str] = []
-    for event in records:
-        event_type = str(event.get("type") or "")
-        if event_type == "prd_milestone_graph_compiled":
-            milestones = event.get("milestones") or "?"
-            execution_dir = str(event.get("execution_dir") or "")
-            detail = f" at `{execution_dir}`" if execution_dir else ""
-            lines.append(f"- PRD run `{run_id}` compiled {milestones} milestone(s){detail}.")
-        elif event_type == "prd_model_preflight_finished":
-            milestone = str(event.get("milestone_id") or "?")
-            source = str(event.get("source") or "deterministic")
-            accepted = "accepted" if event.get("accepted") else "fallback"
-            files = _compact_list(event.get("expected_files") or [], 4)
-            suffix = f"; targets {files}" if files else ""
-            lines.append(f"- {milestone}: planner preflight {accepted} from {source}{suffix}.")
-        elif event_type == "prd_milestone_checkpointed":
-            milestone = str(event.get("milestone_id") or "?")
-            status = str(event.get("status") or "?")
-            verification = str(event.get("verification_status") or "?")
-            changed = _compact_list(event.get("changed_files") or [], 5)
-            suffix = f"; changed {changed}" if changed else ""
-            lines.append(f"- {milestone}: checkpoint {status}, verifier {verification}{suffix}.")
-        elif event_type.startswith("prd_milestone_verification_"):
-            milestone = str(event.get("milestone_id") or "?")
-            status = event_type.removeprefix("prd_milestone_verification_")
-            summary = _clip(str(event.get("summary") or ""), 180)
-            command = str(event.get("command") or "").strip()
-            detail = summary or command
-            lines.append(f"- {milestone}: verifier {status}: {detail or 'no summary'}")
-        elif event_type == "prd_milestone_repair_finished":
-            milestone = str(event.get("milestone_id") or "?")
-            status = str(event.get("status") or "?")
-            lines.append(f"- {milestone}: repair finished with {status}.")
-    return lines[-limit:]
-
-
-def _compact_list(values: Any, limit: int) -> str:
-    if not isinstance(values, list):
-        return ""
-    items = [str(value) for value in values if str(value).strip()]
-    if not items:
-        return ""
-    shown = ", ".join(f"`{item}`" for item in items[:limit])
-    if len(items) > limit:
-        shown += f", +{len(items) - limit} more"
-    return shown
 
 
 def _search_one_session(logger: "SessionLogger", needle: str) -> list[dict[str, Any]]:

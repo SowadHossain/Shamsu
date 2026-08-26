@@ -42,9 +42,13 @@ def mentioned_workspace_files(workspace_root: Path, text: str, limit: int = 5) -
         if rel is None:
             base = token.rsplit("/", 1)[-1].lower()
             if walker_files is None:
-                from shamsu.indexer.walker import FileWalker
+                # `indexer.walker.FileWalker` used to wrap this one call and
+                # nothing else, so the wrapper went and the call stayed.
+                from shamsu.indexer.policy import walk_workspace_files
                 try:
-                    walker_files = FileWalker(workspace_root).discover()
+                    walker_files = walk_workspace_files(
+                        workspace_root.resolve(), indexable_only=True
+                    )
                 except Exception:
                     walker_files = []
             for match in walker_files:

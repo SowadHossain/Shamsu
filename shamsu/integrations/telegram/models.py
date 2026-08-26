@@ -175,16 +175,18 @@ class TelegramSessionSummary:
 
 @dataclass(frozen=True)
 class TelegramRuntimeStatus:
+    """What /status can honestly say about a run.
+
+    The phase / plan-step / last-action fields were dropped with the
+    orchestrator that produced them: nothing in the small harness ever filled
+    them, so the card showed a hard-coded row of dashes and called it status.
+    """
+
     session: TelegramSessionSummary | None
     status: str = "idle"
     task: str = ""
-    phase: str = ""
-    plan_completed: int = 0
-    plan_total: int = 0
-    current_step: str = ""
     actions: int = 0
     max_actions: int = 4
-    last_action: str = ""
     updated_at: str = ""
     run_id: str = ""
 

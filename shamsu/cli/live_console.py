@@ -96,14 +96,19 @@ MAX_PATH_CHARS = 22
 #:
 #: The dispatcher is read-only on purpose. Anything that mutates session state,
 #: starts work, or changes the mode is unsafe to run underneath a turn that is
-#: itself reading and writing that state - `/compact clear` mid-turn would
-#: rewrite the history the model is being sent on the next round.
+#: itself reading and writing that state.
 #:
-#: Kept deliberately small. Each entry is a command the mid-turn dispatcher can
-#: actually call - not a command that merely looks harmless - because a name on
-#: this list that has no handler behind it is a promise the prompt cannot keep.
-#: Adding one means wiring its handler in `_midturn_command` and nothing else.
-MIDTURN_COMMANDS: frozenset[str] = frozenset({"/context", "/queue", "/help"})
+#: This used to be a hand-written set here, which made it a SECOND source of
+#: truth next to the command handlers - a name on the list with no handler
+#: behind it is a promise the prompt cannot keep. It is now derived from the
+#: one registry, so `midturn=True` on a Command is the whole declaration.
+def midturn_commands() -> frozenset[str]:
+    """Command words safe to run while a turn is in flight, aliases included."""
+    from shamsu.cli.commands import registry
+
+    return frozenset(
+        name for name, command in registry().items() if command.midturn
+    )
 
 #: The rungs of the toolbar's degradation ladder, cheapest information first.
 #: See `TurnTelemetry._render_meters` for why the row narrows from the LEFT.
@@ -163,7 +168,7 @@ def route_input(text: str, *, midturn: bool) -> tuple[str, str]:
     if not midturn:
         return (ROUTE_COMMAND, line)
     head = line.split()[0].lower()
-    if head in MIDTURN_COMMANDS:
+    if head in midturn_commands():
         return (ROUTE_COMMAND, line)
     return (ROUTE_DEFERRED, line)
 
