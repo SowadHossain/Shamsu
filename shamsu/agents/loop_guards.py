@@ -75,6 +75,22 @@ READ_LOOP_EXHAUSTED = "read_loop_exhausted"
 # Tools that only LOOK. A call to any of these advances the streak; anything
 # else - a write, a command, a memory note - ends it, because the model has
 # produced something.
+#: Tools that are neither a read nor production - the model talking to its own
+#: bookkeeping. They must not reset the read streak, and that omission is what
+#: let the guard sleep through the failure it exists for.
+#:
+#: Live 2026-08-24, the snake-game run: 21 `read_file` calls interleaved with 10
+#: `contract_assert_pass`, and the call site counted "a tool that is not a read"
+#: as production. Every assertion the model marked passed reset the streak to
+#: zero, so `READS_BEFORE_INSISTING = 8` was never once reached across two turns
+#: that each burned the full 24 rounds. Marking your own homework is not work.
+BOOKKEEPING_TOOLS = frozenset(
+    {
+        "contract_create", "contract_status", "contract_from_plan",
+        "contract_assert_pass", "contract_assert_fail", "contract_assert_skip",
+    }
+)
+
 LOOKING_TOOLS = frozenset(
     {
         "read_file", "read_symbol", "list_files", "find_files", "search_files",
@@ -161,7 +177,16 @@ class ReadLoopDetector:
         if not looked:
             # Something that was not a read. Whatever it was, it was not this
             # fault, and the streak is about CONSECUTIVE looking.
-            if tool_names:
+            #
+            # Unless it produced nothing either. `produced_something` is already
+            # False here, so a round of pure bookkeeping - a `contract_assert_pass`
+            # between two reads - is neither looking nor work, and zeroing the
+            # streak on it hands the model a way to read for ever: read, mark an
+            # assertion passed, read, mark another. That is the shape of the
+            # 2026-08-24 run, ten assertions deep, and this reset is the second
+            # half of why the guard stayed silent through it. Leaving the streak
+            # untouched means such a round neither advances nor forgives.
+            if tool_names and not set(tool_names) <= BOOKKEEPING_TOOLS:
                 self.streak = 0
             return None
         self.streak += len(looked)

@@ -108,12 +108,34 @@ class WiringDiagnostic:
 
 
 @dataclass(frozen=True)
+class _AssetRef:
+    """A file one document points at: `<script src>`, `<link href>`, `<img src>`."""
+
+    file: str
+    line: int
+    target: str
+    attribute: str
+
+
+@dataclass(frozen=True)
+class _Symbol:
+    """A top-level JavaScript declaration, and where it was declared."""
+
+    file: str
+    line: int
+    name: str
+    keyword: str
+
+
+@dataclass(frozen=True)
 class WiringResult:
     diagnostics: tuple[WiringDiagnostic, ...] = ()
     frontend_calls: int = 0
     backend_routes: int = 0
     schema_tables: int = 0
     query_tables: int = 0
+    asset_refs: int = 0
+    js_symbols: int = 0
 
     @property
     def ok(self) -> bool:
@@ -126,6 +148,8 @@ class WiringResult:
             or self.backend_routes
             or self.schema_tables
             or self.query_tables
+            or self.asset_refs
+            or self.js_symbols
         )
 
     def stderr(self) -> str:
@@ -154,6 +178,10 @@ def verify_wiring(project_root: Path | str) -> WiringResult:
     backend_routes: list[_RouteUse] = []
     schema_tables: set[str] = set()
     query_tables: list[_TableUse] = []
+    asset_refs: list[_AssetRef] = []
+    js_symbols: list[_Symbol] = []
+    js_calls: list[_Symbol] = []
+    js_bound: set[str] = set()
 
     for path in sources:
         relative = path.relative_to(root).as_posix()
@@ -165,6 +193,16 @@ def verify_wiring(project_root: Path | str) -> WiringResult:
         backend_routes.extend(_backend_routes(relative, text))
         schema_tables.update(_declared_tables(text))
         query_tables.extend(_query_tables(relative, text))
+        if path.suffix.lower() in {".html", ".htm"}:
+            asset_refs.extend(_asset_refs(relative, text))
+        elif path.suffix.lower() == ".js":
+            js_symbols.extend(_js_symbols(relative, text))
+            js_calls.extend(_js_calls(relative, text))
+            # Bound names pool across the WHOLE project, because plain scripts
+            # share one scope and a helper defined in one file is callable from
+            # every other. Scoping this per file would report each module's use
+            # of its neighbours' functions as undefined.
+            js_bound |= _js_bound_names(text)
 
     diagnostics: list[WiringDiagnostic] = []
     if frontend_calls and _has_backend_surface(sources, root, backend_routes):
@@ -206,18 +244,318 @@ def verify_wiring(project_root: Path | str) -> WiringResult:
                 )
             )
 
+    for asset in asset_refs:
+        if _asset_exists(root, asset.file, asset.target):
+            continue
+        diagnostics.append(
+            WiringDiagnostic(
+                file=asset.file,
+                line=asset.line,
+                kind="missing_asset",
+                message=(
+                    f"{asset.attribute}={asset.target!r} does not resolve to a file "
+                    "in this project; the browser will 404 on it"
+                ),
+            )
+        )
+
+    diagnostics.extend(_redeclarations(js_symbols))
+    diagnostics.extend(_undefined_helpers(js_calls, js_bound))
+
     return WiringResult(
         diagnostics=tuple(_dedupe_diagnostics(diagnostics)),
         frontend_calls=len(frontend_calls),
         backend_routes=len(backend_routes),
         schema_tables=len(schema_tables),
         query_tables=len(query_tables),
+        asset_refs=len(asset_refs),
+        js_symbols=len(js_symbols),
     )
 
 
 def has_wiring_surface(project_root: Path | str) -> bool:
     return verify_wiring(project_root).has_surface
 
+
+# -- assets a document points at -------------------------------------------
+#
+# The cheapest check in this file and the one that would have saved the whole
+# 2026-08-24 snake-game run. `index.html` was written at 19:45:43 with
+# `<script src="game.js">`; `js/game.js` was created at 20:02:59, seventeen
+# minutes later. Nothing ever re-checked the path, so the page 404'd on its
+# only script tag and not one line of the project's 1,800 lines ever ran - and
+# the contract still reported seven of nine assertions passed.
+
+_ASSET_REF = re.compile(
+    r"(?is)<(?:script|link|img|source|iframe|audio|video)\b[^>]*?"
+    r"\b(src|href)\s*=\s*[\"']([^\"'>]+)"
+)
+
+#: Targets no filesystem check can settle. A URL belongs to a server, a data:
+#: URI carries its own bytes, and a bare fragment is this document.
+_NOT_A_LOCAL_FILE = re.compile(
+    r"(?i)^(?:[a-z][a-z0-9+.-]*:|//|#|\{|\$\{)"
+)
+
+
+def _asset_refs(file: str, text: str) -> list[_AssetRef]:
+    found: list[_AssetRef] = []
+    for match in _ASSET_REF.finditer(text):
+        target = match.group(2).strip()
+        if not target or _NOT_A_LOCAL_FILE.match(target):
+            continue
+        found.append(
+            _AssetRef(
+                file=file,
+                line=_line_number(text, match.start()),
+                target=target.split("?")[0].split("#")[0],
+                attribute=match.group(1).lower(),
+            )
+        )
+    return found
+
+
+def _asset_exists(root: Path, document: str, target: str) -> bool:
+    """Resolve *target* the way a browser would, relative to *document*."""
+    if target.startswith("/"):
+        candidate = root / target.lstrip("/")
+    else:
+        candidate = (root / document).parent / target
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return resolved.exists()
+
+
+# -- one JavaScript name, declared twice ------------------------------------
+#
+# Eight modules loaded as plain <script> share ONE global scope, so the same
+# `const` in two of them is not a style problem: it is
+# `SyntaxError: Identifier 'GameState' has already been declared`, and the
+# second file does not run at all. Every file passed `node --check` on its own,
+# which is exactly why nothing caught it - the defect only exists in the
+# combination.
+
+_JS_TOP_LEVEL = re.compile(
+    r"(?m)^(?:export\s+)?(const|let|var|function|class)\s+"
+    r"([A-Za-z_$][A-Za-z0-9_$]*)"
+)
+
+#: A module system gives every file its own scope, so nothing below applies.
+_IS_MODULE = re.compile(
+    r"(?m)^\s*(?:import\s|export\s|export\{)"
+)
+
+
+def _js_symbols(file: str, text: str) -> list[_Symbol]:
+    if _IS_MODULE.search(text):
+        return []
+    return [
+        _Symbol(
+            file=file,
+            line=_line_number(text, match.start()),
+            name=match.group(2),
+            keyword=match.group(1),
+        )
+        for match in _JS_TOP_LEVEL.finditer(text)
+    ]
+
+
+#: Only these collide fatally. Two `function`s with one name is legal - the
+#: second silently wins - and calling that an error would fire on every project
+#: with a `main()` in two files. `const`, `let` and `class` throw.
+_FATAL_REDECLARATION = frozenset({"const", "let", "class"})
+
+
+def _redeclarations(symbols: list[_Symbol]) -> list[WiringDiagnostic]:
+    by_name: dict[str, list[_Symbol]] = {}
+    for symbol in symbols:
+        by_name.setdefault(symbol.name, []).append(symbol)
+
+    diagnostics: list[WiringDiagnostic] = []
+    for name, uses in by_name.items():
+        files = sorted({use.file for use in uses})
+        if len(files) < 2:
+            continue
+        fatal = [use for use in uses if use.keyword in _FATAL_REDECLARATION]
+        if not fatal:
+            continue
+        latest = max(fatal, key=lambda use: (use.file, use.line))
+        others = ", ".join(f for f in files if f != latest.file)
+        diagnostics.append(
+            WiringDiagnostic(
+                file=latest.file,
+                line=latest.line,
+                kind="js_redeclaration",
+                message=(
+                    f"{latest.keyword} {name!r} is also declared in {others}; loaded "
+                    "together as plain scripts they share one scope, and the second "
+                    "file will not run at all"
+                ),
+            )
+        )
+    return diagnostics
+
+
+
+#: Comments and string bodies, blanked before anything reads the code.
+#:
+#: Without this the call scanner reported `body()` from the line
+#: `// Check collision with body (skip first few segments...)`. A gate that
+#: cries wolf on prose is a gate people learn to ignore, which is worse than
+#: no gate. Newlines survive so every line number stays true.
+_JS_NOISE = re.compile(
+    r"(?s)/\*.*?\*/|//[^\n]*"
+    
+)
+_JS_LITERAL = re.compile(
+    r"'(?:\\.|[^\\'\n])*'|\"(?:\\.|[^\\\"\n])*\"|`(?:\\.|[^\\`])*`"
+)
+
+
+def _strip_js_noise(text: str) -> str:
+    """Blank comments and string bodies, keeping every newline in place."""
+
+    def blank(match: re.Match[str]) -> str:
+        return re.sub(r"[^\n]", " ", match.group(0))
+
+    return _JS_LITERAL.sub(blank, _JS_NOISE.sub(blank, text))
+
+# -- a helper every file calls and no file defines --------------------------
+#
+# `playSound` was called eleven times across five modules of the 2026-08-24
+# snake game and defined in none of them - the sound manager exports
+# `SoundManager.play`. Every file passed `node --check`, because a call to an
+# undefined name is valid JavaScript right up until it runs. The contract
+# asserted the opposite in prose: "Has playSound() function (line 48)". There
+# is no such function at line 48 or anywhere else in the project.
+#
+# Reported only when the name is called from TWO OR MORE files. A callback
+# parameter, a local closure, a name bound in some way no regex here models -
+# all of those live in one file, and one file is where the false positives
+# are. A helper that three modules call is a helper somebody forgot to write.
+
+_JS_CALL = re.compile(
+    r"(?<![.\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
+)
+
+#: Everything a name can be bound by, so a local is never mistaken for a gap.
+_JS_BINDING = re.compile(
+    r"(?:(?:const|let|var|function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*))"
+    r"|(?:function\s*\*\s*[A-Za-z0-9_$]*\s*\(([^)]*)\))"
+    r"|(?:\(([^()]*)\)\s*=>)"
+    r"|(?:([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^()]*)\)\s*\{)"
+    r"|(?:catch\s*\(\s*([A-Za-z_$][A-Za-z0-9_$]*))"
+)
+
+#: Called like a function, but not a function anybody writes.
+_JS_KEYWORDS = frozenset(
+    {
+        "if", "for", "while", "switch", "catch", "return", "typeof", "function",
+        "new", "delete", "void", "in", "of", "do", "else", "case", "throw",
+        "await", "yield", "super", "this", "class", "const", "let", "var",
+    }
+)
+
+#: The standard library and the browser. Not exhaustive, and it does not need
+#: to be - anything missed is still filtered by the two-file rule.
+_JS_GLOBALS = frozenset(
+    {
+        "Array", "Boolean", "Date", "Error", "Function", "JSON", "Map", "Math",
+        "Number", "Object", "Promise", "Proxy", "RegExp", "Set", "String",
+        "Symbol", "WeakMap", "WeakSet", "BigInt", "Intl", "Reflect",
+        "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent",
+        "decodeURIComponent", "encodeURI", "decodeURI", "structuredClone",
+        "setTimeout", "setInterval", "clearTimeout", "clearInterval",
+        "queueMicrotask", "requestAnimationFrame", "cancelAnimationFrame",
+        "fetch", "alert", "confirm", "prompt", "console", "document", "window",
+        "navigator", "localStorage", "sessionStorage", "location", "history",
+        "screen", "AudioContext", "webkitAudioContext", "Audio", "Image",
+        "Worker", "Blob", "File", "FileReader", "FormData", "Headers",
+        "Request", "Response", "URL", "URLSearchParams", "AbortController",
+        "Event", "CustomEvent", "EventTarget", "MutationObserver",
+        "IntersectionObserver", "ResizeObserver", "CanvasRenderingContext2D",
+        "Path2D", "DOMParser", "TextEncoder", "TextDecoder", "atob", "btoa",
+        "escape", "unescape", "require", "import", "process", "Buffer",
+        "module", "exports", "describe", "it", "test", "expect",
+        "beforeEach", "afterEach",
+        "Float32Array", "Float64Array", "Int8Array", "Int16Array", "Int32Array",
+        "Uint8Array", "Uint8ClampedArray", "Uint16Array", "Uint32Array",
+        "BigInt64Array", "BigUint64Array", "ArrayBuffer", "DataView",
+    }
+)
+
+
+def _js_bound_names(text: str) -> set[str]:
+    """Every identifier this file binds, however it binds it."""
+    text = _strip_js_noise(text)
+    names: set[str] = set()
+    for match in _JS_BINDING.finditer(text):
+        for group in match.groups():
+            if not group:
+                continue
+            for part in group.split(","):
+                # Strips defaults, rest and destructuring down to the name.
+                cleaned = part.split("=")[0].strip().lstrip(".").strip("{} []")
+                if cleaned and cleaned.isidentifier():
+                    names.add(cleaned)
+    return names
+
+
+#: `new Something(...)`. Skipped, and the reason is that the globals list can
+#: never be finished. `Float32Array` was missing from it and the check reported
+#: a browser builtin as a helper nobody wrote - on `demo-3/asteroid`, where the
+#: real defects are elsewhere. A constructor is either a platform global or a
+#: `class` this project declares, and `_JS_BINDING` already catches the second;
+#: what remains is a list nobody can keep complete, so it is not guessed at.
+_PRECEDED_BY_NEW = re.compile(r"(?:^|[^A-Za-z0-9_$])new\s+$")
+
+
+def _js_calls(file: str, text: str) -> list[_Symbol]:
+    """Bare calls - `foo()`, never `obj.foo()`, which is a different claim."""
+    text = _strip_js_noise(text)
+    return [
+        _Symbol(
+            file=file,
+            line=_line_number(text, match.start(1)),
+            name=match.group(1),
+            keyword="call",
+        )
+        for match in _JS_CALL.finditer(text)
+        if match.group(1) not in _JS_KEYWORDS
+        and not _PRECEDED_BY_NEW.search(text[: match.start(1)])
+    ]
+
+
+def _undefined_helpers(
+    calls: list[_Symbol], bound: set[str]
+) -> list[WiringDiagnostic]:
+    by_name: dict[str, list[_Symbol]] = {}
+    for call in calls:
+        if call.name in bound or call.name in _JS_GLOBALS:
+            continue
+        by_name.setdefault(call.name, []).append(call)
+
+    diagnostics: list[WiringDiagnostic] = []
+    for name, uses in sorted(by_name.items()):
+        files = sorted({use.file for use in uses})
+        if len(files) < 2:
+            continue
+        first = min(uses, key=lambda use: (use.file, use.line))
+        diagnostics.append(
+            WiringDiagnostic(
+                file=first.file,
+                line=first.line,
+                kind="undefined_helper",
+                message=(
+                    f"{name}() is called from {len(files)} files "
+                    f"({len(uses)} times) and defined in none of them"
+                ),
+            )
+        )
+    return diagnostics
 
 def _source_files(root: Path) -> list[Path]:
     result: list[Path] = []

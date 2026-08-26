@@ -514,7 +514,14 @@ def test_freeform_hardens_vite_react_project_before_verify(tmp_path: Path, monke
     assert hardened["skill"] == "react-vite"
     assert hardened["hook"] == "vite-react-contract-foundation"
     verification_events = [event for event in events if event["type"] == "verification_step"]
+    # `wiring` leads since 2026-08-25. A project with HTML asset references or
+    # top-level JS symbols now HAS a wiring surface, where before only fetch
+    # calls and SQL counted - so the cross-file checks (a `<script src>` that
+    # resolves, one `const` in two scripts, a helper called from several files
+    # and defined in none) reach a frontend build that has no backend at all.
+    # It runs first because it is static: no install, no build, no cost.
     assert [event["stage"] for event in verification_events] == [
+        "wiring",
         "setup",
         "build",
         "seed",

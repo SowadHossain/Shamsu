@@ -47,6 +47,7 @@ __all__ = [
     "clear_contract",
     "looks_like_a_done_claim",
     "claims_runtime_behaviour",
+    "write_can_discharge",
     "load_phase_contract",
     "phase_contracts",
 ]
@@ -591,6 +592,63 @@ _RUNTIME_CLAIM = re.compile(
 )
 
 
+#: The other half, and the one that decides the DEFAULT.
+#:
+#: A write proves exactly one kind of claim: that some text is now on disk.
+#: "The README documents the build steps", "every module has a licence header",
+#: "the config lists all five levels" - those are about the artifact, and
+#: reading the artifact settles them. Anything else is about behaviour.
+_ARTIFACT_CLAIM = re.compile(
+    r"(?ix)"
+    r"\b(?:"
+    r"file\s+exists?|exists?\s+(?:at|in|on\s+disk)|is\s+created|are\s+created"
+    r"|readme|licen[cs]e|changelog|docstring|doc\s?string|documented|documents?"
+    r"|comment(?:s|ed)?|annotat(?:ed|ion)|type\s+hints?|spelling|wording"
+    r"|naming\s+convention|directory\s+structure|folder\s+structure"
+    r"|file\s+(?:layout|tree|structure)|is\s+listed\s+in|declared\s+in"
+    r"|(?:\S+\.[a-z0-9]+|the\s+file|it)\s+r?(?:lists?|defines?|exports?|imports?|contains?|includes?|declares?|has|sets?)\b"
+    r")\b"
+)
+
+
+#: Where one promise stops and the next begins. Only the joins that really do
+#: introduce a SECOND claim - a comma does not, or "easy, medium, hard" would
+#: be three assertions.
+_CLAUSE_SPLIT = re.compile(r"(?i)(?:;|\band\b|\bthen\b|\bplus\b)")
+
+
+def write_can_discharge(text: str) -> bool:
+    """Could a file write HONESTLY settle this assertion? Almost never.
+
+    The old question was the opposite one - "does this text prove a runtime
+    claim?" - answered by a vocabulary of verbs. It failed the way every
+    vocabulary gate here has failed: on text that carries no verb at all.
+
+    Live 2026-08-24, the snake-game contract. Nine assertions, and the verb
+    list matched two. These seven passed on `verified_by: write`:
+
+        CSS styling for 3D visual effects and UI
+        JavaScript game engine with snake movement logic
+        Multiple difficulty levels (easy, medium, hard)
+        Menu system with start, settings, and quit options
+        Sound effects for game events (eat, die, level up)
+        Score tracking and level progression system
+        Collision detection for walls and self
+
+    Every one of them is a claim about behaviour written as a noun phrase, and
+    every one of them was false: the page never loaded at all, because
+    `index.html` pointed at `game.js` while the file was at `js/game.js`. The
+    contract's own evidence for the sound assertion cited a `playSound()`
+    function that does not exist anywhere in the project.
+
+    So the default is inverted. A write discharges an assertion only when the
+    assertion is ABOUT the artifact; everything else needs something run. The
+    escape is unchanged and is deliberately loud - `contract_assert_skip` with
+    a reason, reported to the user as unverified.
+    """
+    return bool(_ARTIFACT_CLAIM.search(text or ""))
+
+
 def claims_runtime_behaviour(text: str) -> bool:
     """Does this assertion describe what happens when the code RUNS?
 
@@ -598,5 +656,21 @@ def claims_runtime_behaviour(text: str) -> bool:
     distinction the contract exists to draw is between "the file now says the
     collision detection is there" and "the collision detection works", and this
     is the half that says which one an assertion is asking about.
+
+    Defaults to True. An assertion nobody can classify is treated as a claim
+    about behaviour, because that is the reading that costs a run rather than
+    the reading that ships a broken build under a green tick. `_RUNTIME_CLAIM`
+    survives as the strong signal - it still overrides an artifact word that
+    happens to appear in a sentence about behaviour.
     """
-    return bool(_RUNTIME_CLAIM.search(text or ""))
+    text = text or ""
+    if _RUNTIME_CLAIM.search(text):
+        return True
+    # A compound promise is only as verified as its weakest half. "package.json
+    # lists three.js and the app loads" is two claims, and a write settles one
+    # of them - so reading the sentence as write-backed passes the half nobody
+    # checked. Every clause has to be one a write can settle.
+    clauses = [part for part in _CLAUSE_SPLIT.split(text) if part.strip()]
+    if len(clauses) > 1:
+        return not all(write_can_discharge(part) for part in clauses)
+    return not write_can_discharge(text)

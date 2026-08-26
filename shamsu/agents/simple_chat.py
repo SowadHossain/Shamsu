@@ -41,6 +41,7 @@ from typing import Any
 from shamsu.action_ledger.ledger import ActionLedger
 from shamsu.agents.chat_state import ChatState
 from shamsu.agents.loop_guards import (
+    BOOKKEEPING_TOOLS,
     LOOKING_TOOLS,
     READ_LOOP_EXHAUSTED,
     adapted_temperature,
@@ -3225,8 +3226,15 @@ class SimpleChatLoop:
                 # Producing ANYTHING ends the streak - a file changed, a command
                 # run, a note written. Not just a write: an answer is production
                 # too, and this guard is about a turn with nothing to show.
+                #
+                # Bookkeeping is excluded, and that exclusion is the fix. This
+                # read "a tool that is not a read", so a `contract_assert_pass`
+                # counted as production and zeroed the streak. The snake-game
+                # run of 2026-08-24 alternated reads with ten of them and the
+                # counter never got past a few - two turns ran to `max_rounds`
+                # with this guard armed and silent.
                 produced_something=bool(outcome.written)
-                or bool(set(outcome.tool_names) - LOOKING_TOOLS),
+                or bool(set(outcome.tool_names) - LOOKING_TOOLS - BOOKKEEPING_TOOLS),
                 targets=outcome.read_targets,
             )
             if looping and looping.reason == READ_LOOP_EXHAUSTED:
@@ -7171,6 +7179,7 @@ class SimpleChatLoop:
             else:
                 checked.append(relative)
                 self._unfinished.pop(relative, None)
+        problems.extend(self._cross_file_problems(written))
         if problems:
             return json.dumps(
                 {"ok": False, "message": "Problems in the files just written.",
@@ -7195,6 +7204,36 @@ class SimpleChatLoop:
                       "unfinished": unfinished}},
             ensure_ascii=True,
         )
+
+    def _cross_file_problems(self, written: list[str]) -> list[str]:
+        """Defects that exist only in the COMBINATION of files.
+
+        Everything above this line checks one file at a time, and that is the
+        blind spot the 2026-08-24 snake game fell into: eight modules, every
+        one green under `node --check`, and a page that never ran a line of
+        them. A missing `<script src>`, one `const` declared in two scripts,
+        and a helper eleven calls deep that nobody wrote are all invisible from
+        inside any single file, and all three shipped under a contract
+        reporting seven of nine assertions passed.
+
+        Skipped while anything is mid-build. A half-written file trips every
+        one of these, and reporting it would send the model repairing a file it
+        has not finished writing - the same reason `_run_the_projects_tests`
+        stands down.
+        """
+        if self._unfinished:
+            return []
+        if not any(
+            Path(name).suffix.lower() in {".html", ".htm", ".js"} for name in written
+        ):
+            return []
+        try:
+            from shamsu.verify.wiring import verify_wiring
+
+            result = verify_wiring(self.workspace)
+        except Exception:  # noqa: BLE001 - a check must not cost the turn
+            return []
+        return [item.render() for item in result.diagnostics]
 
     def _settle_unfinished(self) -> None:
         """A file still open when the model walks away is not "in progress".
