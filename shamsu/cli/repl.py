@@ -5224,6 +5224,8 @@ def _start_frame(console: Console, workspace: Path | None = None) -> bool:
     console.width = app.output_width()
     app.echo("SHAMSU - framed mode. PgUp/PgDn or the wheel scrolls this pane,")
     app.echo("F2 toggles mouse capture, Ctrl+D or /tui off returns to the stream.")
+    app.echo("F4 starts Whisper voice input; F5 submits it.")
+    app.echo("Replies speak back in this CLI. Set SHAMSU_VOICE_OUTPUT=off to mute.")
     app.echo("")
     return True
 
@@ -5398,6 +5400,7 @@ async def _run_simple_chat(
     if frame is not None:
         with frame.app.answering():
             console.print(Markdown(body))
+        frame.app.speak_reply(body)
     else:
         console.print(Markdown(body))
     _log_assistant_message(session_logger, body, workflow_id="simple-chat")

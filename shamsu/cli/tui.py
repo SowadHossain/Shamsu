@@ -63,6 +63,7 @@ WHEEL_ROWS = 3
 #: How tall the input box may grow before it scrolls internally. Eight lines
 #: holds a pasted traceback or a short spec without swallowing the log.
 INPUT_MAX_ROWS = 8
+VOICE_MIN_RECORD_SECONDS = 0.75
 
 #: The sidebar's fixed width. Below `MIN_WIDTH_FOR_SIDEBAR` it is dropped
 #: entirely and the telemetry falls back to the bottom toolbar, because a
@@ -942,6 +943,9 @@ class TuiApp:
         on_exit: Callable[[], None] | None = None,
         workspace: Any = None,
         mouse_support: bool = True,
+        voice_service_factory: Callable[[], Any] | None = None,
+        voice_recorder_factory: Callable[[], Any] | None = None,
+        voice_output_factory: Callable[[], Any] | None = None,
     ) -> None:
         from prompt_toolkit.application import Application
         from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -968,6 +972,14 @@ class TuiApp:
         self._prompt_label = prompt_label
         self._mouse = mouse_support
         self.app: Any = None
+        self._voice_service_factory = voice_service_factory
+        self._voice_recorder_factory = voice_recorder_factory
+        self._voice_output_factory = voice_output_factory
+        self._voice_service: Any = None
+        self._voice_recorder: Any = None
+        self._voice_output: Any = None
+        self._voice_state = ""
+        self._voice_started = 0.0
 
         #: `None`, or the question this frame is currently holding. While it
         #: is set the input box stops taking text and single keys answer
@@ -1101,6 +1113,13 @@ class TuiApp:
         keys = " PgUp/PgDn scroll · F2 mouse · ^C stop · ^D close "
         if not self._mouse:
             scroll = f" {self.pane.scroll_position()} · MOUSE OFF "
+        if self._voice_state == "recording":
+            elapsed = max(0, int(time.monotonic() - self._voice_started))
+            mode, mode_style = f" LISTENING {elapsed:02d}s ", "class:tui.status.ask"
+            keys = " F5 stop recording "
+        elif self._voice_state == "transcribing":
+            mode, mode_style = " TRANSCRIBING ", "class:tui.status.busy"
+            keys = " Whisper is listening back "
 
         pending = self._approval
         if pending is not None:
@@ -1147,6 +1166,135 @@ class TuiApp:
             except Exception as exc:  # noqa: BLE001
                 self.pane.write(f"that failed: {exc}\n")
         return False
+
+    def _toggle_voice_recording(self) -> None:
+        if self._approval is not None or self._voice_state == "transcribing":
+            return
+        if self._voice_state == "recording":
+            elapsed = time.monotonic() - self._voice_started
+            if elapsed < VOICE_MIN_RECORD_SECONDS:
+                self.echo("voice: listening - press again after speaking", KIND_NOTICE)
+                return
+            self._stop_voice_recording()
+            return
+        self._start_voice_recording()
+
+    def _start_voice_recording(self) -> None:
+        if self._approval is not None or self._voice_state == "transcribing":
+            return
+        if self._voice_state == "recording":
+            self.echo("voice: already listening - press F5 to submit", KIND_NOTICE)
+            return
+        try:
+            recorder = self._ensure_voice_recorder()
+            recorder.start()
+        except Exception as exc:  # noqa: BLE001
+            self.echo(f"voice input unavailable: {exc}", KIND_NOTICE)
+            return
+        self._voice_state = "recording"
+        self._voice_started = time.monotonic()
+        self.echo("voice: listening - press F5 to submit", KIND_NOTICE)
+
+    def _stop_voice_recording(self) -> None:
+        recorder = self._voice_recorder
+        if recorder is None:
+            self._voice_state = ""
+            return
+        try:
+            audio_path = recorder.stop()
+        except Exception as exc:  # noqa: BLE001
+            self._voice_state = ""
+            self.echo(f"voice input failed: {exc}", KIND_NOTICE)
+            return
+        self._voice_state = "transcribing"
+        self.echo("voice: transcribing with Whisper...", KIND_NOTICE)
+
+        def work() -> None:
+            try:
+                service = self._ensure_voice_service()
+                transcript = service.transcribe_file(audio_path)
+                text = transcript.text.strip()
+            except Exception as exc:  # noqa: BLE001
+                self._post_from_voice_thread(lambda exc=exc: self._voice_failed(exc))
+                return
+            finally:
+                with contextlib.suppress(OSError):
+                    audio_path.unlink()
+            self._post_from_voice_thread(lambda: self._voice_transcribed(text))
+
+        import threading
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _voice_failed(self, exc: BaseException) -> None:
+        self._voice_state = ""
+        self.echo(f"voice input failed: {exc}", KIND_NOTICE)
+
+    def _voice_transcribed(self, text: str) -> None:
+        self._voice_state = ""
+        if not text:
+            self.echo("voice input failed: Whisper did not hear any English speech.", KIND_NOTICE)
+            return
+        self.echo(f'Heard: "{text}"', KIND_NOTICE)
+        try:
+            self._on_submit(text)
+        except Exception as exc:  # noqa: BLE001
+            self.echo(f"that failed: {exc}", KIND_NOTICE)
+
+    def _post_from_voice_thread(self, func: Callable[[], None]) -> None:
+        app = self.app
+        loop = getattr(app, "loop", None)
+        if loop is not None and not loop.is_closed():
+            with contextlib.suppress(Exception):
+                loop.call_soon_threadsafe(func)
+                return
+        func()
+
+    def _ensure_voice_service(self) -> Any:
+        if self._voice_service is None:
+            if self._voice_service_factory is not None:
+                self._voice_service = self._voice_service_factory()
+            else:
+                from shamsu.voice import VoiceService
+
+                self._voice_service = VoiceService()
+        return self._voice_service
+
+    def _ensure_voice_recorder(self) -> Any:
+        if self._voice_recorder is None:
+            if self._voice_recorder_factory is not None:
+                self._voice_recorder = self._voice_recorder_factory()
+            else:
+                from shamsu.voice.recorder import MicrophoneRecorder
+
+                self._voice_recorder = MicrophoneRecorder()
+        return self._voice_recorder
+
+    def speak_reply(self, text: str) -> None:
+        body = str(text or "").strip()
+        if not body:
+            return
+
+        def work() -> None:
+            try:
+                speaker = self._ensure_voice_output()
+                speaker.speak(body)
+            except Exception as exc:  # noqa: BLE001
+                self._post_from_voice_thread(lambda exc=exc: self.echo(f"voice output failed: {exc}", KIND_NOTICE))
+
+        import threading
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _ensure_voice_output(self) -> Any:
+        if self._voice_output is None:
+            if self._voice_output_factory is not None:
+                self._voice_output = self._voice_output_factory()
+            else:
+                from shamsu.voice import SpeechPlayer
+
+                self._voice_output = SpeechPlayer()
+        return self._voice_output
 
     # -- approvals ---------------------------------------------------------
 
@@ -1320,6 +1468,15 @@ class TuiApp:
                 buffer.complete_next()
             else:
                 buffer.start_completion(select_first=False)
+
+        @keys.add("f4")
+        def _(_event) -> None:
+            self._start_voice_recording()
+
+        @keys.add("c-space")
+        @keys.add("f5")
+        def _(_event) -> None:
+            self._toggle_voice_recording()
 
         @keys.add("s-tab")
         def _(event) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -34,6 +35,22 @@ class TelegramTransport(ABC):
         it is a courtesy signal, and an implementation that cannot send one
         must not be forced to pretend it can."""
         return None
+
+    async def download_file(self, file: TelegramFile, destination: Path) -> Path:
+        raise NotImplementedError("This Telegram transport cannot download files.")
+
+    async def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: str,
+        allowed_updates: list[str] | None = None,
+        drop_pending_updates: bool = False,
+    ) -> None:
+        raise NotImplementedError("This Telegram transport cannot configure webhooks.")
+
+    async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
+        raise NotImplementedError("This Telegram transport cannot delete webhooks.")
 
     async def close(self) -> None:
         return None
@@ -108,6 +125,39 @@ class TelegramBotApiTransport(TelegramTransport):
         result = await self._api("sendDocument", data, files=files)
         return int((result or {}).get("message_id") or 0)
 
+    async def download_file(self, file: TelegramFile, destination: Path) -> Path:
+        info = await self._api("getFile", {"file_id": file.file_id})
+        file_path = str((info or {}).get("file_path") or "")
+        if not file_path:
+            raise RuntimeError("Telegram did not return a file path.")
+        url = f"{self._base_url}/file/bot{self._token}/{file_path}"
+        response = await self._client.get(url)
+        if response.is_error:
+            raise RuntimeError(f"Telegram file download failed: HTTP {response.status_code}")
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(response.content)
+        return destination
+
+    async def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: str,
+        allowed_updates: list[str] | None = None,
+        drop_pending_updates: bool = False,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "url": url,
+            "allowed_updates": allowed_updates or ["message", "callback_query"],
+            "drop_pending_updates": bool(drop_pending_updates),
+            "secret_token": secret_token,
+        }
+        await self._api("setWebhook", payload)
+
+    async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
+        await self._api("deleteWebhook", {"drop_pending_updates": bool(drop_pending_updates)})
+
     async def _api(
         self,
         method: str,
@@ -116,14 +166,24 @@ class TelegramBotApiTransport(TelegramTransport):
         files: dict[str, Any] | None = None,
     ) -> Any:
         url = f"{self._base_url}/bot{self._token}/{method}"
-        if files:
-            response = await self._client.post(url, data=payload, files=files)
-        else:
-            response = await self._client.post(url, json=payload)
-        response.raise_for_status()
-        body = response.json()
-        if not body.get("ok"):
-            raise RuntimeError(f"Telegram API failed: {body.get('description', 'unknown')}")
+        try:
+            if files:
+                response = await self._client.post(url, data=payload, files=files)
+            else:
+                response = await self._client.post(url, json=payload)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"Telegram {method} request failed: {_scrub_token(str(exc), self._token)}"
+            ) from exc
+        try:
+            body = response.json()
+        except ValueError:
+            if response.is_error:
+                raise RuntimeError(f"Telegram {method} failed: HTTP {response.status_code}") from None
+            raise RuntimeError(f"Telegram {method} returned unreadable JSON") from None
+        if response.is_error or not body.get("ok"):
+            description = _scrub_token(str(body.get("description") or "unknown"), self._token)
+            raise RuntimeError(f"Telegram {method} failed: {description}")
         return body.get("result")
 
     async def close(self) -> None:
@@ -136,6 +196,10 @@ class FakeTelegramTransport(TelegramTransport):
         self.inbound: asyncio.Queue[TelegramUpdate] = asyncio.Queue()
         self.sent: list[OutboundMessage] = []
         self.actions: list[tuple[int, str]] = []
+        self.files: dict[str, bytes] = {}
+        self.webhook_url = ""
+        self.webhook_secret = ""
+        self.webhook_deleted = False
         self.closed = False
 
     async def updates(self) -> AsyncIterator[TelegramUpdate]:
@@ -154,6 +218,31 @@ class FakeTelegramTransport(TelegramTransport):
 
     async def chat_action(self, chat_id: int, action: str = "typing") -> None:
         self.actions.append((int(chat_id), action))
+
+    async def download_file(self, file: TelegramFile, destination: Path) -> Path:
+        data = self.files.get(file.file_id)
+        if data is None:
+            raise RuntimeError(f"No fake Telegram file registered for {file.file_id}")
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        return destination
+
+    async def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: str,
+        allowed_updates: list[str] | None = None,
+        drop_pending_updates: bool = False,
+    ) -> None:
+        self.webhook_url = url
+        self.webhook_secret = secret_token
+        self.webhook_deleted = False
+
+    async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
+        self.webhook_deleted = True
+        self.webhook_url = ""
 
     async def close(self) -> None:
         self.closed = True
@@ -181,12 +270,14 @@ def normalize_update(raw: dict[str, Any]) -> TelegramUpdate | None:
 
 def _normalize_message(raw: dict[str, Any]) -> TelegramMessage:
     document = raw.get("document") or None
+    voice = raw.get("voice") or raw.get("audio") or None
     return TelegramMessage(
         message_id=int(raw.get("message_id", 0)),
         user=_normalize_user(raw.get("from", {})),
         chat=_normalize_chat(raw.get("chat", {})),
         text=str(raw.get("text") or raw.get("caption") or ""),
         document=_normalize_file(document) if document else None,
+        voice=_normalize_voice(voice) if voice else None,
     )
 
 
@@ -214,3 +305,23 @@ def _normalize_file(raw: dict[str, Any]) -> TelegramFile:
         mime_type=str(raw.get("mime_type") or ""),
         file_size=int(raw.get("file_size") or 0),
     )
+
+
+def _normalize_voice(raw: dict[str, Any]) -> TelegramFile:
+    return TelegramFile(
+        file_id=str(raw.get("file_id") or ""),
+        file_name=str(raw.get("file_name") or "voice.oga"),
+        mime_type=str(raw.get("mime_type") or "audio/ogg"),
+        file_size=int(raw.get("file_size") or 0),
+    )
+
+
+def _scrub_token(text: str, token: str) -> str:
+    cleaned = str(text or "")
+    secret = str(token or "").strip()
+    if secret:
+        cleaned = cleaned.replace(secret, "<token>")
+        head = secret.split(":", 1)[0]
+        if head and head.isdigit():
+            cleaned = cleaned.replace(f"/bot{head}", "/bot<token>")
+    return cleaned

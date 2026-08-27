@@ -5,15 +5,16 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import shamsu.integrations.telegram.sessions as telegram_sessions
 from shamsu.action_ledger import store as action_store
 from shamsu.agents.chat_loop import AgentLoopResult
-import shamsu.integrations.telegram.sessions as telegram_sessions
 from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.callbacks import CallbackRegistry
 from shamsu.integrations.telegram.commands import parse_command
 from shamsu.integrations.telegram.controller import TelegramController
 from shamsu.integrations.telegram.files import TelegramFileStager, sanitize_filename
 from shamsu.integrations.telegram.formatter import TelegramFormatter
+from shamsu.integrations.telegram.local import redact_remote_control_command
 from shamsu.integrations.telegram.models import (
     CallbackAction,
     TelegramCallbackQuery,
@@ -27,19 +28,18 @@ from shamsu.integrations.telegram.models import (
 )
 from shamsu.integrations.telegram.notifications import NotificationFilter
 from shamsu.integrations.telegram.pairing import PairingManager
-from shamsu.integrations.telegram.sessions import RoutedMessageResult
-from shamsu.integrations.telegram.local import redact_remote_control_command
 from shamsu.integrations.telegram.service import (
     TelegramService,
     configure_telegram_bot_token,
     load_telegram_bot_token,
 )
+from shamsu.integrations.telegram.sessions import RoutedMessageResult
 from shamsu.integrations.telegram.storage import TelegramStateStore
-from shamsu.integrations.telegram.transport import FakeTelegramTransport
+from shamsu.integrations.telegram.transport import FakeTelegramTransport, normalize_update
 from shamsu.runtime.run_control import complete_run, get_run_status, pause_run, register_run
 from shamsu.session.manager import SessionManager
 from shamsu.types import RunStatus
-
+from shamsu.voice.models import Transcript
 
 USER = TelegramUser(telegram_user_id := 1001, first_name="Ada", username="ada")
 CHAT = TelegramChat(chat_id=2002, chat_type="private")
@@ -140,7 +140,7 @@ def _store(tmp_path: Path) -> TelegramStateStore:
     return TelegramStateStore(tmp_path, db_path=tmp_path / "telegram.db")
 
 
-def _controller(tmp_path: Path):
+def _controller(tmp_path: Path, *, voice_service=None, voice_downloader=None):
     store = _store(tmp_path)
     pairing = PairingManager(store, installation_id="install-test")
     callbacks = CallbackRegistry(store)
@@ -174,12 +174,38 @@ def _controller(tmp_path: Path):
         gateway=gateway,
         workspace=tmp_path,
         approval_resolver=lambda approval_id, approved: approval_id == "approval-1" and approved,
+        voice_service=voice_service,
+        voice_downloader=voice_downloader,
     )
     return store, pairing, callbacks, gateway, controller
 
 
 def _message(text: str, *, user: TelegramUser = USER, chat: TelegramChat = CHAT, message_id: int = 1):
     return TelegramMessage(message_id=message_id, user=user, chat=chat, text=text)
+
+
+def _voice_message(
+    *,
+    user: TelegramUser = USER,
+    chat: TelegramChat = CHAT,
+    message_id: int = 1,
+):
+    return TelegramMessage(
+        message_id=message_id,
+        user=user,
+        chat=chat,
+        voice=TelegramFile("voice-1", "voice.oga", "audio/ogg", 12),
+    )
+
+
+class FakeVoiceService:
+    def __init__(self, text: str = "run the telegram tests") -> None:
+        self.text = text
+        self.paths: list[Path] = []
+
+    def transcribe_file(self, audio_path: Path) -> Transcript:
+        self.paths.append(Path(audio_path))
+        return Transcript(self.text)
 
 
 async def _drain_service_background(service: TelegramService) -> None:
@@ -247,6 +273,48 @@ def test_telegram_message_routes_to_active_shamsu_session(tmp_path: Path) -> Non
     assert gateway.routed[0][0] == "Implement auth"
     assert gateway.routed[0][1].source == "telegram"
     assert gateway.routed[0][1].session_id == "session-1"
+
+
+def test_telegram_voice_update_normalizes_to_a_voice_file() -> None:
+    update = normalize_update(
+        {
+            "update_id": 42,
+            "message": {
+                "message_id": 3,
+                "from": {"id": USER.user_id, "first_name": "Ada"},
+                "chat": {"id": CHAT.chat_id, "type": "private"},
+                "voice": {"file_id": "voice-1", "file_size": 1234},
+            },
+        }
+    )
+
+    assert update is not None
+    assert update.message is not None
+    assert update.message.voice == TelegramFile("voice-1", "voice.oga", "audio/ogg", 1234)
+
+
+def test_telegram_voice_message_routes_the_whisper_transcript(tmp_path: Path) -> None:
+    voice_service = FakeVoiceService("fix the telegram voice path")
+
+    async def download(file: TelegramFile, destination: Path) -> Path:
+        assert file.file_id == "voice-1"
+        destination.write_bytes(b"fake-oga")
+        return destination
+
+    store, pairing, _callbacks, gateway, controller = _controller(
+        tmp_path,
+        voice_service=voice_service,
+        voice_downloader=download,
+    )
+    assert pairing.verify(pairing.create_code().code, user=USER, chat=CHAT).ok
+    store.set_active_session(USER.user_id, "session-1")
+
+    replies = asyncio.run(controller.handle_update(TelegramUpdate(1, message=_voice_message())))
+
+    assert replies[0].text == 'Heard: "fix the telegram voice path"\n\nTask accepted by SHAMSU.'
+    assert gateway.routed[0][0] == "fix the telegram voice path"
+    assert gateway.routed[0][1].session_id == "session-1"
+    assert voice_service.paths
 
 
 def test_duplicate_update_is_ignored(tmp_path: Path) -> None:

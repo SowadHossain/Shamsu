@@ -1,7 +1,9 @@
 """Deterministic Telegram command and callback controller."""
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from shamsu.integrations.telegram.authentication import TelegramAuthenticator
@@ -9,11 +11,16 @@ from shamsu.integrations.telegram.callbacks import CallbackRegistry
 from shamsu.integrations.telegram.commands import parse_command
 from shamsu.integrations.telegram.files import TelegramFileStager
 from shamsu.integrations.telegram.formatter import TelegramFormatter
-from shamsu.integrations.telegram.keyboards import home_keyboard, run_control_keyboard, session_keyboard
+from shamsu.integrations.telegram.keyboards import (
+    home_keyboard,
+    run_control_keyboard,
+    session_keyboard,
+)
 from shamsu.integrations.telegram.models import (
     CallbackAction,
     OutboundMessage,
     TelegramCallbackQuery,
+    TelegramFile,
     TelegramInboundMetadata,
     TelegramMessage,
     TelegramUpdate,
@@ -22,6 +29,9 @@ from shamsu.integrations.telegram.models import (
 from shamsu.integrations.telegram.pairing import PairingManager
 from shamsu.integrations.telegram.sessions import SessionGateway
 from shamsu.integrations.telegram.storage import TelegramStateStore
+from shamsu.voice import VoiceError, VoiceService
+
+VoiceDownloader = Callable[[TelegramFile, Path], Awaitable[Path]]
 
 
 class TelegramController:
@@ -36,6 +46,8 @@ class TelegramController:
         workspace: Path,
         formatter: TelegramFormatter | None = None,
         approval_resolver: Callable[[str, bool], bool] | None = None,
+        voice_service: VoiceService | None = None,
+        voice_downloader: VoiceDownloader | None = None,
     ) -> None:
         self.store = store
         self.authenticator = authenticator
@@ -45,6 +57,8 @@ class TelegramController:
         self.formatter = formatter or TelegramFormatter()
         self.approval_resolver = approval_resolver
         self.files = TelegramFileStager(workspace)
+        self.voice_service = voice_service
+        self.voice_downloader = voice_downloader
 
     async def handle_update(self, update: TelegramUpdate) -> list[OutboundMessage]:
         self.store.increment_metric("telegram_updates_received")
@@ -104,6 +118,8 @@ class TelegramController:
             ]
         if command is not None:
             return await self._handle_command(message, command.name)
+        if message.voice is not None:
+            return [await self._handle_voice(message)]
         if message.document is not None:
             return [self._handle_file(message)]
         return [await self._handle_free_text(message)]
@@ -313,9 +329,50 @@ class TelegramController:
         return [OutboundMessage(callback.message.chat.chat_id, "Action handled.")]
 
     async def _handle_free_text(self, message: TelegramMessage) -> OutboundMessage:
+        return await self._route_text_message(message, message.text, action="message.route")
+
+    async def _handle_voice(self, message: TelegramMessage) -> OutboundMessage:
+        assert message.voice is not None
+        if self.voice_service is None or self.voice_downloader is None:
+            return OutboundMessage(
+                message.chat.chat_id,
+                "Voice input is not enabled. Install the voice extra and restart SHAMSU.",
+            )
+        try:
+            with tempfile.TemporaryDirectory(prefix="shamsu-telegram-voice-") as directory:
+                suffix = Path(message.voice.file_name or "voice.oga").suffix or ".oga"
+                downloaded = Path(directory) / f"voice{suffix}"
+                await self.voice_downloader(message.voice, downloaded)
+                transcript = await asyncio.to_thread(self.voice_service.transcribe_file, downloaded)
+        except VoiceError as exc:
+            self.store.audit(
+                telegram_user_id=message.user.user_id,
+                telegram_chat_id=message.chat.chat_id,
+                telegram_message_id=message.message_id,
+                action="voice.transcribe",
+                result="failed",
+                payload={"reason": str(exc)[:300]},
+            )
+            return OutboundMessage(message.chat.chat_id, str(exc))
+        text = transcript.text.strip()
+        return await self._route_text_message(
+            message,
+            text,
+            action="voice.route",
+            prefix=f'Heard: "{text}"',
+        )
+
+    async def _route_text_message(
+        self,
+        message: TelegramMessage,
+        text: str,
+        *,
+        action: str,
+        prefix: str = "",
+    ) -> OutboundMessage:
         session_id = self._active_or_default_session(message.user.user_id)
         result = await self.gateway.route_user_message(
-            message.text,
+            text,
             metadata=TelegramInboundMetadata(
                 source="telegram",
                 telegram_user_id=message.user.user_id,
@@ -331,12 +388,15 @@ class TelegramController:
             telegram_message_id=message.message_id,
             session_id=session_id,
             run_id=result.run_id,
-            action="message.route",
+            action=action,
             result=result.status or "ok",
-            payload={"text_preview": message.text[:300]},
+            payload={"text_preview": text[:300]},
         )
         pages = self.formatter.paginate(result.text)
-        return OutboundMessage(message.chat.chat_id, pages[0].text)
+        response = pages[0].text
+        if prefix:
+            response = f"{prefix}\n\n{response}"
+        return OutboundMessage(message.chat.chat_id, response)
 
     def _handle_file(self, message: TelegramMessage) -> OutboundMessage:
         assert message.document is not None

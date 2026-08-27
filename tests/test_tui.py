@@ -868,6 +868,87 @@ def _app_session():
 
 
 @pytest.mark.asyncio
+async def test_ctrl_space_voice_transcribes_and_submits(tmp_path: Path):
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.voice.models import Transcript
+
+    submitted: list[str] = []
+
+    class FakeRecorder:
+        def __init__(self) -> None:
+            self.path = tmp_path / "recording.wav"
+
+        def start(self) -> None:
+            self.path.write_bytes(b"recording")
+
+        def stop(self) -> Path:
+            return self.path
+
+    class FakeVoiceService:
+        def transcribe_file(self, audio_path: Path) -> Transcript:
+            assert audio_path.read_bytes() == b"recording"
+            return Transcript("inspect the tui voice path")
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=submitted.append,
+            voice_recorder_factory=FakeRecorder,
+            voice_service_factory=FakeVoiceService,
+        )
+
+        app._start_voice_recording()
+        assert app._voice_state == "recording"
+        app._voice_started -= 1.0
+        app._toggle_voice_recording()
+
+        for _ in range(20):
+            if submitted:
+                break
+            await asyncio.sleep(0.01)
+
+        assert submitted == ["inspect the tui voice path"]
+        assert app._voice_state == ""
+        assert 'Heard: "inspect the tui voice path"' in app.pane.plain(10)
+
+
+@pytest.mark.asyncio
+async def test_tui_speaks_replies_without_blocking() -> None:
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    spoken: list[str] = []
+
+    class FakeSpeaker:
+        def speak(self, text: str) -> None:
+            spoken.append(text)
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_output_factory=FakeSpeaker,
+        )
+
+        app.speak_reply("Hello from SHAMSU.")
+
+        for _ in range(20):
+            if spoken:
+                break
+            await asyncio.sleep(0.01)
+
+        assert spoken == ["Hello from SHAMSU."]
+
+
+@pytest.mark.asyncio
 async def test_the_frame_runs_and_routes_what_is_typed():
     """The real Application, over prompt_toolkit's pipe input. A layout that
     cannot be constructed, or a control that raises while painting, fails

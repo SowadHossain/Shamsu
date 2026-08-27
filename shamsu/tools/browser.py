@@ -64,6 +64,7 @@ class BrowserTool:
         self.action_ledger = action_ledger
         self._playwright_ctx = None
         self._browser = None
+        self._context = None
         self._page = None
         self._console_errors: list[str] = []
 
@@ -73,22 +74,27 @@ class BrowserTool:
         except RuntimeError as exc:
             return BrowserCapabilityStatus(False, "missing_dependency", str(exc))
         context = None
+        browser = None
         try:
             context = playwright().start()
-            executable = Path(context.chromium.executable_path)
-            if not executable.is_file():
+            browser = context.chromium.launch(headless=True)
+            browser.close()
+            browser = None
+            return BrowserCapabilityStatus(True, "ready", "Playwright Chromium is available.")
+        except Exception as exc:
+            message = str(exc)
+            if "Executable doesn't exist" in message or "playwright install" in message:
                 return BrowserCapabilityStatus(
                     False,
                     "missing_browser",
                     "Playwright is installed, but Chromium is missing. Run `python -m playwright install chromium`.",
-                    str(executable),
                 )
-            return BrowserCapabilityStatus(True, "ready", "Playwright Chromium is available.", str(executable))
-        except Exception as exc:
-            return BrowserCapabilityStatus(False, "failed", str(exc))
+            return BrowserCapabilityStatus(False, "failed", message)
         finally:
+            if browser is not None:
+                self._close_quietly(browser)
             if context is not None:
-                context.stop()
+                self._stop_playwright_quietly(context)
 
     def open(self, url: str, reason: str = "", require_approval: bool = True) -> BrowserActionResult:
         if require_approval and not self._approve(
@@ -211,24 +217,35 @@ class BrowserTool:
         return ""
 
     def close(self) -> None:
+        page, self._page = self._page, None
+        context, self._context = self._context, None
+        browser, self._browser = self._browser, None
+        playwright_ctx, self._playwright_ctx = self._playwright_ctx, None
+        # Close the browser context first. That is the owner Playwright uses to
+        # drain page/event work; closing only the page can leave TargetClosedError
+        # futures behind when the process exits from inside the TUI.
+        if context is not None:
+            self._close_quietly(context)
+        else:
+            self._close_quietly(page)
+        self._close_quietly(browser)
+        self._stop_playwright_quietly(playwright_ctx)
+
+    def _close_quietly(self, target: Any) -> None:
+        if target is None:
+            return
         try:
-            if self._page is not None:
-                self._page.close()
+            target.close()
         except Exception:
-            pass
-        self._page = None
+            return
+
+    def _stop_playwright_quietly(self, playwright_ctx: Any) -> None:
+        if playwright_ctx is None:
+            return
         try:
-            if self._browser is not None:
-                self._browser.close()
+            playwright_ctx.stop()
         except Exception:
-            pass
-        self._browser = None
-        try:
-            if self._playwright_ctx is not None:
-                self._playwright_ctx.stop()
-        except Exception:
-            pass
-        self._playwright_ctx = None
+            return
 
     def _ensure_page(self) -> None:
         if self._page is not None:
@@ -236,7 +253,8 @@ class BrowserTool:
         playwright = self._load_playwright()
         self._playwright_ctx = playwright().start()
         self._browser = self._playwright_ctx.chromium.launch(headless=True)
-        self._page = self._browser.new_page()
+        self._context = self._browser.new_context()
+        self._page = self._context.new_page()
         self._page.on(
             "console",
             lambda message: self._console_errors.append(message.text)

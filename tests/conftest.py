@@ -320,3 +320,73 @@ def _model_presence_cache_reset(monkeypatch):
     monkeypatch.setattr(manager_module, "_MODELS_CONFIRMED_PRESENT", set())
 
 
+# --- test taxonomy ---------------------------------------------------------
+#
+# Marks are DERIVED, not hand-written on 4,000 tests. Two axes (see the marker
+# list in pyproject.toml): LEVEL says how much of the system runs, INTENT says
+# why the test was written. They are independent - a regression test can sit at
+# any level, which is exactly why regression is not one of the levels.
+#
+# The level rule is deliberately mechanical so the pyramid counts in the report
+# are reproducible rather than asserted: a solitary unit test is one that never
+# asks for a filesystem. Where the rule guesses wrong, put an explicit marker on
+# the test - `_declared_level` below lets it win.
+
+#: Files whose tests drive a real subprocess, a real local server, or the full
+#: installed entry point. Everything here is a system test whatever fixtures it
+#: happens to request.
+SYSTEM_FILES = (
+    "test_webui",
+    "test_noninteractive_runner",
+    "test_release_scripts",
+    "test_native_runtime_cli",
+    "test_dev_server",
+    "test_server_commands_and_shell",
+    "test_install_script_safety",
+)
+
+#: Files that exist because something broke in the field. The naming convention
+#: is the record: an incident date or an issue batch in the filename.
+REGRESSION_FILES = (
+    "_regressions",
+    "_fixes",
+    "issue_batch",
+    "_bug",
+    "dogfood",
+)
+
+_LEVELS = ("unit", "integration", "system")
+
+
+def _declared_level(item) -> str | None:
+    """An explicit level marker on the test beats the derived one."""
+    for marker in item.iter_markers():
+        if marker.name in _LEVELS:
+            return marker.name
+    return None
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        path = str(item.fspath).replace("\\", "/")
+        fixtures = set(getattr(item, "fixturenames", ()))
+
+        if _declared_level(item) is None:
+            if any(tag in path for tag in SYSTEM_FILES):
+                item.add_marker(pytest.mark.system)
+            # NB: `tmp_path_factory` is NOT a usable signal - the autouse
+            # hermeticity fixtures above request it, so it appears in every
+            # test's fixturenames and would classify the whole suite as
+            # integration. Only the function-scoped `tmp_path`, which a test
+            # has to ask for itself, means "this test touches a filesystem".
+            elif "tmp_path" in fixtures:
+                item.add_marker(pytest.mark.integration)
+            else:
+                item.add_marker(pytest.mark.unit)
+
+        if any(tag in path for tag in REGRESSION_FILES):
+            item.add_marker(pytest.mark.regression)
+        if "hermeticity" in path:
+            item.add_marker(pytest.mark.guard)
+
+

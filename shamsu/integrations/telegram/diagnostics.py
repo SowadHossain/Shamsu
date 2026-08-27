@@ -1,7 +1,11 @@
 """Ask Telegram what it thinks of this bot, and fix the one thing that silently breaks it.
 
-SHAMSU receives updates by **long polling** - `getUpdates` in a loop, see
-`transport.py`. There is no webhook handler and no tunnel, and none is planned.
+SHAMSU now has a webhook mode as well as polling. This diagnostic still matters:
+when the user explicitly runs polling, any stale Telegram webhook URL blocks
+`getUpdates` until it is removed.
+
+In polling mode, SHAMSU receives updates with `getUpdates` in a loop, see
+`transport.py`. In webhook mode, `webhook.py` owns the local receiver and tunnel.
 
 That makes one remote setting lethal in a way nothing surfaces: if a webhook
 URL is registered against the bot token - by another tool, an earlier

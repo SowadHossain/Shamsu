@@ -15,9 +15,12 @@ from rich.panel import Panel
 from shamsu.cli.prompt_label import SURFACE_TELEGRAM, prompt_label
 from shamsu.integrations.telegram.service import (
     ALREADY_RUNNING,
+    FAILED,
     HELD_ELSEWHERE,
     NO_TOKEN,
     STARTED,
+    TRANSPORT_POLLING,
+    TRANSPORT_WEBHOOK,
     PollerStart,
     TelegramService,
     configure_telegram_bot_token,
@@ -27,6 +30,7 @@ from shamsu.safety.commands import redact
 
 #: Pins `configure` to this project instead of the installation.
 WORKSPACE_FLAG = "--workspace"
+DEFAULT_TRANSPORT_MODE = TRANSPORT_WEBHOOK
 
 
 class ConsoleTelegramMirror:
@@ -132,38 +136,62 @@ class LocalTelegramBridgeManager:
         self._mirror: ConsoleTelegramMirror | None = None
         self._lock = threading.Lock()
 
-    def service_for(self, workspace: Path, console: Console | None = None) -> TelegramService:
+    def service_for(
+        self,
+        workspace: Path,
+        console: Console | None = None,
+        *,
+        transport_mode: str | None = None,
+    ) -> TelegramService:
         resolved = Path(workspace).resolve()
         with self._lock:
             if console is not None:
                 self._mirror = ConsoleTelegramMirror(console)
-            if self._service is None or self._workspace != resolved:
-                self._service = TelegramService(resolved, cli_mirror=self._mirror)
+            mode = transport_mode or DEFAULT_TRANSPORT_MODE
+            current_mode = getattr(self._service, "transport_mode", None)
+            running = self._thread is not None and self._thread.is_alive()
+            if self._service is None or self._workspace != resolved or (current_mode != mode and not running):
+                self._service = TelegramService(resolved, cli_mirror=self._mirror, transport_mode=mode)
                 self._workspace = resolved
             elif self._mirror is not None:
                 self._service.set_cli_mirror(self._mirror)
             return self._service
 
-    def reload_service(self, workspace: Path, console: Console | None = None) -> TelegramService:
+    def reload_service(
+        self,
+        workspace: Path,
+        console: Console | None = None,
+        *,
+        transport_mode: str | None = None,
+    ) -> TelegramService:
         resolved = Path(workspace).resolve()
         with self._lock:
             if console is not None:
                 self._mirror = ConsoleTelegramMirror(console)
-            self._service = TelegramService(resolved, cli_mirror=self._mirror)
+            self._service = TelegramService(
+                resolved,
+                cli_mirror=self._mirror,
+                transport_mode=transport_mode or DEFAULT_TRANSPORT_MODE,
+            )
             self._workspace = resolved
             return self._service
 
     def start(
-        self, workspace: Path, console: Console | None = None, *, timeout: float = 5.0
+        self,
+        workspace: Path,
+        console: Console | None = None,
+        *,
+        timeout: float = 110.0,
+        transport_mode: str | None = None,
     ) -> PollerStart:
-        """Begin polling, and say what actually happened.
+        """Begin the Telegram bridge, and say what actually happened.
 
         The outcome is decided on the poller's own thread - that is where the
         install-wide lease is claimed - so it is handed back through a queue
         rather than guessed at here. Callers that only ever wanted fire and
         forget can keep ignoring the return value.
         """
-        service = self.service_for(workspace, console)
+        service = self.service_for(workspace, console, transport_mode=transport_mode)
         if service.transport is None:
             return PollerStart(NO_TOKEN, detail="Telegram is not configured.")
         outcome: queue.Queue[PollerStart] = queue.Queue(maxsize=1)
@@ -277,6 +305,13 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
     parts = user_input.split(maxsplit=1)
     rest = parts[1].strip() if len(parts) > 1 else ""
     subcommand = rest.lower()
+    transport_mode = DEFAULT_TRANSPORT_MODE
+    if subcommand in {"poll", "polling", "long-polling", "long polling"}:
+        transport_mode = TRANSPORT_POLLING
+        subcommand = "connect"
+    elif subcommand in {"webhook", "webhooks", "cloudflare", "cloudflare-tunnel"}:
+        transport_mode = TRANSPORT_WEBHOOK
+        subcommand = "connect"
     if subcommand.startswith("configure"):
         argument = rest.partition(" ")[2].strip()
         # `--workspace` pins the token to this project instead. Parsed from
@@ -306,19 +341,31 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
             console.print(Panel(str(exc), title="Remote Control", border_style="red"))
             return
         _MANAGER.stop()
-        service = _MANAGER.reload_service(workspace, console)
-        _MANAGER.start(workspace, console)
-        panel = service.local_panel("status")
+        service = _MANAGER.reload_service(workspace, console, transport_mode=DEFAULT_TRANSPORT_MODE)
+        started = _MANAGER.start(workspace, console, transport_mode=DEFAULT_TRANSPORT_MODE)
         scope_note = (
             "It applies to every project until you change it."
             if install_scope
             else "It applies to this project only."
         )
+        body = f"Telegram bot token saved to {path}.\n{scope_note}\n\n"
+        border = "green"
+        if started.outcome == FAILED:
+            border = "red"
+            body += _startup_failed_message(started.detail)
+        elif started.outcome == HELD_ELSEWHERE:
+            border = "yellow"
+            body += _held_elsewhere_message(started)
+        elif started.detail == "starting":
+            border = "yellow"
+            body += _startup_in_progress_message(started)
+        else:
+            body += _connect_success_message(service)
         console.print(
             Panel(
-                f"Telegram bot token saved to {path}.\n{scope_note}\n\n{panel.message}",
+                body,
                 title="Remote Control",
-                border_style="green",
+                border_style=border,
             )
         )
         return
@@ -328,22 +375,66 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
         _MANAGER.stop()
         console.print(Panel(panel.message, title="Remote Control"))
         return
-    service = _MANAGER.service_for(workspace, console)
-    panel = service.local_panel(subcommand)
-    message = panel.message
     if subcommand in {"", "connect", "repair"}:
-        started = _MANAGER.start(workspace, console)
+        service = _MANAGER.service_for(workspace, console, transport_mode=transport_mode)
+        started = _MANAGER.start(workspace, console, transport_mode=transport_mode)
         if started.outcome == HELD_ELSEWHERE:
             # Worth saying out loud. Telegram allows one `getUpdates` caller per
             # token; the loser is refused with 409 and would otherwise sit there
             # looking connected and receiving nothing.
-            message = (
-                f"Another SHAMSU process (pid {started.holder_pid}) is already "
-                "polling this bot, so this one did not start.\n\n"
-                "Stop it there, or use this session as the poller by stopping "
-                "the other one first."
-            )
+            message = _held_elsewhere_message(started)
+        elif started.outcome == FAILED:
+            message = _startup_failed_message(started.detail)
+        elif started.detail == "starting":
+            message = _startup_in_progress_message(started)
+        else:
+            message = _connect_success_message(service)
+    else:
+        service = _MANAGER.service_for(workspace, console, transport_mode=transport_mode)
+        panel = service.local_panel(subcommand)
+        message = panel.message
     console.print(Panel(message, title="Remote Control"))
+
+
+def _connect_success_message(service: TelegramService) -> str:
+    if service.store.authorized_users():
+        return service.local_panel("status").message
+    return service.local_panel("").message
+
+
+def _held_elsewhere_message(started: PollerStart) -> str:
+    return (
+        f"Another SHAMSU process (pid {started.holder_pid}) is already "
+        "running this Telegram bot, so this one did not start.\n\n"
+        "Stop it there, or use this session by stopping the other one first."
+    )
+
+
+def _startup_failed_message(detail: str) -> str:
+    return f"Telegram remote control did not start.\n\n{detail}\n\n{_startup_hint(detail)}"
+
+
+def _startup_in_progress_message(started: PollerStart) -> str:
+    return (
+        "Telegram remote control is still starting.\n\n"
+        f"Transport: {started.transport}\n\n"
+        "Webhook mode is waiting for Cloudflare Tunnel and Telegram setup. "
+        "Run /remote_control status in a moment, or use polling now with:\n\n"
+        "/remote_control polling"
+    )
+
+
+def _startup_hint(detail: str) -> str:
+    lowered = detail.lower()
+    if "cloudflared" in lowered or "tunnel" in lowered:
+        return (
+            "Webhook mode needs a working Cloudflare Tunnel. To use the old outbound-only "
+            "mode for now, run:\n\n/remote_control polling"
+        )
+    return (
+        "Telegram rejected the webhook setup. Run /remote_control again after this patch "
+        "to see Telegram's exact reason, or use polling for now:\n\n/remote_control polling"
+    )
 
 
 def _announce_token_promotion(workspace: Path, console: Console) -> None:

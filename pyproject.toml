@@ -53,6 +53,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+voice = [
+    "faster-whisper>=1.0",
+    "imageio-ffmpeg>=0.5",
+    "sounddevice>=0.4",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
@@ -68,6 +73,25 @@ dev = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+# Two orthogonal axes, assigned automatically in tests/conftest.py.
+#
+#   LEVEL  - where a test sits in the pyramid: how much of the system runs.
+#   INTENT - why the test exists at all. A regression test can be a unit test
+#            OR a system test; intent is not a level, so it is a separate mark.
+#
+# An auto-assigned level can always be overridden on the test itself - an
+# explicit marker wins over the derived one.
+markers = [
+    "unit: solitary - pure logic, no filesystem, no agent loop",
+    "integration: sociable - real collaborators against a scripted model client",
+    "system: full request path, real subprocess or local server, no live model",
+    "regression: pins a specific field defect so it cannot return",
+    "contract: asserts an assumption about an external interface (Ollama, MCP)",
+    "negative: asserts something must NOT happen",
+    "guard: meta-test protecting the test infrastructure itself",
+]
 
 [tool.ruff]
 line-length = 100

@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from shamsu.control.store import MACHINE_LEASE_KEY
 from shamsu.integrations.telegram import install
-from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.approvals import TelegramApprovalBroker
+from shamsu.integrations.telegram.authentication import TelegramAuthenticator
 from shamsu.integrations.telegram.callbacks import CallbackRegistry
 from shamsu.integrations.telegram.commands import parse_command
 from shamsu.integrations.telegram.controller import TelegramController
@@ -26,9 +28,21 @@ from shamsu.integrations.telegram.pairing import PairingCode, PairingManager
 from shamsu.integrations.telegram.sessions import LocalShamsuSessionGateway, SessionGateway
 from shamsu.integrations.telegram.storage import TelegramStateStore
 from shamsu.integrations.telegram.transport import TelegramBotApiTransport, TelegramTransport
+from shamsu.integrations.telegram.webhook import (
+    CloudflaredQuickTunnel,
+    TelegramWebhookError,
+    TelegramWebhookServer,
+    wait_for_public_webhook,
+)
 from shamsu.safety.sandbox import Sandbox
+from shamsu.voice import VoiceService
 
 TOKEN_ENV_VAR = "SHAMSU_TELEGRAM_BOT_TOKEN"
+TRANSPORT_ENV_VAR = "SHAMSU_TELEGRAM_TRANSPORT"
+WEBHOOK_URL_ENV_VAR = "SHAMSU_TELEGRAM_WEBHOOK_URL"
+WEBHOOK_HOST_ENV_VAR = "SHAMSU_TELEGRAM_WEBHOOK_HOST"
+WEBHOOK_PORT_ENV_VAR = "SHAMSU_TELEGRAM_WEBHOOK_PORT"
+WEBHOOK_TUNNEL_ATTEMPTS_ENV_VAR = "SHAMSU_TELEGRAM_WEBHOOK_TUNNEL_ATTEMPTS"
 
 #: The bot's slot in the install-wide lease table. Telegram allows exactly one
 #: `getUpdates` caller per token and answers the second one with 409, so two
@@ -46,6 +60,10 @@ POLLER_SESSION = "telegram-poller"
 META_POLL_ERROR = "last_poll_error"
 META_POLL_ERROR_AT = "last_poll_error_at"
 META_POLLER_WORKSPACE = "poller_workspace"
+META_TRANSPORT_MODE = "telegram_transport_mode"
+META_WEBHOOK_URL = "telegram_webhook_url"
+META_WEBHOOK_LOCAL_URL = "telegram_webhook_local_url"
+META_WEBHOOK_STARTED_AT = "telegram_webhook_started_at"
 
 #: A constant, because the title used to be `f"Telegram {display_name}"` while
 #: the body carried the rest of the sentence - so a pairing produced a panel
@@ -83,6 +101,7 @@ class PollerStart:
     holder_pid: int = 0
     holder_surface: str = ""
     detail: str = ""
+    transport: str = "polling"
 
     @property
     def running(self) -> bool:
@@ -93,6 +112,10 @@ STARTED = "started"
 ALREADY_RUNNING = "already-running"
 HELD_ELSEWHERE = "held-elsewhere"
 NO_TOKEN = "no-token"
+FAILED = "failed"
+
+TRANSPORT_POLLING = "polling"
+TRANSPORT_WEBHOOK = "webhook"
 
 
 class TelegramService:
@@ -106,6 +129,9 @@ class TelegramService:
         gateway: SessionGateway | None = None,
         installation_id: str | None = None,
         cli_mirror: Callable[[str, str], None] | None = None,
+        transport_mode: str | None = None,
+        tunnel_factory: Callable[[str], CloudflaredQuickTunnel] | None = None,
+        webhook_ready_checker: Callable[[str], None] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         self.store = store or TelegramStateStore(self.workspace)
@@ -116,6 +142,9 @@ class TelegramService:
         self.authenticator = TelegramAuthenticator(self.store)
         self.status = RemoteControlStatus.DISABLED
         self.cli_mirror = cli_mirror
+        self.transport_mode = _normalize_transport_mode(transport_mode)
+        self.tunnel_factory = tunnel_factory or (lambda local_url: CloudflaredQuickTunnel(local_url))
+        self.webhook_ready_checker = webhook_ready_checker or wait_for_public_webhook
         self.token, self.token_source = (
             (token, "injected") if token is not None else load_telegram_bot_token(self.workspace)
         )
@@ -131,6 +160,8 @@ class TelegramService:
         )
         self._poll_task: asyncio.Task[Any] | None = None
         self._heartbeat_task: asyncio.Task[Any] | None = None
+        self._webhook_server: TelegramWebhookServer | None = None
+        self._cloudflare_tunnel: CloudflaredQuickTunnel | None = None
         self._control: Any = None
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self.approval_broker = TelegramApprovalBroker(
@@ -155,6 +186,8 @@ class TelegramService:
             workspace=self.workspace,
             formatter=self.formatter,
             approval_resolver=self.resolve_approval_callback,
+            voice_service=VoiceService(),
+            voice_downloader=self._download_telegram_file,
         )
 
     def set_cli_mirror(self, cli_mirror: Callable[[str, str], None] | None) -> None:
@@ -208,9 +241,15 @@ class TelegramService:
         self._loop = asyncio.get_running_loop()
         if self.transport is None:
             self.status = RemoteControlStatus.DISABLED
-            return PollerStart(NO_TOKEN, detail="Telegram is not configured.")
+            return PollerStart(
+                NO_TOKEN,
+                detail="Telegram is not configured.",
+                transport=self.transport_mode,
+            )
         if self._poll_task is not None and not self._poll_task.done():
-            return PollerStart(ALREADY_RUNNING)
+            return PollerStart(ALREADY_RUNNING, transport=self.transport_mode)
+        if self._webhook_server is not None:
+            return PollerStart(ALREADY_RUNNING, transport=self.transport_mode)
         if not self._claim_poller_lease():
             holder = self._poller_holder()
             self.status = RemoteControlStatus.DISABLED
@@ -218,13 +257,29 @@ class TelegramService:
                 HELD_ELSEWHERE,
                 holder_pid=holder.owner_pid if holder is not None else 0,
                 holder_surface=holder.owner_surface if holder is not None else "",
-                detail="Another SHAMSU process is already polling this bot.",
+                detail="Another SHAMSU process is already running this Telegram bot.",
+                transport=self.transport_mode,
             )
         self.store.set_meta(META_POLLER_WORKSPACE, str(self.workspace))
+        self.store.set_meta(META_TRANSPORT_MODE, self.transport_mode)
         self.status = RemoteControlStatus.STARTING
+        if self.transport_mode == TRANSPORT_WEBHOOK:
+            try:
+                await self._start_webhook()
+            except Exception as exc:  # noqa: BLE001 - startup failures are user-facing
+                self.status = RemoteControlStatus.ERROR
+                self._record_poll_error(exc)
+                await self._stop_webhook_runtime()
+                try:
+                    self._control_store().release_lease(MACHINE_LEASE_KEY, POLLER_SESSION)
+                except Exception:  # noqa: BLE001, S110 - a bad lease DB must not hide startup error
+                    pass
+                return PollerStart(FAILED, detail=str(exc), transport=self.transport_mode)
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            return PollerStart(STARTED, transport=self.transport_mode)
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        return PollerStart(STARTED)
+        return PollerStart(STARTED, transport=self.transport_mode)
 
     def _claim_poller_lease(self) -> bool:
         try:
@@ -267,6 +322,7 @@ class TelegramService:
                 pass
 
     async def stop(self) -> None:
+        await self._stop_webhook_runtime()
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
@@ -293,6 +349,77 @@ class TelegramService:
         if self.transport is not None:
             await self.transport.close()
         self.status = RemoteControlStatus.DISCONNECTED
+
+    async def _start_webhook(self) -> None:
+        assert self.transport is not None
+        assert self._loop is not None
+        secret = secrets.token_urlsafe(24)
+        host = os.environ.get(WEBHOOK_HOST_ENV_VAR, "127.0.0.1").strip() or "127.0.0.1"
+        server = TelegramWebhookServer(
+            host=host,
+            port=_webhook_port(),
+            path=f"/telegram/{secret}",
+            secret_token=secret,
+            loop=self._loop,
+            process_update=self.process_update,
+        )
+        server.start()
+        self._webhook_server = server
+        public_root = os.environ.get(WEBHOOK_URL_ENV_VAR, "").strip().rstrip("/")
+        if not public_root:
+            public_root = await self._start_cloudflare_tunnel(server.local_url)
+        if not public_root.startswith("https://"):
+            raise TelegramWebhookError("Telegram webhooks require an https URL.")
+        if self._cloudflare_tunnel is None:
+            await asyncio.to_thread(self.webhook_ready_checker, public_root)
+        webhook_url = f"{public_root}{server.webhook_url_path}"
+        await self.transport.set_webhook(
+            webhook_url,
+            secret_token=secret,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=False,
+        )
+        self.store.set_meta(META_WEBHOOK_URL, webhook_url)
+        self.store.set_meta(META_WEBHOOK_LOCAL_URL, server.local_url)
+        self.store.set_meta(META_WEBHOOK_STARTED_AT, utc_now())
+        self.status = (
+            RemoteControlStatus.CONNECTED
+            if self.store.authorized_users()
+            else RemoteControlStatus.WAITING_FOR_PAIR
+        )
+
+    async def _stop_webhook_runtime(self) -> None:
+        if self.transport is not None and self._webhook_server is not None:
+            try:
+                await self.transport.delete_webhook(drop_pending_updates=False)
+            except Exception:  # noqa: BLE001, S110 - shutdown should keep going
+                pass
+        server = self._webhook_server
+        tunnel = self._cloudflare_tunnel
+        self._webhook_server = None
+        self._cloudflare_tunnel = None
+        if server is not None:
+            await asyncio.to_thread(server.stop)
+        if tunnel is not None:
+            await asyncio.to_thread(tunnel.stop)
+
+    async def _start_cloudflare_tunnel(self, local_url: str) -> str:
+        attempts = _webhook_tunnel_attempts()
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            tunnel = self.tunnel_factory(local_url)
+            public_root = await asyncio.to_thread(tunnel.start)
+            try:
+                await asyncio.to_thread(self.webhook_ready_checker, public_root)
+            except Exception as exc:  # noqa: BLE001 - retry with a new quick-tunnel hostname
+                last_error = exc
+                await asyncio.to_thread(tunnel.stop)
+                if attempt + 1 >= attempts:
+                    break
+                continue
+            self._cloudflare_tunnel = tunnel
+            return public_root
+        raise TelegramWebhookError(str(last_error) if last_error else "Cloudflare tunnel did not start.")
 
     async def process_update(self, update: TelegramUpdate) -> None:
         if self._loop is None:
@@ -338,7 +465,7 @@ class TelegramService:
         if message.document is not None:
             return False
         text = (message.text or "").strip()
-        if not text:
+        if not text and message.voice is None:
             return False
         if _looks_like_pairing_code(text):
             return False
@@ -348,6 +475,11 @@ class TelegramService:
 
     def _background_ack(self, update: TelegramUpdate) -> OutboundMessage:
         assert update.message is not None
+        if update.message.voice is not None:
+            return OutboundMessage(
+                update.message.chat.chat_id,
+                "Voice received. SHAMSU is transcribing it now.\n\nUse /status anytime while it works.",
+            )
         return OutboundMessage(
             update.message.chat.chat_id,
             "Task received. SHAMSU is starting now.\n\nUse /status anytime while it works.",
@@ -393,6 +525,11 @@ class TelegramService:
             self._mirror_outbound(message)
         except Exception:
             self.store.increment_metric("telegram_send_failures")
+
+    async def _download_telegram_file(self, file: Any, destination: Path) -> Path:
+        if self.transport is None:
+            raise RuntimeError("Telegram transport is not running.")
+        return await self.transport.download_file(file, destination)
 
     def _notify_from_thread(self, message: OutboundMessage) -> None:
         if self._loop is None:
@@ -473,6 +610,12 @@ class TelegramService:
     def _status_from_store(self) -> RemoteControlStatus:
         if not self.token:
             return RemoteControlStatus.DISABLED
+        if self.status in {
+            RemoteControlStatus.ERROR,
+            RemoteControlStatus.STARTING,
+            RemoteControlStatus.DISCONNECTED,
+        }:
+            return self.status
         if self.store.authorized_users():
             return RemoteControlStatus.CONNECTED
         return self.status if self.status != RemoteControlStatus.DISABLED else RemoteControlStatus.WAITING_FOR_PAIR
@@ -486,8 +629,12 @@ class TelegramService:
                 "",
                 f"Status: {self._status_from_store().value}",
                 f"Owner: {owner}",
+                f"Transport: {self.transport_mode}",
                 f"Active remote users: {len(users)}",
                 "",
+                f"Webhook: {self.store.get_meta(META_WEBHOOK_URL, '-')}"
+                if self.transport_mode == TRANSPORT_WEBHOOK
+                else "Webhook: disabled",
                 f"Bot token: configured ({self.token_source})" if self.token else "Bot token: missing",
             ]
         )
@@ -509,6 +656,12 @@ class TelegramService:
             echo = getattr(self.cli_mirror, "prompt_echo", None)
             if as_prompt and callable(echo) and message.text:
                 echo(message.text, self._active_session_title(message.user.user_id))
+                return
+            if message.voice is not None:
+                self.cli_mirror(
+                    TELEGRAM_PANEL_TITLE,
+                    f"{message.user.display_name} sent a voice message.",
+                )
                 return
             if message.document is not None:
                 self.cli_mirror(
@@ -592,25 +745,54 @@ def poller_status(workspace: Path | None = None) -> dict[str, Any]:
     store = TelegramStateStore(resolved)
     metrics = store.metrics()
     users = store.authorized_users()
+    mode = store.get_meta(META_TRANSPORT_MODE, "") or _normalize_transport_mode(None)
     return {
         "configured": bool(token),
         "token_source": source if token else "missing",
-        # Stated rather than detected: SHAMSU has no webhook mode, and a page
-        # that left this ambiguous is what let a registered webhook go
-        # unnoticed in the first place.
-        "transport": "long polling",
+        "transport": "webhook" if mode == TRANSPORT_WEBHOOK else "long polling",
+        "transport_mode": mode,
         "running": holder is not None,
         "owner_pid": holder.owner_pid if holder is not None else 0,
         "owner_surface": holder.owner_surface if holder is not None else "",
         "since": holder.heartbeat if holder is not None else "",
         "is_this_process": bool(holder is not None and holder.is_mine),
         "workspace": store.get_meta(META_POLLER_WORKSPACE, ""),
+        "webhook_url": store.get_meta(META_WEBHOOK_URL, ""),
+        "webhook_local_url": store.get_meta(META_WEBHOOK_LOCAL_URL, ""),
+        "webhook_started_at": store.get_meta(META_WEBHOOK_STARTED_AT, ""),
         "paired_count": len(users),
         "messages_sent": int(metrics.get("telegram_messages_sent", 0)),
         "send_failures": int(metrics.get("telegram_send_failures", 0)),
         "last_error": store.get_meta(META_POLL_ERROR, ""),
         "last_error_at": store.get_meta(META_POLL_ERROR_AT, ""),
     }
+
+
+def _normalize_transport_mode(value: str | None) -> str:
+    raw = (value or os.environ.get(TRANSPORT_ENV_VAR, "") or TRANSPORT_POLLING).strip().lower()
+    if raw in {"webhook", "webhooks", "cloudflare", "cloudflare-tunnel"}:
+        return TRANSPORT_WEBHOOK
+    return TRANSPORT_POLLING
+
+
+def _webhook_port() -> int:
+    raw = os.environ.get(WEBHOOK_PORT_ENV_VAR, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _webhook_tunnel_attempts() -> int:
+    raw = os.environ.get(WEBHOOK_TUNNEL_ATTEMPTS_ENV_VAR, "").strip()
+    if not raw:
+        return 3
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 3
 
 
 def load_telegram_bot_token(workspace: Path) -> tuple[str, str]:

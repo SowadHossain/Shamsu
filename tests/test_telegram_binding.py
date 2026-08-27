@@ -13,6 +13,9 @@ moved this state to install scope and either could regress silently:
 from __future__ import annotations
 
 import asyncio
+import json
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -23,6 +26,7 @@ from shamsu.integrations.telegram.pairing import PairingManager
 from shamsu.integrations.telegram.service import POLLER_SESSION, TelegramService
 from shamsu.integrations.telegram.storage import TelegramStateStore
 from shamsu.integrations.telegram.transport import FakeTelegramTransport
+from shamsu.integrations.telegram.webhook import TelegramWebhookServer
 
 
 def workspace(tmp_path: Path, name: str) -> Path:
@@ -42,6 +46,20 @@ def pair_a_phone(store: TelegramStateStore) -> int:
     )
     assert result.ok
     return result.telegram_user_id
+
+
+def _post_webhook(url: str, payload: dict[str, object], secret: str) -> int:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Telegram-Bot-Api-Secret-Token": secret,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return int(response.status)
 
 
 def test_pairings_survive_a_change_of_workspace(tmp_path: Path) -> None:
@@ -82,6 +100,20 @@ def service_with_fake_transport(project: Path) -> TelegramService:
     return TelegramService(project, transport=FakeTelegramTransport(), token="123456:AAH-fake")
 
 
+class FakeTunnel:
+    def __init__(self, local_url: str) -> None:
+        self.local_url = local_url
+        self.started = False
+        self.stopped = False
+
+    def start(self) -> str:
+        self.started = True
+        return "https://shamsu-test.trycloudflare.com"
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
 def test_starting_the_poller_takes_the_install_wide_lease(tmp_path: Path) -> None:
     project = workspace(tmp_path, "alpha")
     service = service_with_fake_transport(project)
@@ -96,6 +128,95 @@ def test_starting_the_poller_takes_the_install_wide_lease(tmp_path: Path) -> Non
 
     asyncio.run(run())
     assert ControlStore().lease_holder(MACHINE_LEASE_KEY, POLLER_SESSION) is None
+
+
+def test_webhook_mode_registers_telegram_webhook_and_cloudflare_tunnel(tmp_path: Path) -> None:
+    project = workspace(tmp_path, "alpha")
+    transport = FakeTelegramTransport()
+    tunnels: list[FakeTunnel] = []
+
+    def tunnel_factory(local_url: str) -> FakeTunnel:
+        tunnel = FakeTunnel(local_url)
+        tunnels.append(tunnel)
+        return tunnel
+
+    service = TelegramService(
+        project,
+        transport=transport,
+        token="123456:AAH-fake",
+        transport_mode="webhook",
+        tunnel_factory=tunnel_factory,
+        webhook_ready_checker=lambda _url: None,
+    )
+
+    async def run() -> None:
+        started = await service.start()
+        assert started.outcome == "started"
+        assert started.transport == "webhook"
+        assert transport.webhook_url.startswith("https://shamsu-test.trycloudflare.com/telegram/")
+        assert transport.webhook_secret
+        assert tunnels and tunnels[0].started
+        assert tunnels[0].local_url.startswith("http://127.0.0.1:")
+        assert service.store.get_meta("telegram_webhook_url") == transport.webhook_url
+        assert service.store.get_meta("telegram_transport_mode") == "webhook"
+        await service.stop()
+
+    asyncio.run(run())
+
+    assert transport.webhook_deleted
+    assert tunnels[0].stopped
+    assert ControlStore().lease_holder(MACHINE_LEASE_KEY, POLLER_SESSION) is None
+
+
+def test_webhook_server_accepts_telegram_updates_with_secret() -> None:
+    received: list[int] = []
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+
+        async def process(update) -> None:
+            received.append(update.update_id)
+
+        server = TelegramWebhookServer(
+            host="127.0.0.1",
+            port=0,
+            path="/telegram/secret",
+            secret_token="secret",
+            loop=loop,
+            process_update=process,
+        )
+        server.start()
+        try:
+            payload = {
+                "update_id": 44,
+                "message": {
+                    "message_id": 1,
+                    "from": {"id": 7, "first_name": "Ada"},
+                    "chat": {"id": 7, "type": "private"},
+                    "text": "/status",
+                },
+            }
+            ok = await asyncio.to_thread(
+                _post_webhook,
+                f"{server.local_url}/telegram/secret",
+                payload,
+                "secret",
+            )
+            assert ok == 200
+            with pytest.raises(urllib.error.HTTPError) as exc_info:
+                await asyncio.to_thread(
+                    _post_webhook,
+                    f"{server.local_url}/telegram/secret",
+                    payload | {"update_id": 45},
+                    "wrong",
+                )
+            assert exc_info.value.code == 403
+        finally:
+            await asyncio.to_thread(server.stop)
+
+    asyncio.run(scenario())
+
+    assert received == [44]
 
 
 def test_the_bound_workspace_is_recorded_where_another_process_can_read_it(

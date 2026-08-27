@@ -85,6 +85,7 @@ class TelegramMessage:
     text: str = ""
     date: str = field(default_factory=utc_now)
     document: TelegramFile | None = None
+    voice: TelegramFile | None = None
 
 
 @dataclass(frozen=True)

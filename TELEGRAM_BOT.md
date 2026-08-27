@@ -7,6 +7,12 @@ drive SHAMSU, and how the bot and the local SHAMSU application run concurrently
 All code referenced lives in `shamsu/integrations/telegram/` (16 modules) unless
 stated otherwise. Tests: `tests/test_telegram_remote_control.py` (30 tests).
 
+> Current transport note: `/remote_control` now starts webhook mode by default.
+> SHAMSU opens a local webhook receiver, publishes it with
+> `cloudflared tunnel --url ...`, and registers that HTTPS URL with Telegram.
+> The old outbound-only `getUpdates` transport remains available with
+> `/remote_control polling`.
+
 ---
 
 ## 1. How the Telegram bot is implemented
