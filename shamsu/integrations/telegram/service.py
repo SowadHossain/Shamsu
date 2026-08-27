@@ -250,6 +250,13 @@ class TelegramService:
             return PollerStart(ALREADY_RUNNING, transport=self.transport_mode)
         if self._webhook_server is not None:
             return PollerStart(ALREADY_RUNNING, transport=self.transport_mode)
+        try:
+            await self.transport.get_me()
+        except Exception as exc:  # noqa: BLE001 - invalid tokens must be visible at startup
+            self.status = RemoteControlStatus.ERROR
+            message = f"Telegram bot token check failed: {exc}"
+            self._record_poll_error(RuntimeError(message))
+            return PollerStart(FAILED, detail=message, transport=self.transport_mode)
         if not self._claim_poller_lease():
             holder = self._poller_holder()
             self.status = RemoteControlStatus.DISABLED

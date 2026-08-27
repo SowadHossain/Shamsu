@@ -221,12 +221,13 @@ class LocalTelegramBridgeManager:
             thread = self._thread
         if loop is None or service is None:
             return
-        future = asyncio.run_coroutine_threadsafe(service.stop(), loop)
-        try:
-            future.result(timeout=5)
-        except Exception:
-            pass
-        loop.call_soon_threadsafe(loop.stop)
+        if not loop.is_closed():
+            future = asyncio.run_coroutine_threadsafe(service.stop(), loop)
+            try:
+                future.result(timeout=5)
+            except Exception:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
         if thread is not None:
             thread.join(timeout=5)
         with self._lock:
@@ -234,6 +235,8 @@ class LocalTelegramBridgeManager:
             # a dead thread and a stopped loop it cannot schedule onto.
             self._loop = None
             self._thread = None
+            self._service = None
+            self._workspace = None
 
     def rebind(
         self, workspace: Path, console: Console | None = None, *, remember: bool = True
@@ -277,14 +280,25 @@ class LocalTelegramBridgeManager:
             result = loop.run_until_complete(service.start())
         except Exception as exc:  # noqa: BLE001
             outcome.put(PollerStart(NO_TOKEN, detail=f"{type(exc).__name__}: {exc}"))
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(service.stop())
             return
         outcome.put(result)
         if not result.running:
             # Somebody else owns the bot. Spinning an empty event loop forever
             # would leave a thread that looks alive and polls nothing, and the
             # next start() would refuse on the strength of it.
+            if result.outcome == FAILED:
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(service.stop())
             return
-        loop.run_forever()
+        try:
+            loop.run_forever()
+        finally:
+            with contextlib.suppress(Exception):
+                loop.run_until_complete(service.stop())
+            with contextlib.suppress(Exception):
+                loop.close()
 
 
 _MANAGER = LocalTelegramBridgeManager()
@@ -341,8 +355,11 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
             console.print(Panel(str(exc), title="Remote Control", border_style="red"))
             return
         _MANAGER.stop()
-        service = _MANAGER.reload_service(workspace, console, transport_mode=DEFAULT_TRANSPORT_MODE)
-        started = _MANAGER.start(workspace, console, transport_mode=DEFAULT_TRANSPORT_MODE)
+        service, started, fallback_note = _start_with_optional_polling_fallback(
+            workspace,
+            console,
+            transport_mode=DEFAULT_TRANSPORT_MODE,
+        )
         scope_note = (
             "It applies to every project until you change it."
             if install_scope
@@ -360,7 +377,7 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
             border = "yellow"
             body += _startup_in_progress_message(started)
         else:
-            body += _connect_success_message(service)
+            body += f"{fallback_note}{_connect_success_message(service)}"
         console.print(
             Panel(
                 body,
@@ -376,8 +393,11 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
         console.print(Panel(panel.message, title="Remote Control"))
         return
     if subcommand in {"", "connect", "repair"}:
-        service = _MANAGER.service_for(workspace, console, transport_mode=transport_mode)
-        started = _MANAGER.start(workspace, console, transport_mode=transport_mode)
+        service, started, fallback_note = _start_with_optional_polling_fallback(
+            workspace,
+            console,
+            transport_mode=transport_mode,
+        )
         if started.outcome == HELD_ELSEWHERE:
             # Worth saying out loud. Telegram allows one `getUpdates` caller per
             # token; the loser is refused with 409 and would otherwise sit there
@@ -388,7 +408,7 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
         elif started.detail == "starting":
             message = _startup_in_progress_message(started)
         else:
-            message = _connect_success_message(service)
+            message = f"{fallback_note}{_connect_success_message(service)}"
     else:
         service = _MANAGER.service_for(workspace, console, transport_mode=transport_mode)
         panel = service.local_panel(subcommand)
@@ -396,10 +416,62 @@ def handle_remote_control_command(user_input: str, workspace: Path, console: Con
     console.print(Panel(message, title="Remote Control"))
 
 
+def _start_with_optional_polling_fallback(
+    workspace: Path,
+    console: Console | None,
+    *,
+    transport_mode: str,
+) -> tuple[TelegramService, PollerStart, str]:
+    service = _MANAGER.service_for(workspace, console, transport_mode=transport_mode)
+    started = _MANAGER.start(workspace, console, transport_mode=transport_mode) or PollerStart(
+        STARTED,
+        transport=transport_mode,
+    )
+    if (
+        transport_mode != TRANSPORT_WEBHOOK
+        or started.outcome != FAILED
+        or not _webhook_failure_can_fallback(started.detail)
+    ):
+        return service, started, ""
+    _MANAGER.stop()
+    service = _MANAGER.reload_service(workspace, console, transport_mode=TRANSPORT_POLLING)
+    fallback = _MANAGER.start(workspace, console, transport_mode=TRANSPORT_POLLING) or PollerStart(
+        STARTED,
+        transport=TRANSPORT_POLLING,
+    )
+    if not fallback.running:
+        return service, fallback, f"Webhook setup failed first:\n{started.detail}\n\n"
+    return (
+        service,
+        fallback,
+        "Webhook setup failed, so SHAMSU fell back to long polling.\n"
+        f"Webhook error: {started.detail}\n\n",
+    )
+
+
+def _webhook_failure_can_fallback(detail: str) -> bool:
+    lowered = detail.lower()
+    if "unauthorized" in lowered or "token" in lowered:
+        return False
+    return any(
+        phrase in lowered
+        for phrase in (
+            "bad webhook",
+            "cloudflare",
+            "cloudflared",
+            "failed to resolve host",
+            "not reachable",
+            "webhooks require an https url",
+        )
+    )
+
+
 def _connect_success_message(service: TelegramService) -> str:
-    if service.store.authorized_users():
+    store = getattr(service, "store", None)
+    if store is not None and store.authorized_users():
         return service.local_panel("status").message
-    return service.local_panel("").message
+    subcommand = "" if store is not None else "status"
+    return service.local_panel(subcommand).message
 
 
 def _held_elsewhere_message(started: PollerStart) -> str:

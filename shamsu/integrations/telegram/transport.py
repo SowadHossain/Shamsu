@@ -39,6 +39,10 @@ class TelegramTransport(ABC):
     async def download_file(self, file: TelegramFile, destination: Path) -> Path:
         raise NotImplementedError("This Telegram transport cannot download files.")
 
+    async def get_me(self) -> dict[str, Any]:
+        """Return the Telegram bot identity if the token is usable."""
+        return {}
+
     async def set_webhook(
         self,
         url: str,
@@ -116,6 +120,10 @@ class TelegramBotApiTransport(TelegramTransport):
 
     async def chat_action(self, chat_id: int, action: str = "typing") -> None:
         await self._api("sendChatAction", {"chat_id": chat_id, "action": action})
+
+    async def get_me(self) -> dict[str, Any]:
+        result = await self._api("getMe", {})
+        return result if isinstance(result, dict) else {}
 
     async def _send_document(self, message: OutboundMessage) -> int:
         path = message.document_path
@@ -218,6 +226,9 @@ class FakeTelegramTransport(TelegramTransport):
 
     async def chat_action(self, chat_id: int, action: str = "typing") -> None:
         self.actions.append((int(chat_id), action))
+
+    async def get_me(self) -> dict[str, Any]:
+        return {"id": 1, "is_bot": True, "username": "fake_shamsu_bot"}
 
     async def download_file(self, file: TelegramFile, destination: Path) -> Path:
         data = self.files.get(file.file_id)

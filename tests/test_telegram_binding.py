@@ -114,6 +114,11 @@ class FakeTunnel:
         self.stopped = True
 
 
+class InvalidTokenTransport(FakeTelegramTransport):
+    async def get_me(self) -> dict[str, object]:
+        raise RuntimeError("Telegram getMe failed: Unauthorized")
+
+
 def test_starting_the_poller_takes_the_install_wide_lease(tmp_path: Path) -> None:
     project = workspace(tmp_path, "alpha")
     service = service_with_fake_transport(project)
@@ -128,6 +133,22 @@ def test_starting_the_poller_takes_the_install_wide_lease(tmp_path: Path) -> Non
 
     asyncio.run(run())
     assert ControlStore().lease_holder(MACHINE_LEASE_KEY, POLLER_SESSION) is None
+
+
+def test_start_fails_fast_when_the_bot_token_is_invalid(tmp_path: Path) -> None:
+    project = workspace(tmp_path, "alpha")
+    transport = InvalidTokenTransport()
+    service = TelegramService(project, transport=transport, token="123456:AAH-fake")
+
+    async def run() -> None:
+        started = await service.start()
+        assert started.outcome == "failed"
+        assert "Unauthorized" in started.detail
+
+    asyncio.run(run())
+
+    assert ControlStore().lease_holder(MACHINE_LEASE_KEY, POLLER_SESSION) is None
+    assert "Unauthorized" in service.store.get_meta("last_poll_error")
 
 
 def test_webhook_mode_registers_telegram_webhook_and_cloudflare_tunnel(tmp_path: Path) -> None:
