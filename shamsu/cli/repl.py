@@ -8265,10 +8265,12 @@ def _bugfix_report_from_last_failure(
 
 
 _FILE_WRITE_VERBS = {
+    "build",
     "create",
     "write",
     "save",
     "generate",
+    "implement",
     "make",
     "add",
     "edit",
@@ -8294,11 +8296,24 @@ _FILE_HINT_WORDS = {
     "env",
     "npmrc",
     "config",
+    "app",
+    "game",
+    "site",
+    "website",
+    "tool",
     "page",
     "class",
     "test",
     "tests",
 }
+
+_ACTION_QUESTION_RE = re.compile(
+    r"^\s*(?:can|could|would)\s+you\s+"
+    r"(?:please\s+)?"
+    r"(?:build|create|write|save|generate|implement|make|add|edit|update|modify|"
+    r"overwrite|fix|repair|change)\b",
+    re.IGNORECASE,
+)
 
 _FILELIKE_RE = re.compile(
     r"(?:^|\s|['\"`@])(?:[A-Za-z0-9_. -]+[/\\])*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}(?:\s|$|['\"`,.;:])"
@@ -8328,7 +8343,9 @@ def _looks_like_file_write_request(user_input: str) -> bool:
     safe write_file tool. Questions still stay on QA.
     """
     raw = user_input.strip().lower()
-    if not raw or raw.endswith("?"):
+    if not raw:
+        return False
+    if raw.endswith("?") and not _ACTION_QUESTION_RE.search(user_input):
         return False
     if any(raw.startswith(prefix) for prefix in _QUESTION_PREFIXES):
         return False

@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -970,3 +971,44 @@ def test_listing_workspaces_does_not_read_every_thread(portal, monkeypatch):
     assert summary["session_count"] == 5
     # A count and a timestamp, not a session list.
     assert "sessions" not in summary
+
+
+def test_new_thread_route_can_target_a_workspace_just_added(portal, tmp_path):
+    """The server has enough information to create the thread in the added project."""
+    added = tmp_path / "added"
+    added.mkdir()
+
+    status, payload = _post(portal, "/api/workspaces", {"path": str(added)})
+    assert status == 201
+
+    workspace_id = payload["workspace"]["id"]
+    status, created = _post(
+        portal,
+        f"/api/workspaces/{workspace_id}/sessions",
+        {"title": "from added"},
+    )
+    assert status == 201
+    assert created["session"]["title"] == "from added"
+
+    assert SessionManager(portal.workspace).list_sessions() == []
+    assert [item.title for item in SessionManager(added).list_sessions()] == ["from added"]
+
+
+def test_client_selects_an_added_workspace_before_new_thread():
+    """Regression for the web flow: add workspace, then press New thread."""
+    source = Path("shamsu/webui/static/app.js").read_text(encoding="utf-8")
+    add_workspace = source[
+        source.index("async function addWorkspace") : source.index(
+            "/* --- settings", source.index("async function addWorkspace")
+        )
+    ]
+    new_thread = source[
+        source.index("async function newThread") : source.index(
+            "async function addWorkspace", source.index("async function newThread")
+        )
+    ]
+
+    assert "await openWorkspace(workspace);" in add_workspace
+    assert "const workspace = state.workspace || state.workspaces[0];" in new_thread
+    assert "const freshWorkspace = state.workspaces.find" in new_thread
+    assert "await openSession(session, freshWorkspace);" in new_thread

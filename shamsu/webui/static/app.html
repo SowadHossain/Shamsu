@@ -26,13 +26,15 @@
       </button>
     </footer>
   </aside>
+  <div id="rail-scrim" aria-hidden="true"></div>
 
   <main id="main">
     <header id="thread-head">
       <!-- The toggle lives HERE, not in the sidebar. Inside the sidebar it
            vanished along with the thing it was meant to bring back. -->
       <button id="rail-toggle" class="icon-btn" title="Toggle sidebar"
-              aria-label="Toggle sidebar">&#9776;</button>
+              aria-label="Toggle sidebar" aria-controls="sidebar"
+              aria-expanded="true">&#9776;</button>
       <div class="head-left">
         <h1 id="thread-title">SHAMSU</h1>
         <span id="thread-sub"></span>
@@ -46,10 +48,7 @@
     <div id="scroller">
       <div id="conversation">
         <div id="welcome" class="welcome">
-          <h2>Pick a thread, or start one</h2>
-          <p>Every workspace SHAMSU has opened is on the left, most recent first.
-             A thread runs the same whether you drive it from here, the terminal,
-             or Telegram. Type <code>/</code> for commands.</p>
+          <h2>No thread selected</h2>
         </div>
       </div>
     </div>
@@ -69,9 +68,7 @@
           </svg>
         </button>
       </form>
-      <p class="composer-hint" id="composer-hint">
-        Enter to send &middot; Shift+Enter for a new line &middot; / for commands
-      </p>
+      <p class="composer-hint" id="composer-hint" aria-live="polite"></p>
     </div>
   </main>
 

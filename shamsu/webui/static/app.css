@@ -28,7 +28,7 @@
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --rail: 252px;
-  --measure: 44rem;
+  --measure: 52rem;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -71,10 +71,12 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 #app.rail-hidden { grid-template-columns: 0 minmax(0, 1fr); }
 #app.rail-hidden #sidebar { display: none; }
+#rail-scrim { display: none; }
 
 /* --- sidebar ---------------------------------------------------------- */
 
 #sidebar {
+  grid-column: 1;
   background: var(--bg-rail);
   border-right: 1px solid var(--line);
   display: flex;
@@ -82,7 +84,13 @@ button, input, textarea { font: inherit; color: inherit; }
   min-height: 0;
 }
 
-.rail-head { display: flex; align-items: center; gap: 9px; padding: 13px 12px 6px; }
+.rail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+  padding: 13px 12px 8px;
+}
 
 .mark {
   font-family: var(--mono);
@@ -96,9 +104,14 @@ button, input, textarea { font: inherit; color: inherit; }
   background: none;
   color: var(--ink-faint);
   cursor: pointer;
-  padding: 3px 6px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  padding: 0;
   border-radius: 5px;
   line-height: 1;
+  flex: none;
 }
 .icon-btn:hover { background: var(--bg-sunken); color: var(--ink); }
 
@@ -135,6 +148,7 @@ button, input, textarea { font: inherit; color: inherit; }
   color: var(--ink-faint);
 }
 .ws:hover { background: var(--bg-sunken); color: var(--ink-dim); }
+.ws[aria-current="true"] { color: var(--ink); background: var(--bg-sunken); }
 .ws-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws .count { font-variant-numeric: tabular-nums; opacity: 0.7; }
 
@@ -185,12 +199,21 @@ button, input, textarea { font: inherit; color: inherit; }
 
 /* --- main ------------------------------------------------------------- */
 
-#main { display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
+#main {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+}
 
 #thread-head {
   display: flex; align-items: center; gap: 12px;
+  min-height: 58px;
   padding: 12px 20px;
   border-bottom: 1px solid var(--line-soft);
+  background: var(--bg);
 }
 .head-left { flex: 1; min-width: 0; }
 .head-right { display: flex; align-items: center; gap: 8px; flex: none; }
@@ -207,7 +230,15 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .ghost-btn:hover { border-color: var(--accent); color: var(--accent); }
 #thread-title { margin: 0; font-size: 14px; font-weight: 600; }
-#thread-sub { display: block; font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); }
+#thread-sub {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .pill {
   font-family: var(--mono);
@@ -220,7 +251,7 @@ button, input, textarea { font: inherit; color: inherit; }
 }
 .pill.running { background: var(--accent-soft); color: var(--accent); }
 
-#scroller { overflow-y: auto; flex: 1; min-height: 0; padding: 22px 26px 8px; scroll-behavior: smooth; }
+#scroller { overflow-y: auto; flex: 1; min-height: 0; padding: 24px 28px 10px; scroll-behavior: smooth; }
 
 #conversation {
   max-width: var(--measure);
@@ -230,9 +261,14 @@ button, input, textarea { font: inherit; color: inherit; }
   gap: 20px;
 }
 
-.welcome { text-align: center; padding: 14vh 0; color: var(--ink-faint); }
-.welcome h2 { font-size: 16px; font-weight: 500; color: var(--ink-dim); margin: 0 0 8px; }
-.welcome p { margin: 0 auto; max-width: 32rem; font-size: 13.5px; }
+.welcome {
+  min-height: 42vh;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  color: var(--ink-faint);
+}
+.welcome h2 { font-size: 15px; font-weight: 500; color: var(--ink-dim); margin: 0; }
 
 /* Chat bubbles, the way every chat client does them: you on the right in a
  * tinted bubble, the agent on the left in a plain one. Claude's typeface and
@@ -244,7 +280,7 @@ button, input, textarea { font: inherit; color: inherit; }
 .msg.assistant { align-items: flex-start; }
 
 .msg .body {
-  max-width: 82%;
+  max-width: min(82%, 42rem);
   padding: 10px 15px;
   border-radius: 16px;
   white-space: pre-wrap;
@@ -269,7 +305,7 @@ button, input, textarea { font: inherit; color: inherit; }
 
 .turn {
   align-self: flex-start;
-  max-width: 82%;
+  max-width: min(88%, 46rem);
   border-left: 2px solid var(--line);
   padding: 2px 0 2px 13px;
 }
@@ -320,7 +356,7 @@ button, input, textarea { font: inherit; color: inherit; }
 .approval h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; }
 .approval .what { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
 .approval .meta { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); }
-.approval .row { display: flex; gap: 7px; }
+.approval .row { display: flex; flex-wrap: wrap; gap: 7px; }
 
 .btn {
   border: 1px solid var(--line);
@@ -385,15 +421,35 @@ button, input, textarea { font: inherit; color: inherit; }
 
 .composer-hint {
   max-width: var(--measure); margin: 6px auto 0;
+  min-height: 18px;
   font-size: 11.5px; color: var(--ink-faint); text-align: center;
 }
 
 @media (max-width: 820px) {
   #app { grid-template-columns: minmax(0, 1fr); }
-  #sidebar { position: fixed; inset: 0 auto 0 0; width: 84vw; max-width: var(--rail); z-index: 20; }
+  #main { grid-column: 1; }
+  #sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: 84vw;
+    max-width: var(--rail);
+    z-index: 20;
+    box-shadow: 12px 0 28px rgba(0, 0, 0, 0.18);
+  }
+  #rail-scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 15;
+    background: rgba(0, 0, 0, 0.28);
+  }
+  #app.rail-open #rail-scrim { display: block; }
   #app:not(.rail-open) #sidebar { display: none; }
+  #app.rail-hidden { grid-template-columns: minmax(0, 1fr); }
   #scroller, #composer-wrap { padding-left: 14px; padding-right: 14px; }
   #thread-head { padding: 11px 14px; }
+  .head-right { gap: 6px; }
+  .ghost-btn { padding: 4px 9px; }
+  .msg .body, .turn { max-width: 100%; }
 }
 
 

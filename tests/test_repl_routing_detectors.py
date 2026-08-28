@@ -300,7 +300,11 @@ def test_vague_action_request(text, expected):
         ("create hello.py", True),
         ("create a config file", True),
         ("write a new test", True),
+        ("Can you build me a snake game?", True),
+        ("try again and make me a snake game", True),
+        ("build me an app", True),
         ("what is hello.py", False),          # question prefix
+        ("do we need to update config?", False),
         ("how are you", False),
         ("explain the build script", False),  # question prefix, no write intent
     ],

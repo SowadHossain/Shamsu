@@ -1185,6 +1185,7 @@ class TuiApp:
         if self._voice_state == "recording":
             self.echo("voice: already listening - press F5 to submit", KIND_NOTICE)
             return
+        self._stop_voice_output()
         try:
             recorder = self._ensure_voice_recorder()
             recorder.start()
@@ -1295,6 +1296,13 @@ class TuiApp:
 
                 self._voice_output = SpeechPlayer()
         return self._voice_output
+
+    def _stop_voice_output(self) -> None:
+        speaker = self._voice_output
+        stop = getattr(speaker, "stop", None)
+        if callable(stop):
+            with contextlib.suppress(Exception):
+                stop()
 
     # -- approvals ---------------------------------------------------------
 

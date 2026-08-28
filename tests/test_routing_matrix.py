@@ -109,6 +109,8 @@ PLAIN_CASES: list[tuple[str, str]] = [
     ("show me the files", "workspace.files"),
     ("create hello.py", "file.write"),
     ("write a new test file", "file.write"),
+    ("Can you build me a snake game?", "file.write"),
+    ("try again and make me a snake game", "file.write"),
     ("write python code to print the first 100 primes", "direct_code"),
     ("write a function to reverse a string", "direct_code"),
     ("commit the current changes", "git"),

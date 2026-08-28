@@ -38,17 +38,23 @@ class WhisperTranscriber:
         )
         self._model: Any = None
 
-    def transcribe(self, audio_path: Path) -> Transcript:
+    def transcribe(self, audio_path: Path, *, retry_without_vad: bool = False) -> Transcript:
         model = self._load_model()
         try:
-            segments, info = model.transcribe(
-                str(audio_path),
-                language="en",
-                vad_filter=True,
-            )
-            text = " ".join(segment.text.strip() for segment in segments).strip()
+            transcript = self._transcribe_once(model, audio_path, vad_filter=True)
+            if not transcript.text.strip() and retry_without_vad:
+                transcript = self._transcribe_once(model, audio_path, vad_filter=False)
         except Exception as exc:
             raise VoiceError(f"Whisper transcription failed: {exc}") from exc
+        return transcript
+
+    def _transcribe_once(self, model: Any, audio_path: Path, *, vad_filter: bool) -> Transcript:
+        segments, info = model.transcribe(
+            str(audio_path),
+            language="en",
+            vad_filter=vad_filter,
+        )
+        text = " ".join(segment.text.strip() for segment in segments).strip()
         duration = float(getattr(info, "duration", 0.0) or 0.0)
         language = str(getattr(info, "language", "en") or "en")
         return Transcript(text=text, language=language, duration_seconds=duration)

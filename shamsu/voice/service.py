@@ -4,7 +4,7 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from shamsu.voice.audio import normalize_for_whisper
+from shamsu.voice.audio import normalize_for_whisper, wav_signal_stats
 from shamsu.voice.models import Transcript, VoiceError
 from shamsu.voice.whisper import WhisperTranscriber
 
@@ -22,7 +22,13 @@ class VoiceService:
         with tempfile.TemporaryDirectory(prefix="shamsu-voice-") as directory:
             wav_path = Path(directory) / "input.wav"
             normalize_for_whisper(source, wav_path)
-            transcript = self.transcriber.transcribe(wav_path)
+            stats = wav_signal_stats(wav_path)
+            transcript = self.transcriber.transcribe(
+                wav_path,
+                retry_without_vad=stats.has_voice_level,
+            )
         if not transcript.text.strip():
+            if not stats.has_voice_level:
+                raise VoiceError("Voice recording was too quiet or empty.")
             raise VoiceError("Whisper did not hear any English speech.")
         return transcript

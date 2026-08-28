@@ -6,6 +6,7 @@ import platform
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 
 from shamsu.voice.models import VoiceError
@@ -37,6 +38,8 @@ class SpeechPlayer:
 
     def __init__(self, settings: SpeechSettings | None = None) -> None:
         self.settings = settings or load_speech_settings()
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[str] | None = None
 
     def speak(self, text: str) -> None:
         if not self.settings.enabled:
@@ -46,15 +49,52 @@ class SpeechPlayer:
             return
         system = platform.system().lower()
         if system == "windows":
-            _speak_windows(spoken, self.settings)
+            command, env = _windows_command(spoken, self.settings)
+            self._run(command, env=env)
             return
         if system == "darwin" and shutil.which("say"):
-            _run(["say", spoken])
+            self._run(["say", spoken])
             return
         if shutil.which("spd-say"):
-            _run(["spd-say", spoken])
+            self._run(["spd-say", spoken])
             return
         raise VoiceError("Voice output needs Windows SAPI, macOS say, or Linux spd-say.")
+
+    def stop(self) -> None:
+        with self._lock:
+            process = self._process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    def _run(self, command: list[str], *, env: dict[str, str] | None = None) -> None:
+        self.stop()
+        try:
+            process = subprocess.Popen(
+                command,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise VoiceError(f"Voice output command was not found: {command[0]}") from exc
+        with self._lock:
+            self._process = process
+        try:
+            _stdout, stderr = process.communicate()
+        finally:
+            with self._lock:
+                if self._process is process:
+                    self._process = None
+        if process.returncode:
+            detail = (stderr or "").strip()
+            raise VoiceError(f"Voice output failed: {detail[:300] or command[0]}")
 
 
 def load_speech_settings() -> SpeechSettings:
@@ -80,7 +120,7 @@ def prepare_spoken_text(text: str, *, max_chars: int = 900) -> str:
     return clean[:max_chars].rsplit(" ", 1)[0].rstrip() + "."
 
 
-def _speak_windows(text: str, settings: SpeechSettings) -> None:
+def _windows_command(text: str, settings: SpeechSettings) -> tuple[list[str], dict[str, str]]:
     script = """
 Add-Type -AssemblyName System.Speech
 $speaker = New-Object System.Speech.Synthesis.SpeechSynthesizer
@@ -99,24 +139,7 @@ $speaker.Dispose()
         "SHAMSU_VOICE_VOLUME_CURRENT": str(settings.volume),
         "SHAMSU_VOICE_NAME_CURRENT": settings.voice_name,
     }
-    _run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script], env=env)
-
-
-def _run(command: list[str], *, env: dict[str, str] | None = None) -> None:
-    try:
-        subprocess.run(
-            command,
-            env=env,
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise VoiceError(f"Voice output command was not found: {command[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or "").strip()
-        raise VoiceError(f"Voice output failed: {detail[:300] or command[0]}") from exc
+    return ["powershell", "-NoProfile", "-NonInteractive", "-Command", script], env
 
 
 def _env_enabled(name: str, *, default: bool) -> bool:

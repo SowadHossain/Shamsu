@@ -94,9 +94,19 @@ function rememberGroups(open) {
   }
 }
 
+function rememberOpenWorkspace(workspaceId) {
+  const open = openGroups();
+  open.add(workspaceId);
+  rememberGroups(open);
+}
+
 async function loadWorkspaces() {
   const { workspaces } = await api("/api/workspaces");
   state.workspaces = workspaces;
+  if (state.workspace) {
+    state.workspace =
+      workspaces.find((workspace) => workspace.id === state.workspace.id) || state.workspace;
+  }
   const tree = el("tree");
   tree.replaceChildren();
 
@@ -121,6 +131,7 @@ async function loadWorkspaces() {
     const header = document.createElement("button");
     header.type = "button";
     header.className = "ws";
+    header.dataset.workspaceId = workspace.id;
     const chevron = document.createElement("span");
     chevron.className = "chev";
     chevron.textContent = "\u203a";
@@ -141,6 +152,7 @@ async function loadWorkspaces() {
     if (shouldOpen) loadGroup(workspace, body);
 
     header.addEventListener("click", () => {
+      selectWorkspace(workspace);
       const nowOpen = !group.classList.contains("open");
       setGroupOpen(group, nowOpen);
       const remembered = openGroups();
@@ -156,6 +168,7 @@ async function loadWorkspaces() {
     group.append(header, body);
     tree.append(group);
   });
+  markActiveWorkspace();
 }
 
 function setGroupOpen(group, open) {
@@ -262,6 +275,49 @@ function applyFilter() {
   }
 }
 
+async function openWorkspace(workspace) {
+  selectWorkspace(workspace);
+  const group = document.querySelector(`.group[data-workspace-id="${workspace.id}"]`);
+  if (!group) return;
+  const body = group.querySelector(".group-body");
+  setGroupOpen(group, true);
+  if (body && !body.dataset.loaded) await loadGroup(workspace, body);
+}
+
+function selectWorkspace(workspace) {
+  state.workspace = workspace;
+  state.session = null;
+  state.base = "";
+  state.turnId = "";
+  state.pendingNew = 0;
+  updateJump();
+  rememberOpenWorkspace(workspace.id);
+  markActiveWorkspace();
+  el("thread-title").textContent = workspace.name;
+  el("thread-sub").textContent = workspace.path;
+  el("conversation").replaceChildren(workspaceEmpty(workspace));
+}
+
+function markActiveWorkspace() {
+  for (const header of document.querySelectorAll(".ws")) {
+    header.setAttribute(
+      "aria-current",
+      String(Boolean(state.workspace) && header.dataset.workspaceId === state.workspace.id),
+    );
+  }
+}
+
+function workspaceEmpty(workspace) {
+  const empty = document.createElement("div");
+  empty.className = "welcome";
+  const title = document.createElement("h2");
+  title.textContent = workspace.session_count
+    ? "No thread selected"
+    : "No threads in this workspace";
+  empty.append(title);
+  return empty;
+}
+
 /* --- opening a thread --------------------------------------------------- */
 
 async function openSession(session, workspace) {
@@ -278,6 +334,7 @@ async function openSession(session, workspace) {
       String(button.dataset.sessionId === session.session_id),
     );
   }
+  markActiveWorkspace();
   el("thread-title").textContent = session.title || session.session_id;
   el("thread-sub").textContent = workspace.path;
   el("prompt").disabled = false;
@@ -289,6 +346,7 @@ async function openSession(session, workspace) {
   scrollToBottom(true);
   subscribe();
   refreshQueue();
+  closeMobileRail();
 }
 
 function renderMessages(messages) {
@@ -347,7 +405,7 @@ function bubble(role, content, meta) {
   if (marks.length) {
     const tag = document.createElement("span");
     tag.className = "from";
-    tag.textContent = marks.join(" · ");
+    tag.textContent = marks.join(" / ");
     block.append(tag);
   }
   const steps = Array.isArray(info.steps) ? info.steps : [];
@@ -530,7 +588,7 @@ function meterText(data) {
   if (typeof data.tokens_per_second === "number" && data.tokens_per_second > 0) {
     parts.push(`${Math.round(data.tokens_per_second)} tok/s`);
   }
-  return parts.join(" · ");
+  return parts.join(" / ");
 }
 
 function setFooter(value, done, data) {
@@ -547,7 +605,7 @@ function setFooter(value, done, data) {
   if (meter) {
     const span = document.createElement("span");
     span.className = "meter";
-    span.textContent = ` · ${meter}`;
+    span.textContent = ` / ${meter}`;
     foot.append(span);
   }
 
@@ -598,7 +656,7 @@ function notice(message, bad) {
   hint.style.color = bad ? "var(--danger)" : "var(--warn)";
   clearTimeout(notice.timer);
   notice.timer = setTimeout(() => {
-    hint.textContent = "Enter to send · Shift+Enter for a new line";
+    hint.textContent = "";
     hint.style.color = "";
   }, 6000);
 }
@@ -631,7 +689,8 @@ async function refreshQueue() {
     drop.className = "x";
     drop.type = "button";
     drop.title = "Remove from queue";
-    drop.textContent = "×";
+    drop.textContent = "x";
+    drop.setAttribute("aria-label", "Remove from queue");
     drop.addEventListener("click", async () => {
       await post(`${state.base}/cancel`, { queue_id: item.queue_id });
       refreshQueue();
@@ -683,7 +742,7 @@ function approvalCard(approval) {
   meta.className = "meta";
   meta.textContent = [approval.risk_level && `risk: ${approval.risk_level}`, approval.workspace]
     .filter(Boolean)
-    .join(" · ");
+    .join(" / ");
 
   const row = document.createElement("div");
   row.className = "row";
@@ -913,8 +972,9 @@ async function newThread(title) {
       title,
     });
     await loadWorkspaces();
-    await openSession(session, workspace);
-    notice(`new thread in ${workspace.name}`);
+    const freshWorkspace = state.workspaces.find((item) => item.id === workspace.id) || workspace;
+    await openSession(session, freshWorkspace);
+    notice(`new thread in ${freshWorkspace.name}`);
   } catch (error) {
     notice(`could not create: ${error.message}`, true);
   }
@@ -926,6 +986,7 @@ async function addWorkspace(path) {
   try {
     const { workspace } = await post("/api/workspaces", { path: chosen });
     await loadWorkspaces();
+    await openWorkspace(workspace);
     notice(`added ${workspace.name}`);
   } catch (error) {
     notice(error.message, true);
@@ -1346,6 +1407,42 @@ async function clearStaleLocks() {
   }
 }
 
+/* --- responsive rail ----------------------------------------------------- */
+
+function narrowViewport() {
+  return window.matchMedia("(max-width: 820px)").matches;
+}
+
+function toggleRail() {
+  const app = el("app");
+  if (narrowViewport()) {
+    const isOpen = app.classList.toggle("rail-open");
+    app.classList.remove("rail-hidden");
+    el("rail-toggle").setAttribute("aria-expanded", String(isOpen));
+    return;
+  }
+  const isHidden = app.classList.toggle("rail-hidden");
+  app.classList.remove("rail-open");
+  el("rail-toggle").setAttribute("aria-expanded", String(!isHidden));
+}
+
+function closeMobileRail() {
+  if (!narrowViewport()) return;
+  el("app").classList.remove("rail-open");
+  el("rail-toggle").setAttribute("aria-expanded", "false");
+}
+
+function normalizeRailForViewport() {
+  const app = el("app");
+  if (narrowViewport()) {
+    app.classList.remove("rail-hidden");
+    el("rail-toggle").setAttribute("aria-expanded", String(app.classList.contains("rail-open")));
+  } else {
+    app.classList.remove("rail-open");
+    el("rail-toggle").setAttribute("aria-expanded", String(!app.classList.contains("rail-hidden")));
+  }
+}
+
 /* --- boot --------------------------------------------------------------- */
 
 async function boot() {
@@ -1354,9 +1451,8 @@ async function boot() {
   el("filter").addEventListener("input", applyFilter);
   el("jump").addEventListener("click", () => scrollToBottom(false));
   el("composer").addEventListener("submit", send);
-  el("rail-toggle").addEventListener("click", () => {
-    document.getElementById("app").classList.toggle("rail-hidden");
-  });
+  el("rail-toggle").addEventListener("click", toggleRail);
+  el("rail-scrim").addEventListener("click", closeMobileRail);
   el("prompt").addEventListener("input", () => {
     autoGrow();
     refreshPalette();
@@ -1379,14 +1475,18 @@ async function boot() {
   el("ol-unload").addEventListener("click", unloadModels);
   el("lock-clear").addEventListener("click", clearStaleLocks);
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el("drawer").hidden) closeSettings();
+    if (event.key !== "Escape") return;
+    if (!el("drawer").hidden) closeSettings();
+    closeMobileRail();
   });
+  window.addEventListener("resize", normalizeRailForViewport);
   el("scroller").addEventListener("scroll", () => {
     if (isAtBottom() && state.pendingNew) {
       state.pendingNew = 0;
       updateJump();
     }
   });
+  normalizeRailForViewport();
 
   // The token gate goes AFTER the first call, not before it.
   //

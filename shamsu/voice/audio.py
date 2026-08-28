@@ -3,11 +3,27 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import wave
+from array import array
+from dataclasses import dataclass
 from pathlib import Path
 
 from shamsu.voice.models import VoiceError
 
 WHISPER_SAMPLE_RATE = 16_000
+MIN_VOICE_PEAK = 800
+MIN_VOICE_RMS = 100
+
+
+@dataclass(frozen=True)
+class WavSignalStats:
+    duration_seconds: float
+    peak: int
+    rms: int
+
+    @property
+    def has_voice_level(self) -> bool:
+        return self.peak >= MIN_VOICE_PEAK or self.rms >= MIN_VOICE_RMS
 
 
 def normalize_for_whisper(source: Path, destination: Path) -> Path:
@@ -50,3 +66,27 @@ def _ffmpeg_executable() -> str:
     except ImportError:
         return ""
     return str(imageio_ffmpeg.get_ffmpeg_exe() or "")
+
+
+def wav_signal_stats(path: Path) -> WavSignalStats:
+    try:
+        with wave.open(str(path), "rb") as wav:
+            frames = wav.getnframes()
+            rate = wav.getframerate()
+            width = wav.getsampwidth()
+            channels = wav.getnchannels()
+            data = wav.readframes(frames)
+    except (OSError, wave.Error) as exc:
+        raise VoiceError(f"Could not inspect normalized audio: {exc}") from exc
+    duration = frames / rate if rate else 0.0
+    if width != 2:
+        return WavSignalStats(duration_seconds=duration, peak=0, rms=0)
+    samples = array("h")
+    samples.frombytes(data)
+    if channels > 1:
+        samples = array("h", samples[::channels])
+    if not samples:
+        return WavSignalStats(duration_seconds=duration, peak=0, rms=0)
+    peak = max(abs(sample) for sample in samples)
+    rms = int((sum(sample * sample for sample in samples) / len(samples)) ** 0.5)
+    return WavSignalStats(duration_seconds=duration, peak=int(peak), rms=rms)

@@ -949,6 +949,39 @@ async def test_tui_speaks_replies_without_blocking() -> None:
 
 
 @pytest.mark.asyncio
+async def test_voice_recording_stops_active_reply_playback(tmp_path: Path) -> None:
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    stopped: list[bool] = []
+
+    class FakeSpeaker:
+        def stop(self) -> None:
+            stopped.append(True)
+
+    class FakeRecorder:
+        def start(self) -> None:
+            return None
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_recorder_factory=FakeRecorder,
+            voice_output_factory=FakeSpeaker,
+        )
+        app._voice_output = FakeSpeaker()
+
+        app._start_voice_recording()
+
+        assert stopped == [True]
+        assert app._voice_state == "recording"
+
+
+@pytest.mark.asyncio
 async def test_the_frame_runs_and_routes_what_is_typed():
     """The real Application, over prompt_toolkit's pipe input. A layout that
     cannot be constructed, or a control that raises while painting, fails
