@@ -114,7 +114,7 @@ CATEGORY_SIGNALS: dict[str, tuple[Signal, ...]] = {
     ),
     "write": _signals(
         (r"\b(fix|change|update|modify|edit|refactor|rename|replace|patch|move)\b", 3.0),
-        (r"\b(add|insert|append|prepend|implement|create|write|make|build\s+a)\b", 2.5),
+        (r"\b(add|insert|append|prepend|implement|create|write|make|build\s+(?:me\s+)?an?)\b", 2.5),
         (r"\b(remove|delete|strip|clean\s*up|drop)\b", 2.0),
         (r"\b(bug|error|typo|issue|broken|wrong|incorrect|failing|fail|crash)\b", 2.0),
         (r"\b(file|function|class|method|variable|import|export)\b", 1.0),
@@ -242,6 +242,7 @@ def classify_request(message: str) -> Classification:
 _UNAMBIGUOUS_CHANGE = re.compile(
     r"\b(implement|fix|fixes|fixed|rewrite|refactor|rename|patch|replace|"
     r"create|delete|remove|append|insert|"
+    r"build|builds|make|makes|"
     r"add|adds|update|updates|write|writes)\b",
     re.IGNORECASE,
 )
@@ -284,16 +285,34 @@ def categories_for(message: str) -> tuple[str, ...]:
         "web": ("web", "read"),
     }
     chosen = companions.get(verdict.category, (verdict.category, "read"))
-    if (
-        "write" not in chosen
-        # `plan` is exempt, and that exemption is the category's whole point.
-        # smallcode's planner.md is a strong planner because its frontmatter
-        # lists no write tools, so it CANNOT skip to implementing; here that is
-        # a category with the write tools left out. "plan how to ADD
-        # authentication" names a change verb and must still be unable to make
-        # the change - see test_asking_for_a_plan_withholds_the_write_tools.
-        and verdict.category != "plan"
-        and _UNAMBIGUOUS_CHANGE.search(message or "")
-    ):
+    # The write family rides with EVERY category except `plan`, unconditionally.
+    #
+    # It used to ride only when `_UNAMBIGUOUS_CHANGE` matched the message, and
+    # that is the hole that shipped: "build me a snake game" scored `run` 2.5
+    # against `write` 0.0 at 0.833 confidence, so a decisive-and-WRONG guess
+    # handed a build request a roster with no way to create a file. The model
+    # printed the game into the chat and the turn was graded a success.
+    # Measured 2026-08-28 across 22 ordinary phrasings, 6 lost every write tool
+    # the same way - all of them phrasings where "build" was the verb and was
+    # not literally followed by "a".
+    #
+    # The cost matrix settles this, not the scorer's accuracy: four write
+    # schemas that nothing calls cost ~733 tokens, about 2.3% of a 32k window.
+    # NOT sending them when they were needed costs the whole turn, silently,
+    # with no log line saying so. Those two are not comparable, and the old
+    # code weighed them as though they were.
+    #
+    # This also closes a second incoherence: the system prompt names
+    # `write_file`, `append_file`, `patch_file` and `replace_symbol` on every
+    # turn regardless of the roster, so a narrowed turn told the model to use
+    # tools it had not been given. Strong models ignored the roster and called
+    # them anyway (qwen3.5:9b did, 8 times in one turn on 2026-08-24); models
+    # that obey the tools array - the smaller ones this project targets - had
+    # no way to act and answered in prose instead.
+    #
+    # `plan` stays exempt, and that exemption is the category's whole point: a
+    # planning turn that can call `write_file` is just a normal turn with a
+    # different label - see test_asking_for_a_plan_withholds_the_write_tools.
+    if "write" not in chosen and verdict.category != "plan":
         chosen = (*chosen, "write")
     return chosen

@@ -460,6 +460,107 @@ DEGENERATE_CASES: tuple[EvalCase, ...] = (
 
 # Part of the suite, not an optional extra. Held back, they would measure
 # nothing - which is exactly the state the guards were in for three phases.
+# --- speaking like a user, not like a commit message --------------------------
+#
+# Every write-shaped case above names its target file: "Create a file hello.py",
+# "In calc.py, change the add function", "broken.py has a syntax error". Real
+# users do not. On 2026-08-28 a user typed "Can you modify the file and make it
+# print 200 numbers?" into a one-file workspace; the agent printed the new code,
+# asked "Would you like me to write this updated code to the file?", changed
+# nothing, and the turn was graded a success.
+#
+# The suite could not have caught that, because naming the file is exactly what
+# `describes_an_unmade_edit` needs in order to fire - so the blind spot and the
+# eval coverage had the same shape. These cases speak the way people actually
+# speak: vague pronouns, no filenames, casual verbs.
+
+_PRIMES_SOURCE = """def is_prime(n):
+    if n <= 1:
+        return False
+    for i in range(2, int(n**0.5) + 1):
+        if n % i == 0:
+            return False
+    return True
+
+
+def show(count):
+    n, seen = 2, 0
+    while seen < count:
+        if is_prime(n):
+            print(n)
+            seen += 1
+        n += 1
+
+
+show(100)
+"""
+
+_AREA_SOURCE = """import math
+
+
+def area(r):
+    return math.pi * radius ** 2
+"""
+
+
+def _seed_the_file(workspace: Path) -> None:
+    _write(workspace, "primes.py", _PRIMES_SOURCE)
+
+
+def _check_the_file(workspace: Path, final: str) -> bool:
+    """The FILE says 200. Not the answer - an answer that says 200 while the
+    file still says 100 is precisely the failure being measured."""
+    return "show(200)" in _read(workspace, "primes.py").replace(" ", "")
+
+
+def _seed_pasted_error(workspace: Path) -> None:
+    _write(workspace, "app.py", _AREA_SOURCE)
+
+
+def _check_pasted_error(workspace: Path, final: str) -> bool:
+    """Fixing it means editing the file, not explaining the traceback: the
+    undefined `radius` has to stop being undefined."""
+    content = _read(workspace, "app.py")
+    if "def area(" not in content:
+        return False
+    return "radius" not in content or "def area(radius" in content.replace(" ", "")
+
+
+def _created_any_source_file(workspace: Path, final: str) -> bool:
+    for path in workspace.rglob("*"):
+        if not path.is_file() or ".shamsu" in path.parts:
+            continue
+        if path.suffix.lower() in {".py", ".js", ".html", ".ts"}:
+            return True
+    return False
+
+
+SEED_CASES.extend(
+    [
+        EvalCase(
+            name="edits_the_file_when_the_user_never_names_it",
+            prompt="Can you modify the file and make it print 200 numbers?",
+            check=_check_the_file,
+            seed=_seed_the_file,
+            tags=("write", "small-model"),
+        ),
+        EvalCase(
+            name="builds_when_told_to_build_me_a",
+            prompt="build me a snake game",
+            check=_created_any_source_file,
+            tags=("write", "small-model"),
+        ),
+        EvalCase(
+            name="fixes_a_pasted_traceback",
+            prompt="app.py:5 NameError: name 'radius' is not defined",
+            check=_check_pasted_error,
+            seed=_seed_pasted_error,
+            tags=("bugfix", "small-model"),
+        ),
+    ]
+)
+
+
 SEED_CASES.extend(DEGENERATE_CASES)
 
 

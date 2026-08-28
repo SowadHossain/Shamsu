@@ -4,6 +4,56 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Fixed - a change request could be answered in prose and graded a success (2026-08-28)
+
+Three defects, one symptom: asked to build or modify something, the agent
+printed the code into the chat, wrote nothing, and the turn was recorded as a
+success. Reported after a session where "Can you modify the file and make it
+print 200 numbers?" produced a perfect answer and an unchanged file.
+
+**The roster could withhold the write tools outright.** `categories_for` only
+added the `write` family when `_UNAMBIGUOUS_CHANGE` matched, and the `write`
+signal required "build" to be followed literally by "a". "build me a snake
+game" therefore scored `run` 2.5 against `write` 0.0 - a *confident* wrong
+answer at 0.833 - and the turn went out with no way to create a file.
+Measured across 22 ordinary phrasings, 6 lost every write tool this way; the
+pattern was any request where "build" was the verb and was not followed by "a".
+
+The fix is not a better scorer, it is a corrected cost matrix. Four write
+schemas nothing calls cost ~733 tokens, about 2.3% of a 32k window; not sending
+them when they were needed costs the whole turn, silently. The write family now
+rides with every category except `plan`, whose exemption is the point of the
+category. This also ends an incoherence: the system prompt names `write_file`,
+`patch_file` and `replace_symbol` on every turn regardless of the roster, so a
+narrowed turn was instructing the model to call tools it had not been given.
+Strong models ignored the roster and called them anyway - qwen3.5:9b did, eight
+times in one turn - which is why this only ever showed up on smaller models.
+
+**The safety net needed the model to name a file.** `describes_an_unmade_edit`
+catches a reply that shows code instead of writing it, but only if the reply
+names a real workspace file. In a one-file workspace the user said "the file"
+and the model said "the file" back, so the net never fired. That requirement
+correlates with project size, not with correctness: on a ten-file project the
+model says `js/game.js` constantly and the net works. `answered_a_change_request_with_prose`
+adds a filename-free path, guarded by "nothing changed in this entire turn" -
+strictly stronger than the guard added on 2026-08-23, after a looser nudge told
+a model that had just written 106 lines that it had not changed the file. A
+planning request is exempt, compared on scores rather than on the winner,
+because `plan` and `write` tie on "plan how you would change it".
+
+**Nothing said the write tools had been withheld.** The turn now records which
+tool families it was given, because the failure was silent by construction and
+the only way to find it was to dump the raw request payload and count schemas.
+
+### Added - eval cases that speak the way users speak (2026-08-28)
+
+Every write-shaped case in the suite named its target file - "Create a file
+hello.py", "In calc.py, change the add function", "broken.py has a syntax
+error" - and naming the file is exactly what the unmade-edit detector needed in
+order to fire. The blind spot and the eval coverage had the same shape, so the
+suite could not have caught any of the above. Three cases now use vague
+pronouns, no filenames, and casual verbs, and are tagged `small-model`.
+
 ### Added - `/logs migrate` brings the old unredacted chat-logs forward (2026-08-22)
 
 Deleting `simple_log.py` stopped new leaks; it did nothing about the files

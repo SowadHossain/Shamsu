@@ -2736,6 +2736,21 @@ class SimpleChatLoop:
         # about to be thrown away.
         self._request = user_input
         self._tool_category = ""
+        # Say out loud which tool families this turn was given. The failure
+        # this makes visible is silent by construction: on 2026-08-28 six
+        # ordinary build phrasings arrived with no write tools at all, the
+        # model answered in prose, the turn was graded a success, and the only
+        # way to discover any of it was to dump the raw request payload and
+        # count schemas by hand. A turn that has been made unable to write
+        # should say so BEFORE it fails, not in a post-mortem.
+        try:
+            from shamsu.agents.tool_classifier import categories_for
+
+            families = categories_for(user_input)
+            if families:
+                self._activity("tool families this turn: " + ", ".join(families))
+        except Exception:  # noqa: BLE001, S110 - telemetry must never break a turn
+            pass
         self._elide_payloads()
         # Expand `@file` before the model sees a word. Otherwise the literal
         # string goes through and the first round is spent on a `read_file`
@@ -2996,6 +3011,30 @@ class SimpleChatLoop:
                         origin=ORIGIN_LOOP,
                     )
                     self._activity(f"described a change to {described} without making it; asked it to apply")
+                    continue
+                if (
+                    not described
+                    and not changed
+                    and prose_nudges < MAX_PROSE_NUDGES
+                    and answered_a_change_request_with_prose(text, self._request)
+                ):
+                    # The same failure the branch above catches, in the case it
+                    # cannot see: the reply never named a file. `not changed`
+                    # is what makes this safe - see the docstring.
+                    prose_nudges += 1
+                    self._repair_streak += 1
+                    self.state.append_assistant(text)
+                    self.state.append_user(
+                        "You were asked to change something and nothing has changed - "
+                        "you showed the code instead of writing it. Apply it now with "
+                        "write_file, patch_file or replace_symbol. If you are unsure "
+                        "which file to change, call ask_user; do not ask in prose, "
+                        "because that ends your turn. Do not repeat the code.",
+                        origin=ORIGIN_LOOP,
+                    )
+                    self._activity(
+                        "answered a change request with prose and changed nothing; asked it to apply"
+                    )
                     continue
                 promised = ""
                 if not self._hit_the_length_limit():
@@ -8444,6 +8483,56 @@ def describes_an_unmade_edit(text: str, files: list[str]) -> str:
     if body_lines < 4:
         return ""
     return names_a_workspace_file(text, files)
+
+
+def answered_a_change_request_with_prose(text: str, request: str) -> bool:
+    """A change request answered with a code fence, having changed nothing.
+
+    `describes_an_unmade_edit` catches the same shape, but only when the reply
+    NAMES a workspace file - and that requirement is what made it blind on
+    2026-08-28. A one-file workspace, a user who typed "Can you modify the file
+    and make it print 200 numbers?", and a model that said "the file" straight
+    back: it printed the new contents, asked "Would you like me to write this
+    updated code to the file?", changed nothing, and the turn was graded a
+    success. `names_a_workspace_file` returned "" the whole time, so the net
+    never fired. Insert the filename into that same reply and it fires
+    correctly - the detector was never wrong, it was just unreachable.
+
+    Naming a file correlates with project size, which is why this went unseen:
+    on a ten-file project a model says `js/game.js` constantly and the old
+    detector works. On a one-file project it says "the file".
+
+    Deliberately does NOT look at filenames. The caller pairs it with "nothing
+    changed in this entire turn", which is a strictly stronger guard than the
+    one added on 2026-08-23 after a looser prose nudge told a model that had
+    just written 106 lines and passed the verifier that it "did not change the
+    file" - that model re-read, found the work already there, and ended the
+    turn confused. That cannot happen here: if anything was written this turn,
+    this never runs.
+    """
+    if not (request or "").strip():
+        return False
+    if asks_only_for_words(request):
+        # Asked for a plan or a review, it planned. Same exemption the
+        # filename-based detector takes, and for the same reason.
+        return False
+    body_lines = 0
+    for match in _FENCE_RE.finditer(text or ""):
+        body_lines = max(body_lines, len(match.group("body").strip().splitlines()))
+    if body_lines < 4:
+        return False
+    from shamsu.agents.tool_classifier import classify_request
+
+    verdict = classify_request(request)
+    # A planning request must never be nudged into writing - that is the one
+    # category whose value is the ABSENCE of edits, and pushing it to write is
+    # how "plan how you would change it" would have become an unasked-for edit.
+    # `asks_only_for_words` above misses this one because `plan` and `write`
+    # both score 3.0 on it and PRIORITY breaks the tie toward `write`, so the
+    # scores are compared directly rather than trusting the winner.
+    if verdict.scores.get("plan", 0.0) >= max(verdict.scores.get("write", 0.0), 1.0):
+        return False
+    return verdict.category == "write"
 
 
 # Ways a model announces that it is about to act. Only ever consulted on the

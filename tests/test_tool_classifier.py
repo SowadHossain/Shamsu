@@ -130,7 +130,13 @@ def test_a_narrowed_roster_is_smaller_than_the_whole_catalogue(tmp_path):
     narrowed = _names(request="run the tests")
 
     assert len(narrowed) < len(everything)
-    assert "write_file" not in narrowed, "a test run does not need the write tools"
+    # It still narrows - that is the point of the exercise and it survives.
+    # What it no longer does is withhold the WRITE tools, which used to be
+    # asserted here as "a test run does not need the write tools". It does:
+    # "run the tests and fix whatever fails" is one request, and 2026-08-28
+    # measured six ordinary build phrasings arriving with no way to write a
+    # file at all. See `categories_for`.
+    assert "write_file" in narrowed
 
 
 def test_every_narrowed_roster_carries_the_way_back(tmp_path):
@@ -307,12 +313,19 @@ def test_a_change_verb_always_brings_the_write_tools():
 
 
 def test_a_request_that_only_looks_is_still_narrowed():
-    """The point is not to send everything. A search stays a search."""
+    """The point is not to send everything. A search stays a search - in the
+    families it drops, which is where the tokens are, not in its ability to act.
+
+    The write tools ride along now even here, and the case that forced it was a
+    LOOKING request: "menu.js:198 Uncaught ReferenceError: module is not
+    defined" scores `read` 1.5 on the `.js` alone, and on 2026-08-24 that turn
+    went on to patch eight files. A pasted error message is shaped like a
+    question and means "fix this"."""
     for request in ("find where the config is loaded",
                     "review the modules and tell me what they do"):
         roster = _roster(request)
         assert "read_file" in roster
-        assert "write_file" not in roster, request
+        assert "write_file" in roster, request
         assert len(roster) < 30, "it must still narrow"
 
 
