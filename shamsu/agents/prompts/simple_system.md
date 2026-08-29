@@ -71,6 +71,10 @@ Act on what you were asked. If a task has several parts, carry on through them
 and say what you did at the end - ask only when the request is genuinely
 ambiguous and a wrong guess would waste real work.
 
+Showing code is not changing code: if you were asked to change something, put
+it in the file. To ask the user something, call ask_user - a question in your
+reply only ends the turn.
+
 ## symbols
 
 <!--

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from shamsu.context.budget import PER_MESSAGE_OVERHEAD, message_tokens
-from shamsu.session.manager import SessionLogger
+from shamsu.session.manager import ORIGIN_LOOP, SessionLogger
 
 # Compaction: hydrate only the most recent N transcript turns. The session
 # summary and long-term memory carry older context separately, so we never
@@ -333,6 +333,53 @@ class ChatState:
         folded into the rolling summary: ``_messages[_summarized_upto:start_abs]``."""
         lower = max(1, self._summarized_upto)
         return self._messages[lower:start_abs]
+
+    def drop_stale_loop_messages(self) -> int:
+        """Forget the harness's own corrections from EARLIER turns. Returns how
+        many were dropped.
+
+        A nudge is written in the user role because that is the role the model
+        must read it in, and then it stays there for the rest of the session.
+        Live 2026-08-28 that was not untidy, it was load-bearing: after three
+        empty replies the transcript held "That reply was empty. Answer the
+        question, or call one tool." twice and "You have already been working on
+        something in this turn..." twice, and every later turn was generated
+        against a conversation that looked like a user repeatedly complaining.
+        The model then answered four consecutive snake-game requests with
+        byte-identical replies - it was copying its own transcript, which is
+        what `known_tools` above already documents a model doing.
+
+        Called at the START of a turn, so every remaining loop message is by
+        definition from a previous one; the corrections steering the CURRENT
+        turn are appended after this runs and are untouched.
+
+        The on-disk transcript keeps them. They are a real record of what the
+        harness said and the `origin` tag already marks them as harness speech -
+        this only stops them being replayed to the model as though a person had
+        typed them.
+        """
+        kept: list[ChatMessage] = []
+        dropped = 0
+        for message in self._messages:
+            if message.role == "user" and message.origin == ORIGIN_LOOP:
+                dropped += 1
+                continue
+            # The empty assistant turn a nudge was paired with. Keeping it would
+            # leave the model an example of answering with nothing, which is the
+            # behaviour the nudge existed to correct.
+            if (
+                message.role == "assistant"
+                and not str(message.content or "").strip()
+                and not message.tool_calls
+            ):
+                dropped += 1
+                continue
+            kept.append(message)
+        if dropped:
+            self._messages = kept
+            # Indices into `_messages` moved, so anything holding one is stale.
+            self._summarized_upto = min(self._summarized_upto, len(self._messages))
+        return dropped
 
     def update_rolling_summary(self, summary: str, start_abs: int) -> None:
         self._rolling_summary = summary

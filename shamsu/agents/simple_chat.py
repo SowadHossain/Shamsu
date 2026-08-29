@@ -1,7 +1,7 @@
 """Simple mode: Ollama chat with coding tools attached.
 
-The default path SHAMSU should have had. One conversation, a small system
-prompt, seven tools, and a loop that does exactly this:
+The default path SHAMSU should have had. One conversation, one system prompt,
+and a loop that does exactly this:
 
     call the model -> it asks for a tool -> run it -> put the REAL result back
     into the same conversation -> call the model again -> it answers.
@@ -11,10 +11,29 @@ frame rebuilt per call. If the model does not need a tool, this behaves like
 plain Ollama chat; if it does, the same model reads, edits, runs and continues
 without changing lanes.
 
+It started at seven tools and is now 37 schemas, ~4,300 tokens, against a
+system prompt of ~1,200. That is the standing cost of a turn before a line of
+project code enters the window, and it is why `_narrowed_by_request` exists -
+it drops the families a request plainly cannot use. What it must never drop is
+the ability to ACT: the write family rides with every category except `plan`,
+unconditionally, because a roster that is merely wasteful costs tokens while a
+roster that cannot write costs the whole turn, silently. See `categories_for`.
+
 What the harness still does, invisibly: the path sandbox, approvals, the action
 ledger, conversation persistence, and a verification pass after code changes -
 whose result is appended as an ordinary tool message, so a failure reaches the
 model as information it can act on rather than as a verdict panel.
+
+Two habits of this loop are worth knowing before reading it, because both come
+from the model imitating its own transcript rather than from any bug in the
+tools. The loop steers with messages in the USER role - "That reply was empty",
+"you showed the code instead of writing it" - because that is the role the
+model must read them in; they are tagged `ORIGIN_LOOP` and dropped from the
+window at the start of the NEXT turn, or a later turn is generated against a
+conversation that reads as a person repeatedly complaining. And a turn that was
+asked to change something and changed nothing is not finished: it is nudged
+once, whether or not the reply happened to name a file, because requiring a
+filename made the check blind exactly where workspaces are small.
 
 Deliberately separate from :class:`~shamsu.agents.chat_loop.AgentChatLoop`.
 Adding a "simple" flag to a 5,000-line class with 30 constructor parameters is
@@ -1747,6 +1766,27 @@ def _narrowed_by_request(
     return [*narrowed, category_selector_tool()]
 
 
+#: How many sibling files a post-write conflict check may open. A check that
+#: makes every write slow in a large repository gets switched off, and then it
+#: checks nothing at all.
+_CONFLICT_SCAN_LIMIT = 200
+
+#: How many clashes are worth naming. Past a few, the answer is not a list of
+#: names - it is that the file was written into the wrong namespace.
+_MAX_REPORTED_CONFLICTS = 5
+
+#: How many files the per-turn skeleton may cover, and how many names each may
+#: list. Both exist so a large repository degrades to "the first N files" rather
+#: than to a brief nobody can afford to send.
+MAX_SKELETON_FILES = 12
+MAX_SKELETON_NAMES = 12
+
+#: Share of the window the skeleton may take. Sized against `summary_budget`,
+#: which takes ~6% for the rolling summary: this is worth about the same, and
+#: on an 8k window it correctly comes out near nothing rather than crowding out
+#: the conversation it exists to inform.
+SKELETON_BUDGET_RATIO = 0.06
+
 MUTATING_TOOLS = frozenset({"write_file", "patch_file", "replace_symbol"})
 
 # Calls that EXERCISE the code rather than describe it. The only kind of tool
@@ -2717,7 +2757,41 @@ class SimpleChatLoop:
             )
         except Exception:  # noqa: BLE001 - a note must never fail a turn
             pass
+        if result.changed_files:
+            await asyncio.to_thread(self._refresh_code_graph)
         return result
+
+    def _refresh_code_graph(self) -> None:
+        """Re-sync the code graph after a turn that changed files.
+
+        Nothing did this. `index_repository` appeared nowhere under
+        `shamsu/agents/`, so the graph described the workspace as it was when
+        someone last indexed it by hand - and a build turn that writes ten files
+        left it wrong about every one of them.
+
+        That was survivable only because the graph is reached exclusively
+        through `graph_search` and `explain_symbol`: a tool result is something
+        the model weighed and asked for. It stops being survivable the moment
+        the harness puts graph facts into the window as context, because
+        injected context is TRUSTED rather than weighed - a stale claim about
+        code the model just wrote is worse than no claim at all.
+
+        Only when a graph already exists. Indexing a workspace nobody chose to
+        index is a decision for the user, not a side effect of an edit.
+
+        Awaited rather than fired and forgotten. The alternative races the next
+        turn, and a refresh that lands halfway through the read it was meant to
+        correct is the bug this exists to prevent. It runs only on turns that
+        actually wrote something, and the upstream sync is incremental.
+        """
+        if not _has_code_graph(self.workspace):
+            return
+        try:
+            from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+
+            CodebaseMemoryAdapter().refresh_workspace(self.workspace)
+        except Exception:  # noqa: BLE001, S110 - a stale graph must not fail a turn
+            pass
 
     async def _run_turn(self, user_input: str) -> SimpleChatResult:
         # Refresh the ownership heartbeat every turn. Claiming only at resume
@@ -2736,6 +2810,14 @@ class SimpleChatLoop:
         # about to be thrown away.
         self._request = user_input
         self._tool_category = ""
+        # Forget the harness's corrections from earlier turns before anything
+        # else reads the transcript. They were written in the user role so the
+        # model would act on them, and then they stayed - so a later turn was
+        # generated against a conversation that read as a user complaining.
+        # See `ChatState.drop_stale_loop_messages`.
+        stale = self.state.drop_stale_loop_messages()
+        if stale:
+            self._activity(f"dropped {stale} harness correction(s) from earlier turns")
         # Say out loud which tool families this turn was given. The failure
         # this makes visible is silent by construction: on 2026-08-28 six
         # ordinary build phrasings arrived with no write tools at all, the
@@ -3893,6 +3975,16 @@ class SimpleChatLoop:
             grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
             grounding = f"{grounding}\n\n{self._brief}"
+        # And what every OTHER file declares. `_brief` covers the files the
+        # request named; this covers the ones it did not, which is where the
+        # cross-file collisions were coming from. Budgeted against the window,
+        # so a small context degrades to a few files rather than to a brief it
+        # cannot afford - see `workspace_skeletons`.
+        skeletons = workspace_skeletons(
+            self.workspace, self._files, int(max_ctx() * SKELETON_BUDGET_RATIO)
+        )
+        if skeletons:
+            grounding = grounding + chr(10) + chr(10) + skeletons
         # LAST, not at position 1. llama.cpp reuses the KV cache for the
         # longest common PREFIX of the token sequence, and this block changes
         # whenever a file changes or the turn is about a different file.
@@ -4389,6 +4481,16 @@ class SimpleChatLoop:
             grounding = remembered + chr(10) * 2 + grounding
         if self._brief:
             grounding = grounding + chr(10) + chr(10) + self._brief
+        # And what every OTHER file declares. `_brief` covers the files the
+        # request named; this covers the ones it did not, which is where the
+        # cross-file collisions were coming from. Budgeted against the window,
+        # so a small context degrades to a few files rather than to a brief it
+        # cannot afford - see `workspace_skeletons`.
+        skeletons = workspace_skeletons(
+            self.workspace, self._files, int(max_ctx() * SKELETON_BUDGET_RATIO)
+        )
+        if skeletons:
+            grounding = grounding + chr(10) + chr(10) + skeletons
         total += count_tokens(grounding) + PER_MESSAGE_OVERHEAD
         summary = self.state.rolling_summary
         if summary.strip():
@@ -6606,11 +6708,83 @@ class SimpleChatLoop:
         # Net lines gained. The repeated-edit ceiling reads this to tell a file
         # being BUILT from a file being churned; see `_run_tools`.
         data["grew_by"] = len(after.splitlines()) - len(before.splitlines())
-        return ToolResult(
-            result.ok,
-            f"{result.message}\n\nWhat changed:\n" + "\n".join(shown),
-            data,
-        )
+        message = f"{result.message}\n\nWhat changed:\n" + "\n".join(shown)
+        clash = self._symbols_now_declared_twice(path, after)
+        if clash:
+            data["symbol_conflicts"] = clash
+            message += (
+                "\n\nAlso declared elsewhere: "
+                + "; ".join(f"{name} in {where}" for name, where in clash)
+                + ".\nIf this file is loaded alongside those, the second "
+                "declaration wins or the runtime refuses both - check before "
+                "you move on."
+            )
+        return ToolResult(result.ok, message, data)
+
+    def _symbols_now_declared_twice(
+        self, path: str, text: str
+    ) -> list[tuple[str, str]]:
+        """Top-level names this file declares that another file declares too.
+
+        The question the graph could always answer and nobody ever asked. Live
+        2026-08-24 a build wrote nine modules and then spent four turns on
+        `Uncaught SyntaxError: Identifier 'GameState' has already been declared`
+        and `ReferenceError: isOccupied is not defined` - both of them one file
+        writing into another file's namespace, both plain from any two outlines
+        laid side by side, and neither noticed, because the only way to look was
+        a tool call the model had to think to make. This is that lookup moved to
+        where it cannot be skipped.
+
+        Reported on the write itself rather than left to the verifier: the model
+        reads this result, and it is still in the turn that caused the clash.
+
+        Bounded on purpose - same suffix only, and it stops after
+        `_CONFLICT_SCAN_LIMIT` files. A cross-file check that makes every write
+        slow in a large repository gets switched off, and then it checks nothing.
+        """
+        from shamsu.agents.simple_outline import outline, outline_for_path
+
+        target = Path(path)
+        suffix = target.suffix.lower()
+        if not suffix:
+            return []
+        try:
+            mine = {
+                symbol.name
+                for symbol in outline(text, suffix)
+                if symbol.depth == 0 and symbol.name
+            }
+            candidates = sorted(self.workspace.rglob("*" + suffix))
+        except Exception:  # noqa: BLE001 - a conflict check must not fail a write
+            return []
+        if not mine:
+            return []
+        try:
+            written = (self.workspace / target).resolve()
+        except OSError:
+            return []
+        found: list[tuple[str, str]] = []
+        scanned = 0
+        for other in candidates:
+            if scanned >= _CONFLICT_SCAN_LIMIT or len(found) >= _MAX_REPORTED_CONFLICTS:
+                break
+            if any(part.startswith(".") for part in other.parts):
+                continue
+            try:
+                if other.resolve() == written:
+                    continue
+            except OSError:
+                continue
+            scanned += 1
+            for symbol in outline_for_path(other):
+                if symbol.depth == 0 and symbol.name in mine:
+                    try:
+                        where = other.relative_to(self.workspace).as_posix()
+                    except ValueError:
+                        where = other.name
+                    found.append((symbol.name, where))
+                    break
+        return found
 
     def _every_definition_of(
         self, path: str, text: str, wanted: str, matches: list[Any]
@@ -7740,6 +7914,46 @@ def _skill_catalog(workspace: Path) -> Any:
         return SkillCatalog()
 
 
+#: What a file extension says about which skills could ever apply here. Only
+#: the skills that are genuinely stack-specific are listed; anything absent
+#: from this map is offered everywhere, which is the right default for the
+#: discipline skills (`developer`, `testing`, `large-file-surgery`).
+_SKILL_STACK_HINTS: dict[str, tuple[str, ...]] = {
+    "react-vite": (".jsx", ".tsx", ".ts", ".js"),
+    "ui-designer": (".jsx", ".tsx", ".html", ".css", ".js"),
+    "sql-databases": (".sql",),
+    "sqlite-persistence": (".sql", ".db", ".sqlite", ".sqlite3", ".py"),
+}
+
+
+def _skills_worth_offering(skills: list[Any], workspace: Path) -> list[Any]:
+    """The skills this workspace could plausibly use.
+
+    Deliberately dumb - file extensions, no model call, no embedding. The index
+    is a tiebreaker for a capability the model has never once been observed
+    using, so spending a round trip to decide whether to advertise it would
+    cost more than the tokens it saves.
+    """
+    try:
+        suffixes = {
+            path.suffix.lower()
+            for path in workspace.rglob("*")
+            if path.is_file() and not any(part.startswith(".") for part in path.parts)
+        }
+    except OSError:
+        return []
+    # No files yet: the stack-specific skills cannot apply to a stack that does
+    # not exist, so an empty workspace gets the general ones rather than the
+    # whole roster. `react-vite` advertised into an empty folder is the clearest
+    # case of the rent this function exists to stop paying.
+    return [
+        skill
+        for skill in skills
+        if not (hint := _SKILL_STACK_HINTS.get(str(getattr(skill, "name", ""))))
+        or suffixes.intersection(hint)
+    ]
+
+
 def skill_index(workspace: Path) -> str:
     """One line per skill, for the prompt. ``""`` when there are none.
 
@@ -7748,11 +7962,27 @@ def skill_index(workspace: Path) -> str:
     `use_skill` for it (their issue #58 again), while pasting every skill body
     into the prompt would spend the window on instructions for tasks this turn
     is not doing.
+
+    Only the skills this WORKSPACE could plausibly want. The index costs 147
+    tokens of window on every turn, and across every session logged to
+    2026-08-28 - two workspaces, eleven turns, a 9B and a 7B - `use_skill` was
+    called exactly zero times. A roster nobody orders from is not free; it is a
+    rent, and a Python project pays it for `react-vite` every turn.
+
+    Keyed on the workspace and NOT on the request, which was tried first and is
+    wrong: the system prompt is the head of the KV prefix, so a roster that
+    changes with each message invalidates the cache every turn. Saving 147
+    tokens by re-prefilling the whole prompt is a loss. The workspace is stable
+    for the life of the thread, so this narrows without moving the prefix.
+
+    An empty match falls back to the whole roster - a workspace the matcher
+    cannot read is not evidence that it wants no skills.
     """
     catalog = _skill_catalog(workspace)
     skills = getattr(catalog, "sorted_skills", list)()
     if not skills:
         return ""
+    skills = _skills_worth_offering(skills, workspace) or skills
     lines = ["Skills you can load with use_skill, when one fits the job:"]
     # Indented rather than bulleted: the prompt deliberately carries no bullet
     # list, because the legacy path's 49-bullet wall is what this mode replaced,
@@ -8435,6 +8665,70 @@ def workspace_files(workspace: Path, limit: int = MAX_LISTED_FILES) -> list[str]
             if len(found) >= limit:
                 return found
     return found
+
+
+def workspace_skeletons(
+    workspace: Path, files: list[str], budget_tokens: int
+) -> str:
+    """What each source file DECLARES, one line per file, to a budget.
+
+    The third thing the window needed and did not have. The listing says which
+    files exist; `codebase_brief` says what is inside the ones the request
+    NAMED - at most three, and only when the user typed the path. Everything
+    else the model had to go and read, one `read_file` at a time, having first
+    decided to.
+
+    That gap is where the cross-file bugs live. Live 2026-08-24 a build wrote
+    nine modules and then spent four turns on `Identifier 'GameState' has
+    already been declared` and `isOccupied is not defined` - one file writing
+    into another file's namespace, every time. Both were answerable from two
+    outlines side by side, and the model never had them side by side.
+
+    Names only, not signatures and not bodies. A name is what a collision is
+    made of, and it is the cheapest possible thing that prevents one - a full
+    `render_outline` of a dozen modules would cost more window than the whole
+    tool catalogue.
+
+    Deliberately not graph-backed. `simple_graph` notes that most workspaces
+    never run `index_repository`, so a graph-only answer is empty exactly where
+    a fresh project needs it most; outlines are computed from the files that
+    are there. Bounded by `budget_tokens` and by `MAX_SKELETON_FILES`, and
+    empty for an empty workspace - greenfield generation has nothing to compile.
+    """
+    if not files or budget_tokens <= 0:
+        return ""
+    from shamsu.agents.simple_outline import outline_for_path
+
+    lines: list[str] = []
+    spent = 0
+    shown = 0
+    for relative in files:
+        if shown >= MAX_SKELETON_FILES:
+            break
+        path = Path(workspace) / relative
+        try:
+            symbols = outline_for_path(path)
+        except Exception:  # noqa: BLE001, S112 - a brief must never end a turn
+            continue
+        names = [s.name for s in symbols if s.depth == 0 and s.name]
+        if not names:
+            continue
+        line = f"  {relative}: " + ", ".join(names[:MAX_SKELETON_NAMES])
+        if len(names) > MAX_SKELETON_NAMES:
+            line += f", +{len(names) - MAX_SKELETON_NAMES} more"
+        cost = count_tokens(line)
+        if spent + cost > budget_tokens:
+            break
+        lines.append(line)
+        spent += cost
+        shown += 1
+    if not lines:
+        return ""
+    header = (
+        "What each file declares (top level only - read a file for its "
+        "contents):"
+    )
+    return header + chr(10) + chr(10).join(lines)
 
 
 def render_workspace_files(files: list[str]) -> str:

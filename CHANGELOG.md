@@ -4,6 +4,89 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Note - what the write-roster fix does and does not explain (2026-08-29)
+
+Recorded because the first account of it was wrong, and the correction matters
+more than the fix.
+
+`create_and_run` is a member of BOTH the `write` and `run` families, and it
+writes a file. So a request scored `run` never actually lost the ability to
+write - it lost `write_file`, `patch_file`, `replace_symbol` and `append_file`
+while keeping a general-purpose writer. That is why a defect present since
+2026-08-20 went eight days unnoticed, and it is why the reported failure is not
+explained by the roster: the model that answered "Would you like me to write
+this updated code to the file?" was holding a tool that would have written it.
+
+Measured three ways on the default tier, at 3 and at 7 samples, baseline
+`adcf7a6` against the fix: 100% -> 100%, 33% -> 100% (flaky), 71% -> 100%
+(flaky). Every verdict NOISE. The one consistent signal is cost - the fix ran
+36% faster on the isolating case, because a model without patch_file burns
+rounds working around its absence - and cost does not count toward the verdict.
+
+The eval that was meant to settle it was itself built on a wrong number. Its
+seed was sized against the tool description's "60 lines / 8KB per call", but
+`WRITE_LINES_GUIDANCE = 60` is prompt guidance the code calls belt-and-braces,
+while the cap that refuses a call is `max_write_chars`, 2,000-8,000 characters.
+The 174-line seed was 2,096 characters, so `create_and_run` rewrote it whole and
+the baseline scored 5/7 on a case built to be impossible for it. The seed is now
+15,038 characters, past `WRITE_CHARS_CEILING`.
+
+So: the roster defect is real, deterministic, and worth fixing on its own terms.
+It is not the cause of the reported bug. The changes with evidence behind them
+are the ones drawn from the transcript - harness corrections outliving their
+turn, and an unmade-edit check that needed the model to name a file.
+
+### Fixed - the harness kept its own capabilities behind a decision (2026-08-29)
+
+Four changes with one shape. A capability existed, was reachable only if the
+model thought to reach for it, and so was reached on a 9B and not on a 7B.
+
+**Harness corrections outlived their turn.** A nudge is written in the user role
+because that is the role the model must read it in, and then it stayed there for
+the session. After three empty replies the transcript held "That reply was
+empty" twice and "You have already been working on something in this turn" twice
+- and every later turn was generated against a conversation that read as a user
+repeatedly complaining. The model answered four consecutive snake-game requests
+with byte-identical replies; it was copying its own transcript. They are now
+dropped at the start of the next turn. The on-disk record keeps them.
+
+**The code graph went stale the moment the agent wrote.** `index_repository`
+appeared nowhere under `shamsu/agents/`, so a build turn that wrote ten files
+left the graph wrong about all ten. Survivable while the graph was only reached
+through `graph_search`, where a stale answer is one the model asked for and can
+weigh. Not survivable now that a write reads it. Turns that changed files
+re-sync before returning.
+
+**A write into another file's namespace said nothing.** 2026-08-24 a build wrote
+nine modules and then spent four turns on `Identifier 'GameState' has already
+been declared` and `isOccupied is not defined` - both one file writing into
+another's namespace, both plain from two outlines side by side, and neither
+noticed because looking required a tool call the model had to think to make. The
+write result now names the clash while the model is still in the turn that
+caused it.
+
+**The window said which files existed, never what was in them.**
+`codebase_brief` covered the files a request NAMED, at most three, and only when
+the user typed the path. Everything else had to be read one call at a time,
+having first been thought of. Every turn now carries the top-level names each
+file declares, budgeted at ~6% of the window so a small context degrades to a
+few files rather than crowding out the conversation. Names only - a name is what
+a collision is made of, and a full outline of a dozen modules would cost more
+than the whole tool catalogue.
+
+### Changed - the skill index is charged for where it could be used (2026-08-29)
+
+Across every session logged to 2026-08-28 - two workspaces, eleven turns, a 9B
+and a 7B - `use_skill` was called zero times, while its index shipped on every
+turn. It is now keyed on the workspace: a Python project stops paying for
+`react-vite`, and an empty one gets the general skills rather than all twelve.
+
+Keyed on the WORKSPACE and not the request, which was built first and reverted:
+the system prompt heads the KV prefix, so a roster that changes per message
+re-prefills the whole prompt, and saving 147 tokens that way is a loss. With the
+new line in `act` - "showing code is not changing code" - the prompt still came
+out smaller than before: 615 to 598 tokens on an empty workspace.
+
 ### Fixed - a change request could be answered in prose and graded a success (2026-08-28)
 
 Three defects, one symptom: asked to build or modify something, the agent

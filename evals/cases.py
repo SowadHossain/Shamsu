@@ -473,6 +473,11 @@ DEGENERATE_CASES: tuple[EvalCase, ...] = (
 # `describes_an_unmade_edit` needs in order to fire - so the blind spot and the
 # eval coverage had the same shape. These cases speak the way people actually
 # speak: vague pronouns, no filenames, casual verbs.
+#
+# They measure TASK SUCCESS and are not attribution guards: measured 2026-08-28
+# all three scored 3/3 on a 7B both before and after the write-roster fix, for
+# the reason written up on `extends_a_file_too_large_to_rewrite` below. Read
+# them as "can a 7B still do this", never as "did a change help".
 
 _PRIMES_SOURCE = """def is_prime(n):
     if n <= 1:
@@ -558,6 +563,105 @@ SEED_CASES.extend(
             tags=("bugfix", "small-model"),
         ),
     ]
+)
+
+
+# --- a change that CANNOT be made by rewriting the file -----------------------
+#
+# Why the three cases above could not attribute anything. Measured 2026-08-28,
+# baseline `adcf7a6` versus the write-roster fix: both scored 3/3, verdict
+# NOISE. The gate defect was real and deterministic - "build me a snake game"
+# scored `run` and lost write_file, patch_file and replace_symbol - but
+# `create_and_run` sits in the RUN family and writes files, so the baseline
+# reached the goal by another road and the check, which only asked whether a
+# source file existed, could not tell the roads apart.
+#
+# This case closes that road. `create_and_run` caps its content at 60 lines,
+# so a file well past that cannot be rewritten whole by anything in the run
+# family: the only ways through are patch_file and replace_symbol, which are
+# exactly what a `build`-phrased request used to lose. The check then asks for
+# both halves - the change landed AND the rest of the file survived - because a
+# "fix" that truncates 150 lines to 20 is the other failure this project keeps
+# meeting.
+
+_MENU_HEAD = """SEPARATOR = "-" * 40
+TITLE = "Arcade"
+
+
+def _pad(text, width):
+    return str(text).ljust(width)
+
+
+def render_header():
+    print(TITLE)
+    print(SEPARATOR)
+
+"""
+
+_MENU_TAIL = """
+def render_footer():
+    print(SEPARATOR)
+    print("press q to quit")
+
+
+def render_menu(items):
+    render_header()
+    for index, item in enumerate(items, start=1):
+        print(_pad(index, 4), item)
+    render_footer()
+"""
+
+
+def _menu_source() -> str:
+    """Past the ENFORCED write cap, which is characters and not lines.
+
+    Sized at 60 lines first, from the tool description ("60 lines / 8KB per
+    call"), and that was wrong: `WRITE_LINES_GUIDANCE = 60` is prompt guidance
+    the code itself calls belt-and-braces, while the cap that actually refuses
+    a call is `max_write_chars`, 2,000-8,000 characters. The 174-line seed came
+    to 2,096 characters, so `create_and_run` could rewrite it whole and the
+    baseline scored 5/7 on a case built to be impossible for it.
+
+    Well past `WRITE_CHARS_CEILING` now, so no single call can replace this
+    file and patch_file or replace_symbol is the only way through.
+    """
+    nl = chr(10)
+    filler = "".join(
+        f"def option_{n}():{nl}"
+        f'    """Menu entry {n} - returns its own index and label."""{nl}'
+        f"    label = _pad('option {n}', 24){nl}"
+        f"    prefix = SEPARATOR[:4]{nl}"
+        f"    if not label.strip():{nl}"
+        f"        raise ValueError('option {n} has no label'){nl}"
+        f"    return prefix, label, {n}{nl}{nl}{nl}"
+        for n in range(1, 61)
+    )
+    return _MENU_HEAD + filler + _MENU_TAIL
+
+
+def _seed_big_menu(workspace: Path) -> None:
+    _write(workspace, "menu.py", _menu_source())
+
+
+def _check_big_menu(workspace: Path, final: str) -> bool:
+    content = _read(workspace, "menu.py")
+    if not content:
+        return False
+    changed = "high" in content.lower() and "score" in content.lower()
+    # The rest of the file has to still be there. A rewrite that drops 29 of the
+    # 30 options passes "changed" and is not the thing that was asked for.
+    survived = content.count("def option_") >= 25 and "render_footer" in content
+    return changed and survived
+
+
+SEED_CASES.append(
+    EvalCase(
+        name="extends_a_file_too_large_to_rewrite",
+        prompt="build out the menu system so it also shows the high score",
+        check=_check_big_menu,
+        seed=_seed_big_menu,
+        tags=("write", "small-model", "isolating"),
+    )
 )
 
 
