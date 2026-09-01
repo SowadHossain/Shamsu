@@ -1,7 +1,8 @@
 ---
 name: simple-system
 description: The system prompt simple mode sends on every turn.
-sections: [base, act, symbols, done, recall, big_read, big_file, graph]
+sections: [base, act, continuity, symbols, done, done_open, recall,
+           recall_stored, recall_history, big_read, big_file, graph]
 ---
 
 <!--
@@ -101,14 +102,46 @@ a job with parts, not an instruction to contract every "what does this do?".
 -->
 
 For a job with several parts, contract_create writes down what done means as
-checkable claims, then contract_assert_pass records each one with the evidence
-that shows it. You cannot report the task finished while a claim is unchecked.
+checkable claims. You cannot report the task finished while a claim is
+unchecked.
+
+## done_open
+
+<!--
+Split when the four assert tools became conditional on a contract existing.
+Naming `contract_assert_pass` before there is anything to assert ON is the
+defect this file's other conditional sections exist to prevent - the schema is
+not sent until the contract is there.
+-->
+
+Your contract is open: contract_assert_pass records a claim with the evidence
+that shows it, contract_assert_fail records one that did not work, and
+contract_status shows what is left.
 
 ## recall
 
-You remember this project: memory_remember keeps a decision or a gotcha,
-memory_load brings back what bears on the job, and history_search finds anything
-said earlier, including turns you can no longer see.
+<!--
+Split in two on 2026-08-30, for the same reason `graph` is conditional at all.
+`memory_remember` always ships. `memory_load` and `memory_list` are withheld
+until the workspace HAS notes and `history_search` until it has more than one
+session - see CONDITIONAL_TOOL_FAMILIES - so naming all four unconditionally
+told the model about three tools it had not been given, on every fresh
+workspace. Same defect as `graph`, one door along.
+-->
+
+You remember this project: memory_remember keeps a decision or a gotcha worth
+having next time. Whatever you noted before is already in front of you when it
+bears on the job.
+
+## recall_stored
+
+Anything you noted earlier is searchable: memory_load brings back what bears on
+the job and memory_list shows what is there.
+
+## recall_history
+
+history_search finds anything said in an earlier session, including turns you
+can no longer see.
 
 ## big_read
 

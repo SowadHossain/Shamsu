@@ -1,0 +1,71 @@
+# 2026-08-31 - background processes outliving their session
+
+## The evidence
+
+From F:\Work\voice-demo, session 20260831-000635-f56d (ended 01:59 UTC):
+
+  command.detached | {"command": "cd asteroid && ...python.exe -m http.server 8000",
+                      "log": "...\.shamsu\processes\1788135549-5614.log"}
+
+Checked at 08:20 local, over two hours later:
+
+  LocalPort OwningProcess
+  --------- -------------
+       8000         19776
+
+  ProcessId : 10520   CreationDate : 8/31/2026 6:19:09 AM   -m http.server 8000
+  ProcessId : 19776   CreationDate : 8/31/2026 6:19:09 AM   -m http.server 8000
+
+Both stopped by hand:
+  SUCCESS: The process with PID 19776 (child process of PID 10520) terminated.
+  nothing listening on 8000
+
+## Why nothing could have cleaned it up
+
+  _DETACHED            in-memory dict, dies with the interpreter
+  atexit only          does not fire on window close / kill / crash
+  log filename         <timestamp>-<hash>.log  - does not name the process
+  .shamsu/dev-servers.json   absent (dev_server.py is not on the run_command path)
+
+## After
+
+Launch, then simulate the crash by wiping the in-memory registry:
+
+  launch exit: 0
+  recorded    : [(35844, None)]
+  record file : ['35844.json']
+
+  after 'crash' (registry wiped):
+    still findable on disk: [(35844, ...)]
+    stopped: [35844]
+    alive now: False
+    records left: []
+
+## The CLI
+
+  --- what a new session would say on open ---
+  1 background process(es) from an earlier session are still running here:
+    pid 42828 on port 8952, running 0m - python -m http.server 8952
+    `/processes stop <pid>` or `/processes stop all`
+
+  --- /processes stop all ---
+  Stopped pid 42828 - python -m http.server 8952
+
+  --- /processes again ---
+  Nothing is running in the background for this workspace.
+
+## Port detection (listing only; errs towards silence)
+
+    8931  <- python -m http.server 8931
+    5173  <- npm run dev -- --port 5173
+    3000  <- vite --port=3000
+    8080  <- npx serve 8080
+    4000  <- PORT=4000 npm start
+    8000  <- uvicorn app:app --port 8000
+    8000  <- php -S localhost:8000
+    3001  <- next dev -p 3001
+    None  <- npm run dev
+    None  <- python -m http.server
+    None  <- node --max-old-space-size=4096 server.js
+
+tests/test_background_processes.py: 18 passed

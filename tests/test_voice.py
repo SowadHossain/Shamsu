@@ -7,7 +7,11 @@ import pytest
 from shamsu.voice.audio import WavSignalStats
 from shamsu.voice.models import Transcript, VoiceError
 from shamsu.voice.service import VoiceService
-from shamsu.voice.speech import prepare_spoken_text
+from shamsu.voice.speech import (
+    load_speech_settings,
+    prepare_spoken_text,
+    reply_should_be_spoken,
+)
 from shamsu.voice.whisper import WhisperTranscriber
 
 
@@ -124,3 +128,53 @@ def test_prepare_spoken_text_removes_markdown_noise() -> None:
     )
 
     assert spoken == "Done. code block omitted. See the file and pytest."
+
+
+def test_replies_are_spoken_only_for_what_was_said_out_loud(monkeypatch) -> None:
+    monkeypatch.delenv("SHAMSU_VOICE_OUTPUT", raising=False)
+
+    assert reply_should_be_spoken(voice_input=True) is True
+    assert reply_should_be_spoken(voice_input=False) is False
+
+
+def test_voice_output_off_silences_even_a_spoken_prompt(monkeypatch) -> None:
+    monkeypatch.setenv("SHAMSU_VOICE_OUTPUT", "off")
+
+    assert reply_should_be_spoken(voice_input=True) is False
+
+
+def test_voice_output_always_restores_speaking_every_reply(monkeypatch) -> None:
+    monkeypatch.setenv("SHAMSU_VOICE_OUTPUT", "always")
+
+    assert reply_should_be_spoken(voice_input=False) is True
+    assert load_speech_settings().speak_when == "always"
+
+
+def test_remote_surfaces_never_reach_the_local_speaker() -> None:
+    """A voice note sent from a phone is answered in TEXT.
+
+    Telegram, the web portal and `--print` runs drive their own chat loops,
+    and none of them may reach the machine's speaker: the terminal that is
+    open beside them belongs to whoever is sitting AT it, and it stays silent
+    unless they spoke into it themselves. This is a source guard rather than a
+    behavioural one because the correct behaviour here is an absence.
+    """
+    import shamsu
+
+    package = Path(shamsu.__file__).resolve().parent
+    watched = [
+        *sorted((package / "integrations").rglob("*.py")),
+        *sorted((package / "control").rglob("*.py")),
+        package / "cli" / "noninteractive.py",
+    ]
+    offenders = [
+        str(path.relative_to(package))
+        for path in watched
+        if path.exists()
+        and any(
+            marker in path.read_text(encoding="utf-8", errors="ignore")
+            for marker in ("SpeechPlayer", "speak_reply", "shamsu.voice.speech")
+        )
+    ]
+
+    assert offenders == []

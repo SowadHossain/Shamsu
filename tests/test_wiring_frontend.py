@@ -210,7 +210,17 @@ def test_the_whole_snake_game_failure_is_caught(tmp_path: Path):
     (tmp_path / "js" / "snake.js").write_text("playSound(2);\n", encoding="utf-8")
 
     kinds = set(_kinds(tmp_path))
-    assert kinds == {"missing_asset", "js_redeclaration", "undefined_helper"}, kinds
+    # Four, since 2026-08-31. `unreferenced_script` is a genuine FOURTH fault in
+    # this same shipped failure and not a new false positive: the page loads
+    # `game.js` from the root, every real script lives in `js/`, so all three of
+    # them are files nothing ever loads. `missing_asset` reports the tag that
+    # points at nothing; this reports the code that nothing points at.
+    assert kinds == {
+        "missing_asset",
+        "js_redeclaration",
+        "undefined_helper",
+        "unreferenced_script",
+    }, kinds
 
 
 def test_a_clean_project_stays_clean(tmp_path: Path):

@@ -150,3 +150,62 @@ def render_interjection(messages: list[str]) -> str:
         "over what you were doing - adjust now rather than finishing first.]\n"
         + body
     )
+
+
+class RunControlFeedback:
+    """`FeedbackQueue`'s interface over a run-control run's queue.
+
+    The bridge that was missing, and the reason a remote steer went nowhere.
+
+    Mid-turn feedback from Telegram or the web portal lands in
+    `run_control.add_feedback`, which puts it on the run's `feedback_queue` and
+    answers **"Added your feedback to the active SHAMSU run."** Only the LEGACY
+    `chat_loop` ever drained that queue. Simple mode - the default path - reads
+    a `FeedbackQueue` instead, and `sessions.py` never passed it one, so
+    `_take_feedback` returned `False` on its first line every time.
+
+    The result was worse than doing nothing: the user was told their correction
+    had been accepted, the turn carried on exactly as before, and the only way
+    to find out was to watch it not happen. Live 2026-09-01, sent as a voice
+    note mid-turn.
+
+    Drains without an event loop on purpose. `feedback_queue` is an
+    `asyncio.Queue`, and `_take_feedback` runs on the loop's own thread inside a
+    round; `get_nowait` is the only access that is safe from there and it is all
+    this needs.
+    """
+
+    def __init__(self, run_id: str) -> None:
+        self.run_id = run_id
+
+    def _queue(self):
+        try:
+            from shamsu.runtime.run_control import _RUNS
+
+            run = _RUNS.get(self.run_id)
+        except Exception:  # noqa: BLE001 - feedback must never end a turn
+            return None
+        return getattr(run, "feedback_queue", None) if run is not None else None
+
+    def drain(self) -> list[str]:
+        """Everything said since the last check, oldest first."""
+        queue = self._queue()
+        if queue is None:
+            return []
+        said: list[str] = []
+        while True:
+            try:
+                said.append(str(queue.get_nowait()))
+            except Exception:  # noqa: BLE001 - empty, or a queue mid-teardown
+                break
+        return [item for item in (" ".join(s.split()) for s in said) if item]
+
+    def __len__(self) -> int:
+        queue = self._queue()
+        try:
+            return queue.qsize() if queue is not None else 0
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def __bool__(self) -> bool:
+        return len(self) > 0

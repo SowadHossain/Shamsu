@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["qa", "acceptance", "evidence", "verification"],
+  "triggers": ["acceptance", "acceptance criteria", "qa", "does it work", "check it works", "edge case", "edge cases", "smoke test", "needs evidence", "verify it"],
+  "applies_to": ["verification", "review"],
+  "allowed_tools": ["run_command", "run_tests", "read_file", "contract_assert_pass", "contract_assert_fail", "contract_assert_skip"],
+  "context_budget_tokens": 320
+}

@@ -125,14 +125,47 @@ SAFETY_MARGIN_TOKENS = 512         # extra buffer against off-by-one token count
 # agent module.
 DEFAULT_CHAT_CTX = 32768
 
+#: Below this the system prompt and one tool schema do not both fit, so a
+#: smaller window produces a model that fails on its first call rather than a
+#: model that thinks in a smaller space. The floor was written out separately in
+#: `settings.chat_max_ctx`, `simple_chat.max_ctx` and the `/context window`
+#: handler; three copies of a number is three chances to change two of them.
+MIN_USABLE_CTX_WINDOW = 4096
+
+#: The windows `/context window` offers and snaps to. Powers of two from the
+#: floor up to `DEFAULT_CHAT_CTX` - the range where a local KV cache actually
+#: fits on one card. Anything between them is almost always a typo, and a
+#: window that differs from `chat_ctx_ceiling()` by even 18 tokens costs a full
+#: model reload on every call that does not share it.
+OFFERED_CTX_WINDOWS: tuple[int, ...] = (4096, 8192, 16384, 32768)
+
 
 def ctx_window_for_model(model_name: str) -> int:
-    """The window *model_name* may be asked for: exact name, then family, then 8k.
+    """The window *model_name* may be asked for.
 
-    Three steps rather than one, because a model pulled by tag - `qwen2.5:3b`,
-    `qwen2.5-coder:7b-instruct-q4_K_M` - matches the exact table only by luck,
-    and the fallback it landed on shrank every cap downstream of it.
+    The SERVER first, then the exact table, then the family, then 8k. Four steps
+    rather than three because the table is thirty hand-written entries and a
+    hand-written entry goes stale: measured 2026-08-30, `qwen3:8b` was listed at
+    32,768 and really holds 40,960. Ollama reports the real number on
+    `/api/tags` and it costs nothing to believe it.
+
+    The server answer is CACHED and never fetched on this call - see
+    `llm.capabilities`. A cache miss falls through to the table, which is also
+    what happens with no server running, so nothing here can block or fail.
+
+    The three table steps stay exactly as they were, because a model pulled by
+    tag - `qwen2.5:3b`, `qwen2.5-coder:7b-instruct-q4_K_M` - matches the exact
+    table only by luck, and the fallback it landed on shrank every cap
+    downstream of it.
     """
+    try:
+        from shamsu.llm.capabilities import model_facts
+
+        facts = model_facts(model_name)
+        if facts is not None and facts.context_length >= MIN_USABLE_CTX_WINDOW:
+            return facts.context_length
+    except Exception:  # noqa: BLE001 - the table must always be reachable
+        pass
     exact = MODEL_CONTEXT_WINDOWS.get(model_name)
     if exact:
         return exact
@@ -141,6 +174,33 @@ def ctx_window_for_model(model_name: str) -> int:
         if pattern in lowered:
             return window
     return SAFE_FALLBACK_CTX_WINDOW
+
+
+def chat_ctx_ceiling() -> int:
+    """The context-window ceiling, from whichever source owns it.
+
+    **env > settings.json > DEFAULT_CHAT_CTX**, and this is the ONLY place that
+    order is written down. It used to be written twice - here, reading the
+    environment alone, and in `simple_chat.max_ctx`, reading the environment
+    AND the saved setting. So the moment anyone set a window from inside SHAMSU
+    (`/context window`, the web panel, Telegram) the two disagreed, which is the
+    one thing `shared_num_ctx` exists to prevent.
+
+    Live 2026-08-30: a saved `chat_max_ctx` of 32786 - a typo for 32768 - had
+    simple mode asking for 32786 while every `llm/manager.py` call asked for
+    32768. Ollama reloads a ~6GB model whenever `num_ctx` changes, so every
+    background call in the session paid for one.
+    """
+    raw = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
+    if raw.isdigit() and int(raw) >= MIN_USABLE_CTX_WINDOW:
+        return int(raw)
+    try:
+        from shamsu.runtime.settings import chat_max_ctx
+
+        chosen = chat_max_ctx()
+    except Exception:  # noqa: BLE001 - a bad settings file is not a dead model
+        chosen = None
+    return chosen or DEFAULT_CHAT_CTX
 
 
 def shared_num_ctx(model_name: str) -> int:
@@ -154,11 +214,11 @@ def shared_num_ctx(model_name: str) -> int:
     turning 5-15s replies into 74-107s.
 
     Capped per model, so a small model is never asked for more than it has.
-    `SHAMSU_CHAT_MAX_CTX` overrides the ceiling.
+    The ceiling comes from `chat_ctx_ceiling()`, which is what makes this agree
+    with `simple_chat.max_ctx` by construction rather than by both remembering
+    to read the same two places.
     """
-    raw = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
-    ceiling = int(raw) if raw.isdigit() and int(raw) >= 4096 else DEFAULT_CHAT_CTX
-    return min(ctx_window_for_model(model_name), ceiling)
+    return min(ctx_window_for_model(model_name), chat_ctx_ceiling())
 
 
 def count_tokens(text: str) -> int:

@@ -42,8 +42,10 @@ how this codebase ended up with two orchestrators in the first place.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import difflib
 import hashlib
+import ast
 import json
 import os
 import re
@@ -74,6 +76,13 @@ from shamsu.agents.loop_guards import (
 from shamsu.agents.plan_anchor import anchor as plan_anchor
 from shamsu.agents.plan_anchor import ask_for_a_plan
 from shamsu.agents.simple_memory import MEMORY_TYPES, render_memory
+from shamsu.agents.simple_skills import (
+    SKILL_BUDGET_RATIO,
+    Situation,
+    render_skill,
+    situation_skill_name,
+    skill_for_turn,
+)
 from shamsu.agents.simple_outline import (
     can_outline,
     find_symbols,
@@ -102,7 +111,11 @@ from shamsu.context.budget import (
     tool_schema_tokens,
 )
 from shamsu.llm.output import parse_model_turn
-from shamsu.runtime.models import model_for_role, model_is_reasoning
+from shamsu.runtime.models import (
+    model_for_role,
+    model_is_reasoning,
+    model_supports_native_tools,
+)
 from shamsu.runtime.turn_stream import TurnEvent
 from shamsu.session.manager import ORIGIN_LOOP, SessionLogger
 from shamsu.tools.agent_tools import (
@@ -129,15 +142,71 @@ DEFAULT_MAX_ROUNDS = 24
 # slowest, `writes_the_steps_down_before_starting`, runs ~2 min a sample) so
 # this only ever catches a turn that is not converging. SHAMSU_TURN_BUDGET_S
 # overrides; 0 disables it.
+#: How close to the round ceiling before a turn is asked to stop writing and
+#: check. Three: enough to start a server, load the page and read the answer,
+#: and few enough that it only fires on a turn that really is running out.
+ROUNDS_LEFT_FOR_A_LOOK = 3
+
+#: Tools that ask whether the code WORKS, as opposed to changing it. A turn that
+#: has called none of these has produced code and established nothing about it.
+_CHECKING_TOOLS = frozenset({"check_page", "run_tests", "run_command", "create_and_run"})
+
 DEFAULT_TURN_BUDGET_SECONDS = 1200.0
+
+#: Sampling, pinned so the harness and not the server decides. These are
+#: Ollama's own defaults for `top_p`/`top_k`, stated rather than inherited;
+#: `repeat_penalty` is the one that differs, and deliberately - see `_call_model`.
+REPEAT_PENALTY = 1.0
+TOP_P = 0.9
+TOP_K = 40
+
+
+def sampling_seed() -> int | None:
+    """A fixed sampler seed for this process, or ``None`` for none.
+
+    Off in normal use: a coding assistant that answers identically to the same
+    question forever is not obviously better, and Ollama's default of a fresh
+    seed per call is the right one for a person at a keyboard.
+
+    It exists for MEASUREMENT. Every benchmark this project has produced is
+    littered with FLAKY rows, and `BENCHMARK.md` has to warn its own readers not
+    to read a delta by eye - because two runs of the same suite over the same
+    code sample different tokens. Seeded per (case, sample), a re-run draws the
+    SAME seven samples, so a difference between two runs is a difference in the
+    code. Variance across the seven samples is preserved, which is the point of
+    running seven.
+    """
+    raw = os.environ.get("SHAMSU_SAMPLING_SEED", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def configured_max_rounds() -> int:
+    """How many tool-call steps one turn may take."""
+    try:
+        from shamsu.runtime.settings import max_rounds
+
+        return max_rounds()
+    except Exception:  # noqa: BLE001 - a bad settings file must not end turns
+        return DEFAULT_MAX_ROUNDS
 
 
 def turn_budget_seconds() -> float:
-    """How long one turn may run before it stops and reports what it managed."""
-    raw = os.environ.get("SHAMSU_TURN_BUDGET_S", "").strip()
+    """How long one turn may run before it stops and reports what it managed.
+
+    `SHAMSU_TURN_BUDGET_S` still wins, and the value is now also settable from
+    inside SHAMSU (`/set turn_budget_s`) rather than only by exporting a
+    variable and restarting.
+    """
     try:
-        chosen = float(raw)
-    except ValueError:
+        from shamsu.runtime.settings import turn_budget_s
+
+        chosen = turn_budget_s()
+    except Exception:  # noqa: BLE001 - a bad settings file must not end turns
         return DEFAULT_TURN_BUDGET_SECONDS
     # 0 turns it off entirely - an escape hatch for a genuinely long job, and
     # the only way to get the old unbounded behaviour back.
@@ -451,24 +520,19 @@ def max_ctx() -> int:
     back down if the GPU refuses, so an unconfigured server degrades instead of
     hanging, but it degrades to SLOW. Check those two vars first.
 
-    SHAMSU_CHAT_MAX_CTX overrides.
-    """
-    raw = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
-    if raw.isdigit() and int(raw) >= 4096:
-        return int(raw)
-    # Then whatever was chosen in the CLI, the web portal or Telegram - one
-    # setting, install-wide, so changing it in one surface is not undone by
-    # opening another. The env var still wins: an operator who exported it did
-    # so for a reason.
-    try:
-        from shamsu.runtime.settings import chat_max_ctx
+    SHAMSU_CHAT_MAX_CTX overrides, then whatever was chosen in the CLI, the web
+    portal or Telegram - one setting, install-wide, so changing it in one
+    surface is not undone by opening another.
 
-        chosen = chat_max_ctx()
-    except Exception:  # noqa: BLE001 - a bad settings file is not a dead model
-        chosen = None
-    if chosen:
-        return chosen
-    return 32768
+    The precedence itself lives in `budget.chat_ctx_ceiling`, not here. It used
+    to be spelled out in both places and the two spellings differed: this one
+    read the saved setting, `shared_num_ctx` did not. So a window set from
+    inside SHAMSU applied to the chat call and not to any background call, and
+    Ollama reloaded the model between them.
+    """
+    from shamsu.context.budget import chat_ctx_ceiling
+
+    return chat_ctx_ceiling()
 
 
 def output_reserve(ceiling: int) -> int:
@@ -731,6 +795,13 @@ SIMPLE_TOOLS: dict[str, str] = {
     # command. Detection lives in `simple_tests`; the run goes through
     # `run_command`, so approval and the risk classifier still apply.
     "run_tests": "run_tests",
+    # Load the page in a real browser and say what happened. The gap this
+    # closes was named by the model that fell into it: live 2026-08-31 it
+    # invented `verify_web_app`, invented its output, and skipped twelve
+    # contract assertions on the strength of the invention. `BrowserTool` was
+    # built and tested the whole time and had no schema, so for a browser
+    # project the contract's run-evidence was unreachable by construction.
+    "check_page": "check_page",
     # smallcode's `use_skill`, over the skill loader SHAMSU already had and
     # never showed the model. The INDEX goes in the prompt (a name and one
     # line); the body is fetched only when the model asks, so a dozen skills
@@ -745,6 +816,11 @@ SIMPLE_TOOLS: dict[str, str] = {
     # a set of assertions that are resolved or are not.
     "contract_create": "contract_create",
     "contract_from_plan": "contract_from_plan",
+    # The Definition of Done, taken from the DOCUMENT rather than from what the
+    # model remembers of it. Reading a spec and listing what it asks for is the
+    # job a 3B does worst; live 2026-08-31 it turned eight requirements into one
+    # assertion containing the eight of them printed as a list.
+    "contract_from_spec": "contract_from_spec",
     "contract_status": "contract_status",
     "contract_assert_pass": "contract_assert_pass",
     "contract_assert_fail": "contract_assert_fail",
@@ -764,6 +840,74 @@ SIMPLE_TOOLS: dict[str, str] = {
 }
 
 SIMPLE_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "contract_from_spec",
+            "description": (
+                "Read a spec, PRD or requirements document and turn what it asks "
+                "for into the contract, one checkable claim per requirement. Use "
+                "this instead of contract_create whenever the job comes from a "
+                "document - it reads the file itself, so nothing is missed or "
+                "reworded. Works on .md, .txt, .docx and .pdf."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filepath": {
+                        "type": "string",
+                        "description": "The spec file, relative to the workspace.",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Optional name for the contract.",
+                        "default": "",
+                    },
+                },
+                "required": ["filepath"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_page",
+            "description": (
+                "Load a page in a real browser and report what happened: console "
+                "errors, which elements rendered, how much of the canvas is "
+                "actually drawn on, and a screenshot. Use this to CHECK a web page "
+                "you built - writing the file is not evidence that it works. Start "
+                "the server first with run_command, then pass its URL. For anything "
+                "behind a button, pass click and wait_seconds: loading a game and "
+                "PLAYING one give different answers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The page to load, e.g. http://localhost:8000",
+                    },
+                    "click": {
+                        "type": "string",
+                        "description": (
+                            "Optional CSS selector to click first, e.g. #startBtn."
+                        ),
+                        "default": "",
+                    },
+                    "wait_seconds": {
+                        "type": "number",
+                        "description": (
+                            "Optional seconds to watch after clicking, up to 10. "
+                            "Use 3 or more to see whether anything moves."
+                        ),
+                        "default": 0,
+                    },
+                },
+                "required": ["url"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -1546,6 +1690,19 @@ CONDITIONAL_TOOL_FAMILIES: dict[str, tuple[str, ...]] = {
     # network is a decision a local-first tool must be asked to make, and a tool
     # pointed at nothing is a round spent learning that.
     "web": ("web_search", "fetch_url"),
+    # The five contract tools that need a contract to act on. 515 tokens -
+    # 12% of the whole schema array - shipped on every turn BEFORE one
+    # exists, which is every first turn of every build, to describe
+    # operations on a thing that is not there. `contract_create` and
+    # `contract_from_plan` are deliberately NOT here: they are how a
+    # contract comes to exist, so gating them on one existing is the
+    # bootstrap trap this family is otherwise the cure for.
+    "contract": (
+        "contract_status",
+        "contract_assert_pass",
+        "contract_assert_fail",
+        "contract_assert_skip",
+    ),
 }
 
 
@@ -1563,6 +1720,7 @@ def available_tool_families(workspace: Path) -> frozenset[str]:
         ("history", _has_earlier_sessions),
         ("git", _is_a_git_repo),
         ("web", _web_is_reachable),
+        ("contract", _has_open_contract),
     ):
         try:
             if probe(workspace):
@@ -1628,6 +1786,17 @@ def _has_code_graph(workspace: Path) -> bool:
     return (workspace / ".shamsu" / "abstract" / "last-index.json").is_file()
 
 
+def _has_open_contract(workspace: Path) -> bool:
+    """Is there a contract for the assert tools to act on?
+
+    Cheap on purpose - the same file `simple_contract.load_contract` reads,
+    stat'd rather than parsed, because this runs once per turn beside four
+    other probes and a JSON parse of a contract nobody asked for is a cost
+    with no answer attached.
+    """
+    return (workspace / ".shamsu" / "contract.json").is_file()
+
+
 def _has_earlier_sessions(workspace: Path) -> bool:
     from shamsu import paths
 
@@ -1651,6 +1820,64 @@ def _without_unavailable_families(
     if not withheld:
         return schemas
     return [s for s in schemas if s.get("function", {}).get("name") not in withheld]
+
+
+#: Tools the SYSTEM PROMPT names unconditionally, and which narrowing therefore
+#: may never withhold.
+#:
+#: The prompt heads the KV prefix, so it cannot change per message - that was
+#: built and reverted on 2026-08-29, because re-prefilling the whole prompt to
+#: save 147 tokens is a loss. Everything it names is therefore named on EVERY
+#: turn, including turns the scorer narrowed. So a narrowed roster was telling
+#: the model to call tools it had not been given: `plan how you would add auth`
+#: lost `write_file`, `patch_file`, `replace_symbol` and `append_file` while the
+#: `symbols` and `big_file` sections went on describing all four, and every
+#: category but `write` lost `memory_remember` and `contract_create`.
+#:
+#: That is the defect fixed on 2026-08-29 for the write family - "the system
+#: prompt names write_file and patch_file every turn regardless of the roster,
+#: so a narrowed turn instructed the model to call tools it had not been given"
+#: - arrived at from the other end.
+#:
+#: **Two withholdings are DELIBERATE and are not listed here.** A wider floor
+#: was written first and reverted, because it silently reversed two decisions
+#: that have tests behind them:
+#:
+#: * `plan` withholds the write family on purpose. Asked to "review the PRD and
+#:   plan the next steps" a model holding `write_file` wrote five backend files,
+#:   hit the round cap at 577s and delivered no plan (live 2026-08-18).
+#:   Planning is the one thing that must not be able to write.
+#: * `contract_create` ships only for a request `ask_for_a_plan` calls
+#:   multi-part - "not worth the tokens otherwise", and the prompt's `done`
+#:   section is phrased as an offer for a job with parts rather than an
+#:   instruction to contract every question.
+#:
+#: So the prompt does name two things a narrowed turn may not have, knowingly.
+#: What is left is the accidental loss: `memory_remember` was dropped by every
+#: category but `write`, for no reason anyone chose, while the `recall` section
+#: named it on every single turn.
+PROMPT_NAMED_TOOLS: frozenset[str] = frozenset(
+    {
+        "read_file",  # base + big_read
+        "read_symbol",  # big_read
+        "ask_user",  # act
+        "memory_remember",  # recall
+        "use_skill",  # the skill index
+    }
+)
+
+
+def _with_promised_tools(schemas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Put back anything the prompt names that narrowing dropped."""
+    present = {s.get("function", {}).get("name") for s in schemas}
+    missing = PROMPT_NAMED_TOOLS - present
+    if not missing:
+        return schemas
+    return schemas + [
+        s
+        for s in SIMPLE_TOOL_SCHEMAS
+        if s.get("function", {}).get("name") in missing
+    ]
 
 
 def active_tool_schemas(
@@ -1694,9 +1921,14 @@ def active_tool_schemas(
             else _narrowed_by_request(SIMPLE_TOOL_SCHEMAS, request)
         )
     elif not category:
+        # The two-stage first call is the ONE roster the prompt floor does not
+        # apply to: `select_category` is sent instead of the tools, not
+        # alongside a narrowed set of them, and the model's next call gets the
+        # real roster with the floor on it.
         return [category_selector_tool()]
     else:
         schemas = tools_for_category(category, SIMPLE_TOOL_SCHEMAS)
+    schemas = _with_promised_tools(schemas)
     if available is None:
         return schemas
     return _without_unavailable_families(schemas, available)
@@ -1778,6 +2010,24 @@ _MAX_REPORTED_CONFLICTS = 5
 #: How many files the per-turn skeleton may cover, and how many names each may
 #: list. Both exist so a large repository degrades to "the first N files" rather
 #: than to a brief nobody can afford to send.
+#: Suffixes `verify.wiring` can actually say something about. Read from the
+#: verifier itself rather than restated, so the two cannot drift - the gate in
+#: `_cross_file_problems` was `{".html", ".htm", ".js"}` while the verifier had
+#: handled `.py`, `.ts`, `.tsx`, `.jsx`, `.vue`, `.svelte`, `.sql` and
+#: `.prisma` for months. Every Python and TypeScript project therefore got
+#: per-file syntax checks and nothing else: no duplicate declaration, no
+#: frontend call with no backend route behind it, no missing asset.
+def _wiring_suffixes() -> frozenset[str]:
+    try:
+        from shamsu.verify.wiring import _SOURCE_SUFFIXES
+
+        return frozenset(_SOURCE_SUFFIXES)
+    except Exception:  # noqa: BLE001 - fall back to what the gate always had
+        return frozenset({".html", ".htm", ".js"})
+
+
+_WIRING_SUFFIXES = _wiring_suffixes()
+
 MAX_SKELETON_FILES = 12
 MAX_SKELETON_NAMES = 12
 
@@ -1953,18 +2203,81 @@ _TOOL_ARG_ALIASES["contract_from_plan"] = {
 }
 
 
+#: Arguments whose schema type is an ARRAY. A small model routinely sends one as
+#: a string - the whole list, printed - and a string is not a type error, so it
+#: is accepted and silently means something else.
+_LIST_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "contract_create": ("assertions",),
+    "contract_from_plan": ("assertions",),
+    "ask_user": ("options",),
+    "memory_remember": ("tags",),
+}
+
+
+def _as_list(value: Any) -> Any:
+    """A list argument sent as a printed list, recovered. Otherwise unchanged.
+
+    THE bug this exists for, live 2026-08-31 in `F:\\Work\\voice-demo`. Asked to
+    build an asteroid game, the model called `contract_create` with::
+
+        "assertions": "['Game has a main menu with start button', 'Player ship
+         can move with arrow keys and shoot with spacebar', ... 8 items]"
+
+    - a Python list, printed, in a field the schema declares as an array of
+    strings. Nothing rejected it, so the contract was created with ONE assertion
+    whose text was the entire blob: eight requirements collapsed into one
+    unsatisfiable claim that stayed `pending` for the whole two-hour session.
+
+    The Definition of Done is the harness's only answer to "did it do what was
+    asked", and it was inert from the first minute of the run. Nothing later
+    could have noticed - a contract with one pending assertion looks exactly
+    like a contract with one pending assertion.
+
+    Tries JSON first, then Python's own literal syntax, because the model
+    produced single quotes and JSON will not read those. A string that is not a
+    printed list is returned untouched and becomes a one-item list upstream,
+    exactly as before - a single assertion sent as a plain string is a legal
+    thing to do and must keep working.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not (text.startswith("[") and text.endswith("]")):
+        return value
+    for parse in (json.loads, ast.literal_eval):
+        try:
+            parsed = parse(text)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            continue
+        if isinstance(parsed, (list, tuple)):
+            # Every element as text: a model that nests a dict in here means the
+            # sentence, and `str` of a dict is at least legible where a dict in
+            # a string field is not.
+            return [item if isinstance(item, str) else str(item) for item in parsed]
+    return value
+
+
 def normalize_arguments(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Accept the near-miss argument names small models produce.
 
-    Two layers: a per-tool table for tools whose implementation genuinely names
-    an argument differently (`list_files`/`search_files` take a `path`, not a
-    `filepath`; `search_files` takes a `query`, not a `pattern`), then the
-    global near-miss aliases for everything else.
+    Three layers now: a per-tool table for tools whose implementation genuinely
+    names an argument differently (`list_files`/`search_files` take a `path`, not
+    a `filepath`; `search_files` takes a `query`, not a `pattern`), then the
+    global near-miss aliases for everything else, then the near-miss argument
+    SHAPES - a list sent as its own printed representation.
+
+    The third layer is the one with a two-hour session behind it; see `_as_list`.
+    This is where it belongs rather than in each tool: the same mistake reaches
+    `ask_user.options` and `memory_remember.tags`, and a fix per tool is three
+    chances to fix two of them.
     """
     per_tool = _TOOL_ARG_ALIASES.get(tool, {})
+    listish = _LIST_ARGUMENTS.get(tool, ())
     normalized: dict[str, Any] = {}
     for key, value in (arguments or {}).items():
         target = per_tool.get(key) or _ARG_ALIASES.get(key, key)
+        if target in listish:
+            value = _as_list(value)
         normalized.setdefault(target, value)
     return normalized
 
@@ -2405,7 +2718,7 @@ class SimpleChatLoop:
         session_logger: SessionLogger | None = None,
         action_ledger: ActionLedger | None = None,
         model_name: str | None = None,
-        max_rounds: int = DEFAULT_MAX_ROUNDS,
+        max_rounds: int | None = None,
         on_activity: Any | None = None,
         on_status: Any | None = None,
         on_trace: Any | None = None,
@@ -2422,7 +2735,10 @@ class SimpleChatLoop:
         self.session_logger = session_logger
         self.action_ledger = action_ledger
         self.model_name = model_name or model_for_role("agent-chat")
-        self.max_rounds = max(1, int(max_rounds))
+        # None means "whatever is configured", not "the constant". The
+        # ceiling was reachable only by editing this file; it is now
+        # env > settings.json > 24, like every other limit.
+        self.max_rounds = max(1, int(max_rounds if max_rounds is not None else configured_max_rounds()))
         self.on_activity = on_activity
         # Replaces a LIVE status line rather than printing a new one. Without
         # it a model call is completely silent for as long as it takes, and at
@@ -2616,6 +2932,42 @@ class SimpleChatLoop:
         # Readable per-turn transcript of prompt + raw response.
         self._files: list[str] = []
         self._brief = ""
+        # The skill in the window right now. Chosen from the request before the
+        # loop starts, and re-asked at a round boundary when the TURN has said
+        # something the request could not - see `_reconsider_skill`.
+        #
+        # Not "rendered once" any more, and the reason is measured: across
+        # every session logged to 2026-08-31, `use_skill` was called zero
+        # times and nothing was ever auto-injected either. The asteroid run
+        # asked for "an asteroid game with multiple levels and sound effects",
+        # which scores `developer` at 2.0 against a floor of 3.0 - so no skill
+        # matched, while the turn went on to append to one file eight times
+        # (`large-file-surgery`) and fail the same assertion three times
+        # (`testing`). Both were sitting in the roster, unread.
+        self._skill = ""
+        # Two things a turn does that only the harness sees. `corrections` is
+        # how many times the loop had to steer the model - five on one stuck
+        # file, live 2026-08-31 - and `elisions` is how many times a tool
+        # payload was thrown out of the window to make room. Both are health
+        # signals and neither reached any report.
+        self._corrections_this_turn = 0
+        self._elisions_this_turn = 0
+        # Whether anything this turn actually EXERCISED the code, and whether the
+        # loop has already said so. Writing is not checking, and until now no
+        # part of a turn knew the difference.
+        self._checks_run = 0
+        self._asked_for_a_look = False
+        # Memoised on the inputs, not per turn. `_messages` and
+        # `_fixed_overhead` both want it and both run every round, so this was
+        # parsing up to twelve files twice a round - measured 0.73s cold and
+        # 0.036s warm on an 80-file project, ~1.7s a turn, on the event loop.
+        # Keyed on the file LIST so a turn that writes a new file still gets a
+        # fresh answer, which is the reason it was recomputed in the first place.
+        self._skeleton_cache: tuple[tuple[str, ...], int, str] | None = None
+        # Skill names already put in the window this turn. A skill arrives
+        # once; re-injecting it every round for the rest of the turn would
+        # spend the budget re-saying what the model has already been told.
+        self._skills_used: list[str] = []
         # The user request this turn is about. Memory is recalled AGAINST it -
         # a store of hundreds of notes puts five in the prompt, which is what
         # keeps a growing memory from becoming a growing tax on the window.
@@ -2741,8 +3093,14 @@ class SimpleChatLoop:
                 stopped=result.stopped,
                 failures=failures,
                 truncated=result.truncated,
+                contract=self._contract_verdict(),
+                corrections=self._corrections_this_turn,
+                elisions=self._elisions_this_turn,
             ),
             status=status,
+            contract=self._contract_verdict(),
+            corrections=self._corrections_this_turn,
+            elisions=self._elisions_this_turn,
             error=result.error,
             elapsed=elapsed,
             rounds=result.rounds,
@@ -2757,6 +3115,8 @@ class SimpleChatLoop:
             )
         except Exception:  # noqa: BLE001 - a note must never fail a turn
             pass
+        self._record_contract_state()
+        self._note_a_plan_that_was_never_written()
         if result.changed_files:
             await asyncio.to_thread(self._refresh_code_graph)
         return result
@@ -2776,20 +3136,59 @@ class SimpleChatLoop:
         injected context is TRUSTED rather than weighed - a stale claim about
         code the model just wrote is worse than no claim at all.
 
-        Only when a graph already exists. Indexing a workspace nobody chose to
-        index is a decision for the user, not a side effect of an edit.
+        It also CREATES one. This used to return early unless a graph already
+        existed, on the reasoning that indexing a workspace nobody chose to
+        index is the user's decision - and the consequence was that nothing
+        under `shamsu/agents/` ever created a graph, so the capability was real,
+        wired, advertised in the prompt, and unreachable in practice. The tools
+        are withheld until a graph exists and a graph existed only if someone
+        had run a slash command; a small model was never going to close that
+        loop on its own.
+
+        Memory settled the same argument the same way and it is worth stating
+        once: `run()` writes an evidence note at the end of every turn because
+        `memory_remember` "exists ONLY when the model volunteers a tool call -
+        and it does not". A graph nobody builds is a graph nobody can search.
+
+        Three guards keep it from being a nuisance:
+
+        * only on a turn that WROTE something - reading a project does not
+          change what a graph would say about it;
+        * only where the indexer is actually installed, so a machine without it
+          pays one cheap health check and not a failed subprocess per turn;
+        * `index_workspace` refuses a disposable directory on its own (see its
+          own comment - 129 temp workspaces in the global store), so a test or a
+          scratch folder does not accumulate.
 
         Awaited rather than fired and forgotten. The alternative races the next
         turn, and a refresh that lands halfway through the read it was meant to
-        correct is the bug this exists to prevent. It runs only on turns that
-        actually wrote something, and the upstream sync is incremental.
+        correct is the bug this exists to prevent. The upstream sync is
+        incremental, so the expensive case is the first one.
         """
-        if not _has_code_graph(self.workspace):
-            return
         try:
             from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
 
-            CodebaseMemoryAdapter().refresh_workspace(self.workspace)
+            adapter = CodebaseMemoryAdapter()
+            if _has_code_graph(self.workspace):
+                adapter.refresh_workspace(self.workspace)
+                return
+            # Building the first one. Announced, because it is the one call here
+            # that can take real time on a large project, and a silent pause is
+            # how "the harness got extremely slow" gets reported.
+            if not adapter.is_available(self.workspace):
+                return
+            if not any(self._files):
+                return
+            self._activity("indexing this project so it can be searched by symbol")
+            result = adapter.index_workspace(self.workspace)
+            if not (result or {}).get("ok"):
+                # A refusal is information, not a failure: `disposable_workspace`
+                # is the expected answer under a temp directory.
+                self._trace(
+                    "simple.graph_index_skipped",
+                    str((result or {}).get("error") or "index refused"),
+                    {"skipped": (result or {}).get("skipped", "")},
+                )
         except Exception:  # noqa: BLE001, S110 - a stale graph must not fail a turn
             pass
 
@@ -2872,14 +3271,26 @@ class SimpleChatLoop:
         # PLAN.md, and a markdown file has no assertions and no evidence gate.
         # Letting one stand in here would suppress this ask on exactly the
         # projects that have plans, and lose the done-guard with it.
+        self._asked_for_a_plan = False
         if not self._standing_contract():
             wanted = ask_for_a_plan(user_input, self.workspace)
             if wanted:
-                self.state.append_user(wanted, origin=ORIGIN_LOOP)
+                self._steer(wanted)
+                self._asked_for_a_plan = True
                 self._activity("this has several parts; asked it to write them down first")
         # Once per user message, not per round: the graph lookup costs ~2s and
         # what a file exports does not change between rounds of the same turn.
+        await asyncio.to_thread(self._warn_if_spilled_to_ram)
         self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
+        self._skills_used = []
+        self._skill = await asyncio.to_thread(
+            render_skill,
+            self.workspace,
+            user_input,
+            int(self._ceiling() * SKILL_BUDGET_RATIO),
+        )
+        if self._skill:
+            self._activity("this matched a project skill; using it")
         await self._compact_if_needed()
         changed: list[str] = []
         tool_calls = 0
@@ -3007,9 +3418,8 @@ class SimpleChatLoop:
                         # (Salvaging first cost the probe turns 8-10: 0 tools,
                         # main.py never written.)
                         self.state.append_assistant("")
-                        self.state.append_user(
+                        self._steer(
                             "That reply was empty. Answer the question, or call one tool.",
-                            origin=ORIGIN_LOOP,
                         )
                         continue
                     if turn.thinking and not self._hit_the_length_limit():
@@ -3084,13 +3494,12 @@ class SimpleChatLoop:
                     prose_nudges += 1
                     self._repair_streak += 1
                     self.state.append_assistant(text)
-                    self.state.append_user(
+                    self._steer(
                         f"You showed the new contents of {described} but did not change the file. "
                         f"Apply it now: replace_symbol if that is a whole function or class, "
                         f"patch_file for one exact replacement inside {described}, or "
                         "append_file only if it belongs at the END of the file. Do not "
                         "repeat the code in prose.",
-                        origin=ORIGIN_LOOP,
                     )
                     self._activity(f"described a change to {described} without making it; asked it to apply")
                     continue
@@ -3106,13 +3515,12 @@ class SimpleChatLoop:
                     prose_nudges += 1
                     self._repair_streak += 1
                     self.state.append_assistant(text)
-                    self.state.append_user(
+                    self._steer(
                         "You were asked to change something and nothing has changed - "
                         "you showed the code instead of writing it. Apply it now with "
                         "write_file, patch_file or replace_symbol. If you are unsure "
                         "which file to change, call ask_user; do not ask in prose, "
                         "because that ends your turn. Do not repeat the code.",
-                        origin=ORIGIN_LOOP,
                     )
                     self._activity(
                         "answered a change request with prose and changed nothing; asked it to apply"
@@ -3134,12 +3542,11 @@ class SimpleChatLoop:
                     promise_nudges += 1
                     self._repair_streak += 1
                     self.state.append_assistant(text)
-                    self.state.append_user(
+                    self._steer(
                         f"Your reply ended on {promised!r} and then stopped. Nothing "
                         "followed it and you called no tool, so nothing happened.\n\n"
                         "Do it now, in this turn: call the tool that carries out what you "
                         "just said you would do. Do not say you are about to do it again.",
-                        origin=ORIGIN_LOOP,
                     )
                     self._activity("ended on a promise with no tool call; asked it to act")
                     continue
@@ -3174,11 +3581,10 @@ class SimpleChatLoop:
                         else " Pick one from the tools you were given."
                     )
                     self.state.append_assistant(text)
-                    self.state.append_user(
+                    self._steer(
                         f"That reply was a tool call for {leaked!r}, which is not a "
                         f"tool.{suggestion} Make the call properly this time - as a "
                         "tool call, not as text in your reply.",
-                        origin=ORIGIN_LOOP,
                     )
                     self._activity(f"replied with a bare {leaked} call; asked it to call a real tool")
                     continue
@@ -3191,7 +3597,7 @@ class SimpleChatLoop:
                     empty_nudges += 1
                     self._repair_streak += 1
                     self.state.append_assistant(text)
-                    self.state.append_user(lost.correction, origin=ORIGIN_LOOP)
+                    self._steer(lost.correction)
                     self._activity(lost.activity)
                     continue
                 blocked = self._contract_blocks_this_claim(text, contract_nudges)
@@ -3210,7 +3616,7 @@ class SimpleChatLoop:
                     # honouring `origin` it would still have been recorded as
                     # something the user asked for - and it is the longest of
                     # them, because it names every unresolved assertion.
-                    self.state.append_user(blocked, origin=ORIGIN_LOOP)
+                    self._steer(blocked)
                     self._activity("claimed done with the contract unresolved; asked it to check")
                     continue
                 cut_off = self._hit_the_length_limit()
@@ -3244,6 +3650,9 @@ class SimpleChatLoop:
             outcome = await self._run_tools(turn.tool_calls)
             tool_calls += len(turn.tool_calls)
             changed.extend(outcome.written)
+            # The round has run; what it DID may have said something the
+            # request never could.
+            await self._reconsider_skill()
             if outcome.asked:
                 # The turn ends on the question. Not a stop - nothing went
                 # wrong, and marking it stopped would file a deliberate,
@@ -3317,7 +3726,7 @@ class SimpleChatLoop:
                     # another.
                     self._stalls.unproductive = 0
                     self._strategy_switched = True
-                    self.state.append_user(switch, origin=ORIGIN_LOOP)
+                    self._steer(switch)
                     self._activity("patching is not working; asked it to change approach")
                     continue
                 # Reset now the user has been TOLD. The defect was a counter
@@ -3341,7 +3750,7 @@ class SimpleChatLoop:
                 # watches a tool vanish without a word spends a round working
                 # out what it did wrong; a model told the same thing every round
                 # is the nudge spiral this fix exists to end.
-                self.state.append_user(announce, origin=ORIGIN_LOOP)
+                self._steer(announce)
             looping = self._read_loop.record(
                 outcome.tool_names,
                 # Producing ANYTHING ends the streak - a file changed, a command
@@ -3365,18 +3774,17 @@ class SimpleChatLoop:
                 self._activity(looping.activity)
                 return self._stop(looping.correction, round_index, tool_calls, changed)
             if looping:
-                self.state.append_user(looping.correction, origin=ORIGIN_LOOP)
+                self._steer(looping.correction)
                 self._activity(looping.activity)
             if outcome.repeated_read:
                 # A read that repeats verbatim is the model having lost track of
                 # what it already has, not new information. Say so once and name
                 # the result it is re-fetching, rather than letting it spend the
                 # round budget re-reading the same listing.
-                self.state.append_user(
+                self._steer(
                     f"You have already called {outcome.repeated_read} this turn and the "
                     "result has not changed. Use the result you already have, and either "
                     "answer now or make a DIFFERENT call.",
-                    origin=ORIGIN_LOOP,
                 )
                 self._read_signatures[outcome.repeated_read] = 0
                 self._activity(f"repeated {outcome.repeated_read}; asked it to move on")
@@ -3404,16 +3812,16 @@ class SimpleChatLoop:
                     f"changed {outcome.repeated_path} {outcome.repeated_edit} times "
                     "this turn without confirming a fix"
                 )
-                self.state.append_user(
+                self._steer(
                     f"You have changed {outcome.repeated_path} "
                     f"{outcome.repeated_edit} times this turn and cannot confirm any of "
                     "them worked. Do not edit it again on a guess. Either say precisely "
                     "what you changed and what the user should check, or ask for the "
                     "exact error or the lines around the problem.",
-                    origin=ORIGIN_LOOP,
                 )
             if outcome.written and self.verify_changes:
                 await self._append_verification(outcome.written)
+            self._ask_for_a_look_before_the_ceiling(round_index, changed)
 
         return self._stop(
             "I stopped after "
@@ -3424,6 +3832,54 @@ class SimpleChatLoop:
         )
 
     # -- model -----------------------------------------------------------
+
+    def _warn_if_spilled_to_ram(self) -> None:
+        """Say when the model is running partly out of system RAM.
+
+        Silent by construction until now: Ollama does not error when a model
+        does not fit, it loads what it can and runs the rest from RAM. Only the
+        HARD refusal reaches `looks_like_out_of_memory`, and this is not that.
+
+        Live 2026-08-31 on an 8GB card with the desktop running Chrome, Edge,
+        VS Code, OBS, Word and Telegram: 7,632 MiB of 8,188 in use, 1.28GB of
+        `qwen3.5:9b` outside VRAM, and a single model call that took 536
+        seconds. The session reported nothing, so from outside it looked like a
+        hang - and the first question asked was whether SHAMSU was stuck.
+
+        Once per turn, and it names the two things that actually fix it. A
+        warning that says "this is slow" and not what to do about it is a
+        warning that gets read once and ignored after.
+        """
+        try:
+            from shamsu.llm.capabilities import loaded_model_spill
+
+            spilled = loaded_model_spill()
+        except Exception:  # noqa: BLE001 - a warning must never end a turn
+            return
+        over = spilled.get(self.model_name)
+        if not over:
+            # The active model may be listed under a slightly different tag.
+            over = next(
+                (
+                    amount
+                    for name, amount in spilled.items()
+                    if name.split(":")[0] == self.model_name.split(":")[0]
+                ),
+                0,
+            )
+        if not over:
+            return
+        window = self._ceiling()
+        smaller = next(
+            (bucket for bucket in reversed(CTX_BUCKETS) if bucket < window), 0
+        )
+        advice = "close what else is using the GPU"
+        if smaller:
+            advice += f", or run smaller with `/context window {smaller}`"
+        self._notice(
+            f"{over / 1e9:.1f}GB of {self.model_name} is running from system RAM, "
+            f"not the GPU - expect every step to take minutes. To fix it, {advice}."
+        )
 
     def _warn_if_filling(self) -> None:
         """Say the window is filling on the way UP, once.
@@ -3617,14 +4073,25 @@ class SimpleChatLoop:
     async def _call_model(self) -> Any:
         messages = self._messages()
         num_ctx = self._num_ctx(messages)
-        kwargs = {
-            "model": self.model_name,
-            "messages": messages,
-            "tools": self._without_broken_tools(
+        # A model the server says cannot call tools is sent none. Live
+        # 2026-08-30 `gemma3:4b` reports no `tools` capability and was being
+        # sent thirty-seven schemas - ~4,300 tokens of a window it then had to
+        # answer in, describing calls it had no way to make. The salvager still
+        # reads a tool call out of its prose, which is how such a model works
+        # here at all.
+        schemas = (
+            self._without_broken_tools(
                 active_tool_schemas(
                     num_ctx, self._tool_category, self._available_families, self._request
                 )
-            ),
+            )
+            if model_supports_native_tools(self.model_name)
+            else []
+        )
+        kwargs = {
+            "model": self.model_name,
+            "messages": messages,
+            "tools": schemas,
             "stream": False,
             "think": self._should_think(),
             "options": {
@@ -3638,8 +4105,35 @@ class SimpleChatLoop:
                 # The system prompt survives an overflow the budget failed to
                 # prevent. Ollama keeps 4 tokens by default; see `_num_keep`.
                 "num_keep": self._num_keep(num_ctx),
+                # PINNED, not left to whatever the server defaults to this
+                # month. Two reasons, and the second is the load-bearing one.
+                #
+                # A benchmark that moves when Ollama changes a default is a
+                # benchmark that cannot attribute a delta to a change in this
+                # repo - which is the same defect the eval seed fixes one level
+                # up.
+                #
+                # And `repeat_penalty` defaults to 1.1, applied to CODE. The
+                # tokens a repetition penalty punishes in prose are the tokens
+                # source code is made of: indentation, `self.`, `return`, a
+                # closing brace. 1.0 is off, and off is the right setting for a
+                # coding model; the loop already has `adapted_temperature` and
+                # `IDENTICAL_FAILURES_BEFORE_REFUSING` for the actual repetition
+                # failure, which is a model repeating a whole wrong ANSWER, not
+                # a token.
+                "repeat_penalty": REPEAT_PENALTY,
+                "top_p": TOP_P,
+                "top_k": TOP_K,
             },
         }
+        # Only when something asked for one - see `sampling_seed`. Sent inside
+        # `options` rather than beside it: Ollama reads it there, and a seed at
+        # the top level is silently ignored, which would make a "seeded" suite
+        # that is not seeded at all - worse than an unseeded one, because the
+        # numbers would look trustworthy.
+        seed = sampling_seed()
+        if seed is not None:
+            kwargs["options"]["seed"] = seed
         self._trace(
             "simple.model_call",
             f"{len(messages)} messages, num_ctx {num_ctx}",
@@ -3681,6 +4175,19 @@ class SimpleChatLoop:
     # honoured it, so a real turn produced a log with approvals and file writes
     # in it and no sign of what the agent read, ran, or said. These four are
     # that promise, kept. All best-effort: logging must never break a turn.
+
+    def _steer(self, message: str) -> None:
+        """Write one harness correction into the transcript, and count it.
+
+        Thirteen places used to call `state.append_user(..., origin=ORIGIN_LOOP)`
+        directly, so the number of times a turn had to correct the model existed
+        only as however many of those had run - visible nowhere, countable by
+        nobody. It is the single most diagnostic number a turn produces: five
+        corrections on one file is a stuck turn, and the verdict said
+        `2 files changed`.
+        """
+        self._corrections_this_turn += 1
+        self.state.append_user(message, origin=ORIGIN_LOOP)
 
     def _notice(self, message: str) -> None:
         """Say something about the TURN, to the console and to the log.
@@ -3750,6 +4257,40 @@ class SimpleChatLoop:
             )
         except Exception:
             pass
+
+    async def _reconsider_skill(self) -> None:
+        """Ask again, now that the turn has done something.
+
+        A request is what someone thought the job was before starting it. The
+        situation is what it turned out to be, and when they disagree the
+        second one is right: "build an asteroid game with multiple levels and
+        sound effects" cannot be read as `large-file-surgery` by any matcher,
+        but eight `append_file` calls against one path says it outright.
+
+        Cheap enough to run every round - `_skill_catalog` is cached per
+        workspace, and `situation_skill_name` is two counters over lists the
+        loop already keeps. Nothing is read from disk until a situation
+        actually fires, which on most turns is never.
+        """
+        situation = Situation(
+            writes=tuple(self._observed_writes),
+            failures=tuple(self._turn_failures),
+        )
+        if not situation_skill_name(situation):
+            return
+        name, text = await asyncio.to_thread(
+            skill_for_turn,
+            self.workspace,
+            self._request,
+            int(self._ceiling() * SKILL_BUDGET_RATIO),
+            situation=situation,
+            already_used=tuple(self._skills_used),
+        )
+        if not name or not text:
+            return
+        self._skills_used.append(name)
+        self._skill = text
+        self._activity(f"the way this turn is going matched the {name} skill; using it")
 
     def _ledger_model_started(
         self, messages: list[dict[str, Any]], kwargs: dict[str, Any]
@@ -3858,7 +4399,7 @@ class SimpleChatLoop:
         if not evicted:
             return
 
-        facts = _digest(self.state.rolling_summary, evicted)
+        facts = _digest(self.state.rolling_summary, evicted, self._ceiling())
         # Use the bucket the REAL call is about to use. `self._num_ctx_floor` is
         # 0 here - a fresh loop is built per user turn - so reading it fell back
         # to the smallest bucket and every compaction cost a model reload.
@@ -3947,7 +4488,7 @@ class SimpleChatLoop:
             # decisions entirely rather than keeping a trace of them.
             evicted = self.state.newly_evicted(start_abs)
             if evicted:
-                digest = _digest(self.state.rolling_summary, evicted)
+                digest = _digest(self.state.rolling_summary, evicted, self._ceiling())
                 if digest:
                     self.state.update_rolling_summary(digest, start_abs)
         messages = self.state.build_ollama_messages(
@@ -3973,6 +4514,12 @@ class SimpleChatLoop:
         remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
+        # The skill this request matched, if one did. Injected rather than
+        # offered: `use_skill` was called zero times across every session
+        # logged, which is what a capability behind a judgment call is worth
+        # on a 7B. `render_memory` above settled the same argument first.
+        if self._skill:
+            grounding = self._skill + chr(10) * 2 + grounding
         if self._brief:
             grounding = f"{grounding}\n\n{self._brief}"
         # And what every OTHER file declares. `_brief` covers the files the
@@ -3980,9 +4527,7 @@ class SimpleChatLoop:
         # cross-file collisions were coming from. Budgeted against the window,
         # so a small context degrades to a few files rather than to a brief it
         # cannot afford - see `workspace_skeletons`.
-        skeletons = workspace_skeletons(
-            self.workspace, self._files, int(max_ctx() * SKELETON_BUDGET_RATIO)
-        )
+        skeletons = self._skeletons()
         if skeletons:
             grounding = grounding + chr(10) + chr(10) + skeletons
         # LAST, not at position 1. llama.cpp reuses the KV cache for the
@@ -4305,6 +4850,7 @@ class SimpleChatLoop:
                 "eliding payloads will not help much here"
             )
             return self._elide_payloads()
+        self._elisions_this_turn += 1
         self._notice("context is filling; eliding older tool payloads")
         return self._elide_payloads(
             self._verbatim_tail(VERBATIM_TAIL_FRACTION_UNDER_PRESSURE)
@@ -4479,6 +5025,12 @@ class SimpleChatLoop:
         remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
+        # The skill this request matched, if one did. Injected rather than
+        # offered: `use_skill` was called zero times across every session
+        # logged, which is what a capability behind a judgment call is worth
+        # on a 7B. `render_memory` above settled the same argument first.
+        if self._skill:
+            grounding = self._skill + chr(10) * 2 + grounding
         if self._brief:
             grounding = grounding + chr(10) + chr(10) + self._brief
         # And what every OTHER file declares. `_brief` covers the files the
@@ -4486,9 +5038,7 @@ class SimpleChatLoop:
         # cross-file collisions were coming from. Budgeted against the window,
         # so a small context degrades to a few files rather than to a brief it
         # cannot afford - see `workspace_skeletons`.
-        skeletons = workspace_skeletons(
-            self.workspace, self._files, int(max_ctx() * SKELETON_BUDGET_RATIO)
-        )
+        skeletons = self._skeletons()
         if skeletons:
             grounding = grounding + chr(10) + chr(10) + skeletons
         total += count_tokens(grounding) + PER_MESSAGE_OVERHEAD
@@ -4671,7 +5221,7 @@ class SimpleChatLoop:
                 # same generation still deserve to run - the model may have
                 # asked and read a file in one turn.
                 outcome.asked = result.message.strip() or outcome.asked
-            payload = _budgeted(result.to_json())
+            payload = _budgeted(result.to_json(), self._ceiling())
             if name == "read_file" and '"content_truncated": true' in payload.lower():
                 # `_budgeted` trims AFTER `_execute` has run, so the ToolResult
                 # the partial-read guard inspected looked complete. Without this
@@ -4888,7 +5438,7 @@ class SimpleChatLoop:
         self._trace(
             "simple.refused_repeat", f"{name} {named}", {"tool": name, "attempts": seen}
         )
-        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json(), self._ceiling()))
 
     def _max_write_chars(self) -> int:
         """This session's content cap, from the reply budget that last bound.
@@ -5036,7 +5586,7 @@ class SimpleChatLoop:
             f"{name} {named}",
             {"tool": name, "filepath": target, "chars": len(content), "max_chars": cap},
         )
-        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json(), self._ceiling()))
 
     def _truncated_content(
         self, name: str, arguments: dict[str, Any]
@@ -5113,7 +5663,7 @@ class SimpleChatLoop:
             f"{name} {named}",
             {"tool": name, "filepath": target, "why": why},
         )
-        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json(), self._ceiling()))
 
     def _refuse_truncated_write(
         self,
@@ -5177,7 +5727,7 @@ class SimpleChatLoop:
             f"{name} {named}",
             {"tool": name, "filepath": target, "refusals": self._truncated_refusals},
         )
-        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json()))
+        self.state.append_tool(_call_id(call), name, _budgeted(result.to_json(), self._ceiling()))
 
     def _execute(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         name = canonical_tool_name(name)
@@ -5200,6 +5750,13 @@ class SimpleChatLoop:
             return self._replace_symbol(arguments)
         if name.startswith("contract_"):
             return self._contract_tool(name, arguments)
+        # The three that EXERCISE the code rather than produce it. Counted here,
+        # at the one place every tool call passes through, so the count cannot
+        # drift from what actually ran - see `_ask_for_a_look_before_the_ceiling`.
+        if name in _CHECKING_TOOLS:
+            self._checks_run += 1
+        if name == "check_page":
+            return self._check_page(arguments)
         if name == "run_tests":
             return self._run_tests(arguments)
         if name == "use_skill":
@@ -5699,6 +6256,146 @@ class SimpleChatLoop:
         except Exception:  # noqa: BLE001 - an anchor must never fail a turn
             return ""
 
+    def _ask_for_a_look_before_the_ceiling(
+        self, round_index: int, changed: list[str]
+    ) -> None:
+        """With a few rounds left and nothing checked, stop writing and look.
+
+        The budget went entirely on production. Live 2026-08-31 a build spent
+        all 24 rounds and both turns writing, ran nothing, and produced a game
+        in which - measured afterwards - clicking START moved the canvas from
+        1.22% covered to 1.23%. There was never a moment where the turn stopped
+        adding code and asked whether any of it worked, because nothing ever
+        suggested one.
+
+        Fires ONCE, and only when all three are true: the ceiling is close, this
+        turn actually wrote something, and nothing has been run or loaded. A turn
+        that already checked its work does not need telling, and a turn that
+        wrote nothing has nothing to check.
+
+        A steer, not a stop. The model may reasonably decide the last rounds are
+        better spent finishing a file - but it should decide that having been
+        asked, rather than by never considering it.
+        """
+        if self._asked_for_a_look or not changed:
+            return
+        if round_index < self.max_rounds - ROUNDS_LEFT_FOR_A_LOOK:
+            return
+        if self._checks_run:
+            return
+        self._asked_for_a_look = True
+        left = self.max_rounds - round_index - 1
+        self._activity("nearly out of rounds and nothing has been run; asked it to check")
+        self._steer(
+            f"{left} step(s) left in this turn, and nothing you have written has "
+            "been run or loaded. Stop adding code and check what is there: "
+            "run_tests, or run_command to start it, or check_page with the url "
+            "and a click on whatever starts it. A file that was written is not a "
+            "feature that works, and this is the last chance to find out which "
+            "you have."
+        )
+
+    def _note_a_plan_that_was_never_written(self) -> None:
+        """The ask was made and ignored. Say so, once, at the end of the turn.
+
+        `ask_for_a_plan` is a nudge and stops there: nothing has ever noticed
+        when the model did not act on it. Live 2026-08-31 a build of a whole
+        game ran two turns and finished with no `.shamsu/contract.json` at all -
+        so there was no Definition of Done, nothing to check the work against,
+        and every verdict was computed from files and syntax alone. The turn
+        reported four files changed and could not have reported anything else.
+
+        A note, not a nudge and not a refusal. The model has already spent the
+        turn; telling it off at the end changes nothing about the work, while
+        telling the USER means the next message can be "write the contract
+        first" instead of "continue".
+        """
+        if not getattr(self, "_asked_for_a_plan", False):
+            return
+        if self._standing_contract():
+            return
+        self._notice(
+            "no contract was written for this, so nothing checked the work "
+            "against what you asked for"
+        )
+        if self.action_ledger is None:
+            return
+        try:
+            self.action_ledger.log_event("contract_never_written")
+        except Exception:  # noqa: BLE001 - a note must never end a turn
+            pass
+
+    def _record_contract_state(self) -> None:
+        """Tell the LEDGER what the contract says, at turn end.
+
+        The verdict line already says it to the person watching. This says it to
+        the run record, which is what `/runs`, the web portal and any later
+        question about "did that work" all read - and which decided the outcome
+        from mutations and syntax alone. A run that wrote files and parsed them
+        was `success` however much of its own Definition of Done was untouched.
+
+        A demotion to `success_unverified`, never a failure: unchecked is not
+        broken, it is unknown, and that is the word this ledger already has.
+        """
+        if self.action_ledger is None:
+            return
+        try:
+            from shamsu.agents.simple_contract import contract_disabled, load_contract
+
+            if contract_disabled():
+                return
+            contract = load_contract(self.workspace)
+            if contract is None or not contract.assertions:
+                return
+            pending = [i for i in contract.assertions if i.state == "pending"]
+            unproven = list(contract.unproven)
+            if not pending and not unproven:
+                return
+            self.action_ledger.log_event(
+                "contract_unresolved",
+                title=contract.title,
+                total=len(contract.assertions),
+                pending=len(pending),
+                unproven=len(unproven),
+                ids=[i.id for i in (pending + unproven)][:20],
+            )
+        except Exception:  # noqa: BLE001 - a record must never end a turn
+            pass
+
+    def _contract_verdict(self) -> str:
+        """How much of the Definition of Done is actually done, for the one line
+        the user reads. ``""`` when there is no contract.
+
+        The harness has always known this and never said it. Live 2026-08-31 a
+        two-hour session reported five turns of `N files changed` while its only
+        assertion sat `pending` from the first minute - the contract had been
+        created from a malformed payload and was inert, and nothing in any
+        verdict would have shown that.
+
+        Deliberately counts UNPROVEN separately from unchecked: an assertion
+        marked passed on the strength of a file being written is not the same as
+        one nobody looked at, and `done_guard` already makes that distinction
+        the moment a completion is claimed.
+        """
+        try:
+            from shamsu.agents.simple_contract import contract_disabled, load_contract
+
+            if contract_disabled():
+                return ""
+            contract = load_contract(self.workspace)
+        except Exception:  # noqa: BLE001 - a verdict must never end a turn
+            return ""
+        if contract is None or not contract.assertions:
+            return ""
+        total = len(contract.assertions)
+        resolved = sum(1 for item in contract.assertions if item.state != "pending")
+        if resolved < total:
+            return f"{total - resolved} of {total} checks outstanding"
+        unproven = len(contract.unproven)
+        if unproven:
+            return f"{unproven} of {total} checks unproven"
+        return f"all {total} checks done"
+
     def _standing_contract(self) -> str:
         """The active contract as this turn's plan, or ``""``.
 
@@ -5788,6 +6485,42 @@ class SimpleChatLoop:
             True,
             f"Skill: {skill.name} - {skill.description}" + chr(10) * 2 + body,
             {"skill": skill.name, "source": skill.source},
+        )
+
+    def _check_page(self, arguments: dict[str, Any]) -> ToolResult:
+        """Load a page in a real browser and hand back what happened.
+
+        Composed here rather than in the registry because `BrowserTool` owns a
+        Chromium process and its own approval prompt, and threading that through
+        `AgentToolRegistry` would put a browser session behind the file-write
+        policy for no reason.
+        """
+        url = str(arguments.get("url") or "").strip()
+        if not url:
+            return ToolResult(False, "check_page needs a url, e.g. http://localhost:8000", {})
+        try:
+            from shamsu.tools.browser import BrowserTool
+            from shamsu.tools.page_check import check_page
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(False, f"The browser tool is unavailable: {exc}", {})
+        browser = BrowserTool(self.workspace, session_logger=self.session_logger)
+        try:
+            report = check_page(
+                browser,
+                url,
+                click=str(arguments.get("click") or "").strip(),
+                wait_seconds=float(arguments.get("wait_seconds") or 0),
+            )
+        except Exception as exc:  # noqa: BLE001 - a check must never end a turn
+            return ToolResult(False, f"Could not check {url}: {exc}", {"url": url})
+        finally:
+            with contextlib.suppress(Exception):
+                browser.close()
+        payload = json.loads(report.render())
+        return ToolResult(
+            bool(payload.get("ok")),
+            str(payload.get("message") or ""),
+            dict(payload.get("data") or {}),
         )
 
     def _run_tests(self, arguments: dict[str, Any]) -> ToolResult:
@@ -5919,6 +6652,8 @@ class SimpleChatLoop:
             self._activity(f"contract set: {contract.title} ({len(contract.assertions)} assertions)")
             return ToolResult(True, contract.render(), {"assertions": len(contract.assertions)})
 
+        if name == "contract_from_spec":
+            return self._contract_from_spec(arguments)
         if name == "contract_from_plan":
             return self._contract_from_plan(arguments)
 
@@ -6078,6 +6813,67 @@ class SimpleChatLoop:
         contracts.save_contract(self.workspace, contract)
         self._activity(f"{item.id} {item.state}: {item.text[:60]}")
         return ToolResult(True, contract.render(), {"assertion": item.id, "state": item.state})
+
+    def _contract_from_spec(self, arguments: dict[str, Any]) -> ToolResult:
+        """Make the document's requirements the contract.
+
+        The extraction is deterministic on purpose - see `simple_spec`. The
+        model's job here is to point at the right file, which it can do; listing
+        what a document asks for without dropping half of it is the job it
+        cannot.
+        """
+        from shamsu.agents import simple_contract as contracts
+        from shamsu.agents.simple_spec import extract_requirements, read_spec
+
+        filepath = str(arguments.get("filepath") or "").strip()
+        if not filepath:
+            return ToolResult(False, "contract_from_spec needs a filepath.", {})
+        text, error = read_spec(self.workspace, filepath)
+        if error:
+            return ToolResult(False, error, {"filepath": filepath})
+        found = extract_requirements(text)
+        if not found:
+            # A real answer, not a failure: some documents are prose. Say which
+            # shapes were looked for so the next call is an informed one.
+            return ToolResult(
+                False,
+                f"No requirements found in {filepath}. This looks for bulleted or "
+                "numbered items, and for sentences saying something must or should "
+                "happen. If the document states them another way, use "
+                "contract_create with the claims written out.",
+                {"filepath": filepath},
+            )
+        existing = contracts.load_contract(self.workspace)
+        if existing is not None and not existing.done:
+            return ToolResult(
+                False,
+                f"There is already an open contract ({existing.title}) with "
+                f"{len(existing.assertions)} assertions. Finish or clear it before "
+                "starting another - two contracts for one job is how the numbers "
+                "stop meaning anything.",
+                {"blocked_by": existing.title},
+            )
+        title = str(arguments.get("title") or "").strip() or Path(filepath).stem
+        contract = contracts.new_contract(
+            title, f"From {filepath}", [item.text for item in found]
+        )
+        contracts.save_contract(self.workspace, contract)
+        self._activity(
+            f"contract set from {filepath}: {len(contract.assertions)} requirements"
+        )
+        listing = chr(10).join(
+            f"  {item.id}  {item.text}" for item in contract.assertions
+        )
+        return ToolResult(
+            True,
+            f"{len(contract.assertions)} requirements from {filepath} are now the "
+            f"contract:{chr(10) * 2}{listing}",
+            {
+                "filepath": filepath,
+                "count": len(contract.assertions),
+                "sources": sorted({item.source for item in found}),
+            },
+        )
 
     def _contract_from_plan(self, arguments: dict[str, Any]) -> ToolResult:
         """Make one phase of PLAN.md the active contract.
@@ -7236,7 +8032,7 @@ class SimpleChatLoop:
             + _first_line(result.message or ""),
             {"auto": True, "command": found.command, "ok": bool(result.ok)},
         )
-        self.state.append_tool("", "run_tests", _budgeted(payload.to_json()))
+        self.state.append_tool("", "run_tests", _budgeted(payload.to_json(), self._ceiling()))
         self._trace("simple.autotest", found.command, {"ok": bool(result.ok)})
 
     def _record_evidence(
@@ -7418,6 +8214,20 @@ class SimpleChatLoop:
             ensure_ascii=True,
         )
 
+    def _skeletons(self) -> str:
+        """`workspace_skeletons` for the current file list, computed once."""
+        budget = int(self._ceiling() * SKELETON_BUDGET_RATIO)
+        key = tuple(self._files)
+        if (
+            self._skeleton_cache is not None
+            and self._skeleton_cache[0] == key
+            and self._skeleton_cache[1] == budget
+        ):
+            return self._skeleton_cache[2]
+        rendered = workspace_skeletons(self.workspace, self._files, budget)
+        self._skeleton_cache = (key, budget, rendered)
+        return rendered
+
     def _cross_file_problems(self, written: list[str]) -> list[str]:
         """Defects that exist only in the COMBINATION of files.
 
@@ -7437,7 +8247,7 @@ class SimpleChatLoop:
         if self._unfinished:
             return []
         if not any(
-            Path(name).suffix.lower() in {".html", ".htm", ".js"} for name in written
+            Path(name).suffix.lower() in _WIRING_SUFFIXES for name in written
         ):
             return []
         try:
@@ -7842,6 +8652,9 @@ def _turn_verdict(
     stopped: bool,
     failures: int = 0,
     truncated: bool = False,
+    contract: str = "",
+    corrections: int = 0,
+    elisions: int = 0,
 ) -> str:
     """The one line a surface shows where the live footer used to tick.
 
@@ -7869,6 +8682,19 @@ def _turn_verdict(
         parts.append(f"{failures} tool call{'s' if failures != 1 else ''} failed")
     if truncated:
         parts.append("answer cut off")
+    # Three things the harness knew and never said. A turn was reported as
+    # `done in 8m12s - 4 files changed` while five of nine assertions sat
+    # unchecked, the loop had corrected the model ten times, and seventeen tool
+    # payloads had been thrown out of the window to make room. All three are
+    # measured; none of them reached the one line anyone reads.
+    if contract:
+        parts.append(contract)
+    if corrections:
+        parts.append(
+            f"steered {corrections} time{'s' if corrections != 1 else ''}"
+        )
+    if elisions:
+        parts.append(f"context trimmed {elisions}x")
     return " - ".join(parts)
 
 
@@ -8344,7 +9170,7 @@ def codebase_brief(workspace: Path, text: str, limit: int = MAX_BRIEF_TARGETS) -
         return ""
 
 
-def _digest(previous: str, evicted: list[Any]) -> str:
+def _digest(previous: str, evicted: list[Any], ceiling: int | None = None) -> str:
     """A deterministic `asked -> did` trace of turns that no longer fit.
 
     No model call: a digest that costs a round-trip gets skipped under pressure,
@@ -8394,7 +9220,9 @@ def _digest(previous: str, evicted: list[Any]) -> str:
         lines.append("- files changed earlier: " + ", ".join(dict.fromkeys(touched))[:300])
     if not lines:
         return ""
-    return _bounded_summary(lines, summary_budget(max_ctx()))
+    # THIS session's window. Budgeted against the install-wide maximum, the
+    # digest kept spending 32k-sized room inside an 8k window.
+    return _bounded_summary(lines, summary_budget(ceiling or max_ctx()))
 
 
 
@@ -9311,14 +10139,21 @@ def expand_mentions(workspace: Path, text: str) -> str:
     return text + chr(10) * 2 + "Mentioned file context:" + chr(10) + rendered
 
 
-def _budgeted(payload: str) -> str:
+def _budgeted(payload: str, ceiling: int | None = None) -> str:
     """Cap one tool result so it cannot crowd the conversation out of the window.
 
     Truncates the CONTENT field, not the JSON string. Slicing raw JSON left an
     unterminated string and unclosed braces - a payload the model can only read
     as garbage. Whatever survives the cap must still be shaped like a result.
+
+    *ceiling* is THIS session's window, not the install-wide maximum.
+    `tool_result_budget` has taken a ceiling since it stopped being a flat
+    number - its own comment says why, "97.7% of an 8k window" - and this, the
+    only call site that matters, passed nothing. So a session walked down to 8k
+    by `_shrink_for_oom` went on allowing 8,000 tokens for one tool result:
+    98% of the window it actually had.
     """
-    cap = tool_result_budget()
+    cap = tool_result_budget(ceiling)
     if count_tokens(payload) <= cap:
         return payload
     keep = cap * 4

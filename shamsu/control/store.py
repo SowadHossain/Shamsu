@@ -48,8 +48,25 @@ LEASE_STALE_SECONDS = 90.0
 LEASE_HEARTBEAT_SECONDS = 20.0
 
 #: Unanswered approvals fail closed. Matching the Telegram broker's existing
-#: default rather than inventing a second number.
+#: default rather than inventing a second number. The FALLBACK now, not the
+#: value - see `approval_timeout()`, which lets it be set without a restart.
 APPROVAL_TIMEOUT_SECONDS = 900.0
+
+
+def approval_timeout() -> float:
+    """How long an approval card waits, from env > settings.json > 900s.
+
+    Resolved per call rather than baked into a default argument: a default
+    is evaluated once at import, so a value set from inside SHAMSU would not
+    reach a process that was already running - which is the whole point of
+    the setting.
+    """
+    try:
+        from shamsu.runtime.settings import approval_timeout_s
+
+        return approval_timeout_s()
+    except Exception:  # noqa: BLE001 - approvals must never fail to be asked
+        return APPROVAL_TIMEOUT_SECONDS
 
 QUEUED = "queued"
 RUNNING = "running"
@@ -414,12 +431,14 @@ class ControlStore:
         description: str = "",
         risk_level: str = "",
         preview: str = "",
-        timeout_seconds: float = APPROVAL_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         approval_id: str = "",
     ) -> str:
         approval_id = approval_id or f"approval-{uuid.uuid4().hex[:16]}"
         created = datetime.now(timezone.utc)
-        expires = created.timestamp() + float(timeout_seconds)
+        expires = created.timestamp() + float(
+            timeout_seconds if timeout_seconds is not None else approval_timeout()
+        )
         with self._connect(write=True) as conn:
             conn.execute(
                 """
@@ -497,7 +516,7 @@ class ControlStore:
         self,
         approval_id: str,
         *,
-        timeout_seconds: float = APPROVAL_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         poll_seconds: float = 0.25,
         should_stop=lambda: False,
     ) -> str:
@@ -509,7 +528,9 @@ class ControlStore:
 
         Fails CLOSED. An unanswered approval is a denial, never an allow.
         """
-        deadline = time.monotonic() + float(timeout_seconds)
+        deadline = time.monotonic() + float(
+            timeout_seconds if timeout_seconds is not None else approval_timeout()
+        )
         while time.monotonic() < deadline and not should_stop():
             record = self.approval(approval_id)
             if record is None:

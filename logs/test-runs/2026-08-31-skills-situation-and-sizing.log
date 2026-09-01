@@ -1,0 +1,45 @@
+# 2026-08-31 skills: situation-aware selection + small-model sizing
+
+## Why: the asteroid run (F:\Work\voice-demo, run_2026-08-31_00-07-32_fa88)
+  status: failed after 24 steps, 13 minutes
+  request: "Let's build an asteroid game with multiple levels and sound effects."
+  skill index in all 24 prompts (~147 tokens each, ~3,500 total)
+  use_skill calls: 0
+  auto-injected skills: 0   ("How this project does" appears 0 times in that workspace)
+
+Request-only scores against the real trigger metadata:
+  developer            2.0   ("build")
+  large-file-surgery   0.0
+  ui-designer          0.0
+  testing              0.0
+  everything else      0.0
+MIN_SCORE is 3.0, so nothing was injected - correctly, by that matcher.
+
+Meanwhile the turn did:
+  8 consecutive append_file calls on asteroid/game.js  (76 -> 581 lines)
+  3 x contract_assert_pass, same refusal each time: "a01 needs evidence:
+    what did you run, and what did it say?"
+  1 verification_failed: syntax:asteroid/index.html
+
+## Skill sizes: before -> after
+                        before   after   (327 = 0.04 of an 8k window)
+  developer               393     292
+  large-file-surgery      722 *   294     * over its OWN 700 budget: truncated
+  sql-databases           591     324
+  critic                    -     221     new
+  debugger                  -     250     new
+  planner                   -     231     new
+  qa-tester                 -     206     new
+  others                unchanged, all already under 327
+
+Every one of 13 skills now fits an 8k window intact. Max 324.
+
+## Tests
+.......................                                                  [100%]
+23 passed in 1.23s
+.......................................................................  [100%]
+647 passed in 114.36s (0:01:54)
+
+ruff: shamsu/agents/simple_skills.py tests/test_simple_skills.py tests/test_skills.py
+All checks passed!
+simple_chat.py carries 41 pre-existing ruff errors; none in the edited regions.

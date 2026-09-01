@@ -1,0 +1,6 @@
+# 2026-08-31 voice-output-gate
+cmd: .venv/Scripts/python.exe -m pytest tests/test_voice.py tests/test_tui.py tests/test_telegram_remote_control.py -q
+
+........................................................................ [ 51%]
+....................................................................     [100%]
+140 passed in 8.84s

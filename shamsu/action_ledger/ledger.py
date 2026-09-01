@@ -462,6 +462,9 @@ class ActionLedger:
         mutation_statuses = [str(item.get("status", "")) for item in mutations]
         mutation_seen = bool(mutations) or "patch_apply_succeeded" in event_types
         verification_passed = "verification_passed" in event_types
+        # The model wrote down what "done" means and did not get there. Written
+        # by the loop at turn end; see `SimpleChatLoop._record_contract_state`.
+        contract_unresolved = "contract_unresolved" in event_types
         failure_event_seen = any(
             event_type in event_types
             for event_type in {
@@ -495,9 +498,22 @@ class ActionLedger:
             or self._has_unrecovered_patch_failure(events)
         ):
             outcome = "failed"
-        elif mutation_seen and verification_passed:
+        elif mutation_seen and verification_passed and not contract_unresolved:
             outcome = "success"
         elif mutation_seen:
+            # `success_unverified` covers BOTH "nothing checked the files" and
+            # "the model's own Definition of Done still has open claims". The
+            # second was invisible here: the outcome was decided from mutations
+            # and syntax alone, so a run that wrote files and parsed them was
+            # `success` while its contract said nothing had been established.
+            #
+            # Live 2026-08-31: eight requirements, one malformed assertion,
+            # `pending` from the first minute to the last - and five turns
+            # reported as work done.
+            #
+            # Deliberately a DEMOTION and not a failure. Unchecked is not
+            # broken; it is unknown, and `success_unverified` is the word this
+            # ledger already has for that.
             outcome = "success_unverified"
         elif self._has_successful_command(events):
             outcome = "success"

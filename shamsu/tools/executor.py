@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import json
 import re
 import os
 import signal
@@ -97,6 +98,31 @@ def _platform_command(command: str) -> str:
         command,
     )
 
+
+
+def _kill_pid_tree(pid: int) -> None:
+    """Kill *pid* and everything it started, given only the number.
+
+    The counterpart to `_kill_process_tree` for a process this interpreter did
+    not start - a server stranded by a previous session, found by sweeping
+    `.shamsu/processes`. There is no `Popen` handle for one of those, and that
+    is exactly the case the on-disk registry exists to serve.
+    """
+    if pid <= 0:
+        return
+    if sys.platform == "win32":
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        return
+    with contextlib.suppress(Exception):
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    with contextlib.suppress(Exception):
+        os.kill(pid, signal.SIGKILL)
 
 
 def _kill_process_tree(process: "subprocess.Popen") -> None:
@@ -223,6 +249,137 @@ _DETACH_ALIVE_SECONDS = 3.0
 #: strand a server holding port 3000 after it exits.
 _DETACHED: "dict[int, tuple[subprocess.Popen, str]]" = {}
 
+#: Where the same thing is written DOWN. The in-memory registry above dies with
+#: the interpreter that holds it, and `atexit` - its only trigger - does not run
+#: when a console window is closed, when the process is killed, or when it
+#: crashes. Those are the ordinary ways a terminal session ends on Windows.
+#:
+#: Measured 2026-08-31 in `F:\\voice-demo`: `python -m http.server 8000` started
+#: at 06:19 was still listening on port 8000 at 08:20, two hours after its
+#: session ended. Nothing could have found it - the only trace on disk was a log
+#: file named `<timestamp>-<hash>.log`, which does not name the process.
+#:
+#: One file per process, named by pid, so a sweep is a directory listing and two
+#: processes can never race on one index file. `dev_server.py` has done this
+#: properly all along (`.shamsu/dev-servers.json`); it is simply not on the path
+#: `run_command` takes.
+PROCESS_DIR = Path(".shamsu") / "processes"
+
+
+def _record_path(workspace: Path, pid: int) -> Path:
+    return workspace / PROCESS_DIR / f"{pid}.json"
+
+
+def _write_record(workspace: Path, pid: int, command: str, cwd: Path, log_path: Path) -> None:
+    """Note a live background process on disk. Never raises."""
+    record = {
+        "pid": pid,
+        "command": command,
+        "cwd": str(cwd),
+        "log": str(log_path),
+        "started": time.time(),
+        "port": _port_of(command),
+    }
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        path = _record_path(workspace, pid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+
+
+def _forget_record(workspace: Path, pid: int) -> None:
+    with contextlib.suppress(OSError):
+        _record_path(workspace, pid).unlink(missing_ok=True)
+
+
+#: The port a background command is probably on, for the listing only. It errs
+#: towards saying NOTHING: a wrong port in "still running on port 4096" is worse
+#: than no port at all, and `--max-old-space-size=4096` is exactly the shape
+#: that would produce one.
+_PORT = re.compile(
+    r"(?:"
+    r"(?<![\w.])--?p(?:ort)?[= ]"          # -p 3000, --port 3000, --port=3000
+    r"|(?<![\w.])PORT="                    # PORT=4000 npm start
+    r"|(?<![\w.-])(?:localhost|127\.0\.0\.1):"
+    r"|(?<![\w.])http\.server\s+"          # python -m http.server 8000
+    r"|(?<![\w.])serve\s+"                 # npx serve 8080
+    r")(\d{2,5})(?![\w.])"
+)
+
+
+def _port_of(command: str) -> int | None:
+    match = _PORT.search(command or "")
+    return int(match.group(1)) if match else None
+
+
+def pid_alive(pid: int) -> bool:
+    """Is *pid* a process that still exists?
+
+    Deliberately generous: anything that cannot be determined counts as ALIVE,
+    because reporting a live server as dead would strand it exactly as before.
+    """
+    if pid <= 0:
+        return False
+    try:
+        if sys.platform == "win32":
+            completed = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return str(pid) in (completed.stdout or "")
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:  # noqa: BLE001 - an unanswerable probe must not strand it
+        return True
+    return True
+
+
+def background_processes(workspace: Path) -> list[dict]:
+    """Every background process this workspace believes it started, still alive.
+
+    Dead entries are forgotten as they are found, so the directory does not
+    become a history of every server a project ever ran.
+    """
+    found: list[dict] = []
+    directory = Path(workspace) / PROCESS_DIR
+    if not directory.is_dir():
+        return found
+    for path in sorted(directory.glob("*.json")):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+            continue
+        pid = int(record.get("pid") or 0)
+        if not pid_alive(pid):
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+            continue
+        found.append(record)
+    return found
+
+
+def stop_background_process(workspace: Path, pid: int) -> bool:
+    """Kill one recorded background process and forget it. True if it was alive."""
+    was_alive = pid_alive(pid)
+    if was_alive:
+        _kill_pid_tree(pid)
+    _forget_record(Path(workspace), pid)
+    return was_alive
+
+
+def stop_all_background_processes(workspace: Path) -> list[dict]:
+    """Kill everything this workspace has recorded. Returns what was stopped."""
+    stopped = []
+    for record in background_processes(workspace):
+        if stop_background_process(workspace, int(record.get("pid") or 0)):
+            stopped.append(record)
+    return stopped
+
 
 def _forget_dead_detached() -> None:
     """Drop the ones that have already exited.
@@ -235,10 +392,17 @@ def _forget_dead_detached() -> None:
             _DETACHED.pop(pid, None)
 
 
+#: Workspaces this process started something in, so `_reap_detached` can clear
+#: their records without being handed one.
+_DETACHED_WORKSPACES: "set[str]" = set()
+
+
 def _reap_detached() -> None:
-    for process, _ in list(_DETACHED.values()):
+    for pid, (process, _) in list(_DETACHED.items()):
         if process.poll() is None:
             _kill_process_tree(process)
+        for workspace in _DETACHED_WORKSPACES:
+            _forget_record(Path(workspace), pid)
     _DETACHED.clear()
 
 
@@ -255,8 +419,17 @@ def _run_command_detached(
     cwd: "Path",
     log_path: "Path",
     creationflags: int,
-) -> tuple[int, str, str]:
+    workspace: "Path | None" = None,
+) -> tuple[int, str, str, bool]:
     """Start *command* and leave it running, returning what it said on the way up.
+
+    The fourth value says whether it is STILL RUNNING. Without it the caller
+    could not tell a detached server from a command that died on the way up, and
+    logged `command.detached` - "Started in the background" - for both. Live
+    2026-08-31: `cd /workspace && python -m http.server 8000` exited 1 on a path
+    that does not exist on Windows and was recorded as a started server, which
+    is how the session log came to show two servers on port 8000 when there was
+    one.
 
     The contract with the caller is deliberately not `subprocess.run`'s: there
     is no exit code to report because the process has not exited, and that is
@@ -286,6 +459,13 @@ def _run_command_detached(
             handle.close()
     _forget_dead_detached()
     _DETACHED[process.pid] = (process, str(log_path))
+    # On disk as well as in memory, and BEFORE the readiness wait: if this
+    # interpreter dies during those twelve seconds the process is already
+    # findable. That ordering is the whole point - the in-memory half is the
+    # one that cannot survive its own process.
+    if workspace is not None:
+        _write_record(workspace, process.pid, command, cwd, log_path)
+        _DETACHED_WORKSPACES.add(str(workspace))
 
     deadline = time.monotonic() + _DETACH_READY_SECONDS
     alive_enough = time.monotonic() + _DETACH_ALIVE_SECONDS
@@ -309,7 +489,14 @@ def _run_command_detached(
         # It stopped on its own, so it was not a server after all - report it
         # exactly as a foreground run would have.
         _DETACHED.pop(process.pid, None)
-        return int(exited), redact(captured), "" if exited == 0 else redact(captured)
+        if workspace is not None:
+            _forget_record(workspace, process.pid)
+        return (
+            int(exited),
+            redact(captured),
+            "" if exited == 0 else redact(captured),
+            False,
+        )
 
     note = (
         f"[still running: pid {process.pid}, output -> {log_path}]" + chr(10)
@@ -318,7 +505,7 @@ def _run_command_detached(
         "rather than starting it again. Starting it a second time will only take "
         "another port."
     )
-    return 0, redact(captured) + chr(10) + note, ""
+    return 0, redact(captured) + chr(10) + note, "", True
 
 
 class CommandRunner(ICommandRunner):
@@ -497,14 +684,26 @@ class CommandRunner(ICommandRunner):
                 / "processes"
                 / f"{int(time.time())}-{abs(hash(detached_command)) % 10000:04d}.log"
             )
-            exit_code, stdout, stderr = _run_command_detached(
-                detached_command, validated_cwd, log_path, creationflags
+            exit_code, stdout, stderr, still_running = _run_command_detached(
+                detached_command,
+                validated_cwd,
+                log_path,
+                creationflags,
+                self.workspace_root,
             )
             if self.session_logger:
+                # Only when it actually stayed up. A command that died on the way
+                # up is a FAILED command, and calling it "Started in the
+                # background" is how a log comes to show two servers on a port
+                # that only ever had one.
                 self.session_logger.log(
-                    "command.detached",
+                    "command.detached" if still_running else "command.failed",
                     {"command": detached_command, "log": str(log_path), "exit_code": exit_code},
-                    f"Started in the background: {detached_command}",
+                    (
+                        f"Started in the background: {detached_command}"
+                        if still_running
+                        else f"Exited immediately, not running: {detached_command}"
+                    ),
                     workflow_id="command",
                 )
             self.audit_logger.log(

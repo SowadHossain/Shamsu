@@ -1,0 +1,57 @@
+# 2026-08-31 tui-icon-column
+
+## The layout: a mark in column 0, text in column 3, detail in column 5
+
+✈  add a health endpoint
+     The router file is where a route is added.
+     I will read it first.
+▤  Reading app/routes.py · 340ms
+⌕  Searching health · 120ms
+⚑  approval needed — file_edit on app/routes.py
+⌕  Searching health x3
+✎  Editing app/routes.py · 90ms
+     +@app.get('/health')                                                    
+     +def health():                                                          
+     +    return {'ok': True}                                                
+✗  the model returned no tool call
+·  voice: transcribing with Whisper...
+
+›  why did the write cap kill my session?
+▤  Reading shamsu/agents/simple_chat.py · 1.2s
+⌕  Searching write cap · 1.2s
+✎  Editing shamsu/tools/gateway.py · 1.2s
+✗  Testing tests/test_write_cap.py FAILED 2 failed · 1.2s
+
+◆  The gate judged patch_file.new_string as a whole file.                       
+│  
+│  What I changed                                                               
+│  
+│   1 gateway.py passes the edit kind down                                      
+│   2 The cap only applies to file.write                                        
+│  
+│                                                                               
+│   if call.tool == "file.write":                                               
+│       enforce_write_cap(payload)                                              
+│                                                                               
+│  
+│  Tests: 3218 pass.                                                            
+
+## What it was
+Two icon columns, and text in both of them:
+
+  - the frame's own marks (prompt chevron, answer diamond) at column 0, text at 2
+  - tool/approval/error rows indented two spaces, icon at column 2, text at 4
+  - activity lines indented 2, reasoning indented 4, diff padded 4
+
+Mixed 0/2/4 indentation, and a row's icon landing where another row's text was.
+
+## What it is
+  ICON_COLUMN = 3 (turn_render) == GUTTER_WIDTH = 3 (tui), held equal by a test.
+  Every mark: column 0. Every text: column 3. Subordinate detail: column 5.
+  A row with no mark of its own starts at the text column, never before it.
+## Tests
+......................................                                   [100%]
+110 passed in 4.75s
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+808 passed, 3420 deselected, 1 warning in 74.85s (0:01:14)
+All checks passed!

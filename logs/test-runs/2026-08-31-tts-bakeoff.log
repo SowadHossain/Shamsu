@@ -1,0 +1,72 @@
+# 2026-08-31 - Kokoro TTS: measurement, then the engine layer
+Machine: Windows 11, 14 physical / 20 logical cores, CPU only (no GPU used at any point).
+Python 3.13.3, onnxruntime 1.29.0 (CPU build), kokoro-onnx 0.6.1.
+
+## 1. Why fp32 and not the "small" int8 model
+Same sentences, same voice (af_heart), warm-up call excluded.
+
+  model  threads  load   short sentence           long sentence            RTF
+  fp32   4        0.81s  0.70s / 1.81s audio      1.73s / 5.53s audio      0.38 / 0.31
+  fp32   8        0.86s  0.51s / 1.81s audio      1.31s / 5.53s audio      0.28 / 0.24
+  int8   4        0.71s  1.69s / 1.88s audio      4.43s / 5.59s audio      0.90 / 0.79
+  int8   8        0.75s  1.81s / 1.88s audio      4.62s / 5.59s audio      0.97 / 0.83
+
+fp32 is 3.4x FASTER than int8 here. The 92MB build is a trap: dynamic
+quantization has no fast kernel on this CPU, so it trades 233MB of disk for
+most of the speed. int8 at RTF ~0.9 cannot stay ahead of the speaker.
+
+## 2. Thread count (int8 sweep, before fp32 was tried)
+  threads=default  RTF 0.93
+  threads=4        RTF 0.82
+  threads=8        RTF 0.82
+  threads=14       RTF 0.95
+  threads=20       RTF 1.21   <- oversubscribed, synthesis falls behind speech
+
+8 is the default. Using all 20 logical cores is SLOWER than using 8.
+
+## 3. End to end, through SpeechPlayer -> build_engine("auto") -> Kokoro
+Real model, real settings, markdown reply with a fenced code block and a link.
+
+  engine selected by auto: kokoro
+  chunk 1: ready at 2.13s, 4.14s of audio
+  chunk 2: ready at 2.53s, 1.34s of audio
+  chunk 3: ready at 3.40s, 3.73s of audio
+  chunk 4: ready at 3.81s, 1.45s of audio
+  chunk 5: ready at 4.26s, 1.64s of audio
+  total synth 4.26s for 12.31s of speech -> RTF 0.35
+
+The producer stays ~3 sentences ahead of playback, so the voice never pauses
+mid-paragraph. The code block was replaced with "code block omitted" and the
+markdown link read as its text, as prepare_spoken_text intends.
+
+## 4. Latency as actually felt, same player, three replies
+  cold (model load)  first audio at 1.65s
+  warm               first audio at 0.60s
+  warm               first audio at 0.85s
+
+The model loads once per session. Every reply after that starts speaking in
+under a second.
+
+## 5. CPU-only, verified rather than assumed
+  providers=['CPUExecutionProvider']
+
+kokoro-onnx's own resolve_providers() returns EVERY available provider once an
+accelerated onnxruntime is installed, which would hand a spoken reply the GPU
+that Ollama is using. The session is therefore built here with the provider
+named explicitly, and test_kokoro_never_asks_onnxruntime_for_the_gpu pins it.
+
+## 6. Tests
+  .venv/Scripts/python.exe -m pytest tests/test_voice_engines.py -q
+  17 passed
+
+  .venv/Scripts/python.exe -m pytest tests/ -q
+  4212 passed, 2 skipped, 1 warning in 579.28s
+
+One defect was found by the tests rather than by listening: after stop(), the
+consumer kept yielding audio that was already queued behind the producer. The
+real player breaks on the flag so playback was correct, but an engine that has
+been told to stop must not hand out sound at all. Fixed in _synthesize_ahead.
+
+## 7. Samples to listen to
+~/.shamsu/voices/samples/  - af_heart, af_bella, am_michael, am_puck, bf_emma,
+bm_george, and reply-as-spoken.wav (the markdown reply above, as SHAMSU says it).

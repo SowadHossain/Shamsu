@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import os
 import tempfile
 import time
 import uuid
@@ -355,6 +357,55 @@ async def _run_one(
         )
 
 
+#: Set to "0" to measure the way this suite used to - a fresh sampler seed per
+#: call, so two runs of the same code draw different tokens.
+SEEDED_ENV = "SHAMSU_EVAL_SEEDED"
+
+
+def eval_seed(case_name: str, sample_index: int) -> int:
+    """The seed for one attempt: stable across runs, different across samples.
+
+    Derived from the case NAME rather than its position, so adding a case to
+    `cases.py` does not silently re-roll every case after it and invalidate the
+    baseline you were comparing against.
+    """
+    digest = hashlib.sha256(f"{case_name}:{sample_index}".encode()).digest()
+    # Ollama takes a 32-bit seed; anything wider is truncated somewhere out of
+    # sight, and a seed that is quietly altered is worse than none.
+    return int.from_bytes(digest[:4], "big")
+
+
+@contextlib.contextmanager
+def _sampled_deterministically(case: EvalCase, sample_index: int):
+    """Pin the model's sampler for this attempt.
+
+    Every benchmark this project has produced carries FLAKY rows, and
+    `BENCHMARK.md` warns its own readers not to read a delta by eye: two runs of
+    the same suite over the same code sampled different tokens, so a 3/7 against
+    a 5/7 could be a fix, a regression, or nothing at all. Seeded per (case,
+    sample) a re-run draws the same seven attempts, and a difference between two
+    runs is a difference in the CODE.
+
+    Variance across the seven is untouched - each sample gets its own seed. What
+    goes away is variance across RUNS, which was never information.
+
+    Restores whatever was there, including nothing: a suite that leaked a seed
+    into the environment would silently pin the next interactive session.
+    """
+    if os.environ.get(SEEDED_ENV, "").strip() == "0":
+        yield
+        return
+    previous = os.environ.get("SHAMSU_SAMPLING_SEED")
+    os.environ["SHAMSU_SAMPLING_SEED"] = str(eval_seed(case.name, sample_index))
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("SHAMSU_SAMPLING_SEED", None)
+        else:
+            os.environ["SHAMSU_SAMPLING_SEED"] = previous
+
+
 async def _run_one_in_workspace(
     case: EvalCase,
     driver: Driver,
@@ -387,20 +438,21 @@ async def _run_one_in_workspace(
     try:
         if case.seed is not None:
             case.seed(workspace)
-        final = await _run_driver_with_heartbeat(
-            case,
-            driver,
-            workspace,
-            progress=progress,
-            progress_interval_s=progress_interval_s,
-            started=started,
-            sample_index=sample_index,
-            samples=samples,
-            case_index=case_index,
-            total_cases=total_cases,
-            attempt_index=attempt_index,
-            total_attempts=total_attempts,
-        )
+        with _sampled_deterministically(case, sample_index):
+            final = await _run_driver_with_heartbeat(
+                case,
+                driver,
+                workspace,
+                progress=progress,
+                progress_interval_s=progress_interval_s,
+                started=started,
+                sample_index=sample_index,
+                samples=samples,
+                case_index=case_index,
+                total_cases=total_cases,
+                attempt_index=attempt_index,
+                total_attempts=total_attempts,
+            )
         outcome = case.check(workspace, final or "")
         if isinstance(outcome, CheckOutcome):
             passed = bool(outcome.passed)

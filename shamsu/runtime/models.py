@@ -423,7 +423,23 @@ def model_supports_native_tools(model_name: str) -> bool:
     model, fall back to its family name (gemma/deepseek-r1/… don't do native
     tools); anything still unknown is assumed tool-capable — the output salvager
     backs it up either way, and refusing to pass a schema to a model that
-    actually supports tools would be the bigger regression."""
+    actually supports tools would be the bigger regression.
+
+    The SERVER is asked first, because it is authoritative in a way a cookbook
+    entry cannot be: Ollama reports a `tools` capability per model on
+    `/api/tags`, and measured 2026-08-30 `gemma3:4b` reports none while being
+    sent thirty-seven schemas - ~4,300 tokens of a window it then had to answer
+    in, describing calls it had no way to make. Cached and never fetched on this
+    call, so a server that is down or slow costs nothing and the cookbook
+    answers instead."""
+    try:
+        from shamsu.llm.capabilities import model_facts
+
+        facts = model_facts(model_name)
+        if facts is not None:
+            return facts.supports_tools
+    except Exception:  # noqa: BLE001 - the cookbook must always be reachable
+        pass
     spec = MODEL_COOKBOOK.get(model_name)
     if spec is not None:
         return spec.supports_native_tools

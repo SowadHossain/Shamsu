@@ -19,7 +19,10 @@ def test_bundled_skills_are_discovered():
 
     assert {"developer", "prd-planner", "react-vite", "ui-designer"} <= set(catalog.skills)
     assert catalog.skills["developer"].source == "bundled"
-    assert "Inspect relevant files" in catalog.skills["developer"].instructions
+    # The rule, not the sentence. This asserted on one phrase of the body and
+    # broke when the skill was rewritten to fit a small model's window, which
+    # told us nothing about discovery - the thing the test is named for.
+    assert "patch_file" in catalog.skills["developer"].instructions
 
 
 def test_workspace_skill_overrides_bundled_skill(tmp_path: Path):

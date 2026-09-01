@@ -1,0 +1,95 @@
+# 2026-08-31 - defects from the F:\voice-demo asteroid session
+
+Source run: F:\Work\voice-demo\.shamsu\sessions\20260831-000635-f56d
+5 turns, 00:06:50 -> 01:59 UTC. 1 success (a greeting), 4 failed build turns.
+
+## What the harness got RIGHT (from messages.jsonl)
+
+  write_file      refused 18.1KB / 585 lines - "cannot be parsed reliably"
+  write_file      refused a blind overwrite after a partial read
+  replace_symbol  refused - "would delete 4 members it still contains"
+  replace_symbol  refused - "would delete the LAST definition, leaving 0"
+  patch/replace   refused the 3rd identical failing call
+  contract_assert refused a pass with no evidence (x3)
+  verify          caught <script src="game.js"> 404 before the file existed
+  verify          caught the duplicate SoundManager and said so x4
+  append_file     built 580 lines of game.js in chunks, "still being built"
+                  reported correctly instead of a false syntax error
+
+## Failed tool results, by tool
+
+  patch_file       17
+  replace_symbol    9
+  verify            5
+  write_file        3
+  contract_assert   3
+  delete_file       3
+
+26 of these are one loop: removing a duplicate SoundManager.
+
+## Defect 1 - the contract was void
+
+Model sent, at 00:07:32:
+  "assertions": "['Game has a main menu with start button', ...8 items]"
+
+Stored as ONE assertion, state=pending, for the whole session.
+
+After the fix, on that exact payload:
+  type: list  count: 8
+    a01  Game has a main menu with start button
+    a02  Player ship can move with arrow keys and shoot with spacebar
+    a03  Asteroids spawn and move across the screen
+    a04  Player collects points by destroying asteroids
+    a05  Game has at least 3 difficulty levels
+    a06  Sound effects play on shoot, explosion, and level complete
+    a07  Game ends when player loses all lives or completes all levels
+    a08  High score is saved to local storage
+
+## Defects 2 and 3 - the verifier on the real project
+
+Before: 1 diagnostic, naming the fault only.
+After:  2 diagnostics, both naming the next call.
+
+  sounds.js:1: error: sounds.js is never loaded: no page has a
+    <script src="..."> pointing at it, so none of it runs. Add it to
+    index.html with patch_file, before the script that uses it - or delete
+    the file if it is not needed.
+
+  sounds.js:3: error: class 'SoundManager' is also declared in game.js;
+    loaded together as plain scripts they share one scope, and the second
+    file will not run at all. Keep ONE copy: if sounds.js is the version you
+    want, delete 'SoundManager' from game.js with patch_file and make sure
+    the page loads sounds.js first; otherwise delete it from sounds.js
+    instead. Do not edit both copies to match - two copies is the fault.
+
+False-positive check on unreferenced_script:
+  vite (module graph)                -> clean
+  plain page, all loaded             -> clean
+  plain page, one orphan             -> ['unreferenced_script']
+  library, no html                   -> clean
+  html with no scripts at all        -> clean
+
+## Defect 4 - the skill matcher (mine, same day)
+
+  _mentions('lets build an asteroid game', 'ui')  True -> False   (b-UI-ld)
+  _mentions('the latest version', 'test')         True -> False
+  _mentions('fix the ui layout', 'ui')            True  (still)
+  _mentions('set up react-vite here', 'react-vite')  True  (still)
+
+## The game itself (F:\Work\voice-demo\asteroid)
+
+Two compounding bugs, headless simulation of the real update loop:
+
+  BEFORE
+    press Start -> asteroids [] -> update() sees length===0 -> nextLevel()
+    x3 frames -> level 4 > maxLevels 3 -> victory()
+    and spawnInterval was undefined, so no asteroid could ever spawn:
+      this.difficulty = 1                       // a number
+      this.spawnInterval = {easy:..,medium:..,hard:..}[this.difficulty]
+
+  AFTER
+    after start      : state=playing level=1 onscreen=0
+    after 5 frames   : state=playing level=1   <-- was victory / level 4
+    after spawning   : state=playing level=1 spawned=8 onscreen=8
+    level 1 cleared  : state=playing level=2
+    all levels done  : state=victory level=4

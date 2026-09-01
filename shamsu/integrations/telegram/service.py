@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import secrets
 import uuid
@@ -188,7 +189,30 @@ class TelegramService:
             approval_resolver=self.resolve_approval_callback,
             voice_service=VoiceService(),
             voice_downloader=self._download_telegram_file,
+            on_transcript=self._echo_transcript,
         )
+
+    def _echo_transcript(self, text: str, telegram_user_id: int = 0) -> None:
+        """Print what a voice note actually said, on the desktop.
+
+        `_mirror_update` runs on the raw inbound update and a voice note carries
+        no `.text`, so the most it could ever say was "sent a voice message" -
+        and the terminal then showed a whole turn without ever stating what had
+        been asked. The phone gets `Heard: "..."` in its reply; this is the same
+        line for the person at the keyboard, printed the moment Whisper returns
+        rather than at the end.
+        """
+        if self.cli_mirror is None:
+            return
+        echo = getattr(self.cli_mirror, "prompt_echo", None)
+        if callable(echo):
+            try:
+                echo(f'Heard: "{text}"', self._active_session_title(telegram_user_id))
+                return
+            except Exception:  # noqa: BLE001 - an echo must never fail a turn
+                pass
+        with contextlib.suppress(Exception):
+            self.cli_mirror(TELEGRAM_PANEL_TITLE, f'Heard: "{text}"')
 
     def set_cli_mirror(self, cli_mirror: Callable[[str, str], None] | None) -> None:
         self.cli_mirror = cli_mirror

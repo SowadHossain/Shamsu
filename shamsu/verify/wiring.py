@@ -259,6 +259,7 @@ def verify_wiring(project_root: Path | str) -> WiringResult:
             )
         )
 
+    diagnostics.extend(_unreferenced_scripts(root, sources, asset_refs))
     diagnostics.extend(_redeclarations(js_symbols))
     diagnostics.extend(_undefined_helpers(js_calls, js_bound))
 
@@ -369,6 +370,75 @@ def _js_symbols(file: str, text: str) -> list[_Symbol]:
 _FATAL_REDECLARATION = frozenset({"const", "let", "class"})
 
 
+#: A `.js` nobody has to reference: bundlers and module graphs reach these
+#: without a `<script src>`, so demanding one would report every Vite project as
+#: broken. Matched on the path, because that is what distinguishes a module in a
+#: build from a script meant to be loaded by a page.
+_BUNDLED_HINTS = ("node_modules/", "/src/", "src/", "dist/", "build/", ".min.js")
+
+
+def _unreferenced_scripts(
+    root: Path, sources: list[Path], asset_refs: list[_AssetRef]
+) -> list[WiringDiagnostic]:
+    """A script the project wrote and no page loads.
+
+    The other half of `missing_asset`, which catches a `<script src>` pointing
+    at nothing. This catches the reverse and it is the more expensive one,
+    because it is SILENT: nothing 404s, nothing throws, the file simply never
+    runs and the feature it holds is quietly absent.
+
+    Live 2026-08-31, `F:\\voice-demo`. Asked to split one big `game.js` into
+    parts, the agent wrote `sounds.js` - 74 lines, correct, parsing - and never
+    added a `<script src="sounds.js">`. `index.html` still loaded `game.js`
+    alone, so the request was reported as done, the file existed to prove it,
+    and not one line of it ever executed. The duplicate-class check fired on the
+    same pair and said nothing about this: two files can collide in scope only
+    if both are loaded, and here only one ever was.
+
+    Only fires where the project has an HTML page that loads SOMETHING. A
+    workspace with no `<script src>` anywhere is a bundler project or a library,
+    and neither owes any file a script tag.
+    """
+    pages = [path for path in sources if path.suffix.lower() in {".html", ".htm"}]
+    if not pages:
+        return []
+    loaded = {
+        (root / ref.file).parent.joinpath(ref.target).resolve()
+        if not ref.target.startswith("/")
+        else (root / ref.target.lstrip("/")).resolve()
+        for ref in asset_refs
+        if ref.attribute == "src"
+    }
+    # No script tag anywhere means nothing here is loaded by a page at all -
+    # a module graph, not a broken one.
+    if not loaded:
+        return []
+    diagnostics: list[WiringDiagnostic] = []
+    for path in sources:
+        if path.suffix.lower() != ".js":
+            continue
+        relative = path.relative_to(root).as_posix()
+        if any(hint in f"/{relative}" for hint in _BUNDLED_HINTS):
+            continue
+        if path.resolve() in loaded:
+            continue
+        page = pages[0].relative_to(root).as_posix()
+        diagnostics.append(
+            WiringDiagnostic(
+                file=relative,
+                line=1,
+                kind="unreferenced_script",
+                message=(
+                    f"{relative} is never loaded: no page has a "
+                    f'<script src="..."> pointing at it, so none of it runs. '
+                    f"Add it to {page} with patch_file, before the script that "
+                    "uses it - or delete the file if it is not needed."
+                ),
+            )
+        )
+    return diagnostics
+
+
 def _redeclarations(symbols: list[_Symbol]) -> list[WiringDiagnostic]:
     by_name: dict[str, list[_Symbol]] = {}
     for symbol in symbols:
@@ -384,6 +454,24 @@ def _redeclarations(symbols: list[_Symbol]) -> list[WiringDiagnostic]:
             continue
         latest = max(fatal, key=lambda use: (use.file, use.line))
         others = ", ".join(f for f in files if f != latest.file)
+        # NAME THE NEXT CALL. This diagnostic was correct and useless: live
+        # 2026-08-31 in `F:\voice-demo` it reported a duplicate `SoundManager`
+        # across game.js and sounds.js four times, and the model answered with
+        # twenty-six failed edits - seventeen `patch_file`, nine
+        # `replace_symbol` - every one of them refused for a good reason, and
+        # four turns ending on "I tried 4 edits in a row that changed nothing".
+        #
+        # It knew WHAT was wrong and never what to DO, which is the one lesson
+        # this project keeps relearning: naming the exact next call took 42s
+        # where vague guidance cost 674s and a failure. Every other message in
+        # this harness ends with the call to make; this one ended with the
+        # diagnosis.
+        #
+        # Deliberately the DUPLICATE's file, not the original's: the copy that
+        # came second is the one safe to remove, and "delete the class" without
+        # saying which copy is how a model ends up deleting the only one - which
+        # `replace_symbol` then refuses, which is exactly the loop above.
+        first = next(f for f in files if f != latest.file)
         diagnostics.append(
             WiringDiagnostic(
                 file=latest.file,
@@ -392,7 +480,12 @@ def _redeclarations(symbols: list[_Symbol]) -> list[WiringDiagnostic]:
                 message=(
                     f"{latest.keyword} {name!r} is also declared in {others}; loaded "
                     "together as plain scripts they share one scope, and the second "
-                    "file will not run at all"
+                    "file will not run at all. Keep ONE copy: if "
+                    f"{latest.file} is the version you want, delete {name!r} from "
+                    f"{first} with patch_file and make sure the page loads "
+                    f"{latest.file} first; otherwise delete it from {latest.file} "
+                    "instead. Do not edit both copies to match - two copies is "
+                    "the fault."
                 ),
             )
         )

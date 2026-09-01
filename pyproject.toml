@@ -57,6 +57,18 @@ voice = [
     "faster-whisper>=1.0",
     "imageio-ffmpeg>=0.5",
     "sounddevice>=0.4",
+    # Speaking a reply back. CPU only by design - `kokoro-onnx[gpu]` is
+    # deliberately NOT used, because the GPU belongs to the coder model, and
+    # the ONNX session is pinned to CPUExecutionProvider besides.
+    "kokoro-onnx>=0.6.1",
+    "numpy>=2.0",
+]
+
+# The fallback voice: smaller and instant, but audibly synthetic. Worth having
+# on a machine that cannot spare 353MB for the Kokoro model, and nothing else
+# depends on it - `auto` skips straight past a missing engine.
+voice-piper = [
+    "piper-tts>=1.7",
 ]
 dev = [
     "pytest>=8.2",
@@ -75,6 +87,15 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
+# A ceiling per test, so one hung subprocess cannot take the suite with it.
+# Measured 2026-08-31: `test_command_runner_installs_only_through_created_project_venv`
+# creates a real venv and runs ensurepip; it normally takes 12s and once wedged
+# at 0% CPU for 35 minutes, with the whole run stuck behind it. Generous enough
+# that no honest test is near it - the slowest is ~24s.
+timeout = 300
+# `thread` rather than `signal`: signal-based timeouts do not fire on Windows,
+# which is where this suite runs.
+timeout_method = "thread"
 # Two orthogonal axes, assigned automatically in tests/conftest.py.
 #
 #   LEVEL  - where a test sits in the pyramid: how much of the system runs.

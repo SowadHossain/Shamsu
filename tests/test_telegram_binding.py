@@ -324,3 +324,167 @@ def test_a_recorded_error_never_contains_the_token(tmp_path: Path) -> None:
     from shamsu.integrations.telegram.service import poller_status
 
     assert "123456:AAH-fake" not in poller_status(project)["last_error"]
+
+
+# -- a voice note should say what it heard, on the desktop too ----------------
+
+
+def test_a_voice_note_echoes_its_transcript_to_the_terminal():
+    """`_mirror_update` runs on the raw inbound update, and a voice note has no
+    `.text` - so the most the desktop could ever print was "sent a voice
+    message", and the terminal then showed a whole turn without ever stating
+    what had been asked. The phone gets `Heard: "..."`; this is the same line
+    for the person at the keyboard."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from shamsu.integrations.telegram.controller import TelegramController
+
+    heard: list[tuple[str, int]] = []
+    controller = TelegramController.__new__(TelegramController)
+    controller.voice_service = MagicMock()
+    controller.voice_service.transcribe_file = MagicMock(
+        return_value=MagicMock(text="  tone down the sensitivity  ")
+    )
+    controller.voice_downloader = AsyncMock()
+    controller.store = MagicMock()
+    controller.on_transcript = lambda text, user_id: heard.append((text, user_id))
+    controller._route_text_message = AsyncMock(return_value="routed")
+
+    message = MagicMock()
+    message.voice.file_name = "voice.oga"
+    message.user.user_id = 4242
+
+    asyncio.run(controller._handle_voice(message))
+
+    assert heard == [("tone down the sensitivity", 4242)]
+    # And the transcript - not the raw note - is what gets routed.
+    routed = controller._route_text_message.await_args
+    assert routed.args[1] == "tone down the sensitivity"
+    assert 'Heard: "tone down the sensitivity"' == routed.kwargs["prefix"]
+
+
+def test_an_echo_that_raises_does_not_lose_the_turn():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from shamsu.integrations.telegram.controller import TelegramController
+
+    controller = TelegramController.__new__(TelegramController)
+    controller.voice_service = MagicMock()
+    controller.voice_service.transcribe_file = MagicMock(
+        return_value=MagicMock(text="do the thing")
+    )
+    controller.voice_downloader = AsyncMock()
+    controller.store = MagicMock()
+
+    def explode(_text, _user_id):
+        raise RuntimeError("no terminal")
+
+    controller.on_transcript = explode
+    controller._route_text_message = AsyncMock(return_value="routed")
+
+    message = MagicMock()
+    message.voice.file_name = "voice.oga"
+    message.user.user_id = 1
+
+    assert asyncio.run(controller._handle_voice(message)) == "routed"
+
+
+def test_a_silent_note_echoes_nothing():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from shamsu.integrations.telegram.controller import TelegramController
+
+    heard: list = []
+    controller = TelegramController.__new__(TelegramController)
+    controller.voice_service = MagicMock()
+    controller.voice_service.transcribe_file = MagicMock(return_value=MagicMock(text="   "))
+    controller.voice_downloader = AsyncMock()
+    controller.store = MagicMock()
+    controller.on_transcript = lambda t, u: heard.append(t)
+    controller._route_text_message = AsyncMock(return_value="routed")
+
+    message = MagicMock()
+    message.voice.file_name = "voice.oga"
+    message.user.user_id = 1
+
+    asyncio.run(controller._handle_voice(message))
+    assert heard == []
+
+
+# -- a steer sent mid-turn has to REACH the turn -------------------------------
+
+
+def test_feedback_added_to_a_run_is_drained_by_the_loops_interface():
+    """`add_feedback` answers "Added your feedback to the active SHAMSU run" and
+    only the LEGACY loop ever drained that queue. Simple mode reads a
+    `FeedbackQueue`, and Telegram never passed it one - so `_take_feedback`
+    returned False on its first line and the sentence was untrue every time it
+    was said. Live 2026-09-01, sent as a voice note mid-turn."""
+    import asyncio
+
+    from shamsu.agents.simple_feedback import RunControlFeedback
+    from shamsu.runtime.run_control import add_feedback, register_run
+
+    async def scenario():
+        register_run("run-feedback-1")
+        assert add_feedback("run-feedback-1", "  tone down the sensitivity  ")
+        assert add_feedback("run-feedback-1", "and slow the rotation")
+        queue = RunControlFeedback("run-feedback-1")
+        assert len(queue) == 2
+        assert bool(queue) is True
+        # Oldest first, whitespace normalised, exactly like FeedbackQueue.
+        assert queue.drain() == ["tone down the sensitivity", "and slow the rotation"]
+        assert queue.drain() == []
+        assert bool(queue) is False
+
+    asyncio.run(scenario())
+
+
+def test_an_unknown_run_drains_to_nothing_rather_than_raising():
+    from shamsu.agents.simple_feedback import RunControlFeedback
+
+    queue = RunControlFeedback("no-such-run")
+    assert queue.drain() == []
+    assert len(queue) == 0
+    assert bool(queue) is False
+
+
+def test_the_loop_actually_folds_it_in():
+    """The interface is only worth having if `_take_feedback` accepts it."""
+    import asyncio
+
+    from shamsu.agents.simple_chat import SimpleChatLoop
+    from shamsu.agents.simple_feedback import RunControlFeedback
+    from shamsu.runtime.run_control import add_feedback, register_run
+
+    async def scenario():
+        register_run("run-feedback-2")
+        add_feedback("run-feedback-2", "you are editing the wrong file")
+
+        loop = SimpleChatLoop.__new__(SimpleChatLoop)
+        loop.feedback = RunControlFeedback("run-feedback-2")
+        appended: list[str] = []
+        loop.state = type("S", (), {"append_user": lambda _s, text, **_k: appended.append(text)})()
+        loop._activity = lambda *_a, **_k: None
+        loop._corrections_this_turn = 0
+        assert loop._take_feedback() is True
+        assert appended and "wrong file" in appended[0]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "surface", ["shamsu/integrations/telegram/sessions.py", "shamsu/control/runner.py"]
+)
+def test_every_remote_surface_passes_a_feedback_queue(surface):
+    """The CLI has had one since the feature shipped; these two had none."""
+    from pathlib import Path
+
+    body = Path(surface).read_text(encoding="utf-8")
+    assert "RunControlFeedback(" in body
+    # Passed as the loop's `feedback`, not merely imported. Telegram guards it
+    # on the ledger existing, which a unit test may not give it.
+    assert "feedback=(" in body or "feedback=RunControlFeedback" in body

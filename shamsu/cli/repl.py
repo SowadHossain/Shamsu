@@ -495,6 +495,11 @@ SYSTEM_COMMANDS = (
     "/context show",
     "/context window",
     "/context window ",
+    "/set",
+    "/set ",
+    "/processes",
+    "/processes stop ",
+    "/processes stop all",
     "/edit ",
     "/fix ",
     "/test-gen ",
@@ -506,6 +511,30 @@ SYSTEM_COMMANDS = (
 _MODEL_COMPLETION_CACHE: tuple[float, tuple[str, ...]] = (0.0, ())
 _MODEL_COMPLETION_LOCK = threading.Lock()
 _MODEL_COMPLETION_REFRESHING = False
+
+
+def _ctx_window_meta(window: int) -> str:
+    """The one line shown beside a window in the completion dropdown.
+
+    What it COSTS, not what it is - the number is already the label. No network
+    and no model probe: this runs on a keystroke, and `_installed_model_names`
+    records what happens when a completer reaches for the server (~2.1s, on the
+    event loop, mid-word).
+    """
+    try:
+        from shamsu.agents.simple_chat import output_reserve
+        from shamsu.context.budget import ctx_window_for_model
+        from shamsu.runtime.models import model_for_role
+        from shamsu.runtime.settings import chat_model
+
+        reserve = output_reserve(window)
+        note = f"{window // 1024}k - {reserve:,} reply reserve"
+        model = chat_model() or model_for_role("agent-chat")
+        if window > ctx_window_for_model(model):
+            note += " - MORE THAN THIS MODEL HOLDS"
+        return note
+    except Exception:  # noqa: BLE001 - a keystroke must never raise
+        return f"{window // 1024}k"
 
 
 class SlashCommandCompleter(Completer):
@@ -526,6 +555,53 @@ class SlashCommandCompleter(Completer):
         if not text.startswith("/"):
             return
         lowered = text.lower()
+        if lowered.startswith("/set "):
+            from shamsu.runtime.settings import NUMERIC_LIMITS, numeric_limit
+
+            fragment = text[len("/set ") :]
+            if " " not in fragment.strip() and not fragment.endswith(" "):
+                for name, (_floor, _default, description) in NUMERIC_LIMITS.items():
+                    if name.startswith(fragment.lower()):
+                        yield Completion(
+                            name,
+                            start_position=-len(fragment),
+                            display_meta=description,
+                        )
+                return
+            # Past the key: offer what it is NOW and what it falls back to, so
+            # the two numbers worth typing never have to be remembered.
+            name = fragment.split()[0].lower()
+            if name in NUMERIC_LIMITS:
+                typed = fragment[len(name) :].lstrip()
+                _floor, default, _description = NUMERIC_LIMITS[name]
+                now, fallback = f"{numeric_limit(name):g}", f"{default:g}"
+                offers = [(now, "current" if now != fallback else "current (default)")]
+                if fallback != now:
+                    offers.append((fallback, "default"))
+                offers.append(("default", "reset to default"))
+                for candidate, meta in offers:
+                    if candidate.startswith(typed.lower()):
+                        yield Completion(
+                            candidate, start_position=-len(typed), display_meta=meta
+                        )
+            return
+        if lowered.startswith("/context window "):
+            # The windows, offered rather than remembered. Every other way in
+            # here accepts a free-typed integer, and a free-typed integer is
+            # how `32786` got saved - one key away from 32768, silently legal,
+            # and worth a ~6GB model reload on every call that did not share it.
+            fragment = text[len("/context window ") :].strip()
+            for offered in _OFFERED_WINDOWS:
+                for form in (str(offered), f"{offered // 1024}k"):
+                    if not fragment or form.startswith(fragment.lower()):
+                        yield Completion(
+                            form,
+                            start_position=-len(fragment),
+                            display=f"{offered:,}",
+                            display_meta=_ctx_window_meta(offered),
+                        )
+                        break
+            return
         if lowered.startswith("/models use "):
             fragment = text[len("/models use ") :]
             candidates = ["tier", *_installed_model_completion_names()]
@@ -657,6 +733,8 @@ def _print_help(console: Console) -> None:
                     "  /models repair            Start Ollama and pull missing models",
                     "  /models tier [light|default|heavy]  Show or switch model tier",
                     "  /models use <model>|tier   Pin an installed Ollama model or return to tiers",
+                    "  /set [name] [value]       Show or change a limit (rounds, turn budget, approvals)",
+                    "  /processes [stop <pid>|stop all]  Background servers this workspace started",
                     "  /web search <query>       Search the web with approval",
                     "  /web open <url>           Fetch and summarize a web page",
                     "  /web summarize <url>      Alias for /web open",
@@ -3693,10 +3771,45 @@ def _context_bucket_rows() -> list[str]:
     return rows
 
 
-#: Windows offered by `/context window` with no argument. Powers of two from
-#: the floor `settings.chat_max_ctx` enforces up to the ceiling `max_ctx`
-#: defaults to - the range where a local KV cache actually fits on one card.
-_OFFERED_WINDOWS = (4096, 8192, 16384, 32768)
+#: Windows offered by `/context window` with no argument. Defined once, in
+#: `context/budget`, because the completer, the validator and the help text all
+#: have to agree about what a legal window is - and because three copies of a
+#: list is how two of them go stale.
+from shamsu.context.budget import (  # noqa: E402 - grouped with its own comment
+    MIN_USABLE_CTX_WINDOW as _MIN_CTX_WINDOW,
+    OFFERED_CTX_WINDOWS as _OFFERED_WINDOWS,
+)
+
+
+def parse_ctx_window(argument: str) -> int | None:
+    """`"32k"`, `"32768"` -> 32768. Anything unreadable -> ``None``.
+
+    The `k` suffix used to be handled with `.replace("k", "024")`, which is
+    string surgery wearing arithmetic's clothes: it is correct for `1k` and
+    wrong for every other value. `4k` became 4024 - below the floor, so it was
+    REFUSED with a message about 4096 - and `32k` became 32024, which is saved
+    happily and is not a window anything else in the system asks for.
+    """
+    text = (argument or "").strip().lower().replace(",", "").replace("_", "")
+    if not text:
+        return None
+    if text.endswith("k"):
+        head = text[:-1].strip()
+        if not head.isdigit():
+            return None
+        return int(head) * 1024
+    return int(text) if text.isdigit() else None
+
+
+def snap_ctx_window(size: int) -> int:
+    """The offered window nearest *size*.
+
+    A window that differs from what every other call asks for costs a full
+    model reload per call, so "close enough" is not close enough - see
+    `budget.chat_ctx_ceiling`. Ties go DOWN: a window is a VRAM reservation and
+    guessing high is the expensive direction.
+    """
+    return min(_OFFERED_WINDOWS, key=lambda offered: (abs(offered - size), offered))
 
 
 def _handle_context_window(argument: str, console: Console) -> None:
@@ -3708,10 +3821,12 @@ def _handle_context_window(argument: str, console: Console) -> None:
     Changing a window meant exporting an environment variable and restarting.
     """
     from shamsu.agents.simple_chat import max_ctx, output_reserve, summary_budget
-    from shamsu.runtime.settings import chat_max_ctx, update_settings
+    from shamsu.context.budget import ctx_window_for_model
+    from shamsu.runtime.models import model_for_role
+    from shamsu.runtime.settings import chat_max_ctx, chat_model, update_settings
 
     pinned = os.environ.get("SHAMSU_CHAT_MAX_CTX", "").strip()
-    wanted = argument.strip().lower().replace("k", "024") if argument.strip().endswith("k") else argument.strip()
+    wanted = argument.strip()
 
     if not wanted:
         current = max_ctx()
@@ -3734,19 +3849,45 @@ def _handle_context_window(argument: str, console: Console) -> None:
         )
         return
 
-    if not wanted.isdigit():
-        console.print("[red]Usage: /context window <tokens>, e.g. /context window 16384[/red]")
+    asked = parse_ctx_window(wanted)
+    if asked is None:
+        console.print(
+            "[red]Usage: /context window <tokens>, e.g. /context window 16384 "
+            "or /context window 16k[/red]"
+        )
         return
-    size = int(wanted)
-    if size < 4096:
+    if asked < _MIN_CTX_WINDOW:
         # The same floor `settings.chat_max_ctx` enforces, said out loud rather
         # than silently ignored - a number that is accepted and then discarded
         # is how someone spends an afternoon wondering why nothing changed.
         console.print(
-            "[red]4096 is the smallest usable window - below it the system prompt "
-            "and one tool schema do not both fit.[/red]"
+            f"[red]{_MIN_CTX_WINDOW} is the smallest usable window - below it the "
+            "system prompt and one tool schema do not both fit.[/red]"
         )
         return
+    # Snap, and SAY so. `32786` - one key away from 32768 - was saved live on
+    # 2026-08-30 and cost a ~6GB model reload on every background call for as
+    # long as it stood, because simple mode asked for 32786 and everything else
+    # asked for 32768. A window is not a dial; it is one of four values.
+    size = snap_ctx_window(asked)
+    if size != asked:
+        console.print(
+            f"[yellow]{asked:,} is not one of the windows SHAMSU uses "
+            f"({', '.join(f'{w:,}' for w in _OFFERED_WINDOWS)}) - saving the "
+            f"nearest, {size:,}.[/yellow]\n"
+            "[dim]A window that no other call shares makes Ollama reload the "
+            "model on every call that does not share it.[/dim]"
+        )
+    # What the MODEL can hold, not just what the card can. Asking a 32k model
+    # for 64k does not fail loudly - it is silently clamped somewhere below,
+    # and every budget downstream then believes in room that is not there.
+    model_ceiling = ctx_window_for_model(chat_model() or model_for_role("agent-chat"))
+    if size > model_ceiling:
+        console.print(
+            f"[yellow]The active model tops out at {model_ceiling:,} tokens; "
+            f"saving that instead of {size:,}.[/yellow]"
+        )
+        size = snap_ctx_window(min(size, model_ceiling))
     try:
         update_settings(chat_max_ctx=size)
     except Exception as exc:  # noqa: BLE001 - the user asked for a change; say if it failed
@@ -3763,6 +3904,201 @@ def _handle_context_window(argument: str, console: Console) -> None:
             f"[yellow]Note: SHAMSU_CHAT_MAX_CTX={pinned} is set in this "
             "environment and overrides it. Unset it for the saved value to "
             "take effect.[/yellow]"
+        )
+
+
+def _describe_background_processes(workspace: Path) -> list[str]:
+    """One line per live background process, newest last. Empty when there are none."""
+    from shamsu.tools.executor import background_processes
+
+    lines: list[str] = []
+    for record in background_processes(workspace):
+        started = record.get("started")
+        try:
+            age = time.time() - float(started)
+            ago = f"{int(age // 3600)}h{int(age % 3600) // 60:02d}m" if age >= 3600 else f"{int(age // 60)}m"
+        except (TypeError, ValueError):
+            ago = "?"
+        port = record.get("port")
+        where = f" on port {port}" if port else ""
+        lines.append(
+            f"  pid {record.get('pid')}{where}, running {ago} - {str(record.get('command'))[:70]}"
+        )
+    return lines
+
+
+def _report_stranded_processes(workspace: Path, console: Console) -> None:
+    """Say what a previous session left running here.
+
+    Called once when a workspace is opened. Reporting rather than killing: a
+    server someone deliberately left up is a normal thing to come back to, and
+    taking it out from under them would be its own failure. What was missing was
+    ever being TOLD.
+
+    Live 2026-08-31: `python -m http.server 8000` from a session that ended at
+    01:59 was still holding port 8000 at 08:20. Nothing on disk named it, so
+    nothing could have reported it and nothing could have stopped it.
+    """
+    lines = _describe_background_processes(workspace)
+    if not lines:
+        return
+    console.print(
+        f"[yellow]{len(lines)} background process(es) from an earlier session are "
+        "still running here:[/yellow]"
+    )
+    for line in lines:
+        console.print(f"[dim]{line}[/dim]")
+    console.print("[dim]  `/processes stop <pid>` or `/processes stop all`[/dim]")
+
+
+def _handle_processes(normalized_input: str, workspace: Path, console: Console) -> None:
+    """`/processes`, `/processes stop <pid>`, `/processes stop all`.
+
+    The servers `run_command` starts in the background were tracked only in
+    memory, so nothing outside `executor.py` could see them and only a CLEAN
+    interpreter exit ever stopped them - not a closed console window, not a
+    kill, not a crash. This is the half that was missing: a way to look, and a
+    way to stop one.
+    """
+    from shamsu.tools.executor import (
+        stop_all_background_processes,
+        stop_background_process,
+    )
+
+    parts = normalized_input.split()
+    action = parts[1].lower() if len(parts) > 1 else ""
+    target = parts[2] if len(parts) > 2 else ""
+
+    if not action:
+        lines = _describe_background_processes(workspace)
+        if not lines:
+            console.print("Nothing is running in the background for this workspace.")
+            return
+        console.print(f"[bold]{len(lines)} background process(es)[/bold]")
+        for line in lines:
+            console.print(line)
+        console.print("\n[dim]Stop one with `/processes stop <pid>`, or all of them "
+                      "with `/processes stop all`.[/dim]")
+        return
+
+    if action != "stop":
+        console.print("[red]Usage: /processes, /processes stop <pid>, /processes stop all[/red]")
+        return
+
+    if target.lower() == "all":
+        stopped = stop_all_background_processes(workspace)
+        if not stopped:
+            console.print("Nothing was running.")
+            return
+        for record in stopped:
+            console.print(f"Stopped pid {record.get('pid')} - {str(record.get('command'))[:70]}")
+        return
+
+    if not target.isdigit():
+        console.print("[red]Usage: /processes stop <pid>, or /processes stop all[/red]")
+        return
+    pid = int(target)
+    if stop_background_process(workspace, pid):
+        console.print(f"Stopped pid {pid}.")
+    else:
+        console.print(f"pid {pid} was not running; forgotten.")
+
+
+def _handle_set(normalized_input: str, console: Console) -> None:
+    """`/set`, `/set <key>`, `/set <key> <value>` for the numeric ceilings.
+
+    The limits people actually needed to change - how many steps a turn may
+    take, how long it may run, how long an approval waits - were reachable only
+    by exporting an environment variable and restarting, or by editing the
+    source. The context window got a command of its own when the web portal
+    needed it; these three never did.
+
+    Deliberately only the ceilings. The window SHARES (`tool_result_budget`,
+    the skeleton ratio) stay fractions of the live window: a share follows a
+    window that moves and an absolute number does not, which is exactly the bug
+    fixed alongside this.
+    """
+    from shamsu.runtime.settings import (
+        NUMERIC_LIMITS,
+        load_settings,
+        numeric_limit,
+        update_settings,
+    )
+
+    parts = normalized_input.split(maxsplit=2)
+    key = parts[1].lower() if len(parts) > 1 else ""
+    value = parts[2].strip() if len(parts) > 2 else ""
+    saved = load_settings()
+
+    if not key:
+        console.print("[bold]Settings you can change from here[/bold]\n")
+        for name, (floor, default, description) in NUMERIC_LIMITS.items():
+            current = numeric_limit(name)
+            source = (
+                "environment"
+                if os.environ.get(f"SHAMSU_{name.upper()}", "").strip()
+                else ("saved" if name in saved else "default")
+            )
+            console.print(
+                f"  [cyan]{name:<20}[/cyan] {current:g}  [dim]({source}; "
+                f"min {floor:g}, default {default:g}) - {description}[/dim]"
+            )
+        console.print(
+            "\n[dim]Set one with `/set <name> <value>`. "
+            "The context window has its own command: `/context window`.[/dim]"
+        )
+        return
+
+    if key not in NUMERIC_LIMITS:
+        # Name the near miss rather than the whole table - the same correction
+        # `_execute` gives a model that invents a tool name.
+        close = [name for name in NUMERIC_LIMITS if name.startswith(key[:3])]
+        hint = f" Did you mean {' or '.join(close)}?" if close else ""
+        console.print(
+            f"[red]There is no setting called {key}.[/red]{hint}\n"
+            "[dim]`/set` on its own lists them.[/dim]"
+        )
+        return
+
+    floor, default, description = NUMERIC_LIMITS[key]
+    if not value:
+        console.print(
+            f"[cyan]{key}[/cyan] = {numeric_limit(key):g}  [dim]({description}; "
+            f"min {floor:g}, default {default:g})[/dim]\n"
+            f"[dim]Change it with `/set {key} <value>`, or `/set {key} default` "
+            "to unset.[/dim]"
+        )
+        return
+
+    if value.lower() in {"default", "reset", "unset"}:
+        update_settings(**{key: None})
+        console.print(f"{key} reset to its default, {default:g}.")
+        return
+
+    try:
+        number = float(value)
+    except ValueError:
+        console.print(f"[red]{value!r} is not a number. `/set {key} <number>`[/red]")
+        return
+    if number < floor:
+        # Refused, not clamped. A ceiling below its floor is a mistake about
+        # what the number means, and silently substituting a different one is
+        # how someone spends an afternoon wondering why nothing changed.
+        console.print(
+            f"[red]{key} cannot go below {floor:g} - {description}.[/red]"
+        )
+        return
+    stored = int(number) if float(number).is_integer() else number
+    try:
+        update_settings(**{key: stored})
+    except Exception as exc:  # noqa: BLE001 - the user asked; say if it failed
+        console.print(f"[red]Could not save that: {exc}[/red]")
+        return
+    console.print(f"{key} set to [bold]{stored:g}[/bold]. It applies to the next turn.")
+    if os.environ.get(f"SHAMSU_{key.upper()}", "").strip():
+        console.print(
+            f"[yellow]Note: SHAMSU_{key.upper()} is set in this environment and "
+            "overrides it. Unset it for the saved value to take effect.[/yellow]"
         )
 
 
@@ -5221,10 +5557,14 @@ def _start_frame(console: Console, workspace: Path | None = None) -> bool:
     # output. That is what makes the scrollback the conversation.
     _FRAME_CONSOLE_STATE = (console.file, console.width)
     console.file = PaneWriter(app.pane, app.invalidate)
-    console.width = app.output_width()
+    # The frame owns the width from here: rich pads to the console width, and
+    # the pane then adds a gutter, so the console gets the pane's width MINUS
+    # that gutter. Handed over rather than set once, because a terminal resize
+    # moves it and a stale width wraps every line of every answer.
+    app.adopt_console(console)
     app.echo("SHAMSU - framed mode. PgUp/PgDn or the wheel scrolls this pane,")
     app.echo("F2 toggles mouse capture, Ctrl+D or /tui off returns to the stream.")
-    app.echo("F4 starts Whisper voice input; F5 submits it.")
+    app.echo("F4 starts Whisper voice input; F5 submits it; F6 skips a spoken reply.")
     app.echo("Replies speak back in this CLI. Set SHAMSU_VOICE_OUTPUT=off to mute.")
     app.echo("")
     return True
@@ -19422,6 +19762,13 @@ def main(argv: list[str] | None = None) -> None:
         console.print(f"[red]{exc}[/red]", soft_wrap=True)
         sys.exit(2)
     console.print(f"[dim]Trace: {read_trace_mode(workspace)}[/dim]")
+    # What a previous session left running. The sweep also FORGETS the dead
+    # ones, so this is the only thing that keeps `.shamsu/processes` from
+    # becoming a graveyard - and it is the first moment anyone could have been
+    # told, since the old registry lived only in the memory of a process that
+    # had already exited.
+    with contextlib.suppress(Exception):
+        _report_stranded_processes(workspace, console)
     console.print("[dim]Type a prompt, or `/help` for commands.[/dim]\n")
     web_tool = WebTool(
         workspace=workspace,
@@ -19746,6 +20093,12 @@ def main(argv: list[str] | None = None) -> None:
             continue
         if lowered_input.startswith("context"):
             _handle_context(normalized_input, workspace, console)
+            continue
+        if lowered_input == "set" or lowered_input.startswith("set "):
+            _handle_set(normalized_input, console)
+            continue
+        if lowered_input == "processes" or lowered_input.startswith("processes "):
+            _handle_processes(normalized_input, workspace, console)
             continue
         if lowered_input == "queue" or lowered_input.startswith("queue "):
             _handle_queue(f"/{normalized_input}", console)

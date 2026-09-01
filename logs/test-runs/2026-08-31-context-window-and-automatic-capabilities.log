@@ -1,0 +1,36 @@
+# 2026-08-31 - context window, budgets, automatic capabilities
+
+Full suite: 4195 passed, 2 skipped, 0 failed in 496.98s
+
+## num_ctx now agrees across readers
+
+  qwen2.5-coder:7b-instruct-q4_K_M   max_ctx=32768  shared_num_ctx=32768
+  qwen2.5-coder:3b-instruct          max_ctx=32768  shared_num_ctx=32768
+
+## budgets as a share of the live window
+
+  window   tool-result      summary       skeleton
+    4096    1500 ( 36%)    256 ( 6%)    245 ( 5%)
+    8192    2048 ( 25%)    512 ( 6%)    491 ( 5%)
+   16384    4096 ( 25%)   1024 ( 6%)    983 ( 5%)
+   32768    8000 ( 24%)   2048 ( 6%)   1966 ( 5%)
+
+## model facts from /api/tags (table value in brackets)
+
+  gemma3:4b                          ctx=      0  tools=False
+  qwen2.5-coder:3b-instruct          ctx=  32768  tools=True
+  qwen2.5-coder:7b-instruct          ctx=  32768  tools=True
+  qwen2.5-coder:7b-instruct-q4_K_M   ctx=  32768  tools=True
+  qwen2.5:3b-instruct                ctx=  32768  tools=True
+  qwen3.5:9b-q4_K_M                  ctx= 262144  tools=True
+  qwen3:8b                           ctx=  40960  tools=True
+
+## prompt and roster, fresh workspace
+
+  system prompt: 515 tokens (was 594)
+   3000 tok / 22 schemas   build me a snake game
+   2509 tok / 17 schemas   fix the bug in app.py
+   1656 tok / 12 schemas   plan how you would add auth
+   2979 tok / 21 schemas   run the tests
+   3399 tok / 26 schemas   (same, once a contract exists)
+

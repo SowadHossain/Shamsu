@@ -48,6 +48,7 @@ class TelegramController:
         approval_resolver: Callable[[str, bool], bool] | None = None,
         voice_service: VoiceService | None = None,
         voice_downloader: VoiceDownloader | None = None,
+        on_transcript: Callable[[str, int], None] | None = None,
     ) -> None:
         self.store = store
         self.authenticator = authenticator
@@ -59,6 +60,14 @@ class TelegramController:
         self.files = TelegramFileStager(workspace)
         self.voice_service = voice_service
         self.voice_downloader = voice_downloader
+        # Called with the TRANSCRIPT once a voice note has been heard.
+        #
+        # The desktop mirror runs on the raw inbound update, before any
+        # transcription exists, so all it could ever print for a voice note was
+        # "sent a voice message" - and the terminal then showed a whole turn
+        # with no idea what had been asked. The phone gets `Heard: "..."` in its
+        # reply; this is how the same thing reaches the person at the keyboard.
+        self.on_transcript = on_transcript
 
     async def handle_update(self, update: TelegramUpdate) -> list[OutboundMessage]:
         self.store.increment_metric("telegram_updates_received")
@@ -355,6 +364,11 @@ class TelegramController:
             )
             return OutboundMessage(message.chat.chat_id, str(exc))
         text = transcript.text.strip()
+        if text and self.on_transcript is not None:
+            try:
+                self.on_transcript(text, message.user.user_id)
+            except Exception:  # noqa: BLE001 - an echo must never lose the turn
+                pass
         return await self._route_text_message(
             message,
             text,

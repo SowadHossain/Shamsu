@@ -1,0 +1,38 @@
+# 2026-08-31 tui-answer-block-and-icons
+
+## One turn, rendered through the real CliTurnRenderer and the real pane
+
+› why did the write cap kill my session?
+  ▤ Reading shamsu/agents/simple_chat.py · 1.2s
+  ⌕ Searching write cap · 1.2s
+  ✎ Editing shamsu/tools/gateway.py · 1.2s
+  ✗ Testing tests/test_write_cap.py FAILED 2 failed · 1.2s
+
+◆ The gate judged patch_file.new_string as a whole file.                        
+│ 
+│ What I changed                                                                
+│ 
+│  1 gateway.py passes the edit kind down                                       
+│  2 The cap only applies to file.write                                         
+│ 
+│                                                                               
+│  if call.tool == "file.write":                                                
+│      enforce_write_cap(payload)                                               
+│                                                                               
+│ 
+│ Tests: 3218 pass.                                                             
+
+Before this change the same turn showed:
+  - four identical cyan (\u25a4) rows, one per tool, a failed run_tests among them
+  - the answer starting on the line directly under the last tool row
+  - a \u25c6 on all 13 answer lines, blank ones included
+
+## Tests
+...................................                                      [100%]
+107 passed in 8.24s
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+764 passed, 3461 deselected, 1 warning in 92.14s (0:01:32)
+
+ruff check shamsu/cli/tui.py shamsu/cli/turn_render.py tests/test_tui.py
+All checks passed!

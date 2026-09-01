@@ -1,0 +1,28 @@
+# 2026-08-31 session close - full suite
+
+Final, after every change today (voice gating, Kokoro + engine registry, am_adam,
+TUI wrapping/answer-block/icon-column, situation-aware skills + resizing, F6 skip):
+
+  .venv/Scripts/python.exe -m pytest tests/ -q -p no:cacheprovider
+  4401 passed, 2 skipped, 1 warning in 875.08s (0:14:35)
+
+## Transient failures seen earlier today, none reproducible
+
+  test_release_scripts::test_unix_lifecycle_scripts_parse_with_bash
+    Failed in two background runs, passed alone and with its own file (5/5).
+    Shells out to `bash -n`; both failures happened while bash-heavy commands
+    ran against the same machine. Did not recur.
+
+  test_harness_honesty_and_parity::test_every_pinned_parameter_reaches_the_request
+    Failed once with TokenError from tokenize.py - the assertion never ran.
+    The test tokenizes simple_chat.py via inspect.getsource. First explanation
+    was a concurrent write, which the file's mtime (22:17, against a 23:06-23:39
+    run) ruled out. Did not recur. Cause unknown; not asserting one.
+
+  A transient IndentationError at simple_chat.py:7775 during an interactive
+    run, which vanished on re-read. That one WAS a concurrent write.
+
+Context: two agents edited this working tree today. Test count went from 4394
+to 4403 between the last two full runs, so the other one is still adding work.
+The first of these two runs took 33:14 against 14:35 for the second - the same
+suite, on the same tree, under different load.

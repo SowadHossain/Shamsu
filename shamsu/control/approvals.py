@@ -19,7 +19,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable
 
-from shamsu.control.store import ALLOW, APPROVAL_TIMEOUT_SECONDS, ControlStore
+from shamsu.control.store import ALLOW, ControlStore, approval_timeout
 from shamsu.safety.commands import redact
 
 
@@ -30,12 +30,16 @@ class SharedApprovalBroker:
         self,
         store: ControlStore | None = None,
         *,
-        timeout_seconds: float = APPROVAL_TIMEOUT_SECONDS,
+        timeout_seconds: float | None = None,
         on_raised: Callable[[str], None] | None = None,
         on_resolved: Callable[[str, str], None] | None = None,
     ) -> None:
         self.store = store or ControlStore()
-        self.timeout_seconds = float(timeout_seconds)
+        # Resolved now rather than at import, so a timeout set from inside
+        # SHAMSU reaches a broker built by a process already running.
+        self.timeout_seconds = float(
+            timeout_seconds if timeout_seconds is not None else approval_timeout()
+        )
         # Hooks so a surface can push the card out immediately rather than
         # waiting for its next poll - and, just as importantly, retract it when
         # somebody else answers.

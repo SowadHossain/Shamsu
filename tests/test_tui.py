@@ -8,6 +8,7 @@ scrollback that jumps to the bottom while you are reading it is not one.
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 from typing import ClassVar
 
@@ -411,7 +412,9 @@ async def test_a_turn_started_elsewhere_shows_whose_it_was():
         app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
         app.absorb_for_display(Remote())
 
-    assert "✈ deploy the thing" in app.pane.plain(10)
+    from shamsu.cli.tui import prompt_decoration
+
+    assert f"{prompt_decoration('telegram')[0]}deploy the thing" in app.pane.plain(10)
 
 
 @pytest.mark.asyncio
@@ -490,8 +493,12 @@ async def test_a_turn_the_terminal_never_started_still_shows_up():
         )
 
         text = app.pane.plain(20)
-        assert "◈ write the plan" in text, "the prompt never reached the terminal"
-        assert "◆ Wrote PLAN.md." in text, "the answer never reached the terminal"
+        from shamsu.cli.tui import KIND_ANSWER, LINE_KINDS, prompt_decoration
+
+        web_mark = prompt_decoration("web")[0]
+        answer_mark = LINE_KINDS[KIND_ANSWER][0]
+        assert f"{web_mark}write the plan" in text, "the prompt never reached the terminal"
+        assert f"{answer_mark}Wrote PLAN.md." in text, "the answer never reached the terminal"
         assert "web turn failed" in text, "the failure was silent"
 
         detach()
@@ -918,7 +925,7 @@ async def test_ctrl_space_voice_transcribes_and_submits(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_tui_speaks_replies_without_blocking() -> None:
+async def test_tui_speaks_the_reply_to_something_spoken() -> None:
     from prompt_toolkit.application import create_app_session
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
@@ -938,6 +945,8 @@ async def test_tui_speaks_replies_without_blocking() -> None:
             voice_output_factory=FakeSpeaker,
         )
 
+        # What the microphone path does when Whisper comes back with text.
+        app._voice_transcribed("read the tui file")
         app.speak_reply("Hello from SHAMSU.")
 
         for _ in range(20):
@@ -946,6 +955,87 @@ async def test_tui_speaks_replies_without_blocking() -> None:
             await asyncio.sleep(0.01)
 
         assert spoken == ["Hello from SHAMSU."]
+
+
+@pytest.mark.asyncio
+async def test_a_typed_prompt_is_answered_in_silence() -> None:
+    """The bug this covers: every reply was spoken, whatever was typed."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    spoken: list[str] = []
+
+    class FakeSpeaker:
+        def speak(self, text: str) -> None:
+            spoken.append(text)
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_output_factory=FakeSpeaker,
+        )
+
+        app.speak_reply("Typed prompts get a typed answer.")
+        await asyncio.sleep(0.05)
+
+        assert spoken == []
+
+
+@pytest.mark.asyncio
+async def test_speaking_is_armed_once_and_not_left_standing() -> None:
+    """A spoken prompt earns ONE spoken reply.
+
+    The flag is consumed by the reply it belongs to, and cleared again the
+    moment something is typed - otherwise a voice turn that answered through
+    another surface would leave the next typed prompt talking.
+    """
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    spoken: list[str] = []
+
+    class FakeSpeaker:
+        def speak(self, text: str) -> None:
+            spoken.append(text)
+
+    class FakeBuffer:
+        text = "now type instead"
+
+        def reset(self, append_to_history: bool = False) -> None:
+            return None
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_output_factory=FakeSpeaker,
+        )
+
+        app._voice_transcribed("say something back")
+        app.speak_reply("First answer.")
+        app.speak_reply("Second answer, to nothing spoken.")
+
+        for _ in range(20):
+            if spoken:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)
+
+        assert spoken == ["First answer."]
+
+        app._voice_transcribed("armed again")
+        app._accept(FakeBuffer())
+        app.speak_reply("Answer to what was typed.")
+        await asyncio.sleep(0.05)
+
+        assert spoken == ["First answer."]
 
 
 @pytest.mark.asyncio
@@ -1697,3 +1787,434 @@ def test_tearing_the_frame_down_releases_whatever_is_outstanding():
 
     assert stuck.is_set(), "the turn is over; nothing else will release it"
     assert live._handover_depth == 0
+
+
+@pytest.mark.asyncio
+async def test_an_answer_is_not_wrapped_by_its_own_gutter() -> None:
+    """The defect: every line of every answer had a near-empty row under it.
+
+    Rich pads what it renders to the console width. The pane then prepends a
+    two-column gutter, so each already-full line overflowed the pane and wrapped
+    - doubling the height of every answer with rows holding nothing but the
+    padding that ran over.
+    """
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    from rich.console import Console
+    from rich.markdown import Markdown
+
+    from shamsu.cli.tui import PaneWriter
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        app.pane.set_width(app.output_width())
+        console = Console(force_terminal=True, color_system="truecolor")
+        console.file = PaneWriter(app.pane, app.invalidate)
+        app.adopt_console(console)
+
+        with app.answering():
+            console.print(Markdown("A fragment is not a file. " * 12))
+
+        rows = [row for row in app.pane.plain(60).split("\n") if row.strip()]
+        assert rows, "the answer rendered nothing"
+        # Every row that carries text carries a mark - the diamond opens the
+        # block, the rule carries it. A wrapped row would arrive with neither.
+        assert all(row.startswith(("◆", "│")) for row in rows), rows
+
+
+@pytest.mark.asyncio
+async def test_the_console_follows_the_pane_when_the_terminal_resizes() -> None:
+    """Set once at startup, the width went stale on the first resize - and a
+    console wider than the pane is the same wrapping defect by another route."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    from rich.console import Console
+
+    from shamsu.cli.tui import GUTTER_WIDTH
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        console = Console(force_terminal=True)
+        app.adopt_console(console)
+
+        widths: list[int] = [140]
+        app._terminal_width = lambda: widths[0]  # type: ignore[method-assign]
+        app._sync_console_width()
+        assert console.width == app.output_width() - GUTTER_WIDTH
+
+        widths[0] = 90
+        app._output_fragments()
+
+        assert console.width == app.output_width() - GUTTER_WIDTH
+
+
+def test_every_gutter_is_the_width_the_console_reserves() -> None:
+    """GUTTER_WIDTH is subtracted from the console width, so a mark that is
+    not that wide would put the wrapping bug back for one kind of line only -
+    which is exactly the sort of thing nobody notices for a year."""
+    from shamsu.cli.tui import (
+        GUTTER_WIDTH,
+        LINE_KINDS,
+        PROMPT_SURFACES,
+        UNKNOWN_SURFACE,
+    )
+
+    marks = [gutter for gutter, _s, _t in LINE_KINDS.values() if gutter]
+    marks += [gutter for gutter, _s, _t in PROMPT_SURFACES.values()]
+    marks.append(UNKNOWN_SURFACE[0])
+
+    assert marks, "no gutters to check"
+    assert {len(mark) for mark in marks} == {GUTTER_WIDTH}
+
+
+@pytest.mark.asyncio
+async def test_an_answer_opens_with_a_mark_and_is_carried_by_a_rule() -> None:
+    """Twenty lines of an answer used to be twenty diamonds.
+
+    Repeated that often a mark stops being a mark. The diamond now opens the
+    block and a thin rule carries it, which keeps the block's extent legible
+    with the colour stripped out - the reason every row was marked in the
+    first place - without the repetition.
+    """
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        app.pane.write_as("first line\nsecond line\nthird line", "answer")
+
+        rows = [row for row in app.pane.plain(20).split("\n") if row.strip()]
+
+        assert rows[0].startswith("◆ ")
+        assert [row[0] for row in rows] == ["◆", "│", "│"]
+
+
+@pytest.mark.asyncio
+async def test_each_answer_opens_its_own_block() -> None:
+    """The rule must not leak across turns: a second answer is a new block and
+    opens with the diamond again."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        app.pane.write_as("one\ntwo", "answer")
+        app.pane.write_as("three\nfour", "answer")
+
+        rows = [row for row in app.pane.plain(20).split("\n") if row.strip()]
+
+        assert [row[0] for row in rows] == ["◆", "│", "◆", "│"]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_is_separated_from_the_actions_above_it() -> None:
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    from rich.console import Console
+
+    from shamsu.cli.tui import KIND_LOG, PaneWriter
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        console = Console(force_terminal=True)
+        console.file = PaneWriter(app.pane, app.invalidate)
+        app.adopt_console(console)
+        app.pane.write_as("▤  Reading gateway.py", KIND_LOG)
+
+        with app.answering():
+            console.print("the answer")
+
+        rows = app.pane.plain(20).split("\n")
+        answer_at = next(i for i, row in enumerate(rows) if row.startswith("◆"))
+        assert not rows[answer_at - 1].strip(), rows
+
+
+@pytest.mark.asyncio
+async def test_the_separator_does_not_stack_up() -> None:
+    """Called twice - an interrupted turn, or an answer that is all there is -
+    it must still leave exactly one blank row."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+        app.pane.write_as("a tool row", "log")
+        app.pane.separate()
+        app.pane.separate()
+        app.pane.write_as("the answer", "answer")
+
+        rows = app.pane.plain(20).split("\n")
+        blanks = [i for i, row in enumerate(rows[:3]) if not row.strip()]
+        assert len(blanks) == 1, rows
+
+
+def test_a_read_a_search_and_a_write_do_not_share_one_icon() -> None:
+    """Reads and searches are most of a turn, so leaving them on one mark put
+    a column of identical icons down the pane and wasted the icons."""
+    from shamsu.cli.turn_render import _style_of
+
+    marks = {
+        tool: _style_of(tool, True)[0]
+        for tool in ("read_file", "search_files", "outline", "patch_file", "run_tests")
+    }
+
+    assert len(set(marks.values())) == len(marks), marks
+
+
+def test_a_failure_takes_the_failure_mark_whatever_the_tool_was() -> None:
+    """A failed search is a failure first. It must not be distinguishable from
+    a successful one by colour alone."""
+    from shamsu.cli.turn_render import ICON_FAIL, _style_of
+
+    for tool in ("read_file", "search_files", "patch_file", "run_tests"):
+        assert _style_of(tool, False) == (ICON_FAIL, "red")
+
+
+def test_the_icon_column_is_the_same_width_on_both_sides() -> None:
+    """The pane and the renderer each know how wide the icon column is, and
+    neither imports the other. If they disagree, marks land in one column and
+    text in another - which is the layout this pair of constants exists to
+    stop."""
+    from shamsu.cli.tui import GUTTER_WIDTH
+    from shamsu.cli.turn_render import ICON_COLUMN
+
+    assert GUTTER_WIDTH == ICON_COLUMN
+
+
+def _rendered_turn() -> list[str]:
+    """One turn of every row type, painted through the real renderer."""
+    from rich.console import Console
+
+    from shamsu.cli.tui import PaneWriter
+    from shamsu.cli.turn_render import CliTurnRenderer
+    from shamsu.runtime.turn_stream import TurnEvent
+
+    seq = [0]
+
+    def ev(kind: str, text: str = "", **data: object) -> TurnEvent:
+        seq[0] += 1
+        return TurnEvent(seq=seq[0], kind=kind, text=text, data=dict(data))
+
+    app = TuiApp(telemetry=_telemetry(), on_submit=lambda _t: None)
+    app.pane.set_width(app.output_width())
+    console = Console(force_terminal=True, color_system="truecolor")
+    console.file = PaneWriter(app.pane, app.invalidate)
+    app.adopt_console(console)
+    renderer = CliTurnRenderer(console, verbosity="verbose")
+
+    app.echo_prompt("add a health endpoint", "telegram")
+    renderer(ev("reasoning", "trace", text_full="The router file is where a route goes."))
+    renderer(ev("tool.call", "read_file", tool="read_file", target="app/routes.py"))
+    renderer(
+        ev("tool.result", "ok", tool="read_file", ok=True, target="app/routes.py", duration_ms=340)
+    )
+    for _ in range(3):
+        renderer(ev("tool.call", "search_files", tool="search_files", target="health"))
+        renderer(
+            ev("tool.result", "ok", tool="search_files", ok=True, target="health", duration_ms=120)
+        )
+    renderer(
+        ev("approval", "approval", phase="requested", action_type="file_edit", target="app/routes.py")
+    )
+    renderer(ev("tool.call", "patch_file", tool="patch_file", target="app/routes.py"))
+    renderer(
+        ev(
+            "tool.result",
+            "ok",
+            tool="patch_file",
+            ok=True,
+            target="app/routes.py",
+            duration_ms=90,
+            diff="--- a\n+++ b\n@@\n+@app.get('/health')\n+def health():\n+    return 1",
+        )
+    )
+    renderer(ev("error", "the model returned no tool call"))
+    from shamsu.cli.tui import KIND_NOTICE
+
+    app.echo("voice: transcribing with Whisper...", KIND_NOTICE)
+    with app.answering():
+        console.print("The endpoint is in. Tests pass.")
+
+    return [row for row in app.pane.plain(60).split("\n") if row.strip()]
+
+
+@pytest.mark.asyncio
+async def test_no_text_ever_lands_in_the_icon_column() -> None:
+    """The layout rule, over every row type a turn can paint.
+
+    Rows used to be indented two spaces and carry their icon at column 2,
+    while the frame's own marks sat at column 0 - so there were two icon
+    columns and text in both. A mark now owns column 0 and nothing else may
+    enter the gap behind it.
+    """
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.cli.tui import GUTTER_WIDTH
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        rows = _rendered_turn()
+
+    assert len(rows) > 8, rows
+    for row in rows:
+        column = row[:GUTTER_WIDTH]
+        # Either a single mark in column 0, or nothing at all. Never a word.
+        assert len(column.strip()) <= 1, f"text in the icon column: {row!r}"
+        if column.strip():
+            assert column[0] != " ", f"mark is not in column 0: {row!r}"
+
+
+@pytest.mark.asyncio
+async def test_every_row_starts_its_text_at_the_same_column() -> None:
+    """A row with no mark of its own - an activity line, a diff, a reasoning
+    trace - still begins where the marked rows' text begins, or further in.
+    Never before it."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from shamsu.cli.tui import GUTTER_WIDTH
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        rows = _rendered_turn()
+
+    for row in rows:
+        text_at = len(row) - len(row.lstrip())
+        if row[:1].strip():
+            # A marked row: the mark, then the gap, then the text.
+            assert row[1:GUTTER_WIDTH].strip() == "", f"no gap after the mark: {row!r}"
+        else:
+            assert text_at >= GUTTER_WIDTH, f"text before the text column: {row!r}"
+
+
+@pytest.mark.asyncio
+async def test_f6_stops_the_reply_being_spoken() -> None:
+    """The key you press when the answer is spoken, you have already read it,
+    and you want the next thing to happen now."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    started = asyncio.Event()
+    release = threading.Event()
+    stopped: list[bool] = []
+
+    class SlowSpeaker:
+        def speak(self, _text: str) -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        def stop(self) -> None:
+            stopped.append(True)
+            release.set()
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_output_factory=SlowSpeaker,
+        )
+        app._voice_transcribed("say something")
+        app.speak_reply("A long spoken answer.")
+
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set(), "the speaker never started"
+        assert app._speaking is True
+
+        app._skip_speech()
+
+        assert stopped == [True]
+        assert "voice: skipped" in app.pane.plain(10)
+
+
+@pytest.mark.asyncio
+async def test_f6_says_so_when_there_is_nothing_to_skip() -> None:
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    stopped: list[bool] = []
+
+    class Speaker:
+        def speak(self, _text: str) -> None:
+            return None
+
+        def stop(self) -> None:
+            stopped.append(True)
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_output_factory=Speaker,
+        )
+
+        app._skip_speech()
+
+        assert stopped == []
+        assert "nothing is being spoken" in app.pane.plain(10)
+
+
+@pytest.mark.asyncio
+async def test_a_playback_error_does_not_leave_the_frame_thinking_it_speaks() -> None:
+    """Otherwise the status bar offers F6 for the rest of the session and the
+    key does nothing - which is how the approval menu went wrong."""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    class BrokenSpeaker:
+        def speak(self, _text: str) -> None:
+            raise RuntimeError("no audio device")
+
+        def stop(self) -> None:
+            return None
+
+    with create_pipe_input() as pipe, create_app_session(
+        input=pipe, output=DummyOutput()
+    ):
+        app = TuiApp(
+            telemetry=_telemetry(),
+            on_submit=lambda _t: None,
+            voice_output_factory=BrokenSpeaker,
+        )
+        app._voice_transcribed("say something")
+        app.speak_reply("This will fail.")
+
+        for _ in range(100):
+            if "voice output failed" in app.pane.plain(10):
+                break
+            await asyncio.sleep(0.01)
+
+        assert app._speaking is False
+        assert "voice output failed" in app.pane.plain(10)

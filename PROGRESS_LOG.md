@@ -3,6 +3,403 @@
 One entry per completed task, newest at the top. Raw model/test output lives in
 `logs/test-runs/<date>-<task>.log`.
 
+### 2026-08-31 - Interactive check_page, a look before the ceiling, and a spill nobody could see
+Files edited: `shamsu/tools/page_check.py`, `shamsu/agents/simple_chat.py`,
+`shamsu/llm/capabilities.py`, `shamsu/skills/bundled/ui-designer/*`,
+`tests/test_page_check.py`, `tests/test_spec_to_contract.py`,
+`tests/test_model_facts_and_limits.py`, `tests/test_simple_skills.py`
+What changed: four fixes from reviewing a live build that produced a game in
+which nothing happens. `check_page` takes `click` and `wait_seconds` and reports
+canvas coverage and motion - measured on that game, clicking START moved it from
+1.22% to 1.23% covered, which is the bug stated as a number; no vision model is
+involved, the browser reads its own pixels and the harness writes the sentence.
+A turn with three rounds left that has written code and run nothing is now asked
+to check it. A plan asked for and never written is reported at turn end, since
+that build finished with no contract at all. And the harness now reads
+`/api/ps` and says when the model is running partly from system RAM - the cause
+of a 536-second model call that looked exactly like a hang.
+Tests: 20 new. Full suite 4394 passed / 2 skipped / 0 failed.
+Log: logs/test-runs/2026-08-31-interactive-check-and-spill.log
+
+### 2026-08-31 - check_page retries a server that is still binding; a dead command stops claiming it started
+Files edited: `shamsu/tools/page_check.py`, `shamsu/tools/executor.py`,
+`tests/test_page_check.py`, `tests/test_background_processes.py`
+What changed: reviewed the first live run of `check_page` in `F:oice-demo`.
+The game it built works, and two defects showed up anyway. `check_page` reported
+`net::ERR_EMPTY_RESPONSE` on a server that had been detached seconds earlier -
+`curl` fetched the same URL ten seconds later - so a working page was reported
+broken and the model fell back to a check that cannot see rendering; connection
+-level errors now retry 3x over ~3s while a real failure still fails at once,
+and approval is asked once across retries. And `command.detached` was logged
+unconditionally, so a command that exited 1 on a bad path was recorded as
+"Started in the background"; the launcher now reports whether it stayed up.
+Also confirmed, and worth recording: the situation-triggered skill injection
+fired twice in that run, and the write guards refused an oversized rewrite and
+two deletes before the model found the correct patch.
+Tests: 8 new (retry classification, a first navigation that fails and a check
+that still passes, approval asked once, a command that dies is not recorded as
+running). Full suite green.
+Log: logs/test-runs/2026-08-31-check-page-retry.log
+
+### 2026-08-31 - check_page: a real browser, reachable from the agent
+Files edited: `shamsu/tools/page_check.py` (new), `shamsu/agents/simple_chat.py`,
+`shamsu/agents/simple_router.py`, `tests/test_page_check.py` (new),
+`tests/test_simple_chat.py`
+What changed: `BrowserTool` had a passing real-Chromium test and no tool schema
+at all, so a model asked to build a web page could never check it - which is why
+the 2026-08-31 session invented `verify_web_app`, invented its output, and
+skipped twelve assertions. `check_page(url)` now loads the page and reports
+console errors, which elements rendered, whether a canvas has a non-zero drawing
+surface, and a screenshot. Local URLs are auto-approved (a prompt per check is
+what would make it unusable); anything else still asks. Assigned to the `run`
+category and added to the non-registry set - both caught by existing tests.
+Tests: 15 new, all driving real Chromium against real fixtures, covering the
+three failures that look identical from outside: a page that throws, a page that
+renders nothing, and a 0x0 canvas. Verified against the real asteroid game.
+Full suite 4327 passed / 2 skipped / 0 failed.
+Log: logs/test-runs/2026-08-31-check-page.log
+
+### 2026-08-31 - Verdict honesty, cross-file coverage, surface parity, pinned sampling
+Files edited: `shamsu/agents/simple_chat.py`, `shamsu/control/runner.py`,
+`shamsu/integrations/telegram/sessions.py`, `scripts/validate_release.py`,
+`pyproject.toml`, `RELEASE_VALIDATION.md`,
+`tests/test_harness_honesty_and_parity.py` (new)
+What changed: seven items from the 2026-08-31 audit. The turn verdict now
+reports outstanding contract checks, how many times the loop steered the model
+and how often the context was trimmed - all three were measured and none
+reached the user; counting the corrections needed a single seam (`_steer`)
+because thirteen call sites wrote them directly. `_cross_file_problems` reads
+its suffix set from `verify.wiring` instead of restating three of its ten, so
+Python and TypeScript projects get cross-file checks at last. Telegram now
+builds its tools through `build_simple_tools` in simple mode, so all three
+surfaces share one approval policy and the eval override works there; the web
+runner gained the ActionLedger it never had. Sampling parameters are pinned,
+with repeat_penalty at 1.0 rather than Ollama's 1.1 applied to code. The
+release gate's two latency budgets were re-based off 1.5s, which no local model
+can meet and which had the gate permanently red. pytest-timeout added at 300s
+after a venv test wedged the suite for 35 minutes. The file skeleton is
+memoised on its inputs instead of parsed twice a round.
+Not done here, and deliberately: browser/dev-server tools (BrowserTool and
+DevServerTool have no schema at all - a build, not a wiring fix), autonomous
+continuation, the contract as a gate, and requirement extraction. State-
+triggered skills landed concurrently from another author and were verified
+rather than duplicated.
+Tests: 19 new, full suite 4312 passed / 2 skipped / 0 failed.
+Log: logs/test-runs/2026-08-31-audit-batch.log
+
+### 2026-08-31 - Background servers are written down, swept and stoppable
+Files edited: `shamsu/tools/executor.py`, `shamsu/cli/repl.py`,
+`tests/test_background_processes.py` (new)
+What changed: a detached server was tracked only in memory and reaped only by
+`atexit`, so closing the console window, killing the process or crashing left it
+running with nothing on disk that named it. Found live: two `http.server`
+processes holding port 8000 two hours after their session ended. Each background
+process now gets `.shamsu/processes/<pid>.json` written before the readiness
+wait; opening a workspace sweeps the directory, drops dead entries and REPORTS
+live ones rather than killing them; `/processes [stop <pid>|stop all]` lists and
+ends them; `_kill_pid_tree` works from a bare pid, since a process from a
+previous session has no Popen handle.
+Tests: 18, including the real regression - launch a server, wipe the in-memory
+registry to simulate the crash, and assert it is still findable and stoppable
+from disk alone. Full suite green.
+Log: logs/test-runs/2026-08-31-background-process-tracking.log
+
+### 2026-08-31 - Three defects the voice-demo session exposed, and the skill matcher it broke
+Files edited: `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_skills.py`,
+`shamsu/verify/wiring.py`, `tests/test_voice_demo_regressions.py` (new),
+`tests/test_wiring_frontend.py`
+What changed: reviewed a live two-hour run in `F:oice-demo` that built an
+asteroid game which declared victory the moment you pressed Start. Every guard
+fired correctly; three things behind them did not. `contract_create` accepted
+`assertions` as a printed Python list and stored eight requirements as one
+assertion, so the Definition of Done was inert for the whole session -
+`normalize_arguments` now recovers a printed list for the four array arguments
+that get sent that way. The duplicate-class diagnostic named the fault and not
+the next call, and the model answered it with 26 refused edits across four
+turns; it now says which copy to delete, with which tool, and which file must
+load first. And a `.js` written but never referenced by any page was invisible -
+`unreferenced_script` is the reverse of `missing_asset` and the more expensive
+direction, because nothing 404s. Running the new skill matcher against the real
+prompts from that session also caught a defect in it: `phrase in text` made `ui`
+match inside "build", so a game build scored `ui-designer`; matching is on word
+boundaries now.
+Tests: 26 new tests in `test_voice_demo_regressions.py`, built from the actual
+payloads and files of the run; one existing wiring assertion widened, because
+`unreferenced_script` is a genuine fourth fault in the snake-game fixture it
+covers. Full suite green.
+Log: logs/test-runs/2026-08-31-voice-demo-regressions.log
+
+### 2026-08-31 - One context window, budgets that follow it, and four automatic capabilities
+Files edited: `shamsu/context/budget.py`, `shamsu/agents/simple_chat.py`,
+`shamsu/agents/simple_prompt.py`, `shamsu/agents/prompts/simple_system.md`,
+`shamsu/agents/simple_skills.py` (new), `shamsu/llm/capabilities.py` (new),
+`shamsu/runtime/settings.py`, `shamsu/runtime/models.py`, `shamsu/cli/repl.py`,
+`shamsu/control/store.py`, `shamsu/control/approvals.py`, `evals/harness.py`,
+`tests/test_context_window_settings.py` (new),
+`tests/test_model_facts_and_limits.py` (new),
+`tests/test_capabilities_are_automatic.py` (new), `~/.shamsu/settings.json`
+What changed: ten fixes in one pass, at the user's request. The window
+precedence now lives once in `chat_ctx_ceiling`, so a setting made inside
+SHAMSU no longer makes the chat call and the background calls disagree and
+reload a 6GB model between them - found live as a saved `chat_max_ctx` of
+32786. `/context window` does real arithmetic on `k`, snaps to one of four
+windows, refuses one the model cannot hold, and completes from a dropdown.
+`tool_result_budget`, `summary_budget` and the skeleton ratio take the live
+ceiling, so a session shrunk to 8k stops spending as if it had 32k - one tool
+result was allowed 98% of the window. `max_rounds`, `turn_budget_s` and
+`approval_timeout_s` became settings with a `/set` command. Model window and
+tool-calling support now come from `/api/tags`, cached off the hot path, with
+the table as fallback. Skills are matched by the harness and injected instead
+of waiting for a `use_skill` that was called zero times in every logged
+session; the code graph builds itself instead of only refreshing; the prompt
+and the roster read the same probes; and the four contract assert tools are
+withheld until there is a contract. A floor of ten prompt-named tools survives
+narrowing, which is the general form of the 2026-08-29 write-roster fix.
+Tests: 3 new files, 92 tests, all passing; full suite green (see log).
+Log: logs/test-runs/2026-08-31-context-window-and-automatic-capabilities.log
+
+### 2026-08-31 - F6 skips a spoken reply
+Files edited: `shamsu/cli/tui.py`, `shamsu/cli/repl.py`,
+`shamsu/voice/playback.py`, `tests/test_tui.py`, `tests/test_voice_engines.py`
+What changed: F6 stops the reply being spoken. Deliberately not the same thing
+as `SHAMSU_VOICE_OUTPUT=off`, which is the setting - this is the key for when
+the answer is being read out, you have already read it, and you want the next
+thing to happen now. The text stays in the pane; only the audio is dropped.
+The status bar offers the key only while something is actually speaking, since
+a hint for a key that does nothing is how the approval menu went wrong.
+
+The binding was the easy half. Live, the sound kept going for 2.14 seconds
+after the key: `stream.write` blocks until the device accepts the data, so
+writing a whole sentence per call meant the stop flag went unread for the
+length of that sentence. It was set the entire time and nothing was looking at
+it. Audio now goes out in 0.1s blocks with the flag checked between them,
+measured at 0.45s from key to silence - most of what is left is the device
+buffer that `abort()` drops.
+Tests: 5 added. Three on the frame (F6 stops a speaker that is mid-utterance;
+it says so when there is nothing to skip; a playback error leaves `_speaking`
+False rather than offering a dead key for the rest of the session), two on the
+player (a 4-second chunk goes out as ~40 writes, and stopping during the third
+block drops the remaining ninety-odd). 144 pass across voice/voice_engines/tui,
+ruff clean |
+Log: logs/test-runs/2026-08-31-f6-skip-speech.log
+
+### 2026-08-31 - A skill is chosen from what the turn is doing, and sized to fit
+Files edited: `shamsu/agents/simple_skills.py`, `shamsu/agents/simple_chat.py`,
+`shamsu/skills/bundled/{debugger,planner,critic,qa-tester}/` (new),
+`shamsu/skills/bundled/{large-file-surgery,developer,sql-databases}/SKILL.md`,
+`tests/test_simple_skills.py` (new), `tests/test_skills.py`
+What changed: skills were dead. Across the asteroid session - 24 model calls,
+13 minutes, failed - `use_skill` was called zero times and nothing was
+auto-injected either, while the 7-skill index rode along in all 24 prompts at
+~147 tokens each. Not a bug in the matcher: "build an asteroid game with
+multiple levels and sound effects" scores `developer` at 2.0 against a floor
+of 3.0 and everything else at 0.0, so injecting nothing was the correct answer
+to the question being asked. The question was wrong.
+
+Selection now asks the SITUATION first and the request second, because a
+request is what someone thought the job was before starting it. `Situation`
+reads two lists the loop already keeps - `_observed_writes` and
+`_turn_failures` - so nothing new is recorded: three writes to one path is
+`large-file-surgery`, two identical `contract_assert` refusals is `qa-tester`,
+two identical anything-else failures is `debugger`. Re-asked at each round
+boundary, injected once per turn per skill. That run would have got surgery at
+step 8 of its 9-part file and qa-tester at the second of three identical
+"needs evidence" refusals.
+
+It also fixes a second-order bug: the stack filter reads the extensions
+PRESENT, and the workspace was empty when the turn began, so `ui-designer` was
+filtered out at the moment of choosing and became applicable four tool calls
+later. Re-asking mid-turn re-reads it.
+
+Sizing: 0.04 of an 8k window is 327 tokens, and `large-file-surgery` was 722 -
+over its own 700 budget - so the skill this situation code injects was the one
+guaranteed to arrive cut in half, with the "do not rewrite the whole file"
+rules in the half that got cut. Rewritten to 294. `developer` 393 -> 292,
+`sql-databases` 591 -> 324. All 13 skills now fit an 8k window intact.
+
+Four smallcode personas converted from `reference/smallcode/agents/`:
+debugger, planner, critic, qa-tester - the ones that map onto failures this
+harness actually has. Not `oracle`, `scout` or `librarian`, which assume
+sub-agent delegation SHAMSU does not have. Rewritten rather than copied: their
+`model:`/`tools:` frontmatter is meaningless here, and 200-250 tokens of
+numbered imperative steps is what a 3B follows.
+Tests: 23 added. The fixture is the asteroid run's real write and failure
+sequence, written out rather than read from that workspace - it is a demo, not
+a test fixture. Three are invariants rather than cases: every bundled skill
+fits a small model's window, every bundled skill has triggers (one without
+them can only be reached by a `use_skill` call that never comes), and every
+name `SITUATION_SKILLS` points at exists. 647 pass across
+skills/simple_skills/simple_chat/capabilities/hardening.
+
+One existing test asserted on the phrase "Inspect relevant files" in the
+developer skill and broke when it was rewritten; it now asserts the rule
+(`patch_file`) rather than the sentence, since the test is named for discovery
+and was telling us nothing about it |
+Log: logs/test-runs/2026-08-31-skills-situation-and-sizing.log
+
+### 2026-08-31 - One icon column, one text column
+Files edited: `shamsu/cli/tui.py`, `shamsu/cli/turn_render.py`, `tests/test_tui.py`
+What changed: there were TWO icon columns and text landing in both. The frame
+put its own marks - a prompt's chevron, an answer's diamond - in column 0 with
+text at column 2, while every row the renderer painted was indented two spaces
+and carried its icon at column 2 with text at column 4. Reasoning was indented
+four, a diff padded four, activity lines two. Nothing lined up with anything.
+
+One rule now: a mark owns column 0, text starts at column 3, and subordinate
+detail - a diff under a write, a reasoning trace - sits at column 5 so it
+reads as belonging to the row above rather than as another row. A row with no
+mark of its own (an activity line, a repeat counter) starts at the text column
+rather than in the gap. `marked()` builds a mark plus the gap that follows it,
+so a glyph and its padding are never written apart.
+
+The width is `ICON_COLUMN` in the renderer and `GUTTER_WIDTH` in the pane -
+two constants, because neither module imports the other and neither should.
+`test_the_icon_column_is_the_same_width_on_both_sides` is what stops them
+drifting; if they ever disagree, marks land in one column and text in another,
+which is the exact layout this replaced.
+Tests: 3 added - the two constants agree, no text ever lands in the icon
+column, and every row starts its text at the same column - each asserted over
+a whole rendered turn (prompt, reasoning, reads, a collapsed repeat, an
+approval, a write with a diff, an error, a notice, an answer) rather than one
+row type. Four existing tests hard-coded the old one-space gap; they now
+assert through the mark constants, so the gap lives in one place and they keep
+testing what they are about. 110 in test_tui, 808 across the
+tui/turn/render/parity/trace/repl/log suites, ruff clean |
+Log: logs/test-runs/2026-08-31-tui-icon-column.log
+
+### 2026-08-31 - The answer reads as a block, and the action rows stop looking alike
+Files edited: `shamsu/cli/tui.py`, `shamsu/cli/turn_render.py`, `tests/test_tui.py`
+What changed: three things, all of them "the pane is technically correct and
+still hard to read".
+
+A mark repeated twenty times stops being a mark. `CONTINUATION_MARKS` gives a
+kind a SECOND glyph for its second and later lines, so an answer opens with
+the diamond and is carried by a thin rule. The block's extent is still legible
+with the colour stripped out - which was the whole reason for marking every
+row - without the column of diamonds. A kind absent from the map repeats its
+own mark, which is what the approval bar wants.
+
+Every read, search and outline shared ICON_TOOL, and reads are most of a turn:
+a live run is three or four of them per write, so the differentiated icons
+were being spent on the rare rows and the common ones were an undifferentiated
+column. `_TOOL_STYLES` is consulted before the family rules, so a tool takes
+its own mark without widening the if-chain. Failure still wins over all of it:
+a failed search is a failure first, and must not differ from a successful one
+by colour alone.
+
+An answer began on the line directly under a tool row, where the eye has
+nothing to catch - the mark changes, but marks are two columns wide and the
+text runs on at the same indent. `LogPane.separate()` puts one blank row
+there, and is idempotent because its callers are.
+Tests: 6 added (block opens once and is carried; a second answer opens its own
+block; the separator exists and does not stack; read/search/outline/write/test
+hold five distinct marks; a failure takes the failure mark whatever the tool
+was), plus the earlier wrapping test updated to accept the rule. 107 in
+test_tui, 764 across tui/turn/render/parity/repl/voice/log, ruff clean.
+
+Full suite: 4222 passed, 1 failed, 2 skipped. The failure is
+`test_release_scripts.py::test_unix_lifecycle_scripts_parse_with_bash`, which
+shells out to bash and passes on its own - it fell over while bash-heavy
+commands were running against the same machine. No shell script was touched
+here |
+Log: logs/test-runs/2026-08-31-tui-answer-block-and-icons.log
+
+### 2026-08-31 - An answer no longer wraps itself on its own gutter
+Files edited: `shamsu/cli/tui.py`, `shamsu/cli/repl.py`, `tests/test_tui.py`
+What changed: the frame set `console.width = app.output_width()` - the PANE's
+width - and the pane then prepended a two-column gutter to every decorated
+line. Rich pads what it renders to the full console width, so each answer line
+was already full when the mark went on, overflowed, and wrapped: a near-empty
+continuation row under every single line, carrying no gutter and so no colour
+either. That is what "something feels off when it replies in text" was.
+`content_width()` is the pane width minus `GUTTER_WIDTH`, and it is what the
+console gets now.
+
+Second route to the same defect, fixed with it: the width was set ONCE at
+frame start, so it went stale on the first terminal resize. `adopt_console()`
+hands the console to the frame, which re-syncs the width on every paint beside
+the pane's own `set_width`.
+Tests: 3 added - an answer whose every row carries its mark (verified to FAIL
+on the old behaviour: 5 rows, 1 unmarked, against 4 rows all marked), the
+console following a resize, and a guard that every gutter really is
+GUTTER_WIDTH wide, since a 1-column mark would restore the bug for one kind of
+line only. 101 in test_tui, 509 across the tui/repl/voice/frame suites |
+Log: logs/test-runs/2026-08-31-tui-answer-wrapping.log
+
+### 2026-08-31 - SHAMSU speaks as am_adam
+Files edited: `shamsu/voice/kokoro_engine.py`, `tests/test_voice_engines.py`
+What changed: `DEFAULT_VOICE` is `am_adam` rather than `af_heart`. One line,
+but it decides what SHAMSU sounds like on every machine that has not set
+`SHAMSU_VOICE_NAME`, so it is pinned by a test rather than left to whoever
+edits the constant next.
+Tests: 2 added (the default is what gets spoken; an explicit voice_name beats
+it), 19 pass. Both take a `no_model_needed` fixture - written first without
+it, they passed only on a machine where the 353MB model happened to be on
+disk, which is a coincidence rather than a test |
+Log: logs/test-runs/2026-08-31-tts-bakeoff.log
+
+### 2026-08-31 - Kokoro speaks the replies, behind a swappable engine layer
+Files edited: `shamsu/voice/engines.py` (new), `shamsu/voice/kokoro_engine.py`
+(new), `shamsu/voice/piper_engine.py` (new), `shamsu/voice/playback.py` (new),
+`shamsu/voice/__main__.py` (new), `shamsu/voice/speech.py`,
+`shamsu/voice/__init__.py`, `pyproject.toml`,
+`tests/test_voice_engines.py` (new)
+What changed: SAPI was the only voice there had ever been, because
+`SpeechPlayer` WAS the engine. It now holds settings and text cleanup only,
+and asks `engines.build_engine()` for something with `speak()`/`stop()`.
+Three exist - kokoro, piper, system - and none is named anywhere else in the
+codebase. Adding a fourth is `register_engine()` plus one line in
+`AUTO_ORDER`. `auto` walks that order and takes the first engine that can run
+on this machine, reading a factory's `VoiceError` as "try the next"; a NAMED
+engine fails loudly instead, because someone who asked for Kokoro and has no
+model wants to hear about the model, not be handed SAPI in silence.
+
+The defaults are measurements, not preferences, and the numbers are in
+logs/test-runs/2026-08-31-tts-bakeoff.log. fp32 is 3.4x FASTER than the int8
+build on this CPU (RTF 0.24 against 0.83), so the 92MB "small" model was
+rejected and the 325MB one is the default - quantization bought disk and cost
+most of the speed. `intra_op_num_threads=8` beat both 4 and all-20; at 20 the
+RTF passes 1.2 and synthesis falls behind the speaker. Replies are synthesized
+a sentence at a time on a producer thread that runs ahead of playback, so a
+warm session starts speaking 0.6-0.85s after the answer lands.
+
+The ONNX session names `providers=["CPUExecutionProvider"]` itself rather than
+letting kokoro-onnx resolve them: its resolver takes EVERY available provider
+once an accelerated onnxruntime is installed, and the GPU belongs to Ollama.
+That is the one promise here a refactor could break invisibly, so a test holds
+it rather than a comment.
+
+Downloading is `python -m shamsu.voice download`, never automatic - 353MB is
+not something a spoken reply may start while someone waits for an answer.
+Tests: 17 added (engine selection + fallback + named-engine failure, CPU-only
+provider pinning, per-sentence streaming, stop semantics, rate mapping,
+playback abort-vs-drain), full suite 4212 passed / 2 skipped. The stop test
+found a real defect - queued audio was still handed out after stop() - which
+was fixed in `_synthesize_ahead` |
+Log: logs/test-runs/2026-08-31-tts-bakeoff.log
+
+### 2026-08-31 - A reply is spoken only when the prompt was spoken
+Files edited: `shamsu/voice/speech.py`, `shamsu/voice/__init__.py`,
+`shamsu/cli/tui.py`, `tests/test_voice.py`, `tests/test_tui.py`
+What changed: `speak_reply` spoke EVERY reply, because nothing on that path
+knew how the prompt had arrived - typed prompts talked back, and so did any
+turn the terminal was merely watching. `TuiApp` now arms a single flag in
+`_voice_transcribed` (the microphone path, the only place that knows), clears
+it on anything typed, and consumes it in `speak_reply`; the policy itself lives
+in `reply_should_be_spoken()` so there is one answer rather than one per
+caller. `SHAMSU_VOICE_OUTPUT` carries the policy as well as the switch:
+`voice` (default), `always` (the old behaviour), `off`.
+
+Telegram and the web portal already drove their own chat loops and never
+reached the speaker, so a voice note keeps being answered in text and the open
+terminal stays silent. That was true by accident of structure, so it is now
+held by a source guard - `test_remote_surfaces_never_reach_the_local_speaker`
+- because the correct behaviour there is an absence, and an absence is what
+the next refactor deletes without noticing.
+Tests: 5 added (2 voice-policy, 1 silence-on-typed, 1 armed-once, 1 remote
+guard), 140 passed across test_voice/test_tui/test_telegram_remote_control |
+Log: logs/test-runs/2026-08-31-voice-output-gate.log
+
 ### 2026-08-24 - One contract per phase, derived from PLAN.md
 Files edited: `shamsu/agents/plan_anchor.py`, `shamsu/agents/simple_contract.py`,
 `shamsu/agents/simple_chat.py`, `shamsu/agents/simple_router.py`,

@@ -76,7 +76,10 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
     },
     "run": {
         "description": "Run a shell command, the project, or its tests",
-        "tools": ["run_command", "run_tests", "create_and_run"],
+        # `check_page` belongs with running rather than reading: it is how you
+        # find out whether the thing you started actually works, which is the
+        # same question `run_tests` answers for code without a browser.
+        "tools": ["run_command", "run_tests", "create_and_run", "check_page"],
     },
     "plan": {
         "description": "Work out what to do and write the steps down, without changing anything",
@@ -96,6 +99,7 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
             "explain_symbol",
             "contract_create",
             "contract_from_plan",
+            "contract_from_spec",
             "contract_status",
         ],
     },
@@ -104,6 +108,7 @@ TOOL_CATEGORIES: dict[str, dict[str, Any]] = {
         "tools": [
             "contract_create",
             "contract_from_plan",
+            "contract_from_spec",
             "contract_status",
             "contract_assert_pass",
             "contract_assert_fail",

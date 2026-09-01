@@ -115,14 +115,28 @@ def simple_system_prompt(workspace: Path, *, has_history: bool = True) -> str:
     only a caller that KNOWS the thread is empty passes False.
     """
     parts = [section(name) for name in ALWAYS]
+    # Read ONCE. Five file stats, and the prompt asks about four of them.
+    families = _available_families(workspace)
     if has_history:
         parts.append(section("continuity"))
     parts.append(section("symbols"))
     parts.append(section("done"))
+    if "contract" in families:
+        parts.append(section("done_open"))
     parts.append(section("recall"))
+    # The two halves of recall that depend on there being something to recall
+    # FROM. Gated on exactly what `CONDITIONAL_TOOL_FAMILIES` gates the schemas
+    # on, so the prose and the `tools` array can never disagree about which of
+    # these the model has.
+    if "memory" in families:
+        parts.append(section("recall_stored"))
+    if "history" in families:
+        parts.append(section("recall_history"))
     parts.append(section("big_read"))
     parts.append(section("big_file"))
-    if _graph_is_usable(workspace):
+    # Same set again: `graph` is gated on `_has_code_graph`, which is exactly
+    # what decides whether `graph_search` and `explain_symbol` are sent.
+    if "graph" in families:
         parts.append(section("graph"))
     parts.append(_skill_index(workspace))
     prompt = (chr(10) * 2).join(part for part in parts if part)
@@ -144,12 +158,40 @@ def _skill_index(workspace: Path) -> str:
         return ""
 
 
-def _graph_is_usable(workspace: Path) -> bool:
-    """Whether this workspace actually has a code graph worth advertising."""
-    try:
-        from shamsu.tools.codebase_memory import CodebaseMemoryAdapter
+def _available_families(workspace: Path) -> frozenset[str]:
+    """Which conditional tool families this workspace can actually answer from.
 
-        return bool(CodebaseMemoryAdapter().is_available(Path(workspace)))
+    The prompt reads the SAME function the roster does. Two probes for one
+    capability is how `graph` came to be advertised on every turn and sent on
+    none.
+    """
+    try:
+        from shamsu.agents.simple_chat import available_tool_families
+
+        return available_tool_families(Path(workspace))
+    except Exception:  # noqa: BLE001 - never let the prompt fail to render
+        return frozenset()
+
+
+def _graph_is_usable(workspace: Path) -> bool:
+    """Whether this workspace actually has a code graph worth advertising.
+
+    The SAME probe that decides whether the schemas are sent, and that is the
+    whole point. It used to ask a different question - `CodebaseMemoryAdapter.
+    is_available`, meaning "is the MCP binary healthy" - while
+    `simple_chat._has_code_graph` asked "has this workspace been indexed". The
+    binary is installed almost always and the workspace is indexed almost
+    never, so the prompt named `graph_search` and `explain_symbol` on
+    essentially every turn while the schemas shipped on essentially none.
+
+    That is smallcode issue #58, which every conditional section in this file
+    exists to avoid: a small model trusts this prose over the `tools` array, so
+    a capability named here and not given is a wasted round.
+    """
+    try:
+        from shamsu.agents.simple_chat import _has_code_graph
+
+        return bool(_has_code_graph(Path(workspace)))
     except Exception:  # noqa: BLE001 - never let the prompt fail to render
         return False
 

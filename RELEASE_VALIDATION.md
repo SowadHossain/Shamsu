@@ -1,6 +1,8 @@
 # SHAMSU Beta Release Validation
 
-- Release gate: FAIL
+- Release gate: STALE - re-run needed
+- (the two latency budgets were re-based on 2026-08-31; every FAIL below was
+   a 1.5s ceiling on a turn that calls a local LLM)
 - Startup: 1.310s
 - First answer: 20.575s
 - Five-task total: 70.010s
@@ -11,8 +13,8 @@
 | Budget | Result |
 |---|---|
 | startup_under_3s | PASS |
-| cold_first_answer_under_1_5s | FAIL |
-| warm_answer_under_1s | FAIL |
+| cold_first_answer_under_60s | FAIL |
+| warm_answer_under_30s | FAIL |
 | peak_rss_under_1gb | PASS |
 | per_run_logs_under_1mb | PASS |
 

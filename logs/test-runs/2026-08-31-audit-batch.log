@@ -1,0 +1,59 @@
+# 2026-08-31 - audit batch: honesty, coverage, parity, sampling
+
+Full suite: 4312 passed, 2 skipped, 0 failed in 437.64s
+
+## The verdict line, before and after
+
+  before:  done in 8m12s - 2 files changed
+  after :  done in 8m12s - 2 files changed - 4 of 9 checks outstanding
+           - steered 5 times - context trimmed 17x
+
+  the voice-demo turn as it would now read:
+    stopped after 21m40s - no files changed - 26 tool calls failed
+    - 1 of 1 checks outstanding - steered 10 times - context trimmed 17x
+
+  a plain question-and-answer turn is unchanged:
+    done in 12s
+
+## Cross-file gate
+
+  before: .html .htm .js
+  after : .html .js .jsx .prisma .py .sql .svelte .ts .tsx .vue
+          (read from verify.wiring._SOURCE_SUFFIXES, not restated)
+
+## Surface parity
+
+  CLI       build_simple_tools + ledger + feedback     (unchanged)
+  web       build_simple_tools + ledger                (ledger added)
+  telegram  build_simple_tools + ledger                (was raw registry)
+  telegram legacy branch keeps its own raw registry    (deliberate)
+
+## Sampling
+
+  pinned: repeat_penalty=1.0  top_p=0.9  top_k=40
+  (repeat_penalty was inheriting Ollama's 1.1, applied to code generation)
+
+## Release gate
+
+  cold_first_answer_under_1_5s -> cold_first_answer_under_60s
+  warm_answer_under_1s         -> warm_answer_under_30s
+  measured on 2026-08-30: cold 20.6s, warm 15.7s
+
+## Audit of "built but not wired"
+
+  registry declares 43 tools, simple mode offers 38
+  of the 30 not offered:
+    20  mutating git suite      deliberate, documented
+    15  aliases already offered (edit_file/grep_files/find_file/file_info)
+     4  docs suite              ask_docs ingest_docs search_docs summarize_docs
+     4  other                   request_scope_expansion search_index ...
+  shamsu/tools/browser.py     _tool_schema entries = 0
+  shamsu/tools/dev_server.py  _tool_schema entries = 0
+  -> browser/dev-server are a BUILD, not a wiring fix
+
+## State-triggered skills (landed concurrently, verified not duplicated)
+
+  8 appends to one file   -> large-file-surgery
+  3x same assert failure  -> qa-tester
+  2x same patch failure   -> debugger
+  a quiet turn            -> (nothing)

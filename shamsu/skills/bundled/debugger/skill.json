@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["debug", "bugfix", "diagnosis", "regression"],
+  "triggers": ["bug", "broken", "failing", "error", "crash", "traceback", "stack trace", "root cause", "debug", "regression", "not working"],
+  "applies_to": ["bug_fix", "code_edit"],
+  "allowed_tools": ["read_file", "read_symbol", "search_files", "patch_file", "run_tests", "run_command"],
+  "context_budget_tokens": 320
+}

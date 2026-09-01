@@ -4,6 +4,461 @@ All notable SHAMSU release changes are documented here.
 
 ## Unreleased
 
+### Added - check_page can use a page, not only load one (2026-08-31)
+
+Loading a page and playing one give different answers, and the harness could
+only ask the first question. `check_page(url, click="#startBtn", wait_seconds=3)`
+now clicks, waits, and reports what happened - including how much of the canvas
+is drawn on and how much of it changed while watching.
+
+No vision model is involved and none is needed: the browser reads its own pixels
+and returns two numbers, which the harness turns into a sentence. The model
+supplies a CSS selector it can read off the HTML it just wrote, and gets back
+prose. The screenshot is for the person, not the model.
+
+The measurement that made this necessary. The asteroid game of 2026-08-31 loaded
+with no console errors, a canvas with a real drawing surface, and every element
+the page promised - so every check this tool had said it was fine. Clicking START
+and playing for three seconds moved the ink from **1.22% to 1.23%**: the stars
+and the ship, and not one asteroid. The cause, which took reading the source to
+find, was that half the asteroids spawn moving away from the screen and are never
+cleaned up. Those two numbers state it outright.
+
+The numbers go in the SENTENCE, not only the data. A canvas 1.3% covered that
+changed 0.3% in three seconds passes every threshold and is still a game in which
+nothing happens - and only the model knows what it was trying to build. Hiding
+that behind a verdict is how "the page loaded and drew something" came to be the
+whole account of an asteroid game with no asteroids.
+
+A blank canvas is only called a problem once the page has been GIVEN a chance -
+clicked, or waited on. A canvas blank the instant it loads is one nothing has
+drawn to yet, which is ordinary.
+
+### Added - a turn is asked to look before its rounds run out (2026-08-31)
+
+The budget went entirely on production. That build spent all 24 rounds of both
+turns writing, ran nothing, and stopped at the ceiling - there was never a moment
+where the turn stopped adding code and asked whether any of it worked, because
+nothing suggested one.
+
+With three rounds left, a turn that has written something and run nothing is now
+told so, once, and given the calls: `run_tests`, `run_command`, or `check_page`
+with a click. A steer and not a stop - the model may reasonably spend its last
+rounds finishing a file, but it should decide that having been asked.
+
+### Added - a plan that was asked for and never written is reported (2026-08-31)
+
+`ask_for_a_plan` is a nudge and stopped there; nothing noticed when the model
+did not act on it. That build ran two turns and finished with no
+`.shamsu/contract.json` at all, so there was no Definition of Done, nothing to
+check the work against, and every verdict was computed from files and syntax
+alone. The turn reported four files changed and could not have reported anything
+else. Now noted to the user and to the run record at turn end - a note, not a
+nudge: the model has already spent the turn, and it is the NEXT message that can
+usefully be "write the contract first" instead of "continue".
+
+### Added - the harness says when the model is running from system RAM (2026-08-31)
+
+A silent failure, and the reason a session was reported as stuck. Ollama does not
+error when a model does not fit on the card: it loads what it can and runs the
+rest from system RAM, and every token then crosses that boundary.
+`looks_like_out_of_memory` only ever sees the HARD refusal, and this is not that.
+
+Measured on an 8GB card with the desktop running Chrome, Edge, VS Code, OBS, Word
+and Telegram: **7,632 MiB of 8,188 in use**, `qwen3.5:9b` resident at 6.8GB with
+5.5GB on the GPU, and a single model call that took **536 seconds**. SHAMSU said
+nothing, so from outside it looked like a hang - and the first question asked was
+whether it was stuck.
+
+`/api/ps` reports `size` against `size_vram`; the turn now checks once and says
+so, naming the two things that fix it. 256MB of overhang is ignored, because a
+warning that fires on a small one is a warning that gets ignored; a `size_vram`
+of 0 is a machine with no GPU rather than a spill.
+
+### Fixed - two defects the first live run of check_page found (2026-08-31)
+
+`F:oice-demo`, an asteroid game, on the day `check_page` shipped. The build
+worked - the page loads, the canvas draws, no console errors - and the run still
+turned up two things.
+
+**A server that was still binding was reported as a broken page.** The agent
+started `python -m http.server 8000`, called `check_page` seconds later and got
+`net::ERR_EMPTY_RESPONSE`; `curl` fetched the same URL ten seconds on. That is
+the most expensive answer this tool can give - it tells the model to go and fix
+working code - and it sent the model back to `curl`, which can say a page was
+served but nothing about whether it renders.
+
+Connection-level failures (`ERR_EMPTY_RESPONSE`, `ERR_CONNECTION_REFUSED`,
+`ERR_CONNECTION_RESET`, ...) are now retried three times over ~3s. A real failure
+- `ERR_NAME_NOT_RESOLVED`, a timeout, a denied approval - still fails at once,
+three seconds sooner than a retry would allow. Approval is asked ONCE across the
+retries: a retry is the same decision, and prompting three times per check is how
+a capability becomes unusable.
+
+**A command that died on the way up was logged as a started server.**
+`command.detached` was written unconditionally, so `cd /workspace && python -m
+http.server 8000` - a Linux path that exits 1 on Windows - was recorded as
+"Started in the background" with `exit_code: 1`. Nothing leaked; the registry
+correctly forgets a process that exits. But the session log showed two servers on
+port 8000 when there had only ever been one, which is a false record of exactly
+the kind that makes a later reader diagnose the wrong thing. `_run_command_
+detached` now reports whether it stayed up, and a command that did not is logged
+as `command.failed`.
+
+### Note - what that run got right (2026-08-31)
+
+Recorded because it is the first evidence any of this week's work helps.
+
+`use_skill(planner)` was called by the model once, and the harness INJECTED a
+situation-matched skill twice more on top of it, triggered by a five-append chain
+into one file - the mechanism that existed to fire exactly there. The write
+guards held: an 18.5KB whole-file rewrite refused, a `delete_file` on a file the
+model could not edit refused twice, and after all of that the model read the file
+and patched it successfully. That sequence - destructive shortcut refused, model
+finds the right route - is the behaviour the guards were written for, observed
+end to end for the first time.
+
+### Added - check_page: the tool the model invented because it did not exist (2026-08-31)
+
+Live 2026-08-31 in `F:oice-demo`, building a browser game, the model called
+`verify_web_app` repeatedly - a name that has never existed anywhere in this
+codebase - got "There is no tool called verify_web_app" every time, and then told
+the user:
+
+    "verify_web_app keeps reporting 'no canvas found' even though the game runs
+     successfully... an environment limitation where the browser tool cannot
+     properly detect WebGL canvases."
+
+None of that happened. It invented the tool, invented its output, and skipped
+twelve contract assertions on the strength of the invention.
+
+It was reaching for something real. `BrowserTool` has existed for weeks, with a
+passing test that drives actual Chromium and captures console output and a
+screenshot - and **zero `_tool_schema` entries**. It was never made into an agent
+tool, so for any browser project the contract's `BY_RUN` evidence was unreachable
+by construction and `contract_assert_skip` was the only exit available.
+
+`check_page(url)` loads the page in a real browser and reports what happened:
+console errors and uncaught exceptions, which elements rendered, whether a canvas
+has an actual drawing surface, the visible text, and a screenshot. It answers the
+three failures that look identical from outside - a page that throws, a page that
+renders nothing, and a canvas that is present in the DOM at 0x0 and therefore
+invisible.
+
+One tool rather than six. `open`/`click`/`type_text`/`read`/`screenshot` is a
+driving API for something with a plan; what a coding agent needs after writing a
+page is one question - did it load, did it draw, did it throw - and one answer it
+can put in a contract.
+
+**Local pages do not ask.** A prompt per check is what would have made this
+unusable in the place it is needed, and loading a page the agent just served,
+headlessly, on this machine, is the same kind of act as reading a file it just
+wrote. `localhost`, `127.0.0.1` and `file:` go through; anything else is network
+egress and still asks, which is the same line `_web_is_reachable` draws for the
+web tools.
+
+Verified against the real asteroid game from that session: `The page loaded and
+drew something` - canvas 1, buttons 6, h1 3, canvas_drawn true, no console
+errors. Fifteen tests drive real Chromium against real files, because there is no
+point mocking the thing whose entire job is to report what a real browser did.
+
+Two existing tests caught the integration and are why this is wired properly:
+`check_page` had no routing category (so narrowing could never offer it) and was
+not in the non-registry set (so the argument probe sent it to a registry that has
+no browser).
+
+### Fixed - the turn verdict says what the turn cost (2026-08-31)
+
+`done in 8m12s - 4 files changed` was the whole account of a turn whose only
+contract assertion had sat `pending` since the first minute, in which the loop
+had corrected the model ten times - five of them on one stuck file - and which
+had thrown seventeen tool payloads out of the window to make room. Every one of
+those numbers was measured and none of them reached the line anyone reads.
+
+The verdict now carries three more: outstanding contract checks, how many times
+the harness had to steer, and how often the context was trimmed. A plain
+question-and-answer turn is unchanged - `done in 12s` - because none of the
+three fire on one.
+
+Counting the corrections needed a seam: thirteen places called
+`state.append_user(..., origin=ORIGIN_LOOP)` directly, so the number existed
+only as however many of them had run. They now go through `_steer`.
+
+### Fixed - cross-file checks reached three suffixes out of ten (2026-08-31)
+
+`_cross_file_problems` gated on `{".html", ".htm", ".js"}` while `verify.wiring`
+has handled `.py`, `.ts`, `.tsx`, `.jsx`, `.vue`, `.svelte`, `.sql` and
+`.prisma` for months. Every Python and TypeScript project therefore got per-file
+syntax checks and nothing else - no duplicate declaration, no missing asset, no
+frontend call with no backend route behind it. The gate now reads the suffix set
+from the verifier rather than restating it, so the two cannot drift again.
+
+### Fixed - three surfaces built the same loop three ways (2026-08-31)
+
+**Telegram skipped the shared approval wiring.** It built `AgentToolRegistry`
+directly, so `make_approval_func` never wrapped it - and the registry raises an
+`ApprovalRequest` for every file write, which the broker turns into a card with
+a 900-second timeout. A turn writing three files could spend its whole budget
+waiting for taps the CLI never asks for, because the sandbox has already fenced
+those writes. It also meant `get_approval_override()` was never consulted, which
+is the omission that took `run_command_verify` from 3/3 to 0/3 on the CLI. Simple
+mode now goes through `build_simple_tools`; the legacy branch keeps its own
+registry, because `make_approval_func` encodes simple mode's policy specifically.
+
+**The web runner passed no ledger.** A turn started in the browser or from the
+remote queue journalled no mutations, so there was nothing for `/undo` to undo
+and nothing in `/runs`. It now starts a run like the CLI and Telegram do.
+
+### Changed - sampling is decided here, not by the server (2026-08-31)
+
+The request carried `temperature`, `num_ctx`, `num_predict` and `num_keep`, and
+let `top_p`, `top_k` and `repeat_penalty` fall through to whatever Ollama
+defaults to. Two costs: a benchmark that moves when a default changes cannot
+attribute a delta to this repo, and `repeat_penalty` defaults to 1.1 applied to
+CODE - where the tokens a repetition penalty punishes are the tokens source is
+made of. Pinned, with `repeat_penalty` at 1.0. The actual repetition failure - a
+model repeating a whole wrong answer - is already handled by
+`adapted_temperature` and `IDENTICAL_FAILURES_BEFORE_REFUSING`.
+
+### Fixed - the release gate could never go green (2026-08-31)
+
+`cold_first_answer_under_1_5s` and `warm_answer_under_1s` bound a turn that
+calls a local LLM. No local model answers in 1.5 seconds, so the gate reported
+FAIL on every stack on every run - and was red while five real defects sat
+behind it. Re-based to 60s cold and 30s warm, which still catch a harness that
+has started thrashing without failing on physics.
+
+### Fixed - one hung test could take the suite with it (2026-08-31)
+
+`pytest-timeout` was not installed and no ceiling was set.
+`test_command_runner_installs_only_through_created_project_venv` creates a real
+venv and runs ensurepip; it normally takes 12s and once wedged at 0% CPU for 35
+minutes with the whole run stuck behind it. 300s per test, `thread` method
+because signal-based timeouts do not fire on Windows.
+
+### Changed - the file skeleton is computed once, not twice a round (2026-08-31)
+
+`_messages` and `_fixed_overhead` both want it and both run every round, so up
+to twelve files were parsed twice a round - 0.73s cold, 0.036s warm on an
+80-file project, ~1.7s a turn, on the event loop. Memoised on the file list
+rather than per turn, so a turn that writes a new file still gets a fresh answer.
+
+### Fixed - a background server outlived the session that started it (2026-08-31)
+
+Measured in `F:oice-demo`: `python -m http.server 8000`, started at 06:19 by a
+session that ended at 01:59, was still listening on port 8000 at 08:20. Two
+processes, one port, two hours after anything was using them.
+
+The cleanup existed and was correctly written - a `_DETACHED` registry and a
+`_reap_detached` that kills the whole process tree. It had two holes, and both
+of them are the same hole.
+
+**`atexit` was its only trigger.** That runs on a clean interpreter exit. It does
+not run when a console window is closed, when the process is killed, or when it
+crashes - which are the ordinary ways a terminal session ends on Windows.
+
+**The registry lived in memory.** Nothing was written down, so the moment the
+process was gone the server could not be found again by anything: the only trace
+on disk was a log named `<timestamp>-<hash>.log`, which does not name the
+process. Nothing outside `executor.py` could even see the registry, so there was
+no way to list a stray, no sweep on startup, and no command to stop one.
+
+Now each background process gets `.shamsu/processes/<pid>.json` - command, cwd,
+port, log, start time - written BEFORE the readiness wait, so a crash during
+those twelve seconds still leaves it findable. Opening a workspace sweeps that
+directory, forgets the dead, and reports the live ones rather than killing them:
+a server someone deliberately left up is a normal thing to come back to, and
+taking it out from under them would be its own failure. What was missing was
+ever being told.
+
+`/processes` lists them, `/processes stop <pid>` and `/processes stop all` end
+them, and `_kill_pid_tree` does it from a bare pid because a process stranded by
+a previous session has no `Popen` handle - which is precisely the case the
+on-disk record exists to serve.
+
+`dev_server.py` has kept a proper record all along (`.shamsu/dev-servers.json`,
+with liveness checks and duplicate detection). It is simply not on the path
+`run_command` takes, which is the path every `npm run dev` actually goes down -
+the same shape as the browser tools, built and not wired to the path that runs.
+
+### Fixed - three defects one live session exposed (2026-08-31)
+
+`F:oice-demo`, five turns, two hours, a game that showed the victory screen
+the moment you pressed Start. Every guard in the harness fired correctly and the
+run still failed, which makes it the most useful session recorded here.
+
+**The contract was void from the first minute.** `contract_create` was called
+with `assertions` as a printed Python list - one string, single-quoted - in a
+field the schema declares as an array. Nothing rejected it, so the contract was
+created with ONE assertion whose text was the whole blob: eight requirements
+collapsed into a single unsatisfiable claim that stayed `pending` all session.
+The Definition of Done is the harness's only answer to "did it do what was
+asked", and it was inert before the first file was written. Nothing later could
+have noticed - a contract with one pending assertion looks exactly like a
+contract with one pending assertion.
+
+`normalize_arguments` now recovers a printed list, trying JSON and then Python's
+own literal syntax (the model wrote single quotes, which JSON will not read).
+Applied to `contract_create`, `contract_from_plan`, `ask_user.options` and
+`memory_remember.tags` - the same mistake reaches all four, and a fix per tool
+is four chances to fix three of them. A string that is not a printed list is
+untouched, so a single assertion sent as plain text still works.
+
+**A correct diagnosis nobody could act on.** The wiring verifier found the
+duplicate `SoundManager` across `game.js` and `sounds.js` and reported it four
+times. The model answered with twenty-six refused edits - seventeen
+`patch_file`, nine `replace_symbol`, every refusal correct - and four turns
+ending on "I tried 4 edits in a row that changed nothing".
+
+The message named the fault and never the next call, which is the one lesson
+this project keeps relearning: naming the exact call took 42s where vague
+guidance cost 674s and a failure. It now says which copy to delete, with which
+tool, and which file must load first - and says not to edit both copies to
+match, since two copies IS the fault.
+
+**A file written and never loaded.** Asked to split the JS into parts, the agent
+wrote `sounds.js` - 74 lines, correct, parsing - and left `index.html` loading
+`game.js` alone. Nothing 404s and nothing throws; the file simply never runs and
+the feature it holds is silently absent. `missing_asset` catches a `<script src>`
+pointing at nothing; the new `unreferenced_script` catches the reverse, which is
+the more expensive direction because it is silent. Quiet for bundler projects, a
+page with no scripts, and any workspace with no HTML - none of those owe a file
+a script tag.
+
+### Fixed - a skill trigger is a word, not a substring (2026-08-31)
+
+The matcher added earlier the same day used `phrase in text`, so `ui` matched the
+middle of "b**ui**ld": "Let's build an asteroid game with multiple levels and
+sound effects" scored `ui-designer` at 3.0 and would have injected a page-layout
+skill into a game build. `test` matches "la**test**" the same way. Matching is on
+word boundaries now, with `re.escape`, because a trigger is author-supplied text
+rather than a pattern and one containing `c++` must match itself.
+
+Caught by running the new matcher against the real prompts from the session
+above - it had passed its own unit tests, which used triggers that happened not
+to collide.
+
+### Fixed - one context window, and budgets that follow it (2026-08-31)
+
+A window is a VRAM reservation every call in the process has to agree on, and
+three places were free to disagree about it.
+
+**A window set from inside SHAMSU reached the chat call and nothing else.**
+`shared_num_ctx` read `SHAMSU_CHAT_MAX_CTX` and the per-model table;
+`simple_chat.max_ctx` read the environment AND `settings.json`. So `/context
+window 16384` applied to the chat and not to memory, summaries or health
+checks - and Ollama reloads a ~6GB model whenever `num_ctx` changes. Found live:
+a saved `chat_max_ctx` of **32786**, one key away from 32768, against a manager
+asking for 32768. The precedence now lives once, in `budget.chat_ctx_ceiling`,
+and both readers call it.
+
+**`/context window 32k` computed 32024.** The `k` suffix was
+`.replace("k", "024")` - string surgery wearing arithmetic's clothes, correct
+for `1k` and wrong for every other value. `4k` became 4024, below the floor, and
+was refused with a message about 4096. It is arithmetic now, any input snaps to
+one of the four offered windows and says so, a window past what the model holds
+is refused, and the argument completes from a dropdown that shows what each one
+costs. You cannot type 32786 any more.
+
+**Three budgets ignored the window the session actually had.** `_budgeted` -
+which caps every tool result in the system - called `tool_result_budget()` with
+no ceiling, so it always used the install-wide maximum: on a session walked down
+to 8k by `_shrink_for_oom`, one tool result was allowed 8,000 tokens, 98% of the
+context. Same for the rolling digest and the file skeletons. The function has
+taken a `ceiling` parameter since it stopped being a flat number - its own
+comment says why, "97.7% of an 8k window" - and the one call site that mattered
+never passed it. All three now take `self._ceiling()`, and every budget is a
+share of the live window at every size.
+
+### Added - limits you can change without a restart (2026-08-31)
+
+`max_rounds`, `turn_budget_s` and `approval_timeout_s` join `settings.json`
+behind a new `/set` command, with the same env > settings > default precedence
+the context window uses and the same completion treatment. `max_rounds` was
+previously reachable only by editing the source.
+
+Deliberately ceilings and NOT shares: `tool_result_budget` and the skeleton
+ratio stay fractions of the live window, because a share follows a window that
+moves and an absolute number does not - which is the defect fixed above.
+
+### Changed - the model's own limits come from the server (2026-08-31)
+
+`MODEL_CONTEXT_WINDOWS` is thirty hand-written entries and `qwen3:8b` was listed
+at 32,768 when it really holds 40,960. `gemma3:4b` reports no tool-calling
+capability at all, which a table of window sizes cannot express - so a model
+that cannot call a tool was being sent 37 schemas, ~4,300 tokens of a window it
+then had to answer in. Ollama reports both on `/api/tags`.
+
+Cached, refreshed in the background, never fetched on the hot path
+(`ctx_window_for_model` runs inside `_ceiling()`, every round). The table is the
+offline fallback and a dead server keeps the last good answer. The 32k VRAM cap
+stays on top of whatever the server says: that is a hardware decision.
+
+### Fixed - four capabilities that only existed if the model thought of them (2026-08-31)
+
+The same finding as 2026-08-29, in the four places it survived.
+
+**Skills were never used.** `use_skill` was called ZERO times across every
+session logged - the index shipped in every prompt and the capability was
+reachable only by a judgment call a 7B does not make. The harness now matches
+one skill to the request and injects it, the way `render_memory` has always put
+memory back without being asked. One skill, never a shelf: specific triggers
+outscore general ones, so `developer` cannot win every coding request by breadth,
+and a single bare verb is below the threshold entirely.
+
+**The graph never got built.** `_refresh_code_graph` refreshed an existing graph
+and returned early otherwise, and nothing else under `shamsu/agents/` indexed
+anything - so the tools stayed withheld forever on any workspace nobody had
+indexed by hand. It now builds the first one too, only on a turn that wrote
+something, only where the indexer is installed, and `index_workspace` still
+refuses a disposable directory on its own.
+
+**The prompt named tools it had not been given.** Two probes for one capability:
+the `graph` section was gated on the MCP binary being healthy while the schemas
+were gated on the workspace being indexed. The binary is installed almost
+always and the workspace indexed almost never, so `graph_search` was advertised
+on nearly every turn and sent on nearly none - smallcode issue #58, which every
+conditional section in that file exists to prevent. `recall` had it too, naming
+three tools withheld on a fresh workspace. Both now read the same
+`available_tool_families` the roster does.
+
+**And narrowing could withhold what the prompt promises.** The general form of
+the same bug: the system prompt heads the KV prefix so it cannot change per
+message, which means everything it names is named on every turn - including
+turns the scorer narrowed. `plan how you would change it` lost `write_file`,
+`patch_file`, `replace_symbol` and `append_file` while the prompt went on
+describing all four, and every category but `write` lost `memory_remember` and
+`contract_create`. A floor of ten prompt-named tools is now put back after
+narrowing. Whatever the prompt promises, the roster keeps.
+
+### Changed - the contract tools are charged for when they can act (2026-08-31)
+
+Five of the six contract tools need a contract to act on, and 515 tokens of
+schema describing operations on a thing that does not exist shipped on every
+first turn of every build. They join `CONDITIONAL_TOOL_FAMILIES`, gated on
+`.shamsu/contract.json`. `contract_create` and `contract_from_plan` are
+deliberately NOT gated - they are how a contract comes to exist, and gating them
+on one existing is the bootstrap trap the family is otherwise the cure for.
+
+The system prompt splits to match, so the assert tools are described only once
+there is a contract to assert against. Net on a fresh workspace: the prompt drops
+from 594 to 526 tokens and the roster from 3,399 to 3,000.
+
+### Added - the eval suite draws the same samples twice (2026-08-31)
+
+There was no seed anywhere in `evals/harness.py`. Every benchmark this project
+has produced carries FLAKY rows and `BENCHMARK.md` has to warn its own readers
+not to read a delta by eye, because two runs of the same suite over the same
+code sampled different tokens - a 3/7 against a 5/7 could be a fix, a
+regression, or nothing.
+
+Each attempt now gets a seed derived from the case NAME and the sample index, so
+a re-run draws the same seven attempts and a difference between two runs is a
+difference in the code. Variance ACROSS the seven is untouched, which is the
+point of running seven. Derived from the name rather than the position so adding
+a case does not silently re-roll every case after it. `SHAMSU_EVAL_SEEDED=0`
+measures the old way.
+
 ### Note - what the write-roster fix does and does not explain (2026-08-29)
 
 Recorded because the first account of it was wrong, and the correction matters

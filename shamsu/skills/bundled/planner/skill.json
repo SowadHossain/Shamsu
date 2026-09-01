@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["planning", "design", "breakdown", "roadmap"],
+  "triggers": ["plan", "break down", "break it down", "steps", "roadmap", "approach", "architecture", "design the", "how should we", "where do i start"],
+  "applies_to": ["generate", "planning"],
+  "allowed_tools": ["read_file", "search_files", "list_files", "write_file", "contract_create"],
+  "context_budget_tokens": 320
+}

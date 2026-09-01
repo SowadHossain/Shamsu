@@ -1,0 +1,42 @@
+# 2026-08-31 - check_page
+
+Full suite: 4327 passed, 2 skipped, 0 failed in 448.83s
+tests/test_page_check.py: 15 passed (real Chromium)
+
+## Against the real game from the voice-demo session
+
+  ok      : True
+  message : The page loaded and drew something.
+  title   : Asteroid Game
+  elements: {'canvas': 1, 'button': 6, 'h1': 3}
+  canvas drawn: True
+  console : []
+  shot    : True
+
+## The three failures it exists to catch
+
+  0x0 canvas        -> ok=False  "a canvas element exists but its drawing surface is 0x0"
+  script throws     -> ok=False  "1 console error(s)", error text preserved
+  nothing rendered  -> ok=False  "the page rendered no text and no canvas"
+  dead url          -> ok=False  clean message, no traceback
+
+## Approval
+
+  True   http://localhost:8000
+  True   http://127.0.0.1:3000/x
+  True   file:///c:/a.html
+  False  https://example.com
+  False  http://192.168.1.5:8000
+  False  ftp://x
+
+## Integration gaps caught by EXISTING tests
+
+  test_every_offered_tool_is_reachable_from_some_category
+    -> check_page had no routing category; narrowing could never offer it
+  test_every_tool_schema_argument_survives_normalisation
+    -> check_page was not in _NON_REGISTRY_TOOLS, so the probe sent it to a
+       registry with no browser ("Unknown tool: check_page")
+
+## Cost
+
+  schema: 135 tokens

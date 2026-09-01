@@ -69,6 +69,22 @@ VOICE_MIN_RECORD_SECONDS = 0.75
 #: entirely and the telemetry falls back to the bottom toolbar, because a
 #: 28-column pane out of 70 leaves the log unreadable.
 SIDEBAR_WIDTH = 30
+
+#: One glyph, then the gap that separates the icon column from the text
+#: column. Every kind of line - a prompt, an answer, a tool row, an activity
+#: line - puts its mark in column 0 and its text in column 3, so the marks
+#: form a column of their own and no text ever lands in it. Widening this
+#: widens the gap everywhere at once.
+#:
+#: `turn_render.ICON_COLUMN` is the same number on the renderer's side, and
+#: `test_the_icon_column_is_the_same_width_on_both_sides` holds them equal.
+#: Rich pads what it renders to
+#: the full console width, so a console given the PANE's width produces lines
+#: that are already full before the gutter is prepended - and each one then
+#: wraps, putting a near-empty continuation row under every line of every
+#: answer. The console is given `content_width()` for that reason.
+#: `test_every_gutter_is_the_width_the_console_reserves` keeps the two in step.
+GUTTER_WIDTH = 3
 MIN_WIDTH_FOR_SIDEBAR = 90
 
 
@@ -94,20 +110,31 @@ KIND_APPROVAL = "approval"
 #: portal and Telegram, and "who asked for this?" is otherwise unanswerable
 #: from the log.
 PROMPT_SURFACES: dict[str, tuple[str, str, str]] = {
-    "cli": ("› ", "class:kind.cli.mark", "class:kind.cli"),
-    "web": ("◈ ", "class:kind.web.mark", "class:kind.web"),
-    "telegram": ("✈ ", "class:kind.telegram.mark", "class:kind.telegram"),
+    "cli": ("›  ", "class:kind.cli.mark", "class:kind.cli"),
+    "web": ("◈  ", "class:kind.web.mark", "class:kind.web"),
+    "telegram": ("✈  ", "class:kind.telegram.mark", "class:kind.telegram"),
 }
-UNKNOWN_SURFACE = ("? ", "class:kind.other.mark", "class:kind.other")
+UNKNOWN_SURFACE = ("?  ", "class:kind.other.mark", "class:kind.other")
 
 #: The non-prompt kinds. `log` is deliberately blank - it is the default, it
 #: arrives already coloured by rich, and marking every action row would put a
 #: gutter on 95% of the pane.
 LINE_KINDS: dict[str, tuple[str, str, str]] = {
     KIND_LOG: ("", "", ""),
-    KIND_ANSWER: ("◆ ", "class:kind.answer.mark", "class:kind.answer"),
-    KIND_NOTICE: ("· ", "class:kind.notice", "class:kind.notice"),
-    KIND_APPROVAL: ("┃ ", "class:kind.approval.mark", "class:kind.approval"),
+    KIND_ANSWER: ("◆  ", "class:kind.answer.mark", "class:kind.answer"),
+    KIND_NOTICE: ("·  ", "class:kind.notice", "class:kind.notice"),
+    KIND_APPROVAL: ("┃  ", "class:kind.approval.mark", "class:kind.approval"),
+}
+
+#: What a kind's SECOND and later lines carry. An answer is a block - twenty
+#: lines of it were twenty ◆, which stops reading as a mark and starts reading
+#: as noise. The diamond now opens the answer and a thin rule carries it, so
+#: the block's extent is still visible with the colour stripped out (which was
+#: the reason for marking every row in the first place) without the repetition.
+#: A kind absent here repeats its own mark, which is right for the approval
+#: bar and costs nothing for the single-line kinds.
+CONTINUATION_MARKS: dict[str, str] = {
+    KIND_ANSWER: "│  ",
 }
 
 
@@ -244,19 +271,33 @@ def wrap_line(
 class _Decorated:
     """Sets the pane's line decoration for the length of a `with` block."""
 
-    def __init__(self, pane: Any, gutter: str, gutter_style: str, style: str) -> None:
+    def __init__(
+        self,
+        pane: Any,
+        gutter: str,
+        gutter_style: str,
+        style: str,
+        continuation: str = "",
+    ) -> None:
         self._pane = pane
         self._new = (gutter, gutter_style, style)
+        self._continuation = continuation
         self._old = ("", "", "")
+        self._old_continuation = ""
 
     def __enter__(self) -> Any:
         pane = self._pane
         self._old = (pane._gutter, pane._gutter_style, pane._style)
+        self._old_continuation = pane._continuation
         # Close whatever half-line is open first, or it inherits the new mark.
         if pane._partial:
             pane._append_logical(pane._partial)
             pane._partial = []
         pane._gutter, pane._gutter_style, pane._style = self._new
+        pane._continuation = self._continuation
+        # A fresh block always opens with its own mark, never with the rule
+        # left over from the last one.
+        pane._opened = False
         return pane
 
     def __exit__(self, *_exc: object) -> None:
@@ -265,6 +306,8 @@ class _Decorated:
             pane._append_logical(pane._partial)
             pane._partial = []
         pane._gutter, pane._gutter_style, pane._style = self._old
+        pane._continuation = self._old_continuation
+        pane._opened = False
 
 
 class LogPane:
@@ -292,6 +335,10 @@ class LogPane:
         self._gutter = ""
         self._gutter_style = ""
         self._style = ""
+        #: What the CURRENT block's second and later lines carry, and whether
+        #: its first line has been written yet.
+        self._continuation = ""
+        self._opened = False
 
     # -- intake ------------------------------------------------------------
 
@@ -316,7 +363,9 @@ class LogPane:
         if self.follow:
             self.to_end()
 
-    def decorate_as(self, gutter: str, gutter_style: str, style: str) -> Any:
+    def decorate_as(
+        self, gutter: str, gutter_style: str, style: str, continuation: str = ""
+    ) -> Any:
         """Mark every line written inside this block as one KIND.
 
         A context manager rather than an argument on `write`, because the
@@ -324,13 +373,15 @@ class LogPane:
         never heard of a pane - the whole point of redirecting the console was
         that a hundred call sites did not have to learn about the frame.
         """
-        return _Decorated(self, gutter, gutter_style, style)
+        return _Decorated(self, gutter, gutter_style, style, continuation)
 
     def _decorate(self, line: list[tuple[str, str]]) -> list[tuple[str, str]]:
         if self._style:
             line = [(style or self._style, text) for style, text in line]
         if self._gutter:
-            line = [(self._gutter_style, self._gutter), *line]
+            mark = self._gutter if not self._opened else (self._continuation or self._gutter)
+            self._opened = True
+            line = [(self._gutter_style, mark), *line]
         return line
 
     def _append_logical(self, line: list[tuple[str, str]]) -> None:
@@ -362,7 +413,9 @@ class LogPane:
     def write_as(self, text: str, kind: str) -> None:
         """Write a block already known to be one kind - a prompt, an answer."""
         gutter, gutter_style, style = LINE_KINDS.get(kind, LINE_KINDS[KIND_LOG])
-        with self.decorate_as(gutter, gutter_style, style):
+        with self.decorate_as(
+            gutter, gutter_style, style, CONTINUATION_MARKS.get(kind, "")
+        ):
             self.write(text if text.endswith(chr(10)) else text + chr(10))
 
     def write_prompt(self, text: str, surface: str) -> None:
@@ -370,6 +423,23 @@ class LogPane:
         gutter, gutter_style, style = prompt_decoration(surface)
         with self.decorate_as(gutter, gutter_style, style):
             self.write(text if text.endswith(chr(10)) else text + chr(10))
+
+    def separate(self) -> None:
+        """One blank row, unless the pane already ends in one.
+
+        Idempotent because the callers are: a turn that printed nothing but
+        its answer must not open with two empty rows, and a turn interrupted
+        and resumed calls this twice.
+        """
+        if self._partial:
+            self._append_logical(self._partial)
+            self._partial = []
+        if not self._logical:
+            return
+        last = self._logical[-1]
+        if not "".join(text for _style, text in last).strip():
+            return
+        self._append_logical([])
 
     def clear(self) -> None:
         self._logical.clear()
@@ -980,6 +1050,18 @@ class TuiApp:
         self._voice_output: Any = None
         self._voice_state = ""
         self._voice_started = 0.0
+        #: Set only by `_voice_transcribed`, cleared by anything typed and by
+        #: the reply it belongs to. A spoken answer is the answer to something
+        #: SAID here - not to a typed prompt, and not to a turn that a phone
+        #: or a browser started and this terminal is merely watching.
+        self._voice_reply_armed = False
+        #: Whether a reply is being spoken RIGHT NOW. Set on the voice thread
+        #: and read while painting, so the status bar can offer the key that
+        #: stops it only while there is something to stop.
+        self._speaking = False
+        #: The rich console whose output is redirected into this pane, held so
+        #: its width can follow a resize. Set by `_start_frame`.
+        self._output_console: Any = None
 
         #: `None`, or the question this frame is currently holding. While it
         #: is set the input box stops taking text and single keys answer
@@ -1076,8 +1158,27 @@ class TuiApp:
             return 100
 
     def output_width(self) -> int:
+        """How wide the pane is, gutter included."""
         width = self._terminal_width()
         return max(20, width - (SIDEBAR_WIDTH if self._sidebar_fits() else 0))
+
+    def content_width(self) -> int:
+        """How wide a LINE may be. What the rich console must be set to."""
+        return max(10, self.output_width() - GUTTER_WIDTH)
+
+    def _sync_console_width(self) -> None:
+        """Keep the redirected console in step with the pane.
+
+        Set once when the frame starts, it went stale the first time anyone
+        resized the terminal - and a console wider than the pane wraps every
+        answer, which is the same defect arriving by a different route.
+        """
+        console = self._output_console
+        if console is None:
+            return
+        wanted = self.content_width()
+        if console.width != wanted:
+            console.width = wanted
 
     def _output_height(self) -> int:
         try:
@@ -1087,6 +1188,7 @@ class TuiApp:
 
     def _output_fragments(self) -> list[tuple]:
         self.pane.set_width(self.output_width())
+        self._sync_console_width()
         return self.pane.visible(self._output_height(), self._wheel)
 
     def _sidebar_fragments(self) -> list[tuple[str, str]]:
@@ -1120,6 +1222,10 @@ class TuiApp:
         elif self._voice_state == "transcribing":
             mode, mode_style = " TRANSCRIBING ", "class:tui.status.busy"
             keys = " Whisper is listening back "
+        elif self._speaking:
+            # Offered only while there is something to stop. A key hint for a
+            # key that does nothing is how the approval menu went wrong.
+            keys = " F6 skip the voice · PgUp/PgDn scroll · ^C stop "
 
         pending = self._approval
         if pending is not None:
@@ -1160,6 +1266,7 @@ class TuiApp:
     def _accept(self, buffer: Any) -> bool:
         text = buffer.text
         buffer.reset(append_to_history=True)
+        self._voice_reply_armed = False
         if text.strip():
             try:
                 self._on_submit(text)
@@ -1237,6 +1344,7 @@ class TuiApp:
             self.echo("voice input failed: Whisper did not hear any English speech.", KIND_NOTICE)
             return
         self.echo(f'Heard: "{text}"', KIND_NOTICE)
+        self._voice_reply_armed = True
         try:
             self._on_submit(text)
         except Exception as exc:  # noqa: BLE001
@@ -1275,17 +1383,40 @@ class TuiApp:
         body = str(text or "").strip()
         if not body:
             return
+        # Consumed whether or not we end up speaking: one spoken prompt earns
+        # one spoken reply, and a turn that answers silently must not leave the
+        # flag standing for whatever the user types next.
+        voice_input = self._voice_reply_armed
+        self._voice_reply_armed = False
+        if not self._reply_should_be_spoken(voice_input=voice_input):
+            return
 
         def work() -> None:
             try:
                 speaker = self._ensure_voice_output()
+                self._speaking = True
+                self._post_from_voice_thread(self.invalidate)
                 speaker.speak(body)
             except Exception as exc:  # noqa: BLE001
                 self._post_from_voice_thread(lambda exc=exc: self.echo(f"voice output failed: {exc}", KIND_NOTICE))
+            finally:
+                # In a `finally`: a playback error must not leave the frame
+                # believing it is still speaking, offering a key that stops
+                # nothing for the rest of the session.
+                self._speaking = False
+                self._post_from_voice_thread(self.invalidate)
 
         import threading
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _reply_should_be_spoken(self, *, voice_input: bool) -> bool:
+        from shamsu.voice.speech import reply_should_be_spoken
+
+        try:
+            return reply_should_be_spoken(voice_input=voice_input)
+        except Exception:  # noqa: BLE001 - a settings read must not eat a reply
+            return False
 
     def _ensure_voice_output(self) -> Any:
         if self._voice_output is None:
@@ -1296,6 +1427,20 @@ class TuiApp:
 
                 self._voice_output = SpeechPlayer()
         return self._voice_output
+
+    def _skip_speech(self) -> None:
+        """Shut it up, without turning voice off.
+
+        Separate from `SHAMSU_VOICE_OUTPUT=off`, which is the setting: this is
+        the key you press when the answer is spoken, you have already read it,
+        and you want the next thing to happen now. The reply stays in the pane
+        - only the audio is dropped.
+        """
+        if not self._speaking:
+            self.echo("voice: nothing is being spoken", KIND_NOTICE)
+            return
+        self._stop_voice_output()
+        self.echo("voice: skipped", KIND_NOTICE)
 
     def _stop_voice_output(self) -> None:
         speaker = self._voice_output
@@ -1481,6 +1626,10 @@ class TuiApp:
         def _(_event) -> None:
             self._start_voice_recording()
 
+        @keys.add("f6")
+        def _(_event) -> None:
+            self._skip_speech()
+
         @keys.add("c-space")
         @keys.add("f5")
         def _(_event) -> None:
@@ -1524,6 +1673,11 @@ class TuiApp:
 
     # -- handing the terminal back -----------------------------------------
 
+    def adopt_console(self, console: Any) -> None:
+        """Take responsibility for this console's width while the frame is up."""
+        self._output_console = console
+        self._sync_console_width()
+
     def echo(self, text: str, kind: str = KIND_NOTICE) -> None:
         """Put a line into the pane directly, without going through rich."""
         self.pane.write_as(text, kind)
@@ -1541,8 +1695,15 @@ class TuiApp:
         answer is the thing you scroll back to find, and it used to be
         indistinguishable from the forty action rows above it.
         """
+        # One blank row between the last action and the answer. Without it the
+        # reply begins on the line directly under a tool row and the eye has
+        # nothing to catch: the mark changes, but marks are two columns wide
+        # and the text runs on at the same indent.
+        self.pane.separate()
         gutter, gutter_style, style = LINE_KINDS[KIND_ANSWER]
-        return self.pane.decorate_as(gutter, gutter_style, style)
+        return self.pane.decorate_as(
+            gutter, gutter_style, style, CONTINUATION_MARKS.get(KIND_ANSWER, "")
+        )
 
     def absorb_for_display(self, event: Any) -> None:
         """Show a turn that started somewhere ELSE in this pane.

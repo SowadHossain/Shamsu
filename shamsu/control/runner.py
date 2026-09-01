@@ -229,19 +229,34 @@ class QueuedRunner:
             session_id=session_id,
             should_stop=self._stopping.is_set,
         )
+        # The ledger, which this surface did without. Every mutation a turn
+        # makes is journalled through it - with hashes, and with the backup that
+        # makes `/undo` possible - so a turn started in the browser or on the
+        # phone was previously unrecoverable and invisible to `/runs`. The CLI
+        # has passed one since simple mode shipped; this is the same wiring.
+        from shamsu.action_ledger.ledger import start_run
+
+        ledger = start_run(workspace, item.text, session_logger=logger, source=self.surface)
         tools = build_simple_tools(
             workspace,
             main_loop=None,
             console_approval=approve,
             session_logger=logger,
+            action_ledger=ledger,
         )
+        from shamsu.agents.simple_feedback import RunControlFeedback
+
         loop = SimpleChatLoop(
             workspace,
             client=_default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig()),
             tools=tools,
             session_logger=logger,
+            action_ledger=ledger,
             emit=stream.publish,
             source=self.surface,
+            # Same wire as Telegram and the CLI: a steer sent while this turn
+            # runs must reach the turn, not just be acknowledged at it.
+            feedback=RunControlFeedback(ledger.run_id),
         )
         result = asyncio.run(loop.run(item.text))
         return result.final

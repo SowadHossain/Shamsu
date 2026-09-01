@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "tags": ["review", "critique", "quality", "audit"],
+  "triggers": ["review", "critique", "code review", "feedback", "assess", "is this good", "look over", "what is wrong with", "audit"],
+  "applies_to": ["review", "code_edit"],
+  "allowed_tools": ["read_file", "read_symbol", "search_files", "outline", "run_tests"],
+  "context_budget_tokens": 320
+}

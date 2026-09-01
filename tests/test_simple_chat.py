@@ -99,6 +99,13 @@ _NON_REGISTRY_TOOLS = frozenset({
     "memory_remember", "memory_load", "memory_list", "memory_forget",
     "graph_search", "explain_symbol", "history_search", "append_file",
     "find_files", "read_symbol", "run_tests", "use_skill", "replace_symbol",
+    # Composed in the loop rather than the registry: it owns a Chromium process
+    # and its own approval, and threading that through AgentToolRegistry would
+    # put a browser session behind the file-write policy.
+    "check_page",
+    # Reads the spec itself and writes the contract - neither of which the
+    # registry knows about.
+    "contract_from_spec",
     "contract_create", "contract_status", "contract_assert_pass",
     "contract_assert_fail", "contract_assert_skip", "contract_from_plan",
     "find_and_read", "search_and_read", "read_and_patch", "create_and_run",
@@ -281,6 +288,11 @@ def test_the_offered_tools_are_exactly_the_ones_that_can_run(tmp_path):
         "git_status", "git_diff", "git_log",
         # And nothing is serving search on a test machine.
         "web_search", "fetch_url",
+        # No contract has been written yet, so the four tools that act ON one
+        # have nothing to act on. `contract_create` and `contract_from_plan`
+        # stay - they are how a contract comes to exist.
+        "contract_status", "contract_assert_pass",
+        "contract_assert_fail", "contract_assert_skip",
     }
 
     # Everything that can act on a bare workspace, and nothing that cannot.
@@ -305,9 +317,11 @@ def test_the_full_roster_is_offered_once_everything_has_something_to_answer(tmp_
     for name in ("20260819-000001-aaaa", "20260819-000002-bbbb"):
         (paths.sessions_dir(tmp_path) / name).mkdir(parents=True, exist_ok=True)
     # "Everything has something to answer from" now includes a repository for
-    # read-only git to describe, and a reachable search backend. The web probe
-    # is faked rather than served: this test is about the ROSTER honouring
-    # availability, not about httpx.
+    # read-only git to describe, a reachable search backend, and - since the
+    # four contract assert tools became conditional - an open contract for them
+    # to act on. The web probe is faked rather than served: this test is about
+    # the ROSTER honouring availability, not about httpx.
+    (tmp_path / ".shamsu" / "contract.json").write_text("{}", encoding="utf-8")
     import subprocess
 
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
@@ -2152,6 +2166,12 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
                 "find_files": {"pattern": "**/*.py"},
                 "read_symbol": {"filepath": "hello.py", "symbol": "greet"},
                 "run_tests": {"test_filter": "nothing_matches_this"},
+                # Nothing is serving on port 9, so this is a legitimate NO -
+                # see the allowed set below. The probe is here to prove `url`
+                # reaches the implementation.
+                "check_page": {"url": "http://127.0.0.1:9/"},
+                # No spec file in this tmp_path, which is a legitimate NO.
+                "contract_from_spec": {"filepath": "SPEC.md"},
                 "use_skill": {"name": "developer"},
                 # Ordered so the contract exists before anything asserts on it -
                 # `SIMPLE_TOOL_SCHEMAS` lists create first.
@@ -2182,6 +2202,10 @@ def test_every_tool_schema_argument_survives_normalisation(tmp_path):
             assert result.ok or name in {
                 "memory_forget", "read_and_patch", "run_tests",
                 "contract_assert_pass",
+                # No server on port 9, which is the honest answer.
+                "check_page",
+                # No SPEC.md in this tmp_path, likewise.
+                "contract_from_spec",
                 # No PLAN.md in this tmp_path, which is the honest answer.
                 "contract_from_plan",
             }, (

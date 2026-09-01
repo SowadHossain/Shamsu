@@ -1,0 +1,29 @@
+# 2026-08-31 tui-answer-wrapping
+
+## The defect, rendered through the real pane (console width == pane width)
+◆ A fragment is not a file. The gate measured your 40-line edit against the 
+  
+◆ 1,500-line write cap and refused it.                                      
+  
+
+Every answer line followed by a near-empty continuation row. Rich pads what it
+renders to the console width; the pane then prepends a 2-column gutter; the row
+overflows the pane and wraps. The overflow row carries no gutter mark, so it is
+also invisible to the kind colouring.
+
+## Same content after console.width = content_width() (pane width - gutter)
+◆ A fragment is not a file. The gate measured your 40-line edit against the 
+◆ 1,500-line write cap and refused it.                                      
+
+## Regression check - the test fails on the old behaviour
+FIXED (content_width)    rows=  4  marked=  4  all marked=True
+BEFORE (output_width)    rows=  5  marked=  4  all marked=False
+
+## Tests
+  pytest tests/test_tui.py -q  -> 101 passed
+  pytest tests/ -k 'tui or repl or voice or frame or render or console' -q -> 509 passed, 3710 deselected
+  ruff check shamsu/cli/tui.py tests/test_tui.py -> All checks passed
+
+repl.py carries 137 pre-existing ruff errors at HEAD and 139 now; neither of the
+two new ones is in the edited region (5400-5500) - they are in another session's
+uncommitted work in the same file.

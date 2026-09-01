@@ -278,13 +278,31 @@ class LocalShamsuSessionGateway:
         )
         progress.start_task("SHAMSU remote task")
         try:
-            tools = AgentToolRegistry(
-                self.workspace,
-                approval_func=approval_func if approval_func is not None else (lambda _request: False),
-                session_logger=logger,
-                action_ledger=ledger,
+            raw_approval = (
+                approval_func if approval_func is not None else (lambda _request: False)
             )
             if simple_mode_enabled():
+                # Through `build_simple_tools`, like the CLI and the web portal,
+                # so the APPROVAL POLICY is the same on all three. Built raw,
+                # this surface asked the broker about every single file write -
+                # the registry raises an ApprovalRequest for each one - and the
+                # broker turns each into a card with a 900s timeout. A turn that
+                # writes three files could spend its entire budget waiting for
+                # taps that the CLI never asks for, because `make_approval_func`
+                # auto-approves writes the sandbox has already fenced.
+                #
+                # It also restores `get_approval_override()`, which only that
+                # wrapper consults - the same omission that took
+                # `run_command_verify` from 3/3 to 0/3 when the CLI had it.
+                from shamsu.agents.simple_chat import build_simple_tools
+
+                tools = build_simple_tools(
+                    self.workspace,
+                    main_loop=None,
+                    console_approval=raw_approval,
+                    session_logger=logger,
+                    action_ledger=ledger,
+                )
                 # Telegram resumes the LATEST session in the workspace, which is
                 # normally the one the desktop REPL is in. Running the legacy
                 # loop here therefore wrote ITS tool vocabulary -
@@ -295,6 +313,16 @@ class LocalShamsuSessionGateway:
                 # showed no turn for it, because Telegram writes no chat log.
                 final = self._run_simple(text, logger, tools, ledger, progress, metadata)
             else:
+                # The legacy path keeps the raw registry it has always had:
+                # `make_approval_func` encodes SIMPLE mode's policy, and applying
+                # it to a loop with different tools and a different contract
+                # would be a change nobody asked for.
+                tools = AgentToolRegistry(
+                    self.workspace,
+                    approval_func=raw_approval,
+                    session_logger=logger,
+                    action_ledger=ledger,
+                )
                 from shamsu.runtime.turn_stream import TurnEvent, TurnStream
 
                 session_id = str(getattr(logger, "session_id", "") or "")
@@ -383,6 +411,8 @@ class LocalShamsuSessionGateway:
             progress.live_card = True
         self._attach_desktop_mirror(stream)
 
+        from shamsu.agents.simple_feedback import RunControlFeedback
+
         loop = SimpleChatLoop(
             self.workspace,
             client=_default_ollama_client(OLLAMA_BASE_URL, TimeoutConfig()),
@@ -392,6 +422,14 @@ class LocalShamsuSessionGateway:
             emit=stream.publish,
             source="telegram",
             on_activity=lambda message: progress.step(str(message)),
+            # A message sent WHILE this turn runs. `route_user_message` already
+            # merges one into the active run and answers "Added your feedback to
+            # the active SHAMSU run" - and until now nothing in simple mode ever
+            # read it, so that sentence was untrue every time it was said. The
+            # CLI has had this since the feature shipped; this is the same wire.
+            feedback=(
+                RunControlFeedback(ledger.run_id) if ledger is not None else None
+            ),
         )
         # Register the turn so a SECOND message arriving mid-turn can see it.
         #

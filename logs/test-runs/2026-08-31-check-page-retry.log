@@ -1,0 +1,47 @@
+# 2026-08-31 - first live run of check_page (F:\voice-demo, session 20260831-134519-1d5e)
+
+## The build WORKS
+
+  ok      : True
+  message : The page loaded and drew something.
+  elements: {'canvas': 1, 'button': 4, 'h1': 3}
+  console : []
+  index.html 525 | game.js 308 | sounds.js 57 | styles.css 116
+  wiring verifier: 0 diagnostics
+  top-level declarations shared between index.html and game.js: none
+
+## Skills - both routes fired
+
+  use_skill(planner)                                   1  (model's own call)
+  "the way this turn is going matched the ... skill"   2  (harness injection)
+
+## Defect 1 - check_page on a server still binding
+
+  13:55:52  command.detached  cd "F:/Work/voice-demo" && python -m http.server 8000
+  13:55:5x  check_page        net::ERR_EMPTY_RESPONSE
+  13:56:02  curl              exit 0, page returned
+
+  classification after the fix:
+    retry=True   net::ERR_EMPTY_RESPONSE
+    retry=True   net::ERR_CONNECTION_REFUSED
+    retry=False  net::ERR_NAME_NOT_RESOLVED
+    retry=False  Timeout 30000ms exceeded
+
+## Defect 2 - a dead command logged as a started server
+
+  13:54:32  command.started   cd /workspace && ... -m http.server 8000 &
+  13:55:18  command.detached  same command, exit_code 1
+
+  Nothing leaked - one process record (38212.json) for one surviving server.
+  The LOG was wrong: "Started in the background" for a command that exited 1.
+
+## The guards, working
+
+  write_file      refused 18.5KB / 533 lines
+  write_file      refused a whole-file write after a partial read (x3)
+  delete_file     refused twice - "deleting the file you cannot edit is not a repair"
+  then            read_file -> patch_file -> applied, twice
+
+## Suite
+
+  4375 passed, 2 skipped, 0 failed (before the executor fix)

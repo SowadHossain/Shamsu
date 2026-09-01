@@ -1,0 +1,22 @@
+# 2026-08-31 F6 skips a spoken reply
+
+## Live, with the real Kokoro engine and a real audio device
+A ~20s spoken reply, skip pressed at 2.5s.
+
+  before (one write per sentence):
+    pressing F6 at 2.50s
+    speak() returned at 4.64s      <- 2.14s of audio after the key
+
+  after (0.1s blocks, flag checked between them):
+    pressing F6 at 2.50s
+    speak() returned at 2.94s (alive=False)
+
+`stream.write` blocks until the device accepts the data, so a whole sentence
+in one call meant the stop flag went unread for the length of that sentence.
+The flag was set the entire time; nothing was looking at it.
+
+## Tests
+........................................................................ [100%]
+144 passed in 5.92s
+
+All checks passed!

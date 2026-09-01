@@ -38,7 +38,8 @@ lose. `console.status` coexists because it is transient and unpinned.
 from __future__ import annotations
 
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from rich.markup import escape
 from rich.syntax import Syntax
@@ -51,12 +52,41 @@ from shamsu.runtime.turn_stream import TurnEvent, body_kinds
 #: width is unreliable in a Windows console.
 ICON_MODEL = "◆"
 ICON_TOOL = "▤"
+#: Reading and searching are most of a turn - live runs are three or four
+#: reads for every write - so leaving them all on ICON_TOOL put a column of
+#: identical marks down the pane and undid the point of having icons. These
+#: split that column into the three things a read-ish call can be.
+ICON_SEARCH = "⌕"
+ICON_OUTLINE = "☰"
+ICON_DELETE = "⌫"
 ICON_APPROVAL = "⚑"
 ICON_PATCH = "✎"
 ICON_COMMAND = "▶"
 ICON_PASS = "✓"
 ICON_FAIL = "✗"
 ICON_NOTE = "·"
+
+#: The layout every row obeys: a mark in column 0, its text in column
+#: `ICON_COLUMN`. Rows used to be indented two and carry their icon at column
+#: 2, while the frame's own marks - a prompt's chevron, an answer's diamond -
+#: sat at column 0. Two icon columns, and text landing in both of them.
+#:
+#: `tui.GUTTER_WIDTH` is the same number on the pane's side, and
+#: `test_the_icon_column_is_the_same_width_on_both_sides` holds them equal.
+ICON_COLUMN = 3
+
+#: A line with no mark of its own - an activity line, a repeat counter - still
+#: starts where every other line's TEXT starts, never in the icon column.
+TEXT_INDENT = " " * ICON_COLUMN
+
+#: Subordinate detail hanging under a row: a diff under a write, a reasoning
+#: trace. One step in from the text column, so it reads as belonging to the
+#: row above rather than as another row.
+DETAIL_INDENT = " " * (ICON_COLUMN + 2)
+
+#: A mark and the gap that follows it, ready to prefix a row.
+def marked(icon: str) -> str:
+    return f"{icon}{' ' * (ICON_COLUMN - len(icon))}"
 
 #: Tools whose name reads better as a verb. Same table as the log's.
 _TOOL_VERBS = {
@@ -201,7 +231,7 @@ class CliTurnRenderer:
             return
         self._flush()
         for line in _clip(text, MAX_REASONING_CHARS).splitlines():
-            self.console.print(f"    [dim italic]{escape(line)}[/dim italic]")
+            self.console.print(f"{DETAIL_INDENT}[dim italic]{escape(line)}[/dim italic]")
 
     def _on_approval(self, event: TurnEvent) -> None:
         """Loud, and never dim. This is the one row that wants an answer."""
@@ -219,7 +249,7 @@ class CliTurnRenderer:
         on = f" on [bold]{escape(target)}[/bold]" if target else ""
         if str(data.get("phase") or "") == "requested":
             self.console.print(
-                f"  [bold yellow]{ICON_APPROVAL} approval needed[/bold yellow] "
+                f"[bold yellow]{marked(ICON_APPROVAL)}approval needed[/bold yellow] "
                 f"— [bold]{action}[/bold]{on}"
             )
             return
@@ -230,7 +260,7 @@ class CliTurnRenderer:
             else "[bold red]DENIED[/bold red]"
         )
         self.console.print(
-            f"  [yellow]{ICON_APPROVAL}[/yellow] {action}{on} — {verdict}"
+            f"[yellow]{marked(ICON_APPROVAL)}[/yellow]{action}{on} — {verdict}"
         )
 
     def _on_turn_end(self, event: TurnEvent) -> None:
@@ -256,7 +286,9 @@ class CliTurnRenderer:
     def _on_error(self, event: TurnEvent) -> None:
         self._flush()
         if event.text:
-            self.console.print(f"  [bold red]{ICON_FAIL} {escape(event.text)}[/bold red]")
+            self.console.print(
+                f"[bold red]{marked(ICON_FAIL)}{escape(event.text)}[/bold red]"
+            )
 
     def _on_body(self, event: TurnEvent) -> None:
         """Anything with no richer treatment: an activity line, as before."""
@@ -273,7 +305,7 @@ class CliTurnRenderer:
             # how eight suppressed rows still cost eight lines. Recorded above
             # for parity; not painted.
             return
-        self.console.print(f"  [dim]{escape(event.text)}[/dim]")
+        self.console.print(f"{TEXT_INDENT}[dim]{escape(event.text)}[/dim]")
 
     # -- rows --------------------------------------------------------------
 
@@ -315,7 +347,7 @@ class CliTurnRenderer:
         repeats, self._repeats = self._repeats, 1
         if repeats > 1 and self._last_row:
             self.console.print(
-                f"  {self._last_row} [bold yellow]x{repeats}[/bold yellow]"
+                f"{self._last_row} [bold yellow]x{repeats}[/bold yellow]"
             )
         self._last_tool = ""
         self._last_row = ""
@@ -342,7 +374,7 @@ class CliTurnRenderer:
                 suffix += f" [red]{escape(_clip(note, 70, one_line=True))}[/red]"
         if elapsed is not None:
             suffix += f" [dim]· {_duration(elapsed)}[/dim]"
-        self.console.print(f"  {row}{suffix}")
+        self.console.print(f"{row}{suffix}")
         self._print_diff(str(data.get("diff") or ""))
 
     def _print_diff(self, diff: str) -> None:
@@ -366,7 +398,7 @@ class CliTurnRenderer:
                 theme="ansi_dark",
                 background_color="default",
                 word_wrap=True,
-                padding=(0, 0, 0, 4),
+                padding=(0, 0, 0, ICON_COLUMN + 2),
             )
         )
 
@@ -398,7 +430,7 @@ def _row_of(data: dict[str, Any], text: str, name: str = "") -> str:
     """One action, as a coloured title. Mirrors `log-summary.md`'s wording."""
     tool = str(data.get("tool") or name or "")
     if not tool:
-        return f"[dim]{escape(text)}[/dim]"
+        return f"{TEXT_INDENT}[dim]{escape(text)}[/dim]"
     # `target` is what the emitter said this call was pointed at. When it did
     # not say - an older emitter, a salvaged call, a test - recover it from the
     # line's own text rather than printing a bare tool name: dropping "a.py"
@@ -407,24 +439,46 @@ def _row_of(data: dict[str, Any], text: str, name: str = "") -> str:
     target = str(data.get("target") or "") or _subject_of(text, tool)
     icon, colour = _style_of(tool, bool(data.get("ok", True)))
     verb = _TOOL_VERBS.get(tool)
+    mark = marked(icon)
     if verb and target:
-        return f"[{colour}]{icon} {verb}[/{colour}] [bold]{escape(target)}[/bold]"
+        return f"[{colour}]{mark}{verb}[/{colour}] [bold]{escape(target)}[/bold]"
     if target:
-        return f"[{colour}]{icon} {escape(tool)}[/{colour}] [bold]{escape(target)}[/bold]"
-    return f"[{colour}]{icon} {escape(tool)}[/{colour}]"
+        return f"[{colour}]{mark}{escape(tool)}[/{colour}] [bold]{escape(target)}[/bold]"
+    return f"[{colour}]{mark}{escape(tool)}[/{colour}]"
 
 
 def _subject_of(text: str, tool: str) -> str:
     """Whatever a body line said after the tool's own name."""
     rest = (text or "").strip()
-    if rest.startswith(tool):
-        rest = rest[len(tool):]
+    rest = rest.removeprefix(tool)
     return rest.strip(" :-")
 
 
+#: `tool -> (icon, colour)`. Consulted before the family rules below, so a
+#: tool that wants its own mark takes it without widening the if-chain.
+_TOOL_STYLES: dict[str, tuple[str, str]] = {
+    "search_files": (ICON_SEARCH, "cyan"),
+    "find_file": (ICON_SEARCH, "cyan"),
+    "code.search": (ICON_SEARCH, "cyan"),
+    "outline": (ICON_OUTLINE, "cyan"),
+    "read_symbol": (ICON_OUTLINE, "cyan"),
+    "delete_file": (ICON_DELETE, "yellow"),
+}
+
+
 def _style_of(tool: str, ok: bool) -> tuple[str, str]:
+    """The mark and colour for one row.
+
+    Failure wins over everything: a failed search is a failure first and a
+    search second, and the row that tells you a tool BROKE must not be
+    distinguishable only by colour - some terminals, and some eyes, do not
+    carry that difference.
+    """
     if not ok:
         return (ICON_FAIL, "red")
+    named = _TOOL_STYLES.get(tool)
+    if named is not None:
+        return named
     if tool in _WRITERS:
         return (ICON_PATCH, "green")
     if tool in {"run_command", "run_tests"}:
