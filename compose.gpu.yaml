@@ -1,0 +1,10 @@
+# Optional NVIDIA acceleration: docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

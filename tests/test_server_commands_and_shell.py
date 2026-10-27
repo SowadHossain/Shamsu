@@ -110,16 +110,38 @@ def test_mkdir_dash_p_also_fixes_the_separators():
 
 
 @WINDOWS_ONLY
-@pytest.mark.parametrize(
-    "command,expected_fragment",
-    [
-        ("curl -s http://x | head -50", "Select-Object -First 50"),
-        ("type log.txt | tail -20", "Select-Object -Last 20"),
-        ("which node", "where node"),
-    ],
-)
-def test_the_posix_isms_that_cost_this_session_a_turn(command, expected_fragment):
-    assert expected_fragment in _platform_command(command)
+def test_the_posix_ism_that_cost_this_session_a_turn():
+    assert "where node" in _platform_command("which node")
+
+
+@WINDOWS_ONLY
+@pytest.mark.parametrize("command", ["curl -s http://x | head -50", "type log.txt | tail -20"])
+def test_head_and_tail_are_no_longer_a_shell_stage(command):
+    """This assertion is inverted on purpose, and the reason is worth keeping.
+
+    `| head -50` used to be rewritten into a `powershell -Command "$input |
+    Select-Object -First 50"` stage, and this test pinned that. On cmd.exe a
+    pipeline reports the LAST stage's exit code, so the rewrite silently turned
+    every failure on the left into a success: `curl` that could not connect
+    came back as exit 0 with empty output rather than exit 7.
+
+    Live 2026-08-31 that happened five times in one turn. The model read the
+    empty output as "the page I am serving is empty", ran
+    `curl -s http://localhost:8000/ > index.html` to restore it, and cmd
+    truncated the file before curl ran - 5KB to 0 bytes, no backup, no journal
+    entry. The rewrite this test used to protect is what made that reasoning
+    look sound.
+
+    The filtering now happens in Python, on captured output, so the command
+    runs alone and keeps its own exit code. See `_split_output_filter` and
+    `tests/test_shell_hazards.py`.
+    """
+    from shamsu.tools.executor import _split_output_filter
+
+    assert "powershell" not in _platform_command(command)
+    stripped, output_filter = _split_output_filter(command)
+    assert output_filter is not None, "the filter must still be applied"
+    assert "|" not in stripped, "the pipeline stage is gone, not just retargeted"
 
 
 @WINDOWS_ONLY

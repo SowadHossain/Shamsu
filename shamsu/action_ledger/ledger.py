@@ -874,7 +874,25 @@ class ActionLedger:
         call_id: str = "",
         error: str = "",
         traceback_text: str = "",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        context_window: int = 0,
+        done_reason: str = "",
     ) -> None:
+        """Record a finished model call.
+
+        The token counts are new, and their absence is why a real failure took
+        an hour of forensics to explain. Ollama returns `prompt_eval_count` and
+        `eval_count` on every response, `_record_usage` already reads both -
+        and neither reached the run log. A run recorded 23 model calls, a
+        `prompt_sha256`, an 800-character preview of a 39,563-character prompt,
+        and not one number about how full the window was. "It fails at 16k" had
+        to be reconstructed by dividing `prompt_chars` by four.
+
+        `context_window` goes with them on purpose. A prompt size means nothing
+        without the window it had to fit in, and the window moves - the OOM
+        walk-down steps it, and the user can set it.
+        """
         if not self.enabled:
             return
         call_id = call_id or self._latest_open_model_call(role, model)
@@ -903,6 +921,16 @@ class ActionLedger:
             "traceback_path": traceback_path,
             "meta": self._compact(meta or {}),
         }
+        if prompt_tokens or completion_tokens or context_window:
+            record["prompt_tokens"] = int(prompt_tokens)
+            record["completion_tokens"] = int(completion_tokens)
+            record["context_window"] = int(context_window)
+            if context_window > 0 and prompt_tokens > 0:
+                record["window_used_pct"] = round(
+                    100.0 * prompt_tokens / context_window, 1
+                )
+        if done_reason:
+            record["done_reason"] = done_reason
         if self.full_artifacts and response:
             record["response_path"] = self._write_artifact(self.responses_dir, call_id, response, "response")
         friendly_response_path = self._write_friendly_model_artifact(
@@ -940,6 +968,11 @@ class ActionLedger:
             model=model,
             duration_ms=record["duration_ms"],
             error=error,
+            prompt_tokens=int(prompt_tokens),
+            completion_tokens=int(completion_tokens),
+            context_window=int(context_window),
+            window_used_pct=record.get("window_used_pct", 0.0),
+            done_reason=done_reason,
         )
 
     def log_model_thinking(

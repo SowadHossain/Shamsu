@@ -385,6 +385,7 @@ SYSTEM_COMMANDS = (
     "/django fix-tests ",
     "/compact",
     "/compact clear",
+    "/clear",
     "/sessions list",
     "/sessions new",
     "/sessions current",
@@ -727,6 +728,7 @@ def _print_help(console: Console) -> None:
                     "  /context meter            Live context meter, counters and efficiency",
                     "  /context inspect          Detailed budget breakdown",
                     "  /context compact          Show auto-compact threshold and last status",
+                    "  /clear                    Start the model fresh (transcript is kept)",
                     "  /context show             Show observability + what the working trace surfaces",
                     "  /models status            Show local Ollama/model status",
                     "  /models pull              Pull missing local models",
@@ -4238,7 +4240,8 @@ def _handle_context(
             "still on disk. Compaction is the model-driven one and records what "
             "was DECIDED, which a deterministic digest cannot.[/dim]",
             "",
-            "[dim]`/compact` shows the summary the model is carrying, "
+            "[dim]`/clear` starts the model fresh without losing the transcript. "
+            "`/compact` shows the summary the model is carrying, "
             "`/compact clear` forgets it. A compaction count that climbs once "
             "per turn means the window is too small for the work - "
             "`/context window` to change it.[/dim]",
@@ -19597,6 +19600,34 @@ def _make_prompt_session(
         return None
 
 
+def _handle_clear(session_logger: Any, console: Any) -> None:
+    """`/clear` - the model starts fresh; the transcript keeps everything.
+
+    The half of context control that was missing. `/compact` shows the digest of
+    older turns and `/compact clear` forgets the DIGEST, which only makes the
+    next prompt rebuild one from the same turns. Neither could answer "stop
+    carrying this conversation" - and the workaround, `/sessions new`, changes
+    which thread you are in, so resuming the work meant resuming the confusion.
+
+    Deliberately not a delete. `/sessions show`, `history_search` and the
+    archive all still reach every cleared message; only the prompt starts later.
+    Someone asking to clear a context wants the MODEL to forget, not the record.
+    """
+    try:
+        forgotten = session_logger.clear_context()
+    except Exception as exc:  # noqa: BLE001 - a failed clear must say so
+        console.print(f"[red]Could not clear the context: {exc}[/red]")
+        return
+    if not forgotten:
+        console.print("[dim]Nothing to clear - this session has no history yet.[/dim]")
+        return
+    console.print(
+        f"[dim]Cleared. The model starts fresh from here; {forgotten} earlier "
+        "message(s) stay in the transcript and are still searchable with "
+        "`/sessions show` and history_search.[/dim]"
+    )
+
+
 def _handle_compact(user_input: str, session_logger: Any, console: Any) -> None:
     """`/compact` shows the running summary; `/compact clear` forgets it.
 
@@ -20046,6 +20077,9 @@ def main(argv: list[str] | None = None) -> None:
                 )
             else:
                 _handle_django(normalized_input, workspace, console, session_logger=session_logger)
+            continue
+        if lowered_input.startswith("clear"):
+            _handle_clear(session_logger, console)
             continue
         if lowered_input.startswith("compact"):
             _handle_compact(normalized_input, session_logger, console)

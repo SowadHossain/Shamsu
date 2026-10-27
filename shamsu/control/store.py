@@ -275,7 +275,7 @@ class ControlStore:
         return None
 
     def acquire_lease(
-        self, workspace: Path | str, session_id: str, surface: str = "cli"
+        self, workspace: Path | str, session_id: str, surface: str = "cli", *, reentrant: bool = True,
     ) -> bool:
         """Claim this thread. True if it is now ours.
 
@@ -290,7 +290,7 @@ class ControlStore:
             ).fetchone()
             if row is not None:
                 lease = _lease(row)
-                if lease.owner_pid != os.getpid() and _lease_is_live(lease):
+                if _lease_is_live(lease) and (lease.owner_pid != os.getpid() or not reentrant):
                     return False
             conn.execute(
                 """
@@ -418,6 +418,48 @@ class ControlStore:
 
     def queue_depth(self, workspace: Path | str, session_id: str) -> int:
         return len(self.pending(workspace, session_id))
+
+    def queued_sessions(self) -> list[tuple[str, str]]:
+        """Oldest waiting sessions, including work accepted by another process."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT workspace, session_id, MIN(queue_id) AS first_id FROM queue "
+                "WHERE status = 'queued' GROUP BY workspace, session_id ORDER BY first_id"
+            ).fetchall()
+        return [(row["workspace"], row["session_id"]) for row in rows]
+
+    def recover_interrupted(self, *, include_own_pid: bool = False) -> list[QueuedPrompt]:
+        """Close abandoned turns without replaying possibly applied mutations.
+
+        include_own_pid is only for standalone process startup: container PID 1
+        can be reused after a restart, but no worker has started yet.
+        """
+        interrupted: list[QueuedPrompt] = []
+        with self._connect(write=True) as conn:
+            rows = conn.execute("SELECT * FROM queue WHERE status = 'running'").fetchall()
+            for row in rows:
+                lease_row = conn.execute(
+                    "SELECT * FROM leases WHERE workspace = ? AND session_id = ?",
+                    (row["workspace"], row["session_id"]),
+                ).fetchone()
+                lease = _lease(lease_row) if lease_row else None
+                abandoned = lease is None or not _lease_is_live(lease)
+                if include_own_pid and lease and lease.is_mine:
+                    abandoned = True
+                if abandoned:
+                    conn.execute(
+                        "UPDATE queue SET status = 'cancelled', updated_at = ? WHERE queue_id = ?",
+                        (_now(), row["queue_id"]),
+                    )
+                    interrupted.append(_queued(dict(row)))
+            for row in conn.execute("SELECT * FROM leases").fetchall():
+                lease = _lease(row)
+                if not _lease_is_live(lease) or (include_own_pid and lease.is_mine):
+                    conn.execute(
+                        "DELETE FROM leases WHERE workspace = ? AND session_id = ?",
+                        (lease.workspace, lease.session_id),
+                    )
+        return interrupted
 
     # -- approvals -------------------------------------------------------
 

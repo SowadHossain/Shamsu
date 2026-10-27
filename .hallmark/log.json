@@ -1,0 +1,33 @@
+[
+ {
+  "shape": "app screen",
+  "theme": "Rim, night",
+  "axes": [
+   "dark",
+   "grotesk-sans",
+   "warm"
+  ],
+  "hero": "not applicable: coding workspace",
+  "nav": "persistent projects rail; mobile drawer",
+  "footer": "workspace/model status",
+  "imagery": "working product UI",
+  "photos": [],
+  "entry": "browser onboarding with project creation and model readiness",
+  "fingerprint": "graphite amber workbench with conversation and run inspector",
+  "sections": [
+   "projects",
+   "conversation",
+   "task composer",
+   "run details",
+   "settings"
+  ],
+  "signature": "persistent conversation with a live run inspector",
+  "waived": [],
+  "prompt": "Redesign the existing Shamsu web UI using Hallmark and UI UX Pro Max; make it standalone and Docker deployable.",
+  "scope": "app",
+  "mode": "redesign",
+  "depth": "full",
+  "verification": "0 FAIL, 0 REFLEX, 3 WARN; in-thread finish review. Consistent controls intentional; mobile panels accessible with toggles.",
+  "date": "2026-10-25"
+ }
+]

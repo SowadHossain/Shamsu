@@ -29,17 +29,21 @@ out of a ~31,400-token prompt.
 """
 from __future__ import annotations
 
-import json
+import logging
+import os
 import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from shamsu.context.budget import count_tokens
+from shamsu.context.budget import count_tokens, fit_token_budget
+from shamsu.memory.service import MemoryService
+from shamsu.memory.types import NOTE_KINDS
 
-# Notes live in the workspace so they are per-project, reviewable and editable
-# by hand. Under `memory/` rather than at the root of `.shamsu/`, next to the
+# Notes live in the workspace. SQLite is authoritative; Markdown exports
+# are generated views and must be edited through the memory API. Under
+# `memory/` rather than at the root of `.shamsu/`, next to the
 # long-term SQLite store, so there is one place to look for "what does SHAMSU
 # remember" rather than two.
 MEMORY_DIR = Path(".shamsu") / "memory" / "notes"
@@ -73,7 +77,7 @@ ARCHIVE_AFTER_DAYS = 60
 DELETE_AFTER_DAYS = 90
 ARCHIVE_RANK_WEIGHT = 0.3
 
-_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_WORD_RE = re.compile(r"[^\W\d]\w*", re.UNICODE)
 
 
 def _now() -> str:
@@ -101,167 +105,152 @@ class Note:
     updated_at: str = ""
     last_used_at: str = ""
     tier: str = "hot"
+    pinned: bool = False
 
     def as_line(self) -> str:
         return f"[{self.type}] {self.title}: {self.content}"
 
 
 class MemoryStore:
-    """Typed notes on disk: one index plus a markdown file per note.
+    """Compact note view over the same SQLite records used by /memory.
 
-    The markdown duplicates the index on purpose. The index is what this class
-    reads; the markdown is what a human reads, greps and deletes by hand, and
-    a memory a user cannot inspect is one they cannot trust.
+    Legacy JSON/markdown are migration inputs, never rewritten. Markdown under
+    notes/exports is a generated view; use remember (same type/title updates)
+    and forget to change authoritative records.
     """
 
     def __init__(self, workspace: Path) -> None:
         from shamsu import paths
 
-        self.root = paths.memory_notes_dir(Path(workspace))
+        self.workspace = Path(workspace).resolve()
+        self.root = paths.memory_notes_dir(self.workspace)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.service = MemoryService(self.workspace)
         self.notes: dict[str, Note] = {}
+        self._loaded_updated: dict[str, str] = {}
+        self._owned: set[str] = set()
         self._load()
-
-    # -- persistence -----------------------------------------------------
 
     @property
     def index_path(self) -> Path:
+        """Legacy import path; SQLite is authoritative after migration."""
         return self.root / INDEX_FILENAME
 
     def _load(self) -> None:
-        try:
-            text = self.index_path.read_text(encoding="utf-8")
-        except OSError:
-            return
-        try:
-            raw = json.loads(text)
-        except json.JSONDecodeError:
-            # Do NOT return quietly. The store is now empty, and the next
-            # `remember()` would write a fresh index straight over notes that
-            # are still on disk and may be recoverable by hand. This codebase
-            # has been bitten by exactly this shape before - a reformatted
-            # transcript hydrated ONE message and nothing anywhere said so.
-            self._quarantine_index()
-            return
-        for entry in raw.get("notes", []):
-            if not isinstance(entry, dict) or not entry.get("id"):
-                continue
-            known = {f: entry.get(f) for f in Note.__dataclass_fields__ if f in entry}
-            known.setdefault("type", "context")
-            known.setdefault("title", "")
-            known.setdefault("content", "")
-            try:
-                self.notes[str(known["id"])] = Note(**known)  # type: ignore[arg-type]
-            except TypeError:
-                continue
-
-    def _quarantine_index(self) -> None:
-        """Move an unreadable index aside instead of letting it be overwritten.
-
-        Best-effort and silent about failure - but the file is kept, which is
-        the whole point. A user who lost notes can open the `.corrupt` copy.
-        """
-        try:
-            spoiled = self.index_path.with_suffix(".json.corrupt")
-            if spoiled.exists():
-                spoiled.unlink()
-            self.index_path.rename(spoiled)
-        except OSError:
-            pass
+        self.notes = {}
+        self._owned = set()
+        reverse_kinds = {kind: note_type for note_type, kind in NOTE_KINDS.items()}
+        for memory in self.service.list_local():
+            payload = memory.metadata.get("note")
+            if isinstance(payload, dict):
+                known = {key: value for key, value in payload.items() if key in Note.__dataclass_fields__}
+                known.update(id=memory.memory_id)
+                known.setdefault("type", reverse_kinds.get(memory.kind, "context"))
+                known.setdefault("title", "")
+                known.setdefault("content", memory.text)
+                known["type"] = known["type"] if known["type"] in MEMORY_TYPES else "context"
+                known["title"] = str(known["title"] or "")
+                known["content"] = str(known["content"] or memory.text)
+                tags = known.get("tags")
+                known["tags"] = [str(tag) for tag in tags] if isinstance(tags, list) else []
+                for key in ("created_at", "updated_at", "last_used_at"):
+                    known[key] = str(known.get(key) or "")
+                note = Note(**known)
+                self._owned.add(note.id)
+            else:
+                note = Note(
+                    id=memory.memory_id, type=reverse_kinds.get(memory.kind, "convention"),
+                    title=memory.kind.replace("_", " "), content=memory.text,
+                    created_at=datetime.fromtimestamp(memory.created_at, timezone.utc).isoformat(),
+                    pinned=memory.kind in {"user_preference", "safety_rule"},
+                )
+            self.notes[note.id] = note
+        self._loaded_updated = {key: note.updated_at for key, note in self.notes.items()}
+        self._baseline = {key: asdict(note) for key, note in self.notes.items()}
 
     def _save(self) -> None:
+        """Compatibility for tier/usage changes; never replace a store snapshot."""
+        for note in self.notes.values():
+            if note.id not in self._owned:
+                continue
+            if asdict(note) == self._baseline.get(note.id):
+                continue
+            note.updated_at = _now()
+            saved = self.service.update_note_metadata(
+                note.id, asdict(note), self._loaded_updated.get(note.id, ""),
+            )
+            if saved:
+                self._loaded_updated[note.id] = note.updated_at
+                self._baseline[note.id] = asdict(note)
+
+    def _export(self, note: Note) -> str:
+        """Best-effort generated view, separate from manually edited legacy files."""
+        directory = self.root / "exports"
+        temporary = directory / f".{uuid.uuid4().hex}.tmp"
         try:
-            self.root.mkdir(parents=True, exist_ok=True)
-            self.index_path.write_text(
-                json.dumps(
-                    {"version": 1, "updated_at": _now(),
-                     "notes": [asdict(note) for note in self.notes.values()]},
-                    indent=2,
-                ),
+            directory.mkdir(parents=True, exist_ok=True)
+            safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", note.id)
+            temporary.write_text(
+                f"<!-- Generated from memory.db; edit using memory_remember with the same type/title. -->\n"
+                f"# {note.title}\n\n- type: {note.type}\n- tags: {', '.join(note.tags) or '-'}\n"
+                f"- tier: {note.tier}\n- id: {note.id}\n\n{note.content}\n",
                 encoding="utf-8",
             )
-        except OSError:
-            return
-        live = set()
-        for note in self.notes.values():
-            name = f"{note.type}-{note.id}.md"
-            live.add(name)
+            os.replace(temporary, directory / f"{note.type}-{safe_id}.md")
+            return ""
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Memory saved, but export failed: %s", exc)
+            return " Markdown export unavailable."
+        finally:
             try:
-                (self.root / name).write_text(
-                    f"# {note.title}\n\n"
-                    f"- type: {note.type}\n"
-                    f"- tags: {', '.join(note.tags) or '-'}\n"
-                    f"- tier: {note.tier}\n"
-                    f"- created: {note.created_at}\n\n"
-                    f"{note.content}\n",
-                    encoding="utf-8",
-                )
+                temporary.unlink(missing_ok=True)
             except OSError:
-                continue
-        # Drop markdown for notes that decayed away, so the folder is a true
-        # picture of what is remembered rather than an archaeological record.
-        try:
-            for path in self.root.glob("*.md"):
-                if path.name not in live:
-                    path.unlink()
-        except OSError:
-            pass
+                pass
 
-    # -- writing ---------------------------------------------------------
-
-    def remember(
-        self,
-        note_type: str,
-        title: str,
-        content: str,
-        tags: list[str] | None = None,
-    ) -> tuple[bool, str]:
+    def remember(self, note_type: str, title: str, content: str,
+                 tags: list[str] | None = None) -> tuple[bool, str]:
         kind = (note_type or "").strip().lower()
         if kind not in MEMORY_TYPES:
-            return False, (
-                f"Unknown memory type {note_type!r}. Use one of: "
-                + ", ".join(MEMORY_TYPES)
-            )
+            return False, f"Unknown memory type {note_type!r}. Use one of: " + ", ".join(MEMORY_TYPES)
         clean_title = " ".join((title or "").split())[:120]
         clean_content = " ".join((content or "").split())[:MAX_NOTE_CHARS]
         if not clean_title or not clean_content:
             return False, "A note needs both a short title and the fact itself."
-        existing = self._same_note(kind, clean_title, clean_content)
-        if existing is not None:
-            # A model that decided something once will decide it again every
-            # turn. Twenty copies of a line is how a budget evaporates.
-            existing.updated_at = _now()
-            existing.last_used_at = _now()
-            existing.tier = "hot"
-            self._save()
-            return True, f"Already remembered as [{existing.type}] {existing.title}."
-        note = Note(
-            id=uuid.uuid4().hex[:8],
-            type=kind,
-            title=clean_title,
-            content=clean_content,
-            tags=[t.strip().lower() for t in (tags or []) if str(t).strip()][:6],
-            created_at=_now(),
-            updated_at=_now(),
-            last_used_at=_now(),
+        note = Note(id="", type=kind, title=clean_title, content=clean_content,
+                    tags=[str(tag).strip().lower() for tag in tags or [] if str(tag).strip()][:6],
+                    created_at=_now(), updated_at=_now(), last_used_at=_now())
+        result = self.service.remember_local(
+            f"{clean_title}: {clean_content}", NOTE_KINDS[kind],
+            {"note": asdict(note), "source": "model_note"},
         )
-        self.notes[note.id] = note
-        self.tidy()
-        self._save()
-        return True, f"Remembered [{note.type}] {note.title} ({len(self.notes)} notes held)."
-
-    def _same_note(self, kind: str, title: str, content: str) -> Note | None:
-        key = (title.lower(), content.lower())
-        for note in self.notes.values():
-            if note.type == kind and (note.title.lower(), note.content.lower()) == key:
-                return note
-        return None
+        if not result.get("ok"):
+            return False, str(result.get("error") or result.get("reason") or "Memory was not saved.")
+        try:
+            self._load()
+        except Exception as exc:  # noqa: BLE001 - the fact is already committed
+            logging.getLogger(__name__).warning("Memory saved, but refresh failed: %s", exc)
+            return True, f"Remembered [{kind}] {clean_title}. Saved to SQLite; the memory view could not refresh."
+        note = self.notes.get(str(result["memory_id"]))
+        if note is None:
+            return False, "Memory was saved but could not be read back."
+        warning = ""
+        try:
+            self.tidy()
+        except Exception as exc:  # noqa: BLE001 - maintenance cannot undo the commit
+            logging.getLogger(__name__).warning("Memory saved, but cleanup failed: %s", exc)
+            warning = " Memory cleanup unavailable."
+        warning += self._export(note)
+        prefix = "Already remembered" if result.get("deduped") else "Remembered"
+        return True, f"{prefix} [{note.type}] {note.title} ({len(self.notes)} notes held)." + warning
 
     def forget(self, note_id: str) -> tuple[bool, str]:
-        note = self.notes.pop((note_id or "").strip(), None)
+        self._load()
+        note = self.notes.get((note_id or "").strip())
         if note is None:
             return False, f"No memory with id {note_id!r}."
-        self._save()
-        return True, f"Forgot [{note.type}] {note.title}."
+        result = self.service.forget(note.id)
+        self._load()
+        return bool(result.get("ok")), f"Forgot [{note.type}] {note.title}." if result.get("ok") else str(result.get("error"))
 
     # -- reading ---------------------------------------------------------
 
@@ -271,6 +260,7 @@ class MemoryStore:
         This is the whole reason the store can grow without the prompt growing
         with it: hundreds of notes on disk, five in the window.
         """
+        self._load()
         words = {
             word.lower()
             for word in _WORD_RE.findall(task or "")
@@ -280,8 +270,8 @@ class MemoryStore:
             return []
         scored: list[tuple[float, Note]] = []
         for note in self.notes.values():
-            body = f"{note.title} {note.content} {' '.join(note.tags)}".lower()
-            title = note.title.lower()
+            title = note.title.lower() if note.id in self._owned else ""
+            body = f"{title} {note.content} {' '.join(note.tags)}".lower()
             score = 0
             for word in words:
                 if word in body:
@@ -290,6 +280,8 @@ class MemoryStore:
                     score += _WEIGHT_TITLE
                 if any(word in tag for tag in note.tags):
                     score += _WEIGHT_TAG
+            if note.pinned:
+                score += 100
             if score <= 0:
                 continue
             weighted = score * (ARCHIVE_RANK_WEIGHT if note.tier == "archive" else 1.0)
@@ -300,13 +292,15 @@ class MemoryStore:
             note.last_used_at = _now()
             note.tier = "hot"
         if chosen:
-            self._save()
+            self.service.touch_notes([note.id for note in chosen])
         return chosen
 
     def all_notes(self) -> list[Note]:
+        self._load()
         return sorted(self.notes.values(), key=lambda note: note.created_at)
 
     def stats(self) -> dict[str, int]:
+        self._load()
         counts: dict[str, int] = {}
         for note in self.notes.values():
             counts[note.type] = counts.get(note.type, 0) + 1
@@ -322,19 +316,24 @@ class MemoryStore:
         """
         changed = 0
         for note in list(self.notes.values()):
+            if note.id not in self._owned:
+                continue
             age = _age_days(note.last_used_at or note.created_at)
             if note.tier == "hot" and age > ARCHIVE_AFTER_DAYS:
                 note.tier = "archive"
                 changed += 1
             elif note.tier == "archive" and age > DELETE_AFTER_DAYS:
+                self.service.forget(note.id)
                 del self.notes[note.id]
                 changed += 1
-        hot = [n for n in self.notes.values() if n.tier == "hot"]
+        hot = [n for n in self.notes.values() if n.tier == "hot" and n.id in self._owned]
         if len(hot) > HOT_CAP:
             hot.sort(key=lambda note: note.last_used_at or note.created_at)
             for note in hot[: len(hot) - HOT_CAP]:
                 note.tier = "archive"
                 changed += 1
+        if changed:
+            self._save()
         return changed
 
 
@@ -347,23 +346,23 @@ def render_memory(workspace: Path, task: str = "") -> str:
     """
     try:
         store = MemoryStore(workspace)
-    except Exception:  # noqa: BLE001 - memory must never break a turn
+        notes = store.recall(task) if task.strip() else []
+    except Exception as exc:  # noqa: BLE001 - memory must never break a turn
+        logging.getLogger(__name__).warning("Memory recall unavailable: %s", exc)
         return ""
-    notes = store.recall(task) if task.strip() else []
     if not notes:
         return ""
     lines: list[str] = []
-    used = 0
+    header = "What you noted earlier about this project:\n"
     for note in notes:
-        line = f"- {note.as_line()}"
-        cost = count_tokens(line)
-        if used + cost > MAX_MEMORY_TOKENS:
+        line = fit_token_budget(f"- {note.as_line()}", MAX_MEMORY_TOKENS // 3,
+                                " ... [use memory_list for the full record]")
+        if count_tokens(header + "\n".join(lines + [line])) > MAX_MEMORY_TOKENS:
             break
         lines.append(line)
-        used += cost
     if not lines:
         return ""
-    return "What you noted earlier about this project:\n" + "\n".join(lines)
+    return header + "\n".join(lines)
 
 
 def remember(

@@ -1,0 +1,48 @@
+name: shamsu
+services:
+  ollama:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    restart: unless-stopped
+    volumes:
+      - models:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  model-setup:
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/ollama"]
+    command: ["pull", "${SHAMSU_MODEL:-qwen2.5-coder:3b-instruct}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: on-failure
+
+  web:
+    build: .
+    init: false
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SHAMSU_PORT:-8765}:8765"
+    environment:
+      SHAMSU_OLLAMA_BASE_URL: http://ollama:11434
+      SHAMSU_MODEL: ${SHAMSU_MODEL:-qwen2.5-coder:3b-instruct}
+      SHAMSU_CHAT_MAX_CTX: ${SHAMSU_CHAT_MAX_CTX:-8192}
+      SHAMSU_WEB_AUTH_TOKEN: ${SHAMSU_WEB_AUTH_TOKEN:-}
+      SHAMSU_WEB_ALLOWED_HOSTS: localhost,127.0.0.1
+    volumes:
+      - state:/var/lib/shamsu
+      - projects:/workspace
+    depends_on:
+      ollama:
+        condition: service_healthy
+    stop_grace_period: 30s
+
+volumes:
+  state:
+  models:
+  projects:

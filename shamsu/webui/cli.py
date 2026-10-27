@@ -39,8 +39,7 @@ def _watching(portal: WebPortal) -> str:
     total = sum(api.workspace_summary(item)["session_count"] for item in known)
     if not known:
         return (
-            "No workspaces known yet. Open a SHAMSU REPL in a project, or start "
-            "this with --scan <dir> to find existing ones."
+            "No projects yet. Add a project in the browser to start working."
         )
     return f"Watching {len(known)} workspace(s), {total} thread(s)."
 
@@ -60,6 +59,10 @@ def serve(
     console: Console | None = None,
     stop: threading.Event | None = None,
     scan: list[str] | None = None,
+    *,
+    host: str | None = None,
+    token: str | None = None,
+    runner=None,
 ) -> int:
     """Serve until `stop` is set, Ctrl-C, or SIGTERM.
 
@@ -77,7 +80,8 @@ def serve(
         console.print(
             f"[dim]Scanned {root}: found {len(discovered)} workspace(s).[/dim]"
         )
-    portal = WebPortal(workspace, port=port)
+    options = {key: value for key, value in {"host": host, "token": token, "runner": runner}.items() if value is not None}
+    portal = WebPortal(workspace, port=port, **options)
     try:
         portal.start()
     except OSError as exc:
@@ -92,6 +96,10 @@ def serve(
         )
         return 2
 
+    worker = runner or getattr(portal, "runner", None)
+    if worker is not None:
+        worker.start()
+
     console.print(
         Panel(
             f"[bold]{portal.url}[/bold]\n\n"
@@ -101,13 +109,12 @@ def serve(
                 "token, nothing to re-copy.\n\n"
                 if not portal.requires_token
                 else "This bind is reachable beyond this machine, so the link "
-                "carries a one-time token for this run.\n\n"
+                "carries an access token. Keep this link private.\n\n"
             )
             # It was never read-only. `POST .../prompt` has always started a
             # turn, and saying otherwise made the portal look safer than it is.
-            + "It follows runs started from the REPL or Telegram - including "
-            "ones running in another terminal right now - and can start one "
-            "of its own.\n\n"
+            + "The web service owns its coding worker and can start one of its own runs. No interactive CLI is required. "
+            "Tasks keep running when the browser is closed.\n\n"
             "Ctrl-C to stop.",
             title="SHAMSU Web View",
             border_style="green",
@@ -140,6 +147,8 @@ def serve(
     except KeyboardInterrupt:
         pass
     finally:
+        if worker is not None:
+            worker.stop()
         portal.stop()
     console.print("[dim]Web view stopped.[/dim]")
     return 0

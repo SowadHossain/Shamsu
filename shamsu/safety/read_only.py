@@ -30,6 +30,9 @@ _CHANGE_VERB = r"(?:change|edit|modify|write|create|delete|remove|touch|alter|up
 _CHANGE_GERUND = (
     r"(?:changing|editing|modifying|writing|creating|deleting|touching|altering|updating|overwriting)"
 )
+_CHANGE_LIST = (
+    rf"{_CHANGE_VERB}(?:\s*(?:,\s*(?:(?:and|or)\s+)?|(?:and|or)\s+){_CHANGE_VERB})*"
+)
 # "any files", "my code", "the workspace", "any other files", ...
 _TARGET = (
     r"(?:any\s+|my\s+|the\s+|other\s+|existing\s+|else\s+)*"
@@ -73,7 +76,7 @@ _READ_OBJECT = (
 # dry-run recorder could preview anything, so a `--dry-run` create-file produced
 # an empty plan. Dry run is its own mode (see is_dry_run + shamsu/safety/dry_run.py).
 READ_ONLY_RE = re.compile(
-    rf"\b{_FORBID}\s+{_CHANGE_VERB}\s+{_TARGET}\b"
+    rf"\b{_FORBID}\s+{_CHANGE_LIST}\s+{_TARGET}\b"
     rf"|\bwithout\s+{_CHANGE_GERUND}\s+{_TARGET}\b"
     rf"|\b(?:read-only|readonly)\b"
     rf"|\bread\s+only\b(?!\s+{_READ_OBJECT})"

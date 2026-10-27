@@ -26,7 +26,6 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from urllib.parse import urlparse
 
 import httpx
 from json_repair import repair_json
@@ -47,8 +46,9 @@ from shamsu.session.manager import SessionLogger
 from shamsu.types import ContextPack, LLMResponse, RoutingDecision
 from pathlib import Path
 
-OLLAMA_BASE_URL = "http://localhost:11434"
-LOCAL_LLM_HOSTS = {"localhost", "127.0.0.1", "::1"}
+from shamsu.runtime.endpoint import ollama_endpoint, validate_ollama_endpoint
+
+OLLAMA_BASE_URL = ollama_endpoint()
 
 
 def _timeout_env(name: str, default: float) -> float:
@@ -1217,14 +1217,7 @@ def _short_preview(text: str, limit: int) -> str:
 
 
 def _validate_local_llm_url(base_url: str) -> None:
-    parsed = urlparse(base_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError(f"Invalid Ollama URL: {base_url}")
-    if parsed.hostname not in LOCAL_LLM_HOSTS:
-        raise ValueError(
-            "SHAMSU only supports local Ollama endpoints. "
-            f"Refusing non-local LLM URL: {base_url}"
-        )
+    validate_ollama_endpoint(base_url)
 
 
 

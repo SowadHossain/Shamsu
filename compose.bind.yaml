@@ -1,0 +1,6 @@
+# Use an existing host folder. It must be writable by container uid 1000.
+# docker compose -f compose.yaml -f compose.bind.yaml up -d --build
+services:
+  web:
+    volumes:
+      - ${SHAMSU_PROJECTS_DIR:-./workspaces}:/workspace

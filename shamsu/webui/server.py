@@ -83,17 +83,21 @@ class WebPortal:
         *,
         port: int = DEFAULT_PORT,
         runner: Any = None,
+        host: str | None = None,
+        token: str | None = None,
     ) -> None:
         # Optional on purpose. The portal is a view over EVERY workspace this
         # install has used, not a window onto one of them - binding it to the
         # directory it happened to be started in was the reason it showed a
         # single project and, if you started it somewhere fresh, nothing at all.
         self.workspace = Path(workspace).resolve() if workspace else None
-        self.host = HOST
+        self.host = host or HOST
         self.requested_port = int(port)
         # 32 bytes, minted per start. The URL is the credential, so it must not
         # be guessable and must not outlive the process that printed it.
-        self.token = secrets.token_urlsafe(32)
+        self.token = token or os.environ.get("SHAMSU_WEB_AUTH_TOKEN") or secrets.token_urlsafe(32)
+        self._download: dict[str, Any] = {"status": "idle", "model": "", "error": ""}
+        self._download_lock = threading.Lock()
         self._server: _QuietHTTPServer | None = None
         self._thread: threading.Thread | None = None
         # The port actually bound, remembered across `stop()`. With `port=0`
@@ -196,6 +200,38 @@ class WebPortal:
             known.insert(0, self.workspace)
         return known
 
+    def start_model_download(self) -> dict[str, Any]:
+        """Download the configured model without blocking an HTTP request."""
+        from shamsu.runtime.models import model_for_role
+
+        with self._download_lock:
+            if self._download["status"] == "downloading":
+                return dict(self._download)
+            model = model_for_role("agent-chat")
+            self._download = {"status": "downloading", "model": model, "error": ""}
+
+        def pull() -> None:
+            import httpx
+            from shamsu.llm.manager import OLLAMA_BASE_URL
+
+            try:
+                with httpx.Client(timeout=3600, trust_env=False) as client:
+                    response = client.post(
+                        f"{OLLAMA_BASE_URL}/api/pull", json={"name": model, "stream": False},
+                    )
+                    response.raise_for_status()
+                    error = response.json().get("error")
+                    if error:
+                        raise RuntimeError(error)
+                status, error = "ready", ""
+            except Exception as exc:
+                status, error = "failed", str(exc)[:400]
+            with self._download_lock:
+                self._download.update(status=status, error=error)
+
+        threading.Thread(target=pull, name="shamsu-model-download", daemon=True).start()
+        return dict(self._download)
+
 
 def _build_handler(portal: WebPortal):
     class Handler(BaseHTTPRequestHandler):
@@ -238,11 +274,22 @@ def _build_handler(portal: WebPortal):
             position. An absent Origin is fine - that is a direct fetch, not a
             page - but a foreign one never is.
             """
+            authority = self.headers.get("Host", "")
+            try:
+                host = urlparse("//" + authority).hostname
+            except ValueError:
+                return False
+            configured = {item.strip().lower() for item in os.environ.get(
+                "SHAMSU_WEB_ALLOWED_HOSTS", "localhost,127.0.0.1,::1"
+            ).split(",") if item.strip()}
+            if portal.host not in {"0.0.0.0", "::"}:
+                configured.add(portal.host.lower())
+            if not host or host.lower() not in configured:
+                return False
             origin = self.headers.get("Origin")
             if not origin:
                 return True
-            allowed = {portal.base_url, f"http://localhost:{portal.port}"}
-            return origin in allowed
+            return origin in {f"http://{authority}", f"https://{authority}"}
 
         def _authorized(self, query: dict) -> bool:
             if not portal.requires_token:
@@ -267,13 +314,16 @@ def _build_handler(portal: WebPortal):
             if path in ("/", "/index.html"):
                 self._serve_static("app.html", "text/html; charset=utf-8")
                 return
-            if path in ("/app.css", "/app.js"):
+            if path in ("/app.css", "/app.js", "/tokens.css", "/base.css"):
                 self._serve_static(
                     path.lstrip("/"),
                     "text/css; charset=utf-8"
                     if path.endswith(".css")
                     else "text/javascript; charset=utf-8",
                 )
+                return
+            if path == "/healthz":
+                self._json({"ok": True, "service": "shamsu"})
                 return
             if not path.startswith("/api/"):
                 self._error(404, "not found")
@@ -326,7 +376,7 @@ def _build_handler(portal: WebPortal):
             except ValueError:
                 self._error(400, "bad Content-Length")
                 return None
-            if length > MAX_BODY_BYTES:
+            if length < 0 or length > MAX_BODY_BYTES:
                 self._error(413, "body too large")
                 return None
             raw = self.rfile.read(length) if length else b"{}"
@@ -360,6 +410,10 @@ def _build_handler(portal: WebPortal):
                 self._json(_apply_settings(body))
                 return
 
+            if parts == ["runtime", "model"]:
+                self._json(portal.start_model_download(), status=202)
+                return
+
             if parts == ["telegram"]:
                 self._json(_configure_telegram(body))
                 return
@@ -384,7 +438,9 @@ def _build_handler(portal: WebPortal):
             # caller, and it is checked rather than trusted - see api.add_workspace.
             if parts == ["workspaces"]:
                 try:
-                    summary = api.add_workspace(str(body.get("path") or ""))
+                    summary = api.add_workspace(
+                        str(body.get("path") or ""), create=body.get("create") is True,
+                    )
                 except api.BadPath as exc:
                     raise ValueError(str(exc)) from exc
                 self._json({"workspace": summary}, status=201)
@@ -440,6 +496,9 @@ def _build_handler(portal: WebPortal):
             parts = [part for part in path.split("/") if part][1:]  # drop "api"
             if parts == ["health"]:
                 self._json(api.health_payload(portal.workspace))
+                return
+            if parts == ["runtime"]:
+                self._json(api.runtime_payload(portal))
                 return
             if parts == ["approvals"]:
                 self._json(api.approvals_payload(portal.runner.store))
@@ -511,6 +570,9 @@ def _build_handler(portal: WebPortal):
         def _stream(self, workspace: Path, session_id: str) -> None:
             path = api.activity_file(workspace, session_id)
             since = _last_event_id(self.headers.get("Last-Event-ID"))
+            query = parse_qs(urlparse(self.path).query)
+            if since < 0 and "after" in query:
+                since = max(0, _int_arg(query, "after", 0))
             if since < 0:
                 # A FIRST connection, not a reconnect. `Last-Event-ID` is how a
                 # browser says "I have everything up to here"; its absence used

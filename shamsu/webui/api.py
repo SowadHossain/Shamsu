@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from shamsu.runtime.turn_stream import TurnStream, activity_path
+from shamsu.runtime.turn_stream import TurnEvent, TurnStream, activity_path
 from shamsu.safety.commands import redact
 from shamsu.session.manager import ORIGIN_LOOP, SessionManager
 
@@ -150,7 +151,12 @@ def session_messages(workspace: Path, session_id: str, after: int = 0) -> dict[s
     except Exception as exc:  # noqa: BLE001 - resolve() raises ValueError
         raise NotFound(f"unknown session: {session_id}") from exc
 
-    rows = _conversation_from_turns(workspace, logger.session_id)
+    from shamsu.webui.sse import _read_from
+
+    records, cursor = _read_from(activity_path(workspace, logger.session_id), 0)
+    rows = _conversation_from_turns(
+        workspace, logger.session_id, events=[TurnEvent.from_dict(row) for row in records],
+    )
     built_from = "turns"
     if rows is None:
         rows = _conversation_from_transcript(logger.read_messages())
@@ -163,6 +169,7 @@ def session_messages(workspace: Path, session_id: str, after: int = 0) -> dict[s
         "total": len(rows),
         "after": start,
         "built_from": built_from,
+        "stream_cursor": cursor,
         "messages": rows[start : start + MAX_MESSAGES],
     }
 
@@ -190,6 +197,7 @@ MAX_STEPS = 60
 def _steps_payload(events: list[Any]) -> list[dict[str, Any]]:
     """One turn's activity, small enough to ship with the conversation."""
     steps: list[dict[str, Any]] = []
+    diff_budget = 16000
     for event in events[:MAX_STEPS]:
         data = event.data or {}
         if event.kind == "tool.result":
@@ -203,12 +211,18 @@ def _steps_payload(events: list[Any]) -> list[dict[str, Any]]:
                     "detail": redact(str(data.get("message") or ""))[:200],
                 }
             )
+            if data.get("diff") and diff_budget > 0:
+                diff = redact(str(data["diff"]))[:diff_budget]
+                steps[-1]["diff"] = diff
+                diff_budget -= len(diff)
         else:
             steps.append({"kind": "note", "text": redact(str(event.text or ""))[:200]})
     return steps
 
 
-def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str, Any]] | None:
+def _conversation_from_turns(
+    workspace: Path, session_id: str, *, events: list[Any] | None = None,
+) -> list[dict[str, Any]] | None:
     """Prompts and answers, in order, from `activity.jsonl`.
 
     Returns None when this session has no turn stream to read - an older
@@ -216,7 +230,8 @@ def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str,
     back rather than show an empty thread.
     """
     try:
-        events = TurnStream(workspace, session_id, persist=False).replay(-1)
+        if events is None:
+            events = TurnStream(workspace, session_id, persist=False).replay(-1)
     except Exception:  # noqa: BLE001 - an unreadable log costs the nicer
         # rendering, never the thread.
         return None
@@ -305,6 +320,11 @@ def _conversation_from_turns(workspace: Path, session_id: str) -> list[dict[str,
             row["verdict"] = _interrupted_verdict(
                 _transcript_window(workspace, session_id, prompt, order, turns, turn_id)
             )
+            from shamsu.control.store import ControlStore
+
+            if ControlStore().lease_holder(workspace, session_id) is not None:
+                row["pending"] = True
+                row["verdict"] = "Working on this task"
             row["steps"] = _steps_payload(turn.get("steps") or [])
             rows.append(row)
     return rows
@@ -817,7 +837,7 @@ class BadPath(ValueError):
     """A path a caller offered that cannot be made into a workspace."""
 
 
-def add_workspace(raw_path: str) -> dict[str, Any]:
+def add_workspace(raw_path: str, *, create: bool = False) -> dict[str, Any]:
     """Register a directory so it appears in the sidebar.
 
     The one place the portal accepts a filesystem path from a caller, and it is
@@ -831,15 +851,54 @@ def add_workspace(raw_path: str) -> dict[str, Any]:
     if not candidate:
         raise BadPath("give a folder path")
     try:
-        resolved = Path(candidate).expanduser().resolve()
+        root = Path(os.environ["SHAMSU_WORKSPACE_ROOT"]).resolve() if os.environ.get("SHAMSU_WORKSPACE_ROOT") else None
+        requested = Path(candidate).expanduser()
+        resolved = ((root / requested) if root and not requested.is_absolute() else requested).resolve()
+        if root is not None and not resolved.is_relative_to(root):
+            raise BadPath(f"Choose a folder inside {root}")
     except (OSError, ValueError) as exc:
         raise BadPath(f"not a usable path: {candidate}") from exc
+    if create and not resolved.exists():
+        if root is None:
+            raise BadPath("Choose an existing folder, or configure SHAMSU_WORKSPACE_ROOT to create projects")
+        try:
+            resolved.mkdir(parents=True, exist_ok=False)
+        except OSError as exc:
+            raise BadPath(f"Could not create project folder: {exc}") from exc
     if not resolved.exists():
         raise BadPath(f"no such folder: {resolved}")
     if not resolved.is_dir():
         raise BadPath(f"not a folder: {resolved}")
     remember_workspace(resolved)
     return workspace_summary(resolved)
+
+
+def runtime_payload(portal: Any) -> dict[str, Any]:
+    """Service readiness is distinct from model readiness; neither needs a REPL."""
+    import httpx
+    from shamsu.llm.manager import OLLAMA_BASE_URL
+    from shamsu.runtime.models import model_for_role
+
+    model = model_for_role("agent-chat")
+    available: list[str] = []
+    error = ""
+    try:
+        response = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2.0, trust_env=False)
+        response.raise_for_status()
+        available = [str(item.get("name", "")) for item in response.json().get("models", [])]
+        connected = True
+    except Exception:
+        connected = False
+        error = "Ollama is unavailable. Check the model service connection."
+    installed = model in available or (":" not in model and f"{model}:latest" in available)
+    return {
+        "service": "running", "mode": "standalone", "worker": "busy" if portal.runner.busy() else "ready",
+        "model": model, "model_connected": connected, "model_installed": installed,
+        "ready": connected and installed, "model_error": error,
+        "model_download": dict(portal._download),
+        "workspace_root": os.environ.get("SHAMSU_WORKSPACE_ROOT", ""),
+        "queued": len(portal.runner.store.queued_sessions()),
+    }
 
 
 def dumps(payload: dict[str, Any]) -> bytes:

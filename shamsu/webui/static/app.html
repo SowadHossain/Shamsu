@@ -4,77 +4,49 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>SHAMSU</title>
-<link rel="stylesheet" href="/app.css">
+<meta name="description" content="A local coding workspace for projects, conversations, tools, and verified changes.">
+<title>Shamsu workspace</title>
+<link rel="stylesheet" href="./app.css">
 </head>
 <body>
+<noscript><p class="noscript">Shamsu needs JavaScript to connect to the local service. Enable it and reload this page.</p></noscript>
 <div id="app">
-  <aside id="sidebar">
-    <header class="rail-head">
-      <span class="mark">SHAMSU</span>
-      <button id="add-workspace" class="icon-btn" title="Add a workspace by path"
-              aria-label="Add a workspace">+</button>
-    </header>
-    <div class="rail-search">
-      <input id="filter" type="search" placeholder="Search threads" autocomplete="off" spellcheck="false">
-    </div>
-    <nav id="tree" aria-label="Workspaces and threads"></nav>
-    <footer class="rail-foot">
-      <button id="open-settings" class="foot-btn" type="button">
-        <span id="rail-model">&mdash;</span>
-        <span class="gear" aria-hidden="true">&#9881;</span>
-      </button>
-    </footer>
-  </aside>
-  <div id="rail-scrim" aria-hidden="true"></div>
-
-  <main id="main">
-    <header id="thread-head">
-      <!-- The toggle lives HERE, not in the sidebar. Inside the sidebar it
-           vanished along with the thing it was meant to bring back. -->
-      <button id="rail-toggle" class="icon-btn" title="Toggle sidebar"
-              aria-label="Toggle sidebar" aria-controls="sidebar"
-              aria-expanded="true">&#9776;</button>
-      <div class="head-left">
-        <h1 id="thread-title">SHAMSU</h1>
-        <span id="thread-sub"></span>
-      </div>
-      <div class="head-right">
-        <span id="run-pill" class="pill" hidden>idle</span>
-        <button id="new-thread" class="ghost-btn" type="button" hidden>New thread</button>
-      </div>
-    </header>
-
-    <div id="scroller">
-      <div id="conversation">
-        <div id="welcome" class="welcome">
-          <h2>No thread selected</h2>
-        </div>
-      </div>
-    </div>
-
-    <button id="jump" hidden>&darr; <span id="jump-count">0</span> new</button>
-
-    <div id="composer-wrap">
-      <div id="queue-strip" hidden></div>
-      <div id="palette" hidden role="listbox" aria-label="Commands"></div>
-      <form id="composer" autocomplete="off">
-        <textarea id="prompt" rows="1" placeholder="Ask SHAMSU to do something, or / for commands"
-                  spellcheck="false" disabled></textarea>
-        <button id="send" type="submit" class="send" title="Send" aria-label="Send" disabled>
-          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
-            <path d="M4 12h15M13 6l6 6-6 6" fill="none" stroke="currentColor"
-                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </button>
-      </form>
-      <p class="composer-hint" id="composer-hint" aria-live="polite"></p>
-    </div>
-  </main>
-
+<header id="appbar">
+  <div class="brand"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m5 6 6 6-6 6M13 18h6"/></svg><span>Shamsu</span></div>
+  <div class="appbar-actions"><span id="service-state" role="status">Connecting to service</span><button id="open-settings" class="ghost-btn" type="button">Settings</button></div>
+</header>
+<aside id="sidebar" aria-label="Projects and conversations">
+  <header class="rail-head"><h2>Projects</h2><button id="add-workspace" class="icon-btn" disabled title="Add a project" aria-label="Add a project" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></header>
+  <div class="rail-search"><label class="visually-hidden" for="filter">Search conversations</label><input id="filter" type="search" placeholder="Search conversations" autocomplete="off" spellcheck="false"></div>
+  <nav id="tree" aria-label="Workspaces and threads"><p class="ws-empty">Loading projects</p></nav>
+  <footer class="rail-foot"><p>Your local coding agent</p><span id="rail-model">Checking model</span></footer>
+</aside>
+<div id="rail-scrim" aria-hidden="true"></div>
+<main id="main">
+  <header id="thread-head">
+    <button id="rail-toggle" class="icon-btn" title="Toggle projects" aria-label="Toggle sidebar" aria-controls="sidebar" aria-expanded="true" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/></svg></button>
+    <div class="head-left"><h1 id="thread-title">Your workspace</h1><span id="thread-sub">Projects, conversations, and changes in one place</span></div>
+    <div class="head-right"><span id="run-pill" class="pill" hidden>Idle</span><button id="new-thread" class="ghost-btn" type="button" hidden>New conversation</button><button id="inspector-toggle" class="icon-btn" aria-label="Run details" aria-controls="run-inspector" aria-expanded="false" type="button"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="4" y="4" width="16" height="16"/><path d="M14 4v16"/></svg></button></div>
+  </header>
+  <div id="scroller"><div id="conversation"><div id="welcome" class="welcome"><svg class="welcome-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true"><path d="m5 6 6 6-6 6M13 18h6"/></svg><h2>What are we building?</h2><p>Choose a project, then give Shamsu a task. Work continues here when you leave the page.</p><div class="starters"><button class="starter" type="button" data-prompt="Find and fix a bug in this project, then run the relevant tests.">Fix a bug</button><button class="starter" type="button" data-prompt="Help me build a feature in this project. First inspect the existing structure.">Build a feature</button><button class="starter" type="button" data-prompt="Review this project for correctness and explain the highest priority issues. Do not modify files.">Review code</button></div></div></div></div>
+  <button id="jump" type="button" hidden><span id="jump-count">0</span> new events</button>
+  <div id="composer-wrap">
+    <div id="queue-strip" hidden></div><div id="palette" hidden role="listbox" aria-label="Commands"></div>
+    <label class="composer-label" for="prompt">Task</label>
+    <form id="composer" autocomplete="off"><textarea id="prompt" rows="2" placeholder="Describe a change, ask a question, or paste an error" spellcheck="false" disabled aria-describedby="composer-hint"></textarea><button id="send" type="submit" class="send" title="Send task" aria-label="Send" disabled><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg></button></form>
+    <div class="composer-bottom"><span id="composer-scope">Choose a project to begin</span><span>Enter to send, Shift + Enter for a new line</span></div><p class="composer-hint" id="composer-hint" role="status" aria-live="polite"></p>
+  </div>
+</main>
+<aside id="run-inspector" aria-label="Run details">
+  <header class="inspector-head"><h2>Run details</h2><button id="close-inspector" type="button" class="icon-btn" aria-label="Close run details">&times;</button></header>
+  <section class="inspector-section"><h3>Service</h3><p id="runtime-message" role="status">Checking the local worker</p><dl class="runtime-facts"><div><dt>Worker</dt><dd id="worker-state">Checking</dd></div><div><dt>Model</dt><dd id="runtime-model">Checking</dd></div><div><dt>Waiting conversations</dt><dd id="runtime-queue">Not measured</dd></div></dl><button id="runtime-setup" type="button" class="btn" hidden>Set up model</button></section>
+  <section class="inspector-section"><h3>Current activity</h3><p id="run-activity">No run in progress. Start with a task in your project.</p></section>
+  <section class="inspector-section"><h3>Approvals</h3><p id="approval-empty">Nothing waiting for approval.</p><div id="approval-list"></div></section>
+  <section class="inspector-section"><h3>Working here</h3><p>Files and conversation history stay in your project. Closing this tab leaves the service running.</p></section>
+</aside>
   <div id="drawer" hidden>
     <div id="drawer-scrim"></div>
-    <section id="drawer-panel" role="dialog" aria-label="Settings">
+    <section id="drawer-panel" role="dialog" aria-modal="true" aria-label="Settings">
       <header class="drawer-head">
         <h2>Settings</h2>
         <button id="close-settings" class="icon-btn" aria-label="Close">&times;</button>
@@ -82,9 +54,9 @@
       <div class="drawer-body">
         <section class="setting">
           <h3>Model</h3>
-          <p class="value" id="set-model">&mdash;</p>
-          <p class="note" id="model-source">&mdash;</p>
-          <div class="row"><select id="model-pick" aria-label="Model"></select></div>
+          <p class="value" id="set-model">Not measured</p>
+          <p class="note" id="model-source">Not measured</p>
+          <label for="model-pick">Coding model</label><div class="row"><select id="model-pick" aria-label="Model"></select></div><div class="row"><button id="model-download" type="button" class="btn">Download configured model</button></div><p id="model-download-status" class="note" aria-live="polite"></p>
           <p class="note warn" id="model-shadow" hidden>
             This workspace pins its own model, so the choice above will not apply here.
           </p>
@@ -92,7 +64,7 @@
 
         <section class="setting">
           <h3>Context window</h3>
-          <p class="note">Applies everywhere &mdash; terminal, web and Telegram.</p>
+          <p class="note">Applies everywhere Not measured terminal, web and Telegram.</p>
           <div class="row" id="ctx-buttons"></div>
           <p class="meter"><span id="ctx-meter">no turn yet</span></p>
           <p class="note" id="ctx-env" hidden>
@@ -104,7 +76,7 @@
           <h3>Verbosity</h3>
           <p class="note">How much of a turn every surface shows while it works.</p>
           <div class="row" id="verb-buttons"></div>
-          <p class="meter" id="verb-kinds">&mdash;</p>
+          <p class="meter" id="verb-kinds">Not measured</p>
         </section>
 
         <section class="setting">
@@ -113,9 +85,9 @@
           <!-- Token first, then where the bot points, then who may talk to it,
                then run it. That is also the order you do these in the first
                time, so the panel reads top to bottom on day one. -->
-          <p class="value" id="set-telegram">&mdash;</p>
+          <p class="value" id="set-telegram">Not measured</p>
           <div class="row">
-            <input id="tg-token" type="password" placeholder="Bot token" autocomplete="off" spellcheck="false">
+            <label class="visually-hidden" for="tg-token">Telegram bot token</label><input id="tg-token" type="password" placeholder="Bot token" autocomplete="off" spellcheck="false">
             <button id="tg-save" class="btn" type="button">Save</button>
           </div>
           <p class="note">
@@ -127,7 +99,7 @@
           <p class="note">The bot drives one project at a time. Pairings survive a change.</p>
           <div class="row">
             <select id="tg-workspace" aria-label="Telegram workspace"></select>
-            <button id="tg-bind" class="btn" type="button">Bind</button>
+            <button id="tg-bind" class="btn" type="button">Choose project</button>
           </div>
 
           <h4 class="sub">Paired devices</h4>
@@ -138,7 +110,7 @@
           </div>
 
           <h4 class="sub">Connection</h4>
-          <p class="value" id="tg-run">&mdash;</p>
+          <p class="value" id="tg-run">Not measured</p>
           <dl class="facts" id="tg-facts"></dl>
           <p class="note danger" id="tg-webhook" hidden></p>
           <div class="row">
@@ -151,20 +123,20 @@
 
         <section class="setting">
           <h3>Ollama</h3>
-          <p class="value" id="ol-state">&mdash;</p>
-          <p class="note" id="ol-loaded">&mdash;</p>
+          <p class="value" id="ol-state">Not measured</p>
+          <p class="note" id="ol-loaded">Not measured</p>
           <div class="row">
             <button id="ol-unload" class="btn" type="button">Unload models</button>
           </div>
         </section>
 
         <section class="setting">
-          <h3>Runs &amp; locks</h3>
+          <h3>Active sessions</h3>
           <ul id="lock-list" class="locks"></ul>
           <div class="row">
-            <button id="lock-clear" class="btn" type="button">Release stale locks</button>
+            <button id="lock-clear" class="btn" type="button">Release abandoned sessions</button>
           </div>
-          <p class="note">A live lock cannot be taken &mdash; only one left behind by a process that died.</p>
+          <p class="note">Only abandoned sessions can be released. Active work is protected.</p>
         </section>
 
         <section class="setting">
@@ -175,6 +147,8 @@
     </section>
   </div>
 </div>
-<script src="/app.js"></script>
+<dialog id="project-dialog" aria-labelledby="project-dialog-title"><form id="project-form"><h2 id="project-dialog-title">Add a project</h2><p>Choose a folder the service can access. In Docker, your projects live under /workspace.</p><label for="project-path">Folder path</label><input id="project-path" name="path" placeholder="/workspace/my-project" autocomplete="off" required><label class="check-label" for="project-create"><input id="project-create" type="checkbox">Create this folder if it does not exist</label><p id="project-error" class="field-error" role="alert"></p><div class="row"><button type="button" class="btn" id="project-cancel">Cancel</button><button type="submit" class="btn primary" id="project-submit">Add project</button></div></form></dialog>
+<dialog id="connect-dialog" aria-labelledby="connect-title"><form id="connect-form"><h2 id="connect-title">Connect to Shamsu</h2><p>This service requires an access token. Use the link printed at startup or the token saved in your service state.</p><label for="access-token">Access token</label><input id="access-token" type="password" autocomplete="off" required><p id="connect-error" class="field-error" role="alert"></p><div class="row"><button class="btn primary" type="submit">Connect</button></div></form></dialog>
+<script src="./app.js"></script>
 </body>
 </html>

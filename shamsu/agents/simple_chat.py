@@ -55,7 +55,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _replace_dataclass
 from pathlib import Path
 from typing import Any
 
@@ -100,6 +100,7 @@ from shamsu.agents.simple_verify import (
     unfinished_blocks,
 )
 from shamsu.context.budget import (
+    fit_token_budget,
     PER_MESSAGE_OVERHEAD,
     message_tokens,
     RESERVE_OUTPUT_TOKENS,
@@ -123,7 +124,6 @@ from shamsu.tools.agent_tools import (
     LEGACY_ELISION_MARKER,
     MAX_READ_CHARS,
     AgentToolRegistry,
-    looks_elided,
 )
 from shamsu.types import CommandRisk, ToolResult
 
@@ -1777,7 +1777,18 @@ def _has_memory_notes(workspace: Path) -> bool:
     from shamsu import paths
 
     notes = paths.memory_notes_dir(workspace)
-    return notes.is_dir() and any(notes.glob("*.md"))
+    if notes.is_dir() and any(notes.glob("*.md")):
+        return True
+    database = paths.memory_dir(workspace) / "memory.db"
+    if not database.is_file():
+        return False
+    import sqlite3
+
+    connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return connection.execute("SELECT 1 FROM memories WHERE status = 'ACTIVE' LIMIT 1").fetchone() is not None
+    finally:
+        connection.close()
 
 
 def _has_code_graph(workspace: Path) -> bool:
@@ -2157,7 +2168,31 @@ _ARG_ALIASES = {
 # the schema's own `pattern` normalised to nothing and EVERY search failed with
 # "Missing or placeholder query" (measured 2026-08-18, 100% of calls). A rename
 # in one table is the whole fix; per-tool entries win over the global aliases.
+#
+# `name` is the third round of this. It is the most natural word in English for
+# "which file", and four tools read it as something else - `use_skill` (a skill),
+# `read_symbol` and `replace_symbol` (a symbol), `contract_from_plan` (a phase) -
+# so it cannot go in the global table. For every tool that takes a `filepath`
+# and has no `name` of its own it is unambiguous, and live 2026-08-31 the model
+# sent `read_file{"name": "game.js"}` NINE consecutive times, was told "Missing
+# filepath." nine times, and never recovered: 39% of that turn's round ceiling
+# on one word.
+_FILEPATH_ONLY_TOOLS = (
+    "read_file",
+    "write_file",
+    "patch_file",
+    "append_file",
+    "delete_file",
+    "move_file",
+    "read_and_patch",
+    "find_and_read",
+)
+
 _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+    **{
+        tool: {"name": "filepath", "file": "filepath", "path": "filepath"}
+        for tool in _FILEPATH_ONLY_TOOLS
+    },
     "list_files": {"path": "path", "dir": "path", "directory": "path", "folder": "path"},
     "search_files": {
         "pattern": "query",
@@ -2255,6 +2290,59 @@ def _as_list(value: Any) -> Any:
             # a string field is not.
             return [item if isinstance(item, str) else str(item) for item in parsed]
     return value
+
+
+@lru_cache(maxsize=1)
+def _schema_parameters() -> dict[str, tuple[tuple[str, ...], tuple[str, ...]]]:
+    """`{tool: (required, optional)}`, from the schemas themselves."""
+    table: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+    for schema in SIMPLE_TOOL_SCHEMAS:
+        function = schema.get("function") or {}
+        name = str(function.get("name") or "")
+        params = function.get("parameters") or {}
+        properties = tuple((params.get("properties") or {}).keys())
+        required = tuple(params.get("required") or ())
+        table[name] = (required, tuple(k for k in properties if k not in required))
+    return table
+
+
+def argument_help(tool: str, arguments: dict[str, Any]) -> str:
+    """What this tool actually takes, when a call got the shape wrong.
+
+    The single cheapest correction in the harness, and it took a live run to
+    see. `read_file{"name": ...}` was answered with "Missing filepath." - which
+    says what is absent and not what to send, so a model with no schema in
+    front of it has nothing new to try. It tried the same call nine times.
+
+    Two ways to have no schema in front of you: two-stage routing sent one tool
+    and this was not it (see `_adopt_category_from_call`), or the roster was
+    narrowed past it. Both are states the harness put the model in, so the
+    harness answers for them.
+
+    Only speaks when the call really is malformed - an unknown key, or a
+    missing required one. A tool that failed for its own reasons is not helped
+    by being told its own parameter list.
+    """
+    table = _schema_parameters()
+    if tool not in table:
+        return ""
+    required, optional = table[tool]
+    sent = set(arguments or {})
+    unknown = sorted(sent - set(required) - set(optional))
+    missing = [key for key in required if key not in sent]
+    if not unknown and not missing:
+        return ""
+    listed = ", ".join(
+        [f"{key} (required)" for key in required] + list(optional)
+    )
+    hint = f"{tool} takes: {listed or 'no arguments'}."
+    if unknown:
+        hint += " You sent: " + ", ".join(unknown) + "."
+        if len(unknown) == 1 and len(missing) == 1:
+            value = arguments.get(unknown[0])
+            if isinstance(value, str) and value:
+                hint += f' Did you mean {missing[0]}="{value}"?'
+    return hint
 
 
 def normalize_arguments(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2368,7 +2456,12 @@ def make_approval_func(console_approval: Any, *, main_loop: Any = None) -> Any:
 
     def approve(request: Any) -> bool:
         action = str(getattr(request, "action_type", "") or getattr(request, "action", "") or "")
-        if action in {"file_write", "file_edit", "file_read"}:
+        if action in {"file_write", "file_edit"}:
+            injected = get_approval_override()
+            if injected is not None:
+                return bool(injected(request))
+            return True
+        if action == "file_read":
             return True
         command = str(getattr(request, "command", "") or "")
         if action == "run_command" or command:
@@ -2693,6 +2786,15 @@ class _Round:
     #: Every read signature this round, so the read-loop guard can tell a model
     #: opening a project from a model circling one file.
     read_targets: list[str] = field(default_factory=list)
+    #: Tools that FAILED this round. The read-loop guard counted tool NAMES and
+    #: never asked whether the call worked, so nine consecutive
+    #: `read_file{"name": ...}` rejections counted as nine reads, ended the turn
+    #: for reading too much, and said "Everything I read is still in the
+    #: conversation, so nothing is lost" - of a turn that had read nothing at
+    #: all. A rejected call is not a look; it is a different fault with a
+    #: different fix, and diagnosing it as over-reading sends the user looking
+    #: in the wrong place.
+    failed_names: list[str] = field(default_factory=list)
     # A write arrived cut off mid-argument and was refused rather than
     # committed. The loop reads this to know the turn made no progress for a
     # reason it must eventually stop on.
@@ -2961,9 +3063,8 @@ class SimpleChatLoop:
         # `_fixed_overhead` both want it and both run every round, so this was
         # parsing up to twelve files twice a round - measured 0.73s cold and
         # 0.036s warm on an 80-file project, ~1.7s a turn, on the event loop.
-        # Keyed on the file LIST so a turn that writes a new file still gets a
-        # fresh answer, which is the reason it was recomputed in the first place.
-        self._skeleton_cache: tuple[tuple[str, ...], int, str] | None = None
+        # Content fingerprints also invalidate edits to an existing file.
+        self._skeleton_cache: tuple[tuple[tuple[str, str], ...], int, str] | None = None
         # Skill names already put in the window this turn. A skill arrives
         # once; re-injecting it every round for the rest of the turn would
         # spend the budget re-saying what the model has already been told.
@@ -3208,6 +3309,21 @@ class SimpleChatLoop:
         # eliding after budgeting would mean budgeting against bytes that are
         # about to be thrown away.
         self._request = user_input
+        # The standalone worker and CLI must enforce the same user constraints.
+        from shamsu.safety import dry_run, read_only
+
+        self.tools.set_user_request(user_input)
+        if read_only.applies(user_input):
+            self.tools.set_read_only(True)
+        if read_only.is_scoped(user_input):
+            from shamsu.verify.contract import requested_paths
+
+            allowed = requested_paths(user_input, self.workspace)
+            if allowed:
+                self.tools.set_allowed_write_paths(allowed)
+        recorder = dry_run.get_recorder()
+        if recorder is not None:
+            self.tools.set_dry_run(recorder)
         self._tool_category = ""
         # Forget the harness's corrections from earlier turns before anything
         # else reads the transcript. They were written in the user role so the
@@ -3282,6 +3398,8 @@ class SimpleChatLoop:
         # what a file exports does not change between rounds of the same turn.
         await asyncio.to_thread(self._warn_if_spilled_to_ram)
         self._brief = await asyncio.to_thread(codebase_brief, self.workspace, user_input)
+        # This brief was just refreshed for the turn's current revision.
+        self._skeleton_cache = None
         self._skills_used = []
         self._skill = await asyncio.to_thread(
             render_skill,
@@ -3751,8 +3869,16 @@ class SimpleChatLoop:
                 # out what it did wrong; a model told the same thing every round
                 # is the nudge spiral this fix exists to end.
                 self._steer(announce)
+            # Only calls that actually returned something count as looking.
+            failed = list(outcome.failed_names)
+            looked_at_something = []
+            for tool in outcome.tool_names:
+                if tool in failed:
+                    failed.remove(tool)
+                    continue
+                looked_at_something.append(tool)
             looping = self._read_loop.record(
-                outcome.tool_names,
+                looked_at_something,
                 # Producing ANYTHING ends the streak - a file changed, a command
                 # run, a note written. Not just a write: an answer is production
                 # too, and this guard is about a turn with nothing to show.
@@ -4329,8 +4455,18 @@ class SimpleChatLoop:
                 self.action_ledger.log_model_thinking(
                     call_id, "coder", self.model_name, thinking
                 )
+            # Read off `raw` rather than `self.last_prompt_tokens`, so this does
+            # not depend on whether `_record_usage` has run yet for this call.
             self.action_ledger.log_model_call_finished(
-                "coder", self.model_name, content, call_id=call_id, error=error
+                "coder",
+                self.model_name,
+                content,
+                call_id=call_id,
+                error=error,
+                prompt_tokens=int(_response_field(raw, "prompt_eval_count") or 0),
+                completion_tokens=int(_response_field(raw, "eval_count") or 0),
+                context_window=int(self._ceiling() or 0),
+                done_reason=str(_response_field(raw, "done_reason") or ""),
             )
         except Exception:
             pass
@@ -4472,64 +4608,31 @@ class SimpleChatLoop:
         return "\n".join(lines[:6])
 
     def _messages(self) -> list[dict[str, Any]]:
-        """System prompt + workspace listing + older summary + the conversation.
-
-        The listing is the one piece of injected context, and it earns its ~60
-        tokens: it is the difference between working on the project and guessing
-        at it. Everything else is the policy `_messages_within_budget` already
-        uses - keep the largest recent suffix that fits, older turns survive as
-        the rolling summary.
-        """
-        tail, start_abs = self.state.select_for_budget(self._history_budget(), count_tokens)
-        if start_abs > 1:
+        """Assemble measured grounding, a summary and complete recent turns."""
+        grounding = self._grounding()
+        tail, start_abs = self.state.select_for_budget(self._history_budget(grounding), count_tokens)
+        while start_abs > 1:
             # Fold what no longer fits into a digest instead of dropping it.
             # Without this the evicted turns simply vanished and `include_summary`
             # inserted an empty string - so a long session lost its early
             # decisions entirely rather than keeping a trace of them.
             evicted = self.state.newly_evicted(start_abs)
-            if evicted:
-                digest = _digest(self.state.rolling_summary, evicted, self._ceiling())
-                if digest:
-                    self.state.update_rolling_summary(digest, start_abs)
+            if not evicted:
+                break
+            digest = _digest(self.state.rolling_summary, evicted, self._ceiling())
+            if not digest:
+                break
+            self.state.update_rolling_summary(digest, start_abs)
+            # The digest did not exist when the first selection was charged.
+            # Rebudget before assembly so summary growth cannot steal its own
+            # space or force the server to discard the beginning of the prompt.
+            next_tail, next_start = self.state.select_for_budget(self._history_budget(grounding), count_tokens)
+            if next_start <= start_abs:
+                break
+            tail, start_abs = next_tail, next_start
         messages = self.state.build_ollama_messages(
             tail, include_summary=self.state.should_include_summary(start_abs)
         )
-        # Placed AFTER the system prompt and before the conversation, and rebuilt
-        # every call, so it can never be the stale thing the model reasons from.
-        # Two halves of one question: the listing says which files exist, the
-        # brief says what is inside the ones this turn is about.
-        grounding = render_workspace_files(self._files)
-        standing = self._standing_plan()
-        if standing:
-            # The contract has existed for weeks and reached the model only if
-            # it called `contract_status` - so the thing meant to keep a
-            # multi-step task on the rails was invisible to exactly the model
-            # that had lost the thread and stopped asking.
-            grounding = standing + chr(10) * 2 + grounding
-        if self._project:
-            # First, and one line: what KIND of project this is and how its
-            # tests run. Without it a model opening a fresh workspace spends
-            # three to five calls working that out, every session.
-            grounding = self._project + chr(10) * 2 + grounding
-        remembered = render_memory(self.workspace, self._request)
-        if remembered:
-            grounding = remembered + chr(10) * 2 + grounding
-        # The skill this request matched, if one did. Injected rather than
-        # offered: `use_skill` was called zero times across every session
-        # logged, which is what a capability behind a judgment call is worth
-        # on a 7B. `render_memory` above settled the same argument first.
-        if self._skill:
-            grounding = self._skill + chr(10) * 2 + grounding
-        if self._brief:
-            grounding = f"{grounding}\n\n{self._brief}"
-        # And what every OTHER file declares. `_brief` covers the files the
-        # request named; this covers the ones it did not, which is where the
-        # cross-file collisions were coming from. Budgeted against the window,
-        # so a small context degrades to a few files rather than to a brief it
-        # cannot afford - see `workspace_skeletons`.
-        skeletons = self._skeletons()
-        if skeletons:
-            grounding = grounding + chr(10) + chr(10) + skeletons
         # LAST, not at position 1. llama.cpp reuses the KV cache for the
         # longest common PREFIX of the token sequence, and this block changes
         # whenever a file changes or the turn is about a different file.
@@ -4547,8 +4650,49 @@ class SimpleChatLoop:
             messages.insert(len(messages) - 1, block)
         else:
             messages.append(block)
+        messages = self._fit_prompt_messages(messages)
         LAST_ALLOCATION["value"] = self.token_allocation(messages)
         return messages
+
+    def _fit_prompt_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Check the assembled request, including a newly expanded summary.
+
+        An oversized current turn is elided as a whole; call/result pairs and
+        the user's request remain intact. Never rely on server-side eviction.
+        """
+        ceiling = self._ceiling()
+        limit = int((ceiling - output_reserve(ceiling) - SAFETY_MARGIN_TOKENS)
+                    / self._calibration_factor())
+        schemas = tool_schema_tokens(self._sent_schemas())
+
+        def cost(items):
+            return messages_tokens(items) + schemas
+
+        if cost(messages) <= limit:
+            return messages
+        fitted = []
+        for message in messages:
+            clipped = dict(message)
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                clipped["tool_calls"] = _shorten_arguments(message["tool_calls"])
+            elif message.get("role") == "tool":
+                clipped["content"] = elide_tool_result(
+                    canonical_tool_name(message.get("name", "")), message.get("content", ""), 0,
+                )
+            fitted.append(clipped)
+        # The summary is a lossy digest already; reserve space using its final
+        # serialized message, rather than the size it had before compaction.
+        for message in fitted:
+            if message.get("role") == "system" and message.get("content", "").startswith("Summary of earlier conversation:"):
+                remaining = max(0, limit - cost(fitted) + count_tokens(message["content"]))
+                message["content"] = fit_token_budget(message["content"], remaining, "\n[summary truncated]")
+        if cost(fitted) > limit:
+            raise ValueError(
+                "The current task and required context exceed the configured context window. "
+                "Use a smaller task, compact the conversation, or increase the context window. "
+                "No model request was sent."
+            )
+        return fitted
 
     def _shrink_for_oom(self) -> bool:
         """Drop one context bucket after the GPU refused the last request.
@@ -4890,6 +5034,8 @@ class SimpleChatLoop:
         under two-stage routing those differ by ~1,700 tokens, and item A is
         entirely about not letting the estimate and the request disagree.
         """
+        if not model_supports_native_tools(self.model_name):
+            return []
         return self._without_broken_tools(
             active_tool_schemas(
                 self._ceiling(), self._tool_category, self._available_families, self._request
@@ -5005,23 +5151,22 @@ class SimpleChatLoop:
         except Exception:  # noqa: BLE001 - budgeting must never break a turn
             return 1.0
 
-    def _fixed_overhead(self) -> int:
-        """Tokens every request carries that `select_for_budget` cannot see.
-
-        Three of them, and none was charged to any budget before:
-
-          * the six tool schemas, ~630 tokens on EVERY call;
-          * the grounding block, which `_messages` inserts AFTER the budget has
-            already been spent - up to 80 file paths plus the codebase brief;
-          * the rolling summary, prepended by `build_ollama_messages`, bounded
-            at `summary_budget()` - a further 2,048 tokens at a 32k window.
-
-        Counting only `tool_calls` and leaving these three out still overshoots
-        by ~3,900 tokens, which is the difference between the ~8,192 of headroom
-        the reply reserve promises and the ~5,300 it would actually deliver.
-        """
-        total = tool_schema_tokens(self._sent_schemas())
+    def _grounding(self) -> str:
+        """Build the exact injected block used for both accounting and sending."""
+        skeletons = self._skeletons()
         grounding = render_workspace_files(self._files)
+        standing = self._standing_plan()
+        if standing:
+            # The contract has existed for weeks and reached the model only if
+            # it called `contract_status` - so the thing meant to keep a
+            # multi-step task on the rails was invisible to exactly the model
+            # that had lost the thread and stopped asking.
+            grounding = standing + chr(10) * 2 + grounding
+        if self._project:
+            # First, and one line: what KIND of project this is and how its
+            # tests run. Without it a model opening a fresh workspace spends
+            # three to five calls working that out, every session.
+            grounding = self._project + chr(10) * 2 + grounding
         remembered = render_memory(self.workspace, self._request)
         if remembered:
             grounding = remembered + chr(10) * 2 + grounding
@@ -5032,38 +5177,38 @@ class SimpleChatLoop:
         if self._skill:
             grounding = self._skill + chr(10) * 2 + grounding
         if self._brief:
-            grounding = grounding + chr(10) + chr(10) + self._brief
+            grounding = f"{grounding}\n\n{self._brief}"
         # And what every OTHER file declares. `_brief` covers the files the
         # request named; this covers the ones it did not, which is where the
         # cross-file collisions were coming from. Budgeted against the window,
         # so a small context degrades to a few files rather than to a brief it
         # cannot afford - see `workspace_skeletons`.
-        skeletons = self._skeletons()
         if skeletons:
             grounding = grounding + chr(10) + chr(10) + skeletons
+        return grounding
+
+    def _fixed_overhead(self, grounding: str | None = None) -> int:
+        """Schemas and injected messages, measured from the actual prompt text."""
+        if grounding is None:
+            grounding = self._grounding()
+        total = tool_schema_tokens(self._sent_schemas())
         total += count_tokens(grounding) + PER_MESSAGE_OVERHEAD
-        summary = self.state.rolling_summary
-        if summary.strip():
+        if self.state.rolling_summary.strip():
+            summary = "Summary of earlier conversation:\n" + self.state.rolling_summary
             total += count_tokens(summary) + PER_MESSAGE_OVERHEAD
         return total
 
-    def _history_budget(self) -> int:
+    def _history_budget(self, grounding: str | None = None) -> int:
         """Tokens the conversation itself may occupy.
 
-        window - reply reserve - safety margin - everything else the request
-        carries, then divided by the calibration factor so the budget is stated
-        in the same units the estimator speaks. Dividing the budget once is the
-        same as multiplying every estimate, and it keeps the correction in one
-        readable place.
+        Convert the complete usable window to estimator units, then subtract
+        the exact injected overhead. Calibration applies to grounding and
+        schemas as well as conversation history.
         """
         ceiling = self._ceiling()
-        usable = (
-            ceiling
-            - output_reserve(ceiling)
-            - SAFETY_MARGIN_TOKENS
-            - self._fixed_overhead()
-        )
-        return max(1024, int(usable / self._calibration_factor()))
+        usable = int((ceiling - output_reserve(ceiling) - SAFETY_MARGIN_TOKENS)
+                     / self._calibration_factor()) - self._fixed_overhead(grounding)
+        return max(0, usable)
 
     def _num_ctx(self, messages: list[dict[str, Any]]) -> int:
         chosen = self._bucket_for(self._estimate_prompt(messages))
@@ -5125,6 +5270,65 @@ class SimpleChatLoop:
 
     # -- tools -----------------------------------------------------------
 
+    def _adopt_category_from_call(self, name: str) -> None:
+        """Let a real tool call stand in for the `select_category` it skipped.
+
+        Stage 1 of two-stage routing sends ONE schema and waits to be asked for
+        the rest. Live 2026-08-31 the model never asked: it called `read_file`,
+        `patch_file` and `run_command` straight out of the system prompt, which
+        names tools in prose, and every one of them ran - nothing checks a call
+        against the roster it was offered. So `_tool_category` stayed "" for the
+        whole turn, stage 2 never happened, and 47 model calls in a row went out
+        carrying a single tool.
+
+        The model was never confused about what it wanted. `patch_file` IS the
+        answer to "which category", so take it as one instead of waiting for a
+        selector call that is not coming. Costs no round, and the next call
+        carries that category's real schemas - including, crucially, the
+        parameter names. A model that has never been shown a schema is guessing
+        argument names, which is where the nine consecutive
+        `read_file{"name": ...}` failures in that same turn came from.
+
+        Only fires when the tool is NOT in the roster we sent, so a model that
+        does use `select_category` keeps what it chose, and the categories only
+        move when the model reaches for something it was not given.
+        """
+        from shamsu.agents.simple_router import (
+            SELECTOR_TOOL_NAME,
+            category_for_tool,
+            routing_mode,
+        )
+
+        if not name or name == SELECTOR_TOOL_NAME:
+            return
+        if routing_mode(self._ceiling()) != "two_stage":
+            return
+        offered = {
+            (schema.get("function") or {}).get("name")
+            for schema in self._sent_schemas()
+        }
+        if name in offered:
+            return
+        category = category_for_tool(name)
+        if not category or category == self._tool_category:
+            return
+        previous = self._tool_category
+        self._tool_category = category
+        try:
+            if self.action_ledger is not None:
+                self.action_ledger.log_event(
+                    "tool_category_adopted",
+                    tool=name,
+                    category=category,
+                    previous=previous,
+                )
+        except Exception:  # noqa: BLE001 - a record must never end a turn
+            pass
+        self._activity(
+            f"switched to the {category} tools (you called {name})",
+            kind="status",
+        )
+
     async def _run_tools(self, calls: list[Any]) -> _Round:
         outcome = _Round()
         # Was this whole generation stopped by the output cap? If so its LAST
@@ -5136,6 +5340,9 @@ class SimpleChatLoop:
             name = canonical_tool_name(_call_name(call))
             arguments = normalize_arguments(name, _call_arguments(call))
             outcome.tool_names.append(name)
+            # Before anything else: if this call is for a tool we did not offer,
+            # the model has just told us which category it wants. Take it.
+            self._adopt_category_from_call(name)
             if cut_off and index == last and name in WRITING_TOOLS:
                 self._refuse_truncated_write(call, name, arguments, outcome)
                 continue
@@ -5211,10 +5418,16 @@ class SimpleChatLoop:
             )
             self._trust.record(name, bool(result.ok))
             if not result.ok:
+                hint = argument_help(name, arguments)
+                if hint and hint not in result.message:
+                    result = _replace_dataclass(
+                        result, message=result.message + chr(10) + hint
+                    )
                 # Kept for the evidence note. smallcode keeps the error TAIL for
                 # the same reason: the last line says what went wrong, the rest
                 # is where it happened, and a full trace is 5-50KB.
                 self._turn_failures.append((name, _first_line(result.message)))
+                outcome.failed_names.append(name)
             if result.ok and (result.data or {}).get("ask_user"):
                 # The question, for the loop to end the turn on. Recorded here
                 # rather than returned, because the calls after this one in the
@@ -6670,6 +6883,19 @@ class SimpleChatLoop:
 
         wanted = str(arguments.get("assertion_id") or arguments.get("id") or "").strip()
         item = contract.find(wanted)
+        if item is None and wanted:
+            # `assertion_id="a01 Bullets fly in ship's direction"` - the id AND
+            # the text, which is how the model reads its own contract back. The
+            # id is right there in front. Refused FIVE times across two live
+            # turns on 2026-08-31, with the error helpfully listing `a01` each
+            # time, and the model sent the same string again twice.
+            #
+            # The text matcher below could not save it either: the `a01 ` prefix
+            # means the wanted string is neither contained in the assertion nor
+            # contains it, so both directions miss.
+            leading = wanted.split()[0].strip(".:)-,")
+            if leading and leading != wanted:
+                item = contract.find(leading)
         if item is None and not wanted and len(contract.blockers) == 1:
             # The model sent evidence and no id. Measured across four live runs
             # on qwen3.5:9b this was the single most-failing call in the whole
@@ -7425,9 +7651,14 @@ class SimpleChatLoop:
             # symlinked or differently-cased workspace raises instead of
             # searching.
             root = self.workspace.resolve()
-            sub = str(arguments.get("path") or "").strip().strip("./")
-            if sub and (root / sub).is_dir():
-                root = (root / sub).resolve()
+            sub = str(arguments.get("path") or "").strip()
+            if sub:
+                try:
+                    root = self.tools.sandbox.validate(sub).resolve()
+                except (ValueError, OSError) as exc:
+                    return ToolResult(False, f"Search path refused: {exc}", {})
+                if not root.is_dir():
+                    return ToolResult(False, "Search path is not a project directory.", {})
             files = []
             for found in walk_workspace_files(root, suffixes=SOURCE_SUFFIXES):
                 try:
@@ -8215,15 +8446,20 @@ class SimpleChatLoop:
         )
 
     def _skeletons(self) -> str:
-        """`workspace_skeletons` for the current file list, computed once."""
+        """Cache outlines by file content, including changes made outside tools."""
         budget = int(self._ceiling() * SKELETON_BUDGET_RATIO)
-        key = tuple(self._files)
-        if (
-            self._skeleton_cache is not None
-            and self._skeleton_cache[0] == key
-            and self._skeleton_cache[1] == budget
-        ):
-            return self._skeleton_cache[2]
+        key = tuple(
+            (relative, _source_fingerprint(self.workspace, relative))
+            for relative in self._files
+            if can_outline(Path(relative).suffix)
+        )
+        if self._skeleton_cache is not None:
+            if self._skeleton_cache[0] == key and self._skeleton_cache[1] == budget:
+                return self._skeleton_cache[2]
+            if self._skeleton_cache[0] != key:
+                # Graph-derived facts may describe the pre-edit revision. Fresh
+                # local outlines remain available until the next graph refresh.
+                self._brief = ""
         rendered = workspace_skeletons(self.workspace, self._files, budget)
         self._skeleton_cache = (key, budget, rendered)
         return rendered
@@ -9131,6 +9367,18 @@ _BRIEF_CACHE: dict[tuple[Any, ...], str] = {}
 _BRIEF_CACHE_LIMIT = 64
 
 
+def _source_fingerprint(workspace: Path, relative: str) -> str:
+    """Content identity, never a timestamp approximation, within the workspace."""
+    try:
+        path = (workspace / relative).resolve()
+        path.relative_to(workspace.resolve())
+        with path.open("rb") as stream:
+            digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        return f"{digest}:{path.stat().st_mtime_ns}"
+    except (OSError, ValueError):
+        return "missing-or-unavailable"
+
+
 def codebase_brief(workspace: Path, text: str, limit: int = MAX_BRIEF_TARGETS) -> str:
     """What the code graph knows about the existing files *text* names.
 
@@ -9151,13 +9399,8 @@ def codebase_brief(workspace: Path, text: str, limit: int = MAX_BRIEF_TARGETS) -
         targets = mentioned_workspace_files(workspace, text, limit=limit)
         if not targets:
             return ""
-        stamps: list[float] = []
-        for relative in targets:
-            try:
-                stamps.append((Path(workspace) / relative).stat().st_mtime)
-            except OSError:
-                stamps.append(0.0)
-        key = (str(workspace), tuple(targets), tuple(stamps))
+        fingerprints = tuple(_source_fingerprint(workspace, relative) for relative in targets)
+        key = (str(workspace), tuple(targets), fingerprints)
         cached = _BRIEF_CACHE.get(key)
         if cached is not None:
             return cached
@@ -10156,40 +10399,70 @@ def _budgeted(payload: str, ceiling: int | None = None) -> str:
     cap = tool_result_budget(ceiling)
     if count_tokens(payload) <= cap:
         return payload
-    keep = cap * 4
+
+    def fit(render, text):
+        low, high = 0, len(text)
+        best = render(0)
+        if count_tokens(best) > cap:
+            return None
+        while low <= high:
+            middle = (low + high) // 2
+            candidate = render(middle)
+            if count_tokens(candidate) <= cap:
+                best = candidate
+                low = middle + 1
+            else:
+                high = middle - 1
+        return best
+
     try:
         parsed = json.loads(payload)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
         data = parsed.get("data")
         if isinstance(data, dict) and isinstance(data.get("content"), str):
             body = data["content"]
-            overflow = len(payload) - keep
-            if 0 < overflow < len(body):
-                kept = body[: len(body) - overflow]
-                shown = kept.count("\n") + 1
+
+            def render_content(size):
+                kept = body[:size]
+                boundary = kept.rfind("\n")
+                if boundary >= 0:
+                    kept = kept[:boundary + 1]
+                start = int(data.get("start_line") or 1)
+                next_line = start + kept.count("\n")
                 total = data.get("total_lines")
-                # Name the exact next call. "Read the rest with start_line" was
-                # too vague to act on: live 2026-08-18 the model re-read the
-                # same file twice, got the same head both times, and gave up
-                # without ever trying a range or patch_file.
-                if isinstance(total, int) and total > shown:
-                    guidance = (
-                        f"... [showing lines 1-{shown} of {total}. "
-                        f"For the rest call read_file(start_line={shown + 1}, "
-                        f"end_line={total}). To CHANGE this file use patch_file - "
-                        "it is too large to rewrite whole.]"
-                    )
-                else:
-                    guidance = (
-                        f"... [truncated {overflow} chars - call read_file with "
-                        "start_line/end_line for the rest, and patch_file to change it]"
-                    )
-                data["content"] = kept + "\n" + guidance
-                data["content_truncated"] = True
-                data["shown_lines"] = shown
-                return json.dumps(parsed, ensure_ascii=True)
-    except (ValueError, AttributeError, TypeError):
-        pass
-    return payload[:keep] + "\n...[result truncated by SHAMSU]"
+                end = f", end_line={total}" if isinstance(total, int) else ""
+                shown = next_line - start
+                scope = (
+                    f"showing lines {start}-{next_line - 1} of {total}; "
+                    if shown and isinstance(total, int) else "partial content; "
+                )
+                guidance = (
+                    f"... [truncated; {scope}for the rest call read_file(start_line={next_line}{end}). "
+                    "To CHANGE this file use patch_file.]"
+                )
+                clipped = {**data, "content": kept + "\n" + guidance,
+                           "content_truncated": True, "shown_lines": kept.count("\n"),
+                           "next_start_line": next_line}
+                return json.dumps({**parsed, "data": clipped}, ensure_ascii=False)
+
+            try:
+                result = fit(render_content, body)
+            except (TypeError, ValueError):
+                result = None
+            if result is not None:
+                return result
+    # Preserve a valid envelope even when fields other than content exceed the
+    # cap. The preview is explicitly partial; it is never presented as JSON data.
+    def render_preview(size):
+        result = {"truncated": True, "preview": payload[:size],
+                  "message": "Result truncated by SHAMSU; request a smaller range or narrower query."}
+        if isinstance(parsed, dict) and isinstance(parsed.get("ok"), bool):
+            result["ok"] = parsed["ok"]
+        return json.dumps(result, ensure_ascii=False)
+
+    return fit(render_preview, payload) or "{}"
 
 
 def build_simple_tools(

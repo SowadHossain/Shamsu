@@ -1,0 +1,20 @@
+﻿:root {
+  color-scheme: dark;
+  --color-paper: #131512; --color-paper-2: #1b1e19; --color-paper-3: #10120f;
+  --color-ink: #f1f3eb; --color-ink-2: #d4d9cd; --color-muted: #a7b09f;
+  --color-rule: #363d31; --color-input-border: #74816a; --color-selected: #293023;
+  --color-accent: #e8ad78; --color-accent-hover: #f3c294; --color-accent-ink: #21160d;
+  --color-focus: #f0c291; --color-error: #f69b91; --color-success: #b7d6a3; --color-warning: #e8c77d;
+  --color-scrim: rgba(5, 8, 4, .78);
+  --font-display: "Segoe UI Variable", "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-body: var(--font-display); --font-outlier: "Cascadia Code", "SFMono-Regular", Consolas, ui-monospace, monospace;
+  --space-3xs: 2px; --space-2xs: 4px; --space-xs: 8px; --space-sm: 12px; --space-md: 16px; --space-lg: 24px; --space-xl: 40px; --space-2xl: 64px; --space-3xl: 96px;
+  --text-xs: .75rem; --text-sm: .875rem; --text-md: 1rem; --text-lg: 1.125rem; --text-xl: 1.266rem; --text-2xl: 1.602rem; --text-3xl: 2.027rem;
+  --text-display: var(--text-2xl); --text-section: var(--text-xl); --text-title: var(--text-lg); --text-lead: var(--text-md);
+  --display-weight: 500; --tracking-display: -.025em;
+  --radius-card: 0; --radius-pill: 0; --radius-input: 0; --shadow-card: none;
+  --dur-micro: 120ms; --dur-short: 200ms; --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --container: 1600px; --gutter: 24px; --gap-columns: 24px;
+  --z-base: 1; --z-raised: 10; --z-dropdown: 100; --z-sticky: 200; --z-sticky-nav: 300; --z-modal: 400;
+  --danger: var(--color-error); --warn: var(--color-warning); --ink: var(--color-ink); --ink-dim: var(--color-muted);
+}

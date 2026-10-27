@@ -5,6 +5,16 @@ venv/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.hallmark/tools/
+.hallmark/preview-state/
+.hallmark/before/
+.hallmark/after/
+.hallmark/*.log
+.hallmark/*-worktree.patch
+.hallmark/preview.py
+.hallmark/update_client.py
+.hallmark/stop-preview
+workspaces/
 
 # SHAMSU workspace-local runtime state. Keep placeholder dirs tracked, but do
 # not push local indexes, runtime config, sessions, logs, permissions, tasks,
@@ -50,3 +60,4 @@ reference/
 # filename, so they land here rather than in ~/.claude/. Zero bytes, recreated
 # constantly, never ours to commit.
 *claude-notify-signals*
+shamsu/webui/static/.hallmark/

@@ -33,6 +33,11 @@ const state = {
   commands: [],
   paletteIndex: 0,
   telegram: null,
+  selectionEpoch: 0,
+  pendingPrompts: [],
+  sending: false,
+  drafts: new Map(),
+  runtime: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -60,7 +65,7 @@ async function api(path, options = {}) {
     },
   });
   const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+  if (!response.ok) { const error = new Error(payload.error || `HTTP ${response.status}`); error.status = response.status; throw error; }
   return payload;
 }
 
@@ -113,7 +118,7 @@ async function loadWorkspaces() {
   if (!workspaces.length) {
     const empty = document.createElement("p");
     empty.className = "ws-empty";
-    empty.textContent = "No workspaces yet. Open SHAMSU in a project, or start it with --scan.";
+    empty.textContent = "No projects yet. Use Add a project to choose a folder.";
     tree.append(empty);
     return;
   }
@@ -228,8 +233,6 @@ function threadButton(session, workspace) {
   button.dataset.search =
     `${session.title} ${session.last_user_prompt} ${workspace.name}`.toLowerCase();
 
-  const dot = document.createElement("span");
-  dot.className = "dot idle";
   const label = document.createElement("span");
   label.className = "label";
   label.textContent = session.title || session.session_id;
@@ -237,7 +240,7 @@ function threadButton(session, workspace) {
   when.className = "when";
   when.textContent = relativeTime(session.updated_at);
 
-  button.append(dot, label, when);
+  button.append(label, when);
   button.title = session.last_user_prompt || session.title || "";
   button.addEventListener("click", () => openSession(session, workspace));
   return button;
@@ -284,18 +287,22 @@ async function openWorkspace(workspace) {
   if (body && !body.dataset.loaded) await loadGroup(workspace, body);
 }
 
-function selectWorkspace(workspace) {
+function selectWorkspace(workspace, updateHistory = true) {
+  beginSelection();
   state.workspace = workspace;
   state.session = null;
   state.base = "";
-  state.turnId = "";
-  state.pendingNew = 0;
-  updateJump();
   rememberOpenWorkspace(workspace.id);
   markActiveWorkspace();
   el("thread-title").textContent = workspace.name;
   el("thread-sub").textContent = workspace.path;
+  el("composer-scope").textContent = `Working in ${workspace.name}`;
+  el("prompt").value = "";
+  el("prompt").disabled = false;
+  el("send").disabled = false;
+  el("new-thread").hidden = false;
   el("conversation").replaceChildren(workspaceEmpty(workspace));
+  if (updateHistory) rememberLocation(workspace.id, "");
 }
 
 function markActiveWorkspace() {
@@ -311,42 +318,62 @@ function workspaceEmpty(workspace) {
   const empty = document.createElement("div");
   empty.className = "welcome";
   const title = document.createElement("h2");
-  title.textContent = workspace.session_count
-    ? "No thread selected"
-    : "No threads in this workspace";
-  empty.append(title);
+  title.textContent = `Let's work on ${workspace.name}`;
+  const description = document.createElement("p");
+  description.textContent = "Start a conversation with a task, an error, or a question about this project.";
+  const action = document.createElement("button");
+  action.type = "button";
+  action.className = "btn primary";
+  action.textContent = "New conversation";
+  action.addEventListener("click", () => newThread(""));
+  empty.append(title, description, action);
   return empty;
 }
 
 /* --- opening a thread --------------------------------------------------- */
 
-async function openSession(session, workspace) {
+async function openSession(session, workspace, updateHistory = true) {
+  const startingDraft = !state.base ? el("prompt").value : "";
+  const epoch = beginSelection();
   state.session = session;
   state.workspace = workspace;
-  state.base = `/api/workspaces/${workspace.id}/sessions/${session.session_id}`;
-  state.turnId = "";
-  state.pendingNew = 0;
-  updateJump();
-
+  const base = `/api/workspaces/${workspace.id}/sessions/${session.session_id}`;
+  state.base = base;
   for (const button of document.querySelectorAll(".thread")) {
-    button.setAttribute(
-      "aria-current",
-      String(button.dataset.sessionId === session.session_id),
-    );
+    button.setAttribute("aria-current", String(button.dataset.sessionId === session.session_id));
   }
   markActiveWorkspace();
-  el("thread-title").textContent = session.title || session.session_id;
+  el("thread-title").textContent = session.title || "New conversation";
   el("thread-sub").textContent = workspace.path;
+  el("composer-scope").textContent = `Working in ${workspace.name}`;
   el("prompt").disabled = false;
   el("send").disabled = false;
-  el("prompt").focus();
-
-  const { messages } = await api(`${state.base}/messages`);
-  renderMessages(messages);
-  scrollToBottom(true);
-  subscribe();
-  refreshQueue();
-  closeMobileRail();
+  el("prompt").value = state.drafts.get(base) || startingDraft;
+  el("new-thread").hidden = false;
+  el("conversation").replaceChildren();
+  const loading = document.createElement("p");
+  loading.className = "ws-empty";
+  loading.textContent = "Loading conversation";
+  el("conversation").append(loading);
+  if (updateHistory) rememberLocation(workspace.id, session.session_id);
+  try {
+    const { messages, stream_cursor } = await api(`${base}/messages`);
+    if (epoch !== state.selectionEpoch || base !== state.base) return;
+    renderMessages(messages);
+    state.streamCursor = stream_cursor;
+    scrollToBottom(true);
+    subscribe();
+    refreshQueue();
+    closeMobileRail();
+    el("prompt").focus();
+  } catch (error) {
+    if (epoch !== state.selectionEpoch) return;
+    loading.textContent = `Could not load this conversation: ${error.message}`;
+    const retry = document.createElement("button");
+    retry.className = "btn"; retry.type = "button"; retry.textContent = "Try again";
+    retry.addEventListener("click", () => openSession(session, workspace, false));
+    el("conversation").append(retry);
+  }
 }
 
 function renderMessages(messages) {
@@ -373,6 +400,8 @@ function bubble(role, content, meta) {
   const info = typeof meta === "string" ? { source: meta } : meta || {};
   const block = document.createElement("article");
   block.className = `msg ${role}`;
+  if (info.turn_id) block.dataset.turnId = info.turn_id;
+  if (info.pending) block.dataset.pending = "true";
   const who = document.createElement("span");
   who.className = "who";
   who.textContent = role === "user" ? "you" : "shamsu";
@@ -382,7 +411,8 @@ function bubble(role, content, meta) {
   if (text) {
     const body = document.createElement("div");
     body.className = "body";
-    body.textContent = text;
+    if (role === "assistant") renderMarkdown(body, text);
+    else body.textContent = text;
     block.append(body);
   } else if (info.verdict) {
     // A turn that ended without an answer - stopped, failed, cancelled. Shown
@@ -463,6 +493,12 @@ function stepList(steps) {
       row.className = "step note";
       row.textContent = step.text || "";
     }
+    if (step.diff) {
+      const diff = document.createElement("pre");
+      diff.className = "tool-preview";
+      diff.textContent = step.diff;
+      row.append(diff);
+    }
     list.append(row);
   }
   box.append(list);
@@ -473,25 +509,25 @@ function stepList(steps) {
 
 function subscribe() {
   if (state.stream) state.stream.close();
-  // EventSource cannot set headers, so the token rides as a query parameter on
-  // this one request. It never enters the address bar or the history.
-  const url = `${state.base}/stream?t=${encodeURIComponent(state.token)}`;
-  const stream = new EventSource(url);
+  const base = state.base;
+  const epoch = state.selectionEpoch;
+  const cursor = Number.isSafeInteger(state.streamCursor) ? `&after=${state.streamCursor}` : "";
+  const stream = new EventSource(`${base}/stream?t=${encodeURIComponent(state.token)}${cursor}`);
   state.stream = stream;
-  stream.onmessage = (event) => {
-    let payload;
-    try {
-      payload = JSON.parse(event.data);
-    } catch {
-      return;
-    }
-    handleEvent(payload);
+  stream.onopen = () => {
+    if (epoch === state.selectionEpoch) setConnection("Service connected");
   };
-  // The browser reconnects on its own and replays Last-Event-ID.
-  stream.onerror = () => {};
+  stream.onmessage = (event) => {
+    if (epoch !== state.selectionEpoch || base !== state.base) return;
+    try { handleEvent(JSON.parse(event.data)); } catch { /* A malformed event cannot switch sessions. */ }
+  };
+  stream.onerror = () => {
+    if (epoch === state.selectionEpoch) setConnection("Reconnecting updates", true);
+  };
 }
 
 function handleEvent(event) {
+  if (event.kind === "tool.call" || event.kind === "status" || event.kind === "turn.end") el("run-activity").textContent = event.text || "Waiting for the next action";
   if (event.turn_id && event.turn_id !== state.turnId) {
     state.turnId = event.turn_id;
     dropWelcome();
@@ -501,7 +537,15 @@ function handleEvent(event) {
   switch (event.kind) {
     case "turn.start":
       setRunning(true);
-      if (event.text) el("conversation").append(bubble("user", event.text, event.source));
+      if (event.text) {
+        const pending = state.pendingPrompts.find((item) => item.base === state.base && item.text === event.text && !item.echoed);
+        const existing = event.turn_id && [...document.querySelectorAll(".msg.user")].some((node) => node.dataset.turnId === event.turn_id);
+        if (pending) {
+          pending.echoed = true;
+          pending.node.classList.remove("pending");
+          pending.node.dataset.turnId = event.turn_id || "";
+        } else if (!existing) el("conversation").append(bubble("user", event.text, { source: event.source, turn_id: event.turn_id }));
+      }
       openTurnCard();
       break;
     case "activity":
@@ -513,16 +557,31 @@ function handleEvent(event) {
     case "error":
       addLine(event.text, "err");
       break;
+    case "tool.result": {
+      if (event.data?.diff) {
+        const details = document.createElement("details"); details.className = "steps";
+        const summary = document.createElement("summary"); summary.textContent = `Review changes to ${event.data.target || event.data.tool}`;
+        const preview = document.createElement("pre"); preview.className = "tool-preview"; preview.textContent = event.data.diff;
+        details.append(summary, preview); liveTurn().append(details);
+      }
+      break;
+    }
     case "status":
       setFooter(event.text, false, event.data);
       break;
     case "assistant":
-      if (event.text) el("conversation").append(bubble("assistant", event.text));
+      if (event.text) {
+        const pending = [...document.querySelectorAll('.msg.assistant[data-pending="true"]')].find((node) => node.dataset.turnId === event.turn_id);
+        const answer = bubble("assistant", event.text, { turn_id: event.turn_id });
+        if (pending) pending.replaceWith(answer);
+        else el("conversation").append(answer);
+      }
       break;
     case "turn.end":
       setRunning(false);
       setFooter(event.text, true, event.data);
       refreshQueue();
+      state.pendingPrompts = state.pendingPrompts.filter((item) => !item.echoed);
       break;
     default:
       break;
@@ -543,11 +602,9 @@ function dropWelcome() {
 function setRunning(running) {
   state.running = running;
   const pill = el("run-pill");
-  pill.hidden = false;
-  pill.textContent = running ? "running" : "idle";
+  pill.hidden = !state.session;
+  pill.textContent = running ? "Working" : "Idle";
   pill.classList.toggle("running", running);
-  const dot = document.querySelector('.thread[aria-current="true"] .dot');
-  if (dot) dot.classList.toggle("idle", !running);
 }
 
 function openTurnCard() {
@@ -620,34 +677,56 @@ function setFooter(value, done, data) {
 
 async function send(event) {
   event.preventDefault();
+  if (state.sending) return;
   const box = el("prompt");
   const text = box.value.trim();
   if (!text) return;
-
+  if (text.startsWith("/") && (await runCommand(text))) { box.value = ""; autoGrow(); return; }
+  if (!state.workspace) { addWorkspace(""); return; }
+  const intendedWorkspace = state.workspace.id;
+  const intendedBase = state.base;
+  if (state.creatingSession) await state.creatingSession;
+  if (state.workspace?.id !== intendedWorkspace || (intendedBase && state.base !== intendedBase)) return;
+  if (!state.base) await newThread("");
+  if (state.workspace?.id !== intendedWorkspace) return;
+  if (!state.base) return;
+  const base = state.base;
+  const epoch = state.selectionEpoch;
+  state.sending = true;
+  el("send").disabled = true;
+  el("send").setAttribute("aria-busy", "true");
   box.value = "";
+  state.drafts.delete(base);
   autoGrow();
   el("palette").hidden = true;
-
-  // A command is handled here, not sent to the model - the same split the
-  // REPL makes. An unknown slash word falls through as an ordinary prompt,
-  // because "/usr/bin/python is missing" is a sentence, not a typo.
-  if (text.startsWith("/") && (await runCommand(text))) return;
-
-  if (!state.base) {
-    notice("pick a thread first, or /new", true);
-    return;
-  }
   dropWelcome();
-  el("conversation").append(bubble("user", text));
+  const node = bubble("user", text);
+  node.classList.add("pending");
+  el("conversation").append(node);
+  const pending = { text, base, node, echoed: false };
+  state.pendingPrompts.push(pending);
   scrollToBottom(false);
-
   try {
-    const result = await post(`${state.base}/prompt`, { text });
-    if (result.queued) notice(result.reason || "queued");
+    const result = await post(`${base}/prompt`, { text });
+    if (epoch === state.selectionEpoch) notice(result.queued ? result.reason || "Task queued" : "Task accepted");
   } catch (error) {
-    notice(`could not send: ${error.message}`, true);
+    if (pending.echoed) return;
+    node.classList.remove("pending"); node.classList.add("failed");
+    const retry = document.createElement("button");
+    retry.type = "button"; retry.className = "btn"; retry.textContent = "Retry task";
+    retry.addEventListener("click", () => {
+      if (state.base !== base) return;
+      node.remove(); box.value = text; send({ preventDefault() {} });
+    });
+    node.append(retry);
+    state.pendingPrompts = state.pendingPrompts.filter((item) => item !== pending);
+    if (epoch === state.selectionEpoch) { if (!box.value) box.value = text; notice(`Could not send: ${error.message}`, true); }
+  } finally {
+    state.sending = false;
+    el("send").disabled = false;
+    el("send").removeAttribute("aria-busy");
+    if (base === state.base) refreshQueue();
   }
-  refreshQueue();
 }
 
 function notice(message, bad) {
@@ -655,6 +734,7 @@ function notice(message, bad) {
   hint.textContent = message;
   hint.style.color = bad ? "var(--danger)" : "var(--warn)";
   clearTimeout(notice.timer);
+  if (bad) return;
   notice.timer = setTimeout(() => {
     hint.textContent = "";
     hint.style.color = "";
@@ -670,35 +750,26 @@ function autoGrow() {
 /* --- the queue ---------------------------------------------------------- */
 
 async function refreshQueue() {
-  if (!state.base) return;
+  const base = state.base;
+  if (!base) return;
   let payload;
-  try {
-    payload = await api(`${state.base}/queue`);
-  } catch {
-    return;
-  }
+  try { payload = await api(`${base}/queue`); } catch { return; }
+  if (base !== state.base) return;
   const strip = el("queue-strip");
   strip.replaceChildren();
   strip.hidden = payload.queued.length === 0;
   for (const item of payload.queued) {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    const label = document.createElement("span");
-    label.textContent = `${item.source}: ${item.text.slice(0, 48)}`;
-    const drop = document.createElement("button");
-    drop.className = "x";
-    drop.type = "button";
-    drop.title = "Remove from queue";
-    drop.textContent = "x";
-    drop.setAttribute("aria-label", "Remove from queue");
+    const chip = document.createElement("span"); chip.className = "chip";
+    const label = document.createElement("span"); label.textContent = `Queued: ${item.text.slice(0, 48)}`;
+    const drop = document.createElement("button"); drop.className = "x"; drop.type = "button";
+    drop.title = "Remove from queue"; drop.textContent = "\u00d7"; drop.setAttribute("aria-label", "Remove from queue");
     drop.addEventListener("click", async () => {
-      await post(`${state.base}/cancel`, { queue_id: item.queue_id });
-      refreshQueue();
+      try { await post(`${base}/cancel`, { queue_id: item.queue_id }); if (base === state.base) refreshQueue(); }
+      catch (error) { notice(error.message, true); }
     });
-    chip.append(label, drop);
-    strip.append(chip);
+    chip.append(label, drop); strip.append(chip);
   }
-  if (payload.running_on) setRunning(true);
+  setRunning(Boolean(payload.running_on));
 }
 
 /* --- approvals ---------------------------------------------------------- */
@@ -720,10 +791,12 @@ async function pollApprovals() {
       state.seenApprovals.delete(id);
     }
   }
+  el("approval-empty").hidden = payload.approvals.length > 0;
   for (const approval of payload.approvals) {
     if (state.seenApprovals.has(approval.approval_id)) continue;
     state.seenApprovals.add(approval.approval_id);
-    el("conversation").append(approvalCard(approval));
+    el("approval-list").append(approvalCard(approval));
+    setInspector(true);
     if (isAtBottom()) scrollToBottom(false);
   }
 }
@@ -773,11 +846,18 @@ function approvalCard(approval) {
     });
   }
   row.append(allow, deny);
-  card.append(title, what, meta, row);
+  card.append(title, what, meta);
+  if (approval.preview) {
+    const preview = document.createElement("pre");
+    preview.textContent = approval.preview;
+    card.append(preview);
+  }
+  card.append(row);
   return card;
 }
 
 function onComposerKey(event) {
+  if (event.isComposing || event.keyCode === 229) return;
   const matches = paletteMatches();
   const open = !el("palette").hidden && matches.length > 0;
 
@@ -962,35 +1042,36 @@ function showHelp() {
 /* --- threads and workspaces --------------------------------------------- */
 
 async function newThread(title) {
+  if (state.creatingSession) return state.creatingSession;
   const workspace = state.workspace || state.workspaces[0];
-  if (!workspace) {
-    notice("add a workspace first: /workspace <path>", true);
-    return;
-  }
-  try {
-    const { session } = await post(`/api/workspaces/${workspace.id}/sessions`, {
-      title,
-    });
-    await loadWorkspaces();
-    const freshWorkspace = state.workspaces.find((item) => item.id === workspace.id) || workspace;
-    await openSession(session, freshWorkspace);
-    notice(`new thread in ${freshWorkspace.name}`);
-  } catch (error) {
-    notice(`could not create: ${error.message}`, true);
-  }
+  if (!workspace) { addWorkspace(""); return; }
+  const epoch = state.selectionEpoch;
+  const task = (async () => {
+    try {
+      const { session } = await post(`/api/workspaces/${workspace.id}/sessions`, { title });
+      await loadWorkspaces();
+      if (state.workspace?.id !== workspace.id || epoch !== state.selectionEpoch) return;
+      const freshWorkspace = state.workspaces.find((item) => item.id === workspace.id) || workspace;
+      await openSession(session, freshWorkspace);
+      notice(`New conversation in ${freshWorkspace.name}`);
+    } catch (error) { notice(`Could not create conversation: ${error.message}`, true); }
+  })();
+  state.creatingSession = task;
+  try { await task; } finally { state.creatingSession = null; }
 }
 
 async function addWorkspace(path) {
-  const chosen = path || window.prompt("Folder path for the workspace");
-  if (!chosen) return;
-  try {
-    const { workspace } = await post("/api/workspaces", { path: chosen });
-    await loadWorkspaces();
-    await openWorkspace(workspace);
-    notice(`added ${workspace.name}`);
-  } catch (error) {
-    notice(error.message, true);
+  if (!path) {
+    el("project-error").textContent = "";
+    el("project-create").disabled = !state.runtime?.workspace_root;
+    if (state.runtime?.workspace_root && !el("project-path").value) el("project-path").value = state.runtime.workspace_root + "/";
+    el("project-dialog").showModal();
+    return;
   }
+  try {
+    const { workspace } = await post("/api/workspaces", { path });
+    await loadWorkspaces(); await openWorkspace(workspace); notice(`Added ${workspace.name}`);
+  } catch (error) { notice(error.message, true); }
 }
 
 /* --- settings ------------------------------------------------------------ *
@@ -1002,7 +1083,10 @@ async function addWorkspace(path) {
  */
 
 async function openSettings() {
+  state.settingsFocus = document.activeElement;
+  for (const id of ["appbar", "sidebar", "main", "run-inspector"]) el(id).inert = true;
   el("drawer").hidden = false;
+  el("close-settings").focus();
   try {
     renderSettings(await api("/api/settings"));
   } catch (error) {
@@ -1016,6 +1100,8 @@ async function openSettings() {
 
 function closeSettings() {
   el("drawer").hidden = true;
+  for (const id of ["appbar", "sidebar", "main", "run-inspector"]) el(id).inert = false;
+  state.settingsFocus?.focus();
 }
 
 function renderSettings(settings) {
@@ -1410,7 +1496,7 @@ async function clearStaleLocks() {
 /* --- responsive rail ----------------------------------------------------- */
 
 function narrowViewport() {
-  return window.matchMedia("(max-width: 820px)").matches;
+  return window.matchMedia("(max-width: 959px)").matches;
 }
 
 function toggleRail() {
@@ -1475,7 +1561,14 @@ async function boot() {
   el("ol-unload").addEventListener("click", unloadModels);
   el("lock-clear").addEventListener("click", clearStaleLocks);
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Tab" && !el("drawer").hidden) {
+      const fields = [...el("drawer-panel").querySelectorAll('button, input, select, textarea, a[href], [tabindex="0"]')].filter((node) => !node.disabled && node.offsetParent !== null);
+      const first = fields[0], last = fields[fields.length - 1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    }
     if (event.key !== "Escape") return;
+    setInspector(false);
     if (!el("drawer").hidden) closeSettings();
     closeMobileRail();
   });
@@ -1488,40 +1581,140 @@ async function boot() {
   });
   normalizeRailForViewport();
 
-  // The token gate goes AFTER the first call, not before it.
-  //
-  // On a loopback bind the server sets `requires_token` false and answers
-  // every route without one - proven by curl: no header and a garbage header
-  // both return 200. The CLI says so too when it prints the link: "Loopback
-  // only, so the plain link is the whole thing - no token, nothing to
-  // re-copy." But this gate ran first and bailed whenever `?t=` was absent,
-  // so opening the plain bookmarked URL - exactly what the CLI tells you to
-  // do - rendered the empty shell: no workspaces, no threads, nothing. And it
-  // THREW nothing, so the console was clean and the page just sat there.
-  //
-  // `/api/health` is the right probe because it needs no auth to answer. If
-  // the bind really does demand a token, it comes back 401 and the message
-  // below is correct; if it does not, we were never missing anything.
-  try {
-    const health = await api("/api/health");
-    el("rail-model").textContent = health.model || "no model";
-    await loadCommands();
-    await loadWorkspaces();
-    // The composer works before a thread is picked, because /new and
-    // /workspace are how you get one.
-    el("prompt").disabled = false;
-    el("send").disabled = false;
-    el("new-thread").hidden = false;
-  } catch (error) {
-    const needsToken = /HTTP 401|token/i.test(error.message || "");
-    el("thread-title").textContent = needsToken
-      ? "Open the link SHAMSU printed"
-      : `Could not load: ${error.message}`;
-    return;
-  }
+  wireWorkbench();
+  await connectWorkbench();
   setInterval(refreshQueue, QUEUE_POLL_MS);
   setInterval(pollApprovals, APPROVAL_POLL_MS);
-  pollApprovals();
+  setInterval(refreshRuntime, 10000);
 }
 
-boot();
+
+function beginSelection() {
+  if (state.base) state.drafts.set(state.base, el("prompt").value);
+  state.selectionEpoch += 1;
+  state.stream?.close(); state.stream = null;
+  state.turnId = ""; state.pendingNew = 0;
+  el("queue-strip").replaceChildren(); el("queue-strip").hidden = true;
+  setRunning(false); updateJump();
+  return state.selectionEpoch;
+}
+function rememberLocation(project, session) {
+  const hash = new URLSearchParams({ project, ...(session ? { session } : {}) }).toString();
+  if (location.hash !== `#${hash}`) history.pushState({}, "", `#${hash}`);
+}
+async function restoreLocation() {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const project = state.workspaces?.find((item) => item.id === params.get("project"));
+  if (!project) return;
+  const session = params.get("session");
+  if (!session) { selectWorkspace(project, false); return; }
+  try {
+    const payload = await api(`/api/workspaces/${project.id}/sessions`);
+    const found = payload.sessions.find((item) => item.session_id === session);
+    if (found) await openSession(found, project, false);
+    else selectWorkspace(project, false);
+  } catch (error) { notice(error.message, true); }
+}
+function setConnection(message, bad = false) {
+  el("service-state").textContent = message;
+  el("service-state").dataset.state = bad ? "error" : "ready";
+}
+function setInspector(open) {
+  el("app").classList.toggle("inspector-open", open);
+  el("inspector-toggle").setAttribute("aria-expanded", String(open));
+}
+async function refreshRuntime() {
+  try {
+    const runtime = await api("/api/runtime"); state.runtime = runtime;
+    el("project-create").disabled = !runtime.workspace_root;
+    el("worker-state").textContent = runtime.worker === "busy" ? "Working on a task" : "Ready for tasks";
+    el("runtime-model").textContent = runtime.model;
+    el("runtime-queue").textContent = String(runtime.queued);
+    el("rail-model").textContent = runtime.model;
+    const downloading = runtime.model_download?.status === "downloading";
+    const message = downloading ? "Downloading the configured model" : runtime.ready ? "Ready to work independently" : runtime.model_connected ? "Download a model to start coding" : "Model service unavailable";
+    el("runtime-message").textContent = message;
+    el("runtime-message").dataset.state = runtime.ready || downloading ? "ready" : "error";
+    el("runtime-setup").hidden = runtime.ready;
+    el("model-download").disabled = downloading || !runtime.model_connected;
+    el("model-download").textContent = downloading ? "Downloading model" : "Download configured model";
+    el("model-download-status").textContent = runtime.model_download?.error || (downloading ? "The download continues when you close this page." : runtime.model_installed ? "Configured model is installed." : "Downloads model weights to the service's persistent storage.");
+    if (!state.stream || state.stream.readyState === EventSource.OPEN) setConnection("Service connected");
+  } catch (error) { setConnection("Service unavailable", true); }
+}
+async function connectWorkbench() {
+  try {
+    const health = await api("/api/health");
+    el("rail-model").textContent = health.model || "No model configured";
+    setConnection("Service connected");
+    await loadWorkspaces();
+    await loadCommands();
+    el("prompt").disabled = false; el("send").disabled = false;
+    el("new-thread").hidden = !state.workspaces.length;
+    if (location.hash) await restoreLocation();
+    if (!state.workspace && state.workspaces.length) selectWorkspace(state.workspaces[0], false);
+    await refreshRuntime(); await pollApprovals();
+    el("add-workspace").disabled = false;
+    if (el("connect-dialog").open) el("connect-dialog").close();
+  } catch (error) {
+    if (error.status === 401) { setConnection("Access token required", true); if (!el("connect-dialog").open) el("connect-dialog").showModal(); }
+    else { setConnection("Service unavailable", true); notice(`Could not connect: ${error.message}. Reload to retry.`, true); }
+    throw error;
+  }
+}
+function wireWorkbench() {
+  el("inspector-toggle").addEventListener("click", () => setInspector(!el("app").classList.contains("inspector-open")));
+  el("close-inspector").addEventListener("click", () => setInspector(false));
+  el("runtime-setup").addEventListener("click", openSettings);
+  el("project-cancel").addEventListener("click", () => el("project-dialog").close());
+  el("project-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); const submit = el("project-submit"); submit.disabled = true;
+    el("project-error").textContent = "";
+    try {
+      const { workspace } = await post("/api/workspaces", { path: el("project-path").value, create: el("project-create").checked });
+      await loadWorkspaces(); await openWorkspace(workspace); el("project-dialog").close();
+    } catch (error) { el("project-error").textContent = error.message; }
+    finally { submit.disabled = false; }
+  });
+  el("connect-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); state.token = el("access-token").value.trim(); sessionStorage.setItem("shamsu-token", state.token);
+    try { await connectWorkbench(); el("connect-error").textContent = ""; }
+    catch (error) { el("connect-error").textContent = "Could not connect. Check the token and try again."; }
+  });
+  el("model-download").addEventListener("click", async () => {
+    el("model-download").disabled = true;
+    try { await post("/api/runtime/model"); await refreshRuntime(); }
+    catch (error) { el("model-download-status").textContent = error.message; el("model-download").disabled = false; }
+  });
+  for (const button of document.querySelectorAll("[data-prompt]")) button.addEventListener("click", () => {
+    el("prompt").value = button.dataset.prompt;
+    if (!state.workspace) addWorkspace(""); else el("prompt").focus();
+  });
+  window.addEventListener("popstate", restoreLocation);
+}
+function renderMarkdown(container, text) {
+  let code = null, list = null;
+  const inline = (target, value) => {
+    for (const part of value.split(/(`[^`]+`|\*\*[^*]+\*\*)/g)) {
+      if (part.startsWith("`") && part.endsWith("`")) { const node = document.createElement("code"); node.textContent = part.slice(1, -1); target.append(node); }
+      else if (part.startsWith("**") && part.endsWith("**")) { const node = document.createElement("strong"); node.textContent = part.slice(2, -2); target.append(node); }
+      else target.append(document.createTextNode(part));
+    }
+  };
+  for (const line of text.split("\n")) {
+    if (line.trim().startsWith("```")) {
+      if (code) code = null;
+      else { const pre = document.createElement("pre"); code = document.createElement("code"); pre.append(code); container.append(pre); }
+      list = null; continue;
+    }
+    if (code) { code.append(document.createTextNode(line + "\n")); continue; }
+    const bullet = line.match(/^\s*[-*]\s+(.+)/);
+    if (bullet) { if (!list) { list = document.createElement("ul"); container.append(list); } const li = document.createElement("li"); inline(li, bullet[1]); list.append(li); continue; }
+    list = null;
+    if (!line.trim()) continue;
+    const heading = line.match(/^#{1,4}\s+(.+)/);
+    const node = document.createElement(heading ? "h3" : "p"); inline(node, heading ? heading[1] : line); container.append(node);
+  }
+}
+
+boot().catch(() => {});

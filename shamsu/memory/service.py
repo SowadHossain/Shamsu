@@ -1,8 +1,10 @@
-﻿"""Workspace service for required Graphiti long-term memory."""
+"""Authoritative local project memory, with an optional Graphiti mirror."""
 from __future__ import annotations
 
 import json
+import logging
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -74,39 +76,17 @@ class MemoryService:
         return self.memory_dir / "tombstones.json"
 
     def _load_tombstones(self) -> dict[str, set[str]]:
-        try:
-            data = json.loads(self._tombstones_path().read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            data = {}
-        return {
-            "ids": {str(x) for x in data.get("ids", []) if str(x).strip()},
-            "texts": {str(x) for x in data.get("texts", []) if str(x).strip()},
-        }
-
-    def _save_tombstones(self, data: dict[str, set[str]]) -> None:
-        self._write_json(
-            self._tombstones_path(),
-            {"ids": sorted(data["ids"]), "texts": sorted(data["texts"])},
-        )
+        return self.fallback.load_tombstones()
 
     def _add_tombstone(self, value: str) -> None:
         value = str(value or "").strip()
-        if not value:
-            return
-        data = self._load_tombstones()
-        data["ids"].add(value)          # exact id/text match
-        data["texts"].add(_norm(value))  # normalized text/phrase match
-        self._save_tombstones(data)
+        if value:
+            self.fallback.add_tombstone(value)
 
     def _remove_tombstone(self, value: str) -> None:
         value = str(value or "").strip()
-        if not value:
-            return
-        data = self._load_tombstones()
-        if value in data["ids"] or _norm(value) in data["texts"]:
-            data["ids"].discard(value)
-            data["texts"].discard(_norm(value))
-            self._save_tombstones(data)
+        if value:
+            self.fallback.remove_tombstone(value)
 
     def _is_tombstoned(self, memory: LongTermMemory, tombstones: dict[str, set[str]] | None = None) -> bool:
         data = tombstones if tombstones is not None else self._load_tombstones()
@@ -125,10 +105,25 @@ class MemoryService:
         return any(len(term) >= 8 and term in text for term in data["texts"])
 
     def _log_event(self, event: str, detail: dict[str, Any]) -> None:
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
-        line = json.dumps({"event": event, "ts": time.time(), **detail}, ensure_ascii=True)
-        with self._events_path().open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        try:
+            self.memory_dir.mkdir(parents=True, exist_ok=True)
+            line = json.dumps({"event": event, "ts": time.time(), **detail}, ensure_ascii=True)
+            with self._events_path().open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not log memory event: %s", exc)
+
+    def list_local(self) -> list[LongTermMemory]:
+        """The same active records for CLI, model tools and prompt retrieval."""
+        tombstones = self._load_tombstones()
+        return [memory for memory in self.fallback.list_active()
+                if not self._is_tombstoned(memory, tombstones)]
+
+    def touch_notes(self, memory_ids: list[str]) -> None:
+        self.fallback.touch_notes(memory_ids)
+
+    def update_note_metadata(self, memory_id: str, note: dict[str, Any], expected_updated_at: str) -> bool:
+        return self.fallback.update_note_metadata(memory_id, note, expected_updated_at)
 
     def is_available(self) -> bool:
         return True
@@ -225,17 +220,15 @@ class MemoryService:
         full_metadata = _memory_metadata(metadata)
         project_id = str(full_metadata.get("project_id") or self.workspace.name)
         source = str(full_metadata.get("source") or "memory_service")
-        # Deliberately storing a fact un-forgets it (clears a prior tombstone) so
-        # a wrong-then-corrected fact can come back.
-        self._remove_tombstone(decision.text)
-        result = self.fallback.remember(
-            decision.text,
-            decision.kind,
-            full_metadata,
-            project_id=project_id,
-            source=source,
-            confidence=float(full_metadata.get("confidence", 0.85)),
-        )
+        # The durable write also clears an exact tombstone in the same transaction.
+        try:
+            result = self.fallback.remember(
+                decision.text, decision.kind, full_metadata,
+                project_id=project_id, source=source,
+                confidence=float(full_metadata.get("confidence", 0.85)),
+            )
+        except (OSError, sqlite3.Error) as exc:
+            return {"ok": False, "error": f"Could not save memory: {exc}"}
         self._log_event(
             "remember_local",
             {
@@ -420,7 +413,7 @@ class MemoryService:
     def forget(self, memory_id_or_query: str) -> dict[str, Any]:
         """Evict a wrong fact so it is never recalled again.
 
-        SHAMSU owns a tombstone list (`.shamsu/memory/tombstones.json`) that is
+        SHAMSU stores tombstones transactionally in memory.db; each is
         applied on every recall, so forgetting works even when the backend can't
         hard-delete (Graphiti's adapter doesn't expose deletion). We also attempt
         a best-effort backend delete; either way the fact is excluded from recall.
@@ -428,7 +421,6 @@ class MemoryService:
         value = str(memory_id_or_query or "").strip()
         if not value:
             return {"ok": False, "error": "forget needs a memory id or a query text."}
-        self._add_tombstone(value)
         local = self.fallback.forget(value)
         if self._use_fallback() or self.adapter is None:
             backend = {"ok": False, "error": "Graphiti unavailable"}

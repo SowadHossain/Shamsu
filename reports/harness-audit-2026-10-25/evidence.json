@@ -1,0 +1,180 @@
+{
+  "core": {
+    "memory_lost_update": {
+      "notes_after_two_successful_writes": [
+        "second choice"
+      ]
+    },
+    "memory_false_success": {
+      "reported_success": true,
+      "reload_count": 0
+    },
+    "manual_memory_edits_ignored": {
+      "recalled_after_manual_edit": "Use SQLite",
+      "markdown_edit_overwritten": true
+    },
+    "default_mcp_unreachable": {
+      "mcp_schema_count": 0,
+      "dispatch_ok": false,
+      "dispatch_message": "There is no tool called mcp__audit__read_docs. Call select_category to see the tools for what you are doing."
+    },
+    "unrelated_command_verifies_assertion": {
+      "accepted": true,
+      "verified": true,
+      "observation": "run_command(echo hello) exited 0"
+    },
+    "context_grounding_undercount": {
+      "fixed_overhead_before": 4721,
+      "fixed_overhead_after_large_plan": 4721,
+      "actual_grounding_tokens": 2413,
+      "project_tokens_not_in_fixed_overhead": 1201
+    },
+    "budget_can_orphan_tool_result": {
+      "selected_roles": [
+        "tool"
+      ],
+      "selected_start": 3,
+      "tool_call_ids": [
+        "c1"
+      ]
+    },
+    "portal_foreign_host": {
+      "status": 200,
+      "foreign_host_accepted": true,
+      "token_required": false
+    },
+    "ui_duplicate_prompt": {
+      "user_bubble_count": 2
+    },
+    "ui_session_fetch_race": {
+      "title": "Thread B",
+      "body": "shamsuANSWER A",
+      "session": "B"
+    },
+    "ui_settings_escape": {
+      "drawer_still_open": false
+    },
+    "ui_runtime": {
+      "errors": [],
+      "horizontal_overflow": false
+    }
+  },
+  "policy": {
+    "deny": {
+      "file_created": true,
+      "status": "success",
+      "error": "",
+      "approvals": 1,
+      "planned_mutations": [],
+      "final": "Created forbidden.py."
+    },
+    "dryrun": {
+      "file_created": true,
+      "status": "dry_run",
+      "error": "",
+      "approvals": 1,
+      "planned_mutations": [],
+      "final": "Dry run complete: the agent planned no file changes."
+    },
+    "read_only": {
+      "file_created": true,
+      "status": "success",
+      "error": "",
+      "approvals": 1,
+      "planned_mutations": [],
+      "final": "Created forbidden.py."
+    },
+    "typescript_false_syntax_pass": {
+      "text": "const x: = 1;",
+      "verdict": "CheckResult(status='ok', detail='', checker='brackets')"
+    }
+  },
+  "scope": {
+    "outside_path_search_ok": true,
+    "message": "Hybrid search: \"OUTSIDE_AUDIT_SENTINEL\" (mode: keyword) - 1 result(s)\n\n* private.py:1  [score 3.9435]\n    OUTSIDE_AUDIT_SENTINEL = \"outside workspace\"\n\n* exact + semantic match   ~ semantic only (a lead, not a fact)",
+    "data": {
+      "query": "OUTSIDE_AUDIT_SENTINEL",
+      "mode": "keyword",
+      "matches": [
+        {
+          "file": "private.py",
+          "filepath": "private.py",
+          "line": 1,
+          "end_line": 1,
+          "symbol": "",
+          "score": 3.9435,
+          "exact": true,
+          "text": "OUTSIDE_AUDIT_SENTINEL = \"outside workspace\""
+        }
+      ],
+      "count": 1,
+      "index_truncated": false
+    }
+  },
+  "context": {
+    "skeleton_cache_stale": {
+      "unchanged": true,
+      "includes_old_name": true,
+      "includes_new_name": false
+    },
+    "skills_off_ignored": {
+      "injected": true,
+      "prefix": "How this project does debugger (from a skill, because your request matched it):\n# Debugger\n\nFind out WHY it is broken. Do not just make the "
+    },
+    "sqlite_memory_not_in_notes": {
+      "saved_ok": true,
+      "injected_memory": ""
+    },
+    "tool_cap_exceeded": {
+      "cap": 2048,
+      "actual_tokens": 8202,
+      "characters": 8224
+    }
+  },
+  "journal": {
+    "tool_ok": false,
+    "data": {
+      "filepath": "a.py",
+      "erased": [
+        "helper"
+      ],
+      "rolled_back": true
+    },
+    "file_restored": true,
+    "manifests": [
+      {
+        "transaction_id": "20261025T075158-748efe35",
+        "created_at": "2026-10-25T07:51:58.235798+00:00",
+        "reason": "Agent edit_file: a.py",
+        "operations": [
+          {
+            "op": "edit_file",
+            "path": "a.py",
+            "dest_path": "",
+            "reason": ""
+          }
+        ],
+        "destructive": false,
+        "status": "applied",
+        "touched_files": [
+          "a.py"
+        ],
+        "before_hashes": {
+          "a.py": "0d72817aacd6f2802a28eaa5890a5c11f1e7f2fcbcd93b003be5f80749b56642"
+        },
+        "after_hashes": {
+          "a.py": "f58aee3ae30adab3e9d0d102131fe613698bc62aa4d9add426d0e48c43d2c6fa"
+        },
+        "backups": {
+          "a.py": "backups\\a.py"
+        },
+        "verification": null,
+        "error": ""
+      }
+    ]
+  },
+  "ui_extra": {
+    "preview_shown": false,
+    "ime_enter_submits": 1
+  }
+}

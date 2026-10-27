@@ -3897,6 +3897,7 @@ def test_tool_results_are_the_majority_bucket_on_an_edit_session(tmp_path):
 def test_a_write_payload_is_charged_to_tools_not_to_conversation(tmp_path):
     """Lumping the two hid the biggest items behind a label that looked like chat."""
     state = ChatState(simple_system_prompt(tmp_path), hydrate=False)
+    state.append_user("Write a.js")
     state.append_assistant("I will write it", tool_calls=_write_call_body("a.js", "x" * 20_000))
     loop = _loop(tmp_path, [_text("ok")])
     loop.state = state
@@ -4139,16 +4140,17 @@ def test_the_same_fact_is_not_stored_twice(tmp_path):
     assert len(MemoryStore(tmp_path).all_notes()) == 1
 
 
-def test_notes_are_readable_and_deletable_by_hand(tmp_path):
-    """A memory a user cannot inspect is one they cannot trust."""
+def test_notes_have_a_labelled_human_readable_export(tmp_path):
+    """Generated exports remain inspectable; the memory API owns changes."""
     from shamsu.agents.simple_memory import MEMORY_DIR, remember
 
     remember(tmp_path, "convention", "naming", "Modules are snake_case.", ["style"])
 
-    written = list((tmp_path / MEMORY_DIR).glob("convention-*.md"))
+    written = list((tmp_path / MEMORY_DIR / "exports").glob("convention-*.md"))
     assert written, "no human-readable note was written"
     body = written[0].read_text(encoding="utf-8")
     assert "snake_case" in body and "type: convention" in body
+    assert "Generated from memory.db" in body
 
 
 def test_unused_notes_are_archived_then_forgotten(tmp_path):

@@ -1,0 +1,19 @@
+{
+  "scanned": "2026-10-25",
+  "findings": {
+    "fonts": "system sans and monospace: app.css:31",
+    "palette": "warm neutrals and rust: app.css:16",
+    "framework": "Python stdlib HTTP and vanilla JavaScript: webui/server.py:1",
+    "scope": "app redesign"
+  },
+  "preserve": [
+    "all existing fields, hooks, routes and settings",
+    "pre-existing source changes"
+  ],
+  "introduce": [
+    "Rim app tokens",
+    "independent service lifecycle",
+    "container deployment",
+    "browser-first setup"
+  ]
+}

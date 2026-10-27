@@ -71,6 +71,39 @@ class QueuedRunner:
         self._workers: dict[tuple[str, str], threading.Thread] = {}
         self._lock = threading.Lock()
         self._stopping = threading.Event()
+        self._scheduler: threading.Thread | None = None
+        self._wake = threading.Event()
+
+    def start(self, *, recover_own_pid: bool = False) -> None:
+        """Own queue dispatch independently of terminal input or browser connections."""
+        with self._lock:
+            if self._scheduler is not None and self._scheduler.is_alive():
+                return
+            self._stopping.clear()
+            for item in self.store.recover_interrupted(include_own_pid=recover_own_pid):
+                self._announce_failure(
+                    Path(item.workspace), item.session_id,
+                    RuntimeError("The service restarted during this run. Review changes before retrying."),
+                )
+            self._scheduler = threading.Thread(
+                target=self._dispatch_pending, name="shamsu-queue", daemon=True,
+            )
+            self._scheduler.start()
+
+    def _dispatch_pending(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                self.store.expire_approvals()
+                for workspace, session_id in self.store.queued_sessions():
+                    if self._stopping.is_set():
+                        break
+                    if self._start_worker(workspace, session_id) == STARTED:
+                        break
+            except Exception:
+                # A transient DB lock must not permanently stop dispatch.
+                pass
+            self._wake.wait(0.5)
+            self._wake.clear()
 
     # -- accepting -------------------------------------------------------
 
@@ -128,15 +161,24 @@ class QueuedRunner:
     ) -> str:
         key = (str(Path(workspace).resolve()), session_id)
         with self._lock:
+            if self._stopping.is_set():
+                return BUSY
             existing = self._workers.get(key)
             if existing is not None and existing.is_alive():
                 # Already draining this thread: the prompt will be picked up by
                 # the loop that is running, but it is queued, not started.
                 return ALREADY_DRAINING
+            # A database lease is process-reentrant. Different worker threads
+            # in this process must still share one model slot.
+            if any(worker.is_alive() for worker in self._workers.values()):
+                return BUSY
+            machine = self.store.lease_holder(MACHINE_WORKSPACE, MACHINE_SESSION)
+            if machine is not None:
+                return BUSY
             if not self.store.acquire_lease(workspace, session_id, self.surface):
                 return BUSY
             if not self.store.acquire_lease(
-                MACHINE_WORKSPACE, MACHINE_SESSION, self.surface
+                MACHINE_WORKSPACE, MACHINE_SESSION, self.surface, reentrant=False,
             ):
                 self.store.release_lease(workspace, session_id)
                 return BUSY
@@ -178,6 +220,7 @@ class QueuedRunner:
             self.store.release_lease(MACHINE_WORKSPACE, MACHINE_SESSION)
             with self._lock:
                 self._workers.pop((str(workspace), session_id), None)
+            self._wake.set()
 
     def _announce_failure(
         self, workspace: Path, session_id: str, exc: BaseException
@@ -258,13 +301,23 @@ class QueuedRunner:
             # runs must reach the turn, not just be acknowledged at it.
             feedback=RunControlFeedback(ledger.run_id),
         )
-        result = asyncio.run(loop.run(item.text))
+        try:
+            result = asyncio.run(loop.run(item.text))
+        except BaseException as exc:
+            ledger.fail(f"{type(exc).__name__}: {exc}")
+            raise
+        status = "failed" if result.error else "stopped" if result.stopped else "incomplete" if result.truncated else "success"
+        ledger.finish(result.final, status=status)
         return result.final
 
     # -- lifecycle -------------------------------------------------------
 
     def stop(self, timeout: float = 10.0) -> None:
         self._stopping.set()
+        self._wake.set()
+        scheduler = self._scheduler
+        if scheduler is not None and scheduler is not threading.current_thread():
+            scheduler.join(timeout=min(timeout, 2.0))
         with self._lock:
             workers = list(self._workers.values())
         for worker in workers:

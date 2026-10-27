@@ -20,6 +20,15 @@ MemoryKind = Literal[
     "evidence_reference",
 ]
 
+# The compact tool vocabulary and the CLI use the same durable record kinds.
+NOTE_KINDS: dict[str, MemoryKind] = {
+    "decision": "project_decision",
+    "workflow": "workflow_rule",
+    "gotcha": "bug_lesson",
+    "convention": "architecture_note",
+    "context": "project_fact",
+}
+
 
 class MemoryFreshness(str, Enum):
     FRESH = "FRESH"

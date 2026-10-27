@@ -1,5 +1,20 @@
 # SHAMSU
 
+Run the standalone web application with Docker:
+
+```sh
+docker compose up -d --build
+docker compose logs web
+```
+
+Open the access link printed by the service. The web worker, Ollama, project
+files, and session state run independently of the interactive CLI. See
+[standalone deployment](DEPLOYMENT.md) for setup, host project mounts, GPU support,
+and the native `python -m shamsu.webui` entry point.
+
+See [context and project memory](MEMORY_CONTEXT.md) for prompt budgeting,
+shared SQLite memory, automatic migration, and supported note editing.
+
 Local-first autonomous coding agent for low-resource machines.
 
 SHAMSU is a lightweight coding teammate that can inspect, index, search,
@@ -496,7 +511,7 @@ results. A single stochastic model run is not a release-quality measurement.
   sessions/                  resumable conversation metadata and events
   runs/<run-id>/             canonical prompt evidence and final output
   abstract/                  code-memory health and generation metadata
-  memory/                    local Graphiti/SQLite memory state
+  memory/                    authoritative SQLite memory and note snapshots
   web/ and web_cache.db      optional web provider config and cache
   browser/                   local screenshots
 ```

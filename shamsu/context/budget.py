@@ -229,6 +229,30 @@ def count_tokens(text: str) -> int:
     return max(len(text) // CHARS_PER_TOKEN_ESTIMATE, 0)
 
 
+def fit_token_budget(text: str, max_tokens: int, suffix: str = "") -> str:
+    """Fit the final text, including its marker, using the active tokenizer.
+
+    Character ratios are not safe for Unicode, code or escaped JSON. Search
+    prefixes and remeasure the actual returned string instead.
+    """
+    cap = max(0, max_tokens)
+    if count_tokens(text) <= cap:
+        return text
+    if count_tokens(suffix) > cap:
+        suffix = ""
+    low, high = 0, len(text)
+    best = suffix
+    while low <= high:
+        middle = (low + high) // 2
+        candidate = text[:middle] + suffix
+        if count_tokens(candidate) <= cap:
+            best = candidate
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
 # What the chat template adds per message on top of its content: role markers
 # and the special tokens that open and close a turn. Measured against Ollama's
 # `prompt_eval_count` 2026-08-19, qwen3:8b:

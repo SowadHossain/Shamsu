@@ -126,7 +126,12 @@ def _read_from(path: Path, consumed_lines: int) -> tuple[list[dict], int]:
     if not path.exists():
         return [], consumed_lines
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        # An append may be in flight. Do not advance the cursor past a partial
+        # record; its complete line must still be delivered on the next poll.
+        if text and not text.endswith("\n"):
+            lines = lines[:-1]
     except OSError:
         return [], consumed_lines
     if len(lines) <= consumed_lines:

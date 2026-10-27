@@ -45,15 +45,15 @@ def test_select_evicts_oldest_and_snaps_to_user_boundary():
     assert [m.content for m in tail] == ["u2 c d e", "a2 y z"]
 
 
-def test_select_always_keeps_last_message_even_if_it_overflows():
+def test_select_keeps_the_complete_latest_turn_even_if_it_overflows():
     state = _state()
     state.append_user("u1 a b")
     state.append_assistant("this final answer is quite long indeed")  # 7 words
 
     tail, start_abs = state.select_for_budget(1, _wc)
 
-    assert [m.content for m in tail] == ["this final answer is quite long indeed"]
-    assert start_abs == 2
+    assert [m.content for m in tail] == ["u1 a b", "this final answer is quite long indeed"]
+    assert start_abs == 1
 
 
 def test_select_snaps_forward_past_a_leading_non_user_message():

@@ -233,12 +233,12 @@ class ChatState:
         *,
         per_message_overhead: int = PER_MESSAGE_OVERHEAD,
     ) -> tuple[list[ChatMessage], int]:
-        """Pick the largest recent suffix of history that fits in *max_tokens*,
-        always keeping at least the most recent message. Returns
+        """Pick the largest suffix of complete user-led turns that fits.
+        An oversized current turn remains whole for caller-side elision. Returns
         ``(tail, start_abs)`` where ``start_abs`` is the absolute index in
         ``_messages`` at which the kept suffix begins (1 == nothing evicted).
-        The start is snapped forward to a user-message boundary when that still
-        leaves a non-empty tail, so assistant/tool-call sequences stay intact.
+        The start is always a user-message boundary, so assistant calls and
+        their tool results cannot be separated by this selection.
         This is the token-aware replacement for the flat ``messages(30)`` cap.
 
         Each message is charged for its `tool_calls` and its chat-template
@@ -257,21 +257,28 @@ class ChatState:
         history_budget = max(
             0, max_tokens - token_counter(self.system_prompt) - per_message_overhead
         )
+        # Only complete user-led turns may be evicted. In particular, never
+        # keep a tool result after dropping the assistant call that owns it.
+        starts = [i for i, message in enumerate(history) if message.role == "user"]
+        if not starts:
+            return [], len(self._messages)
         used = 0
-        start_rel = len(history)
-        for i in range(len(history) - 1, -1, -1):
-            cost = message_tokens(
-                history[i], token_counter, overhead=per_message_overhead
+        start_rel = starts[-1]
+        end = len(history)
+        for start in reversed(starts):
+            cost = sum(
+                message_tokens(message, token_counter, overhead=per_message_overhead)
+                for message in history[start:end]
             )
-            if start_rel != len(history) and used + cost > history_budget:
+            if end != len(history) and used + cost > history_budget:
                 break
             used += cost
-            start_rel = i
-        snapped = start_rel
-        while snapped < len(history) and history[snapped].role != "user":
-            snapped += 1
-        if snapped < len(history):
-            start_rel = snapped
+            start_rel = start
+            end = start
+            if used > history_budget:
+                break
+        # An oversized current turn stays intact so the caller can elide its
+        # payloads or report insufficient context instead of sending orphans.
         start_abs = start_rel + 1
         return self._messages[start_abs:], start_abs
 
@@ -520,8 +527,18 @@ class ChatState:
             # file either way, and the count of what was SKIPPED is what makes
             # the summary watermark translatable.
             every = self.session_logger.read_messages(None)
+            # `/clear` hides earlier turns from the MODEL without deleting them.
+            # Applied before the window, so clearing always means "from here",
+            # not "from here, unless the window happened to reach further back".
+            floor = 0
+            try:
+                floor = int(self.session_logger.context_floor())
+            except Exception:  # noqa: BLE001 - an older session has no floor
+                floor = 0
+            if floor > 0:
+                every = every[floor:]
             records = every[-self.hydrate_max_messages:] if self.hydrate_max_messages else every
-            self._hydration_offset = max(0, len(every) - len(records))
+            self._hydration_offset = floor + max(0, len(every) - len(records))
             self._hydrate_records(records, key_content="content")
             return
         events = [

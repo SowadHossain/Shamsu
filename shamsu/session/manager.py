@@ -61,6 +61,15 @@ class SessionMetadata:
     summary: str = ""
     # Absolute index in the transcript up to which `summary` already accounts.
     summarized_upto: int = 1
+    # `/clear`: how many transcript messages the model no longer sees.
+    #
+    # A floor, not a delete. The transcript keeps every message - `/sessions
+    # show`, `history_search` and the archive all still reach them - and only
+    # hydration starts later. Clearing a context by truncating the file would
+    # destroy the one record of what happened, which is the opposite of what
+    # someone wants when they say "start fresh": they want the MODEL to forget,
+    # not the project.
+    context_cleared_upto: int = 0
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionMetadata":
@@ -555,6 +564,35 @@ class SessionLogger:
         metadata.summary_updated_at = datetime.now(timezone.utc).isoformat()
         self.manager._write_metadata(metadata)
         self.manager._upsert_index(metadata)
+
+    def clear_context(self) -> int:
+        """Start the model fresh from here. Returns how many turns it forgets.
+
+        `/compact clear` drops the SUMMARY of old turns and leaves the turns
+        themselves, so the next prompt rebuilds a digest and carries on. This is
+        the other half, and the one that was missing: forget the turns.
+
+        Both the floor and the summary have to move together. A summary
+        describing work the model can no longer see is worse than either alone -
+        it would read as a memory of something absent, which is exactly the
+        confusion a clear is meant to end.
+        """
+        try:
+            existing = len(self.read_messages(None))
+        except Exception:  # noqa: BLE001 - an unreadable transcript still clears
+            existing = 0
+        metadata = self.metadata
+        metadata.context_cleared_upto = existing
+        metadata.summary = ""
+        metadata.summarized_upto = max(existing, 1)
+        metadata.summary_updated_at = datetime.now(timezone.utc).isoformat()
+        self.manager._write_metadata(metadata)
+        self.manager._upsert_index(metadata)
+        return existing
+
+    def context_floor(self) -> int:
+        """Transcript messages hidden from the model by `/clear`."""
+        return max(int(self.metadata.context_cleared_upto or 0), 0)
 
     def load_summary(self) -> tuple[str, int]:
         metadata = self.metadata

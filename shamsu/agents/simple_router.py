@@ -148,12 +148,51 @@ ALWAYS_TOOLS = ("memory_load", "history_search", "ask_user", "use_skill")
 SELECTOR_TOOL_NAME = "select_category"
 
 
+def category_for_tool(tool: str) -> str:
+    """The category a tool belongs to, or "" if it is not in any.
+
+    The reverse of `TOOL_CATEGORIES`, and the thing that makes stage 1
+    recoverable. A model that calls `patch_file` while it is still holding the
+    selector has ALREADY told us which category it wants; asking it to say so
+    again in a `select_category` call is asking for information we have.
+
+    Several tools appear in two categories (`read_file` in read and web,
+    `create_and_run` in write and run). First match in declaration order wins,
+    which puts each tool in the category it is most obviously about.
+    """
+    wanted = (tool or "").strip()
+    if not wanted:
+        return ""
+    for name, body in TOOL_CATEGORIES.items():
+        if wanted in body["tools"]:
+            return name
+    return ""
+
+
 def routing_mode(context_window: int) -> str:
-    """``"direct"`` or ``"two_stage"``, from the window unless overridden."""
+    """``"direct"`` or ``"two_stage"``, from the window unless overridden.
+
+    STRICTLY below the threshold, not at it. The comparison used to be `<=`,
+    and 16,384 is not an arbitrary number - it is the value `/context window`
+    offers, what `OFFERED_CTX_WINDOWS` snaps to, and what a machine that cannot
+    hold 32k is told to use. So the single most likely window in the field
+    landed one point inside two-stage.
+
+    That mattered more than an off-by-one normally would, because stage 1 sends
+    ONE schema. Live 2026-08-31 in `voice-demo`, with `chat_max_ctx` set to
+    exactly 16384: `tool_count` was 1 on all 47 model calls of two consecutive
+    runs, the model never called `select_category`, and both runs burned their
+    whole round ceiling and failed. The runs on either side of that setting,
+    at 26 and 29 schemas, succeeded.
+
+    A window at the threshold can plainly afford the schemas - it is the same
+    window the direct path was designed for. Below it, the narrowing earns its
+    round.
+    """
     override = os.environ.get("SHAMSU_TOOL_ROUTING", "").strip().lower()
     if override in {"direct", "two_stage"}:
         return override
-    return "two_stage" if context_window <= TWO_STAGE_CTX_THRESHOLD else "direct"
+    return "two_stage" if context_window < TWO_STAGE_CTX_THRESHOLD else "direct"
 
 
 def category_selector_tool() -> dict[str, Any]:

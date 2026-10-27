@@ -62,12 +62,142 @@ _POSIX_FIXES: tuple[tuple[str, "str | Callable[[re.Match], str]"], ...] = (
     # rewriting it - even downstream of the classifier - moves a refused command
     # one edit closer to running. A model that wants a tree gone can be told the
     # Windows spelling and blocked on it like anyone else.
-    # `head -N` / `tail -N` at the end of a pipe.
-    (r"(?i)\|\s*head\s+-n?\s*(?P<count>\d+)\s*$", r'| powershell -NoProfile -Command "$input | Select-Object -First \g<count>"'),
-    (r"(?i)\|\s*tail\s+-n?\s*(?P<count>\d+)\s*$", r'| powershell -NoProfile -Command "$input | Select-Object -Last \g<count>"'),
+    # NOT `head`/`tail`/`grep`/`wc`. Those used to be rewritten into a
+    # `powershell -Command "$input | ..."` stage, and that rewrite CAUSED the
+    # worst failure this harness has had. See `_split_output_filter`.
     # `which x` -> where x
     (r"(?i)(?P<prefix>^|(?:&&|\|\||[;&|])\s*)which\s+", r"\g<prefix>where "),
 )
+
+
+_OUTPUT_FILTERS = (
+    (re.compile(r"(?i)\s*\|\s*head\s+-n?\s*(\d+)\s*$"), "head"),
+    (re.compile(r"(?i)\s*\|\s*tail\s+-n?\s*(\d+)\s*$"), "tail"),
+    (re.compile(r"(?i)\s*\|\s*wc\s+-l\s*$"), "wc"),
+    (
+        re.compile(
+            r"(?i)\s*\|\s*grep\s+(?P<flags>(?:-[ivEe]+\s+)*)"
+            r"(?P<pattern>\"[^\"]*\"|'[^']*'|\S+)\s*$"
+        ),
+        "grep",
+    ),
+)
+
+
+def _split_output_filter(command: str):
+    """Peel a trailing text filter off a pipeline; return it as a Python one.
+
+    THE most expensive defect this harness has produced, and the fix is to stop
+    using the shell for it.
+
+    `curl ... | head -50` used to be rewritten into
+    `curl ... | powershell -NoProfile -Command "$input | Select-Object -First 50"`.
+    On cmd.exe a pipeline reports the LAST stage's exit code, so when curl could
+    not connect - exit 7 - the pipeline still exited 0 with empty output, and the
+    harness reported "Command exited with 0." Measured directly:
+
+        curl -s http://localhost:59999/                       exit=7  stdout=''
+        curl -s http://localhost:59999/ | powershell ...       exit=0  stdout=''
+
+    Live 2026-08-31 that happened five times in a row. The model concluded the
+    page it was serving was empty, ran `curl -s http://localhost:8000/ >
+    index.html` to "restore" it, and cmd truncated the file before curl ran.
+    A 5KB page became 0 bytes. A failure reported as success is worse than a
+    failure, because everything downstream is reasoning from it.
+
+    Filtering in Python instead fixes it at the root: the command runs ALONE, so
+    its exit code and stderr are its own, and the truncation happens to captured
+    text afterwards. It also makes `grep` and `wc -l` work, which were never
+    translated at all and simply died with "'grep' is not recognized" (exit 255,
+    twice in that same run).
+
+    Only ever peels ONE filter, at the very end, where these appear in practice.
+    Returns ``(command_without_it, filter)``; `filter` is None when there is
+    nothing to peel.
+    """
+    text = (command or "").rstrip()
+    for pattern, kind in _OUTPUT_FILTERS:
+        match = pattern.search(text)
+        if not match:
+            continue
+        head = text[: match.start()].rstrip()
+        if not head:
+            return command, None
+        if kind == "head":
+            count = int(match.group(1))
+            return head, lambda out: chr(10).join(out.splitlines()[:count])
+        if kind == "tail":
+            count = int(match.group(1))
+            return head, lambda out: chr(10).join(out.splitlines()[-count:])
+        if kind == "wc":
+            return head, lambda out: str(len(out.splitlines()))
+        raw = match.group("pattern")
+        if raw[:1] in {'"', "'"} and raw[:1] == raw[-1:]:
+            raw = raw[1:-1]
+        flags = match.group("flags") or ""
+        insensitive = "i" in flags
+        invert = "v" in flags
+        try:
+            needle = re.compile(raw, re.IGNORECASE if insensitive else 0)
+        except re.error:
+            # Not a regex the model meant as one - match it literally rather
+            # than refusing a call over a stray bracket.
+            needle = re.compile(
+                re.escape(raw), re.IGNORECASE if insensitive else 0
+            )
+
+        def _grep(out: str) -> str:
+            kept = [
+                line
+                for line in out.splitlines()
+                if bool(needle.search(line)) != invert
+            ]
+            return chr(10).join(kept)
+
+        return head, _grep
+    return command, None
+
+
+def redirect_would_truncate(command: str, cwd: "Path", workspace: "Path") -> str:
+    """The workspace file a `>` in *command* would empty, or "".
+
+    Every write guard in this harness is one `>` away from irrelevant, and a
+    live run proved it. `write_file` refuses a blind overwrite and says so;
+    `delete_file` refused twice, in as many words - "NOT DELETED - index.html
+    is untouched". Then the same intent walked through `run_command`:
+
+        curl -s "http://localhost:8000/" > F:/Work/voice-demo/index.html
+
+    cmd truncates the target BEFORE the command on the left runs, so this
+    emptied the file whatever curl then did. No backup, no journal entry, and
+    the audit record recorded `affected_paths: []` - the harness did not know a
+    file had been written at all, so there was nothing for `/undo` to reach.
+
+    Deliberately narrow. `>>` appends and destroys nothing. A `>` to a path that
+    does not exist yet creates a file, which is ordinary and useful. Only
+    truncating something that is already there is refused, because that is the
+    only case where the shell can lose work the harness cannot recover.
+    """
+    text = command or ""
+    for match in re.finditer(r"(?<!>)>(?!>)\s*(\"[^\"]+\"|'[^']+'|[^\s|&;<>]+)", text):
+        raw = match.group(1).strip().strip("\"'")
+        if not raw or raw.startswith(("&", "|")):
+            continue
+        try:
+            target = Path(raw)
+            resolved = (
+                target if target.is_absolute() else Path(cwd) / target
+            ).resolve()
+        except (OSError, ValueError):
+            continue
+        if not resolved.is_file():
+            continue
+        try:
+            resolved.relative_to(Path(workspace).resolve())
+        except ValueError:
+            continue
+        return str(resolved)
+    return ""
 
 
 def _strip_posix_background(command: str) -> tuple[str, bool]:
@@ -541,6 +671,42 @@ class CommandRunner(ICommandRunner):
         self.last_command_resolution: CommandResolution | None = None
 
     def run(self, command: str, cwd: Path) -> tuple[int, str, str]:
+        """Run *command*, with the two shell hazards handled before it starts.
+
+        A trailing `head`/`tail`/`grep`/`wc -l` is peeled off and applied to the
+        captured output in Python, so the command's own exit code survives - see
+        `_split_output_filter` for the run where a laundered exit code cost a
+        file. A `>` that would truncate an existing workspace file is refused
+        outright - see `redirect_would_truncate` for the same run, and the same
+        file.
+        """
+        doomed = redirect_would_truncate(command, cwd, self.workspace_root)
+        if doomed:
+            message = (
+                f"Refused: `>` would empty {doomed} before the command on "
+                "the left of it even runs, and the shell does that with no "
+                "backup and no journal entry, so /undo could not bring it "
+                "back. To replace the file, use write_file - it keeps a "
+                "backup. To add to it, use append_file or `>>`. To capture "
+                "output for reading, redirect somewhere new and read that."
+            )
+            self.audit_logger.log(
+                "command_run",
+                "blocked",
+                details={"command": command, "target": doomed},
+            )
+            return BLOCKED_EXIT_CODE, "", message
+
+        stripped, output_filter = _split_output_filter(command)
+        exit_code, stdout, stderr = self._run_unfiltered(stripped, cwd)
+        if output_filter is not None and stdout:
+            try:
+                stdout = output_filter(stdout)
+            except Exception:  # noqa: BLE001 - a filter must never lose output
+                pass
+        return exit_code, stdout, stderr
+
+    def _run_unfiltered(self, command: str, cwd: Path) -> tuple[int, str, str]:
         requested_command = command
         self.last_error_packet = None
         self.last_diagnostic_packet = None
